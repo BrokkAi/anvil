@@ -1018,18 +1018,16 @@ pub async fn run_agent(
                 }
 
                 if is_slash_command(&prompt_text, "setup") {
-                    let report = handle_setup(
-                        &cx,
-                        &prompt_text,
-                        &session_id,
-                        &sessions_prompt,
-                        &llm_login,
-                        &sessions_login,
-                        &refresh_lock_login,
+                    let setup_ctx = SetupContext {
+                        cx: &cx,
+                        sessions: &sessions_prompt,
+                        llm: &llm_login,
+                        login_sessions: &sessions_login,
+                        refresh_lock: &refresh_lock_login,
                         default_idle_timeout_secs,
-                        snap.idle_timeout_secs,
-                    )
-                    .await;
+                        current_session_idle_timeout: snap.idle_timeout_secs,
+                    };
+                    let report = handle_setup(&setup_ctx, &prompt_text, &session_id).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -2088,24 +2086,25 @@ async fn handle_idle_timeout(
     }
 }
 
+/// Infrastructure shared by the `/setup` command family.
+struct SetupContext<'a> {
+    cx: &'a ConnectionTo<Client>,
+    sessions: &'a SessionStore,
+    llm: &'a Arc<MultiBackend>,
+    login_sessions: &'a SessionStore,
+    refresh_lock: &'a Arc<tokio::sync::Mutex<()>>,
+    default_idle_timeout_secs: u64,
+    current_session_idle_timeout: Option<u64>,
+}
+
 /// Handle `/setup`, the single user-facing configuration surface.
 /// The command is intentionally task-oriented: it offers "choose for me",
 /// Codex sign-in, local models, OpenRouter, and an advanced page. Internal
 /// config ids stay hidden unless the user explicitly enters `advanced`.
-async fn handle_setup(
-    cx: &ConnectionTo<Client>,
-    prompt_text: &str,
-    session_id: &str,
-    sessions: &SessionStore,
-    llm: &Arc<MultiBackend>,
-    login_sessions: &SessionStore,
-    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
-    default_idle_timeout_secs: u64,
-    current_session_idle_timeout: Option<u64>,
-) -> String {
+async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &str) -> String {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
-        return render_current_setup(sessions, session_id).await;
+        return render_current_setup(ctx.sessions, session_id).await;
     }
 
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -2114,14 +2113,14 @@ async fn handle_setup(
 
     match command.as_str() {
         "choose" | "choose-for-me" | "chooseforme" => {
-            handle_setup_choose(cx, sessions, session_id, llm, refresh_lock).await
+            handle_setup_choose(ctx.cx, ctx.sessions, session_id, ctx.llm, ctx.refresh_lock).await
         }
         "refresh" | "try-again" => {
-            match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
-                Ok(_) => render_current_setup(sessions, session_id).await,
+            match refresh_model_catalog_now(ctx.llm, ctx.sessions, ctx.refresh_lock).await {
+                Ok(_) => render_current_setup(ctx.sessions, session_id).await,
                 Err(e) => format!(
                     "Setup could not refresh models yet: {e}\n\n{}",
-                    render_current_setup(sessions, session_id).await
+                    render_current_setup(ctx.sessions, session_id).await
                 ),
             }
         }
@@ -2132,18 +2131,29 @@ async fn handle_setup(
                 format!("/codex-login {rest}")
             };
             let mut out =
-                handle_codex_login(&codex_prompt, llm, login_sessions, refresh_lock).await;
+                handle_codex_login(&codex_prompt, ctx.llm, ctx.login_sessions, ctx.refresh_lock)
+                    .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
             out
         }
         "local" | "ollama" => {
-            handle_setup_local(cx, sessions, session_id, llm, refresh_lock, rest).await
+            handle_setup_local(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
         }
-        "openrouter" => handle_setup_openrouter(rest, llm, login_sessions, refresh_lock).await,
+        "openrouter" => {
+            handle_setup_openrouter(rest, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await
+        }
         "permissions" | "permission" => {
-            handle_setup_permission(cx, sessions, session_id, rest).await
+            handle_setup_permission(ctx.cx, ctx.sessions, session_id, rest).await
         }
-        "mode" | "behavior" => handle_setup_mode(cx, sessions, session_id, rest).await,
+        "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
         "timeout" => {
             let prompt = if rest.is_empty() {
                 "/idle-timeout".to_string()
@@ -2153,17 +2163,17 @@ async fn handle_setup(
             handle_idle_timeout(
                 &prompt,
                 session_id,
-                sessions,
-                current_session_idle_timeout,
-                default_idle_timeout_secs,
+                ctx.sessions,
+                ctx.current_session_idle_timeout,
+                ctx.default_idle_timeout_secs,
             )
             .await
         }
         "model" => {
             if rest.is_empty() {
-                render_setup_models(sessions.available_model_metadata().await.as_slice())
+                render_setup_models(ctx.sessions.available_model_metadata().await.as_slice())
             } else {
-                apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, rest).await
+                apply_setup_config(ctx.cx, ctx.sessions, session_id, MODEL_CONFIG_ID, rest).await
             }
         }
         "reasoning" | "reasoning-effort" => {
@@ -2177,14 +2187,20 @@ async fn handle_setup(
                 } else {
                     rest
                 };
-                apply_setup_config(cx, sessions, session_id, REASONING_EFFORT_CONFIG_ID, value)
-                    .await
+                apply_setup_config(
+                    ctx.cx,
+                    ctx.sessions,
+                    session_id,
+                    REASONING_EFFORT_CONFIG_ID,
+                    value,
+                )
+                .await
             }
         }
-        "advanced" => render_setup_advanced(sessions, session_id).await,
+        "advanced" => render_setup_advanced(ctx.sessions, session_id).await,
         other => format!(
             "Unknown setup option `{other}`.\n\n{}",
-            render_current_setup(sessions, session_id).await
+            render_current_setup(ctx.sessions, session_id).await
         ),
     }
 }
@@ -2269,9 +2285,7 @@ async fn handle_setup_local(
                 Ok(catalog) => {
                     let local_count = source_count(&catalog, ModelSource::Ollama);
                     if local_count > 0 {
-                        format!(
-                            "Local models are ready. Run `/setup local use` to use them, or `/setup choose` to let Anvil pick."
-                        )
+                        "Local models are ready. Run `/setup local use` to use them, or `/setup choose` to let Anvil pick.".to_string()
                     } else {
                         render_local_setup_help()
                     }
@@ -2312,9 +2326,7 @@ async fn handle_setup_openrouter(
             Ok(catalog) => {
                 let count = source_count(&catalog, ModelSource::OpenRouter);
                 if count > 0 {
-                    format!(
-                        "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection."
-                    )
+                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
                 } else {
                     format!(
                         "OpenRouter is not showing models yet.\n\n{}",
