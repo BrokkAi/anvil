@@ -214,18 +214,21 @@ impl LlmBackend for MultiBackend {
             let codex_ids: Vec<String> = codex_metadata.iter().map(|m| m.id.clone()).collect();
             let codex_lookup = || async move { Ok::<_, anyhow::Error>(codex_ids) };
 
-            // OpenRouter exposes a flat `/v1/models` list with no
-            // reasoning-effort metadata, so we just need bare ids. When
-            // the backend isn't configured (no `OPENROUTER_API_KEY`),
-            // the closure returns an empty list and `discover_all`
-            // logs/skips it like any other absent source.
-            let openrouter_backend = self.openrouter_snapshot();
-            let openrouter_lookup = move || async move {
-                match openrouter_backend {
-                    Some(or) => or.list_models().await,
-                    None => Ok(Vec::new()),
-                }
+            // OpenRouter catalog entries now carry reasoning metadata for
+            // reasoning-capable models. We snapshot it once, then hand
+            // discover_all the bare ids so source tagging stays uniform.
+            let openrouter = self.openrouter_snapshot();
+            let openrouter_metadata: Vec<ModelMetadata> = match &openrouter {
+                Some(or) => or.list_model_metadata().await.unwrap_or_default(),
+                None => Vec::new(),
             };
+            let openrouter_by_id: HashMap<String, ModelMetadata> = openrouter_metadata
+                .iter()
+                .map(|m| (m.id.clone(), m.clone()))
+                .collect();
+            let openrouter_ids: Vec<String> =
+                openrouter_metadata.iter().map(|m| m.id.clone()).collect();
+            let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
 
             let http = discovery_http_client();
             let discovered: Vec<DiscoveredModel> =
@@ -243,13 +246,15 @@ impl LlmBackend for MultiBackend {
                                 supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
                             })
                             .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                        // Neither Ollama nor OpenRouter publishes
-                        // reasoning presets through its catalog -- ids
-                        // surface with empty metadata so the picker
-                        // simply omits the effort selector for them.
-                        ModelSource::Ollama | ModelSource::OpenRouter => {
-                            ModelMetadata::id_only(wire)
-                        }
+                        ModelSource::Ollama => ModelMetadata::id_only(wire),
+                        ModelSource::OpenRouter => openrouter_by_id
+                            .get(&m.id)
+                            .map(|meta| ModelMetadata {
+                                id: wire.clone(),
+                                default_reasoning_level: meta.default_reasoning_level.clone(),
+                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            })
+                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
                     }
                 })
                 .collect())

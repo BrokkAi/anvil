@@ -244,28 +244,99 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
-    /// Optional reasoning effort parameter for models that support it
-    /// (e.g., OpenRouter's reasoning models, Ollama's thinking models).
-    /// Sent as `extra_body.reasoning_effort` for OpenRouter compatibility.
+    /// Optional reasoning effort parameter for models that support it.
+    /// Serialized as OpenRouter/Ollama's unified `reasoning` object.
     #[serde(skip_serializing_if = "Option::is_none")]
-    extra_body: Option<ExtraBody>,
+    reasoning: Option<ReasoningConfig>,
 }
 
 #[derive(Debug, Serialize)]
-struct ExtraBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
+struct ReasoningConfig {
+    effort: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelEntry {
     pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) supported_parameters: Vec<String>,
+    #[serde(default)]
+    pub(crate) default_parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelsResponse {
     #[serde(default)]
     pub(crate) data: Vec<ModelEntry>,
+}
+
+const OPENROUTER_REASONING_PRESETS: &[(&str, &str)] = &[
+    (
+        "minimal",
+        "Basic reasoning with minimal computational effort",
+    ),
+    ("low", "Light reasoning for simple problems"),
+    ("medium", "Balanced reasoning for moderate complexity"),
+    ("high", "Deep reasoning for complex problems"),
+    (
+        "xhigh",
+        "Extra-high reasoning for the most difficult problems",
+    ),
+];
+
+fn openrouter_reasoning_presets() -> Vec<ReasoningLevelPreset> {
+    OPENROUTER_REASONING_PRESETS
+        .iter()
+        .map(|(effort, description)| ReasoningLevelPreset {
+            effort: (*effort).to_string(),
+            description: (*description).to_string(),
+        })
+        .collect()
+}
+
+fn reasoning_effort_from_default_parameters(
+    default_parameters: Option<&serde_json::Value>,
+) -> Option<String> {
+    let reasoning = default_parameters?.get("reasoning")?;
+    if let Some(effort) = reasoning.get("effort").and_then(|v| v.as_str()) {
+        return Some(effort.to_string());
+    }
+    if reasoning
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Some("medium".to_string());
+    }
+    None
+}
+
+impl ModelEntry {
+    fn supports_reasoning(&self) -> bool {
+        self.supported_parameters
+            .iter()
+            .any(|param| param == "reasoning" || param == "include_reasoning")
+            || self
+                .default_parameters
+                .as_ref()
+                .and_then(|params| params.get("reasoning"))
+                .is_some()
+    }
+
+    fn to_model_metadata(&self) -> ModelMetadata {
+        if !self.supports_reasoning() {
+            return ModelMetadata::id_only(self.id.clone());
+        }
+
+        ModelMetadata {
+            id: self.id.clone(),
+            default_reasoning_level: reasoning_effort_from_default_parameters(
+                self.default_parameters.as_ref(),
+            )
+            .or_else(|| Some("medium".to_string())),
+            supported_reasoning_levels: openrouter_reasoning_presets(),
+        }
+    }
 }
 
 // SSE chunk types for streaming (extended for tool calls)
@@ -357,9 +428,9 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: Option<String>,
     http: reqwest::Client,
-    /// Whether this client should pass reasoning_effort through to the API.
-    /// Enabled for OpenRouter (which supports it via extra_body) and
-    /// Ollama models that declare reasoning support.
+    /// Whether this client should pass reasoning through to the API.
+    /// Enabled for OpenRouter and Ollama models that declare reasoning
+    /// support.
     supports_reasoning_effort: bool,
 }
 
@@ -429,6 +500,10 @@ impl LlmBackend for OpenAiClient {
         Box::pin(self.list_models_impl())
     }
 
+    fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
+        Box::pin(self.list_model_metadata_impl())
+    }
+
     fn stream_chat(
         &self,
         model: &str,
@@ -460,7 +535,7 @@ impl LlmBackend for OpenAiClient {
 }
 
 impl OpenAiClient {
-    async fn list_models_impl(&self) -> Result<Vec<String>> {
+    async fn fetch_models_response(&self) -> Result<ModelsResponse> {
         let url = self.api_url("/models");
 
         let mut req = self.http.get(&url);
@@ -476,11 +551,28 @@ impl OpenAiClient {
             anyhow::bail!("model discovery failed (HTTP {status})");
         }
 
-        let models: ModelsResponse = resp
-            .json()
-            .await
-            .context("failed to parse models response")?;
+        resp.json().await.context("failed to parse models response")
+    }
+
+    async fn list_models_impl(&self) -> Result<Vec<String>> {
+        let models = self.fetch_models_response().await?;
         Ok(models.data.into_iter().map(|m| m.id).collect())
+    }
+
+    async fn list_model_metadata_impl(&self) -> Result<Vec<ModelMetadata>> {
+        let models = self.fetch_models_response().await?;
+        if !self.supports_reasoning_effort {
+            return Ok(models
+                .data
+                .into_iter()
+                .map(|model| ModelMetadata::id_only(model.id))
+                .collect());
+        }
+        Ok(models
+            .data
+            .into_iter()
+            .map(|model| model.to_model_metadata())
+            .collect())
     }
 
     async fn stream_chat_impl(
@@ -497,9 +589,7 @@ impl OpenAiClient {
 
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
-        let extra_body = reasoning_effort.map(|effort| ExtraBody {
-            reasoning_effort: Some(effort),
-        });
+        let reasoning = reasoning_effort.map(|effort| ReasoningConfig { effort });
 
         let body = ChatCompletionRequest {
             model,
@@ -509,7 +599,7 @@ impl OpenAiClient {
             max_tokens: None,
             tools,
             tool_choice,
-            extra_body,
+            reasoning,
         };
 
         let mut req = self.http.post(&url).json(&body);
@@ -1025,7 +1115,8 @@ mod tests {
     /// than OpenAI's (`name`, `canonical_slug`, `pricing`, `architecture`,
     /// etc.). The shared `ModelsResponse` deserializer must round-trip
     /// the catalog without choking on the extra fields, leaving the
-    /// caller with just the bare `id` strings the routing layer expects.
+    /// caller with the model ids and any reasoning metadata the routing
+    /// layer can use.
     /// Sample shape distilled from a live `GET https://openrouter.ai/api/v1/models`
     /// response (vendor/model ids, with nested `pricing` and
     /// `architecture` objects) so a future serde-rename regression is
@@ -1060,5 +1151,50 @@ mod tests {
                 "openai/gpt-4o".to_string(),
             ]
         );
+    }
+
+    /// OpenRouter reasoning-capable models should surface a default
+    /// reasoning effort and the picker presets so the session UI can
+    /// offer them instead of silently collapsing to "no reasoning."
+    #[test]
+    fn openrouter_reasoning_metadata_is_preserved_when_supported() {
+        let raw = r#"{
+            "data": [
+                {
+                    "id": "openai/gpt-5.2",
+                    "supported_parameters": ["temperature", "reasoning"],
+                    "default_parameters": {
+                        "reasoning": {
+                            "enabled": true,
+                            "effort": "high"
+                        }
+                    }
+                },
+                {
+                    "id": "openai/gpt-4o",
+                    "supported_parameters": ["temperature", "top_p"]
+                }
+            ]
+        }"#;
+        let parsed: ModelsResponse = serde_json::from_str(raw).expect("OpenRouter /models parses");
+        let reasoning_model = parsed.data[0].to_model_metadata();
+        assert_eq!(reasoning_model.id, "openai/gpt-5.2");
+        assert_eq!(
+            reasoning_model.default_reasoning_level.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            reasoning_model
+                .supported_reasoning_levels
+                .iter()
+                .map(|preset| preset.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["minimal", "low", "medium", "high", "xhigh"]
+        );
+
+        let plain_model = parsed.data[1].to_model_metadata();
+        assert_eq!(plain_model.id, "openai/gpt-4o");
+        assert!(plain_model.default_reasoning_level.is_none());
+        assert!(plain_model.supported_reasoning_levels.is_empty());
     }
 }
