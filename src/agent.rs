@@ -1027,12 +1027,7 @@ pub async fn run_agent(
                         default_idle_timeout_secs,
                         current_session_idle_timeout: snap.idle_timeout_secs,
                     };
-                    let report = handle_setup(
-                        &setup_ctx,
-                        &prompt_text,
-                        &session_id,
-                    )
-                    .await;
+                    let report = handle_setup(&setup_ctx, &prompt_text, &session_id).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -2106,11 +2101,7 @@ struct SetupContext<'a> {
 /// The command is intentionally task-oriented: it offers "choose for me",
 /// Codex sign-in, local models, OpenRouter, and an advanced page. Internal
 /// config ids stay hidden unless the user explicitly enters `advanced`.
-async fn handle_setup(
-    ctx: &SetupContext<'_>,
-    prompt_text: &str,
-    session_id: &str,
-) -> String {
+async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &str) -> String {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
         return render_current_setup(ctx.sessions, session_id).await;
@@ -2140,14 +2131,25 @@ async fn handle_setup(
                 format!("/codex-login {rest}")
             };
             let mut out =
-                handle_codex_login(&codex_prompt, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await;
+                handle_codex_login(&codex_prompt, ctx.llm, ctx.login_sessions, ctx.refresh_lock)
+                    .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
             out
         }
         "local" | "ollama" => {
-            handle_setup_local(ctx.cx, ctx.sessions, session_id, ctx.llm, ctx.refresh_lock, rest).await
+            handle_setup_local(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
         }
-        "openrouter" => handle_setup_openrouter(rest, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await,
+        "openrouter" => {
+            handle_setup_openrouter(rest, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await
+        }
         "permissions" | "permission" => {
             handle_setup_permission(ctx.cx, ctx.sessions, session_id, rest).await
         }
@@ -2185,8 +2187,14 @@ async fn handle_setup(
                 } else {
                     rest
                 };
-                apply_setup_config(ctx.cx, ctx.sessions, session_id, REASONING_EFFORT_CONFIG_ID, value)
-                    .await
+                apply_setup_config(
+                    ctx.cx,
+                    ctx.sessions,
+                    session_id,
+                    REASONING_EFFORT_CONFIG_ID,
+                    value,
+                )
+                .await
             }
         }
         "advanced" => render_setup_advanced(ctx.sessions, session_id).await,
