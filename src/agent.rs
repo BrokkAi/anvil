@@ -20,6 +20,7 @@ use agent_client_protocol::{
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatMessage, LlmBackend, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
@@ -218,8 +219,8 @@ fn all_config_options(
 }
 
 /// Wire ids accepted by `apply_config_option`. Kept in a single slice so
-/// every caller (the `setSessionConfigOption` request handler and the
-/// `/configure` slash command) reports identical "supported keys" lists.
+/// the ACP `setSessionConfigOption` request handler and `/setup advanced`
+/// report identical supported-key lists.
 const CONFIGURE_KNOWN_KEYS: &[&str] = &[
     BEHAVIOR_CONFIG_ID,
     PERMISSION_CONFIG_ID,
@@ -278,10 +279,10 @@ impl ConfigApplyError {
 }
 
 /// Apply a single `configOptions` change. Single source of truth shared by
-/// the `setSessionConfigOption` ACP request and the `/configure` slash
-/// command: validates the value, mutates session state, and returns the
-/// full re-derived options list so the caller can emit a
-/// `ConfigOptionUpdate` notification with the spec-required complete state.
+/// the `setSessionConfigOption` ACP request and `/setup`: validates the
+/// value, mutates session state, and returns the full re-derived options
+/// list so the caller can emit a `ConfigOptionUpdate` notification with
+/// the spec-required complete state.
 async fn apply_config_option(
     sessions: &SessionStore,
     session_id: &str,
@@ -435,48 +436,21 @@ async fn apply_config_option(
 }
 
 /// Slash commands advertised to clients via `available_commands_update`.
-/// Mirrors the Java executor's `/context` command (other Java commands are
-/// intentionally omitted -- they depend on the live workspace context that
-/// the Rust agent does not yet model). `/codex-login` is published so it
-/// shows up in editor autocomplete (Zed, JetBrains ACP) -- without this
-/// the slash command works when typed but is invisible to discovery.
+/// `/setup` is the single user-facing configuration entry point; provider
+/// login, model selection, permissions, and advanced settings all route
+/// through it so users do not need to learn internal config ids.
 fn builtin_commands() -> Vec<AvailableCommand> {
-    let mut commands = vec![
+    vec![
         AvailableCommand::new("context", "Show current session context snapshot"),
         AvailableCommand::new(
-            "codex-login",
-            "Sign in with ChatGPT (or `status` / `disconnect`)",
+            "setup",
+            "Set up models, login, permissions, and advanced options",
         ),
-    ];
-    // `/openrouter-login` is advertised only when the env var does not
-    // own the credential lifecycle. When `OPENROUTER_API_KEY` is set
-    // in the process environment, the key cannot be mutated from a
-    // session (the server reads env once at startup and a `disconnect`
-    // can't undo that), so showing the slash would be misleading. The
-    // slash is still kept in `builtin_command_names()` unconditionally
-    // so a skill can't claim the name -- typing it manually dispatches
-    // to the handler, which then explains why the command is disabled.
-    // `/configure` exposes the credential status either way so users
-    // can still see where the active key comes from.
-    if !crate::openrouter_auth::CredentialState::snapshot().env_owns() {
-        commands.push(AvailableCommand::new(
-            "openrouter-login",
-            "Save an OpenRouter API key (or `status` / `disconnect`)",
-        ));
-    }
-    commands.push(AvailableCommand::new(
-        "idle-timeout",
-        "Show or set the LLM SSE idle timeout for this session (e.g. `/idle-timeout 600`)",
-    ));
-    commands.push(AvailableCommand::new(
-        "configure",
-        "Show or change session settings (e.g. `/configure model_selection gpt-5`)",
-    ));
-    commands.push(AvailableCommand::new(
-        "pr-create",
-        "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
-    ));
-    commands
+        AvailableCommand::new(
+            "pr-create",
+            "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
+        ),
+    ]
 }
 
 /// Set of built-in slash command names, used to detect collisions with
@@ -484,16 +458,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
 /// filtered skills entirely" guidance: don't expose a slash that won't
 /// actually dispatch to the skill).
 fn builtin_command_names() -> std::collections::HashSet<&'static str> {
-    [
-        "context",
-        "codex-login",
-        "openrouter-login",
-        "idle-timeout",
-        "configure",
-        "pr-create",
-    ]
-    .into_iter()
-    .collect()
+    ["context", "setup", "pr-create"].into_iter().collect()
 }
 
 /// Build the full command list advertised to the client: built-ins plus
@@ -639,6 +604,122 @@ fn spawn_throttled_refresh(
     }
 }
 
+fn spawn_delayed_setup_notice(
+    cx: ConnectionTo<Client>,
+    session: Session,
+    catalog: Vec<ModelMetadata>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let state = crate::setup_state::read();
+        let message = render_session_start_setup_notice(&session, &catalog, state.first_run_seen);
+        send_message(&cx, &session.id, &message);
+        if !state.first_run_seen
+            && let Err(e) = crate::setup_state::mark_first_run_seen()
+        {
+            tracing::warn!("failed to persist first-run setup state: {e:#}");
+        }
+    });
+}
+
+fn render_session_start_setup_notice(
+    session: &Session,
+    catalog: &[ModelMetadata],
+    first_run_seen: bool,
+) -> String {
+    if session.model.is_empty() {
+        let mut out = String::from("No model is ready yet. Starting setup.\n\n");
+        out.push_str(&render_setup_home(session, catalog));
+        return out;
+    }
+
+    if !first_run_seen {
+        let mut out = String::from("Anvil found a working model setup and is ready to use.\n\n");
+        out.push_str("Run `/setup` anytime to change or repair model setup.");
+        return out;
+    }
+
+    "Anvil is ready. Run `/setup` anytime to change or repair model setup.".to_string()
+}
+
+fn source_count(catalog: &[ModelMetadata], source: ModelSource) -> usize {
+    catalog
+        .iter()
+        .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
+        .count()
+}
+
+fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
+    [
+        ModelSource::Codex,
+        ModelSource::Ollama,
+        ModelSource::OpenRouter,
+    ]
+    .into_iter()
+    .find_map(|source| {
+        catalog
+            .iter()
+            .find(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
+            .map(|m| m.id.clone())
+    })
+}
+
+fn render_setup_home(session: &Session, catalog: &[ModelMetadata]) -> String {
+    render_setup_home_for_model(&session.model, catalog)
+}
+
+fn render_setup_home_from_snapshot(snap: &SessionSnapshot, catalog: &[ModelMetadata]) -> String {
+    let mut out =
+        String::from("No model is ready yet. Start setup before asking Anvil to work.\n\n");
+    out.push_str(&render_setup_home_for_model(&snap.model, catalog));
+    out
+}
+
+fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String {
+    let codex_count = source_count(catalog, ModelSource::Codex);
+    let ollama_count = source_count(catalog, ModelSource::Ollama);
+    let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
+    let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
+    let ready = if model.is_empty() {
+        "No model selected yet.".to_string()
+    } else {
+        "A model is selected.".to_string()
+    };
+
+    format!(
+        "**Anvil setup**\n\n\
+         {ready}\n\n\
+         Pick one:\n\
+         - `/setup choose` - Choose for me.\n\
+         - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
+         - `/setup local` - Use free local models on this computer.\n\
+         - `/setup openrouter` - Use OpenRouter.\n\
+         - `/setup advanced` - Show model ids and extra settings.\n\n\
+         Found now:\n\
+         - Codex: {codex_status}\n\
+         - Local models: {local_status}\n\
+         - OpenRouter: {openrouter_status}\n\n\
+         You can run `/setup` anytime.",
+        codex_status = if codex_count > 0 {
+            "ready".to_string()
+        } else {
+            "not signed in".to_string()
+        },
+        local_status = if ollama_count > 0 {
+            "ready".to_string()
+        } else {
+            "not found".to_string()
+        },
+        openrouter_status = if openrouter_count > 0 {
+            "ready".to_string()
+        } else if openrouter_state.active_source() == "none" {
+            "not connected".to_string()
+        } else {
+            "connected, no models found yet".to_string()
+        },
+    )
+}
+
 /// Build and run the ACP agent over stdio.
 pub async fn run_agent(
     llm: Arc<MultiBackend>,
@@ -712,8 +793,7 @@ pub async fn run_agent(
                     );
 
                 responder.respond(
-                    InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(capabilities),
+                    InitializeResponse::new(req.protocol_version).agent_capabilities(capabilities),
                 )
             },
             on_receive_request!(),
@@ -747,6 +827,8 @@ pub async fn run_agent(
                     catalog = vec![ModelMetadata::id_only(&session.model)];
                 }
                 let model_ids: Vec<String> = catalog.iter().map(|m| m.id.clone()).collect();
+                let setup_session = session.clone();
+                let setup_catalog = catalog.clone();
 
                 let meta_value = serde_json::json!({
                     "brokk": {
@@ -761,13 +843,6 @@ pub async fn run_agent(
 
                 let response = NewSessionResponse::new(session.id.clone())
                     .modes(mode_state(session.mode.as_str()))
-                    .config_options(all_config_options(
-                        session.mode,
-                        session.permission_mode,
-                        &session.model,
-                        &catalog,
-                        session.selected_reasoning_effort.as_deref(),
-                    ))
                     .meta(meta_map);
 
                 // Respond first so the client receives the session id, then
@@ -783,6 +858,7 @@ pub async fn run_agent(
                     session.id.clone(),
                     session.skills.clone(),
                 );
+                spawn_delayed_setup_notice(cx.clone(), setup_session, setup_catalog);
                 result
             },
             on_receive_request!(),
@@ -794,7 +870,10 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.to_string();
                 let cwd = req.cwd.clone();
-                tracing::info!("ACP session/load session={session_id}, cwd={}", cwd.display());
+                tracing::info!(
+                    "ACP session/load session={session_id}, cwd={}",
+                    cwd.display()
+                );
 
                 // Look up the session from memory or disk
                 let session = match sessions_load.get_session(&session_id, &cwd).await {
@@ -820,22 +899,16 @@ pub async fn run_agent(
                 }
 
                 let catalog = sessions_load.available_model_metadata().await;
-                let result = responder.respond(
-                    LoadSessionResponse::new()
-                        .modes(mode_state(session.mode.as_str()))
-                        .config_options(all_config_options(
-                            session.mode,
-                            session.permission_mode,
-                            &session.model,
-                            &catalog,
-                            session.selected_reasoning_effort.as_deref(),
-                        )),
-                );
+                let setup_session = session.clone();
+                let setup_catalog = catalog.clone();
+                let result = responder
+                    .respond(LoadSessionResponse::new().modes(mode_state(session.mode.as_str())));
                 spawn_delayed_available_commands_update(
                     cx.clone(),
                     session_id.clone(),
                     session.skills.clone(),
                 );
+                spawn_delayed_setup_notice(cx.clone(), setup_session, setup_catalog);
                 result
             },
             on_receive_request!(),
@@ -847,28 +920,26 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.to_string();
                 let cwd = req.cwd.clone();
-                tracing::info!("ACP session/resume session={session_id}, cwd={}", cwd.display());
+                tracing::info!(
+                    "ACP session/resume session={session_id}, cwd={}",
+                    cwd.display()
+                );
 
                 match sessions_resume.get_session(&session_id, &cwd).await {
                     Some(session) => {
                         sessions_resume.update_cwd(&session_id, cwd).await;
                         let catalog = sessions_resume.available_model_metadata().await;
+                        let setup_session = session.clone();
+                        let setup_catalog = catalog.clone();
                         let result = responder.respond(
-                            ResumeSessionResponse::new()
-                                .modes(mode_state(session.mode.as_str()))
-                                .config_options(all_config_options(
-                                    session.mode,
-                                    session.permission_mode,
-                                    &session.model,
-                                    &catalog,
-                                    session.selected_reasoning_effort.as_deref(),
-                                )),
+                            ResumeSessionResponse::new().modes(mode_state(session.mode.as_str())),
                         );
                         spawn_delayed_available_commands_update(
                             cx.clone(),
                             session_id.clone(),
                             session.skills.clone(),
                         );
+                        spawn_delayed_setup_notice(cx.clone(), setup_session, setup_catalog);
                         result
                     }
                     None => {
@@ -922,10 +993,7 @@ pub async fn run_agent(
                 // read lock; we then consume it via `.into_iter()` to build ChatMessages
                 // without further string copies.
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
-                let snap = match sessions_prompt
-                    .snapshot(&session_id, &fallback_cwd)
-                    .await
-                {
+                let snap = match sessions_prompt.snapshot(&session_id, &fallback_cwd).await {
                     Some(s) => s,
                     None => {
                         send_message(&cx, &session_id, "Error: unknown session");
@@ -949,46 +1017,19 @@ pub async fn run_agent(
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                if is_slash_command(&prompt_text, "codex-login") {
-                    let report = handle_codex_login(
-                        &prompt_text,
-                        &llm_login,
-                        &sessions_login,
-                        &refresh_lock_login,
-                    )
-                    .await;
-                    send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                }
-
-                if is_slash_command(&prompt_text, "openrouter-login") {
-                    let report = handle_openrouter_login(
-                        &prompt_text,
-                        &llm_login,
-                        &sessions_login,
-                        &refresh_lock_login,
-                    )
-                    .await;
-                    send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                }
-
-                if is_slash_command(&prompt_text, "idle-timeout") {
-                    let report = handle_idle_timeout(
+                if is_slash_command(&prompt_text, "setup") {
+                    let report = handle_setup(
+                        &cx,
                         &prompt_text,
                         &session_id,
                         &sessions_prompt,
-                        snap.idle_timeout_secs,
+                        &llm_login,
+                        &sessions_login,
+                        &refresh_lock_login,
                         default_idle_timeout_secs,
+                        snap.idle_timeout_secs,
                     )
                     .await;
-                    send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                }
-
-                if is_slash_command(&prompt_text, "configure") {
-                    let report =
-                        handle_configure(&cx, &prompt_text, &session_id, &sessions_prompt).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -1010,8 +1051,7 @@ pub async fn run_agent(
                             bifrost_binary_prompt.as_deref(),
                         )
                         .await;
-                    let report =
-                        handle_pr_create(&prompt_text, &registry, permission_mode).await;
+                    let report = handle_pr_create(&prompt_text, &registry, permission_mode).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -1023,7 +1063,7 @@ pub async fn run_agent(
                 // appended), so it persists into history and replays
                 // correctly. Built-ins are checked first so a skill
                 // that happens to name itself e.g. `context` or
-                // `idle-timeout` can never shadow them.
+                // `setup` can never shadow them.
                 let prompt_text = if let Some((name, args)) = parse_slash_command(&prompt_text)
                     && let Some(meta) = snap.skills.get(&name)
                 {
@@ -1043,7 +1083,12 @@ pub async fn run_agent(
 
                 // Validate model is configured
                 if snap.model.is_empty() {
-                    send_message(&cx, &session_id, "Error: no model configured. Start the server with --default-model or ensure the LLM endpoint is reachable for model discovery.");
+                    let catalog = sessions_prompt.available_model_metadata().await;
+                    send_message(
+                        &cx,
+                        &session_id,
+                        &render_setup_home_from_snapshot(&snap, &catalog),
+                    );
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
@@ -1054,11 +1099,7 @@ pub async fn run_agent(
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
                 let registry = sessions_prompt
-                    .get_or_create_registry(
-                        &session_id,
-                        snap.cwd,
-                        bifrost_binary_prompt.as_deref(),
-                    )
+                    .get_or_create_registry(&session_id, snap.cwd, bifrost_binary_prompt.as_deref())
                     .await;
 
                 // Capture everything the spawned task needs before we move into it.
@@ -1096,19 +1137,17 @@ pub async fn run_agent(
                     let sid_thought = session_id_for_loop.clone();
 
                     // Text tokens stream to the client in real time via this shared sink.
-                    let text_sink: crate::tool_loop::TextSink = std::sync::Arc::new(
-                        std::sync::Mutex::new(move |token: &str| {
+                    let text_sink: crate::tool_loop::TextSink =
+                        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
                             send_message(&cx_text, &sid_text, token);
-                        }),
-                    );
+                        }));
                     // Reasoning deltas stream into the dedicated ACP
                     // thought channel so the client can render them as
                     // a collapsible block separate from the final answer.
-                    let thought_sink: crate::tool_loop::TextSink = std::sync::Arc::new(
-                        std::sync::Mutex::new(move |token: &str| {
+                    let thought_sink: crate::tool_loop::TextSink =
+                        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
                             send_thought(&cx_thought, &sid_thought, token);
-                        }),
-                    );
+                        }));
 
                     // Catch panics so cleanup (finish_prompt, respond) always runs.
                     // Without this, a panic inside the tool loop would leak the cancel
@@ -1202,7 +1241,9 @@ pub async fn run_agent(
         )
         // Handle session/cancel
         .on_receive_notification(
-            async move |notification: CancelNotification, _cx: ConnectionTo<Client>| -> agent_client_protocol::Result<()> {
+            async move |notification: CancelNotification,
+                        _cx: ConnectionTo<Client>|
+                        -> agent_client_protocol::Result<()> {
                 let session_id = notification.session_id.to_string();
                 tracing::info!("ACP cancel session={session_id}");
                 sessions_cancel.cancel_prompt(&session_id).await;
@@ -1221,25 +1262,22 @@ pub async fn run_agent(
 
                 let Some(mode) = SessionMode::parse(&mode_id) else {
                     return responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params()
-                            .data(serde_json::json!({
-                                "reason": format!("unknown mode '{mode_id}'"),
-                                "supported": available_modes()
-                                    .iter()
-                                    .map(|m| m.id.to_string())
-                                    .collect::<Vec<_>>(),
-                            })),
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!("unknown mode '{mode_id}'"),
+                            "supported": available_modes()
+                                .iter()
+                                .map(|m| m.id.to_string())
+                                .collect::<Vec<_>>(),
+                        })),
                     );
                 };
 
                 match sessions_mode.set_mode(&session_id, mode).await {
                     Ok(true) => responder.respond(SetSessionModeResponse::new()),
                     Ok(false) => responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params().data(
-                            serde_json::json!({
-                                "reason": format!("unknown session '{session_id}'"),
-                            }),
-                        ),
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!("unknown session '{session_id}'"),
+                        })),
                     ),
                     Err(e) => responder.respond_with_error(
                         agent_client_protocol::Error::internal_error().data(serde_json::json!({
@@ -1706,7 +1744,7 @@ async fn handle_codex_login(
                 )
             }
             Ok(None) => {
-                "No Codex credentials found. Run `/codex-login` to authenticate.".to_string()
+                "No Codex credentials found. Run `/setup codex` to authenticate.".to_string()
             }
             Err(e) => format!("Failed to read ~/.codex/auth.json: {e:#}"),
         },
@@ -1720,7 +1758,7 @@ async fn handle_codex_login(
                 llm.uninstall_codex();
                 spawn_throttled_refresh(refresh_lock.clone(), llm.clone(), sessions.clone());
                 "Codex credentials cleared and the in-memory backend was unloaded; \
-                 the picker will only show Ollama models until you re-run `/codex-login`."
+                 the picker will only show local models until you re-run `/setup codex`."
                     .to_string()
             }
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
@@ -1764,7 +1802,7 @@ async fn handle_codex_login(
                     }
                     None => format!(
                         "Codex login completed but the saved credentials are not usable \
-                         (auth_mode={:?}, no OPENAI_API_KEY). Re-run `/codex-login` or \
+                         (auth_mode={:?}, no OPENAI_API_KEY). Re-run `/setup codex` or \
                          inspect ~/.codex/auth.json.",
                         auth.auth_mode
                     ),
@@ -1773,23 +1811,29 @@ async fn handle_codex_login(
             Err(e) => format!("Codex login failed: {e:#}"),
         },
         other => format!(
-            "Unknown subcommand `{other}`. Try: /codex-login | /codex-login status | /codex-login disconnect"
+            "Unknown subcommand `{other}`. Try: /setup codex | /setup codex status | /setup codex disconnect"
         ),
     }
 }
 
 /// User-facing explanation returned when `OPENROUTER_API_KEY` is set
 /// in the process environment. Single source of truth for the message
-/// so the slash handler, future status surfaces, and any test stay in
-/// agreement on the wording (and on the pointer to `/configure` for
-/// the actual state dump).
+/// so the setup handler, future status surfaces, and tests stay in
+/// agreement on the wording.
 fn openrouter_env_owned_explanation() -> String {
-    "OpenRouter credentials are owned by the OPENROUTER_API_KEY environment \
-     variable, so /openrouter-login is disabled. The server reads \
-     OPENROUTER_API_KEY once at startup; unset it (and restart the server) if \
-     you want to manage credentials via /openrouter-login. Run /configure to \
-     see the current credential state (env_set / file_present / active_source)."
-        .to_string()
+    let state = crate::openrouter_auth::CredentialState::snapshot();
+    format!(
+        "OpenRouter credentials are owned by the OPENROUTER_API_KEY environment \
+         variable. Anvil reads that value at startup; unset it and restart the \
+         server if you want `/setup openrouter key <key>` to manage credentials.\n\n\
+         Credential state:\n\
+         - active_source: `{}`\n\
+         - env_set: `{}`\n\
+         - file_present: `{}`",
+        state.active_source(),
+        state.env_set,
+        state.file_present
+    )
 }
 
 /// Handle the `/openrouter-login` slash command and its subcommands.
@@ -1809,7 +1853,8 @@ fn openrouter_env_owned_explanation() -> String {
 /// (see `builtin_commands`), but the handler still runs when typed
 /// manually so users can't get "command not found" with no hint.
 /// Diagnostic state (env_set, file_present, active_source) stays
-/// available via `/configure` regardless of which mode is active.
+/// available via `/setup openrouter status` regardless of which mode is
+/// active.
 async fn handle_openrouter_login(
     prompt_text: &str,
     llm: &Arc<MultiBackend>,
@@ -1837,8 +1882,8 @@ async fn handle_openrouter_login(
     let lowered = after_cmd.to_ascii_lowercase();
     match lowered.as_str() {
         "" => format!(
-            "Usage: `/openrouter-login <key>` | `/openrouter-login status` | \
-             `/openrouter-login disconnect`. Get a key at \
+            "Usage: `/setup openrouter key <key>` | `/setup openrouter status` | \
+             `/setup openrouter disconnect`. Get a key at \
              https://openrouter.ai/keys. Note: the key appears in this session's \
              transcript, so rotate it at openrouter.ai if you share the log. \
              Credentials are persisted to {}.",
@@ -1851,8 +1896,8 @@ async fn handle_openrouter_login(
             // we only reach this arm when the env var is unset. The
             // snapshot's env_set is therefore always false here -- we
             // include it in the output anyway for self-contained
-            // diagnostics so users don't have to cross-reference
-            // /configure to confirm the env is clear.
+            // diagnostics so users can confirm the env is clear from
+            // `/setup openrouter status`.
             let state = crate::openrouter_auth::CredentialState::snapshot();
             let file_key = match crate::openrouter_auth::read() {
                 Ok(Some(auth)) => Some(auth.api_key.trim().to_string()).filter(|s| !s.is_empty()),
@@ -1885,7 +1930,7 @@ async fn handle_openrouter_login(
                 spawn_throttled_refresh(refresh_lock.clone(), llm.clone(), sessions.clone());
                 "OpenRouter credentials cleared and the in-memory backend was unloaded; \
                  the picker will only show models from other configured backends until \
-                 you re-run `/openrouter-login <key>`."
+                 you re-run `/setup openrouter key <key>`."
                     .to_string()
             }
             Err(e) => format!("Failed to remove OpenRouter credential file: {e:#}"),
@@ -1979,8 +2024,8 @@ fn parse_idle_timeout_arg(prompt_text: &str) -> Result<IdleTimeoutAction, String
                  {min}s and {max}s, or use `default` to clear the override."
             )),
             Err(_) => Err(format!(
-                "Unknown subcommand `{other}`. Try: /idle-timeout | \
-                 /idle-timeout <secs> | /idle-timeout default"
+                "Unknown subcommand `{other}`. Try: /setup timeout | \
+                 /setup timeout <seconds> | /setup timeout default"
             )),
         },
     }
@@ -2009,12 +2054,12 @@ async fn handle_idle_timeout(
         IdleTimeoutAction::Show => match current_session_override {
             Some(secs) => format!(
                 "LLM idle timeout: {secs}s (session override).\n\
-                 Server default is {default_secs}s. Use `/idle-timeout default` to clear, \
-                 or `/idle-timeout <secs>` to change."
+                 Server default is {default_secs}s. Use `/setup timeout default` to clear, \
+                 or `/setup timeout <seconds>` to change."
             ),
             None => format!(
                 "LLM idle timeout: {default_secs}s (server default).\n\
-                 Use `/idle-timeout <secs>` to override for this session only, \
+                 Use `/setup timeout <seconds>` to override for this session only, \
                  or restart with `--llm-idle-timeout-secs` / `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS` \
                  to change the default."
             ),
@@ -2043,44 +2088,346 @@ async fn handle_idle_timeout(
     }
 }
 
-/// Handle the `/configure` slash command. Thin façade over
-/// `apply_config_option` so users on clients without the
-/// `configOptions` dropdown UI can drive the same four session knobs
-/// (behavior_mode, permission_mode, model_selection, reasoning_effort)
-/// via text. New keys are added explicitly to `CONFIGURE_KNOWN_KEYS`,
-/// never inferred -- the goal is to mirror the structured surface, not
-/// open a parallel state channel.
-///
-/// Subcommands:
-///   `/configure`                 -> dump current values for every key
-///   `/configure <key>`           -> dump the current value of <key>
-///   `/configure <key> <value>`   -> set <key> to <value>, re-emit
-///                                   `ConfigOptionUpdate` so dropdown UIs
-///                                   stay in sync.
-async fn handle_configure(
+/// Handle `/setup`, the single user-facing configuration surface.
+/// The command is intentionally task-oriented: it offers "choose for me",
+/// Codex sign-in, local models, OpenRouter, and an advanced page. Internal
+/// config ids stay hidden unless the user explicitly enters `advanced`.
+async fn handle_setup(
     cx: &ConnectionTo<Client>,
     prompt_text: &str,
     session_id: &str,
     sessions: &SessionStore,
+    llm: &Arc<MultiBackend>,
+    login_sessions: &SessionStore,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    default_idle_timeout_secs: u64,
+    current_session_idle_timeout: Option<u64>,
 ) -> String {
     let trimmed = slash_command_args(prompt_text);
-
-    // No args, or a single token: show current state.
-    if trimmed.is_empty() || trimmed.split_whitespace().count() == 1 {
-        let fallback_cwd = std::env::current_dir().unwrap_or_default();
-        let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
-            return "Error: unknown session.".to_string();
-        };
-        if trimmed.is_empty() {
-            return render_configure_dump(&session);
-        }
-        return render_configure_single(&trimmed, &session);
+    if trimmed.is_empty() {
+        return render_current_setup(sessions, session_id).await;
     }
 
     let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let key = parts.next().unwrap_or("");
-    let value = parts.next().unwrap_or("").trim();
+    let command = parts.next().unwrap_or("").to_ascii_lowercase();
+    let rest = parts.next().unwrap_or("").trim();
 
+    match command.as_str() {
+        "choose" | "choose-for-me" | "chooseforme" => {
+            handle_setup_choose(cx, sessions, session_id, llm, refresh_lock).await
+        }
+        "refresh" | "try-again" => {
+            match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
+                Ok(_) => render_current_setup(sessions, session_id).await,
+                Err(e) => format!(
+                    "Setup could not refresh models yet: {e}\n\n{}",
+                    render_current_setup(sessions, session_id).await
+                ),
+            }
+        }
+        "codex" => {
+            let codex_prompt = if rest.is_empty() || rest == "login" {
+                "/codex-login".to_string()
+            } else {
+                format!("/codex-login {rest}")
+            };
+            let mut out =
+                handle_codex_login(&codex_prompt, llm, login_sessions, refresh_lock).await;
+            out.push_str("\n\nRun `/setup choose` after sign-in completes.");
+            out
+        }
+        "local" | "ollama" => {
+            handle_setup_local(cx, sessions, session_id, llm, refresh_lock, rest).await
+        }
+        "openrouter" => handle_setup_openrouter(rest, llm, login_sessions, refresh_lock).await,
+        "permissions" | "permission" => {
+            handle_setup_permission(cx, sessions, session_id, rest).await
+        }
+        "mode" | "behavior" => handle_setup_mode(cx, sessions, session_id, rest).await,
+        "timeout" => {
+            let prompt = if rest.is_empty() {
+                "/idle-timeout".to_string()
+            } else {
+                format!("/idle-timeout {rest}")
+            };
+            handle_idle_timeout(
+                &prompt,
+                session_id,
+                sessions,
+                current_session_idle_timeout,
+                default_idle_timeout_secs,
+            )
+            .await
+        }
+        "model" => {
+            if rest.is_empty() {
+                render_setup_models(sessions.available_model_metadata().await.as_slice())
+            } else {
+                apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, rest).await
+            }
+        }
+        "reasoning" | "reasoning-effort" => {
+            if rest.is_empty() {
+                "Use `/setup reasoning default` or `/setup reasoning <level>`.\n\
+                 This is an advanced setting; most users should leave it alone."
+                    .to_string()
+            } else {
+                let value = if rest.eq_ignore_ascii_case("default") {
+                    REASONING_EFFORT_DEFAULT_VALUE
+                } else {
+                    rest
+                };
+                apply_setup_config(cx, sessions, session_id, REASONING_EFFORT_CONFIG_ID, value)
+                    .await
+            }
+        }
+        "advanced" => render_setup_advanced(sessions, session_id).await,
+        other => format!(
+            "Unknown setup option `{other}`.\n\n{}",
+            render_current_setup(sessions, session_id).await
+        ),
+    }
+}
+
+async fn render_current_setup(sessions: &SessionStore, session_id: &str) -> String {
+    let fallback_cwd = std::env::current_dir().unwrap_or_default();
+    let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
+        return "Error: unknown session.".to_string();
+    };
+    let catalog = sessions.available_model_metadata().await;
+    render_setup_home(&session, &catalog)
+}
+
+async fn refresh_model_catalog_now(
+    llm: &Arc<MultiBackend>,
+    sessions: &SessionStore,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+) -> Result<Vec<ModelMetadata>, String> {
+    let _guard = refresh_lock.lock().await;
+    let models = llm
+        .list_model_metadata()
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if let Some(model) = preferred_model(&models) {
+        sessions.set_default_model(model).await;
+    }
+    sessions.set_available_models(models.clone()).await;
+    Ok(models)
+}
+
+async fn handle_setup_choose(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+) -> String {
+    let catalog = match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
+        Ok(models) => models,
+        Err(e) => {
+            return format!(
+                "Anvil could not find a working model yet: {e}\n\n\
+                 Try `/setup codex` if you use Codex, or `/setup local` for free local models."
+            );
+        }
+    };
+    let Some(model) = preferred_model(&catalog) else {
+        return format!(
+            "Anvil could not find a working model yet.\n\n{}",
+            render_setup_home_for_model("", &catalog)
+        );
+    };
+    match apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, &model).await {
+        msg if msg.starts_with("Error:") => msg,
+        _ => "Anvil is ready. Run `/setup` anytime to change or repair model setup.".to_string(),
+    }
+}
+
+async fn handle_setup_local(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    rest: &str,
+) -> String {
+    match rest.to_ascii_lowercase().as_str() {
+        "use" | "choose" => {
+            let catalog = sessions.available_model_metadata().await;
+            if let Some(model) = catalog
+                .iter()
+                .find(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == ModelSource::Ollama))
+                .map(|m| m.id.clone())
+            {
+                return apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, &model).await;
+            }
+            "No local model is ready yet. Install Ollama, start it, then run `/setup local refresh`."
+                .to_string()
+        }
+        "refresh" | "try-again" => {
+            match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
+                Ok(catalog) => {
+                    let local_count = source_count(&catalog, ModelSource::Ollama);
+                    if local_count > 0 {
+                        format!(
+                            "Local models are ready. Run `/setup local use` to use them, or `/setup choose` to let Anvil pick."
+                        )
+                    } else {
+                        render_local_setup_help()
+                    }
+                }
+                Err(e) => format!(
+                    "Could not check local models yet: {e}\n\n{}",
+                    render_local_setup_help()
+                ),
+            }
+        }
+        _ => render_local_setup_help(),
+    }
+}
+
+fn render_local_setup_help() -> String {
+    "Use free local models\n\n\
+     Anvil looks for Ollama automatically. You do not need to know ports or model ids.\n\n\
+     1. Install Ollama from https://ollama.com\n\
+     2. Start Ollama.\n\
+     3. Run `/setup local refresh`.\n\
+     4. Run `/setup local use`.\n\n\
+     llama.cpp and custom local servers belong in `/setup advanced`."
+        .to_string()
+}
+
+async fn handle_setup_openrouter(
+    rest: &str,
+    llm: &Arc<MultiBackend>,
+    sessions: &SessionStore,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+) -> String {
+    if rest.is_empty() {
+        return render_openrouter_setup_help();
+    }
+    let lower = rest.to_ascii_lowercase();
+    if matches!(lower.as_str(), "refresh" | "try-again") {
+        return match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
+            Ok(catalog) => {
+                let count = source_count(&catalog, ModelSource::OpenRouter);
+                if count > 0 {
+                    format!(
+                        "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection."
+                    )
+                } else {
+                    format!(
+                        "OpenRouter is not showing models yet.\n\n{}",
+                        render_openrouter_setup_help()
+                    )
+                }
+            }
+            Err(e) => format!(
+                "Could not check OpenRouter yet: {e}\n\n{}",
+                render_openrouter_setup_help()
+            ),
+        };
+    }
+
+    let prompt = match rest.split_once(char::is_whitespace) {
+        Some((cmd, key)) if cmd.eq_ignore_ascii_case("key") && !key.trim().is_empty() => {
+            format!("/openrouter-login {}", key.trim())
+        }
+        _ if matches!(lower.as_str(), "status" | "disconnect") => {
+            format!("/openrouter-login {rest}")
+        }
+        _ if rest.starts_with("sk-") => format!("/openrouter-login {rest}"),
+        _ => {
+            return format!(
+                "Unknown OpenRouter setup option `{rest}`.\n\n{}",
+                render_openrouter_setup_help()
+            );
+        }
+    };
+    let mut out = handle_openrouter_login(&prompt, llm, sessions, refresh_lock).await;
+    out.push_str("\n\nRun `/setup choose` after OpenRouter is connected.");
+    out
+}
+
+fn render_openrouter_setup_help() -> String {
+    let state = crate::openrouter_auth::CredentialState::snapshot();
+    let status = match state.active_source() {
+        "env" => "OpenRouter is connected from the OPENROUTER_API_KEY environment variable.",
+        "file" => "OpenRouter is connected from saved credentials.",
+        _ => "OpenRouter is not connected.",
+    };
+    format!(
+        "Use OpenRouter\n\n\
+         {status}\n\n\
+         If you already know OpenRouter and have a key, run:\n\
+         `/setup openrouter key <your key>`\n\n\
+         Other useful commands:\n\
+         - `/setup openrouter status`\n\
+         - `/setup openrouter disconnect`\n\
+         - `/setup openrouter refresh`\n\n\
+         Choose for me: `/setup choose`."
+    )
+}
+
+async fn handle_setup_permission(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    rest: &str,
+) -> String {
+    if rest.is_empty() {
+        return "How should Anvil make changes?\n\n\
+                - `/setup permissions ask` - Ask before edits and commands.\n\
+                - `/setup permissions auto-edits` - Edit files automatically, ask for commands.\n\
+                - `/setup permissions read-only` - Do not change files or run commands.\n\
+                - `/setup permissions trusted` - Allow tool calls without prompting."
+            .to_string();
+    }
+    let value = match rest.to_ascii_lowercase().as_str() {
+        "ask" | "default" => "default",
+        "auto-edits" | "edits" | "accept-edits" => "acceptEdits",
+        "read-only" | "readonly" => "readOnly",
+        "trusted" | "bypass" | "bypass-permissions" => "bypassPermissions",
+        _ => {
+            return "Unknown permission choice. Try `/setup permissions ask`, \
+                    `auto-edits`, `read-only`, or `trusted`."
+                .to_string();
+        }
+    };
+    apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
+}
+
+async fn handle_setup_mode(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    rest: &str,
+) -> String {
+    if rest.is_empty() {
+        return "How should Anvil behave?\n\n\
+                - `/setup mode agent` - General coding assistant.\n\
+                - `/setup mode code` - Focus on code changes.\n\
+                - `/setup mode ask` - Answer questions.\n\
+                - `/setup mode plan` - Plan only."
+            .to_string();
+    }
+    let value = match rest.to_ascii_lowercase().as_str() {
+        "agent" | "default" | "lutz" => "LUTZ",
+        "code" => "CODE",
+        "ask" => "ASK",
+        "plan" => "PLAN",
+        _ => return "Unknown mode. Try `/setup mode agent`, `code`, `ask`, or `plan`.".to_string(),
+    };
+    apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
+}
+
+async fn apply_setup_config(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    key: &str,
+    value: &str,
+) -> String {
     match apply_config_option(sessions, session_id, key, value).await {
         Ok(outcome) => {
             let notification = SessionNotification::new(
@@ -2088,13 +2435,18 @@ async fn handle_configure(
                 SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(outcome.updated_options)),
             );
             if let Err(e) = cx.send_notification(notification) {
-                tracing::warn!("failed to send config_option_update from /configure: {e}");
+                tracing::warn!("failed to send config_option_update from /setup: {e}");
             }
-            let mut msg = format!("Set `{key}` to `{value}`.");
+            let mut msg = match key {
+                MODEL_CONFIG_ID => "Model setup updated.".to_string(),
+                PERMISSION_CONFIG_ID => "Permission setup updated.".to_string(),
+                BEHAVIOR_CONFIG_ID => "Behavior setup updated.".to_string(),
+                REASONING_EFFORT_CONFIG_ID => "Advanced reasoning setup updated.".to_string(),
+                _ => "Setup updated.".to_string(),
+            };
             if let Some(prev) = outcome.cleared_reasoning {
                 msg.push_str(&format!(
-                    "\nReasoning effort reset: `{prev}` is not supported by the new model. \
-                     Using model default until you pick a level."
+                    "\nReasoning effort reset: `{prev}` is not supported by the new model."
                 ));
             }
             msg
@@ -2103,11 +2455,151 @@ async fn handle_configure(
     }
 }
 
+fn render_setup_models(catalog: &[ModelMetadata]) -> String {
+    if catalog.is_empty() {
+        return "No models are in the catalog yet. Run `/setup refresh`.".to_string();
+    }
+    let mut out = String::from("Advanced model selection\n\nUse `/setup model <model id>`.\n\n");
+
+    {
+        let mut write_group = |title: &str, models: Vec<String>, empty: &str| {
+            out.push_str(title);
+            out.push('\n');
+            if models.is_empty() {
+                out.push_str(empty);
+                out.push('\n');
+            } else {
+                for id in models {
+                    out.push_str(&format!("- `{id}`\n"));
+                }
+            }
+            out.push('\n');
+        };
+
+        write_group(
+            "Codex",
+            source_model_ids(catalog, ModelSource::Codex, 12),
+            "No Codex models found. Run `/setup codex`.",
+        );
+        write_group(
+            "Local models",
+            source_model_ids(catalog, ModelSource::Ollama, 12),
+            "No local models found. Run `/setup local`.",
+        );
+        write_group(
+            "OpenRouter",
+            filtered_openrouter_models(catalog),
+            "No OpenRouter coding candidates found. Run `/setup openrouter`.",
+        );
+    }
+
+    let openrouter_total = source_count(catalog, ModelSource::OpenRouter);
+    if openrouter_total > 0 {
+        out.push_str(&format!(
+            "OpenRouter list is filtered for chat and coding models ({openrouter_total} total in the raw catalog).\n"
+        ));
+    }
+    out
+}
+
+fn source_model_ids(catalog: &[ModelMetadata], source: ModelSource, limit: usize) -> Vec<String> {
+    catalog
+        .iter()
+        .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
+        .take(limit)
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+fn filtered_openrouter_models(catalog: &[ModelMetadata]) -> Vec<String> {
+    const EXCLUDE: &[&str] = &[
+        "image",
+        "vision",
+        "audio",
+        "tts",
+        "embedding",
+        "moderation",
+        "free",
+    ];
+    const INCLUDE: &[&str] = &[
+        "claude",
+        "gpt",
+        "gemini",
+        "qwen",
+        "deepseek",
+        "codestral",
+        "kimi",
+        "mistral",
+        "llama",
+    ];
+    catalog
+        .iter()
+        .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == ModelSource::OpenRouter))
+        .filter(|m| {
+            let id = m.id.to_ascii_lowercase();
+            INCLUDE.iter().any(|needle| id.contains(needle))
+                && !EXCLUDE.iter().any(|needle| id.contains(needle))
+        })
+        .take(8)
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> String {
+    let fallback_cwd = std::env::current_dir().unwrap_or_default();
+    let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
+        return "Error: unknown session.".to_string();
+    };
+    let catalog = sessions.available_model_metadata().await;
+    let openrouter_picks = filtered_openrouter_models(&catalog);
+    let mut out = String::from("Advanced setup\n\n");
+    out.push_str(&format!(
+        "- Selected model: `{}`\n",
+        if session.model.is_empty() {
+            "(none)"
+        } else {
+            &session.model
+        }
+    ));
+    out.push_str(&format!(
+        "- Permission mode: `{}`\n",
+        session.permission_mode.as_str()
+    ));
+    out.push_str(&format!("- Behavior mode: `{}`\n", session.mode.as_str()));
+    out.push_str(&format!(
+        "- Reasoning effort: `{}`\n",
+        session
+            .selected_reasoning_effort
+            .as_deref()
+            .unwrap_or(REASONING_EFFORT_DEFAULT_VALUE)
+    ));
+    out.push_str(&format!(
+        "- LLM idle timeout: `{}`\n\n",
+        session
+            .idle_timeout_secs
+            .map(|s| format!("{s}s"))
+            .unwrap_or_else(|| "server default".to_string())
+    ));
+    out.push_str("Commands:\n");
+    out.push_str("- `/setup model` - list model ids.\n");
+    out.push_str("- `/setup model <model id>` - choose a specific model.\n");
+    out.push_str("- `/setup permissions` - change edit/command approvals.\n");
+    out.push_str("- `/setup mode` - change assistant behavior.\n");
+    out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
+    out.push_str("- `/setup reasoning default|<level>` - advanced reasoning setting.\n");
+    if !openrouter_picks.is_empty() {
+        out.push_str("\nFiltered OpenRouter coding candidates:\n");
+        for id in openrouter_picks {
+            out.push_str(&format!("- `{id}`\n"));
+        }
+    }
+    out
+}
+
 /// Trimmed args for a slash command. Returns the empty string when the
 /// prompt is not a slash command at all, or when the command has no
-/// trailing args. Shared between `handle_configure` and
-/// `parse_pr_create_arg` -- both want "args after the command name,
-/// trimmed of surrounding whitespace".
+/// trailing args. Shared by setup and `/pr-create` -- both want "args
+/// after the command name, trimmed of surrounding whitespace".
 fn slash_command_args(prompt_text: &str) -> String {
     parse_slash_command(prompt_text)
         .map(|(_, a)| a)
@@ -2302,79 +2794,6 @@ async fn handle_pr_create(
     }
 }
 
-/// Render the `/configure` dump of all four session knobs as a single
-/// readable block. Mirrors `all_config_options` field-for-field so the
-/// text view never drifts from the structured view.
-///
-/// The OpenRouter credential block at the bottom is **read-only** -- it
-/// reports where the active key comes from (env / file / none) and
-/// whether `/openrouter-login` is available, so users can see the
-/// credential state even when the env owns the lifecycle and the slash
-/// is hidden from autocomplete. Setting credentials is intentionally
-/// not routed through `/configure`: a global secret has a different
-/// lifecycle than per-session knobs, and the dedicated
-/// `/openrouter-login` keeps that distinction sharp.
-fn render_configure_dump(session: &Session) -> String {
-    let effort = session
-        .selected_reasoning_effort
-        .clone()
-        .unwrap_or_else(|| REASONING_EFFORT_DEFAULT_VALUE.to_string());
-    let or_state = crate::openrouter_auth::CredentialState::snapshot();
-    let login_available = !or_state.env_owns();
-    format!(
-        "**Configuration**\n\n\
-         - `{BEHAVIOR_CONFIG_ID}`: `{behavior}`\n\
-         - `{PERMISSION_CONFIG_ID}`: `{permission}`\n\
-         - `{MODEL_CONFIG_ID}`: `{model}`\n\
-         - `{REASONING_EFFORT_CONFIG_ID}`: `{effort}`\n\n\
-         Set a value with `/configure <key> <value>`. \
-         Supported keys: {keys}.\n\n\
-         **OpenRouter credentials** (read-only)\n\n\
-         - `active_source`: `{active_source}`\n\
-         - `env_set`: `{env_set}`\n\
-         - `file_present`: `{file_present}`\n\
-         - `login_command_available`: `{login_available}`\n\n\
-         {login_hint}",
-        behavior = session.mode.as_str(),
-        permission = session.permission_mode.as_str(),
-        model = session.model,
-        keys = CONFIGURE_KNOWN_KEYS.join(", "),
-        active_source = or_state.active_source(),
-        env_set = or_state.env_set,
-        file_present = or_state.file_present,
-        login_available = login_available,
-        login_hint = if login_available {
-            "Manage the key with `/openrouter-login <key>` | `status` | `disconnect`."
-        } else {
-            "`/openrouter-login` is disabled because `OPENROUTER_API_KEY` owns \
-             the credential lifecycle. Unset the env var and restart the server \
-             to manage the key from a session."
-        },
-    )
-}
-
-/// Render a single key's current value. Unknown keys return the same
-/// error string `apply_config_option` would produce so the user gets
-/// consistent feedback whether they're reading or writing.
-fn render_configure_single(key: &str, session: &Session) -> String {
-    match key {
-        BEHAVIOR_CONFIG_ID => format!("`{key}`: `{}`", session.mode.as_str()),
-        PERMISSION_CONFIG_ID => format!("`{key}`: `{}`", session.permission_mode.as_str()),
-        MODEL_CONFIG_ID => format!("`{key}`: `{}`", session.model),
-        REASONING_EFFORT_CONFIG_ID => format!(
-            "`{key}`: `{}`",
-            session
-                .selected_reasoning_effort
-                .clone()
-                .unwrap_or_else(|| REASONING_EFFORT_DEFAULT_VALUE.to_string())
-        ),
-        other => format!(
-            "Error: unknown config key '{other}'. Supported: {}",
-            CONFIGURE_KNOWN_KEYS.join(", ")
-        ),
-    }
-}
-
 /// Render the `/context` snapshot. Mirrors the Java executor's report at a
 /// coarser granularity -- the Rust agent does not yet model
 /// editable/readonly/virtual fragments, so the table reports the
@@ -2555,20 +2974,29 @@ mod tests {
     }
 
     #[test]
-    fn builtin_commands_includes_pr_create() {
-        // The advertised list must surface `/pr-create` so editors put
-        // it in autocomplete; the collision set must reserve the name
-        // so a same-named skill cannot shadow the built-in dispatcher.
+    fn builtin_commands_include_setup_and_pr_create() {
+        // `/setup` is the single user-facing configuration surface, and
+        // `/pr-create` remains an explicit workflow command.
         let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "setup"),
+            "builtin_commands() missing setup; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
         assert!(
             cmds.iter().any(|c| c.name == "pr-create"),
             "builtin_commands() missing pr-create; got: {:?}",
             cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
         assert!(
+            builtin_command_names().contains("setup"),
+            "builtin_command_names() missing setup"
+        );
+        assert!(
             builtin_command_names().contains("pr-create"),
             "builtin_command_names() missing pr-create"
         );
+        assert!(!builtin_command_names().contains("configure"));
     }
 
     #[test]
@@ -3011,13 +3439,6 @@ mod tests {
 
     #[test]
     fn available_commands_merges_builtins_and_skills() {
-        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
-        // The expected ordering includes /openrouter-login, which is
-        // gated on OPENROUTER_API_KEY being unset; without this guard
-        // the test would fail on dev machines that happen to have the
-        // env var exported.
-        let _lock = ENV_GUARD.blocking_lock();
-        let _env = EnvScope::remove("OPENROUTER_API_KEY");
         let registry = make_registry(vec![("zebra", "Z skill"), ("apple", "A skill")]);
         let cmds = available_commands(&registry);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
@@ -3025,16 +3446,7 @@ mod tests {
         // sorted alphabetically.
         assert_eq!(
             names,
-            vec![
-                "context",
-                "codex-login",
-                "openrouter-login",
-                "idle-timeout",
-                "configure",
-                "pr-create",
-                "apple",
-                "zebra",
-            ]
+            vec!["context", "setup", "pr-create", "apple", "zebra"]
         );
     }
 
@@ -3056,15 +3468,8 @@ mod tests {
         assert!(names.contains(&"ok-skill"));
     }
 
-    /// When `OPENROUTER_API_KEY` is set, the env owns the credential
-    /// lifecycle and `/openrouter-login` must not appear in
-    /// autocomplete -- it would be misleading because the server can't
-    /// swap the env-sourced backend at runtime. The slash is still
-    /// reserved in `builtin_command_names()` so a skill can't capture
-    /// it; typing it manually still dispatches to the handler, which
-    /// short-circuits with an explanation.
     #[test]
-    fn available_commands_omits_openrouter_login_when_env_set() {
+    fn available_commands_only_expose_setup_for_configuration() {
         use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.blocking_lock();
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
@@ -3073,74 +3478,32 @@ mod tests {
         let cmds = available_commands(&registry);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
 
-        assert!(
-            !names.contains(&"openrouter-login"),
-            "openrouter-login must be hidden when env owns credentials; got {names:?}"
-        );
-        // The other built-ins are unaffected.
-        assert!(names.contains(&"context"));
-        assert!(names.contains(&"codex-login"));
-        assert!(names.contains(&"idle-timeout"));
-        assert!(names.contains(&"configure"));
+        assert!(names.contains(&"setup"));
+        assert!(!names.contains(&"codex-login"));
+        assert!(!names.contains(&"openrouter-login"));
+        assert!(!names.contains(&"idle-timeout"));
+        assert!(!names.contains(&"configure"));
     }
 
-    /// Sanity check the inverse: with the env unset, the slash IS
-    /// advertised. Pairs with the env-set test so a future refactor
-    /// can't accidentally hide the command unconditionally.
-    #[test]
-    fn available_commands_includes_openrouter_login_when_env_unset() {
-        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
-        let _lock = ENV_GUARD.blocking_lock();
-        let _env = EnvScope::remove("OPENROUTER_API_KEY");
-
-        let registry = make_registry(vec![]);
-        let cmds = available_commands(&registry);
-        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
-        assert!(
-            names.contains(&"openrouter-login"),
-            "openrouter-login must be advertised when env is unset; got {names:?}"
-        );
-    }
-
-    /// The `/configure` dump surfaces OpenRouter credential state as a
-    /// read-only block so it stays discoverable even when
-    /// `/openrouter-login` is hidden. Env-owned case: env_set=true,
-    /// login_command_available=false, hint mentions the env var.
     #[tokio::test]
-    async fn render_configure_dump_reports_env_owned_credentials() {
+    async fn openrouter_setup_reports_env_owned_credentials() {
         use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
 
-        let (store, id) = make_store_with_session("m").await;
-        let session = store
-            .get_session(&id, &std::env::temp_dir())
-            .await
-            .expect("session present");
-        let dump = render_configure_dump(&session);
+        let dump = render_openrouter_setup_help();
 
-        assert!(
-            dump.contains("`active_source`: `env`"),
-            "dump must report env as active source; got:\n{dump}"
-        );
-        assert!(dump.contains("`env_set`: `true`"), "dump:\n{dump}");
-        assert!(dump.contains("`file_present`: `false`"), "dump:\n{dump}");
-        assert!(
-            dump.contains("`login_command_available`: `false`"),
-            "dump:\n{dump}"
-        );
         assert!(
             dump.contains("OPENROUTER_API_KEY"),
-            "hint must point at the env var when env owns: {dump}"
+            "dump must report env as active source; got:\n{dump}"
         );
+        assert!(dump.contains("/setup openrouter key <your key>"));
     }
 
-    /// File-owned case: env unset, file has a key. active_source=file,
-    /// login_command_available=true, hint points at `/openrouter-login`.
     #[tokio::test]
-    async fn render_configure_dump_reports_file_owned_credentials() {
+    async fn openrouter_setup_reports_file_owned_credentials() {
         use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
@@ -3151,55 +3514,30 @@ mod tests {
         })
         .unwrap();
 
-        let (store, id) = make_store_with_session("m").await;
-        let session = store
-            .get_session(&id, &std::env::temp_dir())
-            .await
-            .expect("session present");
-        let dump = render_configure_dump(&session);
+        let dump = render_openrouter_setup_help();
 
         assert!(
-            dump.contains("`active_source`: `file`"),
+            dump.contains("saved credentials"),
             "dump must report file as active source; got:\n{dump}"
         );
-        assert!(dump.contains("`env_set`: `false`"), "dump:\n{dump}");
-        assert!(dump.contains("`file_present`: `true`"), "dump:\n{dump}");
-        assert!(
-            dump.contains("`login_command_available`: `true`"),
-            "dump:\n{dump}"
-        );
-        assert!(
-            dump.contains("/openrouter-login"),
-            "hint must mention the slash when login is available: {dump}"
-        );
+        assert!(dump.contains("/setup openrouter status"));
     }
 
-    /// No credentials at all: dump still renders, reports
-    /// active_source=none, login is still available (so the user knows
-    /// they CAN add a key via the slash).
     #[tokio::test]
-    async fn render_configure_dump_reports_no_credentials() {
+    async fn openrouter_setup_reports_no_credentials() {
         use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
         let _env = EnvScope::remove("OPENROUTER_API_KEY");
 
-        let (store, id) = make_store_with_session("m").await;
-        let session = store
-            .get_session(&id, &std::env::temp_dir())
-            .await
-            .expect("session present");
-        let dump = render_configure_dump(&session);
+        let dump = render_openrouter_setup_help();
 
-        assert!(dump.contains("`active_source`: `none`"), "dump:\n{dump}");
-        assert!(dump.contains("`env_set`: `false`"), "dump:\n{dump}");
-        assert!(dump.contains("`file_present`: `false`"), "dump:\n{dump}");
-        // Login is still possible, just no key registered yet.
         assert!(
-            dump.contains("`login_command_available`: `true`"),
+            dump.contains("OpenRouter is not connected"),
             "dump:\n{dump}"
         );
+        assert!(dump.contains("/setup openrouter key <your key>"));
     }
 
     /// The handler short-circuits with the env-owned explanation for
@@ -3230,8 +3568,8 @@ mod tests {
                 "{label} response must explain env ownership: {msg}"
             );
             assert!(
-                msg.contains("/configure"),
-                "{label} response must point at /configure for diagnostics: {msg}"
+                msg.contains("active_source: `env`"),
+                "{label} response must include credential diagnostics: {msg}"
             );
         }
         // And critically: no file was written despite the candidate key.
@@ -3240,6 +3578,25 @@ mod tests {
             !path.exists(),
             "env-owned mode must not persist a key on disk; file at {path:?} should not exist"
         );
+    }
+
+    #[test]
+    fn render_setup_models_filters_openrouter_catalog() {
+        let catalog = vec![
+            ModelMetadata::id_only("codex::chatgpt-latest"),
+            ModelMetadata::id_only("ollama::llama3.1:latest"),
+            ModelMetadata::id_only("openrouter::anthropic/claude-sonnet-4.5"),
+            ModelMetadata::id_only("openrouter::openai/text-embedding-3-large"),
+            ModelMetadata::id_only("openrouter::black-forest-labs/flux-image"),
+        ];
+
+        let out = render_setup_models(&catalog);
+        assert!(out.contains("codex::chatgpt-latest"));
+        assert!(out.contains("ollama::llama3.1:latest"));
+        assert!(out.contains("openrouter::anthropic/claude-sonnet-4.5"));
+        assert!(!out.contains("text-embedding"));
+        assert!(!out.contains("flux-image"));
+        assert!(out.contains("OpenRouter list is filtered"));
     }
 
     #[test]
@@ -3452,30 +3809,9 @@ mod tests {
     }
 
     #[test]
-    fn render_configure_dump_contains_all_keys() {
-        let session = Session::new(
-            "id".into(),
-            std::path::PathBuf::from("/tmp"),
-            "model-x".into(),
-            "name".into(),
-        );
-        let dump = render_configure_dump(&session);
-        for key in CONFIGURE_KNOWN_KEYS {
-            assert!(dump.contains(key), "dump missing key `{key}`: {dump}");
-        }
-        assert!(dump.contains("model-x"));
-    }
-
-    #[test]
-    fn render_configure_single_unknown_key_lists_supported() {
-        let session = Session::new(
-            "id".into(),
-            std::path::PathBuf::from("/tmp"),
-            "model-x".into(),
-            "name".into(),
-        );
-        let out = render_configure_single("bogus", &session);
-        assert!(out.starts_with("Error:"));
+    fn setup_unknown_config_key_error_lists_supported_ids() {
+        let out = ConfigApplyError::UnknownConfigId.human_message();
+        assert!(out.contains("unknown config key"));
         for key in CONFIGURE_KNOWN_KEYS {
             assert!(out.contains(key), "missing key `{key}` in error: {out}");
         }

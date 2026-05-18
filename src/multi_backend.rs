@@ -9,10 +9,10 @@
 //! back to the backend the same way it always has, and the backend strips
 //! the prefix and routes.
 //!
-//! Bare ids (no `<source>::` prefix) fall back to a configurable preferred
+//! Bare ids (no `<source>::` prefix) fall back to a preferred
 //! source so manually-typed model ids still route somewhere reasonable.
 //! Without that fallback, a user typing `llama3:latest` directly into the
-//! `/config` model picker would get a "no backend for model" error even
+//! setup's advanced model picker would get a "no backend for model" error even
 //! though the picker also offers `ollama::llama3:latest`.
 
 use std::collections::HashMap;
@@ -132,22 +132,22 @@ impl MultiBackend {
     /// Computed on demand (rather than cached at construction) so a Codex
     /// login mid-session promotes Codex to the preferred fallback.
     ///
-    /// Priority is Codex > OpenRouter > Ollama. Codex wins first because
+    /// Priority is Codex > Ollama > OpenRouter. Codex wins first because
     /// the more capable backend is more likely to be the user's intent
-    /// for a bare model id like `gpt-5-codex`; OpenRouter sits ahead of
-    /// Ollama because a configured cloud key is a stronger signal of
-    /// intent than a daemon happening to be running locally.
+    /// for a bare model id like `gpt-5-codex`; local models come next so
+    /// a daemon the user already has running beats a paid cloud router
+    /// unless the user explicitly chooses an `openrouter::` id.
     fn fallback_source(&self) -> Option<ModelSource> {
         let codex_present = self.codex.read().unwrap().is_some();
         if codex_present {
             return Some(ModelSource::Codex);
         }
+        if self.ollama.is_some() {
+            return Some(ModelSource::Ollama);
+        }
         let openrouter_present = self.openrouter.read().unwrap().is_some();
         if openrouter_present {
             return Some(ModelSource::OpenRouter);
-        }
-        if self.ollama.is_some() {
-            return Some(ModelSource::Ollama);
         }
         None
     }
@@ -733,13 +733,13 @@ mod tests {
         );
     }
 
-    /// Fallback priority: Codex > OpenRouter > Ollama. With all three
+    /// Fallback priority: Codex > Ollama > OpenRouter. With all three
     /// configured, a bare id routes to Codex (most capable, most likely
-    /// intent). With Codex absent, OpenRouter wins over Ollama because a
-    /// configured cloud key is a stronger signal of intent than a
-    /// happens-to-be-running local daemon.
+    /// intent). With Codex absent, Ollama wins over OpenRouter so a free
+    /// local daemon beats a paid cloud router unless the user explicitly
+    /// chooses an `openrouter::` model.
     #[tokio::test]
-    async fn bare_id_prefers_openrouter_over_ollama_when_codex_absent() {
+    async fn bare_id_prefers_ollama_over_openrouter_when_codex_absent() {
         let (openrouter_backend, openrouter_handles) = recording("openrouter");
         let (ollama_backend, ollama_handles) = recording("ollama");
         let multi = MultiBackend::new(None, Some(openrouter_backend), Some(ollama_backend));
@@ -756,12 +756,12 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await
-            .expect("bare id falls back to openrouter");
+            .expect("bare id falls back to ollama");
         assert_eq!(
-            openrouter_handles.last_model.lock().unwrap().as_deref(),
+            ollama_handles.last_model.lock().unwrap().as_deref(),
             Some("some-bare-id")
         );
-        assert!(ollama_handles.last_model.lock().unwrap().is_none());
+        assert!(openrouter_handles.last_model.lock().unwrap().is_none());
     }
 
     /// Wire id requesting an absent OpenRouter backend errors loudly

@@ -160,12 +160,12 @@ impl CodexClient {
     /// refreshes if another worker beat us to it.
     async fn load_credentials(&self) -> Result<ChatGptCredentials> {
         let auth = read_auth_dot_json()?.ok_or_else(|| {
-            anyhow!("~/.codex/auth.json not found; run /codex-login to authenticate")
+            anyhow!("~/.codex/auth.json not found; run /setup codex to authenticate")
         })?;
         if !is_chatgpt_mode(&auth) {
             anyhow::bail!(
                 "auth.json has auth_mode={:?} (need \"chatgpt\" for subscription routing); \
-                 re-run /codex-login (apikey-mode auth.json is auto-detected by the \
+                 re-run /setup codex (apikey-mode auth.json is auto-detected by the \
                  OPENAI_API_KEY backend at startup -- restart the server to switch)",
                 auth.auth_mode
             );
@@ -556,7 +556,7 @@ impl ChatGptCredentials {
         let tokens = auth
             .tokens
             .as_ref()
-            .ok_or_else(|| anyhow!("auth.json has no `tokens` block; run /codex-login again"))?;
+            .ok_or_else(|| anyhow!("auth.json has no `tokens` block; run /setup codex again"))?;
         if tokens.access_token.is_empty() {
             anyhow::bail!("auth.json `tokens.access_token` is empty");
         }

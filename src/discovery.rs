@@ -162,7 +162,7 @@ pub async fn discover_ollama(
 /// vars. Each closure keeps `discovery.rs` agnostic of those concerns
 /// while still running all sources in parallel.
 ///
-/// Output ordering is fixed: Codex first, then OpenRouter, then Ollama.
+/// Output ordering is fixed: Codex first, then Ollama, then OpenRouter.
 /// The first model in the merged list is auto-selected as the session
 /// default elsewhere -- keeping ordering deterministic stops users from
 /// seeing a different default just because one source happened to be
@@ -224,8 +224,8 @@ where
     let (codex, openrouter, ollama) = tokio::join!(codex_fut, openrouter_fut, ollama_fut);
     let mut all = Vec::with_capacity(codex.len() + openrouter.len() + ollama.len());
     all.extend(codex);
-    all.extend(openrouter);
     all.extend(ollama);
+    all.extend(openrouter);
     all
 }
 
@@ -324,18 +324,29 @@ mod tests {
     /// happens to have a real Ollama running on the default port.
     const TEST_DEAD_OLLAMA_URL: &str = "http://127.0.0.1:1";
 
-    /// `discover_all` returns Codex first, then OpenRouter, then Ollama,
+    /// `discover_all` returns Codex first, then Ollama, then OpenRouter,
     /// regardless of which future resolves first. Stable ordering matters
     /// because the first model in the catalog is auto-selected as the
-    /// session default; we don't want users to see a different default
-    /// just because their Ollama daemon was slow to respond on a
-    /// particular boot.
+    /// session default; OpenRouter stays last because it is the explicit
+    /// paid/cloud choice rather than the "choose for me" default.
     #[tokio::test]
-    async fn discover_all_orders_codex_openrouter_ollama() {
+    async fn discover_all_orders_codex_ollama_openrouter() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "llama3:latest", "object": "model"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
         let http = discovery_http_client();
         let models = discover_all(
             &http,
-            TEST_DEAD_OLLAMA_URL,
+            &server.uri(),
             || async { Ok(vec!["gpt-5-codex".to_string(), "gpt-4o".to_string()]) },
             || async {
                 Ok(vec![
@@ -345,18 +356,20 @@ mod tests {
             },
         )
         .await;
-        // Codex returned 2; OpenRouter returned 2; Ollama failed -> 0.
-        assert_eq!(models.len(), 4);
+        // Codex returned 2; Ollama returned 1; OpenRouter returned 2.
+        assert_eq!(models.len(), 5);
         assert_eq!(models[0].source, ModelSource::Codex);
         assert_eq!(models[0].id, "gpt-5-codex");
         assert_eq!(models[1].source, ModelSource::Codex);
-        assert_eq!(models[2].source, ModelSource::OpenRouter);
-        assert_eq!(models[2].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[2].source, ModelSource::Ollama);
+        assert_eq!(models[2].id, "llama3:latest");
         assert_eq!(models[3].source, ModelSource::OpenRouter);
+        assert_eq!(models[3].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[4].source, ModelSource::OpenRouter);
     }
 
     /// When every source fails, the merged vec is empty rather than an
-    /// error -- the server still starts and the user can run /codex-login,
+    /// error -- the server still starts and the user can run /setup codex,
     /// start Ollama, or export `OPENROUTER_API_KEY`, then re-run discovery
     /// via the next session/new.
     #[tokio::test]

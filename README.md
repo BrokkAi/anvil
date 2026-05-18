@@ -1,12 +1,13 @@
 # Anvil
 
-`anvil` is a high-performance Agent Client Protocol (ACP) server implemented in Rust. It acts as an agentic bridge between ACP-compatible IDEs (like Zed) and Ollama or OpenAI-compatible LLM backends, providing Brokk-style agentic capabilities directly within the editor.
+`anvil` is a high-performance Agent Client Protocol (ACP) server implemented in Rust. It acts as an agentic bridge between ACP-compatible IDEs (like Zed), Codex/ChatGPT sign-in, Ollama, OpenRouter, and OpenAI-compatible LLM backends, providing Brokk-style agentic capabilities directly within the editor.
 
 ## Features
 
 - **Standardized Protocol**: Full support for ACP over stdio, including session lifecycle management.
 - **Agentic Tool Loop**: Implements a multi-turn autonomous loop with a configurable turn limit.
 - **Rich Feedback**: Streams text responses and tool-call lifecycle notifications (Pending, InProgress, Completed/Failed) with inline diffs for file writes.
+- **First-Run Setup**: Starts sessions with setup guidance and keeps model/provider configuration behind one `/setup` command.
 - **Permission Gating**: Configurable security policies (Default, Accept Edits, Read-only, Bypass) to control tool execution.
 - **Code Intelligence**: Optional integration with Bifrost for symbol search, cross-references, and structural analysis.
 - **Session Persistence**: Saves and resumes conversation history and session state from disk.
@@ -24,13 +25,15 @@ The server is composed of several specialized modules:
 
 ## Configuration / CLI Options
 
-The server binary is named `anvil`. It is **zero-config by design**: at startup it reads `~/.codex/auth.json` for Codex credentials and probes `http://localhost:11434/v1/models` for Ollama, presenting whatever responds as a single combined picker. Models are tagged on the wire as `codex::<id>` and `ollama::<id>` so identical names from different sources stay distinct.
+The server binary is named `anvil`. It is **zero-config by design**: at startup it reads `~/.codex/auth.json` for Codex credentials, probes `http://localhost:11434/v1/models` for Ollama, and checks OpenRouter when credentials are available. New sessions always include a short setup hint; run `/setup` in the editor to choose automatically, sign in to Codex, use local models, connect OpenRouter, or change advanced settings.
+
+Provider priority for "Choose for me" is Codex first, local Ollama second, OpenRouter last. Models are tagged on the wire as `codex::<id>`, `ollama::<id>`, and `openrouter::<id>` so identical names from different sources stay distinct.
 
 There are no flags to point at a different Ollama URL or restrict the picker. If your daemon listens elsewhere, run `ollama serve` on the default port.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--default-model` | - | - | Override the default model id for new sessions. Accepts wire form (`codex::gpt-5-codex`) or a bare id. |
+| `--default-model` | - | - | Override the default model id for new sessions. Accepts wire form (`codex::<id>`, `ollama::<id>`, `openrouter::<id>`) or a bare id. |
 | `--max-turns` | - | `25` | Max tool-calling iterations per prompt before forcing a final response. |
 | `--bifrost-binary`| `BROKK_BIFROST_BINARY` | - | Path to the `bifrost` executable to enable code-intel tools. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | (see source) | Seconds of SSE inactivity before aborting a streaming LLM response. |
@@ -73,7 +76,7 @@ standalone):
 # Build the release binary
 cargo build --release --bin anvil
 
-# Run against a local Ollama instance (auto-discovers models)
+# Run and let /setup guide model/provider configuration
 ./target/release/anvil
 
 # Or pin a default model on startup (wire id or bare id):

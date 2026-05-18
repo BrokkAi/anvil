@@ -16,6 +16,7 @@ mod multi_backend;
 mod openrouter_auth;
 mod sandbox_backend;
 mod session;
+mod setup_state;
 mod skills;
 mod tool_loop;
 mod tools;
@@ -24,17 +25,17 @@ use crate::llm_client::LlmBackend;
 use crate::multi_backend::MultiBackend;
 
 /// Anvil -- Rust-based Agent Client Protocol (ACP) server with
-/// zero-config auto-discovery: at startup we read `~/.codex/auth.json`
-/// for Codex credentials and probe `http://localhost:11434/v1/models`
-/// for Ollama, and the model picker shows whatever is reachable. No
-/// flags are required (or even available) to point at a different
-/// Ollama URL or restrict the picker -- if Ollama isn't on the default
-/// port, it's simply not in the catalog.
+/// first-run setup and zero-config auto-discovery: at startup we read
+/// `~/.codex/auth.json` for Codex credentials, probe
+/// `http://localhost:11434/v1/models` for Ollama, and include OpenRouter
+/// when credentials are configured. No flags are required to point at a
+/// different Ollama URL or restrict the picker -- if Ollama isn't on the
+/// default port, it's simply not in the catalog.
 #[derive(Parser)]
 #[command(name = "anvil", version, about)]
 struct Args {
     /// Override the default model id for new sessions. Accepts a wire
-    /// form (`codex::gpt-5-codex`, `ollama::llama3:latest`) or a bare id
+    /// form (`codex::<id>`, `ollama::llama3:latest`) or a bare id
     /// that routes to the preferred backend (Codex if available, else
     /// Ollama). When unset, the first discovered model wins.
     #[arg(long, default_value = "")]
@@ -66,8 +67,8 @@ struct Args {
     /// Counts only meaningful progress (parsed content/tool-call deltas);
     /// keepalive comments and unparseable chunks do not reset the timer.
     /// Bump higher for slow local models with large context (e.g. 600+ on a
-    /// MacBook running a 70B). Overridable per-session via `/idle-timeout`.
-    /// Bounds match the `/idle-timeout` slash command for a single,
+    /// MacBook running a 70B). Overridable per-session via `/setup timeout`.
+    /// Bounds match the `/setup timeout` command for a single,
     /// consistent UX between boot config and runtime override.
     #[arg(
         long,
@@ -163,7 +164,7 @@ async fn build_codex_backend() -> Option<Arc<dyn LlmBackend>> {
         Ok(Some(a)) => a,
         Ok(None) => {
             tracing::info!(
-                "no ~/.codex/auth.json found; Codex auto-discovery skipped. Run /codex-login from a session to authenticate."
+                "no ~/.codex/auth.json found; Codex auto-discovery skipped. Run /setup codex from a session to authenticate."
             );
             return None;
         }
@@ -191,7 +192,7 @@ async fn build_codex_backend() -> Option<Arc<dyn LlmBackend>> {
         (None, mode, _) => {
             tracing::warn!(
                 "~/.codex/auth.json is unusable (auth_mode={:?}, no OPENAI_API_KEY); \
-                 skipping Codex backend. Run /codex-login to re-authenticate.",
+                 skipping Codex backend. Run /setup codex to re-authenticate.",
                 mode
             );
         }
@@ -260,8 +261,8 @@ pub fn openrouter_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
 /// Precedence is env > file: an explicit `OPENROUTER_API_KEY=...` in the
 /// shell that launched the server overrides a stale on-disk key, so a
 /// user rotating their key in a shell session doesn't have to remember
-/// to `/openrouter-login` first. The on-disk file (written by
-/// `/openrouter-login <key>` mid-session) is the persistent fallback for
+/// to `/setup openrouter key <key>` first. The on-disk file (written by
+/// setup mid-session) is the persistent fallback for
 /// the common case of starting the server without env vars.
 fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
     if let Ok(raw) = std::env::var(discovery::OPENROUTER_API_KEY_ENV) {
@@ -362,15 +363,15 @@ async fn main() -> Result<()> {
 
     if codex_backend.is_none() {
         tracing::info!(
-            "Codex backend not available; the picker will fall back to OpenRouter \
-             and Ollama (if discovered). Run /codex-login from a session to add \
+            "Codex backend not available; the picker will fall back to Ollama \
+             and OpenRouter (if discovered). Run /setup codex from a session to add \
              Codex -- the new credentials are picked up on the next discovery \
              refresh, no restart required."
         );
     }
     if openrouter_backend.is_none() {
         tracing::info!(
-            "OpenRouter backend not available; set {} or run `/openrouter-login <key>` \
+            "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
              from a session to enable it.",
             discovery::OPENROUTER_API_KEY_ENV
         );
