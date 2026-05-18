@@ -24,9 +24,14 @@
 //! sources comes online (and can re-run discovery via `session/new`, which
 //! refreshes the cache).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::future::join_all;
+use serde::Deserialize;
+
+use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
 
 /// Where a discovered model came from. The variant is encoded into the
 /// wire id so the routing backend doesn't need a per-request map lookup.
@@ -118,6 +123,13 @@ pub async fn discover_ollama(
     http: &reqwest::Client,
     base_url: &str,
 ) -> Result<Vec<DiscoveredModel>> {
+    discover_ollama_models(http, base_url).await
+}
+
+async fn discover_ollama_models(
+    http: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<DiscoveredModel>> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/v1/models");
     let resp = http
@@ -139,6 +151,107 @@ pub async fn discover_ollama(
             source: ModelSource::Ollama,
         })
         .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+fn ollama_thinking_presets() -> Vec<ReasoningLevelPreset> {
+    [
+        (
+            "none",
+            "Disable the reasoning trace while keeping the model available.",
+        ),
+        ("low", "Light reasoning for shorter problems."),
+        ("medium", "Balanced reasoning for moderate complexity."),
+        ("high", "Deep reasoning for harder problems."),
+    ]
+    .into_iter()
+    .map(|(effort, description)| ReasoningLevelPreset {
+        effort: effort.to_string(),
+        description: description.to_string(),
+    })
+    .collect()
+}
+
+/// Discover Ollama models that advertise the `thinking` capability and
+/// surface the reasoning presets the session UI should show for them.
+///
+/// The list endpoint gives us the installed model ids. `POST /api/show`
+/// tells us whether a given model supports thinking, which is the signal
+/// we need to decide whether to expose reasoning controls.
+pub async fn discover_ollama_model_metadata(
+    http: &reqwest::Client,
+    base_url: &str,
+) -> HashMap<String, ModelMetadata> {
+    let models = match discover_ollama_models(http, base_url).await {
+        Ok(models) => models,
+        Err(e) => {
+            tracing::info!("ollama model metadata discovery skipped at {base_url}: {e:#}");
+            return HashMap::new();
+        }
+    };
+
+    let base = base_url.trim_end_matches('/');
+    let show_url = format!("{base}/api/show");
+    let futures = models.into_iter().map(|model| {
+        let http = http.clone();
+        let show_url = show_url.clone();
+        async move {
+            let model_id = model.id;
+            let body = serde_json::json!({
+                "model": model_id,
+                "verbose": false,
+            });
+
+            let resp = match http.post(&show_url).json(&body).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::info!(
+                        "ollama model details skipped for {model_id} at {show_url}: {e:#}"
+                    );
+                    return Some((model_id.clone(), ModelMetadata::id_only(model_id)));
+                }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                tracing::info!(
+                    "ollama model details skipped for {model_id} at {show_url} (HTTP {status}): {body_text}"
+                );
+                return Some((model_id.clone(), ModelMetadata::id_only(model_id)));
+            }
+
+            let parsed: OllamaShowResponse = match resp.json().await {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    tracing::info!(
+                        "ollama model details skipped for {model_id} at {show_url}: {e:#}"
+                    );
+                    return Some((model_id.clone(), ModelMetadata::id_only(model_id)));
+                }
+            };
+
+            if parsed.capabilities.iter().any(|cap| cap == "thinking") {
+                return Some((
+                    model_id.clone(),
+                    ModelMetadata {
+                        id: model_id,
+                        default_reasoning_level: None,
+                        supported_reasoning_levels: ollama_thinking_presets(),
+                    },
+                ));
+            }
+
+            Some((model_id.clone(), ModelMetadata::id_only(model_id)))
+        }
+    });
+
+    join_all(futures).await.into_iter().flatten().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +345,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// `discover_ollama` parses the OpenAI-shape `/v1/models` body and
@@ -262,6 +375,65 @@ mod tests {
         assert_eq!(models[0].id, "llama3:latest");
         assert_eq!(models[0].source, ModelSource::Ollama);
         assert_eq!(models[1].id, "qwen3.6:35b-a3b-coding-mxfp8");
+    }
+
+    /// `discover_ollama_model_metadata` marks only models whose
+    /// `POST /api/show` response advertises `thinking` and leaves the
+    /// rest as plain `id_only` metadata.
+    #[tokio::test]
+    async fn discover_ollama_model_metadata_marks_thinking_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "gemma4:26b", "object": "model"},
+                    {"id": "qwen3.5:4b", "object": "model"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .and(body_json(serde_json::json!({
+                "model": "gemma4:26b",
+                "verbose": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": ["completion", "vision", "tools", "thinking"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .and(body_json(serde_json::json!({
+                "model": "qwen3.5:4b",
+                "verbose": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "capabilities": ["completion"]
+            })))
+            .mount(&server)
+            .await;
+
+        let http = discovery_http_client();
+        let metadata = discover_ollama_model_metadata(&http, &server.uri()).await;
+        let thinking = metadata.get("gemma4:26b").expect("thinking model metadata");
+        assert!(thinking.default_reasoning_level.is_none());
+        assert_eq!(
+            thinking
+                .supported_reasoning_levels
+                .iter()
+                .map(|preset| preset.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "low", "medium", "high"]
+        );
+
+        let plain = metadata.get("qwen3.5:4b").expect("plain model metadata");
+        assert!(plain.default_reasoning_level.is_none());
+        assert!(plain.supported_reasoning_levels.is_empty());
     }
 
     /// `wire_id` round-trips through `split_wire_id` for every source,

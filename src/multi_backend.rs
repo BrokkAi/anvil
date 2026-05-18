@@ -22,8 +22,8 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 
 use crate::discovery::{
-    DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discovery_http_client,
-    split_wire_id,
+    DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discover_ollama_model_metadata,
+    discovery_http_client, split_wire_id,
 };
 use crate::llm_client::{LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest};
 
@@ -227,8 +227,8 @@ impl LlmBackend for MultiBackend {
             let openrouter_ids: Vec<String> =
                 openrouter_metadata.iter().map(|m| m.id.clone()).collect();
             let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
-
             let http = discovery_http_client();
+            let ollama_metadata = discover_ollama_model_metadata(&http, OLLAMA_DEFAULT_URL).await;
             let discovered: Vec<DiscoveredModel> =
                 discover_all(&http, OLLAMA_DEFAULT_URL, codex_lookup, openrouter_lookup).await;
             Ok(discovered
@@ -244,7 +244,14 @@ impl LlmBackend for MultiBackend {
                                 supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
                             })
                             .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                        ModelSource::Ollama => ModelMetadata::id_only(wire),
+                        ModelSource::Ollama => ollama_metadata
+                            .get(&m.id)
+                            .map(|meta| ModelMetadata {
+                                id: wire.clone(),
+                                default_reasoning_level: meta.default_reasoning_level.clone(),
+                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            })
+                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
                         ModelSource::OpenRouter => openrouter_by_id
                             .get(&m.id)
                             .map(|meta| ModelMetadata {
