@@ -35,7 +35,7 @@ pub const MIN_IDLE_CHUNK_TIMEOUT_SECS: u64 = 1;
 pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
 
 /// Owning callback handed token deltas as the LLM streams them.
-type TokenSink = Box<dyn FnMut(&str) + Send>;
+pub type TokenSink = Box<dyn FnMut(&str) + Send>;
 
 // ---------------------------------------------------------------------------
 // Tool calling types (OpenAI-compatible)
@@ -72,6 +72,22 @@ pub struct FunctionCall {
 pub enum LlmResponse {
     Text(String),
     ToolCalls { text: String, calls: Vec<ToolCall> },
+}
+
+/// Parameters for a single streamed chat request.
+///
+/// Grouping the transport knobs into one object keeps backend APIs below
+/// Clippy's argument-count threshold without hiding the semantics in an
+/// opaque tuple.
+pub struct StreamChatRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    pub tools: Option<Vec<ToolDefinition>>,
+    pub reasoning_effort: Option<String>,
+    pub on_token: TokenSink,
+    pub on_thought: TokenSink,
+    pub cancel: CancellationToken,
+    pub idle_timeout: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,18 +229,7 @@ pub trait LlmBackend: Send + Sync {
     /// meaningful SSE progress before the backend aborts the stream.
     /// Threaded from the CLI flag `--llm-idle-timeout-secs` and the
     /// per-session `/idle-timeout` override.
-    #[allow(clippy::too_many_arguments)]
-    fn stream_chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolDefinition>>,
-        reasoning_effort: Option<&str>,
-        on_token: Box<dyn FnMut(&str) + Send>,
-        on_thought: Box<dyn FnMut(&str) + Send>,
-        cancel: CancellationToken,
-        idle_timeout: Duration,
-    ) -> BoxFuture<'_, Result<LlmResponse>>;
+    fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,33 +509,16 @@ impl LlmBackend for OpenAiClient {
         Box::pin(self.list_model_metadata_impl())
     }
 
-    fn stream_chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolDefinition>>,
-        reasoning_effort: Option<&str>,
-        on_token: Box<dyn FnMut(&str) + Send>,
-        // No chain-of-thought stream on the Chat Completions SSE schema.
-        _on_thought: Box<dyn FnMut(&str) + Send>,
-        cancel: CancellationToken,
-        idle_timeout: Duration,
-    ) -> BoxFuture<'_, Result<LlmResponse>> {
-        let model = model.to_string();
-        let reasoning_effort = if self.supports_reasoning_effort {
-            reasoning_effort.map(str::to_string)
+    fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+        let request = if self.supports_reasoning_effort {
+            request
         } else {
-            None
+            StreamChatRequest {
+                reasoning_effort: None,
+                ..request
+            }
         };
-        Box::pin(self.stream_chat_impl(
-            model,
-            messages,
-            tools,
-            reasoning_effort,
-            on_token,
-            cancel,
-            idle_timeout,
-        ))
+        Box::pin(self.stream_chat_impl(request))
     }
 }
 
@@ -575,16 +563,17 @@ impl OpenAiClient {
             .collect())
     }
 
-    async fn stream_chat_impl(
-        &self,
-        model: String,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolDefinition>>,
-        reasoning_effort: Option<String>,
-        on_token: TokenSink,
-        cancel: CancellationToken,
-        idle_timeout: Duration,
-    ) -> Result<LlmResponse> {
+    async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {
+        let StreamChatRequest {
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            on_token,
+            on_thought: _on_thought,
+            cancel,
+            idle_timeout,
+        } = request;
         let url = self.api_url("/chat/completions");
 
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
