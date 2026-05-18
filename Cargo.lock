@@ -157,6 +157,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil"
+version = "0.4.4"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "base64 0.22.1",
+ "brokk-acp-sandbox",
+ "chrono",
+ "clap",
+ "dirs 6.0.0",
+ "futures",
+ "libc",
+ "oauth2",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "tiny_http",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "wasmtime",
+ "wasmtime-wasi",
+ "webbrowser",
+ "wiremock",
+ "zip",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,41 +308,6 @@ checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
 dependencies = [
  "hybrid-array",
  "zeroize",
-]
-
-[[package]]
-name = "anvil"
-version = "0.4.4"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "base64 0.22.1",
- "brokk-acp-sandbox",
- "chrono",
- "clap",
- "dirs 6.0.0",
- "futures",
- "libc",
- "oauth2",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "tiny_http",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
- "wasmtime",
- "wasmtime-wasi",
- "webbrowser",
- "wiremock",
- "zip",
 ]
 
 [[package]]
