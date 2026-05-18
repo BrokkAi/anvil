@@ -246,7 +246,8 @@ pub fn openrouter_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
         reqwest::header::HeaderValue::from_static("anvil"),
     );
 
-    Some(Arc::new(llm_client::OpenAiClient::with_default_headers(
+    // OpenRouter supports reasoning_effort via extra_body, so enable it
+    Some(Arc::new(llm_client::OpenAiClient::with_reasoning_support(
         discovery::OPENROUTER_BASE_URL.to_string(),
         Some(key.to_string()),
         headers,

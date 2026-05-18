@@ -244,6 +244,17 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    /// Optional reasoning effort parameter for models that support it
+    /// (e.g., OpenRouter's reasoning models, Ollama's thinking models).
+    /// Sent as `extra_body.reasoning_effort` for OpenRouter compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_body: Option<ExtraBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtraBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,6 +357,10 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: Option<String>,
     http: reqwest::Client,
+    /// Whether this client should pass reasoning_effort through to the API.
+    /// Enabled for OpenRouter (which supports it via extra_body) and
+    /// Ollama models that declare reasoning support.
+    supports_reasoning_effort: bool,
 }
 
 impl std::fmt::Debug for OpenAiClient {
@@ -353,6 +368,7 @@ impl std::fmt::Debug for OpenAiClient {
         f.debug_struct("OpenAiClient")
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("supports_reasoning_effort", &self.supports_reasoning_effort)
             .finish()
     }
 }
@@ -383,7 +399,20 @@ impl OpenAiClient {
             base_url,
             api_key,
             http,
+            supports_reasoning_effort: false,
         }
+    }
+
+    /// Construct an `OpenAiClient` that supports reasoning effort.
+    /// Used for OpenRouter and Ollama models that expose reasoning presets.
+    pub fn with_reasoning_support(
+        base_url: String,
+        api_key: Option<String>,
+        default_headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        let mut client = Self::with_default_headers(base_url, api_key, default_headers);
+        client.supports_reasoning_effort = true;
+        client
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -405,10 +434,7 @@ impl LlmBackend for OpenAiClient {
         model: &str,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolDefinition>>,
-        // Chat Completions doesn't take a reasoning_effort dimension on
-        // non-reasoning models, and the reasoning-capable o1/o3 family
-        // routes its own dedicated parameter -- not in scope here.
-        _reasoning_effort: Option<&str>,
+        reasoning_effort: Option<&str>,
         on_token: Box<dyn FnMut(&str) + Send>,
         // No chain-of-thought stream on the Chat Completions SSE schema.
         _on_thought: Box<dyn FnMut(&str) + Send>,
@@ -416,7 +442,20 @@ impl LlmBackend for OpenAiClient {
         idle_timeout: Duration,
     ) -> BoxFuture<'_, Result<LlmResponse>> {
         let model = model.to_string();
-        Box::pin(self.stream_chat_impl(model, messages, tools, on_token, cancel, idle_timeout))
+        let reasoning_effort = if self.supports_reasoning_effort {
+            reasoning_effort.map(str::to_string)
+        } else {
+            None
+        };
+        Box::pin(self.stream_chat_impl(
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            on_token,
+            cancel,
+            idle_timeout,
+        ))
     }
 }
 
@@ -449,6 +488,7 @@ impl OpenAiClient {
         model: String,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolDefinition>>,
+        reasoning_effort: Option<String>,
         on_token: TokenSink,
         cancel: CancellationToken,
         idle_timeout: Duration,
@@ -456,6 +496,10 @@ impl OpenAiClient {
         let url = self.api_url("/chat/completions");
 
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+
+        let extra_body = reasoning_effort.map(|effort| ExtraBody {
+            reasoning_effort: Some(effort),
+        });
 
         let body = ChatCompletionRequest {
             model,
@@ -465,6 +509,7 @@ impl OpenAiClient {
             max_tokens: None,
             tools,
             tool_choice,
+            extra_body,
         };
 
         let mut req = self.http.post(&url).json(&body);
