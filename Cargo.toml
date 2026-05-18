@@ -9,14 +9,14 @@ members = ["xtask", "brokk-acp-sandbox"]
 default-members = ["."]
 
 [package]
-name = "brokk-acp-rust"
+name = "anvil"
 version = "0.4.4"
 edition = "2024"
-description = "Rust ACP server for Brokk with auto-discovery for Codex (~/.codex/auth.json) and Ollama"
+description = "Anvil: Rust ACP server with auto-discovery for Codex (~/.codex/auth.json) and Ollama"
 license = "LGPL-3.0"
 
 [[bin]]
-name = "brokk-acp"
+name = "anvil"
 path = "src/main.rs"
 
 [dependencies]

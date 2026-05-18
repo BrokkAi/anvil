@@ -1,6 +1,6 @@
-# brokk-acp-rust
+# Anvil
 
-`brokk-acp-rust` is a high-performance Agent Client Protocol (ACP) server implemented in Rust. It acts as an agentic bridge between ACP-compatible IDEs (like Zed) and Ollama or OpenAI-compatible LLM backends, providing Brokk's "Lutz Mode" agentic capabilities directly within the editor.
+`anvil` is a high-performance Agent Client Protocol (ACP) server implemented in Rust. It acts as an agentic bridge between ACP-compatible IDEs (like Zed) and Ollama or OpenAI-compatible LLM backends, providing Brokk-style agentic capabilities directly within the editor.
 
 ## Features
 
@@ -16,7 +16,7 @@
 The server is composed of several specialized modules:
 
 - **`agent`**: The entry point for the ACP protocol; handles JSON-RPC dispatching for sessions, configuration, and prompts.
-- **`tool_loop`**: The core "Lutz" engine. Orchestrates LLM streaming, tool execution, and the permission gate.
+- **`tool_loop`**: The core agentic engine. Orchestrates LLM streaming, tool execution, and the permission gate.
 - **`llm_client`**: Handles communication with OpenAI-compatible APIs, including tool-calling SSE stream parsing.
 - **`session`**: Manages session state, conversation history persistence, and model/mode selection.
 - **`tools`**: Implementation of built-in filesystem tools (read, write, list) and shell execution.
@@ -24,7 +24,7 @@ The server is composed of several specialized modules:
 
 ## Configuration / CLI Options
 
-The server binary is named `brokk-acp`. It is **zero-config by design**: at startup it reads `~/.codex/auth.json` for Codex credentials and probes `http://localhost:11434/v1/models` for Ollama, presenting whatever responds as a single combined picker. Models are tagged on the wire as `codex::<id>` and `ollama::<id>` so identical names from different sources stay distinct.
+The server binary is named `anvil`. It is **zero-config by design**: at startup it reads `~/.codex/auth.json` for Codex credentials and probes `http://localhost:11434/v1/models` for Ollama, presenting whatever responds as a single combined picker. Models are tagged on the wire as `codex::<id>` and `ollama::<id>` so identical names from different sources stay distinct.
 
 There are no flags to point at a different Ollama URL or restrict the picker. If your daemon listens elsewhere, run `ollama serve` on the default port.
 
@@ -33,14 +33,16 @@ There are no flags to point at a different Ollama URL or restrict the picker. If
 | `--default-model` | - | - | Override the default model id for new sessions. Accepts wire form (`codex::gpt-5-codex`) or a bare id. |
 | `--max-turns` | - | `25` | Max tool-calling iterations per prompt before forcing a final response. |
 | `--bifrost-binary`| `BROKK_BIFROST_BINARY` | - | Path to the `bifrost` executable to enable code-intel tools. |
+| `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | (see source) | Seconds of SSE inactivity before aborting a streaming LLM response. |
+| `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 
 ## Running Locally
 
 ### Quickest path: build + wire into your editor in one step
 
 The crate ships with two `cargo xtask` subcommands that build the release
-binary **and** rewrite a `Brokk Code (Rust Local)` entry under `agent_servers`
-in your editor's config. Run from `brokk-acp-rust/`:
+binary **and** rewrite an agent-server entry under `agent_servers`
+in your editor's config:
 
 ```bash
 # Wire into Zed   (~/.config/zed/settings.json)
@@ -50,12 +52,10 @@ cargo xtask build-acp-for-zed
 cargo xtask build-acp-for-jetbrains
 ```
 
-Each task runs `cargo build --release --bin brokk-acp`, then writes a
-single agent-server entry pointing at `target/release/brokk-acp`. Other
+Each task runs `cargo build --release --bin anvil`, then writes a
+single agent-server entry pointing at `target/release/anvil`. Other
 entries in the file are preserved verbatim. Re-run any time the binary
-changes — the entry is rewritten in place. After running, restart the
-editor's Brokk panel and pick `Brokk Code (Rust Local)` in the agent
-server selector.
+changes — the entry is rewritten in place.
 
 Both subcommands accept:
 - `--config <path>` — override the editor config path (mostly for tests).
@@ -71,13 +71,13 @@ standalone):
 
 ```bash
 # Build the release binary
-cargo build --release --bin brokk-acp
+cargo build --release --bin anvil
 
 # Run against a local Ollama instance (auto-discovers models)
-./target/release/brokk-acp
+./target/release/anvil
 
 # Or pin a default model on startup (wire id or bare id):
-./target/release/brokk-acp --default-model ollama::llama3.1
+./target/release/anvil --default-model ollama::llama3.1
 ```
 
 Then add the binary path to your editor's agent server config:
@@ -102,10 +102,11 @@ When configured with `--bifrost-binary`, the server spawns a Bifrost subprocess 
 - `get_symbol_sources`: Fetch source code for specific symbols.
 - `most_relevant_files`: Identify related files using import analysis and git history.
 
-## Current Status / Roadmap
+## Releases
 
-The Rust ACP server is actively developed. Current known limitations and planned areas of improvement include:
+Release binaries are published on GitHub Releases. Tags follow `vX.Y.Z`; the workflow validates that the tag matches `Cargo.toml`'s `version` before publishing.
 
-- **Tool Call Persistence**: Intermediate tool calls/results are not yet persisted in the session history (Replay shows text only).
-- **Binary Detection**: Improved handling for binary files and large file limits in search tools.
-- **Terminal Integration**: Future plans include leveraging the ACP Terminal protocol for live-streaming shell output.
+Asset names per platform:
+- `anvil-linux-x86_64`
+- `anvil-macos-aarch64`
+- `anvil-windows-x86_64.exe`

@@ -23,7 +23,7 @@ mod tools;
 use crate::llm_client::LlmBackend;
 use crate::multi_backend::MultiBackend;
 
-/// Brokk ACP Server -- Rust-based Agent Client Protocol server with
+/// Anvil -- Rust-based Agent Client Protocol (ACP) server with
 /// zero-config auto-discovery: at startup we read `~/.codex/auth.json`
 /// for Codex credentials and probe `http://localhost:11434/v1/models`
 /// for Ollama, and the model picker shows whatever is reachable. No
@@ -31,7 +31,7 @@ use crate::multi_backend::MultiBackend;
 /// Ollama URL or restrict the picker -- if Ollama isn't on the default
 /// port, it's simply not in the catalog.
 #[derive(Parser)]
-#[command(name = "brokk-acp", version, about)]
+#[command(name = "anvil", version, about)]
 struct Args {
     /// Override the default model id for new sessions. Accepts a wire
     /// form (`codex::gpt-5-codex`, `ollama::llama3:latest`) or a bare id
@@ -71,7 +71,7 @@ struct Args {
     /// consistent UX between boot config and runtime override.
     #[arg(
         long,
-        env = "BROKK_ACP_LLM_IDLE_TIMEOUT_SECS",
+        env = "ANVIL_LLM_IDLE_TIMEOUT_SECS",
         default_value_t = llm_client::DEFAULT_IDLE_CHUNK_TIMEOUT_SECS,
         value_parser = RangedU64ValueParser::<u64>::new()
             .range(llm_client::MIN_IDLE_CHUNK_TIMEOUT_SECS..=llm_client::MAX_IDLE_CHUNK_TIMEOUT_SECS),
@@ -106,7 +106,7 @@ struct Args {
     /// in-process. The sandbox guards against YAML bombs, ReDoS, and
     /// parser panics taking down the agent; disabling it trades that
     /// isolation for ~5-20ms per call and the host's full memory pool.
-    #[arg(long, env = "BROKK_ACP_NO_WASM_SANDBOX", default_value_t = false)]
+    #[arg(long, env = "ANVIL_NO_WASM_SANDBOX", default_value_t = false)]
     no_wasm_sandbox: bool,
 }
 
@@ -242,7 +242,7 @@ pub fn openrouter_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
     );
     headers.insert(
         reqwest::header::HeaderName::from_static("x-title"),
-        reqwest::header::HeaderValue::from_static("brokk-acp-rust"),
+        reqwest::header::HeaderValue::from_static("anvil"),
     );
 
     Some(Arc::new(llm_client::OpenAiClient::with_default_headers(

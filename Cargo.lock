@@ -276,8 +276,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "brokk-acp-rust"
-version = "0.4.3"
+name = "anvil"
+version = "0.4.4"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
