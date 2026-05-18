@@ -843,6 +843,13 @@ pub async fn run_agent(
 
                 let response = NewSessionResponse::new(session.id.clone())
                     .modes(mode_state(session.mode.as_str()))
+                    .config_options(all_config_options(
+                        session.mode,
+                        session.permission_mode,
+                        &session.model,
+                        &catalog,
+                        session.selected_reasoning_effort.as_deref(),
+                    ))
                     .meta(meta_map);
 
                 // Respond first so the client receives the session id, then
@@ -901,8 +908,17 @@ pub async fn run_agent(
                 let catalog = sessions_load.available_model_metadata().await;
                 let setup_session = session.clone();
                 let setup_catalog = catalog.clone();
-                let result = responder
-                    .respond(LoadSessionResponse::new().modes(mode_state(session.mode.as_str())));
+                let result = responder.respond(
+                    LoadSessionResponse::new()
+                        .modes(mode_state(session.mode.as_str()))
+                        .config_options(all_config_options(
+                            session.mode,
+                            session.permission_mode,
+                            &session.model,
+                            &catalog,
+                            session.selected_reasoning_effort.as_deref(),
+                        )),
+                );
                 spawn_delayed_available_commands_update(
                     cx.clone(),
                     session_id.clone(),
@@ -932,7 +948,15 @@ pub async fn run_agent(
                         let setup_session = session.clone();
                         let setup_catalog = catalog.clone();
                         let result = responder.respond(
-                            ResumeSessionResponse::new().modes(mode_state(session.mode.as_str())),
+                            ResumeSessionResponse::new()
+                                .modes(mode_state(session.mode.as_str()))
+                                .config_options(all_config_options(
+                                    session.mode,
+                                    session.permission_mode,
+                                    &session.model,
+                                    &catalog,
+                                    session.selected_reasoning_effort.as_deref(),
+                                )),
                         );
                         spawn_delayed_available_commands_update(
                             cx.clone(),

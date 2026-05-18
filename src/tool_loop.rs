@@ -13,7 +13,7 @@ use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, ToolDefinition};
+use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, ToolDefinition};
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
@@ -212,16 +212,16 @@ pub(crate) async fn run(
         // `--llm-idle-timeout-secs` and the per-session `/idle-timeout`
         // override.
         let response = llm
-            .stream_chat(
-                model,
-                messages.clone(),
-                turn_tools,
-                reasoning_effort,
+            .stream_chat(StreamChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: turn_tools,
+                reasoning_effort: reasoning_effort.map(str::to_string),
                 on_token,
-                on_thought_cb,
-                cancel.clone(),
+                on_thought: on_thought_cb,
+                cancel: cancel.clone(),
                 idle_timeout,
-            )
+            })
             .await;
 
         match response {

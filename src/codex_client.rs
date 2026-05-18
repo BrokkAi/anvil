@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
 use crate::llm_client::{
     ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata, ReasoningLevelPreset,
-    ToolCall, ToolDefinition,
+    StreamChatRequest, ToolCall, ToolDefinition,
 };
 
 // Codex CLI's `chatgpt_base_url` default is
@@ -216,18 +216,17 @@ impl CodexClient {
         ChatGptCredentials::from_auth(&auth)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_chat_impl(
-        &self,
-        model: String,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolDefinition>>,
-        reasoning_effort: Option<String>,
-        on_token: Box<dyn FnMut(&str) + Send>,
-        on_thought: Box<dyn FnMut(&str) + Send>,
-        cancel: CancellationToken,
-        idle_timeout: Duration,
-    ) -> Result<LlmResponse> {
+    async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {
+        let StreamChatRequest {
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            on_token,
+            on_thought,
+            cancel,
+            idle_timeout,
+        } = request;
         let creds = self.load_credentials().await?;
         let body = build_responses_request(
             &model,
@@ -270,7 +269,6 @@ impl CodexClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn send_responses_request(
         &self,
         creds: &ChatGptCredentials,
@@ -515,29 +513,8 @@ impl LlmBackend for CodexClient {
         Box::pin(self.list_model_metadata_impl())
     }
 
-    fn stream_chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolDefinition>>,
-        reasoning_effort: Option<&str>,
-        on_token: Box<dyn FnMut(&str) + Send>,
-        on_thought: Box<dyn FnMut(&str) + Send>,
-        cancel: CancellationToken,
-        idle_timeout: Duration,
-    ) -> BoxFuture<'_, Result<LlmResponse>> {
-        let model = model.to_string();
-        let reasoning_effort = reasoning_effort.map(str::to_string);
-        Box::pin(self.stream_chat_impl(
-            model,
-            messages,
-            tools,
-            reasoning_effort,
-            on_token,
-            on_thought,
-            cancel,
-            idle_timeout,
-        ))
+    fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+        Box::pin(self.stream_chat_impl(request))
     }
 }
 

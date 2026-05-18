@@ -20,14 +20,12 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 use crate::discovery::{
     DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discovery_http_client,
     split_wire_id,
 };
-use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, ModelMetadata, ToolDefinition};
+use crate::llm_client::{LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest};
 
 /// LLM backend that routes by `<source>::<id>` prefix. Any inner backend
 /// may be absent (e.g. no `auth.json`, no `OPENROUTER_API_KEY`, or no
@@ -214,18 +212,21 @@ impl LlmBackend for MultiBackend {
             let codex_ids: Vec<String> = codex_metadata.iter().map(|m| m.id.clone()).collect();
             let codex_lookup = || async move { Ok::<_, anyhow::Error>(codex_ids) };
 
-            // OpenRouter exposes a flat `/v1/models` list with no
-            // reasoning-effort metadata, so we just need bare ids. When
-            // the backend isn't configured (no `OPENROUTER_API_KEY`),
-            // the closure returns an empty list and `discover_all`
-            // logs/skips it like any other absent source.
-            let openrouter_backend = self.openrouter_snapshot();
-            let openrouter_lookup = move || async move {
-                match openrouter_backend {
-                    Some(or) => or.list_models().await,
-                    None => Ok(Vec::new()),
-                }
+            // OpenRouter catalog entries now carry reasoning metadata for
+            // reasoning-capable models. We snapshot it once, then hand
+            // discover_all the bare ids so source tagging stays uniform.
+            let openrouter = self.openrouter_snapshot();
+            let openrouter_metadata: Vec<ModelMetadata> = match &openrouter {
+                Some(or) => or.list_model_metadata().await.unwrap_or_default(),
+                None => Vec::new(),
             };
+            let openrouter_by_id: HashMap<String, ModelMetadata> = openrouter_metadata
+                .iter()
+                .map(|m| (m.id.clone(), m.clone()))
+                .collect();
+            let openrouter_ids: Vec<String> =
+                openrouter_metadata.iter().map(|m| m.id.clone()).collect();
+            let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
 
             let http = discovery_http_client();
             let discovered: Vec<DiscoveredModel> =
@@ -243,46 +244,28 @@ impl LlmBackend for MultiBackend {
                                 supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
                             })
                             .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                        // Neither Ollama nor OpenRouter publishes
-                        // reasoning presets through its catalog -- ids
-                        // surface with empty metadata so the picker
-                        // simply omits the effort selector for them.
-                        ModelSource::Ollama | ModelSource::OpenRouter => {
-                            ModelMetadata::id_only(wire)
-                        }
+                        ModelSource::Ollama => ModelMetadata::id_only(wire),
+                        ModelSource::OpenRouter => openrouter_by_id
+                            .get(&m.id)
+                            .map(|meta| ModelMetadata {
+                                id: wire.clone(),
+                                default_reasoning_level: meta.default_reasoning_level.clone(),
+                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            })
+                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
                     }
                 })
                 .collect())
         })
     }
 
-    fn stream_chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolDefinition>>,
-        reasoning_effort: Option<&str>,
-        on_token: Box<dyn FnMut(&str) + Send>,
-        on_thought: Box<dyn FnMut(&str) + Send>,
-        cancel: CancellationToken,
-        idle_timeout: Duration,
-    ) -> BoxFuture<'_, Result<LlmResponse>> {
-        let resolution = self.resolve(model);
-        let reasoning_effort = reasoning_effort.map(str::to_string);
+    fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+        let resolution = self.resolve(&request.model);
         Box::pin(async move {
             let (backend, bare) = resolution?;
-            backend
-                .stream_chat(
-                    &bare,
-                    messages,
-                    tools,
-                    reasoning_effort.as_deref(),
-                    on_token,
-                    on_thought,
-                    cancel,
-                    idle_timeout,
-                )
-                .await
+            let mut request = request;
+            request.model = bare;
+            backend.stream_chat(request).await
         })
     }
 }
@@ -292,6 +275,19 @@ mod tests {
     use super::*;
     use futures::future::FutureExt;
     use std::sync::Mutex;
+
+    fn chat_request(model: &str, reasoning_effort: Option<&str>) -> StreamChatRequest {
+        StreamChatRequest {
+            model: model.to_string(),
+            messages: vec![],
+            tools: None,
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            idle_timeout: std::time::Duration::from_secs(60),
+        }
+    }
 
     /// Test double that records the model id and reasoning effort it was
     /// called with. Lets us assert that `MultiBackend` strips the
@@ -311,19 +307,9 @@ mod tests {
             async move { Ok(vec![format!("{name}-stub")]) }.boxed()
         }
 
-        fn stream_chat(
-            &self,
-            model: &str,
-            _messages: Vec<ChatMessage>,
-            _tools: Option<Vec<ToolDefinition>>,
-            reasoning_effort: Option<&str>,
-            _on_token: Box<dyn FnMut(&str) + Send>,
-            _on_thought: Box<dyn FnMut(&str) + Send>,
-            _cancel: CancellationToken,
-            _idle_timeout: Duration,
-        ) -> BoxFuture<'_, Result<LlmResponse>> {
-            *self.last_model.lock().unwrap() = Some(model.to_string());
-            *self.last_reasoning_effort.lock().unwrap() = reasoning_effort.map(str::to_string);
+        fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            *self.last_model.lock().unwrap() = Some(request.model);
+            *self.last_reasoning_effort.lock().unwrap() = request.reasoning_effort;
             let response = LlmResponse::Text(format!("hello from {}", self.name));
             async move { Ok(response) }.boxed()
         }
@@ -362,16 +348,7 @@ mod tests {
         let multi = MultiBackend::new(Some(codex_backend), None, Some(ollama_backend));
 
         let _ = multi
-            .stream_chat(
-                "codex::gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5-codex", None))
             .await
             .expect("codex route");
         assert_eq!(
@@ -381,16 +358,7 @@ mod tests {
         assert!(ollama_handles.last_model.lock().unwrap().is_none());
 
         let _ = multi
-            .stream_chat(
-                "ollama::llama3:latest",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("ollama::llama3:latest", None))
             .await
             .expect("ollama route");
         // The Ollama tag suffix must survive prefix stripping.
@@ -410,16 +378,7 @@ mod tests {
         let multi = MultiBackend::new(Some(codex_backend), None, Some(ollama_backend));
 
         let _ = multi
-            .stream_chat(
-                "gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("gpt-5-codex", None))
             .await
             .expect("bare id falls back to codex");
         assert_eq!(
@@ -438,16 +397,7 @@ mod tests {
         let multi = MultiBackend::new(None, None, Some(ollama_backend));
 
         let _ = multi
-            .stream_chat(
-                "llama3",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("llama3", None))
             .await
             .expect("bare id falls back to ollama");
         assert_eq!(
@@ -467,16 +417,7 @@ mod tests {
         let multi = MultiBackend::new(None, None, Some(ollama_backend));
 
         let err = multi
-            .stream_chat(
-                "codex::gpt-5",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5", None))
             .await
             .expect_err("codex route must fail when codex backend is absent");
         let msg = format!("{err:#}");
@@ -491,16 +432,7 @@ mod tests {
     async fn empty_multi_backend_errors_on_chat() {
         let multi = MultiBackend::new(None, None, None);
         let err = multi
-            .stream_chat(
-                "anything",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("anything", None))
             .await
             .expect_err("no backend means no route");
         let msg = format!("{err:#}");
@@ -523,16 +455,7 @@ mod tests {
 
         // Pre-install: a `codex::*` request must fail loudly.
         let err = multi
-            .stream_chat(
-                "codex::gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5-codex", None))
             .await
             .expect_err("codex route must fail before install");
         assert!(format!("{err:#}").contains("codex"));
@@ -546,16 +469,7 @@ mod tests {
         // stripped, exactly as if the credentials had been there at
         // startup.
         let _ = multi
-            .stream_chat(
-                "codex::gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5-codex", None))
             .await
             .expect("codex route must succeed after install");
         assert_eq!(
@@ -577,16 +491,7 @@ mod tests {
         multi.install_codex(codex_backend);
 
         let _ = multi
-            .stream_chat(
-                "gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("gpt-5-codex", None))
             .await
             .expect("bare id must route to newly-installed codex");
         assert_eq!(
@@ -634,16 +539,7 @@ mod tests {
 
         // Sanity check: routable while installed.
         let _ = multi
-            .stream_chat(
-                "codex::gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5-codex", None))
             .await
             .expect("codex route must succeed while installed");
 
@@ -651,16 +547,7 @@ mod tests {
         multi.uninstall_codex();
 
         let err = multi
-            .stream_chat(
-                "codex::gpt-5-codex",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5-codex", None))
             .await
             .expect_err("codex route must fail after uninstall");
         assert!(
@@ -684,16 +571,10 @@ mod tests {
         );
 
         let _ = multi
-            .stream_chat(
+            .stream_chat(chat_request(
                 "openrouter::anthropic/claude-3.5-sonnet",
-                vec![],
                 None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            ))
             .await
             .expect("openrouter route");
         // The inner slash in `vendor/model` must survive prefix
@@ -715,16 +596,7 @@ mod tests {
         let multi = MultiBackend::new(None, Some(openrouter_backend), None);
 
         let _ = multi
-            .stream_chat(
-                "anthropic/claude-3.5-sonnet",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("anthropic/claude-3.5-sonnet", None))
             .await
             .expect("bare id falls back to openrouter");
         assert_eq!(
@@ -745,16 +617,7 @@ mod tests {
         let multi = MultiBackend::new(None, Some(openrouter_backend), Some(ollama_backend));
 
         let _ = multi
-            .stream_chat(
-                "some-bare-id",
-                vec![],
-                None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("some-bare-id", None))
             .await
             .expect("bare id falls back to ollama");
         assert_eq!(
@@ -777,16 +640,10 @@ mod tests {
         let multi = MultiBackend::new(Some(codex_backend), None, None);
 
         let err = multi
-            .stream_chat(
+            .stream_chat(chat_request(
                 "openrouter::anthropic/claude-3.5-sonnet",
-                vec![],
                 None,
-                None,
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            ))
             .await
             .expect_err("openrouter route must fail when openrouter backend is absent");
         let msg = format!("{err:#}");
@@ -807,16 +664,7 @@ mod tests {
         let multi = MultiBackend::new(Some(codex_backend), None, None);
 
         let _ = multi
-            .stream_chat(
-                "codex::gpt-5.2",
-                vec![],
-                None,
-                Some("xhigh"),
-                Box::new(|_| {}),
-                Box::new(|_| {}),
-                CancellationToken::new(),
-                Duration::from_secs(60),
-            )
+            .stream_chat(chat_request("codex::gpt-5.2", Some("xhigh")))
             .await
             .expect("codex route");
         assert_eq!(
