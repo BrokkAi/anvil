@@ -1090,9 +1090,7 @@ mod tests {
         Box::new(|_| {})
     }
 
-    fn shared_collecting_sink(
-        buf: std::sync::Arc<std::sync::Mutex<String>>,
-    ) -> std::sync::Arc<std::sync::Mutex<Box<dyn FnMut(&str) + Send>>> {
+    fn shared_collecting_sink(buf: std::sync::Arc<std::sync::Mutex<String>>) -> SharedSink {
         std::sync::Arc::new(std::sync::Mutex::new(Box::new(move |t: &str| {
             buf.lock().unwrap().push_str(t)
         })))
