@@ -1259,6 +1259,16 @@ fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
         .collect()
 }
 
+/// Normalize a cwd before comparing or rooting a per-session registry.
+///
+/// We canonicalize when possible so equivalent spellings of the same workspace
+/// (`.`/`..`, symlinks) reuse the same cached registry and Bifrost subprocess.
+/// If the path no longer exists, fall back to the lexical path so callers with
+/// a stale cwd still get a deterministic comparison.
+fn normalize_cwd(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 // ---------------------------------------------------------------------------
 // Thread-safe session store
 // ---------------------------------------------------------------------------
@@ -1396,6 +1406,7 @@ impl SessionStore {
         cwd: PathBuf,
         bifrost_binary: Option<&Path>,
     ) -> Arc<ToolRegistry> {
+        let normalized_cwd = normalize_cwd(&cwd);
         let skills = self
             .sessions
             .read()
@@ -1405,12 +1416,12 @@ impl SessionStore {
             .unwrap_or_else(|| Arc::new(crate::skills::SkillRegistry::default()));
 
         if let Some(existing) = self.registries.read().await.get(session_id).cloned()
-            && existing.cwd() == cwd.as_path()
+            && existing.cwd() == normalized_cwd.as_path()
         {
             existing.set_skills(skills).await;
             return existing;
         }
-        let registry = Arc::new(ToolRegistry::new(cwd, bifrost_binary, skills).await);
+        let registry = Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills).await);
         self.registries
             .write()
             .await
@@ -3066,54 +3077,134 @@ mod tests {
     }
 
     /// `get_or_create_registry` should reuse the cached registry when the
-    /// cwd is unchanged. That keeps the existing Bifrost subprocess alive
-    /// and only refreshes skills in place.
+    /// cwd is only spelled differently (e.g. `path/.`). That keeps the
+    /// existing Bifrost subprocess alive and only refreshes skills in place.
     #[tokio::test]
-    async fn get_or_create_registry_reuses_cached_registry_when_cwd_is_unchanged() {
+    async fn get_or_create_registry_reuses_cached_registry_for_equivalent_cwd_paths() {
         let store = SessionStore::new("m".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let session = store.create_session(cwd.path().to_path_buf()).await;
+        let cwd_alias = cwd.path().join(".");
+        let canonical_cwd = normalize_cwd(cwd.path());
 
         let registry1 = store
             .get_or_create_registry(&session.id, cwd.path().to_path_buf(), None)
             .await;
         let registry2 = store
-            .get_or_create_registry(&session.id, cwd.path().to_path_buf(), None)
+            .get_or_create_registry(&session.id, cwd_alias, None)
             .await;
 
         assert!(
             Arc::ptr_eq(&registry1, &registry2),
-            "same cwd should reuse the cached registry"
+            "equivalent cwd spellings should reuse the cached registry"
         );
-        assert_eq!(registry1.cwd(), cwd.path());
+        assert_eq!(registry1.cwd(), canonical_cwd.as_path());
+    }
+
+    #[cfg(unix)]
+    fn make_fake_bifrost_binary(script_dir: &Path, log_path: &Path) -> PathBuf {
+        let script_path = script_dir.join("fake-bifrost.sh");
+        let script = format!(
+            r#"#!/bin/sh
+log_path="{}"
+printf '%s\n' "$@" >> "$log_path"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'* )
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{}}}}}}'
+      ;;
+    *'"method":"tools/list"'* )
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+            log_path.display()
+        );
+        std::fs::write(&script_path, script).expect("write fake bifrost binary");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake bifrost binary")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake bifrost binary");
+        script_path
+    }
+
+    #[cfg(unix)]
+    fn bifrost_spawn_args(cwd: &Path) -> Vec<String> {
+        vec![
+            "--root".to_string(),
+            cwd.display().to_string(),
+            "--server".to_string(),
+            "searchtools".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn read_log_lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .expect("read fake bifrost log")
+            .lines()
+            .map(|line| line.to_string())
+            .collect()
     }
 
     /// A cwd change must invalidate the cached registry so the next
-    /// prompt runs against the new workspace.
+    /// prompt runs against the new workspace and respawns Bifrost with the
+    /// updated root.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn get_or_create_registry_rebuilds_when_cwd_changes() {
+    async fn get_or_create_registry_rebuilds_and_respawns_bifrost_when_cwd_changes() {
         let store = SessionStore::new("m".to_string());
         let cwd1 = tempfile::tempdir().expect("cwd1");
+        let cwd2 = tempfile::tempdir().expect("cwd2");
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         let session = store.create_session(cwd1.path().to_path_buf()).await;
+        let canonical_cwd1 = normalize_cwd(cwd1.path());
+        let canonical_cwd2 = normalize_cwd(cwd2.path());
 
         let registry1 = store
-            .get_or_create_registry(&session.id, cwd1.path().to_path_buf(), None)
+            .get_or_create_registry(
+                &session.id,
+                cwd1.path().to_path_buf(),
+                Some(fake_bifrost.as_path()),
+            )
             .await;
+        assert_eq!(registry1.cwd(), canonical_cwd1.as_path());
+        assert_eq!(
+            read_log_lines(&bifrost_log),
+            bifrost_spawn_args(&canonical_cwd1)
+        );
 
-        let cwd2 = tempfile::tempdir().expect("cwd2");
         store
             .update_cwd(&session.id, cwd2.path().to_path_buf())
             .await;
 
         let registry2 = store
-            .get_or_create_registry(&session.id, cwd2.path().to_path_buf(), None)
+            .get_or_create_registry(
+                &session.id,
+                cwd2.path().to_path_buf(),
+                Some(fake_bifrost.as_path()),
+            )
             .await;
 
         assert!(
             !Arc::ptr_eq(&registry1, &registry2),
             "changed cwd should rebuild the registry"
         );
-        assert_eq!(registry2.cwd(), cwd2.path());
+        assert_eq!(registry2.cwd(), canonical_cwd2.as_path());
+        assert_eq!(
+            read_log_lines(&bifrost_log),
+            [
+                bifrost_spawn_args(&canonical_cwd1),
+                bifrost_spawn_args(&canonical_cwd2)
+            ]
+            .concat()
+        );
     }
 
     /// Round-trip a full conversation history through the zip: write four
