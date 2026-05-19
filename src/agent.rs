@@ -1166,7 +1166,7 @@ pub async fn run_agent(
                         .max(1),
                 );
 
-                cx.spawn(async move {
+                let spawn_result = cx.spawn(async move {
                     use futures::FutureExt;
                     use std::panic::AssertUnwindSafe;
 
@@ -1272,7 +1272,15 @@ pub async fn run_agent(
                         );
                     }
                     Ok(())
-                })?;
+                });
+
+                if let Err(e) = spawn_result {
+                    // `start_prompt` already registered the in-flight token.
+                    // If spawning fails, clear it here so the session does not
+                    // stay permanently blocked on a prompt that never started.
+                    sessions_prompt.finish_prompt(&session_id).await;
+                    return Err(e);
+                }
 
                 Ok(())
             },
