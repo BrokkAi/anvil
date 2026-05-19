@@ -407,7 +407,7 @@ impl ToolRegistry {
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The shell command to execute (passed to sh -c)."
+                            "description": "The shell command to execute via the platform shell."
                         },
                         "timeoutSeconds": {
                             "type": "integer",
@@ -952,7 +952,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn run_shell_command_timeout_is_clamped_and_reported() {
         let registry = registry_with_skills(vec![]);

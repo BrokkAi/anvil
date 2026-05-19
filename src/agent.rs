@@ -2747,13 +2747,21 @@ fn parse_pr_create_arg(prompt_text: &str) -> Option<String> {
     }
 }
 
-/// Quote a string for `sh -c` by wrapping in single quotes and
-/// escaping any embedded single quote via the standard `'\''` trick.
-/// `runShellCommand` invokes `sh -c` with a single argv element, so
-/// command parts that come from user input (PR title) or external
-/// lookups (default branch name) need shell-safe quoting.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Quote a string for the platform shell. On Unix this is the standard
+/// `sh -c` single-quote form; on Windows it uses PowerShell single-quote
+/// literals, which escape embedded apostrophes by doubling them.
+/// `runShellCommand` invokes the platform shell with a single argv element,
+/// so command parts that come from user input (PR title) or external lookups
+/// (default branch name) need shell-safe quoting.
+fn shell_quote(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// Per-shell-call timeout for slash-command-driven `runShellCommand`
@@ -2891,12 +2899,12 @@ async fn handle_pr_create(
     }
 
     let title_arg = match parse_pr_create_arg(prompt_text) {
-        Some(t) => format!(" --title {}", shell_single_quote(&t)),
+        Some(t) => format!(" --title {}", shell_quote(&t)),
         None => String::new(),
     };
     let cmd = format!(
         "gh pr create --base {} --fill{title_arg}",
-        shell_single_quote(base_branch)
+        shell_quote(base_branch)
     );
     match run_or_report(registry, &cmd, "gh pr create", policy).await {
         Ok(output) => {
@@ -3126,14 +3134,26 @@ mod tests {
         assert!(!builtin_command_names().contains("configure"));
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn shell_single_quote_escapes_embedded_quote() {
-        assert_eq!(shell_single_quote("hello"), "'hello'");
-        assert_eq!(shell_single_quote(""), "''");
+    fn shell_quote_escapes_embedded_quote_unix() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+        assert_eq!(shell_quote(""), "''");
         // The standard `'\''` escape: close, escaped quote, reopen.
-        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
         // Backticks/$/" are harmless inside single quotes -- preserved as-is.
-        assert_eq!(shell_single_quote("$x `y` \"z\""), "'$x `y` \"z\"'");
+        assert_eq!(shell_quote("$x `y` \"z\""), "'$x `y` \"z\"'");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_quote_escapes_embedded_quote_windows() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+        assert_eq!(shell_quote(""), "''");
+        // PowerShell single quotes escape embedded apostrophes by doubling.
+        assert_eq!(shell_quote("it's"), "'it''s'");
+        // Backticks/$/" are literal inside single quotes -- preserved as-is.
+        assert_eq!(shell_quote("$x `y` \"z\""), "'$x `y` \"z\"'");
     }
 
     #[test]

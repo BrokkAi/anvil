@@ -1,16 +1,46 @@
 use super::sandbox::{self, ENV_WHITELIST, SandboxPolicy};
 use super::{ToolResult, ToolStatus};
+use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::{io::AsRawHandle, process::CommandExt};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use tokio::task::JoinHandle;
+#[cfg(windows)]
+use tokio::time::sleep;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
 const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
     "Notice: this command was explicitly approved to run outside the OS sandbox once.";
 
+#[cfg(target_os = "linux")]
 const SANDBOX_BYPASS_WARNING: &str = "[WARNING] OS sandbox unavailable on this platform; the command above ran without one. \
      Install bubblewrap (`apt install bubblewrap`) on Linux to enable kernel-enforced isolation.\n";
+
+#[cfg(target_os = "windows")]
+const SANDBOX_BYPASS_WARNING: &str =
+    "[WARNING] OS sandbox unavailable on Windows; the command above ran without one.\n";
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const SANDBOX_BYPASS_WARNING: &str =
+    "[WARNING] OS sandbox unavailable on this platform; the command above ran without one.\n";
 
 /// Hint appended when the shell exits 127 (POSIX "command not found"). The
 /// sandbox uses a curated PATH that excludes anything outside the parent's
@@ -400,6 +430,158 @@ fn kill_process_group(_pid: u32) -> Option<String> {
     None
 }
 
+#[cfg(windows)]
+const WINDOWS_JOB_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsJobInner {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl WindowsJobInner {
+    fn new() -> std::io::Result<Self> {
+        // SAFETY: CreateJobObjectW is a pure Win32 allocation call.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the pointer/length pair targets a stack-local that lives
+        // through the call, and the struct is the exact type required by
+        // JobObjectExtendedLimitInformation.
+        let ok = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            // SAFETY: handle was returned by CreateJobObjectW above.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(err);
+        }
+
+        Ok(Self { handle })
+    }
+
+    fn assign_child(&self, child: &tokio::process::Child) -> std::io::Result<()> {
+        // SAFETY: child.as_raw_handle() returns the native process handle for
+        // the spawned child, and the job handle is valid for the life of self.
+        let ok = unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle() as HANDLE) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn active_processes(&self) -> std::io::Result<u32> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let mut _returned_len = 0u32;
+        // SAFETY: the buffer points to the exact structure required by
+        // JobObjectBasicAccountingInformation and lives for the duration of
+        // the call.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                &mut accounting as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                &mut _returned_len as *mut u32,
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJobInner {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            // SAFETY: handle was created by CreateJobObjectW and is owned here.
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsProcessTree {
+    reaper: Option<JoinHandle<()>>,
+    disarmed: bool,
+}
+
+#[cfg(windows)]
+impl WindowsProcessTree {
+    fn new(child: &tokio::process::Child) -> std::io::Result<Self> {
+        let job = Arc::new(WindowsJobInner::new()?);
+        job.assign_child(child)?;
+
+        let reaper_job = Arc::clone(&job);
+        let reaper = tokio::spawn(async move {
+            loop {
+                match reaper_job.active_processes() {
+                    Ok(0) => break,
+                    Ok(_) => sleep(WINDOWS_JOB_REAPER_POLL_INTERVAL).await,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to query Windows job object while waiting for shell descendants"
+                        );
+                        break;
+                    }
+                }
+            }
+            // `reaper_job` drops here. If any descendants are still alive,
+            // the job handle remains open until they exit; otherwise this
+            // closes the handle and tears the job down.
+        });
+
+        Ok(Self {
+            reaper: Some(reaper),
+            disarmed: false,
+        })
+    }
+
+    fn release(mut self) {
+        self.disarmed = true;
+    }
+
+    fn abort(mut self) -> String {
+        self.disarmed = true;
+        if let Some(reaper) = self.reaper.take() {
+            reaper.abort();
+        }
+        "Notice: shell process tree was killed after the timeout.".to_string()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessTree {
+    fn drop(&mut self) {
+        if !self.disarmed
+            && let Some(reaper) = self.reaper.take()
+        {
+            reaper.abort();
+        }
+    }
+}
+
 pub async fn run_shell_command(
     cwd: &Path,
     command: &str,
@@ -455,16 +637,15 @@ pub async fn run_shell_command(
     // set via bwrap's --setenv (sandbox.rs). On macOS Seatbelt does not
     // alter env so this is the PATH the child actually sees.
     //
-    // On Windows there is no sandbox (`wrap_platform` is a passthrough),
-    // and the home-tool-dir / Homebrew layout makes no sense, so we
-    // fall back to the historic hardcoded Unix-style PATH the platform
-    // already had. The point is to keep Windows on its prior path of
-    // behavior; deciding what `runShellCommand` *should* do on Windows
-    // is a separate concern from this issue.
+    // On Unix we keep the curated sandbox PATH. On Windows there is no
+    // OS sandbox, so we preserve the parent PATH so native shells can
+    // resolve the user's installed toolchain and shell commands.
     #[cfg(unix)]
-    let sandbox_path = sandbox::discover_sandbox_path();
-    #[cfg(not(unix))]
-    let sandbox_path: String = String::from("/usr/local/bin:/usr/bin:/bin");
+    let sandbox_path: OsString = OsString::from(sandbox::discover_sandbox_path());
+    #[cfg(windows)]
+    let sandbox_path: OsString = std::env::var_os("PATH").unwrap_or_default();
+    #[cfg(not(any(unix, windows)))]
+    let sandbox_path: OsString = OsString::from("/usr/local/bin:/usr/bin:/bin");
     let mut cmd = Command::new(&wrapped.argv[0]);
     cmd.args(&wrapped.argv[1..])
         .current_dir(cwd)
@@ -478,6 +659,10 @@ pub async fn run_shell_command(
         // cleanup below. The timeout path kills the whole process group
         // directly so background descendants do not survive.
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     #[cfg(unix)]
     {
         // Put the shell in its own process group so a timeout can kill the
@@ -516,6 +701,18 @@ pub async fn run_shell_command(
                 status: ToolStatus::InternalError,
                 output: format!("Failed to execute command: {e}"),
             };
+        }
+    };
+
+    #[cfg(windows)]
+    let windows_process_tree = match WindowsProcessTree::new(&child) {
+        Ok(tree) => Some(tree),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to attach shell command to a Windows job object"
+            );
+            None
         }
     };
 
@@ -558,6 +755,13 @@ pub async fn run_shell_command(
     if let Some(notice) = timeout_notice {
         notices.push(notice);
     }
+    #[cfg(windows)]
+    if windows_process_tree.is_none() {
+        notices.push(
+            "Notice: Windows job-object supervision was unavailable; timed-out shell commands may leave descendant processes running."
+                .to_string(),
+        );
+    }
 
     match wait_result {
         Ok(Ok(status)) => {
@@ -593,6 +797,10 @@ pub async fn run_shell_command(
                 combined.push('\n');
                 combined.push_str(SANDBOX_BYPASS_WARNING);
             }
+            #[cfg(windows)]
+            if let Some(tree) = windows_process_tree {
+                tree.release();
+            }
 
             ToolResult {
                 status: if status.success() {
@@ -612,6 +820,10 @@ pub async fn run_shell_command(
             }
         }
         Err(_) => {
+            #[cfg(windows)]
+            if let Some(tree) = windows_process_tree {
+                notices.push(tree.abort());
+            }
             if let Some(pid) = child_pid
                 && let Some(group_notice) = kill_process_group(pid)
             {
@@ -639,11 +851,12 @@ pub async fn run_shell_command(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::Duration;
+    #[cfg(unix)]
     use tokio::sync::Mutex;
 
     /// Serializes tests that mutate process-wide env vars. `cargo test`
@@ -655,14 +868,17 @@ mod tests {
     /// `tokio::sync::Mutex` because the guard is held across `await`
     /// points (the test invokes `run_shell_command(...).await`); a
     /// `std::sync::Mutex` here would trigger `clippy::await_holding_lock`.
+    #[cfg(unix)]
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Restores a single env var on Drop. Pair with `ENV_LOCK` so the
     /// drop order is well-defined.
+    #[cfg(unix)]
     struct EnvGuard {
         var: &'static str,
     }
 
+    #[cfg(unix)]
     impl EnvGuard {
         fn set(var: &'static str, value: &str) -> Self {
             // SAFETY: the caller holds ENV_LOCK, which serializes env
@@ -676,6 +892,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             // SAFETY: same as set() -- guarded by ENV_LOCK.
@@ -685,16 +902,59 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn shell_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
 
+    #[cfg(windows)]
+    fn shell_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+
+    #[cfg(unix)]
+    fn timeout_process_tree_command(target: &std::path::Path) -> String {
+        format!(
+            "sh -c \"sleep 2; touch {}\" & sleep 10",
+            shell_quote(&target.display().to_string())
+        )
+    }
+
+    #[cfg(windows)]
+    fn timeout_process_tree_command(target: &std::path::Path) -> String {
+        let target = shell_quote(&target.display().to_string());
+        let child_command = format!(
+            "Start-Sleep -Seconds 2; New-Item -ItemType File -Path {} -Force | Out-Null",
+            target
+        );
+        format!(
+            "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList {}, {}, {}, {}, {} | Out-Null; Start-Sleep -Seconds 10",
+            shell_quote("-NoLogo"),
+            shell_quote("-NoProfile"),
+            shell_quote("-NonInteractive"),
+            shell_quote("-Command"),
+            shell_quote(&child_command)
+        )
+    }
+
+    #[cfg(unix)]
+    fn timeout_kill_notice() -> &'static str {
+        "process group was killed"
+    }
+
+    #[cfg(windows)]
+    fn timeout_kill_notice() -> &'static str {
+        "process tree was killed"
+    }
+
+    #[cfg(unix)]
     #[test]
     fn parse_rlimit_value_accepts_decimal_byte_count() {
         assert_eq!(parse_rlimit_value("X", "1024", 999), 1024);
         assert_eq!(parse_rlimit_value("X", "  4096  ", 999), 4096);
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_rlimit_value_treats_unlimited_and_empty_as_infinity() {
         assert_eq!(
@@ -709,6 +969,7 @@ mod tests {
         assert_eq!(parse_rlimit_value("X", "   ", 999), libc::RLIM_INFINITY);
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_rlimit_value_falls_back_on_garbage() {
         // Non-numeric input should not crash and should return the default
@@ -718,6 +979,7 @@ mod tests {
         assert_eq!(parse_rlimit_value("X", "1.5", 999), 999);
     }
 
+    #[cfg(unix)]
     #[test]
     fn clamp_to_hard_limit_passes_through_when_request_below_hard() {
         // RLIMIT_NOFILE hard limit is at least 1024 on every realistic
@@ -728,6 +990,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn clamp_to_hard_limit_caps_request_above_hard() {
         // Read the current hard NOFILE; ask for hard+1 and expect hard.
@@ -765,6 +1028,7 @@ mod tests {
     /// drops `cmd.pre_exec`, breaks the env-var read, or wires the cap
     /// to the wrong syscall would silently disable the sandbox feature
     /// without this assertion failing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn rlimit_fsize_actually_kills_oversized_writes() {
         let _guard = ENV_LOCK.lock().await;
@@ -800,6 +1064,7 @@ mod tests {
     /// size that the default (1 GiB) also permits. Pairs with the test
     /// above: together they show the env-var path actually reaches the
     /// child and the limit is what governs success/failure.
+    #[cfg(unix)]
     #[tokio::test]
     async fn rlimit_fsize_unlimited_allows_writes() {
         let _guard = ENV_LOCK.lock().await;
@@ -827,9 +1092,9 @@ mod tests {
     /// the LLM and the user can tell sandbox-PATH problems from genuine
     /// missing tools. Runs with `SandboxPolicy::None` so we don't depend on
     /// bwrap/sandbox-exec being available in CI.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_exit_127_appends_brokk_acp_path_hint() {
-        let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
         let result = run_shell_command(
             &dir,
@@ -857,7 +1122,6 @@ mod tests {
     /// to lock in the gate condition.
     #[tokio::test]
     async fn shell_exit_zero_omits_hint() {
-        let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
         let result = run_shell_command(
             &dir,
@@ -882,7 +1146,6 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_outside_sandbox_once_adds_audit_notice() {
-        let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
         let result = run_shell_command(
             &dir,
@@ -901,15 +1164,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_kills_shell_process_group() {
-        let _guard = ENV_LOCK.lock().await;
+    async fn timeout_kills_shell_process_tree() {
         let dir = std::env::temp_dir();
-        let target: PathBuf = dir.join(format!("brokk-shell-process-group-{}", std::process::id()));
+        let target: PathBuf = dir.join(format!("brokk-shell-process-tree-{}", std::process::id()));
         let _ = std::fs::remove_file(&target);
-        let command = format!(
-            "sh -c \"sleep 2; touch {}\" & sleep 10",
-            shell_quote(&target.display().to_string())
-        );
+        let command = timeout_process_tree_command(&target);
 
         let result = run_shell_command(&dir, &command, 1, SandboxPolicy::None, false, None).await;
         assert!(
@@ -923,8 +1182,8 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("process group was killed"),
-            "timeout output should say the process group was killed; got: {}",
+            result.output.contains(timeout_kill_notice()),
+            "timeout output should say the process tree was killed; got: {}",
             result.output
         );
 

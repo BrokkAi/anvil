@@ -25,6 +25,8 @@
 //!   `WrappedCommand.sandboxed = false` so `shell.rs` can surface a
 //!   user-visible warning to the ACP client.
 //! - **Other (Windows etc.)**: log-and-skip; same posture as the Java side.
+//!   Commands run through the native platform shell (`powershell.exe` on
+//!   Windows, `sh` elsewhere), but no OS-level sandbox is available.
 //!
 //! ### Known UX cost
 //! `bwrap --unshare-all` isolates PID/IPC/UTS namespaces. Inside the sandbox,
@@ -119,11 +121,28 @@ pub struct WrappedCommand {
 impl WrappedCommand {
     fn unwrapped(command: &str) -> Self {
         Self {
-            argv: vec!["sh".into(), "-c".into(), command.into()],
+            argv: platform_shell_argv(command),
             sandboxed: false,
             _policy_file: None,
         }
     }
+}
+
+#[cfg(windows)]
+fn platform_shell_argv(command: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".to_string(),
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        command.to_string(),
+    ]
+}
+
+#[cfg(not(windows))]
+fn platform_shell_argv(command: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), command.into()]
 }
 
 /// Wrap a shell command in the appropriate platform sandbox.
@@ -471,6 +490,23 @@ pub const ENV_WHITELIST: &[&str] = &[
     "PYENV_ROOT",
     "BUN_INSTALL",
     "DENO_INSTALL",
+    // Common Windows runtime / profile pointers. These are not secrets and
+    // help native shells and tools locate their installs after env_clear().
+    "USERPROFILE",
+    "USERNAME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
 ];
 
 /// Operator-supplied override that fully replaces the discovered PATH inside
