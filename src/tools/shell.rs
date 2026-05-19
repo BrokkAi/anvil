@@ -482,6 +482,9 @@ pub async fn run_shell_command(
         },
         Err(_) => {
             let mut msg = format!("Command timed out after {timeout_seconds}s");
+            if outside_sandbox_once {
+                msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
+            }
             if bypass_warning {
                 msg.push('\n');
                 msg.push_str(SANDBOX_BYPASS_WARNING);
