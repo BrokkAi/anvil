@@ -941,6 +941,18 @@ mod tests {
         assert!(result.output.contains("real-skill"));
     }
 
+    #[test]
+    fn run_shell_command_timeout_is_clamped_to_server_max() {
+        let (timeout, notice) = clamp_run_shell_timeout(MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS + 1);
+        assert_eq!(timeout, MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS);
+        let notice = notice.expect("clamped timeout should produce a notice");
+        assert!(
+            notice.contains("clamped to the server maximum"),
+            "clamp notice should be surfaced to the caller; got: {notice}"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_shell_command_timeout_is_clamped_and_reported() {
         let registry = registry_with_skills(vec![]);
