@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::convert::TryFrom;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +46,7 @@ const MAX_CONTENT_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 /// collectively exceed this, even when each is below the per-entry
 /// cap.
 const MAX_CONTENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_SESSION_NAME: &str = "New Session";
 
 // ---------------------------------------------------------------------------
 // Store limits
@@ -91,6 +94,53 @@ fn trim_history(history: &mut Vec<ConversationTurn>, max: usize) {
         let drain_to = history.len() - max;
         history.drain(0..drain_to);
     }
+}
+
+fn current_timestamp_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn normalize_session_title(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == DEFAULT_SESSION_NAME {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn derive_session_title(prompt: &str) -> Option<String> {
+    let first_line = prompt.lines().find(|line| !line.trim().is_empty())?.trim();
+    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '.' | ',' | ':' | ';' | '!' | '?')
+    });
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    const MAX_TITLE_CHARS: usize = 80;
+    let mut title = trimmed.chars().take(MAX_TITLE_CHARS).collect::<String>();
+    if title.is_empty() {
+        None
+    } else {
+        if trimmed.chars().count() > MAX_TITLE_CHARS {
+            title.push_str("...");
+        }
+        if title == DEFAULT_SESSION_NAME {
+            None
+        } else {
+            Some(title)
+        }
+    }
+}
+
+pub(crate) fn rfc3339_from_millis(millis: u64) -> Option<String> {
+    let millis = i64::try_from(millis).ok()?;
+    DateTime::<Utc>::from_timestamp_millis(millis).map(|ts| ts.to_rfc3339())
 }
 
 /// Error returned when a session already has a prompt in flight.
@@ -297,6 +347,18 @@ pub struct SessionManifest {
     pub model: Option<String>,
 }
 
+impl SessionManifest {
+    /// Human-readable title to expose to ACP clients.
+    pub fn title(&self) -> Option<String> {
+        normalize_session_title(&self.name)
+    }
+
+    /// Last activity timestamp formatted for ACP clients.
+    pub fn updated_at(&self) -> Option<String> {
+        rfc3339_from_millis(self.modified)
+    }
+}
+
 fn default_version() -> String {
     "4.0".to_string()
 }
@@ -353,10 +415,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(id: String, cwd: PathBuf, model: String, name: String) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = current_timestamp_millis();
         let mode = SessionMode::Lutz;
         let permission_mode = PermissionMode::Default;
         let manifest = SessionManifest {
@@ -492,6 +551,13 @@ pub struct SessionSnapshot {
     /// Agent Skills (`SKILL.md`) discovered for this session. Wrapped
     /// in `Arc` so cloning the snapshot doesn't copy the registry.
     pub skills: Arc<crate::skills::SkillRegistry>,
+}
+
+/// Human-readable session metadata for ACP notifications and lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionMetadata {
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,7 +1529,12 @@ impl SessionStore {
         let model = select_session_model(prefs.last_model, default_model, &catalog);
         let reasoning_effort =
             select_session_reasoning_effort(&model, prefs.last_reasoning_effort, &catalog);
-        let mut session = Session::new(id.clone(), cwd.clone(), model, "New Session".to_string());
+        let mut session = Session::new(
+            id.clone(),
+            cwd.clone(),
+            model,
+            DEFAULT_SESSION_NAME.to_string(),
+        );
         session.selected_reasoning_effort = reasoning_effort;
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
@@ -1631,6 +1702,81 @@ impl SessionStore {
             project_instructions,
             skills,
         })
+    }
+
+    /// Return session metadata formatted for ACP clients.
+    pub(crate) async fn session_metadata(&self, id: &str) -> Option<SessionMetadata> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(id)?;
+        Some(SessionMetadata {
+            title: session.manifest.title(),
+            updated_at: session.manifest.updated_at(),
+        })
+    }
+
+    /// If the session still has the placeholder title, derive a better
+    /// one from the provided prompt seed and persist it alongside the
+    /// turn history.
+    pub(crate) async fn maybe_rename_from_prompt(
+        &self,
+        id: &str,
+        title_seed: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get_mut(id) {
+                Some(session) => {
+                    if session.manifest.title().is_some() {
+                        return Ok(None);
+                    }
+                    let Some(title) = derive_session_title(title_seed) else {
+                        return Ok(None);
+                    };
+                    let prev_name = session.manifest.name.clone();
+                    let prev_modified = session.manifest.modified;
+                    session.manifest.name = title.clone();
+                    session.manifest.modified = current_timestamp_millis();
+                    Some((
+                        session.cwd.clone(),
+                        session.manifest.clone(),
+                        prev_name,
+                        prev_modified,
+                        title,
+                    ))
+                }
+                None => None,
+            }
+        };
+        let Some((cwd, manifest, prev_name, prev_modified, title)) = snapshot else {
+            return Ok(None);
+        };
+
+        let zip_path = session_zip_path(&cwd, id);
+        let join_result =
+            tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
+                .await;
+
+        let persist_result = match join_result {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!(
+                "session persistence task panicked: {join_err}"
+            )),
+        };
+
+        if let Err(e) = persist_result {
+            tracing::error!(
+                session_id = %id,
+                "failed to persist session title; rolling back in-memory state: {e:#}"
+            );
+            if let Some(session) = self.sessions.write().await.get_mut(id) {
+                session.manifest.name = prev_name;
+                session.manifest.modified = prev_modified;
+            }
+            return Err(e);
+        }
+
+        self.touch(id);
+        Ok(Some(title))
     }
 
     pub async fn update_cwd(&self, id: &str, cwd: PathBuf) {
@@ -1910,10 +2056,7 @@ impl SessionStore {
                 Some(session) => {
                     let prev_modified = session.manifest.modified;
                     session.history.push(turn.clone());
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    let now = current_timestamp_millis();
                     session.manifest.modified = now;
                     Some((
                         session_zip_path(&session.cwd, &session.id),
@@ -2488,6 +2631,49 @@ mod tests {
         assert_eq!(manifest.id, session.id);
         assert_eq!(manifest.mode.as_deref(), Some("LUTZ"));
         assert_eq!(manifest.model.as_deref(), Some("initial-model"));
+        assert!(manifest.title().is_none(), "new sessions start untitled");
+        assert!(
+            manifest.updated_at().is_some(),
+            "manifest.modified must be serializable as ACP updatedAt"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A placeholder-titled session should rename itself from the first
+    /// prompt seed and persist the new title in the manifest zip.
+    #[tokio::test]
+    async fn maybe_rename_from_prompt_persists_title() {
+        let store = SessionStore::new("initial-model".to_string());
+        let cwd =
+            std::env::temp_dir().join(format!("brokk-acp-rust-rename-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+
+        let title = store
+            .maybe_rename_from_prompt(&id, "Investigate session names")
+            .await
+            .expect("title rename should persist");
+
+        assert_eq!(title.as_deref(), Some("Investigate session names"));
+
+        let in_memory = store.sessions.read().await;
+        let session = in_memory.get(&id).expect("session still in memory");
+        assert_eq!(session.manifest.name, "Investigate session names");
+        assert_eq!(
+            session.manifest.title().as_deref(),
+            Some("Investigate session names")
+        );
+        assert!(session.manifest.updated_at().is_some());
+
+        let manifest =
+            read_manifest_from_zip(&session_zip_path(&cwd, &id)).expect("manifest must round-trip");
+        assert_eq!(manifest.name, "Investigate session names");
+        assert_eq!(
+            manifest.title().as_deref(),
+            Some("Investigate session names")
+        );
+        assert!(manifest.updated_at().is_some());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

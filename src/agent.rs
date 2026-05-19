@@ -8,8 +8,8 @@ use agent_client_protocol::schema::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionListCapabilities,
-    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionInfoUpdate,
+    SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent,
@@ -24,8 +24,8 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatMessage, LlmBackend, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    ConversationTurn, PermissionMode, PromptStartError, Session, SessionMode, SessionSnapshot,
-    SessionStore,
+    ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
+    SessionSnapshot, SessionStore,
 };
 
 /// Stable ids for our `SessionConfigOption` selectors. We expose both
@@ -522,6 +522,37 @@ fn send_available_commands_update(
     }
 }
 
+fn session_info_from_manifest(manifest: &SessionManifest, cwd: &Path) -> SessionInfo {
+    SessionInfo::new(manifest.id.clone(), cwd.to_path_buf())
+        .title(manifest.title())
+        .updated_at(manifest.updated_at())
+}
+
+fn send_session_info_update(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    title: Option<String>,
+    updated_at: Option<String>,
+) {
+    if title.is_none() && updated_at.is_none() {
+        return;
+    }
+    let mut update = SessionInfoUpdate::new();
+    if let Some(title) = title {
+        update = update.title(title);
+    }
+    if let Some(updated_at) = updated_at {
+        update = update.updated_at(updated_at);
+    }
+    let notification = SessionNotification::new(
+        session_id.to_string(),
+        SessionUpdate::SessionInfoUpdate(update),
+    );
+    if let Err(e) = cx.send_notification(notification) {
+        tracing::warn!("failed to send session_info_update: {e}");
+    }
+}
+
 /// Defer the `available_commands_update` notification so the client has
 /// time to register the freshly-issued session id before the
 /// notification references it.
@@ -986,7 +1017,7 @@ pub async fn run_agent(
                         .list_sessions_from_disk(cwd)
                         .await
                         .into_iter()
-                        .map(|m| SessionInfo::new(m.id, cwd.clone()))
+                        .map(|m| session_info_from_manifest(&m, cwd))
                         .collect()
                 } else {
                     vec![]
@@ -1005,8 +1036,8 @@ pub async fn run_agent(
                 tracing::info!("ACP session/prompt session={session_id}");
 
                 // Extract prompt text from content blocks
-                let prompt_text = extract_prompt_text(&req.prompt);
-                if prompt_text.is_empty() {
+                let raw_prompt_text = extract_prompt_text(&req.prompt);
+                if raw_prompt_text.is_empty() {
                     send_message(&cx, &session_id, "Error: empty prompt");
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -1029,7 +1060,7 @@ pub async fn run_agent(
                 // purely informational and replaying it on the next session load
                 // would mislead the model about prior dialog. Mirrors the Java
                 // executor's `handleSlashCommand` path.
-                if is_slash_command(&prompt_text, "context") {
+                if is_slash_command(&raw_prompt_text, "context") {
                     let permission_mode = sessions_prompt
                         .permission_mode(&session_id)
                         .await
@@ -1040,7 +1071,7 @@ pub async fn run_agent(
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                if is_slash_command(&prompt_text, "setup") {
+                if is_slash_command(&raw_prompt_text, "setup") {
                     let setup_ctx = SetupContext {
                         cx: &cx,
                         sessions: &sessions_prompt,
@@ -1050,12 +1081,12 @@ pub async fn run_agent(
                         default_idle_timeout_secs,
                         current_session_idle_timeout: snap.idle_timeout_secs,
                     };
-                    let report = handle_setup(&setup_ctx, &prompt_text, &session_id).await;
+                    let report = handle_setup(&setup_ctx, &raw_prompt_text, &session_id).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                if is_slash_command(&prompt_text, "pr-create") {
+                if is_slash_command(&raw_prompt_text, "pr-create") {
                     let permission_mode = sessions_prompt
                         .permission_mode(&session_id)
                         .await
@@ -1072,7 +1103,8 @@ pub async fn run_agent(
                             bifrost_binary_prompt.as_deref(),
                         )
                         .await;
-                    let report = handle_pr_create(&prompt_text, &registry, permission_mode).await;
+                    let report =
+                        handle_pr_create(&raw_prompt_text, &registry, permission_mode).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -1085,7 +1117,14 @@ pub async fn run_agent(
                 // correctly. Built-ins are checked first so a skill
                 // that happens to name itself e.g. `context` or
                 // `setup` can never shadow them.
-                let prompt_text = if let Some((name, args)) = parse_slash_command(&prompt_text)
+                let title_seed = snap
+                    .history
+                    .first()
+                    .map(|turn| turn.user_prompt.clone())
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| raw_prompt_text.clone());
+
+                let prompt_text = if let Some((name, args)) = parse_slash_command(&raw_prompt_text)
                     && let Some(meta) = snap.skills.get(&name)
                 {
                     tracing::info!(skill = %name, "slash-command activating skill");
@@ -1099,7 +1138,7 @@ pub async fn run_agent(
                         format!("{body}\n\nUser input: {args}")
                     }
                 } else {
-                    prompt_text
+                    raw_prompt_text
                 };
 
                 // Validate model is configured
@@ -1155,6 +1194,7 @@ pub async fn run_agent(
                 let cx_for_loop = cx.clone();
                 let session_id_for_loop = session_id.clone();
                 let prompt_text_for_turn = prompt_text;
+                let title_seed_for_turn = title_seed;
                 let model_for_loop = snap.model;
                 let reasoning_effort_for_loop = snap.reasoning_effort;
                 // Resolve per-turn idle timeout: the session override wins,
@@ -1260,6 +1300,32 @@ pub async fn run_agent(
                                  it will not survive a session reload: {e}\n"
                             ),
                         );
+                    } else {
+                        let renamed_title = match sessions_for_loop
+                            .maybe_rename_from_prompt(&session_id_for_loop, &title_seed_for_turn)
+                            .await
+                        {
+                            Ok(title) => title,
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %session_id_for_loop,
+                                    "failed to update session title: {e:#}"
+                                );
+                                None
+                            }
+                        };
+
+                        if let Some(metadata) = sessions_for_loop
+                            .session_metadata(&session_id_for_loop)
+                            .await
+                        {
+                            send_session_info_update(
+                                &cx_for_loop,
+                                &session_id_for_loop,
+                                renamed_title,
+                                metadata.updated_at,
+                            );
+                        }
                     }
 
                     // Clean up cancellation token even on panic / persistence failure.
@@ -3199,6 +3265,29 @@ mod tests {
         assert!(report.contains("Model: `(none)`"));
         assert!(report.contains("(0 known in catalog)"));
         assert!(report.contains("Conversation turns: 0"));
+    }
+
+    /// `session/list` should expose the persisted title and updatedAt
+    /// fields so the client can render the thread name and sort order.
+    #[test]
+    fn session_info_from_manifest_populates_title_and_updated_at() {
+        use crate::session::SessionManifest;
+
+        let manifest = SessionManifest {
+            id: "session-1".into(),
+            name: "Investigate session names".into(),
+            created: 1,
+            modified: 1_706_000_000_000,
+            version: "4.0".into(),
+            mode: None,
+            model: None,
+        };
+        let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
+
+        assert_eq!(info.session_id.to_string(), "session-1");
+        assert_eq!(info.cwd, PathBuf::from("/tmp/cwd"));
+        assert_eq!(info.title.as_deref(), Some("Investigate session names"));
+        assert_eq!(info.updated_at, manifest.updated_at());
     }
 
     /// `build_prompt_messages` for a turn that used no tools must produce
