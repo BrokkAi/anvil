@@ -1382,12 +1382,14 @@ impl SessionStore {
     }
 
     /// Return the cached ToolRegistry for `session_id`, or build one and cache it.
-    /// `bifrost_binary` is consulted only on the first call for a given session.
+    /// `bifrost_binary` is consulted only on the first call for a given cwd.
     ///
-    /// On cache hit we push the latest `SkillRegistry` into the cached
-    /// `ToolRegistry` so the `activate_skill` tool's enum reflects any
-    /// skills added/removed since the last prompt (the session may have
-    /// fired `update_cwd` between turns).
+    /// If the session cwd is unchanged, refresh the cached `SkillRegistry`
+    /// in place so `activate_skill` sees the latest on-disk skills without
+    /// respawning Bifrost.
+    /// If the cwd changed, drop the stale registry and rebuild it so the
+    /// registry's own cwd and Bifrost subprocess are rooted in the new
+    /// workspace.
     pub async fn get_or_create_registry(
         &self,
         session_id: &str,
@@ -1402,7 +1404,9 @@ impl SessionStore {
             .map(|s| s.skills.clone())
             .unwrap_or_else(|| Arc::new(crate::skills::SkillRegistry::default()));
 
-        if let Some(existing) = self.registries.read().await.get(session_id).cloned() {
+        if let Some(existing) = self.registries.read().await.get(session_id).cloned()
+            && existing.cwd() == cwd.as_path()
+        {
             existing.set_skills(skills).await;
             return existing;
         }
@@ -3043,7 +3047,9 @@ mod tests {
 
     /// `update_cwd` rewrites the in-memory cwd; subsequent prompts use the
     /// new directory when computing zip paths. Persistence side is tested
-    /// implicitly via `add_turn`/`set_mode`.
+    /// implicitly via `add_turn`/`set_mode`. Cached registries are left in
+    /// place here and will be rebuilt lazily on the next prompt if their cwd
+    /// no longer matches.
     #[tokio::test]
     async fn update_cwd_changes_in_memory_cwd() {
         let store = SessionStore::new("m".to_string());
@@ -3057,6 +3063,57 @@ mod tests {
         assert_eq!(after.cwd, cwd2);
 
         let _ = std::fs::remove_dir_all(&cwd1);
+    }
+
+    /// `get_or_create_registry` should reuse the cached registry when the
+    /// cwd is unchanged. That keeps the existing Bifrost subprocess alive
+    /// and only refreshes skills in place.
+    #[tokio::test]
+    async fn get_or_create_registry_reuses_cached_registry_when_cwd_is_unchanged() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        let registry1 = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf(), None)
+            .await;
+        let registry2 = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf(), None)
+            .await;
+
+        assert!(
+            Arc::ptr_eq(&registry1, &registry2),
+            "same cwd should reuse the cached registry"
+        );
+        assert_eq!(registry1.cwd(), cwd.path());
+    }
+
+    /// A cwd change must invalidate the cached registry so the next
+    /// prompt runs against the new workspace.
+    #[tokio::test]
+    async fn get_or_create_registry_rebuilds_when_cwd_changes() {
+        let store = SessionStore::new("m".to_string());
+        let cwd1 = tempfile::tempdir().expect("cwd1");
+        let session = store.create_session(cwd1.path().to_path_buf()).await;
+
+        let registry1 = store
+            .get_or_create_registry(&session.id, cwd1.path().to_path_buf(), None)
+            .await;
+
+        let cwd2 = tempfile::tempdir().expect("cwd2");
+        store
+            .update_cwd(&session.id, cwd2.path().to_path_buf())
+            .await;
+
+        let registry2 = store
+            .get_or_create_registry(&session.id, cwd2.path().to_path_buf(), None)
+            .await;
+
+        assert!(
+            !Arc::ptr_eq(&registry1, &registry2),
+            "changed cwd should rebuild the registry"
+        );
+        assert_eq!(registry2.cwd(), cwd2.path());
     }
 
     /// Round-trip a full conversation history through the zip: write four
