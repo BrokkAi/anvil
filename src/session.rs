@@ -93,6 +93,56 @@ fn trim_history(history: &mut Vec<ConversationTurn>, max: usize) {
     }
 }
 
+fn select_session_model(
+    persisted_model: Option<String>,
+    default_model: String,
+    catalog: &[ModelMetadata],
+) -> String {
+    let Some(candidate) = persisted_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return default_model;
+    };
+
+    if catalog.is_empty() || catalog.iter().any(|meta| meta.id == candidate) {
+        candidate.to_string()
+    } else {
+        default_model
+    }
+}
+
+fn select_session_reasoning_effort(
+    model: &str,
+    persisted_reasoning_effort: Option<String>,
+    catalog: &[ModelMetadata],
+) -> Option<String> {
+    let requested = persisted_reasoning_effort?.trim().to_string();
+    if requested.is_empty() || model.is_empty() {
+        return None;
+    }
+
+    let Some(meta) = catalog.iter().find(|meta| meta.id == model) else {
+        // No catalog metadata means we cannot prove the pick is invalid, so
+        // preserve the user's last explicit choice for the new session.
+        return Some(requested);
+    };
+
+    if meta
+        .supported_reasoning_levels
+        .iter()
+        .any(|preset| preset.effort == requested)
+    {
+        Some(requested)
+    } else {
+        // The model knows about reasoning presets but does not support this
+        // one, so leave the session unpinned and let snapshot() fall back to
+        // the model's default_reasoning_level.
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session modes
 // ---------------------------------------------------------------------------
@@ -1376,8 +1426,14 @@ impl SessionStore {
     /// Create a new session and write it to disk as a zip.
     pub async fn create_session(&self, cwd: PathBuf) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
-        let model = self.default_model.read().await.clone();
-        let session = Session::new(id.clone(), cwd.clone(), model, "New Session".to_string());
+        let prefs = crate::setup_state::read();
+        let default_model = self.default_model.read().await.clone();
+        let catalog = self.available_models.read().await.clone();
+        let model = select_session_model(prefs.last_model, default_model, &catalog);
+        let reasoning_effort =
+            select_session_reasoning_effort(&model, prefs.last_reasoning_effort, &catalog);
+        let mut session = Session::new(id.clone(), cwd.clone(), model, "New Session".to_string());
+        session.selected_reasoning_effort = reasoning_effort;
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
         // Persistence failures are logged but not surfaced: `create_session` returns
@@ -1722,6 +1778,19 @@ impl SessionStore {
                         // arbiter rather than dropping silently.
                         _ => None,
                     };
+                    if let Err(e) = crate::setup_state::remember_last_selection(
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.clone())
+                        },
+                        session.selected_reasoning_effort.clone(),
+                    ) {
+                        tracing::warn!(
+                            session_id = %id,
+                            "failed to persist last model/reasoning preference: {e:#}"
+                        );
+                    }
                     (
                         Some((session.cwd.clone(), session.manifest.clone())),
                         cleared,
@@ -1745,13 +1814,22 @@ impl SessionStore {
 
     /// Record the user's reasoning-effort pick for this session.
     /// `None` clears it (back to "use model default"). Returns false
-    /// if the session is unknown. In-memory only -- not persisted to
-    /// the manifest, by issue scope.
+    /// if the session is unknown. The session manifest still does not
+    /// persist this; the install-wide preference file is updated
+    /// separately so new sessions can inherit the last explicit pick.
     pub async fn set_reasoning_effort(&self, id: &str, effort: Option<String>) -> bool {
         let mut sessions = self.sessions.write().await;
         match sessions.get_mut(id) {
             Some(session) => {
                 session.selected_reasoning_effort = effort;
+                if let Err(e) = crate::setup_state::remember_last_reasoning_effort(
+                    session.selected_reasoning_effort.clone(),
+                ) {
+                    tracing::warn!(
+                        session_id = %id,
+                        "failed to persist last reasoning preference: {e:#}"
+                    );
+                }
                 true
             }
             None => false,
@@ -1895,6 +1973,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup_state::TestConfigHomeScope;
 
     /// Build an in-memory session that has NEVER been written to disk, then
     /// call `add_turn`. The append step must fail (because the zip file
@@ -2371,6 +2450,170 @@ mod tests {
         assert_eq!(manifest.model.as_deref(), Some("initial-model"));
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A persisted install-level preference should seed the next new session
+    /// with both the last model and the last supported reasoning effort.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_reuses_persisted_model_and_reasoning_effort() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_selection(
+            Some("model-b".to_string()),
+            Some("high".to_string()),
+        )
+        .expect("persist preferences");
+
+        let store = SessionStore::new("model-a".to_string());
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "model-a".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![ReasoningLevelPreset {
+                        effort: "medium".to_string(),
+                        description: "".to_string(),
+                    }],
+                },
+                ModelMetadata {
+                    id: "model-b".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![
+                        ReasoningLevelPreset {
+                            effort: "low".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "medium".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "high".to_string(),
+                            description: "".to_string(),
+                        },
+                    ],
+                },
+            ])
+            .await;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        assert_eq!(session.model, "model-b");
+        assert_eq!(session.selected_reasoning_effort.as_deref(), Some("high"));
+        let snap = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// If the saved model disappeared from the catalog, new sessions should
+    /// fall back to the current default/preferred model rather than failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_falls_back_to_default_model_when_persisted_model_is_missing() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_selection(
+            Some("ghost-model".to_string()),
+            Some("high".to_string()),
+        )
+        .expect("persist preferences");
+
+        let store = SessionStore::new("model-a".to_string());
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "model-a".to_string(),
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevelPreset {
+                        effort: "low".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "medium".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    },
+                ],
+            }])
+            .await;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        assert_eq!(session.model, "model-a");
+        assert_eq!(session.selected_reasoning_effort.as_deref(), Some("high"));
+        let snap = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// Unsupported saved reasoning should fall back to the chosen model's
+    /// default reasoning level on the first prompt.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_falls_back_to_model_default_when_reasoning_is_unsupported() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_selection(
+            Some("model-b".to_string()),
+            Some("xhigh".to_string()),
+        )
+        .expect("persist preferences");
+
+        let store = SessionStore::new("model-a".to_string());
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "model-a".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![ReasoningLevelPreset {
+                        effort: "medium".to_string(),
+                        description: "".to_string(),
+                    }],
+                },
+                ModelMetadata {
+                    id: "model-b".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![
+                        ReasoningLevelPreset {
+                            effort: "low".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "medium".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "high".to_string(),
+                            description: "".to_string(),
+                        },
+                    ],
+                },
+            ])
+            .await;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        assert_eq!(session.model, "model-b");
+        assert!(
+            session.selected_reasoning_effort.is_none(),
+            "unsupported reasoning should not be seeded explicitly"
+        );
+        let snap = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.reasoning_effort.as_deref(), Some("medium"));
     }
 
     /// `get_session` for an unknown id (with no on-disk zip either) must
