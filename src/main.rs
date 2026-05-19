@@ -212,7 +212,11 @@ fn build_ollama_backend() -> Arc<dyn LlmBackend> {
          models become available if/when the daemon responds",
         discovery::OLLAMA_DEFAULT_URL
     );
-    Arc::new(llm_client::OpenAiClient::new(chat_url, None))
+    Arc::new(llm_client::OpenAiClient::with_reasoning_support(
+        chat_url,
+        None,
+        reqwest::header::HeaderMap::new(),
+    ))
 }
 
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks

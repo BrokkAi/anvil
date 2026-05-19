@@ -127,9 +127,8 @@ fn model_config_option(current: &str, available_models: &[String]) -> Option<Ses
 }
 
 /// Build the reasoning-effort `SessionConfigOption` for the active model.
-/// Returns `None` when the model exposes no presets (e.g. an Ollama model
-/// or a Codex slug whose `supported_reasoning_levels` is empty) -- the
-/// dropdown is omitted entirely in that case rather than shown empty.
+/// Returns `None` when the model exposes no presets -- the dropdown is
+/// omitted entirely in that case rather than shown empty.
 ///
 /// Layout: an explicit "(default)" entry at the head represents "no user
 /// pick, server uses `default_reasoning_level`". The user's stored pick
@@ -193,8 +192,7 @@ fn reasoning_effort_config_option(
 /// selector is appended only when the LLM catalog is known; clients that
 /// drive model selection through the meta extension still see the current
 /// model via `meta.brokk.modelId`. The reasoning-effort selector is appended
-/// only when the active model publishes presets (Codex/ChatGPT models do,
-/// Ollama models don't).
+/// only when the active model publishes presets.
 fn all_config_options(
     behavior: SessionMode,
     permission: PermissionMode,
