@@ -389,12 +389,12 @@ impl WasmSandbox {
     fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
-        config.async_support(false);
         config.wasm_component_model(true);
 
-        let engine = wasmtime::Engine::new(&config).context("creating wasmtime engine")?;
+        let engine =
+            wasmtime::Engine::new(&config).map_err(|e| anyhow!("creating wasmtime engine: {e}"))?;
         let component = wasmtime::component::Component::from_binary(&engine, SANDBOX_WASM)
-            .context("loading sandbox wasm component")?;
+            .map_err(|e| anyhow!("loading sandbox wasm component: {e}"))?;
 
         Ok(Self {
             engine,
@@ -797,7 +797,7 @@ impl WasmSandbox {
         let mut req_bytes = serde_json::to_vec(req).context("serializing sandbox request")?;
         req_bytes.push(b'\n');
 
-        // wasmtime-wasi 27's sync API calls `tokio::Handle::block_on` for
+        // wasmtime-wasi's sync API calls `tokio::Handle::block_on` for
         // its async I/O (file open, preopen materialization, etc.). Most
         // of our callers run inside the ACP agent's tokio runtime, where
         // that panics with "Cannot start a runtime from within a runtime"
@@ -866,8 +866,12 @@ fn run_wasm_round_trip(
     preopen: Option<(&std::path::Path, &str)>,
 ) -> Result<String> {
     use wasmtime::{StoreLimits, StoreLimitsBuilder};
-    use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
-    use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+    use wasmtime_wasi::p2::add_to_linker_sync;
+    use wasmtime_wasi::p2::bindings::sync::Command;
+    use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+    use wasmtime_wasi::{
+        DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    };
 
     let stdin = MemoryInputPipe::new(req_bytes);
     let stdout = MemoryOutputPipe::new(MEMORY_LIMIT_BYTES);
@@ -886,9 +890,9 @@ fn run_wasm_round_trip(
     if let Some((host_dir, guest_mount)) = preopen {
         wasi_builder
             .preopened_dir(host_dir, guest_mount, DirPerms::READ, FilePerms::READ)
-            .with_context(|| {
-                format!(
-                    "preopening sandbox dir '{}' as '{guest_mount}'",
+            .map_err(|e| {
+                anyhow!(
+                    "preopening sandbox dir '{}' as '{guest_mount}': {e}",
                     host_dir.display()
                 )
             })?;
@@ -905,11 +909,11 @@ fn run_wasm_round_trip(
         limits: StoreLimits,
     }
     impl WasiView for Host {
-        fn ctx(&mut self) -> &mut WasiCtx {
-            &mut self.ctx
-        }
-        fn table(&mut self) -> &mut ResourceTable {
-            &mut self.table
+        fn ctx(&mut self) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: &mut self.ctx,
+                table: &mut self.table,
+            }
         }
     }
 
@@ -927,22 +931,21 @@ fn run_wasm_round_trip(
     store.limiter(|h| &mut h.limits);
     store
         .set_fuel(FUEL_PER_REQUEST)
-        .context("setting sandbox fuel")?;
+        .map_err(|e| anyhow!("setting sandbox fuel: {e}"))?;
 
     let mut linker = wasmtime::component::Linker::<Host>::new(engine);
-    wasmtime_wasi::add_to_linker_sync(&mut linker)
-        .context("wiring wasi imports into sandbox linker")?;
+    add_to_linker_sync(&mut linker)
+        .map_err(|e| anyhow!("wiring wasi imports into sandbox linker: {e}"))?;
 
     // Instantiate as a CLI command component (the binary's
     // `_start` is the entry point we want to run end-to-end).
-    let command =
-        wasmtime_wasi::bindings::sync::Command::instantiate(&mut store, component, &linker)
-            .context("instantiating sandbox component")?;
+    let command = Command::instantiate(&mut store, component, &linker)
+        .map_err(|e| anyhow!("instantiating sandbox component: {e}"))?;
 
     let run_result = command
         .wasi_cli_run()
         .call_run(&mut store)
-        .context("invoking wasi:cli/run on sandbox component")?;
+        .map_err(|e| anyhow!("invoking wasi:cli/run on sandbox component: {e}"))?;
     if run_result.is_err() {
         let stderr_bytes = stderr.contents();
         let stderr_text = String::from_utf8_lossy(&stderr_bytes);
@@ -1360,7 +1363,7 @@ mod tests {
         );
     }
 
-    /// Regression: wasmtime-wasi 27 sync API calls `Handle::block_on`
+    /// Regression: wasmtime-wasi's sync API calls `Handle::block_on`
     /// for its I/O, which panics with "Cannot start a runtime from
     /// within a runtime" if invoked from inside a tokio task. The ACP
     /// agent runs every request handler under `#[tokio::main]`, so
