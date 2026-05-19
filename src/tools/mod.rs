@@ -458,6 +458,19 @@ impl ToolRegistry {
         args: serde_json::Value,
         policy: SandboxPolicy,
     ) -> ToolResult {
+        self.execute_with_shell_notice(name, args, policy, false)
+            .await
+    }
+
+    /// Same as `execute`, but lets the caller attach a one-time shell audit
+    /// marker for `runShellCommand`. Other tools ignore the extra flag.
+    pub(crate) async fn execute_with_shell_notice(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        policy: SandboxPolicy,
+        outside_sandbox_once: bool,
+    ) -> ToolResult {
         match name {
             "think" => {
                 let thought = args.get("thought").and_then(|v| v.as_str()).unwrap_or("");
@@ -494,7 +507,8 @@ impl ToolRegistry {
                     .get("timeoutSeconds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(60);
-                shell::run_shell_command(&self.cwd, command, timeout, policy).await
+                shell::run_shell_command(&self.cwd, command, timeout, policy, outside_sandbox_once)
+                    .await
             }
             "activate_skill" => self.execute_activate_skill(args).await,
             // Any name not handled above is delegated to the bifrost

@@ -207,6 +207,23 @@ fn pure_gate_decision(
     PureGateDecision::Prompt
 }
 
+/// Decide which sandbox policy to use for an approved tool call.
+///
+/// A per-call shell override should only survive if the session still exists;
+/// if the session disappears between approval and execution, we fall back to
+/// `ReadOnly` and drop the override.
+fn resolve_execution_policy(
+    permission_mode: Option<PermissionMode>,
+    sandbox_policy_override: Option<SandboxPolicy>,
+) -> (SandboxPolicy, bool) {
+    match (sandbox_policy_override, permission_mode) {
+        (Some(policy), Some(_)) => (policy, true),
+        (Some(_), None) => (SandboxPolicy::ReadOnly, false),
+        (None, Some(mode)) => (SandboxPolicy::from_permission_mode(mode), false),
+        (None, None) => (SandboxPolicy::ReadOnly, false),
+    }
+}
+
 /// Run the agentic tool-calling loop.
 ///
 /// Sends messages to the LLM with tool definitions. If the LLM responds with
@@ -441,33 +458,34 @@ pub(crate) async fn run(
                             // If the session disappeared between gate-accept and exec
                             // (race), fail safe to ReadOnly: the gate already cleared
                             // the call but we no longer trust the mode lookup.
-                            // A per-call override means the user explicitly chose
-                            // to run this shell command outside the OS sandbox.
-                            let policy = match sandbox_policy_override {
-                                Some(policy) => policy,
-                                None => match sessions.permission_mode(&session_id).await {
-                                    Some(mode) => SandboxPolicy::from_permission_mode(mode),
-                                    None => {
-                                        tracing::warn!(
-                                            session_id,
-                                            tool_name,
-                                            "session vanished between gate-accept and exec; falling back to ReadOnly sandbox"
-                                        );
-                                        SandboxPolicy::ReadOnly
-                                    }
-                                },
-                            };
+                            let permission_mode = sessions.permission_mode(&session_id).await;
+                            if permission_mode.is_none() {
+                                tracing::warn!(
+                                    session_id,
+                                    tool_name,
+                                    outside_sandbox_once = sandbox_policy_override.is_some(),
+                                    "session vanished between gate-accept and exec; falling back to ReadOnly sandbox"
+                                );
+                            }
+                            let (policy, outside_sandbox_once) =
+                                resolve_execution_policy(permission_mode, sandbox_policy_override);
 
                             tracing::info!(
-                                "executing tool {} with args: {} (sandbox={:?})",
+                                "executing tool {} with args: {} (sandbox={:?}, outside_sandbox_once={})",
                                 tool_name,
                                 call.function.arguments,
-                                policy
+                                policy,
+                                outside_sandbox_once
                             );
 
-                            let exec =
-                                execute_tool(registry, &tool_name, parsed_input.clone(), policy)
-                                    .await;
+                            let exec = execute_tool(
+                                registry,
+                                &tool_name,
+                                parsed_input.clone(),
+                                policy,
+                                outside_sandbox_once,
+                            )
+                            .await;
 
                             // Build the terminal update -- Completed (with a
                             // Diff for writeFile when we have prior content)
@@ -672,8 +690,11 @@ async fn execute_tool(
     tool_name: &str,
     args: Value,
     policy: SandboxPolicy,
+    outside_sandbox_once: bool,
 ) -> ToolExecution {
-    let result = registry.execute(tool_name, args, policy).await;
+    let result = registry
+        .execute_with_shell_notice(tool_name, args, policy, outside_sandbox_once)
+        .await;
     let (status_prefix, failed) = match result.status {
         ToolStatus::Success => ("", false),
         ToolStatus::RequestError => ("Error: ", true),
@@ -909,6 +930,22 @@ mod tests {
                 allow_always: false,
                 sandbox_policy_override: Some(SandboxPolicy::None),
             }
+        );
+    }
+
+    #[test]
+    fn shell_outside_sandbox_choice_is_dropped_if_session_is_missing() {
+        assert_eq!(
+            resolve_execution_policy(None, Some(SandboxPolicy::None)),
+            (SandboxPolicy::ReadOnly, false)
+        );
+    }
+
+    #[test]
+    fn shell_outside_sandbox_choice_is_kept_when_session_is_present() {
+        assert_eq!(
+            resolve_execution_policy(Some(PermissionMode::Default), Some(SandboxPolicy::None)),
+            (SandboxPolicy::None, true)
         );
     }
 
