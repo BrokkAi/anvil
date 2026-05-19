@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -92,6 +92,22 @@ fn trim_history(history: &mut Vec<ConversationTurn>, max: usize) {
         history.drain(0..drain_to);
     }
 }
+
+/// Error returned when a session already has a prompt in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStartError {
+    AlreadyInFlight,
+}
+
+impl std::fmt::Display for PromptStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyInFlight => write!(f, "prompt already in flight"),
+        }
+    }
+}
+
+impl std::error::Error for PromptStartError {}
 
 fn select_session_model(
     persisted_model: Option<String>,
@@ -1864,12 +1880,12 @@ impl SessionStore {
     /// on-disk zip is unchanged on any failure path.
     ///
     /// Concurrency: callers must serialize `add_turn` per session. The agent
-    /// achieves this by holding the per-session cancellation token via
-    /// `start_prompt`/`finish_prompt` for the entire prompt-plus-persistence
-    /// window — `finish_prompt` runs *after* `add_turn` returns. Without
-    /// that ordering, a second `session/prompt` could push a new turn
-    /// between this turn's push and its rollback `pop()`, removing the
-    /// wrong entry.
+    /// achieves this by calling `start_prompt`, which refuses a second
+    /// in-flight prompt for the same session, and keeping that token alive
+    /// via `finish_prompt` for the entire prompt-plus-persistence window --
+    /// `finish_prompt` runs *after* `add_turn` returns. Without that
+    /// ordering, a second `session/prompt` could push a new turn between
+    /// this turn's push and its rollback `pop()`, removing the wrong entry.
     pub async fn add_turn(&self, id: &str, turn: ConversationTurn) -> anyhow::Result<()> {
         // Mutate in-memory state first, then release the lock BEFORE blocking I/O.
         // Capture pre-mutation `modified` so we can reverse the bump on failure.
@@ -1950,13 +1966,19 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    pub async fn start_prompt(&self, session_id: &str) -> CancellationToken {
+    pub async fn start_prompt(
+        &self,
+        session_id: &str,
+    ) -> Result<CancellationToken, PromptStartError> {
         let token = CancellationToken::new();
-        self.cancel_tokens
-            .write()
-            .await
-            .insert(session_id.to_string(), token.clone());
-        token
+        let mut cancel_tokens = self.cancel_tokens.write().await;
+        match cancel_tokens.entry(session_id.to_string()) {
+            Entry::Occupied(_) => Err(PromptStartError::AlreadyInFlight),
+            Entry::Vacant(entry) => {
+                entry.insert(token.clone());
+                Ok(token)
+            }
+        }
     }
 
     pub async fn cancel_prompt(&self, session_id: &str) {
@@ -2264,7 +2286,10 @@ mod tests {
             store.touch(id);
         }
         // "old" is the LRU candidate, but mark it in-flight so it's pinned.
-        let _token = store.start_prompt("old").await;
+        let _token = store
+            .start_prompt("old")
+            .await
+            .expect("in-flight session should register once");
 
         store.enforce_session_cap().await;
 
@@ -2729,7 +2754,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_prompt_lifecycle() {
         let store = SessionStore::new("m".to_string());
-        let token = store.start_prompt("s1").await;
+        let token = store
+            .start_prompt("s1")
+            .await
+            .expect("first prompt should start");
         assert!(!token.is_cancelled());
 
         store.cancel_prompt("s1").await;
@@ -2746,6 +2774,40 @@ mod tests {
     async fn cancel_prompt_unknown_session_is_noop() {
         let store = SessionStore::new("m".to_string());
         store.cancel_prompt("never-started").await;
+    }
+
+    /// `start_prompt` must reject a second in-flight prompt for the same
+    /// session instead of overwriting the original cancellation token.
+    #[tokio::test]
+    async fn start_prompt_rejects_concurrent_prompt_for_same_session() {
+        let store = SessionStore::new("m".to_string());
+        let token = store
+            .start_prompt("s1")
+            .await
+            .expect("first prompt should start");
+
+        let err = store
+            .start_prompt("s1")
+            .await
+            .expect_err("second prompt should be rejected");
+        assert_eq!(err, PromptStartError::AlreadyInFlight);
+        assert!(
+            !token.is_cancelled(),
+            "rejected concurrent prompt must not affect the active token"
+        );
+
+        store.cancel_prompt("s1").await;
+        assert!(
+            token.is_cancelled(),
+            "cancel_prompt should still target the active prompt token"
+        );
+
+        store.finish_prompt("s1").await;
+        let next = store
+            .start_prompt("s1")
+            .await
+            .expect("prompt should be restartable after finish");
+        assert!(!next.is_cancelled());
     }
 
     /// `set_default_model` flows into the next `create_session`. The

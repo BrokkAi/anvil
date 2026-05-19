@@ -24,7 +24,8 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatMessage, LlmBackend, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    ConversationTurn, PermissionMode, Session, SessionMode, SessionSnapshot, SessionStore,
+    ConversationTurn, PermissionMode, PromptStartError, Session, SessionMode, SessionSnapshot,
+    SessionStore,
 };
 
 /// Stable ids for our `SessionConfigOption` selectors. We expose both
@@ -1112,10 +1113,28 @@ pub async fn run_agent(
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                let messages = build_prompt_messages(&snap, &prompt_text);
+                // Create a cancellation token for this prompt. Reject a
+                // second in-flight prompt for the same session before we
+                // spawn any background work.
+                let cancel = match sessions_prompt.start_prompt(&session_id).await {
+                    Ok(cancel) => cancel,
+                    Err(PromptStartError::AlreadyInFlight) => {
+                        tracing::warn!(
+                            "rejecting concurrent ACP session/prompt session={session_id}"
+                        );
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(
+                                serde_json::json!({
+                                    "reason": format!(
+                                        "prompt already in flight for session '{session_id}'"
+                                    ),
+                                }),
+                            ),
+                        );
+                    }
+                };
 
-                // Create a cancellation token for this prompt
-                let cancel = sessions_prompt.start_prompt(&session_id).await;
+                let messages = build_prompt_messages(&snap, &prompt_text);
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
                 let registry = sessions_prompt
