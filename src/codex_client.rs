@@ -234,12 +234,16 @@ impl CodexClient {
             tools.as_deref(),
             reasoning_effort.as_deref(),
         );
+        // Keep the caller's sinks behind a mutex so a retry can build
+        // fresh FnMut wrappers without losing the live callbacks.
+        let shared_on_token = Arc::new(std::sync::Mutex::new(on_token));
+        let shared_on_thought = Arc::new(std::sync::Mutex::new(on_thought));
         match self
             .send_responses_request(
                 &creds,
                 &body,
-                on_token,
-                on_thought,
+                shared_sink_forwarder(shared_on_token.clone()),
+                shared_sink_forwarder(shared_on_thought.clone()),
                 cancel.clone(),
                 idle_timeout,
             )
@@ -249,17 +253,11 @@ impl CodexClient {
             Err(e) if is_unauthorized(&e) => {
                 tracing::info!("ChatGPT backend returned 401; refreshing tokens and retrying once");
                 let creds = self.force_refresh().await?;
-                // Caller's on_token/on_thought sinks are consumed by the first
-                // attempt; build no-op sinks for the retry so the trait stays
-                // FnMut-only. Streaming text from the retry still flows back
-                // via `LlmResponse::Text`.
-                let noop_token: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
-                let noop_thought: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
                 self.send_responses_request(
                     &creds,
                     &body,
-                    noop_token,
-                    noop_thought,
+                    shared_sink_forwarder(shared_on_token),
+                    shared_sink_forwarder(shared_on_thought),
                     cancel,
                     idle_timeout,
                 )
@@ -585,6 +583,17 @@ fn is_unauthorized(err: &anyhow::Error) -> bool {
         .find_map(|cause| cause.downcast_ref::<ChatGptHttpError>())
         .map(|e| e.status == reqwest::StatusCode::UNAUTHORIZED)
         .unwrap_or(false)
+}
+
+type SharedSink = Arc<std::sync::Mutex<Box<dyn FnMut(&str) + Send>>>;
+
+fn shared_sink_forwarder(shared: SharedSink) -> Box<dyn FnMut(&str) + Send> {
+    Box::new(move |value: &str| {
+        if let Ok(mut sink) = shared.lock() {
+            let sink = sink.as_mut();
+            sink(value);
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,6 +1090,12 @@ mod tests {
         Box::new(|_| {})
     }
 
+    fn shared_collecting_sink(buf: std::sync::Arc<std::sync::Mutex<String>>) -> SharedSink {
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(move |t: &str| {
+            buf.lock().unwrap().push_str(t)
+        })))
+    }
+
     #[test]
     fn build_request_collapses_system_messages_into_instructions() {
         let messages = vec![
@@ -1420,6 +1435,30 @@ mod tests {
         })
         .context("posting Responses API request");
         assert!(is_unauthorized(&err));
+    }
+
+    #[test]
+    fn shared_sink_forwarders_can_be_reused_after_a_retry() {
+        // The 401 retry path builds fresh wrappers on top of the same
+        // underlying sink so the second attempt keeps streaming into
+        // the live ACP client instead of a no-op callback.
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let thought = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let shared_text = shared_collecting_sink(text.clone());
+        let shared_thought = shared_collecting_sink(thought.clone());
+
+        let mut first_token = shared_sink_forwarder(shared_text.clone());
+        let mut retry_token = shared_sink_forwarder(shared_text);
+        let mut first_thought = shared_sink_forwarder(shared_thought.clone());
+        let mut retry_thought = shared_sink_forwarder(shared_thought);
+
+        first_token("hel");
+        first_thought("weigh ");
+        retry_token("lo");
+        retry_thought("options");
+
+        assert_eq!(text.lock().unwrap().as_str(), "hello");
+        assert_eq!(thought.lock().unwrap().as_str(), "weigh options");
     }
 
     #[test]
