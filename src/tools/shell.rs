@@ -2,6 +2,7 @@ use super::sandbox::{self, ENV_WHITELIST, SandboxPolicy};
 use super::{ToolResult, ToolStatus};
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
@@ -312,12 +313,100 @@ where
     }
 }
 
+async fn read_stream_to_end<R>(mut stream: R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn join_output_task(
+    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    label: &'static str,
+) -> Result<Vec<u8>, ToolResult> {
+    match task.await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(ToolResult {
+            status: ToolStatus::InternalError,
+            output: format!("Failed to read command {label}: {e}"),
+        }),
+        Err(e) => Err(ToolResult {
+            status: ToolStatus::InternalError,
+            output: format!("Command {label} task failed: {e}"),
+        }),
+    }
+}
+
+fn render_child_output(stdout: &[u8], stderr: &[u8], exit_code: i32) -> String {
+    let mut combined = String::new();
+
+    let stdout = String::from_utf8_lossy(stdout);
+    if !stdout.is_empty() {
+        combined.push_str(&stdout);
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push_str("\n--- stderr ---\n");
+        }
+        combined.push_str(&stderr);
+    }
+
+    if !combined.is_empty() {
+        return combined;
+    }
+
+    format!("Command completed with exit code {exit_code}")
+}
+
+fn prepend_notices(output: String, notices: &[String]) -> String {
+    if notices.is_empty() {
+        return output;
+    }
+
+    let prefix = notices.join("\n");
+    if output.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}\n\n{output}")
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> Option<String> {
+    let pgid = pid as libc::pid_t;
+    // SAFETY: `killpg` is async-signal-safe and only sends a signal to
+    // the already-spawned child process group. A failure here is not
+    // fatal to the server; we still kill the direct child below and let
+    // the timeout surface to the caller.
+    let ret = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if ret == 0 {
+        Some("Notice: shell process group was killed after the timeout.".to_string())
+    } else {
+        tracing::warn!(
+            pid,
+            error = %std::io::Error::last_os_error(),
+            "failed to kill shell process group after timeout"
+        );
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) -> Option<String> {
+    None
+}
+
 pub async fn run_shell_command(
     cwd: &Path,
     command: &str,
     timeout_seconds: u64,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
+    timeout_notice: Option<String>,
 ) -> ToolResult {
     if command.trim().is_empty() {
         return ToolResult {
@@ -385,11 +474,16 @@ pub async fn run_shell_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // If the wall-clock timeout fires below, dropping `cmd.output()`'s
-        // future tears down the Child; without `kill_on_drop`, tokio leaves
-        // a runaway/CPU-spinning child alive past timeout, holding the
-        // rlimit budget and consuming CPU until reaped some other way.
+        // Safety net if this function unwinds before the explicit timeout
+        // cleanup below. The timeout path kills the whole process group
+        // directly so background descendants do not survive.
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // Put the shell in its own process group so a timeout can kill the
+        // shell and any descendants that stayed in the same group.
+        cmd.process_group(0);
+    }
     for key in ENV_WHITELIST {
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
@@ -415,47 +509,79 @@ pub async fn run_shell_command(
         }
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), cmd.output()).await;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return ToolResult {
+                status: ToolStatus::InternalError,
+                output: format!("Failed to execute command: {e}"),
+            };
+        }
+    };
 
-    // `wrapped` MUST stay in scope until output() resolves so the
-    // TempPolicyFile Drop guard doesn't yank `sandbox-exec`'s `-f` profile
-    // mid-call. The explicit drop is a tripwire for refactors that might
-    // otherwise reuse `wrapped`'s name and shrink its lifetime.
+    // The sandbox wrapper only needs the temp policy file until the child
+    // has been spawned. Drop it now so a later timeout cannot accidentally
+    // outlive the wrapper file for no reason.
     drop(wrapped);
 
-    match result {
-        Ok(Ok(output)) => {
-            let mut combined = String::new();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return ToolResult {
+                status: ToolStatus::InternalError,
+                output: "Failed to capture command stdout".to_string(),
+            };
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            return ToolResult {
+                status: ToolStatus::InternalError,
+                output: "Failed to capture command stderr".to_string(),
+            };
+        }
+    };
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                combined.push_str(&stdout);
-            }
+    let stdout_task = tokio::spawn(read_stream_to_end(stdout));
+    let stderr_task = tokio::spawn(read_stream_to_end(stderr));
+    let child_pid = child.id();
 
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                if !combined.is_empty() {
-                    combined.push_str("\n--- stderr ---\n");
+    let wait_result =
+        tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await;
+
+    let mut notices = Vec::new();
+    if outside_sandbox_once {
+        notices.push(EXPLICIT_OUTSIDE_SANDBOX_NOTICE.to_string());
+    }
+    if let Some(notice) = timeout_notice {
+        notices.push(notice);
+    }
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            let stdout = match join_output_task(stdout_task, "stdout").await {
+                Ok(bytes) => bytes,
+                Err(result) => {
+                    stderr_task.abort();
+                    return result;
                 }
-                combined.push_str(&stderr);
-            }
+            };
+            let stderr = match join_output_task(stderr_task, "stderr").await {
+                Ok(bytes) => bytes,
+                Err(result) => return result,
+            };
 
-            let exit_code = output.status.code().unwrap_or(-1);
-            if !output.status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            let mut combined = render_child_output(&stdout, &stderr, exit_code);
+            if !status.success() {
                 combined.push_str(&format!("\n\nExit code: {exit_code}"));
                 #[cfg(unix)]
                 if exit_code == 127 {
                     combined.push_str(EXIT_127_HINT);
                 }
             }
-
-            if combined.is_empty() {
-                combined = format!("Command completed with exit code {exit_code}");
-            }
-
-            if outside_sandbox_once {
-                combined = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{combined}");
-            }
+            combined = prepend_notices(combined, &notices);
 
             if combined.len() > MAX_OUTPUT_BYTES {
                 combined.truncate(MAX_OUTPUT_BYTES);
@@ -468,7 +594,7 @@ pub async fn run_shell_command(
             }
 
             ToolResult {
-                status: if output.status.success() {
+                status: if status.success() {
                     ToolStatus::Success
                 } else {
                     ToolStatus::RequestError
@@ -476,15 +602,30 @@ pub async fn run_shell_command(
                 output: combined,
             }
         }
-        Ok(Err(e)) => ToolResult {
-            status: ToolStatus::InternalError,
-            output: format!("Failed to execute command: {e}"),
-        },
-        Err(_) => {
-            let mut msg = format!("Command timed out after {timeout_seconds}s");
-            if outside_sandbox_once {
-                msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
+        Ok(Err(e)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            ToolResult {
+                status: ToolStatus::InternalError,
+                output: format!("Failed to execute command: {e}"),
             }
+        }
+        Err(_) => {
+            if let Some(pid) = child_pid
+                && let Some(group_notice) = kill_process_group(pid)
+            {
+                notices.push(group_notice);
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+
+            let _ = join_output_task(stdout_task, "stdout").await;
+            let _ = join_output_task(stderr_task, "stderr").await;
+
+            let mut msg = prepend_notices(
+                format!("Command timed out after {timeout_seconds}s"),
+                &notices,
+            );
             if bypass_warning {
                 msg.push('\n');
                 msg.push_str(SANDBOX_BYPASS_WARNING);
@@ -501,6 +642,7 @@ pub async fn run_shell_command(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::sync::Mutex;
 
     /// Serializes tests that mutate process-wide env vars. `cargo test`
@@ -540,6 +682,10 @@ mod tests {
                 std::env::remove_var(self.var);
             }
         }
+    }
+
+    fn shell_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 
     #[test]
@@ -633,7 +779,7 @@ mod tests {
             target.display()
         );
 
-        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false).await;
+        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false, None).await;
         let written = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&target);
 
@@ -666,7 +812,7 @@ mod tests {
             target.display()
         );
 
-        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false).await;
+        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false, None).await;
         let _ = std::fs::remove_file(&target);
 
         assert!(
@@ -690,6 +836,7 @@ mod tests {
             30,
             SandboxPolicy::None,
             false,
+            None,
         )
         .await;
         assert!(
@@ -711,8 +858,15 @@ mod tests {
     async fn shell_exit_zero_omits_hint() {
         let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
-        let result =
-            run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None, false).await;
+        let result = run_shell_command(
+            &dir,
+            "echo hello-brokk",
+            30,
+            SandboxPolicy::None,
+            false,
+            None,
+        )
+        .await;
         assert!(
             matches!(result.status, ToolStatus::Success),
             "echo must succeed; got: {}",
@@ -729,12 +883,56 @@ mod tests {
     async fn explicit_outside_sandbox_once_adds_audit_notice() {
         let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
-        let result =
-            run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None, true).await;
+        let result = run_shell_command(
+            &dir,
+            "echo hello-brokk",
+            30,
+            SandboxPolicy::None,
+            true,
+            None,
+        )
+        .await;
         assert!(
             result.output.starts_with(EXPLICIT_OUTSIDE_SANDBOX_NOTICE),
             "explicit outside-sandbox runs must prefix an audit notice; got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_shell_process_group() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir();
+        let target: PathBuf = dir.join(format!("brokk-shell-process-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&target);
+        let command = format!(
+            "sh -c \"sleep 2; touch {}\" & sleep 10",
+            shell_quote(&target.display().to_string())
+        );
+
+        let result = run_shell_command(&dir, &command, 1, SandboxPolicy::None, false, None).await;
+        assert!(
+            matches!(result.status, ToolStatus::RequestError),
+            "timed out commands should return RequestError; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Command timed out after 1s"),
+            "timeout message should report the effective timeout; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("process group was killed"),
+            "timeout output should say the process group was killed; got: {}",
+            result.output
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !target.exists(),
+            "background child should not survive the timeout and create {}",
+            target.display()
+        );
+        let _ = std::fs::remove_file(&target);
     }
 }

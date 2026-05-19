@@ -235,6 +235,25 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "runShellCommand",
 ];
 
+/// Server-side wall-clock cap for `runShellCommand.timeoutSeconds`.
+///
+/// The model can request a larger timeout, but the server clamps it to
+/// this documented maximum before launching the shell.
+const MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS: u64 = 600;
+
+fn clamp_run_shell_timeout(requested: u64) -> (u64, Option<String>) {
+    if requested <= MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS {
+        return (requested, None);
+    }
+
+    (
+        MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS,
+        Some(format!(
+            "Notice: requested `timeoutSeconds` value of {requested}s was clamped to the server maximum of {MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS}s."
+        )),
+    )
+}
+
 /// Unified tool registry: filesystem tools + shell + think + (optionally)
 /// bifrost code-intelligence tools + Agent Skills activation.
 ///
@@ -382,7 +401,7 @@ impl ToolRegistry {
             ),
             tool_def(
                 "runShellCommand",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Use for build, test, git, or other CLI operations.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. The `timeoutSeconds` field is clamped server-side to 600s. Use for build, test, git, or other CLI operations.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -393,7 +412,8 @@ impl ToolRegistry {
                         "timeoutSeconds": {
                             "type": "integer",
                             "default": 60,
-                            "description": "Maximum execution time in seconds."
+                            "maximum": MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS,
+                            "description": "Maximum execution time in seconds. Server-clamped to 600s."
                         }
                     },
                     "required": ["command"]
@@ -503,12 +523,20 @@ impl ToolRegistry {
             }
             "runShellCommand" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                let timeout = args
+                let timeout_requested = args
                     .get("timeoutSeconds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(60);
-                shell::run_shell_command(&self.cwd, command, timeout, policy, outside_sandbox_once)
-                    .await
+                let (timeout, timeout_notice) = clamp_run_shell_timeout(timeout_requested);
+                shell::run_shell_command(
+                    &self.cwd,
+                    command,
+                    timeout,
+                    policy,
+                    outside_sandbox_once,
+                    timeout_notice,
+                )
+                .await
             }
             "activate_skill" => self.execute_activate_skill(args).await,
             // Any name not handled above is delegated to the bifrost
@@ -911,6 +939,33 @@ mod tests {
         assert!(matches!(result.status, ToolStatus::RequestError));
         assert!(result.output.contains("Unknown skill 'nonexistent'"));
         assert!(result.output.contains("real-skill"));
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_timeout_is_clamped_and_reported() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute(
+                "runShellCommand",
+                json!({
+                    "command": "echo clamp-check",
+                    "timeoutSeconds": MAX_RUN_SHELL_COMMAND_TIMEOUT_SECS + 1,
+                }),
+                SandboxPolicy::None,
+            )
+            .await;
+
+        assert!(matches!(result.status, ToolStatus::Success));
+        assert!(
+            result.output.contains("clamped to the server maximum"),
+            "clamped timeout should be surfaced in the tool output; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("clamp-check"),
+            "command output should still be preserved; got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
