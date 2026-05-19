@@ -519,10 +519,11 @@ pub async fn run_shell_command(
         }
     };
 
-    // The sandbox wrapper only needs the temp policy file until the child
-    // has been spawned. Drop it now so a later timeout cannot accidentally
-    // outlive the wrapper file for no reason.
-    drop(wrapped);
+    // Keep the temp policy file alive until the function exits.
+    // macOS sandbox-exec reads the Seatbelt profile from the path passed
+    // via `-f`, so dropping it immediately after spawn can delete the file
+    // before sandbox-exec has opened it.
+    let _wrapped_guard = wrapped;
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
