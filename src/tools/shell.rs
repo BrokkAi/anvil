@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::process::Command;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
+const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
+    "Notice: this command was explicitly approved to run outside the OS sandbox once.";
 
 const SANDBOX_BYPASS_WARNING: &str = "[WARNING] OS sandbox unavailable on this platform; the command above ran without one. \
      Install bubblewrap (`apt install bubblewrap`) on Linux to enable kernel-enforced isolation.\n";
@@ -315,6 +317,7 @@ pub async fn run_shell_command(
     command: &str,
     timeout_seconds: u64,
     policy: SandboxPolicy,
+    outside_sandbox_once: bool,
 ) -> ToolResult {
     if command.trim().is_empty() {
         return ToolResult {
@@ -437,11 +440,6 @@ pub async fn run_shell_command(
                 combined.push_str(&stderr);
             }
 
-            if combined.len() > MAX_OUTPUT_BYTES {
-                combined.truncate(MAX_OUTPUT_BYTES);
-                combined.push_str("\n... output truncated");
-            }
-
             let exit_code = output.status.code().unwrap_or(-1);
             if !output.status.success() {
                 combined.push_str(&format!("\n\nExit code: {exit_code}"));
@@ -449,6 +447,19 @@ pub async fn run_shell_command(
                 if exit_code == 127 {
                     combined.push_str(EXIT_127_HINT);
                 }
+            }
+
+            if combined.is_empty() {
+                combined = format!("Command completed with exit code {exit_code}");
+            }
+
+            if outside_sandbox_once {
+                combined = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{combined}");
+            }
+
+            if combined.len() > MAX_OUTPUT_BYTES {
+                combined.truncate(MAX_OUTPUT_BYTES);
+                combined.push_str("\n... output truncated");
             }
 
             if bypass_warning {
@@ -462,16 +473,7 @@ pub async fn run_shell_command(
                 } else {
                     ToolStatus::RequestError
                 },
-                output: if combined.is_empty() {
-                    let mut s = format!("Command completed with exit code {exit_code}");
-                    if bypass_warning {
-                        s.push('\n');
-                        s.push_str(SANDBOX_BYPASS_WARNING);
-                    }
-                    s
-                } else {
-                    combined
-                },
+                output: combined,
             }
         }
         Ok(Err(e)) => ToolResult {
@@ -480,6 +482,9 @@ pub async fn run_shell_command(
         },
         Err(_) => {
             let mut msg = format!("Command timed out after {timeout_seconds}s");
+            if outside_sandbox_once {
+                msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
+            }
             if bypass_warning {
                 msg.push('\n');
                 msg.push_str(SANDBOX_BYPASS_WARNING);
@@ -628,7 +633,7 @@ mod tests {
             target.display()
         );
 
-        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None).await;
+        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false).await;
         let written = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&target);
 
@@ -661,7 +666,7 @@ mod tests {
             target.display()
         );
 
-        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None).await;
+        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false).await;
         let _ = std::fs::remove_file(&target);
 
         assert!(
@@ -684,6 +689,7 @@ mod tests {
             "nonexistent_brokk_acp_command_xyz_qqq_42",
             30,
             SandboxPolicy::None,
+            false,
         )
         .await;
         assert!(
@@ -705,7 +711,8 @@ mod tests {
     async fn shell_exit_zero_omits_hint() {
         let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
-        let result = run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None).await;
+        let result =
+            run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None, false).await;
         assert!(
             matches!(result.status, ToolStatus::Success),
             "echo must succeed; got: {}",
@@ -714,6 +721,19 @@ mod tests {
         assert!(
             !result.output.contains("Hint: exit 127"),
             "successful command must not contain exit-127 hint; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_outside_sandbox_once_adds_audit_notice() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir();
+        let result =
+            run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None, true).await;
+        assert!(
+            result.output.starts_with(EXPLICIT_OUTSIDE_SANDBOX_NOTICE),
+            "explicit outside-sandbox runs must prefix an audit notice; got: {}",
             result.output
         );
     }

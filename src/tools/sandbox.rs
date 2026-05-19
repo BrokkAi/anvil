@@ -65,8 +65,8 @@ impl SandboxPolicy {
     /// "Allow" prompt into a no-op for shell writes and contradicted the
     /// README contract ("Prompts the user for approval before every mutating
     /// tool call"). `ReadOnly` mode still maps to `ReadOnly` for "no writes
-    /// at all", and `BypassPermissions` is the explicit opt-out from
-    /// sandboxing entirely.
+    /// at all", and `BypassPermissions` is the explicit session-level opt-out
+    /// from sandboxing entirely.
     pub fn from_permission_mode(mode: PermissionMode) -> Self {
         match mode {
             PermissionMode::BypassPermissions => Self::None,

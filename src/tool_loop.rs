@@ -33,6 +33,77 @@ fn requires_per_call_prompt(tool_name: &str) -> bool {
     tool_name == "runShellCommand"
 }
 
+/// Result of approving a permission request.
+///
+/// `allow_always` is only used for non-shell tools. Shell commands always
+/// re-prompt, but they can optionally request a one-time escape from the OS
+/// sandbox for the approved invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionGrant {
+    allow_always: bool,
+    sandbox_policy_override: Option<SandboxPolicy>,
+}
+
+fn permission_options(tool_name: &str) -> Vec<PermissionOption> {
+    let mut options = Vec::with_capacity(3);
+    if requires_per_call_prompt(tool_name) {
+        options.push(PermissionOption::new(
+            PermissionOptionId::new("allow"),
+            "Allow in sandbox",
+            PermissionOptionKind::AllowOnce,
+        ));
+        options.push(PermissionOption::new(
+            PermissionOptionId::new("allow_outside_sandbox"),
+            "Run outside sandbox once",
+            PermissionOptionKind::AllowOnce,
+        ));
+    } else {
+        options.push(PermissionOption::new(
+            PermissionOptionId::new("allow_always"),
+            format!("Always allow {tool_name}"),
+            PermissionOptionKind::AllowAlways,
+        ));
+        options.push(PermissionOption::new(
+            PermissionOptionId::new("allow"),
+            "Allow",
+            PermissionOptionKind::AllowOnce,
+        ));
+    }
+    options.push(PermissionOption::new(
+        PermissionOptionId::new("reject"),
+        "Reject",
+        PermissionOptionKind::RejectOnce,
+    ));
+    options
+}
+
+fn permission_grant_for_selection(
+    tool_name: &str,
+    option_id: &str,
+) -> Result<PermissionGrant, String> {
+    match option_id {
+        "allow_always" if !requires_per_call_prompt(tool_name) => Ok(PermissionGrant {
+            allow_always: true,
+            sandbox_policy_override: None,
+        }),
+        "allow" => Ok(PermissionGrant {
+            allow_always: false,
+            sandbox_policy_override: None,
+        }),
+        "allow_outside_sandbox" if requires_per_call_prompt(tool_name) => Ok(PermissionGrant {
+            allow_always: false,
+            sandbox_policy_override: Some(SandboxPolicy::None),
+        }),
+        "reject" => Err("Tool use denied by user.".to_string()),
+        other => {
+            tracing::warn!(
+                "request_permission returned unknown option id '{other}'; treating as reject"
+            );
+            Err("Tool use denied (unknown option selected).".to_string())
+        }
+    }
+}
+
 /// Shared text-emit callback. Held behind `Arc<Mutex<>>` so it can be cloned
 /// into each streaming turn's `Box<dyn FnMut>` without being consumed.
 pub type TextSink = Arc<Mutex<dyn FnMut(&str) + Send>>;
@@ -40,7 +111,9 @@ pub type TextSink = Arc<Mutex<dyn FnMut(&str) + Send>>;
 /// Outcome of consulting the permission gate before executing a tool.
 enum GateDecision {
     /// Run the tool without prompting.
-    Allow,
+    Allow {
+        sandbox_policy_override: Option<SandboxPolicy>,
+    },
     /// Refuse the call; feed the LLM the given denial message instead.
     Reject(String),
 }
@@ -132,6 +205,23 @@ fn pure_gate_decision(
     }
 
     PureGateDecision::Prompt
+}
+
+/// Decide which sandbox policy to use for an approved tool call.
+///
+/// A per-call shell override should only survive if the session still exists;
+/// if the session disappears between approval and execution, we fall back to
+/// `ReadOnly` and drop the override.
+fn resolve_execution_policy(
+    permission_mode: Option<PermissionMode>,
+    sandbox_policy_override: Option<SandboxPolicy>,
+) -> (SandboxPolicy, bool) {
+    match (sandbox_policy_override, permission_mode) {
+        (Some(policy), Some(_)) => (policy, true),
+        (Some(_), None) => (SandboxPolicy::ReadOnly, false),
+        (None, Some(mode)) => (SandboxPolicy::from_permission_mode(mode), false),
+        (None, None) => (SandboxPolicy::ReadOnly, false),
+    }
 }
 
 /// Run the agentic tool-calling loop.
@@ -341,7 +431,9 @@ pub(crate) async fn run(
                             );
                             message
                         }
-                        GateDecision::Allow => {
+                        GateDecision::Allow {
+                            sandbox_policy_override,
+                        } => {
                             send_session_update(
                                 spawned_cx.cx(),
                                 &session_id,
@@ -366,28 +458,34 @@ pub(crate) async fn run(
                             // If the session disappeared between gate-accept and exec
                             // (race), fail safe to ReadOnly: the gate already cleared
                             // the call but we no longer trust the mode lookup.
-                            let policy = match sessions.permission_mode(&session_id).await {
-                                Some(mode) => SandboxPolicy::from_permission_mode(mode),
-                                None => {
-                                    tracing::warn!(
-                                        session_id,
-                                        tool_name,
-                                        "session vanished between gate-accept and exec; falling back to ReadOnly sandbox"
-                                    );
-                                    SandboxPolicy::ReadOnly
-                                }
-                            };
+                            let permission_mode = sessions.permission_mode(&session_id).await;
+                            if permission_mode.is_none() {
+                                tracing::warn!(
+                                    session_id,
+                                    tool_name,
+                                    outside_sandbox_once = sandbox_policy_override.is_some(),
+                                    "session vanished between gate-accept and exec; falling back to ReadOnly sandbox"
+                                );
+                            }
+                            let (policy, outside_sandbox_once) =
+                                resolve_execution_policy(permission_mode, sandbox_policy_override);
 
                             tracing::info!(
-                                "executing tool {} with args: {} (sandbox={:?})",
+                                "executing tool {} with args: {} (sandbox={:?}, outside_sandbox_once={})",
                                 tool_name,
                                 call.function.arguments,
-                                policy
+                                policy,
+                                outside_sandbox_once
                             );
 
-                            let exec =
-                                execute_tool(registry, &tool_name, parsed_input.clone(), policy)
-                                    .await;
+                            let exec = execute_tool(
+                                registry,
+                                &tool_name,
+                                parsed_input.clone(),
+                                policy,
+                                outside_sandbox_once,
+                            )
+                            .await;
 
                             // Build the terminal update -- Completed (with a
                             // Diff for writeFile when we have prior content)
@@ -466,7 +564,9 @@ async fn consult_gate(
     let is_always_allowed = sessions.is_always_allowed(session_id, tool_name).await;
 
     match pure_gate_decision(mode, kind, tool_name, is_always_allowed) {
-        PureGateDecision::Allow => GateDecision::Allow,
+        PureGateDecision::Allow => GateDecision::Allow {
+            sandbox_policy_override: None,
+        },
         PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
         PureGateDecision::Prompt => {
             match request_user_permission(
@@ -480,14 +580,16 @@ async fn consult_gate(
             )
             .await
             {
-                Ok(allow_always) => {
+                Ok(grant) => {
                     // Even if a (stale or buggy) client returns allow_always for a
                     // per-call-prompt tool, refuse to persist it. Awaited inline so
                     // the next tool call in the same batch sees the updated set.
-                    if allow_always && !requires_per_call_prompt(tool_name) {
+                    if grant.allow_always && !requires_per_call_prompt(tool_name) {
                         sessions.add_always_allow(session_id, tool_name).await;
                     }
-                    GateDecision::Allow
+                    GateDecision::Allow {
+                        sandbox_policy_override: grant.sandbox_policy_override,
+                    }
                 }
                 Err(reason) => GateDecision::Reject(reason),
             }
@@ -496,7 +598,7 @@ async fn consult_gate(
 }
 
 /// Send `session/request_permission` to the client and await the outcome.
-/// Returns `Ok(allow_always)` if the user approved (with or without remembering),
+/// Returns `Ok(grant)` if the user approved (with or without remembering),
 /// or `Err(reason)` describing the rejection or transport failure.
 async fn request_user_permission(
     spawned_cx: &SpawnedCx<'_>,
@@ -506,7 +608,7 @@ async fn request_user_permission(
     kind: ToolKind,
     tool_call_id: &str,
     raw_input: &Value,
-) -> Result<bool, String> {
+) -> Result<PermissionGrant, String> {
     // The permission modal needs to show *what* is being approved, not just
     // the tool kind. Reuse the same title-builder the standalone tool-call
     // card uses so e.g. ``Run `cargo test` `` appears in the prompt.
@@ -517,24 +619,7 @@ async fn request_user_permission(
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 
-    let mut options = Vec::with_capacity(3);
-    if !requires_per_call_prompt(tool_name) {
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow_always"),
-            format!("Always allow {tool_name}"),
-            PermissionOptionKind::AllowAlways,
-        ));
-    }
-    options.push(PermissionOption::new(
-        PermissionOptionId::new("allow"),
-        "Allow",
-        PermissionOptionKind::AllowOnce,
-    ));
-    options.push(PermissionOption::new(
-        PermissionOptionId::new("reject"),
-        "Reject",
-        PermissionOptionKind::RejectOnce,
-    ));
+    let options = permission_options(tool_name);
 
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
 
@@ -573,17 +658,7 @@ async fn request_user_permission(
         Ok(resp) => match resp.outcome {
             RequestPermissionOutcome::Selected(selected) => {
                 let id: &str = &selected.option_id.0;
-                match id {
-                    "allow_always" => Ok(true),
-                    "allow" => Ok(false),
-                    "reject" => Err("Tool use denied by user.".to_string()),
-                    other => {
-                        tracing::warn!(
-                            "request_permission returned unknown option id '{other}'; treating as reject"
-                        );
-                        Err("Tool use denied (unknown option selected).".to_string())
-                    }
-                }
+                permission_grant_for_selection(tool_name, id)
             }
             RequestPermissionOutcome::Cancelled => Err(
                 "Tool use denied: the prompt was cancelled before the user responded.".to_string(),
@@ -615,8 +690,11 @@ async fn execute_tool(
     tool_name: &str,
     args: Value,
     policy: SandboxPolicy,
+    outside_sandbox_once: bool,
 ) -> ToolExecution {
-    let result = registry.execute(tool_name, args, policy).await;
+    let result = registry
+        .execute_with_shell_notice(tool_name, args, policy, outside_sandbox_once)
+        .await;
     let (status_prefix, failed) = match result.status {
         ToolStatus::Success => ("", false),
         ToolStatus::RequestError => ("Error: ", true),
@@ -821,6 +899,82 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[test]
+    fn shell_permission_prompt_includes_explicit_outside_sandbox_choice() {
+        let options = permission_options("runShellCommand");
+        let labels: Vec<_> = options
+            .iter()
+            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                ("allow", "Allow in sandbox"),
+                ("allow_outside_sandbox", "Run outside sandbox once"),
+                ("reject", "Reject"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_outside_sandbox_choice_maps_to_policy_override() {
+        let grant = permission_grant_for_selection("runShellCommand", "allow_outside_sandbox")
+            .expect("shell override should be accepted");
+
+        assert_eq!(
+            grant,
+            PermissionGrant {
+                allow_always: false,
+                sandbox_policy_override: Some(SandboxPolicy::None),
+            }
+        );
+    }
+
+    #[test]
+    fn shell_outside_sandbox_choice_is_dropped_if_session_is_missing() {
+        assert_eq!(
+            resolve_execution_policy(None, Some(SandboxPolicy::None)),
+            (SandboxPolicy::ReadOnly, false)
+        );
+    }
+
+    #[test]
+    fn shell_outside_sandbox_choice_is_kept_when_session_is_present() {
+        assert_eq!(
+            resolve_execution_policy(Some(PermissionMode::Default), Some(SandboxPolicy::None)),
+            (SandboxPolicy::None, true)
+        );
+    }
+
+    #[test]
+    fn non_shell_permission_prompt_keeps_sticky_allow_and_no_override() {
+        let options = permission_options("writeFile");
+        let labels: Vec<_> = options
+            .iter()
+            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                ("allow_always", "Always allow writeFile"),
+                ("allow", "Allow"),
+                ("reject", "Reject"),
+            ]
+        );
+
+        let grant = permission_grant_for_selection("writeFile", "allow_always")
+            .expect("non-shell sticky allow should still be accepted");
+        assert_eq!(
+            grant,
+            PermissionGrant {
+                allow_always: true,
+                sandbox_policy_override: None,
+            }
+        );
     }
 
     #[test]
