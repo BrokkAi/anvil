@@ -10,6 +10,7 @@ mod agents_md;
 mod bifrost_client;
 mod codex_auth;
 mod codex_client;
+mod context_manager;
 mod discovery;
 mod llm_client;
 mod multi_backend;
