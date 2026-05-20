@@ -121,6 +121,21 @@ and `ContextManager.compressHistoryAsync(Context)`. Differences:
 | Trigger | UI button + automatic in `ArchitectAgent` | `/compress` slash command + automatic per-prompt threshold |
 | Oversized turn | `compressHistory` returns the original on failure | `summarize_turn` chunks and recurses; returns `Err` only on actual LLM/network failure |
 
+## Concurrency
+
+Chunk summarization within `summarize_turn_hierarchical` and the
+recursive meta path in `combine_chunk_summaries` both run through
+`summarize_chunks_parallel`, which uses `futures::buffered(N)` with
+`MAX_CONCURRENT_CHUNK_REQUESTS = 2` to keep up to two chunk requests
+in flight at once. The cap is intentionally low: raising it without
+a per-backend rate-limit story will trigger `429`s on long compress
+runs.
+
+`buffered` preserves submission order, so the combine step sees
+chunk summaries in chronological turn order. `try_collect`
+short-circuits on the first `Err` so a single chunk failure aborts
+the rest of the run rather than burning credits on doomed work.
+
 ## Open follow-ups
 
 - **No input-time gate.** Anvil could add one (ACP's `session/prompt`
@@ -131,10 +146,9 @@ and `ContextManager.compressHistoryAsync(Context)`. Differences:
   many LLM calls (one per chunk + meta). We report verbatim-vs-summary
   token tallies but don't expose dollar/credit cost.
 - **Summarizer model selection.** Today summarization uses the
-  session's active model with `reasoning_effort: "low"`. Brokk has a
-  separate `summarizeModel()` configurable; we could too, in
-  `/setup advanced`.
-- **Parallel chunk summarization.** Brokk fans out via
-  `compressHistoryAsync`. Anvil's chunk loop is sequential because
-  the user is waiting interactively, but for very long sessions on
-  fast backends this could be sped up.
+  session's active model with `reasoning_effort: "low"`. A
+  `/setup advanced` knob would let users route summarization to a
+  cheaper model.
+- **Provider-aware concurrency.** Once we have provider-level rate
+  awareness, `MAX_CONCURRENT_CHUNK_REQUESTS` can be lifted (or made
+  per-backend) to speed up long compress runs.

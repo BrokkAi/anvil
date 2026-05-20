@@ -30,11 +30,20 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, StreamChatRequest};
 use crate::session::ConversationTurn;
 use crate::tokens::{approximate_tokens, approximate_tokens_messages};
+
+/// Maximum number of summarization LLM calls in flight at one time.
+/// Keeps `/compress` and the auto-trigger from saturating provider
+/// rate limits when a turn fans out into many chunks. Two is a
+/// conservative default that avoids `429`s on the common providers
+/// without forcing a per-backend rate-limit story; raise once Anvil
+/// has provider-aware throttling.
+const MAX_CONCURRENT_CHUNK_REQUESTS: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Budget math
@@ -127,18 +136,8 @@ async fn summarize_turn_hierarchical(
         anyhow::bail!("split_turn_to_chunks returned no chunks (turn had no content?)");
     }
 
-    let chunk_count = chunks.len();
-    let mut chunk_summaries: Vec<String> = Vec::with_capacity(chunk_count);
-    for (i, chunk_text) in chunks.iter().enumerate() {
-        if cancel.is_cancelled() {
-            anyhow::bail!("summarization cancelled");
-        }
-        let part_label = format!("{} of {}", i + 1, chunk_count);
-        let messages = build_chunk_summarization_messages(chunk_text, &part_label);
-        let summary =
-            run_summarization_request(llm, model, messages, idle_timeout, cancel.clone()).await?;
-        chunk_summaries.push(summary);
-    }
+    let chunk_summaries =
+        summarize_chunks_parallel(llm, model, &chunks, idle_timeout, cancel.clone()).await?;
 
     // Combine via a meta-summarization pass. Each chunk summary is
     // small (~bullets-only output), so the combined input is usually
@@ -146,6 +145,53 @@ async fn summarize_turn_hierarchical(
     // where even the combined summaries overrun -- e.g. 100+ chunks
     // each producing several KB of bullets.
     combine_chunk_summaries(llm, model, &chunk_summaries, budget, idle_timeout, cancel).await
+}
+
+/// Drive `MAX_CONCURRENT_CHUNK_REQUESTS` chunk summarizations
+/// concurrently against the LLM, preserving submission order in the
+/// returned vec. `buffered(N)` polls at most N futures at a time and
+/// yields results in input order; `try_collect` short-circuits on
+/// the first error so a 429 / network fail aborts the rest of the
+/// run rather than burning credits on doomed work.
+async fn summarize_chunks_parallel(
+    llm: &dyn LlmBackend,
+    model: &str,
+    chunks: &[String],
+    idle_timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<Vec<String>> {
+    let chunk_count = chunks.len();
+    // Pre-build the per-chunk messages synchronously so the futures
+    // dispatched to `buffered` carry only owned data. Capturing `&str`
+    // model and `&[String]` chunks across the closure boundary makes
+    // the compiler's auto-trait inference of `Send` on the resulting
+    // future too narrow (it picks a concrete lifetime instead of a
+    // higher-ranked one, breaking downstream `Send` bounds in the
+    // ACP dispatch path).
+    let prepared: Vec<Vec<ChatMessage>> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk_text)| {
+            let part_label = format!("{} of {}", i + 1, chunk_count);
+            build_chunk_summarization_messages(chunk_text, &part_label)
+        })
+        .collect();
+    let model = model.to_string();
+    let summaries: Vec<String> = stream::iter(prepared)
+        .map(|messages| {
+            let cancel = cancel.clone();
+            let model = model.clone();
+            async move {
+                if cancel.is_cancelled() {
+                    anyhow::bail!("summarization cancelled");
+                }
+                run_summarization_request(llm, &model, messages, idle_timeout, cancel).await
+            }
+        })
+        .buffered(MAX_CONCURRENT_CHUNK_REQUESTS)
+        .try_collect()
+        .await?;
+    Ok(summaries)
 }
 
 /// Run one meta-summarization pass over a list of chunk summaries.
@@ -177,18 +223,8 @@ async fn combine_chunk_summaries(
         // turn stays uncompressed rather than looping forever.
         anyhow::bail!("combined chunk summaries do not fit in budget and cannot be split further");
     }
-    let sub_count = sub_chunks.len();
-    let mut sub_summaries: Vec<String> = Vec::with_capacity(sub_count);
-    for (i, chunk_text) in sub_chunks.iter().enumerate() {
-        if cancel.is_cancelled() {
-            anyhow::bail!("summarization cancelled");
-        }
-        let part_label = format!("meta {} of {}", i + 1, sub_count);
-        let messages = build_chunk_summarization_messages(chunk_text, &part_label);
-        let s =
-            run_summarization_request(llm, model, messages, idle_timeout, cancel.clone()).await?;
-        sub_summaries.push(s);
-    }
+    let sub_summaries =
+        summarize_chunks_parallel(llm, model, &sub_chunks, idle_timeout, cancel.clone()).await?;
     // Box the recursive future so the compiler doesn't try to
     // construct an infinite-size Future type. The recursion depth is
     // bounded by how aggressively `split_plain_text_to_chunks`
@@ -926,6 +962,102 @@ mod tests {
         assert!(
             (1..10).contains(&count),
             "should have made some calls but stopped early, got {count}"
+        );
+    }
+
+    /// Parallel chunk summarization must not exceed
+    /// `MAX_CONCURRENT_CHUNK_REQUESTS` in-flight requests at any
+    /// instant. Without the cap a long compress run would fan out
+    /// to N parallel calls and trip provider rate limits (`429`s).
+    /// The test backend tracks active call count via an
+    /// atomic-style counter and asserts the high-water mark equals
+    /// the cap (not just ≤; with enough chunks we expect the cap to
+    /// be saturated).
+    #[tokio::test]
+    async fn parallel_chunk_summarization_honors_concurrency_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConcurrencyTrackingBackend {
+            in_flight: Arc<AtomicUsize>,
+            high_water: Arc<AtomicUsize>,
+            meta_response: String,
+            chunk_response: String,
+        }
+        impl LlmBackend for ConcurrencyTrackingBackend {
+            fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+                async { Ok(vec!["mock".into()]) }.boxed()
+            }
+            fn stream_chat(
+                &self,
+                request: StreamChatRequest,
+            ) -> BoxFuture<'_, Result<LlmResponse>> {
+                // Increment in-flight on entry, bump the high-water
+                // mark, sleep to leave the slot held long enough
+                // for any over-cap futures to be visible, then
+                // decrement.
+                let in_flight = self.in_flight.clone();
+                let high_water = self.high_water.clone();
+                let system = request
+                    .messages
+                    .first()
+                    .and_then(|m| m.content.as_deref())
+                    .unwrap_or("")
+                    .to_string();
+                let response = if system.contains("Combine them into ONE coherent summary") {
+                    self.meta_response.clone()
+                } else {
+                    self.chunk_response.clone()
+                };
+                async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    high_water.fetch_max(current, Ordering::SeqCst);
+                    // Sleep is short but long enough that concurrent
+                    // futures overlap deterministically under any
+                    // tokio scheduler order.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(LlmResponse::Text(response))
+                }
+                .boxed()
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let backend = ConcurrencyTrackingBackend {
+            in_flight: in_flight.clone(),
+            high_water: high_water.clone(),
+            meta_response: "<conversation_summary>\n- meta\n</conversation_summary>".into(),
+            chunk_response: "- chunk".into(),
+        };
+        // Enough varied content to fan out into several chunks --
+        // 4+ ensures the cap can actually be saturated.
+        let huge: String = (0..2_500)
+            .map(|i| format!("line {i} word1 word2 word3 word4 word5 word6 word7\n"))
+            .collect();
+        let t = turn_with_tool("u", "a", "shell", "{}", &huge);
+        let out = summarize_turn(
+            &backend,
+            "mock",
+            &t,
+            Some(16_000),
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("succeeds");
+        assert_eq!(out, "- meta");
+        let max_observed = high_water.load(Ordering::SeqCst);
+        assert!(
+            max_observed <= MAX_CONCURRENT_CHUNK_REQUESTS,
+            "concurrency cap exceeded: observed {max_observed} in-flight (cap is {MAX_CONCURRENT_CHUNK_REQUESTS})"
+        );
+        // Saturation check: with enough chunks the cap should
+        // actually be hit. If `max_observed` were stuck at 1, the
+        // parallelization isn't actually engaging.
+        assert!(
+            max_observed >= 2,
+            "parallelization not engaging: max in-flight was {max_observed}"
         );
     }
 }
