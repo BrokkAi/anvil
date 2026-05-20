@@ -3260,6 +3260,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let catalog = vec![ModelMetadata {
             id: "gpt-99".into(),
@@ -3294,6 +3297,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let report = render_context_report(&snap, PermissionMode::Default, &[]);
         assert!(report.contains("Model: `(none)`"));
@@ -3346,6 +3352,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "follow up");
         // system + user(history) + assistant(history) + user(new)
@@ -3392,6 +3401,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "now fix them");
 
@@ -3442,6 +3454,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         assert_eq!(msgs.len(), 2);
@@ -3462,6 +3477,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
 
         let msgs = build_prompt_messages(&snap, "hi");
@@ -3513,6 +3531,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "next");
 
@@ -3579,6 +3600,9 @@ mod tests {
                 ("hello-world", "Greet the user with a single short line."),
                 ("pdf-processing", "Extract text from PDFs."),
             ]),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         // system, catalog (user context), user(new) -> 3
@@ -3610,6 +3634,9 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(SkillRegistry::default()),
+            context_strategy: crate::context_manager::ContextStrategy::default(),
+            conversation_summary: None,
+            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         // Just system + the user prompt -- no catalog message.
