@@ -446,6 +446,10 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "Set up models, login, permissions, and advanced options",
         ),
         AvailableCommand::new(
+            "compress",
+            "Summarize uncompressed turns to free up context window",
+        ),
+        AvailableCommand::new(
             "pr-create",
             "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
         ),
@@ -457,7 +461,9 @@ fn builtin_commands() -> Vec<AvailableCommand> {
 /// filtered skills entirely" guidance: don't expose a slash that won't
 /// actually dispatch to the skill).
 fn builtin_command_names() -> std::collections::HashSet<&'static str> {
-    ["context", "setup", "pr-create"].into_iter().collect()
+    ["context", "setup", "compress", "pr-create"]
+        .into_iter()
+        .collect()
 }
 
 /// Build the full command list advertised to the client: built-ins plus
@@ -1190,6 +1196,35 @@ pub async fn run_agent(
                         .unwrap_or(default_idle_timeout_secs)
                         .max(1),
                 );
+
+                // `/compress` runs synchronously here (not via the
+                // spawn task below) because it's a slash command that
+                // produces a final report rather than a streamed LLM
+                // turn. Dispatch *after* `start_prompt` so the user
+                // can `session/cancel` mid-compress -- the cancel
+                // token threads into `run_summarization`, aborting
+                // any in-flight summarization stream, and the loop in
+                // `handle_compress` checks the token between turns.
+                // `finish_prompt` releases the session reservation
+                // before we respond so a subsequent prompt isn't
+                // rejected as AlreadyInFlight.
+                if is_slash_command(&prompt_text, "compress") {
+                    let report = handle_compress(
+                        &snap,
+                        llm_prompt.as_ref(),
+                        &sessions_prompt,
+                        &session_id,
+                        cancel.clone(),
+                        compression_idle_timeout,
+                        context_length,
+                        &cx,
+                    )
+                    .await;
+                    send_message(&cx, &session_id, &report);
+                    sessions_prompt.finish_prompt(&session_id).await;
+                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+
                 let messages = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
@@ -1729,7 +1764,7 @@ async fn build_prompt_messages_with_compression(
     idle_timeout: Duration,
     context_length: Option<u32>,
 ) -> Vec<ChatMessage> {
-    use crate::context_manager::{context_budget, run_summarization};
+    use crate::context_manager::{context_budget, summarize_turn};
 
     let budget = context_budget(context_length);
     let mut messages = build_prompt_messages(snap, prompt_text);
@@ -1753,10 +1788,11 @@ async fn build_prompt_messages_with_compression(
             return messages;
         };
         let turn_to_summarize = snap.history[idx].clone();
-        match run_summarization(
+        match summarize_turn(
             llm,
             &snap.model,
             &turn_to_summarize,
+            context_length,
             idle_timeout,
             cancel.clone(),
         )
@@ -3075,6 +3111,190 @@ async fn handle_pr_create(
     }
 }
 
+/// Run the `/compress` slash command: summarize every uncompressed
+/// turn in the session, one at a time, persisting each summary
+/// through `set_turn_summary` so a reload reproduces the same state.
+///
+/// Mirrors Brokk's user-triggered "Compress History" UI button
+/// (`ContextManager.compressHistoryAsync(Context)`), with two
+/// deliberate differences:
+///
+/// 1. Sequential rather than parallel. Anvil's tool loop already runs
+///    one prompt at a time per session (gated by `start_prompt`), so
+///    fanning out N parallel LLM calls here only adds rate-limit
+///    pressure without saving meaningful wall time -- the user is
+///    waiting on this command interactively.
+/// 2. Errors are non-fatal per turn. If summarizing turn 3 errors,
+///    turns 1, 2, 4... still get summarized; the failed turn just
+///    stays verbatim. Mirrors `ContextManager.compressHistory`
+///    returning the original on failure.
+///
+/// Streams per-turn progress notifications via `send_message` so the
+/// user sees what's happening on long sessions, and finishes with a
+/// summary tally.
+/// Indexes of turns that need compressing on a `/compress` run.
+/// Extracted as a pure helper so the planning logic is unit-testable
+/// without standing up a mock `ConnectionTo<Client>`.
+struct CompressPlan {
+    total: usize,
+    uncompressed: Vec<usize>,
+}
+
+fn plan_compress(snap: &SessionSnapshot) -> CompressPlan {
+    CompressPlan {
+        total: snap.history.len(),
+        uncompressed: snap
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.summary.is_none().then_some(i))
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_compress(
+    snap: &SessionSnapshot,
+    llm: &dyn crate::llm_client::LlmBackend,
+    sessions: &SessionStore,
+    session_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+    idle_timeout: Duration,
+    context_length: Option<u32>,
+    cx: &ConnectionTo<Client>,
+) -> String {
+    let plan = plan_compress(snap);
+    let total_turns = plan.total;
+    let uncompressed = plan.uncompressed;
+    if uncompressed.is_empty() {
+        return format!(
+            "Nothing to compress: {total_turns} turn(s) in history, all already summarized."
+        );
+    }
+
+    send_message(
+        cx,
+        session_id,
+        &format!(
+            "Compressing {} of {} turn(s)...\n",
+            uncompressed.len(),
+            total_turns
+        ),
+    );
+
+    // Track aggregate token impact for the final report. Per-turn we
+    // measure verbatim cost (what the next prompt would have charged)
+    // vs. the produced summary's cost (what it'll charge after
+    // compression).
+    let mut verbatim_tokens_total = 0usize;
+    let mut summary_tokens_total = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed: Vec<(usize, String)> = Vec::new();
+
+    for idx in uncompressed.iter().copied() {
+        if cancel.is_cancelled() {
+            send_message(cx, session_id, "Cancelled.\n");
+            break;
+        }
+        let turn = snap.history[idx].clone();
+        let display_idx = idx + 1;
+        let verbatim_cost = approximate_turn_tokens(&turn);
+        match crate::context_manager::summarize_turn(
+            llm,
+            &snap.model,
+            &turn,
+            context_length,
+            idle_timeout,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(summary) => {
+                let summary_cost = crate::tokens::approximate_tokens(&summary);
+                match sessions.set_turn_summary(session_id, idx, summary).await {
+                    Ok(true) => {
+                        succeeded += 1;
+                        verbatim_tokens_total += verbatim_cost;
+                        summary_tokens_total += summary_cost;
+                        send_message(
+                            cx,
+                            session_id,
+                            &format!(
+                                "- Turn {display_idx}: compressed (~{verbatim_cost} -> ~{summary_cost} tokens)\n"
+                            ),
+                        );
+                    }
+                    Ok(false) => {
+                        // Setter refused (unknown session, out-of-range
+                        // index, or missing fragment_id). Treat as a
+                        // soft failure and keep going.
+                        failed.push((
+                            display_idx,
+                            "setter refused (turn not persisted?)".to_string(),
+                        ));
+                        send_message(
+                            cx,
+                            session_id,
+                            &format!("- Turn {display_idx}: persist refused -- skipped\n"),
+                        );
+                    }
+                    Err(e) => {
+                        failed.push((display_idx, format!("persist failed: {e}")));
+                        send_message(
+                            cx,
+                            session_id,
+                            &format!("- Turn {display_idx}: persist failed -- {e}\n"),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                failed.push((display_idx, e.to_string()));
+                send_message(
+                    cx,
+                    session_id,
+                    &format!("- Turn {display_idx}: summarization failed -- {e}\n"),
+                );
+            }
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("\n**Done.**\n\n");
+    out.push_str(&format!(
+        "- Compressed {succeeded}/{} turn(s).\n",
+        uncompressed.len()
+    ));
+    if succeeded > 0 {
+        let saved = verbatim_tokens_total.saturating_sub(summary_tokens_total);
+        out.push_str(&format!(
+            "- Approx tokens: {verbatim_tokens_total} (verbatim) -> {summary_tokens_total} (summary). \
+             Saved ~{saved}.\n"
+        ));
+    }
+    if !failed.is_empty() {
+        out.push_str(&format!("- Failed {}: \n", failed.len()));
+        for (turn, msg) in &failed {
+            out.push_str(&format!("  - Turn {turn}: {msg}\n"));
+        }
+    }
+    out
+}
+
+/// Approximate per-turn token cost when replayed verbatim (user
+/// prompt + assistant response + tool exchanges). Used by
+/// `handle_compress` to report "before vs. after" savings.
+fn approximate_turn_tokens(turn: &crate::session::ConversationTurn) -> usize {
+    let mut sum = crate::tokens::approximate_tokens(&turn.user_prompt);
+    sum += crate::tokens::approximate_tokens(&turn.agent_response);
+    for exchange in &turn.tool_exchanges {
+        sum += crate::tokens::approximate_tokens(&exchange.tool_name);
+        sum += crate::tokens::approximate_tokens(&exchange.arguments);
+        sum += crate::tokens::approximate_tokens(&exchange.result);
+    }
+    sum
+}
+
 /// Render the `/context` snapshot. Mirrors the Java executor's report at a
 /// coarser granularity -- the Rust agent does not yet model
 /// editable/readonly/virtual fragments, so the table reports the
@@ -3303,6 +3523,126 @@ mod tests {
             "builtin_command_names() missing pr-create"
         );
         assert!(!builtin_command_names().contains("configure"));
+    }
+
+    /// `/compress` must appear in autocomplete (`builtin_commands`)
+    /// and in the collision set (`builtin_command_names`) so a skill
+    /// named "compress" can't shadow the built-in.
+    #[test]
+    fn builtin_commands_include_compress() {
+        let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "compress"),
+            "builtin_commands() missing compress; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            builtin_command_names().contains("compress"),
+            "builtin_command_names() missing compress"
+        );
+    }
+
+    /// `/compress` parses via the same slash-command dispatcher used
+    /// by `/context` and `/setup`, including case-insensitive and
+    /// args-tolerant forms.
+    #[test]
+    fn is_slash_command_matches_compress_variants() {
+        assert!(is_slash_command("/compress", "compress"));
+        assert!(is_slash_command("  /compress  ", "compress"));
+        assert!(is_slash_command("/compress now", "compress"));
+        assert!(is_slash_command("/COMPRESS", "compress"));
+        // The dispatcher must not confuse `/compress` with `/context`.
+        assert!(!is_slash_command("/context", "compress"));
+    }
+
+    /// `plan_compress` returns the indexes of every turn whose
+    /// `summary` is `None`, in chronological order. Already-summarized
+    /// turns must NOT appear -- `/compress` should be idempotent.
+    #[test]
+    fn plan_compress_returns_uncompressed_turn_indexes() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![
+                ConversationTurn {
+                    user_prompt: "u0".into(),
+                    summary: Some("already done".into()),
+                    ..Default::default()
+                },
+                ConversationTurn {
+                    user_prompt: "u1".into(),
+                    ..Default::default()
+                },
+                ConversationTurn {
+                    user_prompt: "u2".into(),
+                    summary: Some("also done".into()),
+                    ..Default::default()
+                },
+                ConversationTurn {
+                    user_prompt: "u3".into(),
+                    ..Default::default()
+                },
+            ],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let plan = plan_compress(&snap);
+        assert_eq!(plan.total, 4);
+        assert_eq!(plan.uncompressed, vec![1, 3]);
+    }
+
+    /// When every turn already carries a summary, `plan_compress`
+    /// must report zero work to do so `handle_compress` can short-
+    /// circuit before making any LLM calls. Idempotent re-runs are
+    /// the property the user relies on.
+    #[test]
+    fn plan_compress_reports_empty_when_all_summarized() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "u".into(),
+                summary: Some("done".into()),
+                ..Default::default()
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        assert!(plan_compress(&snap).uncompressed.is_empty());
+    }
+
+    /// `approximate_turn_tokens` charges tool exchanges as well as
+    /// user/assistant text, so a tool-heavy turn correctly looks
+    /// expensive when the user reads the "verbatim -> summary"
+    /// savings line in the report.
+    #[test]
+    fn approximate_turn_tokens_includes_tool_exchanges() {
+        use crate::session::{ConversationTurn, ToolExchange};
+        let plain = ConversationTurn {
+            user_prompt: "u".into(),
+            agent_response: "a".into(),
+            ..Default::default()
+        };
+        let toolful = ConversationTurn {
+            user_prompt: "u".into(),
+            agent_response: "a".into(),
+            tool_exchanges: vec![ToolExchange {
+                call_id: "c".into(),
+                tool_name: "search".into(),
+                arguments: r#"{"q":"x"}"#.into(),
+                result: "z".repeat(5_000),
+            }],
+            ..Default::default()
+        };
+        assert!(approximate_turn_tokens(&toolful) > approximate_turn_tokens(&plain));
     }
 
     #[test]
@@ -3791,7 +4131,14 @@ mod tests {
         // sorted alphabetically.
         assert_eq!(
             names,
-            vec!["context", "setup", "pr-create", "apple", "zebra"]
+            vec![
+                "context",
+                "setup",
+                "compress",
+                "pr-create",
+                "apple",
+                "zebra"
+            ]
         );
     }
 
