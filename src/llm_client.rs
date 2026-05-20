@@ -186,6 +186,11 @@ pub struct ModelMetadata {
     pub id: String,
     pub default_reasoning_level: Option<String>,
     pub supported_reasoning_levels: Vec<ReasoningLevelPreset>,
+    /// Maximum context window in tokens, as published by the provider.
+    /// `None` when the backend doesn't expose it (Codex, Ollama); the
+    /// compression layer falls back to a per-backend default in that
+    /// case.
+    pub context_length: Option<u32>,
 }
 
 impl ModelMetadata {
@@ -198,6 +203,7 @@ impl ModelMetadata {
             id: id.into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            context_length: None,
         }
     }
 }
@@ -267,6 +273,8 @@ pub(crate) struct ModelEntry {
     pub(crate) supported_parameters: Vec<String>,
     #[serde(default)]
     pub(crate) default_parameters: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) context_length: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,7 +338,12 @@ impl ModelEntry {
 
     fn to_model_metadata(&self) -> ModelMetadata {
         if !self.supports_reasoning() {
-            return ModelMetadata::id_only(self.id.clone());
+            return ModelMetadata {
+                id: self.id.clone(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                context_length: self.context_length,
+            };
         }
 
         ModelMetadata {
@@ -340,6 +353,7 @@ impl ModelEntry {
             )
             .or_else(|| Some("medium".to_string())),
             supported_reasoning_levels: openrouter_reasoning_presets(),
+            context_length: self.context_length,
         }
     }
 }
@@ -553,7 +567,12 @@ impl OpenAiClient {
             return Ok(models
                 .data
                 .into_iter()
-                .map(|model| ModelMetadata::id_only(model.id))
+                .map(|model| ModelMetadata {
+                    id: model.id,
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
+                    context_length: model.context_length,
+                })
                 .collect());
         }
         Ok(models
@@ -1132,14 +1151,34 @@ mod tests {
             ]
         }"#;
         let parsed: ModelsResponse = serde_json::from_str(raw).expect("OpenRouter /models parses");
-        let ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
+        let entries: Vec<(String, Option<u32>)> = parsed
+            .data
+            .iter()
+            .map(|m| (m.id.clone(), m.context_length))
+            .collect();
         assert_eq!(
-            ids,
+            entries,
             vec![
-                "anthropic/claude-3.5-sonnet".to_string(),
-                "openai/gpt-4o".to_string(),
+                ("anthropic/claude-3.5-sonnet".to_string(), Some(200_000)),
+                ("openai/gpt-4o".to_string(), Some(128_000)),
             ]
         );
+        // `to_model_metadata` must surface context_length for both
+        // reasoning-capable and plain entries (compression layer needs
+        // it for the threshold regardless of reasoning support).
+        let plain = parsed.data[1].to_model_metadata();
+        assert_eq!(plain.context_length, Some(128_000));
+    }
+
+    /// Missing `context_length` (some OpenRouter providers omit it, and
+    /// every Codex/Ollama entry will) must deserialize cleanly as
+    /// `None` rather than failing the whole catalog fetch.
+    #[test]
+    fn model_entry_without_context_length_is_none() {
+        let raw = r#"{ "id": "local/model" }"#;
+        let entry: ModelEntry = serde_json::from_str(raw).expect("entry parses");
+        assert!(entry.context_length.is_none());
+        assert!(entry.to_model_metadata().context_length.is_none());
     }
 
     /// OpenRouter reasoning-capable models should surface a default

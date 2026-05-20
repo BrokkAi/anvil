@@ -1065,7 +1065,7 @@ pub async fn run_agent(
                         .permission_mode(&session_id)
                         .await
                         .unwrap_or(PermissionMode::Default);
-                    let available_models = sessions_prompt.available_models().await;
+                    let available_models = sessions_prompt.available_model_metadata().await;
                     let report = render_context_report(&snap, permission_mode, &available_models);
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
@@ -2929,25 +2929,36 @@ async fn handle_pr_create(
 fn render_context_report(
     snap: &crate::session::SessionSnapshot,
     permission_mode: PermissionMode,
-    available_models: &[String],
+    available_models: &[crate::llm_client::ModelMetadata],
 ) -> String {
-    // Char/4 is the same back-of-the-envelope estimate the Java side uses
-    // for non-tokenizer-aware approximations. Good enough for a snapshot
-    // dump; not load-bearing.
-    let approx_tokens = |s: &str| s.chars().count() / 4;
+    // Sum tokens via the o200k_base encoder so this report matches the
+    // numbers the compression layer will see at the threshold. Tool
+    // exchanges count too -- they round-trip back to the LLM on every
+    // replay via build_prompt_messages, so omitting them would
+    // understate real pressure on long sessions.
     let mut user_tokens = 0usize;
     let mut agent_tokens = 0usize;
+    let mut tool_tokens = 0usize;
     for turn in &snap.history {
-        user_tokens += approx_tokens(&turn.user_prompt);
-        agent_tokens += approx_tokens(&turn.agent_response);
+        user_tokens += crate::tokens::approximate_tokens(&turn.user_prompt);
+        agent_tokens += crate::tokens::approximate_tokens(&turn.agent_response);
+        for exchange in &turn.tool_exchanges {
+            tool_tokens += crate::tokens::approximate_tokens(&exchange.tool_name);
+            tool_tokens += crate::tokens::approximate_tokens(&exchange.arguments);
+            tool_tokens += crate::tokens::approximate_tokens(&exchange.result);
+        }
     }
-    let total_tokens = user_tokens + agent_tokens;
+    let total_tokens = user_tokens + agent_tokens + tool_tokens;
     let model_display = if snap.model.is_empty() {
         "(none)".to_string()
     } else {
         snap.model.clone()
     };
     let catalog_size = available_models.len();
+    let context_length = available_models
+        .iter()
+        .find(|m| m.id == snap.model)
+        .and_then(|m| m.context_length);
 
     let mut out = String::new();
     out.push_str("**Session context**\n\n");
@@ -2960,12 +2971,26 @@ fn render_context_report(
     out.push_str(&format!(
         "- Model: `{model_display}` ({catalog_size} known in catalog)\n"
     ));
+    if let Some(ctx) = context_length {
+        let pct = if ctx > 0 {
+            (total_tokens as f64 / ctx as f64 * 100.0).round() as u32
+        } else {
+            0
+        };
+        out.push_str(&format!(
+            "- Context window: {total_tokens} / {ctx} tokens (~{pct}% used)\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "- Context window: {total_tokens} tokens used (model max unknown)\n"
+        ));
+    }
     out.push_str(&format!(
-        "- Conversation turns: {} (~{} tokens user / ~{} tokens agent / ~{} total)\n",
+        "- Conversation turns: {} (~{} user / ~{} agent / ~{} tool exchanges)\n",
         snap.history.len(),
         user_tokens,
         agent_tokens,
-        total_tokens
+        tool_tokens
     ));
     out
 }
@@ -3220,13 +3245,14 @@ mod tests {
     /// "why does the model think X" without a separate inspector.
     #[test]
     fn render_context_report_lists_session_facts() {
+        use crate::llm_client::ModelMetadata;
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             mode: SessionMode::Code,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
-                user_prompt: "hi".repeat(8), // 16 chars -> ~4 tokens
+                user_prompt: "hi".repeat(8),
                 agent_response: "ok".repeat(8),
                 ..Default::default()
             }],
@@ -3235,15 +3261,23 @@ mod tests {
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
-        let report = render_context_report(&snap, PermissionMode::AcceptEdits, &["gpt-99".into()]);
+        let catalog = vec![ModelMetadata {
+            id: "gpt-99".into(),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            context_length: Some(200_000),
+        }];
+        let report = render_context_report(&snap, PermissionMode::AcceptEdits, &catalog);
 
         assert!(report.contains("Mode: `CODE`"));
         assert!(report.contains("Permission mode: `acceptEdits`"));
         assert!(report.contains("Model: `gpt-99`"));
         assert!(report.contains("(1 known in catalog)"));
         assert!(report.contains("Conversation turns: 1"));
-        // Token estimate rolls user + agent into the total.
-        assert!(report.contains("~"));
+        // Context-window line must surface both the count and the cap
+        // when the catalog publishes one.
+        assert!(report.contains("/ 200000 tokens"));
+        assert!(report.contains("% used"));
     }
 
     /// When no model is set, `/context` shows `(none)` rather than the
@@ -3265,6 +3299,9 @@ mod tests {
         assert!(report.contains("Model: `(none)`"));
         assert!(report.contains("(0 known in catalog)"));
         assert!(report.contains("Conversation turns: 0"));
+        // No catalog entry for the (empty) model id -> falls back to
+        // the "model max unknown" line rather than crashing.
+        assert!(report.contains("model max unknown"));
     }
 
     /// `session/list` should expose the persisted title and updatedAt
@@ -3892,6 +3929,7 @@ mod tests {
                         effort: "high".into(),
                         description: "High".into(),
                     }],
+                    context_length: None,
                 },
                 ModelMetadata::id_only("model-b"),
             ])

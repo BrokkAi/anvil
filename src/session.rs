@@ -2702,6 +2702,7 @@ mod tests {
                         effort: "medium".to_string(),
                         description: "".to_string(),
                     }],
+                    context_length: None,
                 },
                 ModelMetadata {
                     id: "model-b".to_string(),
@@ -2720,6 +2721,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    context_length: None,
                 },
             ])
             .await;
@@ -2768,6 +2770,7 @@ mod tests {
                         description: "".to_string(),
                     },
                 ],
+                context_length: None,
             }])
             .await;
         let cwd = tempfile::tempdir().expect("cwd");
@@ -2806,6 +2809,7 @@ mod tests {
                         effort: "medium".to_string(),
                         description: "".to_string(),
                     }],
+                    context_length: None,
                 },
                 ModelMetadata {
                     id: "model-b".to_string(),
@@ -2824,6 +2828,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    context_length: None,
                 },
             ])
             .await;
@@ -3076,6 +3081,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    context_length: None,
                 },
                 ModelMetadata {
                     id: "gpt-mini".to_string(),
@@ -3094,6 +3100,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    context_length: None,
                 },
             ])
             .await;
@@ -3152,11 +3159,13 @@ mod tests {
                     id: "gpt-a".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: supported.clone(),
+                    context_length: None,
                 },
                 ModelMetadata {
                     id: "gpt-b".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: supported,
+                    context_length: None,
                 },
             ])
             .await;

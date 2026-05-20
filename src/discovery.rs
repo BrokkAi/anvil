@@ -243,6 +243,9 @@ pub async fn discover_ollama_model_metadata(
                         id: model_id,
                         default_reasoning_level: None,
                         supported_reasoning_levels: ollama_thinking_presets(),
+                        // Ollama's catalog doesn't publish a context window;
+                        // the compression layer falls back to a default.
+                        context_length: None,
                     },
                 ));
             }

@@ -242,6 +242,7 @@ impl LlmBackend for MultiBackend {
                                 id: wire.clone(),
                                 default_reasoning_level: meta.default_reasoning_level.clone(),
                                 supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                                context_length: meta.context_length,
                             })
                             .unwrap_or_else(|| ModelMetadata::id_only(wire)),
                         ModelSource::Ollama => ollama_metadata
@@ -250,6 +251,7 @@ impl LlmBackend for MultiBackend {
                                 id: wire.clone(),
                                 default_reasoning_level: meta.default_reasoning_level.clone(),
                                 supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                                context_length: meta.context_length,
                             })
                             .unwrap_or_else(|| ModelMetadata::id_only(wire)),
                         ModelSource::OpenRouter => openrouter_by_id
@@ -258,6 +260,7 @@ impl LlmBackend for MultiBackend {
                                 id: wire.clone(),
                                 default_reasoning_level: meta.default_reasoning_level.clone(),
                                 supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                                context_length: meta.context_length,
                             })
                             .unwrap_or_else(|| ModelMetadata::id_only(wire)),
                     }

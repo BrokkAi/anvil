@@ -61,6 +61,14 @@ chrono = { version = "0.4", features = ["serde"] }
 # archived but stable and is what codex's core-skills uses; staying on it
 # avoids ecosystem churn. Revisit only on CVE.
 serde_yaml = "0.9"
+# Token counter for context-window accounting. Mirrors the Java side
+# (Brokk's `Messages.getApproximateTokens` uses jtokkit with
+# `O200K_BASE`), so both halves of the session zip read the same numbers.
+# `o200k_base` is the GPT-4o / o-series tokenizer; we apply it uniformly
+# to every model since no small/accurate alternative exists for
+# Claude/Gemini/Llama and the count is an approximation used to trigger
+# compression, not a billing figure.
+tiktoken-rs = "0.7"
 
 # Unix-only: `setrlimit` via `Command::pre_exec` for per-process resource caps
 # applied to `runShellCommand`. See `tools/shell.rs::apply_rlimits`.
