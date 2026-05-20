@@ -1047,7 +1047,7 @@ pub async fn run_agent(
                 // read lock; we then consume it via `.into_iter()` to build ChatMessages
                 // without further string copies.
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
-                let snap = match sessions_prompt.snapshot(&session_id, &fallback_cwd).await {
+                let mut snap = match sessions_prompt.snapshot(&session_id, &fallback_cwd).await {
                     Some(s) => s,
                     None => {
                         send_message(&cx, &session_id, "Error: unknown session");
@@ -1173,7 +1173,34 @@ pub async fn run_agent(
                     }
                 };
 
-                let messages = build_prompt_messages(&snap, &prompt_text);
+                // Resolve the model's declared context window once, here, so
+                // the compression budget calc has it. Codex/Ollama models
+                // typically don't publish one and fall through to the
+                // per-backend default inside `context_budget`.
+                let context_length = sessions_prompt
+                    .available_model_metadata()
+                    .await
+                    .iter()
+                    .find(|m| m.id == snap.model)
+                    .and_then(|m| m.context_length);
+                // Idle timeout for the summarization LLM call mirrors the
+                // resolution used for the main chat call below.
+                let compression_idle_timeout = Duration::from_secs(
+                    snap.idle_timeout_secs
+                        .unwrap_or(default_idle_timeout_secs)
+                        .max(1),
+                );
+                let messages = build_prompt_messages_with_compression(
+                    &mut snap,
+                    &prompt_text,
+                    llm_prompt.as_ref(),
+                    &sessions_prompt,
+                    &session_id,
+                    cancel.clone(),
+                    compression_idle_timeout,
+                    context_length,
+                )
+                .await;
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
                 let registry = sessions_prompt
@@ -1287,6 +1314,8 @@ pub async fn run_agent(
                                 user_prompt: prompt_text_for_turn,
                                 agent_response: response_text,
                                 tool_exchanges,
+                                summary: None,
+                                fragment_id: None,
                             },
                         )
                         .await;
@@ -1558,14 +1587,26 @@ fn send_thought(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     }
 }
 
-/// Build a system prompt based on the current session mode and working directory.
-/// Build the `Vec<ChatMessage>` to send to the LLM for a fresh prompt:
-/// system prompt, optional project instruction context, then replayed
-/// history (with tool exchanges, #3409), then the new user prompt.
-/// Pure -- exposed for unit testing the
-/// replay shape without spinning up an LLM.
+/// Build the `Vec<ChatMessage>` to send to the LLM for a fresh prompt.
+///
+/// Layout:
+/// 1. System prompt (mode + cwd).
+/// 2. AGENTS.md content, when present.
+/// 3. Skills catalog, when the registry has entries.
+/// 4. For each turn in `snap.history`:
+///    - If the turn has a `summary`, emit a single `user` message
+///      wrapping the summary in `<conversation_summary>` tags. The
+///      original user prompt / tool exchanges / assistant text are
+///      *not* re-emitted -- the summary replaces them in the prompt.
+///    - Otherwise, replay the turn verbatim: user prompt, optional
+///      `assistant_tool_calls` + `tool_result` pairs, optional
+///      assistant text.
+/// 5. The user's new prompt.
+///
+/// Pure -- exposed for unit testing the replay shape without spinning
+/// up an LLM.
 fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMessage> {
-    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 3);
+    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
     messages.push(ChatMessage::system(build_system_prompt(
         &snap.mode, &snap.cwd,
     )));
@@ -1584,6 +1625,21 @@ fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMe
         messages.push(ChatMessage::user(catalog));
     }
     for turn in &snap.history {
+        // Per-turn summarization (mirrors Brokk's `TaskEntry.summary`):
+        // when a summary is present, replace the entire turn (user
+        // prompt + tool exchanges + assistant response) with one
+        // `<conversation_summary>` block. The full log stays on disk
+        // for replay determinism but never goes back to the LLM.
+        if let Some(summary_text) = turn.summary.as_deref() {
+            let trimmed = summary_text.trim();
+            if !trimmed.is_empty() {
+                messages.push(ChatMessage::user(format!(
+                    "<conversation_summary>\n{trimmed}\n</conversation_summary>"
+                )));
+                continue;
+            }
+        }
+
         messages.push(ChatMessage::user(turn.user_prompt.clone()));
 
         // If the prior turn used tools, replay them as a single
@@ -1641,6 +1697,104 @@ fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMe
     }
     messages.push(ChatMessage::user(new_prompt.to_string()));
     messages
+}
+
+/// Wrap `build_prompt_messages` with per-turn LLM summarization.
+///
+/// When the projected prompt exceeds the model's budget, walk the
+/// history from the oldest *uncompressed* turn forward, asking the
+/// LLM to summarize each one in turn (Brokk's pattern from
+/// `ContextManager.compressHistory(TaskEntry)`). Each successful
+/// summary is persisted via [`SessionStore::set_turn_summary`] so a
+/// reload reproduces the same compressed prompt, and the in-memory
+/// `snap` is mutated so the rebuilt prompt sees the new state.
+///
+/// Stops when the prompt fits, when every turn already carries a
+/// summary, or when a summarization call fails. Persistence failures
+/// are logged but non-fatal -- the summary lives in memory for the
+/// current turn and the next session reload will recompress.
+///
+/// Turns that fail to summarize stay uncompressed; we never silently
+/// drop history. The prompt may still overrun budget after this runs
+/// -- the LLM/server is the final arbiter -- but we've done what we
+/// can without losing information.
+#[allow(clippy::too_many_arguments)]
+async fn build_prompt_messages_with_compression(
+    snap: &mut SessionSnapshot,
+    prompt_text: &str,
+    llm: &dyn crate::llm_client::LlmBackend,
+    sessions: &SessionStore,
+    session_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+    idle_timeout: Duration,
+    context_length: Option<u32>,
+) -> Vec<ChatMessage> {
+    use crate::context_manager::{context_budget, run_summarization};
+
+    let budget = context_budget(context_length);
+    let mut messages = build_prompt_messages(snap, prompt_text);
+
+    loop {
+        let projected = crate::tokens::approximate_tokens_messages(&messages);
+        if projected <= budget {
+            return messages;
+        }
+        // Find the oldest uncompressed turn -- compressing in order
+        // mirrors how Brokk's `compressHistoryAsync(Context)` walks
+        // entries, and keeps the most recent (most semantically
+        // important) turns verbatim for the longest.
+        let Some(idx) = snap.history.iter().position(|t| t.summary.is_none()) else {
+            tracing::warn!(
+                session_id = %session_id,
+                projected_tokens = projected,
+                budget,
+                "prompt exceeds context budget but every turn is already summarized"
+            );
+            return messages;
+        };
+        let turn_to_summarize = snap.history[idx].clone();
+        match run_summarization(
+            llm,
+            &snap.model,
+            &turn_to_summarize,
+            idle_timeout,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(new_summary) => {
+                if let Err(e) = sessions
+                    .set_turn_summary(session_id, idx, new_summary.clone())
+                    .await
+                {
+                    // Persistence failure isn't fatal -- we still want
+                    // this turn's prompt to benefit from the summary.
+                    // The next reload will see the uncompressed turn
+                    // and try again.
+                    tracing::warn!(
+                        session_id = %session_id,
+                        turn_index = idx,
+                        "failed to persist turn summary, continuing with in-memory copy: {e:#}"
+                    );
+                }
+                snap.history[idx].summary = Some(new_summary);
+                messages = build_prompt_messages(snap, prompt_text);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    turn_index = idx,
+                    "summarization failed, leaving turn uncompressed: {e:#}"
+                );
+                // Brokk's `ContextManager.compressHistory` returns the
+                // original on failure -- we mirror that by leaving the
+                // turn uncompressed and giving up further attempts on
+                // this prompt rather than retrying earlier turns and
+                // racking up cost.
+                return messages;
+            }
+        }
+    }
 }
 
 fn build_system_prompt(mode: &SessionMode, cwd: &Path) -> String {
@@ -3260,9 +3414,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let catalog = vec![ModelMetadata {
             id: "gpt-99".into(),
@@ -3297,9 +3448,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let report = render_context_report(&snap, PermissionMode::Default, &[]);
         assert!(report.contains("Model: `(none)`"));
@@ -3352,9 +3500,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "follow up");
         // system + user(history) + assistant(history) + user(new)
@@ -3396,14 +3541,13 @@ mod tests {
                         result: "fn main() {}".into(),
                     },
                 ],
+                summary: None,
+                fragment_id: None,
             }],
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "now fix them");
 
@@ -3454,9 +3598,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         assert_eq!(msgs.len(), 2);
@@ -3477,9 +3618,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
 
         let msgs = build_prompt_messages(&snap, "hi");
@@ -3526,14 +3664,13 @@ mod tests {
                     arguments: r#"{"pattern":"x"}"#.into(),
                     result: "no matches".into(),
                 }],
+                summary: None,
+                fragment_id: None,
             }],
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "next");
 
@@ -3600,9 +3737,6 @@ mod tests {
                 ("hello-world", "Greet the user with a single short line."),
                 ("pdf-processing", "Extract text from PDFs."),
             ]),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         // system, catalog (user context), user(new) -> 3
@@ -3634,9 +3768,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(SkillRegistry::default()),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         // Just system + the user prompt -- no catalog message.
@@ -4030,5 +4161,93 @@ mod tests {
         for key in CONFIGURE_KNOWN_KEYS {
             assert!(out.contains(key), "missing key `{key}` in error: {out}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-turn summary substitution in build_prompt_messages
+    // -----------------------------------------------------------------------
+
+    /// When a `ConversationTurn` has a `summary`, the prompt must
+    /// contain that summary wrapped in `<conversation_summary>` tags
+    /// in place of the verbatim user/tool/assistant messages for that
+    /// turn. Mirrors how Brokk's `TaskEntry.summary` substitutes into
+    /// the next prompt.
+    #[test]
+    fn build_prompt_messages_substitutes_summary_for_turn() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![
+                ConversationTurn {
+                    user_prompt: "OLD user".into(),
+                    agent_response: "OLD agent".into(),
+                    summary: Some("- file foo.rs touched\n- decision X".into()),
+                    ..Default::default()
+                },
+                ConversationTurn {
+                    user_prompt: "RECENT user".into(),
+                    agent_response: "RECENT agent".into(),
+                    ..Default::default()
+                },
+            ],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let msgs = build_prompt_messages(&snap, "next");
+        // system + summary(turn 0) + user(turn 1) + assistant(turn 1) + user(new) = 5
+        assert_eq!(msgs.len(), 5);
+        let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.content.as_deref()).collect();
+        // Verbatim OLD content must NOT appear -- the summary replaces it.
+        assert!(
+            bodies.iter().all(|b| !b.contains("OLD user")),
+            "verbatim old user prompt leaked: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().all(|b| !b.contains("OLD agent")),
+            "verbatim old agent response leaked: {bodies:?}"
+        );
+        // Summary block must appear with the tags.
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains("<conversation_summary>") && b.contains("- file foo.rs"))
+        );
+        // The unsummarized recent turn must still come through verbatim.
+        assert!(bodies.iter().any(|b| b.contains("RECENT user")));
+        assert!(bodies.iter().any(|b| b.contains("RECENT agent")));
+    }
+
+    /// An empty / whitespace-only summary must not produce an empty
+    /// `<conversation_summary>` message -- the turn should be replayed
+    /// verbatim instead. Otherwise a corrupted summary could silently
+    /// drop the turn from the prompt.
+    #[test]
+    fn build_prompt_messages_falls_back_to_verbatim_when_summary_blank() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "verbatim user".into(),
+                agent_response: "verbatim agent".into(),
+                summary: Some("   \n  ".into()),
+                ..Default::default()
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let msgs = build_prompt_messages(&snap, "next");
+        let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.content.as_deref()).collect();
+        assert!(bodies.iter().any(|b| b.contains("verbatim user")));
+        assert!(bodies.iter().any(|b| b.contains("verbatim agent")));
+        // No empty summary block leaked through.
+        assert!(bodies.iter().all(|b| !b.contains("<conversation_summary>")));
     }
 }

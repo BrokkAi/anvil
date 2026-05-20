@@ -46,11 +46,6 @@ const MAX_CONTENT_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 /// collectively exceed this, even when each is below the per-entry
 /// cap.
 const MAX_CONTENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-/// Upper bound on the decompressed `summary.json` payload (carries the
-/// conversation summary + pivot + strategy). Generous to absorb future
-/// fields while still rejecting absurd values; the summary itself is
-/// bounded indirectly by the model's context window.
-const MAX_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_SESSION_NAME: &str = "New Session";
 
 // ---------------------------------------------------------------------------
@@ -304,6 +299,25 @@ pub struct ConversationTurn {
     /// answer and may repeat searches/reads/writes it already performed
     /// in the prior turn (#3409).
     pub tool_exchanges: Vec<ToolExchange>,
+    /// LLM-produced summary of this turn, when one has been generated
+    /// by the compression engine. When set, `build_prompt_messages`
+    /// substitutes the summary for this turn's verbatim
+    /// user/tool/assistant messages -- the original log is preserved
+    /// on disk (via `summaryContentId` in the zip) so a session reload
+    /// reproduces the same compressed prompt. Mirrors Brokk's
+    /// `TaskEntry.summary` on the Java side.
+    pub summary: Option<String>,
+    /// Stable identifier matching the fragment id under which this
+    /// turn was persisted in the session zip (the `task.<id>` key in
+    /// `fragments-v4.json` plus the `logId` value in
+    /// `contexts.jsonl`). Populated by the load path from disk and
+    /// by `add_turn` on persist; `None` for turns constructed
+    /// in-process before they've been persisted, and for the test
+    /// fixtures that build turns directly. Used by
+    /// `set_turn_summary` to locate the right `summaryContentId` to
+    /// rewrite. Not persisted as a separate field -- it's just the
+    /// in-memory shadow of the zip's existing id.
+    pub fragment_id: Option<String>,
 }
 
 /// One tool invocation and its result, captured during a turn so the next
@@ -369,66 +383,6 @@ fn default_version() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Compression state (summary.json inside the zip)
-// ---------------------------------------------------------------------------
-
-/// Persisted form of the per-session context-compression state.
-///
-/// Lives in its own `summary.json` zip entry rather than the shared
-/// `manifest.json` so the manifest schema stays binary-compatible with
-/// the Java executor side -- older Brokk readers see `summary.json` as
-/// an unknown entry and ignore it. On the disk-cost tradeoff: we
-/// persist *both* the full history and the summary so a reload
-/// reproduces the same compressed prompt deterministically; disk size
-/// at current session scales isn't the constraint we're optimizing
-/// against here.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct CompressionState {
-    /// Wire form of `ContextStrategy` (`"none"` / `"sliding_window"` /
-    /// `"hybrid"`). Serialized as a string so an older binary can read
-    /// a newer session zip and fall back to defaults gracefully when
-    /// the strategy name is unknown.
-    #[serde(default)]
-    strategy: String,
-    /// `<conversation_summary>` text covering `history[..pivot]`.
-    /// `None` when no compression has run yet.
-    #[serde(default)]
-    summary: Option<String>,
-    /// History index up to which everything is folded into `summary`.
-    /// `history[pivot..]` is replayed verbatim. Always advances
-    /// monotonically -- the planner refuses to move it backwards.
-    #[serde(default)]
-    pivot: usize,
-}
-
-impl CompressionState {
-    /// Phase 4 will call this from the compression engine integration;
-    /// allow until then so the warning doesn't fail CI.
-    #[allow(dead_code)]
-    fn from_session_fields(
-        strategy: crate::context_manager::ContextStrategy,
-        summary: Option<String>,
-        pivot: usize,
-    ) -> Self {
-        Self {
-            strategy: strategy.as_str().to_string(),
-            summary,
-            pivot,
-        }
-    }
-
-    /// Resolve the wire-form strategy back to an enum, falling back to
-    /// the default when a future binary wrote a name this one doesn't
-    /// understand.
-    fn resolved_strategy(&self) -> crate::context_manager::ContextStrategy {
-        if self.strategy.is_empty() {
-            return crate::context_manager::ContextStrategy::default();
-        }
-        crate::context_manager::ContextStrategy::parse(&self.strategy).unwrap_or_default()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Per-session state (in-memory)
 // ---------------------------------------------------------------------------
 
@@ -476,21 +430,6 @@ pub struct Session {
     /// persisted -- on reload the model re-reads the catalog and decides
     /// fresh which skills to activate.
     pub activated_skills: HashSet<String>,
-    /// Compression strategy in effect for this session. Persisted in
-    /// `summary.json` so a reload reproduces the same prompt-build
-    /// behavior. Defaults to `ContextStrategy::Hybrid` for new
-    /// sessions.
-    pub context_strategy: crate::context_manager::ContextStrategy,
-    /// `<conversation_summary>` text produced by the compression
-    /// engine, covering `history[..summary_pivot]`. `None` when no
-    /// compression has run yet. Persisted to / loaded from
-    /// `summary.json` so a reloaded session sends the same compressed
-    /// prompt the live session would.
-    pub conversation_summary: Option<String>,
-    /// Index into `history` at which verbatim replay begins. Turns
-    /// before this index are represented only by `conversation_summary`.
-    /// Advances monotonically across compression rounds.
-    pub summary_pivot: usize,
 }
 
 impl Session {
@@ -527,9 +466,6 @@ impl Session {
             project_instructions,
             skills,
             activated_skills: HashSet::new(),
-            context_strategy: crate::context_manager::ContextStrategy::default(),
-            conversation_summary: None,
-            summary_pivot: 0,
         }
     }
 
@@ -554,7 +490,6 @@ impl Session {
         model: String,
         history: Vec<ConversationTurn>,
         manifest: SessionManifest,
-        compression: CompressionState,
     ) -> Result<Self, SessionIdMismatch> {
         if manifest.id != id {
             return Err(SessionIdMismatch {
@@ -564,13 +499,6 @@ impl Session {
         }
         let project_instructions = crate::agents_md::discover(&cwd);
         let skills = Arc::new(crate::skills::discover(&cwd));
-        // Clamp the persisted pivot against the in-memory history
-        // length so a zip with an out-of-range pivot (e.g. corrupted
-        // or produced by a future schema that handles history
-        // differently) doesn't trigger an out-of-bounds slice on the
-        // first prompt. A clamped pivot just means a few extra turns
-        // get replayed verbatim, which is safe.
-        let summary_pivot = compression.pivot.min(history.len());
         Ok(Self {
             id,
             cwd,
@@ -590,9 +518,6 @@ impl Session {
             project_instructions,
             skills,
             activated_skills: HashSet::new(),
-            context_strategy: compression.resolved_strategy(),
-            conversation_summary: compression.summary,
-            summary_pivot,
         })
     }
 }
@@ -645,21 +570,6 @@ pub struct SessionSnapshot {
     /// Agent Skills (`SKILL.md`) discovered for this session. Wrapped
     /// in `Arc` so cloning the snapshot doesn't copy the registry.
     pub skills: Arc<crate::skills::SkillRegistry>,
-    /// Active compression strategy. Phase 4 will read this before
-    /// building the prompt to decide whether to summarize, slide, or
-    /// pass through verbatim.
-    #[allow(dead_code)]
-    pub context_strategy: crate::context_manager::ContextStrategy,
-    /// `<conversation_summary>` text covering `history[..summary_pivot]`,
-    /// produced by the compression engine on a prior turn. `None`
-    /// when nothing has been compressed yet.
-    #[allow(dead_code)]
-    pub conversation_summary: Option<String>,
-    /// History index where verbatim replay begins. Turns at
-    /// `history[..summary_pivot]` are represented by
-    /// `conversation_summary` rather than by their original messages.
-    #[allow(dead_code)]
-    pub summary_pivot: usize,
 }
 
 /// Human-readable session metadata for ACP notifications and lists.
@@ -787,6 +697,7 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
     //      sequence of task fragments. Works for both newly-written zips and
     //      older ones that already followed this convention -- no migration.
     let chronological_ids = read_task_fragment_order_from_zip(zip_path);
+    let summary_content_ids = read_summary_content_ids_from_zip(zip_path);
 
     // 3. Extract conversation from task fragments, in chronological order
     //    where recoverable. Each task fragment may have:
@@ -821,6 +732,19 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
             // markdown shortcut (which only stores the final text).
             let exchanges = read_tool_exchanges_from_messages(task, &content_map);
 
+            // Resolve this fragment's persisted summary, if any. The
+            // fragment self-identifies via its `id` field (which equals
+            // its outer `task.*` key); we look that up in the
+            // `logId -> summaryContentId` mapping pulled from
+            // contexts.jsonl, then dereference against the content
+            // blob map.
+            let fragment_id = task.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            let summary = fragment_id
+                .as_ref()
+                .and_then(|fragment_id| summary_content_ids.get(fragment_id))
+                .and_then(|sid| content_map.get(sid))
+                .cloned();
+
             // Try markdownContentId first (newer format: pre-rendered markdown)
             if let Some(content_id) = task.get("markdownContentId").and_then(|v| v.as_str())
                 && let Some(text) = content_map.get(content_id)
@@ -841,6 +765,8 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                     user_prompt,
                     agent_response: text.clone(),
                     tool_exchanges: exchanges,
+                    summary,
+                    fragment_id,
                 });
                 continue;
             }
@@ -872,6 +798,8 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                         user_prompt: user_text,
                         agent_response: assistant_text,
                         tool_exchanges: exchanges,
+                        summary: summary.clone(),
+                        fragment_id: fragment_id.clone(),
                     });
                 }
             }
@@ -929,6 +857,49 @@ fn read_task_fragment_order_from_zip(zip_path: &Path) -> Vec<String> {
         }
     }
     ids
+}
+
+/// Walk `contexts.jsonl` and extract the `logId -> summaryContentId`
+/// mapping out of each context's `tasks[]` array. Mirrors the Brokk
+/// Java side's `TaskEntry.summary` storage, where each task references
+/// a `content/<id>.txt` entry holding its compressed summary text.
+///
+/// Returns an empty map if `contexts.jsonl` is missing, unreadable, or
+/// contains no task with a non-null `summaryContentId` -- consistent
+/// with `read_task_fragment_order_from_zip`'s degradation policy.
+fn read_summary_content_ids_from_zip(zip_path: &Path) -> HashMap<String, String> {
+    let buf = match crate::sandbox_backend::global().read_zip_entry_text(
+        zip_path,
+        "contexts.jsonl",
+        MAX_SESSION_ARCHIVE_BYTES,
+        MAX_CONTEXTS_BYTES,
+    ) {
+        Ok(Some(s)) => s,
+        _ => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for line in buf.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(ctx) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(tasks) = ctx.get("tasks").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for task in tasks {
+            let log_id = task.get("logId").and_then(|v| v.as_str());
+            let summary_id = task.get("summaryContentId").and_then(|v| v.as_str());
+            if let (Some(log_id), Some(summary_id)) = (log_id, summary_id) {
+                // Later contexts win -- a turn that was recompressed
+                // points to a new content id, and we want the latest.
+                out.insert(log_id.to_string(), summary_id.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Walk a task fragment's `messages` array and pair `tool_call` entries
@@ -1199,11 +1170,15 @@ fn write_new_session_zip(zip_path: &Path, manifest: &SessionManifest) -> anyhow:
 /// to the caller so `add_turn` can roll back and keep `memory == disk`. The atomic
 /// temp-then-rename in `with_temp_zip_writer` guarantees the on-disk zip is unchanged
 /// on any failure path.
+/// Persist a new turn into the session zip and return the fragment id
+/// it was stored under. The caller (`add_turn`) writes that id back
+/// onto the in-memory `ConversationTurn` so subsequent
+/// `set_turn_summary` calls have a stable handle to the on-disk task.
 fn append_turn_to_zip(
     zip_path: &Path,
     manifest: &SessionManifest,
     turn: &ConversationTurn,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     use anyhow::Context;
 
     // Pre-read the entries we plan to rewrite through the sandbox so a
@@ -1275,6 +1250,15 @@ fn append_turn_to_zip(
     let response_content_id = uuid::Uuid::new_v4().to_string();
     let task_fragment_id = uuid::Uuid::new_v4().to_string();
     let new_context_id = uuid::Uuid::new_v4().to_string();
+    // Persist any pre-existing summary into a content blob and
+    // reference it from the task's `summaryContentId`. Usually `None`
+    // on first append (compression runs later via `set_turn_summary`);
+    // populated when an in-flight summary is being saved alongside
+    // the turn.
+    let summary_content_id: Option<String> = turn
+        .summary
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
 
     // Build the messages array: user message, then tool_call/tool_result
     // pairs (one of each per exchange) interleaved per the OpenAI wire
@@ -1338,7 +1322,7 @@ fn append_turn_to_zip(
             "description": null,
             "logId": task_fragment_id,
             "llmLogId": null,
-            "summaryContentId": null,
+            "summaryContentId": summary_content_id,
             "taskType": null,
             "primaryModelName": null,
             "primaryModelReasoning": null
@@ -1391,6 +1375,99 @@ fn append_turn_to_zip(
             writer.write_all(text.as_bytes())?;
         }
 
+        // Per-turn summary blob, referenced by the context's
+        // `summaryContentId`. Brokk-compatible: the Java side reads
+        // the same slot to render the "compressed" indicator.
+        if let (Some(sid), Some(summary_text)) =
+            (summary_content_id.as_ref(), turn.summary.as_ref())
+        {
+            writer.start_file(format!("content/{sid}.txt"), options)?;
+            writer.write_all(summary_text.as_bytes())?;
+        }
+
+        Ok(())
+    })?;
+    Ok(task_fragment_id)
+}
+
+/// Mutate the `summaryContentId` of the task whose `logId == fragment_id`
+/// in `contexts.jsonl`, and write the new summary blob to
+/// `content/<new_content_id>.txt`. Used by `set_turn_summary` to land
+/// an LLM-produced summary onto a previously-persisted turn without
+/// re-writing every other entry.
+///
+/// Atomic via `with_temp_zip_writer`: any failure leaves the on-disk
+/// zip unchanged, so the caller can roll back its in-memory mutation
+/// and keep `memory == disk`.
+fn rewrite_turn_summary_in_zip(
+    zip_path: &Path,
+    fragment_id: &str,
+    summary_text: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // Read current contexts.jsonl through the sandbox so a hostile zip
+    // on disk can't panic the host parser.
+    let backend = crate::sandbox_backend::global();
+    let existing = backend
+        .read_zip_entry_text(
+            zip_path,
+            "contexts.jsonl",
+            MAX_SESSION_ARCHIVE_BYTES,
+            MAX_CONTEXTS_BYTES,
+        )
+        .context("reading contexts.jsonl for summary rewrite")?
+        .unwrap_or_default();
+
+    let new_content_id = uuid::Uuid::new_v4().to_string();
+    let mut rewritten = String::with_capacity(existing.len() + 128);
+    let mut hit = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            rewritten.push('\n');
+            continue;
+        }
+        let mut ctx: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => {
+                // Pass malformed lines through unchanged -- losing them
+                // would silently rewrite history; the next reload would
+                // miss task fragments referenced only there.
+                rewritten.push_str(line);
+                rewritten.push('\n');
+                continue;
+            }
+        };
+        if let Some(tasks) = ctx.get_mut("tasks").and_then(|v| v.as_array_mut()) {
+            for task in tasks {
+                let matches = task
+                    .get("logId")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v == fragment_id)
+                    .unwrap_or(false);
+                if matches && let Some(obj) = task.as_object_mut() {
+                    obj.insert(
+                        "summaryContentId".to_string(),
+                        serde_json::Value::String(new_content_id.clone()),
+                    );
+                    hit = true;
+                }
+            }
+        }
+        rewritten.push_str(&serde_json::to_string(&ctx).unwrap_or_else(|_| line.to_string()));
+        rewritten.push('\n');
+    }
+    if !hit {
+        anyhow::bail!("no context entry references fragment_id `{fragment_id}` in contexts.jsonl");
+    }
+
+    with_temp_zip_writer(zip_path, |writer, options| {
+        copy_zip_entries_via_sandbox(zip_path, writer, options, |n| n == "contexts.jsonl")?;
+        writer.start_file("contexts.jsonl", options)?;
+        writer.write_all(rewritten.as_bytes())?;
+        writer.start_file(format!("content/{new_content_id}.txt"), options)?;
+        writer.write_all(summary_text.as_bytes())?;
         Ok(())
     })
 }
@@ -1411,54 +1488,6 @@ fn rewrite_manifest_in_zip(zip_path: &Path, manifest: &SessionManifest) -> anyho
             serde_json::to_string_pretty(manifest).context("serializing session manifest")?;
         writer.start_file("manifest.json", options)?;
         writer.write_all(manifest_json.as_bytes())?;
-        Ok(())
-    })
-}
-
-/// Read summary.json out of a session zip. Missing entry, sandbox
-/// rejection, or malformed JSON all collapse to `Default::default()` so
-/// brand-new sessions and zips produced by older binaries that
-/// predate this feature load cleanly.
-fn read_compression_from_zip(zip_path: &Path) -> CompressionState {
-    let body = match crate::sandbox_backend::global().read_zip_entry_text(
-        zip_path,
-        "summary.json",
-        MAX_SESSION_ARCHIVE_BYTES,
-        MAX_SUMMARY_BYTES,
-    ) {
-        Ok(Some(s)) => s,
-        Ok(None) => return CompressionState::default(),
-        Err(e) => {
-            tracing::warn!(
-                path = %zip_path.display(),
-                "session summary unreadable: {e}"
-            );
-            return CompressionState::default();
-        }
-    };
-    serde_json::from_str(&body).unwrap_or_default()
-}
-
-/// Replace summary.json in an existing session zip, copying all other
-/// entries as-is. Mirrors `rewrite_manifest_in_zip`. Atomic via
-/// `with_temp_zip_writer` so a failure leaves the on-disk zip
-/// untouched and the caller can roll back in-memory state.
-///
-/// Unused until Phase 4 wires the compression engine into the prompt
-/// path; allow until then so the warning doesn't fail CI.
-#[allow(dead_code)]
-fn rewrite_compression_in_zip(
-    zip_path: &Path,
-    compression: &CompressionState,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    with_temp_zip_writer(zip_path, |writer, options| {
-        copy_zip_entries_via_sandbox(zip_path, writer, options, |n| n == "summary.json")?;
-        let body =
-            serde_json::to_string_pretty(compression).context("serializing compression state")?;
-        writer.start_file("summary.json", options)?;
-        writer.write_all(body.as_bytes())?;
         Ok(())
     })
 }
@@ -1751,18 +1780,12 @@ impl SessionStore {
         let loaded = tokio::task::spawn_blocking(move || {
             let manifest = read_manifest_from_zip(&zip_path)?;
             let history = read_history_from_zip(&zip_path);
-            // Compression state is best-effort: a missing or
-            // malformed `summary.json` collapses to defaults rather
-            // than failing the whole load, mirroring how legacy
-            // tool-exchange-free zips deserialize cleanly into the
-            // current schema.
-            let compression = read_compression_from_zip(&zip_path);
-            Some((manifest, history, compression))
+            Some((manifest, history))
         })
         .await
         .ok()
         .flatten();
-        let Some((manifest, mut history, compression)) = loaded else {
+        let Some((manifest, mut history)) = loaded else {
             return false;
         };
 
@@ -1789,7 +1812,6 @@ impl SessionStore {
             model,
             history,
             manifest,
-            compression,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1829,14 +1851,7 @@ impl SessionStore {
         // Holding both at once is unnecessary and would invite a lock
         // ordering hazard with set_model (which writes sessions then
         // reads available_models on auto-fallback).
-        let (
-            snap_base,
-            selected_effort,
-            idle_timeout_secs,
-            project_instructions,
-            skills,
-            compression,
-        ) = {
+        let (snap_base, selected_effort, idle_timeout_secs, project_instructions, skills) = {
             let sessions = self.sessions.read().await;
             let s = sessions.get(id)?;
             (
@@ -1845,15 +1860,9 @@ impl SessionStore {
                 s.idle_timeout_secs,
                 s.project_instructions.clone(),
                 s.skills.clone(),
-                (
-                    s.context_strategy,
-                    s.conversation_summary.clone(),
-                    s.summary_pivot,
-                ),
             )
         };
         let (cwd, mode, model, history) = snap_base;
-        let (context_strategy, conversation_summary, summary_pivot) = compression;
         // Resolve "user has no pick" to the model's
         // default_reasoning_level so the backend gets a concrete
         // intent. Models that publish no presets resolve to None and
@@ -1878,9 +1887,6 @@ impl SessionStore {
             idle_timeout_secs,
             project_instructions,
             skills,
-            context_strategy,
-            conversation_summary,
-            summary_pivot,
         })
     }
 
@@ -2085,116 +2091,64 @@ impl SessionStore {
         Ok(true)
     }
 
-    /// Update the per-session compression strategy and persist it into
-    /// `summary.json`. Rollback on persistence failure keeps
-    /// `memory == disk`, mirroring `set_mode`. Returns `Ok(false)` for
-    /// an unknown session id.
+    /// Store an LLM-produced summary onto a previously-persisted turn,
+    /// reachable both by index into the in-memory history and via the
+    /// turn's stable fragment id. Mirrors Brokk's
+    /// `ContextManager.compressHistory(TaskEntry)`: the original log
+    /// stays on disk untouched; only `summaryContentId` flips so the
+    /// next prompt build substitutes the summary in place of the
+    /// verbatim turn.
     ///
-    /// Unused until Phase 5 wires `/setup advanced`; allow until then.
-    #[allow(dead_code)]
-    pub async fn set_context_strategy(
+    /// Returns:
+    /// - `Ok(true)` on success.
+    /// - `Ok(false)` for an unknown session, an out-of-range
+    ///   `turn_index`, or a turn whose `fragment_id` is `None` (a turn
+    ///   that hasn't completed its initial persistence yet -- a
+    ///   programming error rather than a runtime condition).
+    /// - `Err` only when the disk rewrite fails. The in-memory
+    ///   mutation is rolled back so `memory == disk`.
+    pub async fn set_turn_summary(
         &self,
         id: &str,
-        strategy: crate::context_manager::ContextStrategy,
-    ) -> anyhow::Result<bool> {
-        let snapshot = {
-            let mut sessions = self.sessions.write().await;
-            match sessions.get_mut(id) {
-                Some(session) => {
-                    let prev = session.context_strategy;
-                    session.context_strategy = strategy;
-                    let state = CompressionState::from_session_fields(
-                        session.context_strategy,
-                        session.conversation_summary.clone(),
-                        session.summary_pivot,
-                    );
-                    Some((session.cwd.clone(), state, prev))
-                }
-                None => None,
-            }
-        };
-        let Some((cwd, state, prev_strategy)) = snapshot else {
-            return Ok(false);
-        };
-
-        let zip_path = session_zip_path(&cwd, id);
-        let join_result =
-            tokio::task::spawn_blocking(move || rewrite_compression_in_zip(&zip_path, &state))
-                .await;
-        let persist_result = match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        };
-        if let Err(e) = persist_result {
-            tracing::error!(
-                session_id = %id,
-                "failed to persist context strategy; rolling back in-memory state: {e:#}"
-            );
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.context_strategy = prev_strategy;
-            }
-            return Err(e);
-        }
-        Ok(true)
-    }
-
-    /// Update the per-session conversation summary and pivot, then
-    /// persist them into `summary.json`. Called by the compression
-    /// engine after producing a new summary; persisting before the
-    /// real prompt fires guarantees that a session reloaded later
-    /// reproduces the same compressed prompt (the determinism
-    /// requirement that motivated keeping `summary.json` on disk in
-    /// the first place).
-    ///
-    /// `pivot` must be `>= current_pivot && <= history.len()`; values
-    /// outside that range return `Ok(false)` without mutating
-    /// state, so a buggy planner can't silently regress the pivot or
-    /// point into uninitialized history.
-    ///
-    /// Unused until Phase 4 wires the compression engine in.
-    #[allow(dead_code)]
-    pub async fn set_compression_state(
-        &self,
-        id: &str,
-        summary: Option<String>,
-        pivot: usize,
+        turn_index: usize,
+        summary: String,
     ) -> anyhow::Result<bool> {
         let snapshot = {
             let mut sessions = self.sessions.write().await;
             let Some(session) = sessions.get_mut(id) else {
                 return Ok(false);
             };
-            if pivot < session.summary_pivot || pivot > session.history.len() {
+            if turn_index >= session.history.len() {
                 tracing::warn!(
                     session_id = %id,
-                    requested_pivot = pivot,
-                    current_pivot = session.summary_pivot,
+                    turn_index,
                     history_len = session.history.len(),
-                    "rejecting out-of-range compression pivot"
+                    "rejecting set_turn_summary: turn_index out of range"
                 );
                 return Ok(false);
             }
-            let prev_summary = session.conversation_summary.clone();
-            let prev_pivot = session.summary_pivot;
-            session.conversation_summary = summary;
-            session.summary_pivot = pivot;
-            let state = CompressionState::from_session_fields(
-                session.context_strategy,
-                session.conversation_summary.clone(),
-                session.summary_pivot,
-            );
-            Some((session.cwd.clone(), state, prev_summary, prev_pivot))
+            let Some(fragment_id) = session.history[turn_index].fragment_id.clone() else {
+                tracing::warn!(
+                    session_id = %id,
+                    turn_index,
+                    "rejecting set_turn_summary: turn has no fragment_id (was it persisted?)"
+                );
+                return Ok(false);
+            };
+            let prev_summary = session.history[turn_index].summary.clone();
+            session.history[turn_index].summary = Some(summary.clone());
+            Some((session.cwd.clone(), fragment_id, prev_summary))
         };
-        let Some((cwd, state, prev_summary, prev_pivot)) = snapshot else {
+        let Some((cwd, fragment_id, prev_summary)) = snapshot else {
             return Ok(false);
         };
 
         let zip_path = session_zip_path(&cwd, id);
-        let join_result =
-            tokio::task::spawn_blocking(move || rewrite_compression_in_zip(&zip_path, &state))
-                .await;
+        let summary_for_zip = summary.clone();
+        let join_result = tokio::task::spawn_blocking(move || {
+            rewrite_turn_summary_in_zip(&zip_path, &fragment_id, &summary_for_zip)
+        })
+        .await;
         let persist_result = match join_result {
             Ok(r) => r,
             Err(join_err) => Err(anyhow::anyhow!(
@@ -2204,11 +2158,13 @@ impl SessionStore {
         if let Err(e) = persist_result {
             tracing::error!(
                 session_id = %id,
-                "failed to persist compression state; rolling back in-memory state: {e:#}"
+                turn_index,
+                "failed to persist turn summary; rolling back in-memory state: {e:#}"
             );
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.conversation_summary = prev_summary;
-                session.summary_pivot = prev_pivot;
+            if let Some(session) = self.sessions.write().await.get_mut(id)
+                && let Some(turn) = session.history.get_mut(turn_index)
+            {
+                turn.summary = prev_summary;
             }
             return Err(e);
         }
@@ -2389,23 +2345,37 @@ impl SessionStore {
         })
         .await;
 
-        let persist_result = match join_result {
+        let persist_result: anyhow::Result<String> = match join_result {
             Ok(r) => r,
             Err(join_err) => Err(anyhow::anyhow!(
                 "session persistence task panicked: {join_err}"
             )),
         };
 
-        if let Err(e) = persist_result {
-            tracing::error!(
-                session_id = %id,
-                "failed to persist conversation turn; rolling back in-memory state: {e:#}"
-            );
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.history.pop();
-                session.manifest.modified = prev_modified;
+        let assigned_fragment_id = match persist_result {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(
+                    session_id = %id,
+                    "failed to persist conversation turn; rolling back in-memory state: {e:#}"
+                );
+                if let Some(session) = self.sessions.write().await.get_mut(id) {
+                    session.history.pop();
+                    session.manifest.modified = prev_modified;
+                }
+                return Err(e);
             }
-            return Err(e);
+        };
+        // Stamp the persisted fragment id back onto the in-memory
+        // turn so subsequent `set_turn_summary` calls can locate the
+        // right `summaryContentId` to rewrite without re-reading the
+        // zip. Trim eviction (`max_history_turns`) may have dropped
+        // the pushed turn between persist and now -- it stays consistent
+        // with disk either way.
+        if let Some(session) = self.sessions.write().await.get_mut(id)
+            && let Some(last) = session.history.last_mut()
+        {
+            last.fragment_id = Some(assigned_fragment_id);
         }
 
         // Persistence succeeded. Apply the in-memory sliding window so
@@ -2599,7 +2569,6 @@ mod tests {
             "m".into(),
             history.clone(),
             manifest.clone(),
-            CompressionState::default(),
         )
         .expect("matching ids should succeed");
 
@@ -2821,7 +2790,6 @@ mod tests {
             "m".into(),
             Vec::new(),
             manifest,
-            CompressionState::default(),
         )
         .expect_err("mismatched ids must be rejected");
 
@@ -3796,6 +3764,8 @@ done
                             arguments: format!(r#"{{"i":{i}}}"#),
                             result: format!("r-{i}"),
                         }],
+                        summary: None,
+                        fragment_id: None,
                     },
                 )
                 .await
@@ -3863,6 +3833,8 @@ done
                     user_prompt: "explore the repo".into(),
                     agent_response: "found one file".into(),
                     tool_exchanges: exchanges.clone(),
+                    summary: None,
+                    fragment_id: None,
                 },
             )
             .await
@@ -3937,15 +3909,16 @@ done
     }
 
     // -----------------------------------------------------------------------
-    // Phase 3: compression state persistence (summary.json)
+    // Per-turn summary persistence (mirrors Brokk's TaskEntry.summary)
     // -----------------------------------------------------------------------
 
-    /// A freshly-created session has no `summary.json` in its zip; the
-    /// load path must collapse "missing entry" into `CompressionState::default()`
-    /// so the resulting `Session` has no summary, pivot zero, and
-    /// the default Hybrid strategy.
+    /// `set_turn_summary` updates a single turn's `summary` in memory
+    /// and persists it via the existing `summaryContentId` slot. A
+    /// reload must recover the same summary -- without this, the
+    /// next prompt build would re-send the verbatim turn, defeating
+    /// the compression.
     #[tokio::test]
-    async fn fresh_session_loads_with_default_compression_state() {
+    async fn set_turn_summary_round_trips_through_zip() {
         let store = SessionStore::with_limits(
             "m".to_string(),
             SessionLimits {
@@ -3954,67 +3927,61 @@ done
             },
         );
         let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-fresh-compression-{}",
+            "brokk-acp-rust-turn-summary-{}",
             uuid::Uuid::new_v4()
         ));
         let s = store.create_session(cwd.clone()).await;
-
-        // Drop the in-memory copy so the next access forces a disk load.
-        store.sessions.write().await.remove(&s.id);
-        let snap = store
-            .snapshot(&s.id, &cwd)
-            .await
-            .expect("session reloads from disk");
-
-        assert!(snap.conversation_summary.is_none());
-        assert_eq!(snap.summary_pivot, 0);
-        assert_eq!(
-            snap.context_strategy,
-            crate::context_manager::ContextStrategy::default()
-        );
-
-        let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    /// `set_context_strategy` updates the in-memory session and writes
-    /// `summary.json`. Reloading the session from disk must recover
-    /// the same strategy -- this is the replay-determinism property
-    /// the design promises.
-    #[tokio::test]
-    async fn set_context_strategy_persists_through_reload() {
-        use crate::context_manager::ContextStrategy;
-
-        let store = SessionStore::with_limits(
-            "m".to_string(),
-            SessionLimits {
-                max_sessions: 0,
-                max_history_turns: 0,
-            },
-        );
-        let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-strategy-persist-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let s = store.create_session(cwd.clone()).await;
-
         store
-            .set_context_strategy(&s.id, ContextStrategy::SlidingWindow)
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "user 0".into(),
+                    agent_response: "agent 0".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists");
+        store
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "user 1".into(),
+                    agent_response: "agent 1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists");
+
+        // Compress turn 0.
+        store
+            .set_turn_summary(&s.id, 0, "- key bullet for turn 0".into())
             .await
             .expect("persist succeeds");
 
+        // Drop the in-memory copy and reload from disk.
         store.sessions.write().await.remove(&s.id);
         let snap = store.snapshot(&s.id, &cwd).await.expect("reload succeeds");
-        assert_eq!(snap.context_strategy, ContextStrategy::SlidingWindow);
+        assert_eq!(snap.history.len(), 2);
+        assert_eq!(
+            snap.history[0].summary.as_deref(),
+            Some("- key bullet for turn 0"),
+            "turn 0's summary must round-trip"
+        );
+        assert!(
+            snap.history[1].summary.is_none(),
+            "turn 1 was never compressed"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `set_compression_state` updates summary + pivot together and
-    /// persists them. Reload must recover both verbatim, since the
-    /// whole point of persisting `summary.json` is so a re-fed prompt
-    /// matches what the live session would send.
+    /// `set_turn_summary` must reject an out-of-range turn index and
+    /// leave the session untouched, mirroring the guard `set_mode`
+    /// uses for unknown sessions.
     #[tokio::test]
-    async fn set_compression_state_persists_summary_and_pivot() {
+    async fn set_turn_summary_rejects_out_of_range_turn_index() {
         let store = SessionStore::with_limits(
             "m".to_string(),
             SessionLimits {
@@ -4023,56 +3990,10 @@ done
             },
         );
         let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-summary-persist-{}",
+            "brokk-acp-rust-turn-summary-guard-{}",
             uuid::Uuid::new_v4()
         ));
         let s = store.create_session(cwd.clone()).await;
-        // Seed enough history that a non-zero pivot is meaningful.
-        for i in 0..3 {
-            store
-                .add_turn(
-                    &s.id,
-                    ConversationTurn {
-                        user_prompt: format!("u-{i}"),
-                        agent_response: format!("a-{i}"),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("turn persists");
-        }
-
-        store
-            .set_compression_state(&s.id, Some("- key fact".to_string()), 2)
-            .await
-            .expect("compression state persists");
-
-        store.sessions.write().await.remove(&s.id);
-        let snap = store.snapshot(&s.id, &cwd).await.expect("reload succeeds");
-        assert_eq!(snap.conversation_summary.as_deref(), Some("- key fact"));
-        assert_eq!(snap.summary_pivot, 2);
-
-        let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    /// The pivot guard rejects values below the current pivot
-    /// (regression) or above `history.len()` (pointing into
-    /// nothing). Memory must stay untouched on rejection.
-    #[tokio::test]
-    async fn set_compression_state_rejects_out_of_range_pivot() {
-        let store = SessionStore::with_limits(
-            "m".to_string(),
-            SessionLimits {
-                max_sessions: 0,
-                max_history_turns: 0,
-            },
-        );
-        let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-pivot-guard-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let s = store.create_session(cwd.clone()).await;
-        // Seed one turn so history.len() == 1.
         store
             .add_turn(
                 &s.id,
@@ -4084,96 +4005,23 @@ done
             )
             .await
             .expect("turn persists");
-        // Set a baseline pivot of 1 so we can attempt a regression to 0.
-        store
-            .set_compression_state(&s.id, Some("- s".to_string()), 1)
-            .await
-            .expect("baseline persists");
 
-        // Regression below current pivot is rejected.
-        let regress = store
-            .set_compression_state(&s.id, Some("- new".to_string()), 0)
+        let ok = store
+            .set_turn_summary(&s.id, 99, "- nope".into())
             .await
-            .expect("call doesn't error");
-        assert!(!regress, "pivot must not move backwards");
-
-        // Out-of-bounds (> history.len()) is rejected.
-        let oob = store
-            .set_compression_state(&s.id, Some("- new".to_string()), 99)
-            .await
-            .expect("call doesn't error");
-        assert!(!oob, "pivot past history.len() must be rejected");
-
-        // Memory and disk both still carry the baseline value.
-        let in_memory = {
-            let sessions = store.sessions.read().await;
-            let session = sessions.get(&s.id).expect("session resident");
-            (session.conversation_summary.clone(), session.summary_pivot)
-        };
-        assert_eq!(in_memory, (Some("- s".to_string()), 1));
+            .expect("no error");
+        assert!(!ok, "out-of-range index must return false");
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `from_persisted` must clamp an out-of-range pivot loaded off
-    /// disk against history length rather than panicking on a slice
-    /// later. Mirrors the defensive clamps `trim_history` applies on
-    /// the same load path.
-    #[test]
-    fn from_persisted_clamps_pivot_against_history_len() {
-        let manifest = SessionManifest {
-            id: "id".into(),
-            name: "n".into(),
-            created: 1,
-            modified: 2,
-            version: "4.0".into(),
-            mode: Some("CODE".into()),
-            model: Some("m".into()),
-        };
-        let history = vec![ConversationTurn::default(), ConversationTurn::default()];
-        let compression = CompressionState {
-            strategy: "hybrid".into(),
-            summary: Some("- bullet".into()),
-            // Way past history.len() == 2 -- must be clamped.
-            pivot: 99,
-        };
-        let session = Session::from_persisted(
-            "id".into(),
-            PathBuf::from("/tmp/x"),
-            SessionMode::Code,
-            "m".into(),
-            history,
-            manifest,
-            compression,
-        )
-        .expect("load");
-        assert_eq!(session.summary_pivot, 2);
-    }
-
-    /// An unknown wire-form strategy in `summary.json` (e.g. a future
-    /// schema) must fall back to the default rather than failing the
-    /// load -- this is the forward-compat property the wire-form
-    /// string buys us.
-    #[test]
-    fn compression_state_unknown_strategy_falls_back_to_default() {
-        let state = CompressionState {
-            strategy: "from-the-future".into(),
-            summary: None,
-            pivot: 0,
-        };
-        assert_eq!(
-            state.resolved_strategy(),
-            crate::context_manager::ContextStrategy::default()
-        );
-    }
-
-    /// Appending a turn must not destroy a previously-persisted
-    /// `summary.json`: the entry isn't in `REWRITTEN`, so it should
-    /// stream through verbatim. Without this guarantee a single
-    /// post-compression turn would silently erase the summary and
-    /// the next reload would build a different prompt.
+    /// A persisted summary must survive subsequent `add_turn` calls
+    /// (which rewrite the zip's manifest, fragments, and contexts).
+    /// Without this guarantee a single post-compression turn would
+    /// silently erase the summary and the next reload would build a
+    /// different prompt.
     #[tokio::test]
-    async fn add_turn_preserves_existing_summary_json() {
+    async fn add_turn_preserves_existing_turn_summary() {
         let store = SessionStore::with_limits(
             "m".to_string(),
             SessionLimits {
@@ -4182,30 +4030,27 @@ done
             },
         );
         let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-summary-preserve-{}",
+            "brokk-acp-rust-summary-survives-add-{}",
             uuid::Uuid::new_v4()
         ));
         let s = store.create_session(cwd.clone()).await;
-        // Seed two turns so a pivot of 1 is in-range.
-        for i in 0..2 {
-            store
-                .add_turn(
-                    &s.id,
-                    ConversationTurn {
-                        user_prompt: format!("u-{i}"),
-                        agent_response: format!("a-{i}"),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("turn persists");
-        }
         store
-            .set_compression_state(&s.id, Some("- preserved".to_string()), 1)
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "u-old".into(),
+                    agent_response: "a-old".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists");
+        store
+            .set_turn_summary(&s.id, 0, "- preserved bullet".into())
             .await
             .expect("summary persists");
 
-        // Now append a new turn; the existing summary.json must survive.
+        // Append another turn. The first turn's summary must survive.
         store
             .add_turn(
                 &s.id,
@@ -4218,11 +4063,14 @@ done
             .await
             .expect("turn appends");
 
-        // Reload from disk to confirm summary survived the rewrite.
         store.sessions.write().await.remove(&s.id);
         let snap = store.snapshot(&s.id, &cwd).await.expect("reload succeeds");
-        assert_eq!(snap.conversation_summary.as_deref(), Some("- preserved"));
-        assert_eq!(snap.summary_pivot, 1);
+        assert_eq!(snap.history.len(), 2);
+        assert_eq!(
+            snap.history[0].summary.as_deref(),
+            Some("- preserved bullet")
+        );
+        assert!(snap.history[1].summary.is_none());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

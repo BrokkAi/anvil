@@ -43,12 +43,6 @@ pub fn approximate_tokens(text: &str) -> usize {
 /// OpenAI's published formula) because that overhead is provider-
 /// specific and would mislead users on non-OpenAI backends; the
 /// threshold should be set with a safety margin instead.
-///
-/// Currently unused outside tests -- Phase 2 of the context-compression
-/// feature (PLANS.md) calls this from the threshold check before
-/// `build_prompt_messages` to decide whether to summarize. Kept public
-/// here so the API surface is reviewable in isolation.
-#[allow(dead_code)]
 pub fn approximate_tokens_messages(messages: &[ChatMessage]) -> usize {
     let mut total = 0usize;
     for msg in messages {
