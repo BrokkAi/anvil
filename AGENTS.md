@@ -25,6 +25,7 @@ On Linux, `bubblewrap` (`bwrap`) must be installed for `runShellCommand` OS-leve
 - **Session zip reads/writes** all route through `SandboxBackend` to prevent untrusted archives from OOM-ing or panicking the host. Writes use atomic temp-then-rename.
 - **Permission gate** logic lives in `pure_gate_decision()` (unit-testable without a live ACP connection). Four modes: `default`, `acceptEdits`, `readOnly`, `bypassPermissions`. `runShellCommand` always re-prompts regardless of "Always allow" sticky approval.
 - **Path validation**: `safe_resolve` (reads) and `safe_resolve_for_write` (writes) ensure filesystem operations stay within the session's `cwd`. The write variant walks up to the first existing ancestor, canonicalizes it, and rejects `..` in the missing tail.
+- **Context compression** lives in `src/context_manager.rs`. The single public entry point `summarize_turn` fast-paths when the turn fits the summarizer budget (`SUMMARIZER_INPUT_FRACTION = 0.65 * context_length`) and otherwise atomizes → packs into chunks → summarizes each chunk → meta-summarizes the joined output, recursing if the meta input still overruns. Per-turn summaries persist via the existing `summaryContentId` slot in `contexts.jsonl` (Brokk-compatible — same field the Java side reads). `build_prompt_messages` substitutes a single `<conversation_summary>` user message for any turn whose `ConversationTurn.summary` is `Some`. The verbatim log stays on disk regardless, so a reload reproduces the same compressed prompt.
 
 ## Adding a new built-in tool
 

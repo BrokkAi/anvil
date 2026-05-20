@@ -11,6 +11,7 @@
 - **Permission Gating**: Configurable security policies (Default, Accept Edits, Read-only, Bypass) to control tool execution.
 - **Code Intelligence**: Optional integration with Bifrost for symbol search, cross-references, and structural analysis.
 - **Session Persistence**: Saves and resumes conversation history and session state from disk.
+- **Context Management**: `/context` reports current token usage against the model's window; `/compress` summarizes prior turns via the LLM (with hierarchical fallback for turns too large for one summarization call) and persists the result so reloads send the same compressed prompt. Compression also fires automatically when a prompt would overflow the configured budget.
 
 ## Architecture
 
