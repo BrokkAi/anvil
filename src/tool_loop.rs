@@ -389,6 +389,54 @@ pub(crate) async fn run(
                         }
                     };
 
+                    // Refuse outright if the rendered title would exceed the
+                    // dialog-safe cap. An oversized title wraps the approval
+                    // modal across multiple lines and pushes Approve/Reject
+                    // off-screen, so the user could authorize a call they
+                    // can't fully read. We reject instead of truncating so
+                    // nothing is silently hidden from the approver; the LLM
+                    // gets a clear error and is expected to retry with
+                    // smaller arguments.
+                    if let Some(reason) =
+                        announce::rejection_for_oversized_title(&tool_name, &parsed_input)
+                    {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            tool_name = %tool_name,
+                            title_chars = announce::tool_title(&tool_name, &parsed_input)
+                                .chars()
+                                .count(),
+                            "rejecting tool call: rendered title exceeds MAX_TOOL_TITLE_CHARS",
+                        );
+                        send_session_update(
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
+                                &call.id,
+                                &tool_name,
+                                kind,
+                                &parsed_input,
+                            )),
+                        );
+                        send_session_update(
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCallUpdate(announce::update_failed(
+                                &call.id,
+                                &reason,
+                                Some(Value::String(reason.clone())),
+                            )),
+                        );
+                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
+                        tool_exchanges.push(ToolExchange {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            result: reason,
+                        });
+                        continue;
+                    }
+
                     // Pending -- emit the card before the gate runs so the
                     // permission modal (which reuses this id) renders against
                     // a card that already shows path / command / etc.
@@ -612,10 +660,21 @@ async fn request_user_permission(
     // The permission modal needs to show *what* is being approved, not just
     // the tool kind. Reuse the same title-builder the standalone tool-call
     // card uses so e.g. ``Run `cargo test` `` appears in the prompt.
+    //
+    // Assumes the caller has already filtered oversized titles via
+    // `announce::rejection_for_oversized_title` in `run`; the debug assert
+    // catches any future path that reaches the modal without that gate.
+    let title = announce::tool_title(tool_name, raw_input);
+    debug_assert!(
+        title.chars().count() <= announce::MAX_TOOL_TITLE_CHARS,
+        "request_user_permission: oversized title bypassed the pre-gate check \
+         (tool={tool_name}, chars={})",
+        title.chars().count()
+    );
     let fields = ToolCallUpdateFields::new()
         .kind(kind)
         .status(ToolCallStatus::Pending)
-        .title(announce::tool_title(tool_name, raw_input))
+        .title(title)
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 

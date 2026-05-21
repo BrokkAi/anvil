@@ -21,9 +21,85 @@ use crate::tools::ToolRegistry;
 /// separately by `tool_loop::MAX_TOOL_RESULT_BYTES`.
 const MAX_INLINE_OUTPUT_BYTES: usize = 50_000;
 
+/// Cap on the rendered tool-call title's count of Unicode scalars
+/// (`str::chars`). Clients render this title at the top of the permission
+/// dialog with a fixed slot; past this width the title wraps onto
+/// multiple lines and pushes the Approve/Reject buttons (or even
+/// content) off-screen, leading users to authorize calls they can't
+/// fully see. Observed identically across multiple ACP clients, since
+/// they all rely on the title we send.
+///
+/// Counting scalars (rather than grapheme clusters or terminal display
+/// width) is an approximation: a CJK fullwidth string at exactly the cap
+/// renders ~2x wider than an ASCII string at the cap. Adequate for the
+/// dominant case of LLM-emitted shell commands and paths, which are
+/// nearly all ASCII; a future tightening could switch to
+/// `unicode_width::UnicodeWidthStr` if we observe CJK-only blowups.
+///
+/// We deliberately *reject* over-cap titles rather than truncating: a
+/// truncated title hides information from the approver, which is the
+/// exact failure mode we're trying to prevent. The LLM gets a clear
+/// error and is expected to retry with smaller arguments (shorter
+/// command, narrower pattern, etc.).
+pub(super) const MAX_TOOL_TITLE_CHARS: usize = 1024;
+
+/// Build the canned rejection text fed back to the LLM (and surfaced on
+/// the Failed tool-call card) when a title would exceed
+/// `MAX_TOOL_TITLE_CHARS`. Derived from the constant so the number
+/// quoted to the model never drifts from the enforced cap.
+fn title_too_long_reason() -> String {
+    format!(
+        "Tool use denied: the rendered tool-call title would exceed {MAX_TOOL_TITLE_CHARS} \
+         characters, which clips the approval dialog and would hide what's being \
+         authorized. Retry with smaller arguments (shorter command, narrower pattern, etc.)."
+    )
+}
+
 /// Build the initial `Pending` tool call -- the card the client renders
 /// before we run the permission gate.
+///
+/// Assumes the caller has already gated the title length via
+/// `rejection_for_oversized_title`; a debug assertion catches any future
+/// path that emits an oversized title without going through the gate.
+/// In release builds the assertion compiles out, so we degrade to the
+/// pre-cap behavior rather than panicking on user input.
 pub(super) fn initial_tool_call(
+    tool_call_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+) -> ToolCall {
+    let title = tool_title(tool_name, raw_input);
+    debug_assert!(
+        title.chars().count() <= MAX_TOOL_TITLE_CHARS,
+        "initial_tool_call: oversized title bypassed the pre-gate check \
+         (tool={tool_name}, chars={})",
+        title.chars().count()
+    );
+    ToolCall::new(ToolCallId::new(tool_call_id.to_string()), title)
+        .kind(kind)
+        .status(ToolCallStatus::Pending)
+        .raw_input(raw_input.clone())
+        .locations(tool_locations(tool_name, raw_input))
+}
+
+/// If the title we'd render for this call exceeds `MAX_TOOL_TITLE_CHARS`,
+/// return the rejection message. `None` means the call's title fits and
+/// it can proceed to the normal Pending → gate flow.
+pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) -> Option<String> {
+    if tool_title(tool_name, raw_input).chars().count() > MAX_TOOL_TITLE_CHARS {
+        Some(title_too_long_reason())
+    } else {
+        None
+    }
+}
+
+/// Pending card for a call we're about to refuse because its full title
+/// would be too long. Uses only the static display name as the title --
+/// no user-controlled input -- so the rejection card itself can't trigger
+/// the same dialog-clipping problem. `raw_input` is still attached so the
+/// user sees *what* was rejected.
+pub(super) fn rejected_initial_tool_call(
     tool_call_id: &str,
     tool_name: &str,
     kind: ToolKind,
@@ -31,7 +107,7 @@ pub(super) fn initial_tool_call(
 ) -> ToolCall {
     ToolCall::new(
         ToolCallId::new(tool_call_id.to_string()),
-        tool_title(tool_name, raw_input),
+        ToolRegistry::display_name(tool_name).to_string(),
     )
     .kind(kind)
     .status(ToolCallStatus::Pending)
@@ -279,6 +355,74 @@ mod tests {
         assert!(tool_locations("searchFileContents", &json!({"pattern": "x"})).is_empty());
         assert!(tool_locations("think", &json!({"thought": "..."})).is_empty());
         assert!(tool_locations("search_symbols", &json!({"patterns": ["x"]})).is_empty());
+    }
+
+    #[test]
+    fn oversized_title_rejected_for_long_shell_command() {
+        // Single-line shell command long enough to push the rendered
+        // `Run \`<cmd>\`` title past 1024 chars. first_line() only strips
+        // \n, not length, so the long single-line case is what trips the
+        // cap in practice.
+        let cmd = "echo ".to_string() + &"a".repeat(MAX_TOOL_TITLE_CHARS);
+        let reason =
+            rejection_for_oversized_title("runShellCommand", &json!({"command": cmd.clone()}));
+        assert!(reason.is_some(), "title >1024 chars must be rejected");
+
+        let cmd_short = "echo hello".to_string();
+        let reason_short =
+            rejection_for_oversized_title("runShellCommand", &json!({"command": cmd_short}));
+        assert!(reason_short.is_none(), "short title must pass");
+    }
+
+    #[test]
+    fn oversized_title_boundary_is_inclusive() {
+        // Boundary check: title of exactly MAX chars passes, MAX+1 fails.
+        // Title is `Read \`<path>\`` -> 7 chars of chrome ("Read `" + "`").
+        let chrome = "Read ``".chars().count();
+        let path_len = MAX_TOOL_TITLE_CHARS - chrome;
+        let path = "a".repeat(path_len);
+        let title = tool_title("readFile", &json!({"path": path.clone()}));
+        assert_eq!(title.chars().count(), MAX_TOOL_TITLE_CHARS);
+        assert!(rejection_for_oversized_title("readFile", &json!({"path": path})).is_none());
+
+        let path_over = "a".repeat(path_len + 1);
+        assert!(
+            rejection_for_oversized_title("readFile", &json!({"path": path_over})).is_some(),
+            "title MAX+1 chars must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejection_text_quotes_the_actual_cap() {
+        // Drift guard: the message handed to the LLM must mention the same
+        // number the gate enforces. If MAX_TOOL_TITLE_CHARS changes, the
+        // message has to follow.
+        let cmd = "echo ".to_string() + &"a".repeat(MAX_TOOL_TITLE_CHARS);
+        let reason =
+            rejection_for_oversized_title("runShellCommand", &json!({"command": cmd})).unwrap();
+        assert!(
+            reason.contains(&MAX_TOOL_TITLE_CHARS.to_string()),
+            "rejection message must quote the cap; got: {reason}"
+        );
+    }
+
+    #[test]
+    fn rejected_card_uses_static_display_name_not_user_input() {
+        // Sanity: the rejection card's title is the static display name,
+        // never the user-controlled args -- otherwise the rejection card
+        // itself could trigger the same dialog-clip we're protecting
+        // against.
+        let huge = "x".repeat(MAX_TOOL_TITLE_CHARS * 2);
+        let card = rejected_initial_tool_call(
+            "tc1",
+            "runShellCommand",
+            ToolKind::Execute,
+            &json!({"command": huge}),
+        );
+        assert_eq!(card.title, "Running shell command");
+        // raw_input is still attached so the user can inspect what was
+        // attempted; it lives in a scrollable region client-side.
+        assert!(card.raw_input.is_some());
     }
 
     #[test]
