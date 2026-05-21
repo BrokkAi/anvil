@@ -270,6 +270,16 @@ const SEATBELT_BASE_POLICY: &str = r#"(version 1)
     (path "/dev/null")
     (vnode-type CHARACTER-DEVICE)))
 
+; xcrun cache + per-user $TMPDIR. macOS Developer Tools (git, clang, swift,
+; xcodebuild, ...) shell out via xcrun, which sqlite-caches into a directory
+; resolved through confstr(_CS_DARWIN_USER_TEMP_DIR). Without these three
+; rules every git invocation prints "couldn't get path of DARWIN_USER_TEMP_DIR"
+; followed by "Operation not permitted" on a /tmp fallback, and most cc/swift
+; tooling fails outright. dirhelper is the Mach service confstr talks to.
+(allow mach-lookup (global-name "com.apple.bsd.dirhelper"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/private/var/folders"))
+
 ; sysctl whitelist required by the JVM and many Unix tools
 (allow sysctl-read
   (sysctl-name "hw.activecpu")
@@ -830,12 +840,17 @@ mod tests {
     }
 
     #[test]
-    fn read_only_mode_seatbelt_profile_still_blocks_writes() {
+    fn read_only_mode_seatbelt_profile_still_blocks_workspace_writes() {
+        // The base policy now emits `file-write*` rules for the xcrun cache
+        // dirs (/private/tmp, /private/var/folders) — see
+        // `seatbelt_base_policy_allows_xcrun_cache_paths`. The meaningful
+        // ReadOnly assertion is no longer "zero file-write* rules" but
+        // "no rule granting writes to the user's workspace".
         let policy = SandboxPolicy::from_permission_mode(PermissionMode::ReadOnly);
-        let scheme = build_seatbelt_policy(policy, Path::new("/tmp"));
+        let scheme = build_seatbelt_policy(policy, Path::new("/Users/foo/project"));
         assert!(
-            !scheme.contains("file-write*"),
-            "ReadOnly mode must never emit a file-write* rule; got:\n{scheme}"
+            !scheme.contains("/Users/foo/project"),
+            "ReadOnly mode must not emit a workspace-cwd subpath; got:\n{scheme}"
         );
     }
 
@@ -870,11 +885,49 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_policy_read_only_has_no_write_rule() {
-        let content = build_seatbelt_policy(SandboxPolicy::ReadOnly, Path::new("/tmp"));
+    fn seatbelt_policy_read_only_has_no_workspace_write_rule() {
+        // Use a cwd that doesn't overlap the base policy's xcrun-cache
+        // subpaths (/private/tmp, /private/var/folders), so the only way
+        // `file-write* (subpath "/Users/foo/project"` could appear is if
+        // ReadOnly mode incorrectly granted workspace writes.
+        let content =
+            build_seatbelt_policy(SandboxPolicy::ReadOnly, Path::new("/Users/foo/project"));
         assert!(content.contains("(deny default)"));
         assert!(content.contains("(allow file-read*)"));
-        assert!(!content.contains("file-write* (subpath"));
+        assert!(
+            !content.contains("/Users/foo/project"),
+            "ReadOnly must not emit a workspace-cwd subpath; got:\n{content}"
+        );
+    }
+
+    /// Regression for the macOS sandbox-exec UX bug where every `git` call
+    /// produced "confstr() failed with code 5" + "couldn't create cache file
+    /// '/tmp/xcrun_db-*' (Operation not permitted)". xcrun (transitively
+    /// invoked by git, clang, swift, xcodebuild) sqlite-caches into
+    /// $TMPDIR resolved via confstr(_CS_DARWIN_USER_TEMP_DIR), which talks
+    /// to the dirhelper Mach service and writes under /private/var/folders.
+    /// Without these three rules, the sandbox is unusable for any macOS
+    /// Developer Tools workflow even though `git` is on the read-allowed
+    /// filesystem.
+    #[test]
+    fn seatbelt_base_policy_allows_xcrun_cache_paths() {
+        // Apply to both tiers so a future refactor that splits the base
+        // policy can't silently drop these rules from one of them.
+        for policy in [SandboxPolicy::ReadOnly, SandboxPolicy::WorkspaceWrite] {
+            let content = build_seatbelt_policy(policy, Path::new("/Users/foo/project"));
+            assert!(
+                content.contains("(allow mach-lookup (global-name \"com.apple.bsd.dirhelper\"))"),
+                "{policy:?}: dirhelper mach-lookup must be allowed so confstr() can resolve $TMPDIR; got:\n{content}"
+            );
+            assert!(
+                content.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+                "{policy:?}: /private/tmp must be writable for xcrun fallback; got:\n{content}"
+            );
+            assert!(
+                content.contains("(allow file-write* (subpath \"/private/var/folders\"))"),
+                "{policy:?}: /private/var/folders must be writable for $TMPDIR; got:\n{content}"
+            );
+        }
     }
 
     #[test]
