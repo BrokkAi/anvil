@@ -86,10 +86,7 @@ pub(super) fn initial_tool_call(
 /// If the title we'd render for this call exceeds `MAX_TOOL_TITLE_CHARS`,
 /// return the rejection message. `None` means the call's title fits and
 /// it can proceed to the normal Pending → gate flow.
-pub(super) fn rejection_for_oversized_title(
-    tool_name: &str,
-    raw_input: &Value,
-) -> Option<String> {
+pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) -> Option<String> {
     if tool_title(tool_name, raw_input).chars().count() > MAX_TOOL_TITLE_CHARS {
         Some(title_too_long_reason())
     } else {
