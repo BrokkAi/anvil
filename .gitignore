@@ -29,3 +29,5 @@ desktop.ini
 .brokk/
 
 brokk-acp-sandbox/target/
+
+.claude/
