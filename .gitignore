@@ -31,3 +31,6 @@ desktop.ini
 brokk-acp-sandbox/target/
 
 .claude/
+
+# Mjolnir linked worktrees
+.mjolnir/worktrees/
