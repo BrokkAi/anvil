@@ -182,6 +182,21 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
             .map(|c| format!("Run `{}`", first_line(c)))
             .unwrap_or_else(|| display.to_string()),
         "think" => "Think".to_string(),
+        "task" => {
+            // Prefer the human-readable `description` (short label) over
+            // `subagent_type` (catalog key) and the full `prompt` (often
+            // long and noisy in a card title). The order matters: a
+            // generic `brief_input_summary` would pick whichever key
+            // iterates first, which gives us `prompt` half the time.
+            let description = raw_input.get("description").and_then(Value::as_str);
+            let subagent_type = raw_input.get("subagent_type").and_then(Value::as_str);
+            match (subagent_type, description) {
+                (Some(t), Some(d)) if !d.is_empty() => format!("Subagent `{t}`: {d}"),
+                (Some(t), _) => format!("Subagent `{t}`"),
+                (None, Some(d)) if !d.is_empty() => format!("Subagent: {d}"),
+                _ => display.to_string(),
+            }
+        }
         _ => {
             // Bifrost or anything we don't special-case: append a brief
             // input summary so the user sees more than just "Searching for
@@ -332,6 +347,31 @@ mod tests {
     fn missing_path_uses_display_name() {
         let title = tool_title("readFile", &json!({}));
         assert_eq!(title, "Reading file");
+    }
+
+    #[test]
+    fn task_title_shows_subagent_and_description() {
+        let title = tool_title(
+            "task",
+            &json!({
+                "subagent_type": "doc-writer",
+                "description": "Draft the spec",
+                "prompt": "very long prompt that should not appear in the title"
+            }),
+        );
+        assert_eq!(title, "Subagent `doc-writer`: Draft the spec");
+    }
+
+    #[test]
+    fn task_title_with_only_subagent_type() {
+        let title = tool_title("task", &json!({"subagent_type": "doc-writer"}));
+        assert_eq!(title, "Subagent `doc-writer`");
+    }
+
+    #[test]
+    fn task_title_falls_back_to_display_name_when_empty() {
+        let title = tool_title("task", &json!({}));
+        assert_eq!(title, "Running subagent");
     }
 
     #[test]

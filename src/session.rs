@@ -423,6 +423,10 @@ pub struct Session {
     /// descriptions). Refreshed on cwd change just like
     /// `project_instructions`.
     pub skills: Arc<crate::skills::SkillRegistry>,
+    /// Subagent catalog (`<name>.md` files) discovered alongside skills.
+    /// Drives the `task` meta-tool's `subagent_type` enum and supplies
+    /// the body the subagent runs with as a system prompt.
+    pub agents: Arc<crate::agents::AgentRegistry>,
     /// Names of skills the harness has already injected into the
     /// conversation context during this session. Used by the
     /// `activate_skill` tool to skip re-injection (the spec's "Deduplicate
@@ -452,6 +456,7 @@ impl Session {
         };
         let project_instructions = crate::agents_md::discover(&cwd);
         let skills = Arc::new(crate::skills::discover(&cwd));
+        let agents = Arc::new(crate::agents::discover(&cwd));
         Self {
             id,
             cwd,
@@ -465,6 +470,7 @@ impl Session {
             idle_timeout_secs: None,
             project_instructions,
             skills,
+            agents,
             activated_skills: HashSet::new(),
         }
     }
@@ -499,6 +505,7 @@ impl Session {
         }
         let project_instructions = crate::agents_md::discover(&cwd);
         let skills = Arc::new(crate::skills::discover(&cwd));
+        let agents = Arc::new(crate::agents::discover(&cwd));
         Ok(Self {
             id,
             cwd,
@@ -517,6 +524,7 @@ impl Session {
             idle_timeout_secs: None,
             project_instructions,
             skills,
+            agents,
             activated_skills: HashSet::new(),
         })
     }
@@ -1659,21 +1667,26 @@ impl SessionStore {
         bifrost_binary: Option<&Path>,
     ) -> Arc<ToolRegistry> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let skills = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .map(|s| s.skills.clone())
-            .unwrap_or_else(|| Arc::new(crate::skills::SkillRegistry::default()));
+        let (skills, agents) = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(session_id) {
+                Some(s) => (s.skills.clone(), s.agents.clone()),
+                None => (
+                    Arc::new(crate::skills::SkillRegistry::default()),
+                    Arc::new(crate::agents::AgentRegistry::default()),
+                ),
+            }
+        };
 
         if let Some(existing) = self.registries.read().await.get(session_id).cloned()
             && existing.cwd() == normalized_cwd.as_path()
         {
             existing.set_skills(skills).await;
+            existing.set_agents(agents).await;
             return existing;
         }
-        let registry = Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills).await);
+        let registry =
+            Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills, agents).await);
         self.registries
             .write()
             .await
