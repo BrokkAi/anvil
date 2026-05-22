@@ -395,7 +395,8 @@ pub struct Session {
     pub history: Vec<ConversationTurn>,
     pub manifest: SessionManifest,
     pub permission_mode: PermissionMode,
-    /// Tool names the user has chosen "Always allow" for this session.
+    /// Approval keys the user has chosen "Always allow" for this session.
+    /// Most tools use the tool name; shell commands use a scoped key.
     /// In-memory only (matches `claude-agent-acp` behavior).
     pub always_allow_tools: HashSet<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
@@ -2033,20 +2034,20 @@ impl SessionStore {
             .map(|s| s.permission_mode)
     }
 
-    /// True if the session has previously chosen "Always allow" for `tool_name`.
-    pub async fn is_always_allowed(&self, id: &str, tool_name: &str) -> bool {
+    /// True if the session has previously chosen "Always allow" for `approval_key`.
+    pub async fn is_always_allowed(&self, id: &str, approval_key: &str) -> bool {
         self.sessions
             .read()
             .await
             .get(id)
-            .map(|s| s.always_allow_tools.contains(tool_name))
+            .map(|s| s.always_allow_tools.contains(approval_key))
             .unwrap_or(false)
     }
 
-    /// Add `tool_name` to the session's in-memory always-allow set.
-    pub async fn add_always_allow(&self, id: &str, tool_name: &str) {
+    /// Add `approval_key` to the session's in-memory always-allow set.
+    pub async fn add_always_allow(&self, id: &str, approval_key: &str) {
         if let Some(session) = self.sessions.write().await.get_mut(id) {
-            session.always_allow_tools.insert(tool_name.to_string());
+            session.always_allow_tools.insert(approval_key.to_string());
         }
     }
 
@@ -3578,10 +3579,11 @@ mod tests {
         let cwd1 = tempfile::tempdir().expect("cwd1");
         std::fs::create_dir_all(cwd1.path().join(".git")).expect("touch git1");
         let s = store.create_session(cwd1.path().to_path_buf()).await;
+        let agent_name = format!("hunter-{}", uuid::Uuid::new_v4());
         let before = store.sessions.read().await.get(&s.id).cloned().unwrap();
         assert!(
-            before.agents.is_empty(),
-            "fresh session in empty cwd should have no agents"
+            before.agents.get(&agent_name).is_none(),
+            "fresh session in empty cwd should not have the project test agent"
         );
 
         // Second cwd: one project-scope agent.
@@ -3590,8 +3592,8 @@ mod tests {
         let agents_dir = cwd2.path().join(".claude").join("agents");
         std::fs::create_dir_all(&agents_dir).expect("agents dir");
         std::fs::write(
-            agents_dir.join("hunter.md"),
-            "---\nname: hunter\ndescription: Hunt bugs\n---\n\nbody\n",
+            agents_dir.join(format!("{agent_name}.md")),
+            format!("---\nname: {agent_name}\ndescription: Hunt bugs\n---\n\nbody\n"),
         )
         .expect("write agent");
 
@@ -3599,7 +3601,7 @@ mod tests {
 
         let after = store.sessions.read().await.get(&s.id).cloned().unwrap();
         assert!(
-            after.agents.get("hunter").is_some(),
+            after.agents.get(&agent_name).is_some(),
             "update_cwd should re-discover subagents in the new cwd"
         );
     }
