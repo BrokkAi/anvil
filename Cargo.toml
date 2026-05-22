@@ -6,7 +6,7 @@ members = ["xtask"]
 default-members = ["."]
 
 [package]
-name = "anvil"
+name = "brokk-anvil"
 version = "0.6.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"

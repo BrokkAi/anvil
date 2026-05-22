@@ -160,42 +160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil"
-version = "0.6.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "base64",
- "brokk-acp-sandbox",
- "chrono",
- "clap",
- "dirs",
- "futures",
- "libc",
- "oauth2",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "tiktoken-rs",
- "tiny_http",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
- "wasmtime",
- "wasmtime-wasi",
- "webbrowser",
- "wiremock",
- "zip",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -423,6 +387,42 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "walkdir",
+]
+
+[[package]]
+name = "brokk-anvil"
+version = "0.6.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "base64",
+ "brokk-acp-sandbox",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures",
+ "libc",
+ "oauth2",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "tiktoken-rs",
+ "tiny_http",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "wasmtime",
+ "wasmtime-wasi",
+ "webbrowser",
+ "wiremock",
+ "zip",
 ]
 
 [[package]]
