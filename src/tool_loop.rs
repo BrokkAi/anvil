@@ -130,6 +130,12 @@ pub(crate) enum NotificationMode {
 /// from leaking into nested system prompts.
 pub(crate) const MAX_SUBAGENT_DEPTH: usize = 1;
 
+/// Per-subagent turn ceiling, applied as `parent_max_turns.min(...)` in
+/// `execute_subagent`. Bounds the cost of a single delegation so a
+/// parent run with `--max-turns 200` doesn't hand 200 turns to each
+/// `task` invocation.
+pub(crate) const MAX_SUBAGENT_TURNS: usize = 25;
+
 /// Outcome of consulting the permission gate before executing a tool.
 enum GateDecision {
     /// Run the tool without prompting.
@@ -940,6 +946,13 @@ async fn execute_subagent(
     let noop_text: TextSink = Arc::new(Mutex::new(|_: &str| {}));
     let noop_thought: TextSink = Arc::new(Mutex::new(|_: &str| {}));
 
+    // Cap the subagent's turn budget so a runaway delegation can't
+    // burn the parent's entire allowance (which can be 200+ turns).
+    // 25 is enough for a well-scoped focused task; if the subagent
+    // needs more, that's a sign the parent should have done the work
+    // itself or split it differently.
+    let nested_max_turns = max_turns.min(MAX_SUBAGENT_TURNS);
+
     // `Box::pin` is required because `run` is recursive via this
     // function and Rust async fns can't be directly recursive (the
     // future type would have infinite size).
@@ -949,7 +962,7 @@ async fn execute_subagent(
         model,
         reasoning_effort,
         messages,
-        max_turns,
+        nested_max_turns,
         idle_timeout,
         cancel,
         noop_text,
