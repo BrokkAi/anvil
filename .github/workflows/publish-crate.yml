@@ -1,0 +1,70 @@
+name: Publish crate
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to crates.io instead of running a dry-run
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  publish:
+    name: Publish anvil to crates.io
+    runs-on: ubuntu-latest
+    environment: release
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-publish-
+            ${{ runner.os }}-cargo-
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Verify package
+        run: cargo publish --dry-run -p anvil --locked
+
+      - name: Authenticate with crates.io
+        if: github.event_name == 'push' || github.event.inputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish crate
+        if: github.event_name == 'push' || github.event.inputs.publish == 'true'
+        run: cargo publish -p anvil --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

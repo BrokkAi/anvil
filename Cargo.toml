@@ -1,11 +1,8 @@
 [workspace]
-members = ["xtask", "brokk-acp-sandbox"]
+members = ["xtask"]
 # Keep `cargo build` / `cargo test` from the workspace root focused on the
 # root crate. The xtask sub-crate is dev-only and is invoked through the
 # `cargo xtask` alias (see .cargo/config.toml), which builds it on demand.
-# `brokk-acp-sandbox` is dual-purpose: linked as a library for the native
-# fallback path AND built separately to `wasm32-wasip2` (its binary form)
-# so the embedded wasmtime can run untrusted parser code in a sandbox.
 default-members = ["."]
 
 [package]
@@ -14,6 +11,9 @@ version = "0.6.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"
+repository = "https://github.com/BrokkAi/anvil"
+homepage = "https://github.com/BrokkAi/anvil"
+readme = "README.md"
 
 [[bin]]
 name = "anvil"
@@ -25,7 +25,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
 # wasmtime hosts when the wasm sandbox is enabled.
-brokk-acp-sandbox = { path = "brokk-acp-sandbox" }
+brokk-acp-sandbox = "0.1.0"
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.
@@ -93,3 +93,7 @@ tempfile = "3"
 # correctly. Without a mock, the existing tests only exercise the
 # connection-refused error path.
 wiremock = "0.6"
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

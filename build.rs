@@ -7,8 +7,8 @@
 //!     `brokk-acp-sandbox`. Checking in a `.wasm` invites drift between
 //!     the native fallback (linked code) and the sandbox path (loaded
 //!     bytes), where a parser fix lands in one but not the other.
-//!   - It keeps the repository binary-free, so a `cargo install` from
-//!     git always rebuilds both halves from the same source tree.
+//!   - It keeps the repository binary-free, so every install rebuilds
+//!     the sandbox artifact from the resolved crate version.
 //!
 //! Why we invoke `cargo build` recursively instead of letting cargo
 //! resolve the wasm target on its own:
@@ -30,20 +30,24 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+use serde::Deserialize;
+
 const SANDBOX_CRATE: &str = "brokk-acp-sandbox";
 const WASM_TARGET: &str = "wasm32-wasip2";
 
 fn main() {
-    println!("cargo:rerun-if-changed=brokk-acp-sandbox/Cargo.toml");
-    println!("cargo:rerun-if-changed=brokk-acp-sandbox/src");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sandbox_manifest = manifest_dir.join(SANDBOX_CRATE).join("Cargo.toml");
+    let sandbox_manifest = find_dependency_manifest(SANDBOX_CRATE);
+    if let Some(parent) = sandbox_manifest.parent() {
+        println!("cargo:rerun-if-changed={}", parent.join("src").display());
+    }
 
-    // Build to a dedicated target dir so the wasm artifact does not
-    // collide with the host build's `target/`. Placing it next to the
-    // sub-crate keeps the directory tree intuitive.
-    let target_dir = manifest_dir.join(SANDBOX_CRATE).join("target");
+    // Build to a dedicated target dir under OUT_DIR so the registry source
+    // remains read-only and the artifact cannot collide with the host build.
+    let target_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
+        .join("sandbox-target");
 
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
         .args([
@@ -92,4 +96,45 @@ fn main() {
         "cargo:rustc-env=BROKK_ACP_SANDBOX_WASM={}",
         wasm_path.display()
     );
+}
+
+fn find_dependency_manifest(name: &str) -> PathBuf {
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(cargo)
+        .args(["metadata", "--format-version", "1"])
+        // Clear cargo env vars inherited from the outer build so metadata
+        // describes the host build graph, not the nested wasm build.
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTFLAGS")
+        .output()
+        .expect("invoke `cargo metadata`");
+
+    if !output.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        panic!("cargo metadata failed");
+    }
+
+    let metadata: CargoMetadata =
+        serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
+    let package = metadata
+        .packages
+        .into_iter()
+        .find(|package| package.name == name && package.source.is_some())
+        .unwrap_or_else(|| panic!("could not find resolved dependency package `{name}`"));
+
+    PathBuf::from(package.manifest_path)
+}
+
+#[derive(Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackage {
+    name: String,
+    manifest_path: String,
+    source: Option<String>,
 }

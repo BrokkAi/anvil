@@ -413,6 +413,8 @@ dependencies = [
 [[package]]
 name = "brokk-acp-sandbox"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e781d1e0ef8e44d6eb42da9bc6f7844dbf3c56a73f7e0ac31a8f0f3e33807279"
 dependencies = [
  "anyhow",
  "miniz_oxide 0.9.1",
