@@ -25,19 +25,11 @@ const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 /// and spawned task parked indefinitely with no operator-visible signal.
 const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 
-/// Tools that must NEVER pick up an in-session "Always allow" — every call
-/// re-prompts. Today this is just the shell; even with prefix-scoped allow
-/// keys the danger surface is too wide without an OS sandbox (tracked in
-/// https://github.com/BrokkAi/brokk/issues/3390). Once that's wired, revisit.
-fn requires_per_call_prompt(tool_name: &str) -> bool {
-    tool_name == "runShellCommand"
-}
-
 /// Result of approving a permission request.
 ///
-/// `allow_always` is only used for non-shell tools. Shell commands always
-/// re-prompt, but they can optionally request a one-time escape from the OS
-/// sandbox for the approved invocation.
+/// Shell commands can be approved for the session when they run under the
+/// normal sandbox. A one-time outside-sandbox approval is intentionally never
+/// persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PermissionGrant {
     allow_always: bool,
@@ -45,12 +37,17 @@ struct PermissionGrant {
 }
 
 fn permission_options(tool_name: &str) -> Vec<PermissionOption> {
-    let mut options = Vec::with_capacity(3);
-    if requires_per_call_prompt(tool_name) {
+    let mut options = Vec::with_capacity(4);
+    if tool_name == "runShellCommand" {
         options.push(PermissionOption::new(
             PermissionOptionId::new("allow"),
             "Allow in sandbox",
             PermissionOptionKind::AllowOnce,
+        ));
+        options.push(PermissionOption::new(
+            PermissionOptionId::new("allow_always"),
+            "Always allow this command in sandbox",
+            PermissionOptionKind::AllowAlways,
         ));
         options.push(PermissionOption::new(
             PermissionOptionId::new("allow_outside_sandbox"),
@@ -82,7 +79,7 @@ fn permission_grant_for_selection(
     option_id: &str,
 ) -> Result<PermissionGrant, String> {
     match option_id {
-        "allow_always" if !requires_per_call_prompt(tool_name) => Ok(PermissionGrant {
+        "allow_always" => Ok(PermissionGrant {
             allow_always: true,
             sandbox_policy_override: None,
         }),
@@ -90,7 +87,7 @@ fn permission_grant_for_selection(
             allow_always: false,
             sandbox_policy_override: None,
         }),
-        "allow_outside_sandbox" if requires_per_call_prompt(tool_name) => Ok(PermissionGrant {
+        "allow_outside_sandbox" if tool_name == "runShellCommand" => Ok(PermissionGrant {
             allow_always: false,
             sandbox_policy_override: Some(SandboxPolicy::None),
         }),
@@ -190,7 +187,7 @@ enum PureGateDecision {
 fn pure_gate_decision(
     mode: PermissionMode,
     kind: ToolKind,
-    tool_name: &str,
+    _tool_name: &str,
     is_always_allowed: bool,
 ) -> PureGateDecision {
     // bypassPermissions: trust everything. Explicit user opt-out of the gate.
@@ -226,13 +223,29 @@ fn pure_gate_decision(
         return PureGateDecision::Allow;
     }
 
-    // In-session "Always allow". Skipped for tools where one approval would
-    // be carte blanche (currently `runShellCommand`).
-    if !requires_per_call_prompt(tool_name) && is_always_allowed {
+    // In-session "Always allow". `consult_gate` chooses the cache key; shell
+    // commands use the exact command plus cwd, while regular tools use the
+    // tool name.
+    if is_always_allowed {
         return PureGateDecision::Allow;
     }
 
     PureGateDecision::Prompt
+}
+
+fn always_allow_key(tool_name: &str, raw_input: &Value, cwd: &Path) -> String {
+    if tool_name == "runShellCommand"
+        && let Some(command) = raw_input.get("command").and_then(Value::as_str)
+    {
+        return serde_json::json!({
+            "tool": tool_name,
+            "cwd": cwd.display().to_string(),
+            "command": command,
+        })
+        .to_string();
+    }
+
+    tool_name.to_string()
 }
 
 /// Decide which sandbox policy to use for an approved tool call.
@@ -503,6 +516,7 @@ pub(crate) async fn run(
                         kind,
                         &call.id,
                         &parsed_input,
+                        registry.cwd(),
                     )
                     .await;
 
@@ -664,6 +678,7 @@ async fn consult_gate(
     kind: ToolKind,
     tool_call_id: &str,
     raw_input: &Value,
+    cwd: &Path,
 ) -> GateDecision {
     let mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
@@ -680,7 +695,10 @@ async fn consult_gate(
             );
         }
     };
-    let is_always_allowed = sessions.is_always_allowed(session_id, tool_name).await;
+    let always_allow_key = always_allow_key(tool_name, raw_input, cwd);
+    let is_always_allowed = sessions
+        .is_always_allowed(session_id, &always_allow_key)
+        .await;
 
     match pure_gate_decision(mode, kind, tool_name, is_always_allowed) {
         PureGateDecision::Allow => GateDecision::Allow {
@@ -700,11 +718,12 @@ async fn consult_gate(
             .await
             {
                 Ok(grant) => {
-                    // Even if a (stale or buggy) client returns allow_always for a
-                    // per-call-prompt tool, refuse to persist it. Awaited inline so
-                    // the next tool call in the same batch sees the updated set.
-                    if grant.allow_always && !requires_per_call_prompt(tool_name) {
-                        sessions.add_always_allow(session_id, tool_name).await;
+                    // Awaited inline so the next tool call in the same batch
+                    // sees the updated set without re-prompting.
+                    if grant.allow_always && grant.sandbox_policy_override.is_none() {
+                        sessions
+                            .add_always_allow(session_id, &always_allow_key)
+                            .await;
                     }
                     GateDecision::Allow {
                         sandbox_policy_override: grant.sandbox_policy_override,
@@ -1177,15 +1196,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_never_uses_always_allow() {
-        // runShellCommand is excluded from sticky approval -- even if the
-        // session's always-allow set somehow contained it, every call must
-        // re-prompt. Test both Default and AcceptEdits.
+    fn shell_command_uses_scoped_always_allow() {
+        // The cache key is command-scoped for shell calls, so the pure gate
+        // may trust a positive lookup without granting every shell command.
         for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert_eq!(
                 decide(mode, ToolKind::Execute, "runShellCommand", true),
-                PureGateDecision::Prompt,
-                "runShellCommand must prompt in {:?} even when always-allowed",
+                PureGateDecision::Allow,
+                "runShellCommand should honor scoped approval in {:?}",
                 mode
             );
         }
@@ -1203,10 +1221,54 @@ mod tests {
             labels,
             vec![
                 ("allow", "Allow in sandbox"),
+                ("allow_always", "Always allow this command in sandbox"),
                 ("allow_outside_sandbox", "Run outside sandbox once"),
                 ("reject", "Reject"),
             ]
         );
+    }
+
+    #[test]
+    fn shell_allow_always_choice_maps_to_sandboxed_session_approval() {
+        let grant = permission_grant_for_selection("runShellCommand", "allow_always")
+            .expect("shell sticky sandbox approval should be accepted");
+
+        assert_eq!(
+            grant,
+            PermissionGrant {
+                allow_always: true,
+                sandbox_policy_override: None,
+            }
+        );
+    }
+
+    #[test]
+    fn shell_always_allow_key_is_command_and_cwd_scoped() {
+        let cwd = Path::new("/tmp/project");
+        let first = always_allow_key(
+            "runShellCommand",
+            &serde_json::json!({"command": "cargo test", "timeoutSeconds": 60}),
+            cwd,
+        );
+        let same_without_timeout = always_allow_key(
+            "runShellCommand",
+            &serde_json::json!({"command": "cargo test"}),
+            cwd,
+        );
+        let different_command = always_allow_key(
+            "runShellCommand",
+            &serde_json::json!({"command": "cargo check"}),
+            cwd,
+        );
+        let different_cwd = always_allow_key(
+            "runShellCommand",
+            &serde_json::json!({"command": "cargo test"}),
+            Path::new("/tmp/other"),
+        );
+
+        assert_eq!(first, same_without_timeout);
+        assert_ne!(first, different_command);
+        assert_ne!(first, different_cwd);
     }
 
     #[test]
