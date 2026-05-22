@@ -99,6 +99,58 @@ The server supports a variety of tools, including `readFile`, `writeFile`, `list
 - **Read-only**: Strictly forbids any tool that modifies the filesystem or executes commands.
 - **Bypass Permissions**: Trust the agent to execute all tools without interruption.
 
+## Subagents
+
+A subagent is a markdown file that the LLM can delegate a focused task to via the `task` tool. Each delegation runs in an isolated tool loop with its own message history; only the subagent's final assistant text comes back to the parent conversation. Use them to keep noisy multi-step work (deep research, long greps, repetitive refactors) out of the main transcript.
+
+The `task` tool is only advertised to the model when at least one subagent has been discovered. If no subagents exist, the feature is invisible.
+
+### File format
+
+A subagent file is plain markdown with YAML frontmatter. `name` and `description` are required; the body is the subagent's system prompt.
+
+```markdown
+---
+name: bug-hunter
+description: Adversarially review a diff for off-by-one errors, missing null checks, and lock-order issues. Returns findings as a numbered list.
+---
+
+You are a meticulous code reviewer. When given a diff:
+
+1. Read every changed file in full, not just the hunks.
+2. Flag concrete bugs only — no style nits, no speculation.
+3. Return findings as `<path>:<line> — <one-line description>`.
+```
+
+The frontmatter `name` should match the filename stem (`bug-hunter.md` → `name: bug-hunter`). Mismatches load with a warning. Files above 256 KiB are skipped.
+
+### Discovery order
+
+Subagents are loaded from the following roots, in order. Later entries override earlier ones with the same `name`:
+
+1. `~/.claude/agents/` (user scope, Claude Code compatible)
+2. `~/.agents/agents/` (user scope, cross-client)
+3. `<git-root>/.claude/agents/` walking down to `cwd` (project scope, Claude Code compatible)
+4. `<git-root>/.agents/agents/` walking down to `cwd` (project scope, cross-client)
+
+Layout is flat — one `.md` per subagent, no subdirectories. Project-scope subagents win over user-scope; within a scope, `.agents/` wins over `.claude/`.
+
+### How the model invokes a subagent
+
+The model calls the `task` tool with three arguments:
+
+- `subagent_type`: name from the catalog (enum-constrained, so the model cannot invent names).
+- `description`: a 3-5 word label for the UI card.
+- `prompt`: the self-contained task. The subagent does **not** see the parent conversation, so the prompt must include any required context.
+
+### Constraints
+
+- **Same permission gate.** The subagent runs against the parent session's mode and "always allow" set. `readOnly` blocks writes inside subagents too; mutating tools still prompt under `default`.
+- **No nested delegation.** A subagent cannot itself call `task`. Nesting depth is capped at 1.
+- **Bounded turns.** Each delegation runs at most 25 tool-calling iterations, regardless of the parent's `--max-turns`.
+- **Silent execution.** The subagent's intermediate tool calls and streamed tokens are not sent to the client. Permission prompts still surface when required.
+- **Cancellation propagates.** Cancelling the parent prompt cancels the active subagent.
+
 ## Bifrost Integration
 
 When configured with `--bifrost-binary`, the server spawns a Bifrost subprocess to provide structural code intelligence. This enables advanced tools such as:
