@@ -13,7 +13,9 @@ use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, ToolDefinition};
+use crate::llm_client::{
+    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolDefinition,
+};
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
@@ -300,7 +302,7 @@ pub(crate) async fn run(
     sessions: SessionStore,
     notifications: NotificationMode,
     depth: usize,
-) -> (String, Vec<ToolExchange>) {
+) -> (String, Vec<ToolExchange>, TokenUsage) {
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
@@ -314,6 +316,11 @@ pub(crate) async fn run(
     // letting a `session/load` re-feed the LLM the same tool context the
     // model had when it produced `full_response`.
     let mut tool_exchanges: Vec<ToolExchange> = Vec::new();
+    // Aggregate the per-call usage reported by the LLM across every
+    // turn of this tool loop (one prompt may issue many `stream_chat`
+    // calls as it dispatches tools). The caller adds this to the
+    // session-wide running total before emitting `PromptResponse.usage`.
+    let mut turn_usage = TokenUsage::default();
 
     'outer: for turn in 0..max_turns {
         if cancel.is_cancelled() {
@@ -365,12 +372,14 @@ pub(crate) async fn run(
             .await;
 
         match response {
-            Ok(LlmResponse::Text(text)) => {
+            Ok(LlmResponse::Text { text, usage }) => {
+                turn_usage.add(usage);
                 full_response.push_str(&text);
                 // Final text response -- we're done
                 break;
             }
-            Ok(LlmResponse::ToolCalls { text, calls }) => {
+            Ok(LlmResponse::ToolCalls { text, calls, usage }) => {
+                turn_usage.add(usage);
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
@@ -593,7 +602,7 @@ pub(crate) async fn run(
                             // `readOnly`), so by the time we get here we
                             // know the user has authorized the dispatch.
                             let exec = if tool_name == "task" {
-                                execute_subagent(
+                                let (exec, nested_usage) = execute_subagent(
                                     llm,
                                     registry,
                                     model,
@@ -607,7 +616,14 @@ pub(crate) async fn run(
                                     &sessions,
                                     depth + 1,
                                 )
-                                .await
+                                .await;
+                                // A subagent burns its own tokens against
+                                // the same upstream account; surface them
+                                // in the parent's `PromptResponse.usage`
+                                // so the client sees the true cost of the
+                                // turn, not just the parent's own calls.
+                                turn_usage.add(nested_usage);
+                                exec
                             } else {
                                 execute_tool(
                                     registry,
@@ -663,7 +679,7 @@ pub(crate) async fn run(
         }
     }
 
-    (full_response, tool_exchanges)
+    (full_response, tool_exchanges, turn_usage)
 }
 
 /// Apply the per-call permission policy. Returns `Allow` if the tool should
@@ -902,23 +918,29 @@ async fn execute_subagent(
     session_id: &str,
     sessions: &SessionStore,
     depth: usize,
-) -> ToolExecution {
+) -> (ToolExecution, TokenUsage) {
     let subagent_name = match args.get("subagent_type").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
         _ => {
-            return ToolExecution {
-                output: "Error: `task` requires a non-empty `subagent_type`.".to_string(),
-                failed: true,
-            };
+            return (
+                ToolExecution {
+                    output: "Error: `task` requires a non-empty `subagent_type`.".to_string(),
+                    failed: true,
+                },
+                TokenUsage::default(),
+            );
         }
     };
     let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
         _ => {
-            return ToolExecution {
-                output: "Error: `task` requires a non-empty `prompt`.".to_string(),
-                failed: true,
-            };
+            return (
+                ToolExecution {
+                    output: "Error: `task` requires a non-empty `prompt`.".to_string(),
+                    failed: true,
+                },
+                TokenUsage::default(),
+            );
         }
     };
 
@@ -932,13 +954,16 @@ async fn execute_subagent(
             Some(m) => m.clone(),
             None => {
                 let available: Vec<&str> = agents.iter_sorted().map(|m| m.name.as_str()).collect();
-                return ToolExecution {
-                    output: format!(
-                        "Error: unknown subagent '{subagent_name}'. Available: {}",
-                        available.join(", ")
-                    ),
-                    failed: true,
-                };
+                return (
+                    ToolExecution {
+                        output: format!(
+                            "Error: unknown subagent '{subagent_name}'. Available: {}",
+                            available.join(", ")
+                        ),
+                        failed: true,
+                    },
+                    TokenUsage::default(),
+                );
             }
         }
     };
@@ -946,10 +971,13 @@ async fn execute_subagent(
     let body = match crate::agents::read_agent_body(&meta.location) {
         Ok(b) => b,
         Err(e) => {
-            return ToolExecution {
-                output: format!("Error: failed to load subagent '{subagent_name}': {e}"),
-                failed: true,
-            };
+            return (
+                ToolExecution {
+                    output: format!("Error: failed to load subagent '{subagent_name}': {e}"),
+                    failed: true,
+                },
+                TokenUsage::default(),
+            );
         }
     };
 
@@ -994,8 +1022,8 @@ async fn execute_subagent(
     ))
     .await;
 
-    let (text, _exchanges) = nested;
-    if text.trim().is_empty() {
+    let (text, _exchanges, nested_usage) = nested;
+    let exec = if text.trim().is_empty() {
         ToolExecution {
             output: format!("Error: subagent '{subagent_name}' returned an empty response."),
             failed: true,
@@ -1005,7 +1033,8 @@ async fn execute_subagent(
             output: text,
             failed: false,
         }
-    }
+    };
+    (exec, nested_usage)
 }
 
 /// Send a `SessionNotification` and log on failure -- there is nothing

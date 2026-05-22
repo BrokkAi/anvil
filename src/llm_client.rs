@@ -67,11 +67,73 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// What the LLM returned: either final text or tool calls to execute.
+/// Provider-reported token counts for a single `stream_chat` call.
+///
+/// Field names mirror the ACP `session/usage` RFD so they map 1:1 into
+/// `agent_client_protocol::Usage`. Counts are populated from the
+/// upstream LLM's own accounting (OpenAI's `usage` SSE chunk, the Codex
+/// Responses API `response.completed` event); backends that don't
+/// surface usage (e.g. Ollama under some configurations) leave the
+/// fields at zero. Using `u64` matches the wire type expected by the
+/// ACP `Usage` struct.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thought_tokens: u64,
+    pub cached_read_tokens: u64,
+    pub cached_write_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Sum of all categories. Matches the ACP `total_tokens` semantics:
+    /// "Sum of all token types across session." Cached counts are
+    /// included because the spec example treats them as additive
+    /// (35k + 12k + 5k + 5k + 1k = 53k).
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.thought_tokens)
+            .saturating_add(self.cached_read_tokens)
+            .saturating_add(self.cached_write_tokens)
+    }
+
+    /// Merge another reading into this one. Used to roll up per-call
+    /// usage into a per-turn or per-session total.
+    pub fn add(&mut self, other: TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.thought_tokens = self.thought_tokens.saturating_add(other.thought_tokens);
+        self.cached_read_tokens = self
+            .cached_read_tokens
+            .saturating_add(other.cached_read_tokens);
+        self.cached_write_tokens = self
+            .cached_write_tokens
+            .saturating_add(other.cached_write_tokens);
+    }
+}
+
+/// What the LLM returned: either final text or tool calls to execute,
+/// plus the provider-reported token usage for the call.
 #[derive(Debug)]
 pub enum LlmResponse {
-    Text(String),
-    ToolCalls { text: String, calls: Vec<ToolCall> },
+    Text {
+        text: String,
+        usage: TokenUsage,
+    },
+    ToolCalls {
+        text: String,
+        calls: Vec<ToolCall>,
+        usage: TokenUsage,
+    },
+}
+
+impl LlmResponse {
+    pub fn usage(&self) -> TokenUsage {
+        match self {
+            LlmResponse::Text { usage, .. } | LlmResponse::ToolCalls { usage, .. } => *usage,
+        }
+    }
 }
 
 /// Parameters for a single streamed chat request.
@@ -247,6 +309,14 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    /// OpenAI's opt-in to receive a final `usage` payload on a streamed
+    /// response. Without this, the upstream `usage` field is `null` on
+    /// every chunk and we'd have to fall back to local tiktoken
+    /// estimates. OpenRouter and Ollama both honor this flag (it's a
+    /// no-op on servers that don't, since they were ignoring the
+    /// trailing usage chunk anyway).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,6 +329,11 @@ struct ChatCompletionRequest {
     /// Serialized as OpenRouter/Ollama's unified `reasoning` object.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,7 +437,76 @@ impl ModelEntry {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
     choices: Vec<ChunkChoice>,
+    /// Per OpenAI's `stream_options.include_usage`, the final SSE chunk
+    /// before `[DONE]` carries a populated `usage` block with empty
+    /// `choices`. Earlier chunks omit it (or send `null`). Optional so
+    /// servers that don't support the flag still deserialize cleanly.
+    #[serde(default)]
+    usage: Option<UsageChunk>,
+}
+
+/// OpenAI / OpenRouter / Ollama trailing usage block. Field names
+/// match the wire format (`prompt_tokens`, `completion_tokens`,
+/// `prompt_tokens_details.cached_tokens`, etc.); we translate to the
+/// ACP/anvil-internal `TokenUsage` shape at parse time so the rest of
+/// the codebase only sees one vocabulary.
+#[derive(Debug, Deserialize)]
+struct UsageChunk {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
+}
+
+impl UsageChunk {
+    /// Project OpenAI's wire fields onto the ACP-aligned `TokenUsage`.
+    ///
+    /// `prompt_tokens` is OpenAI's total input (cached + uncached). The
+    /// ACP spec splits these into `input_tokens` (uncached input) and
+    /// `cached_read_tokens`. We subtract so the two don't double-count
+    /// in `total_tokens`. Similarly, `completion_tokens` is total
+    /// output (reasoning + visible); we surface reasoning separately
+    /// as `thought_tokens` and subtract from `output_tokens`.
+    fn into_usage(self) -> TokenUsage {
+        let cached_read = self
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning = self
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        TokenUsage {
+            input_tokens: self.prompt_tokens.saturating_sub(cached_read),
+            output_tokens: self.completion_tokens.saturating_sub(reasoning),
+            thought_tokens: reasoning,
+            cached_read_tokens: cached_read,
+            // OpenAI's chat completions API doesn't separate cache
+            // writes; that concept comes from Anthropic's prompt
+            // caching. Leave at zero rather than guess.
+            cached_write_tokens: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -603,6 +747,9 @@ impl OpenAiClient {
             model,
             messages,
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             temperature: None,
             max_tokens: None,
             tools,
@@ -651,6 +798,11 @@ where
     let mut tool_acc = ToolCallAccumulator::default();
     let mut raw_buf: Vec<u8> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle;
+    // Captured from the trailing `usage` chunk emitted when
+    // `stream_options.include_usage = true`. The usage chunk arrives
+    // *before* `[DONE]` with an empty `choices` array, so we stash it
+    // here and attach to whichever variant we return.
+    let mut usage = TokenUsage::default();
 
     loop {
         tokio::select! {
@@ -688,11 +840,12 @@ where
 
                     if data == "[DONE]" {
                         if tool_acc.is_empty() {
-                            return Ok(LlmResponse::Text(full_text));
+                            return Ok(LlmResponse::Text { text: full_text, usage });
                         }
                         return Ok(LlmResponse::ToolCalls {
                             text: full_text,
                             calls: tool_acc.into_tool_calls(),
+                            usage,
                         });
                     }
 
@@ -715,6 +868,13 @@ where
                                     }
                                 }
                             }
+                            // Last chunk before [DONE]: trailing usage
+                            // block. `choices` is empty here; we just
+                            // record the totals.
+                            if let Some(u) = chunk.usage {
+                                usage = u.into_usage();
+                                made_progress = true;
+                            }
                         }
                         Err(e) => {
                             tracing::debug!("skipping unparseable SSE chunk: {e}");
@@ -733,15 +893,22 @@ where
     // (arguments JSON truncated mid-stream). Return only the text we've already
     // streamed to the caller to avoid dispatching malformed tool calls.
     if cancel.is_cancelled() {
-        return Ok(LlmResponse::Text(full_text));
+        return Ok(LlmResponse::Text {
+            text: full_text,
+            usage,
+        });
     }
 
     if tool_acc.is_empty() {
-        Ok(LlmResponse::Text(full_text))
+        Ok(LlmResponse::Text {
+            text: full_text,
+            usage,
+        })
     } else {
         Ok(LlmResponse::ToolCalls {
             text: full_text,
             calls: tool_acc.into_tool_calls(),
+            usage,
         })
     }
 }
@@ -803,7 +970,7 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
-            LlmResponse::Text(t) => assert_eq!(t, "hello"),
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, "hello"),
             other => panic!("expected text response, got {other:?}"),
         }
         assert_eq!(*collected.lock().unwrap(), vec!["hel", "lo"]);
@@ -823,7 +990,7 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
-            LlmResponse::Text(t) => assert_eq!(t, "hi"),
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, "hi"),
             other => panic!("expected text response, got {other:?}"),
         }
         assert_eq!(*collected.lock().unwrap(), vec!["hi"]);
@@ -843,7 +1010,7 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete via cancel") {
-            LlmResponse::Text(t) => assert_eq!(t, ""),
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, ""),
             other => panic!("expected text response, got {other:?}"),
         }
     }
@@ -872,7 +1039,7 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
-            LlmResponse::ToolCalls { text, calls } => {
+            LlmResponse::ToolCalls { text, calls, .. } => {
                 assert!(text.is_empty());
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "call_1");
@@ -900,10 +1067,42 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
-            LlmResponse::Text(t) => assert_eq!(t, "ok"),
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, "ok"),
             other => panic!("expected text response, got {other:?}"),
         }
         assert_eq!(*collected.lock().unwrap(), vec!["ok"]);
+    }
+
+    /// The trailing usage chunk (empty `choices`, populated `usage`)
+    /// emitted by OpenAI / OpenRouter when `stream_options.include_usage`
+    /// is set must populate `LlmResponse.usage` with the ACP-aligned
+    /// projection: `prompt_tokens - cached` → `input_tokens`,
+    /// `completion_tokens - reasoning` → `output_tokens`, and so on.
+    #[tokio::test]
+    async fn drive_sse_stream_captures_trailing_usage_chunk() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":40},\"completion_tokens_details\":{\"reasoning_tokens\":10}}}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, _) = collect_tokens();
+        let cancel = CancellationToken::new();
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+
+        match result.expect("should complete") {
+            LlmResponse::Text { text, usage } => {
+                assert_eq!(text, "hi");
+                assert_eq!(usage.input_tokens, 80); // 120 - 40 cached
+                assert_eq!(usage.output_tokens, 20); // 30 - 10 reasoning
+                assert_eq!(usage.thought_tokens, 10);
+                assert_eq!(usage.cached_read_tokens, 40);
+                assert_eq!(usage.cached_write_tokens, 0);
+                assert_eq!(usage.total_tokens(), 150);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
     }
 
     /// Stream that ends without `[DONE]` returns whatever has been
@@ -921,7 +1120,7 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
-            LlmResponse::Text(t) => assert_eq!(t, "partial"),
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, "partial"),
             other => panic!("expected text response, got {other:?}"),
         }
     }

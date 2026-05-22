@@ -12,7 +12,7 @@ use agent_client_protocol::schema::{
     SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent,
+    TextContent, Usage as AcpUsage,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
@@ -1319,8 +1319,8 @@ pub async fn run_agent(
                     .catch_unwind()
                     .await;
 
-                    let (response_text, tool_exchanges) = match loop_result {
-                        Ok((text, exchanges)) => (text, exchanges),
+                    let (response_text, tool_exchanges, turn_usage) = match loop_result {
+                        Ok((text, exchanges, usage)) => (text, exchanges, usage),
                         Err(panic) => {
                             tracing::error!(
                                 session_id = %session_id_for_loop,
@@ -1330,9 +1330,23 @@ pub async fn run_agent(
                             (
                                 "Error: agent loop panicked. See server logs.".to_string(),
                                 Vec::new(),
+                                crate::llm_client::TokenUsage::default(),
                             )
                         }
                     };
+
+                    // Roll this turn's provider-reported usage into the
+                    // session-wide running total. The cumulative figure
+                    // is what the ACP `session/usage` RFD asks for on
+                    // `PromptResponse.usage` ("Total input tokens across
+                    // all turns", etc.). If the session is gone by now
+                    // (raced delete), fall back to this turn alone so
+                    // we still report something rather than silently
+                    // dropping the numbers.
+                    let cumulative_usage = sessions_for_loop
+                        .record_usage(&session_id_for_loop, turn_usage)
+                        .await
+                        .unwrap_or(turn_usage);
 
                     // Persist the conversation turn BEFORE finish_prompt so the
                     // per-session cancel token is held during the rewrite -- this
@@ -1397,7 +1411,25 @@ pub async fn run_agent(
                     // Clean up cancellation token even on panic / persistence failure.
                     sessions_for_loop.finish_prompt(&session_id_for_loop).await;
 
-                    if let Err(e) = responder.respond(PromptResponse::new(StopReason::EndTurn)) {
+                    // ACP `session/usage` RFD: PromptResponse.usage
+                    // carries cumulative session totals. Field mapping:
+                    // `total_tokens` is the sum of all categories
+                    // (matches the spec example), `input_tokens` /
+                    // `output_tokens` are uncached input and visible
+                    // output respectively, with reasoning and cached
+                    // reads split out so they aren't double-counted.
+                    // `Usage` is `#[non_exhaustive]`, so we go through
+                    // the builder API rather than struct literal syntax.
+                    let acp_usage = AcpUsage::new(
+                        cumulative_usage.total_tokens(),
+                        cumulative_usage.input_tokens,
+                        cumulative_usage.output_tokens,
+                    )
+                    .thought_tokens(cumulative_usage.thought_tokens)
+                    .cached_read_tokens(cumulative_usage.cached_read_tokens)
+                    .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                    let response = PromptResponse::new(StopReason::EndTurn).usage(Some(acp_usage));
+                    if let Err(e) = responder.respond(response) {
                         tracing::warn!(
                             session_id = %session_id_for_loop,
                             "failed to deliver PromptResponse: {e}"

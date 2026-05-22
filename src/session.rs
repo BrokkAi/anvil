@@ -435,6 +435,14 @@ pub struct Session {
     /// persisted -- on reload the model re-reads the catalog and decides
     /// fresh which skills to activate.
     pub activated_skills: HashSet<String>,
+    /// Cumulative provider-reported token usage for this session.
+    /// Populated from each `tool_loop::run` and surfaced on the ACP
+    /// `PromptResponse.usage` payload per the `session/usage` RFD
+    /// ("Sum of all token types across session", "Total input tokens
+    /// across all turns", ...). In-memory only: a session reload
+    /// starts the counters fresh because we don't persist per-call
+    /// usage on disk yet.
+    pub usage: crate::llm_client::TokenUsage,
 }
 
 impl Session {
@@ -473,6 +481,7 @@ impl Session {
             skills,
             agents,
             activated_skills: HashSet::new(),
+            usage: crate::llm_client::TokenUsage::default(),
         }
     }
 
@@ -527,6 +536,7 @@ impl Session {
             skills,
             agents,
             activated_skills: HashSet::new(),
+            usage: crate::llm_client::TokenUsage::default(),
         })
     }
 }
@@ -2049,6 +2059,22 @@ impl SessionStore {
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.always_allow_tools.insert(approval_key.to_string());
         }
+    }
+
+    /// Fold a turn's token usage into the session running total and
+    /// return the new cumulative figure. Used by the prompt handler to
+    /// populate `PromptResponse.usage` after `tool_loop::run` reports
+    /// what the LLM(s) burned for this prompt. Returns `None` if the
+    /// session doesn't exist (e.g. raced with a delete).
+    pub async fn record_usage(
+        &self,
+        id: &str,
+        delta: crate::llm_client::TokenUsage,
+    ) -> Option<crate::llm_client::TokenUsage> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        session.usage.add(delta);
+        Some(session.usage)
     }
 
     /// Update the session's behavior mode and persist the new manifest.

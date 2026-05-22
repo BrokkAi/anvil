@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"
@@ -20,7 +20,7 @@ name = "anvil"
 path = "src/main.rs"
 
 [dependencies]
-agent-client-protocol = "0.12"
+agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that

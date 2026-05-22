@@ -320,7 +320,10 @@ mod tests {
         fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
             *self.last_model.lock().unwrap() = Some(request.model);
             *self.last_reasoning_effort.lock().unwrap() = request.reasoning_effort;
-            let response = LlmResponse::Text(format!("hello from {}", self.name));
+            let response = LlmResponse::Text {
+                text: format!("hello from {}", self.name),
+                usage: crate::llm_client::TokenUsage::default(),
+            };
             async move { Ok(response) }.boxed()
         }
     }

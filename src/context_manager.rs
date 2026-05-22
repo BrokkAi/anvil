@@ -272,7 +272,7 @@ async fn run_summarization_request(
         })
         .await?;
     let text = match response {
-        LlmResponse::Text(t) => t,
+        LlmResponse::Text { text, .. } => text,
         LlmResponse::ToolCalls { text, .. } => text,
     };
     Ok(strip_summary_tags(&text))
@@ -817,7 +817,13 @@ mod tests {
                 self.turn_response.clone()
             };
             self.seen_system_prompts.lock().unwrap().push(system);
-            async move { Ok(LlmResponse::Text(response)) }.boxed()
+            async move {
+                Ok(LlmResponse::Text {
+                    text: response,
+                    usage: crate::llm_client::TokenUsage::default(),
+                })
+            }
+            .boxed()
         }
     }
 
@@ -929,7 +935,13 @@ mod tests {
                 // iteration of the chunk loop should observe the
                 // token and bail out.
                 self.cancel.cancel();
-                async move { Ok(LlmResponse::Text("- partial".into())) }.boxed()
+                async move {
+                    Ok(LlmResponse::Text {
+                        text: "- partial".into(),
+                        usage: crate::llm_client::TokenUsage::default(),
+                    })
+                }
+                .boxed()
             }
         }
         let cancel = CancellationToken::new();
@@ -1016,7 +1028,10 @@ mod tests {
                     // tokio scheduler order.
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     in_flight.fetch_sub(1, Ordering::SeqCst);
-                    Ok(LlmResponse::Text(response))
+                    Ok(LlmResponse::Text {
+                        text: response,
+                        usage: crate::llm_client::TokenUsage::default(),
+                    })
                 }
                 .boxed()
             }
