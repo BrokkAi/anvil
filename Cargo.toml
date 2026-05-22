@@ -10,7 +10,7 @@ default-members = ["."]
 
 [package]
 name = "anvil"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"

@@ -423,6 +423,10 @@ pub struct Session {
     /// descriptions). Refreshed on cwd change just like
     /// `project_instructions`.
     pub skills: Arc<crate::skills::SkillRegistry>,
+    /// Subagent catalog (`<name>.md` files) discovered alongside skills.
+    /// Drives the `task` meta-tool's `subagent_type` enum and supplies
+    /// the body the subagent runs with as a system prompt.
+    pub agents: Arc<crate::agents::AgentRegistry>,
     /// Names of skills the harness has already injected into the
     /// conversation context during this session. Used by the
     /// `activate_skill` tool to skip re-injection (the spec's "Deduplicate
@@ -452,6 +456,7 @@ impl Session {
         };
         let project_instructions = crate::agents_md::discover(&cwd);
         let skills = Arc::new(crate::skills::discover(&cwd));
+        let agents = Arc::new(crate::agents::discover(&cwd));
         Self {
             id,
             cwd,
@@ -465,6 +470,7 @@ impl Session {
             idle_timeout_secs: None,
             project_instructions,
             skills,
+            agents,
             activated_skills: HashSet::new(),
         }
     }
@@ -499,6 +505,7 @@ impl Session {
         }
         let project_instructions = crate::agents_md::discover(&cwd);
         let skills = Arc::new(crate::skills::discover(&cwd));
+        let agents = Arc::new(crate::agents::discover(&cwd));
         Ok(Self {
             id,
             cwd,
@@ -517,6 +524,7 @@ impl Session {
             idle_timeout_secs: None,
             project_instructions,
             skills,
+            agents,
             activated_skills: HashSet::new(),
         })
     }
@@ -1659,21 +1667,26 @@ impl SessionStore {
         bifrost_binary: Option<&Path>,
     ) -> Arc<ToolRegistry> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let skills = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .map(|s| s.skills.clone())
-            .unwrap_or_else(|| Arc::new(crate::skills::SkillRegistry::default()));
+        let (skills, agents) = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(session_id) {
+                Some(s) => (s.skills.clone(), s.agents.clone()),
+                None => (
+                    Arc::new(crate::skills::SkillRegistry::default()),
+                    Arc::new(crate::agents::AgentRegistry::default()),
+                ),
+            }
+        };
 
         if let Some(existing) = self.registries.read().await.get(session_id).cloned()
             && existing.cwd() == normalized_cwd.as_path()
         {
             existing.set_skills(skills).await;
+            existing.set_agents(agents).await;
             return existing;
         }
-        let registry = Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills).await);
+        let registry =
+            Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills, agents).await);
         self.registries
             .write()
             .await
@@ -1966,17 +1979,19 @@ impl SessionStore {
     }
 
     pub async fn update_cwd(&self, id: &str, cwd: PathBuf) {
-        // Re-discover AGENTS.md/CLAUDE.md AND SKILL.md against the new
-        // cwd before taking the write lock: file I/O off the lock keeps
-        // prompt turns and other session mutations unblocked. The
-        // discovery results are then swapped in atomically alongside
-        // the cwd.
+        // Re-discover AGENTS.md/CLAUDE.md, SKILL.md, and subagent `*.md`
+        // files against the new cwd before taking the write lock: file
+        // I/O off the lock keeps prompt turns and other session
+        // mutations unblocked. The discovery results are then swapped
+        // in atomically alongside the cwd.
         let project_instructions = crate::agents_md::discover(&cwd);
         let skills = Arc::new(crate::skills::discover(&cwd));
+        let agents = Arc::new(crate::agents::discover(&cwd));
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
             session.project_instructions = project_instructions;
             session.skills = skills;
+            session.agents = agents;
             // cwd changed -> previously-activated skills may no longer
             // be relevant. Clear so the model can re-activate against
             // the new catalog without stale dedup entries.
@@ -3549,6 +3564,44 @@ mod tests {
         assert_eq!(after.cwd, cwd2);
 
         let _ = std::fs::remove_dir_all(&cwd1);
+    }
+
+    /// `update_cwd` must also re-discover subagents so the `task` tool's
+    /// catalog reflects the new project. A session opened in a cwd with
+    /// no `.claude/agents/` and then moved to a cwd that has one should
+    /// pick up the new agents.
+    #[tokio::test]
+    async fn update_cwd_refreshes_agents() {
+        let store = SessionStore::new("m".to_string());
+
+        // First cwd: no agents.
+        let cwd1 = tempfile::tempdir().expect("cwd1");
+        std::fs::create_dir_all(cwd1.path().join(".git")).expect("touch git1");
+        let s = store.create_session(cwd1.path().to_path_buf()).await;
+        let before = store.sessions.read().await.get(&s.id).cloned().unwrap();
+        assert!(
+            before.agents.is_empty(),
+            "fresh session in empty cwd should have no agents"
+        );
+
+        // Second cwd: one project-scope agent.
+        let cwd2 = tempfile::tempdir().expect("cwd2");
+        std::fs::create_dir_all(cwd2.path().join(".git")).expect("touch git2");
+        let agents_dir = cwd2.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        std::fs::write(
+            agents_dir.join("hunter.md"),
+            "---\nname: hunter\ndescription: Hunt bugs\n---\n\nbody\n",
+        )
+        .expect("write agent");
+
+        store.update_cwd(&s.id, cwd2.path().to_path_buf()).await;
+
+        let after = store.sessions.read().await.get(&s.id).cloned().unwrap();
+        assert!(
+            after.agents.get("hunter").is_some(),
+            "update_cwd should re-discover subagents in the new cwd"
+        );
     }
 
     /// `get_or_create_registry` should reuse the cached registry when the

@@ -1313,6 +1313,8 @@ pub async fn run_agent(
                         spawned_cx,
                         session_id_for_loop.clone(),
                         sessions_for_loop.clone(),
+                        crate::tool_loop::NotificationMode::Live,
+                        0,
                     ))
                     .catch_unwind()
                     .await;

@@ -108,6 +108,34 @@ fn permission_grant_for_selection(
 /// into each streaming turn's `Box<dyn FnMut>` without being consumed.
 pub type TextSink = Arc<Mutex<dyn FnMut(&str) + Send>>;
 
+/// Whether `run()` emits per-tool `SessionUpdate` notifications to the
+/// ACP client.
+///
+/// `Live` is the default for top-level runs: the user sees each tool
+/// card appear, transition Pending -> InProgress -> Completed/Failed.
+///
+/// `Silent` is used for nested subagent runs invoked by the `task`
+/// meta-tool: the subagent's tool-call noise stays out of the parent
+/// conversation. Permission prompts still fire (`Silent` does not relax
+/// the gate); only the progress cards are suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationMode {
+    Live,
+    Silent,
+}
+
+/// Cap on subagent nesting. A depth of 1 means top-level agents can
+/// invoke `task`, but the subagent they spawn cannot in turn invoke
+/// another `task`. Prevents runaway recursion and keeps the catalog
+/// from leaking into nested system prompts.
+pub(crate) const MAX_SUBAGENT_DEPTH: usize = 1;
+
+/// Per-subagent turn ceiling, applied as `parent_max_turns.min(...)` in
+/// `execute_subagent`. Bounds the cost of a single delegation so a
+/// parent run with `--max-turns 200` doesn't hand 200 turns to each
+/// `task` invocation.
+pub(crate) const MAX_SUBAGENT_TURNS: usize = 25;
+
 /// Outcome of consulting the permission gate before executing a tool.
 enum GateDecision {
     /// Run the tool without prompting.
@@ -257,8 +285,17 @@ pub(crate) async fn run(
     spawned_cx: SpawnedCx<'_>,
     session_id: String,
     sessions: SessionStore,
+    notifications: NotificationMode,
+    depth: usize,
 ) -> (String, Vec<ToolExchange>) {
-    let tools: Vec<ToolDefinition> = registry.tool_definitions().await;
+    let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
+    // Nested runs (subagents) must not see the `task` tool themselves --
+    // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
+    // catalog at deeper levels prevents an unbounded recursion of
+    // subagents-spawning-subagents.
+    if depth >= MAX_SUBAGENT_DEPTH {
+        tools.retain(|t| t.function.name != "task");
+    }
     let mut full_response = String::new();
     // Captured per-call so the caller can persist them with the turn (#3409),
     // letting a `session/load` re-feed the LLM the same tool context the
@@ -355,7 +392,8 @@ pub(crate) async fn run(
                             // Render the card anyway so the user sees what
                             // the agent tried to invoke -- raw_input falls
                             // back to the unparsed string.
-                            send_session_update(
+                            maybe_send_session_update(
+                                notifications,
                                 spawned_cx.cx(),
                                 &session_id,
                                 SessionUpdate::ToolCall(announce::initial_tool_call(
@@ -365,7 +403,8 @@ pub(crate) async fn run(
                                     &Value::String(call.function.arguments.clone()),
                                 )),
                             );
-                            send_session_update(
+                            maybe_send_session_update(
+                                notifications,
                                 spawned_cx.cx(),
                                 &session_id,
                                 SessionUpdate::ToolCallUpdate(announce::update_failed(
@@ -408,7 +447,8 @@ pub(crate) async fn run(
                                 .count(),
                             "rejecting tool call: rendered title exceeds MAX_TOOL_TITLE_CHARS",
                         );
-                        send_session_update(
+                        maybe_send_session_update(
+                            notifications,
                             spawned_cx.cx(),
                             &session_id,
                             SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
@@ -418,7 +458,8 @@ pub(crate) async fn run(
                                 &parsed_input,
                             )),
                         );
-                        send_session_update(
+                        maybe_send_session_update(
+                            notifications,
                             spawned_cx.cx(),
                             &session_id,
                             SessionUpdate::ToolCallUpdate(announce::update_failed(
@@ -440,7 +481,8 @@ pub(crate) async fn run(
                     // Pending -- emit the card before the gate runs so the
                     // permission modal (which reuses this id) renders against
                     // a card that already shows path / command / etc.
-                    send_session_update(
+                    maybe_send_session_update(
+                        notifications,
                         spawned_cx.cx(),
                         &session_id,
                         SessionUpdate::ToolCall(announce::initial_tool_call(
@@ -468,7 +510,8 @@ pub(crate) async fn run(
                         GateDecision::Reject(message) => {
                             // Failed terminal update so the card reflects the
                             // denial and doesn't sit at Pending forever.
-                            send_session_update(
+                            maybe_send_session_update(
+                                notifications,
                                 spawned_cx.cx(),
                                 &session_id,
                                 SessionUpdate::ToolCallUpdate(announce::update_failed(
@@ -482,7 +525,8 @@ pub(crate) async fn run(
                         GateDecision::Allow {
                             sandbox_policy_override,
                         } => {
-                            send_session_update(
+                            maybe_send_session_update(
+                                notifications,
                                 spawned_cx.cx(),
                                 &session_id,
                                 SessionUpdate::ToolCallUpdate(announce::update_in_progress(
@@ -526,14 +570,40 @@ pub(crate) async fn run(
                                 outside_sandbox_once
                             );
 
-                            let exec = execute_tool(
-                                registry,
-                                &tool_name,
-                                parsed_input.clone(),
-                                policy,
-                                outside_sandbox_once,
-                            )
-                            .await;
+                            // `task` short-circuits the registry: it needs
+                            // `llm`/`spawned_cx`/`sessions` to spin up a
+                            // nested `run()` for the subagent, none of
+                            // which the registry sees. The gate has
+                            // already cleared this call (kind=Other =>
+                            // prompted in `default`, refused in
+                            // `readOnly`), so by the time we get here we
+                            // know the user has authorized the dispatch.
+                            let exec = if tool_name == "task" {
+                                execute_subagent(
+                                    llm,
+                                    registry,
+                                    model,
+                                    reasoning_effort,
+                                    &parsed_input,
+                                    max_turns,
+                                    idle_timeout,
+                                    cancel.clone(),
+                                    &spawned_cx,
+                                    &session_id,
+                                    &sessions,
+                                    depth + 1,
+                                )
+                                .await
+                            } else {
+                                execute_tool(
+                                    registry,
+                                    &tool_name,
+                                    parsed_input.clone(),
+                                    policy,
+                                    outside_sandbox_once,
+                                )
+                                .await
+                            };
 
                             // Build the terminal update -- Completed (with a
                             // Diff for writeFile when we have prior content)
@@ -549,7 +619,8 @@ pub(crate) async fn run(
                                     .and_then(|prior| build_write_diff(&parsed_input, prior));
                                 announce::update_completed(&call.id, &exec.output, diff)
                             };
-                            send_session_update(
+                            maybe_send_session_update(
+                                notifications,
                                 spawned_cx.cx(),
                                 &session_id,
                                 SessionUpdate::ToolCallUpdate(update),
@@ -773,8 +844,168 @@ async fn execute_tool(
     ToolExecution { output, failed }
 }
 
+/// Dispatch the `task` meta-tool: look up the named subagent, build a
+/// fresh `Vec<ChatMessage>` from its body + the caller-provided prompt,
+/// and drive a nested `run()` to completion with notifications
+/// suppressed. Only the subagent's final assistant text is returned to
+/// the parent loop as the tool result.
+///
+/// The nested call shares:
+///   * `llm`, `registry`, `model`, `reasoning_effort`: same backend, same
+///     tool catalog (minus `task` itself at depth >= MAX_SUBAGENT_DEPTH),
+///     same model and effort as the parent.
+///   * `cancel`: a parent cancellation propagates to the subagent.
+///   * `session_id` and `sessions`: the permission gate stays active
+///     against the parent session's mode and always-allow set, so a
+///     subagent cannot escape `readOnly` or skip a prompt the parent
+///     would have to clear.
+///
+/// What is NOT shared:
+///   * `messages`: the subagent gets a fresh transcript built from its
+///     own system prompt + the dispatcher's `prompt` argument. It does
+///     not see the parent conversation.
+///   * Text/thought sinks: a no-op sink swallows the subagent's
+///     streamed tokens. The parent only sees the final result string.
+///   * Progress notifications: `NotificationMode::Silent` suppresses
+///     per-tool `SessionUpdate`s. Permission prompts still fire when
+///     the gate escalates.
+#[allow(clippy::too_many_arguments)]
+async fn execute_subagent(
+    llm: &Arc<dyn LlmBackend>,
+    registry: &ToolRegistry,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    args: &Value,
+    max_turns: usize,
+    idle_timeout: Duration,
+    cancel: CancellationToken,
+    spawned_cx: &SpawnedCx<'_>,
+    session_id: &str,
+    sessions: &SessionStore,
+    depth: usize,
+) -> ToolExecution {
+    let subagent_name = match args.get("subagent_type").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return ToolExecution {
+                output: "Error: `task` requires a non-empty `subagent_type`.".to_string(),
+                failed: true,
+            };
+        }
+    };
+    let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return ToolExecution {
+                output: "Error: `task` requires a non-empty `prompt`.".to_string(),
+                failed: true,
+            };
+        }
+    };
+
+    // Snapshot the agent metadata under the registry lock, then drop the
+    // guard before recursing into `run()` -- the nested call also
+    // touches `registry.tool_definitions().await`, which takes the same
+    // RwLock for read and would deadlock if we held it across the await.
+    let meta = {
+        let agents = registry.agents_snapshot().await;
+        match agents.get(subagent_name) {
+            Some(m) => m.clone(),
+            None => {
+                let available: Vec<&str> = agents.iter_sorted().map(|m| m.name.as_str()).collect();
+                return ToolExecution {
+                    output: format!(
+                        "Error: unknown subagent '{subagent_name}'. Available: {}",
+                        available.join(", ")
+                    ),
+                    failed: true,
+                };
+            }
+        }
+    };
+
+    let body = match crate::agents::read_agent_body(&meta.location) {
+        Ok(b) => b,
+        Err(e) => {
+            return ToolExecution {
+                output: format!("Error: failed to load subagent '{subagent_name}': {e}"),
+                failed: true,
+            };
+        }
+    };
+
+    let system = format!(
+        "{body}\n\n---\n\nYou are running as a subagent invoked via the `task` tool. \
+         The parent agent will receive your final assistant message as your \
+         result -- be self-contained and end with the answer."
+    );
+    let messages = vec![ChatMessage::system(system), ChatMessage::user(prompt)];
+
+    // No-op sinks: the subagent's streamed tokens stay internal. We
+    // collect the final string from `run()`'s return value.
+    let noop_text: TextSink = Arc::new(Mutex::new(|_: &str| {}));
+    let noop_thought: TextSink = Arc::new(Mutex::new(|_: &str| {}));
+
+    // Cap the subagent's turn budget so a runaway delegation can't
+    // burn the parent's entire allowance (which can be 200+ turns).
+    // 25 is enough for a well-scoped focused task; if the subagent
+    // needs more, that's a sign the parent should have done the work
+    // itself or split it differently.
+    let nested_max_turns = max_turns.min(MAX_SUBAGENT_TURNS);
+
+    // `Box::pin` is required because `run` is recursive via this
+    // function and Rust async fns can't be directly recursive (the
+    // future type would have infinite size).
+    let nested = Box::pin(run(
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        messages,
+        nested_max_turns,
+        idle_timeout,
+        cancel,
+        noop_text,
+        noop_thought,
+        SpawnedCx::new(spawned_cx.cx()),
+        session_id.to_string(),
+        sessions.clone(),
+        NotificationMode::Silent,
+        depth,
+    ))
+    .await;
+
+    let (text, _exchanges) = nested;
+    if text.trim().is_empty() {
+        ToolExecution {
+            output: format!("Error: subagent '{subagent_name}' returned an empty response."),
+            failed: true,
+        }
+    } else {
+        ToolExecution {
+            output: text,
+            failed: false,
+        }
+    }
+}
+
 /// Send a `SessionNotification` and log on failure -- there is nothing
 /// useful we can do if the channel to the client is broken.
+/// Emit a `SessionUpdate` notification only when `mode == Live`. Used so
+/// subagent runs (`mode == Silent`) don't push their internal tool-call
+/// progress cards back to the ACP client -- the parent only sees the
+/// subagent's final answer as the `task` tool's result.
+fn maybe_send_session_update(
+    mode: NotificationMode,
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    update: SessionUpdate,
+) {
+    if mode == NotificationMode::Live {
+        send_session_update(cx, session_id, update);
+    }
+}
+
 fn send_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: SessionUpdate) {
     let notification = SessionNotification::new(session_id.to_string(), update);
     if let Err(e) = cx.send_notification(notification) {

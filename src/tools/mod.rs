@@ -2,6 +2,7 @@ mod filesystem;
 pub mod sandbox;
 mod shell;
 
+use crate::agents::AgentRegistry;
 use crate::bifrost_client::BifrostClient;
 use crate::llm_client::{FunctionDef, ToolDefinition};
 use crate::skills::SkillRegistry;
@@ -206,6 +207,19 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Read,
         display_name: "Activating skill",
     },
+    // --- Subagent dispatch -------------------------------------------------
+    // Like `activate_skill`, registered dynamically in `tool_definitions()`
+    // only when at least one subagent is discovered. Classified `Other`:
+    // its transitive effects are whatever tools the subagent invokes, so
+    // we want the gate to refuse it in `readOnly` mode and prompt in
+    // `default`. Actual dispatch happens in `tool_loop::run` (not
+    // `ToolRegistry::execute`) because the subagent needs `llm`,
+    // `spawned_cx`, and `sessions` -- none of which the registry sees.
+    ToolMeta {
+        name: "task",
+        kind: ToolKind::Other,
+        display_name: "Running subagent",
+    },
 ];
 
 fn tool_meta(name: &str) -> Option<&'static ToolMeta> {
@@ -245,6 +259,7 @@ pub struct ToolRegistry {
     cwd: PathBuf,
     bifrost: Option<Arc<BifrostClient>>,
     skills: RwLock<Arc<SkillRegistry>>,
+    agents: RwLock<Arc<AgentRegistry>>,
 }
 
 impl ToolRegistry {
@@ -259,10 +274,25 @@ impl ToolRegistry {
         *self.skills.write().await = skills;
     }
 
+    /// Replace the cached AgentRegistry. Same pattern as `set_skills`:
+    /// `update_cwd` re-discovers from the new working directory and the
+    /// next prompt's tool catalog reflects it.
+    pub async fn set_agents(&self, agents: Arc<AgentRegistry>) {
+        *self.agents.write().await = agents;
+    }
+
+    /// Snapshot the current AgentRegistry. Used by `tool_loop::run` to
+    /// look up `subagent_type` without holding the read lock across the
+    /// nested LLM call.
+    pub(crate) async fn agents_snapshot(&self) -> Arc<AgentRegistry> {
+        self.agents.read().await.clone()
+    }
+
     pub async fn new(
         cwd: PathBuf,
         bifrost_binary: Option<&Path>,
         skills: Arc<SkillRegistry>,
+        agents: Arc<AgentRegistry>,
     ) -> Self {
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
@@ -291,6 +321,7 @@ impl ToolRegistry {
             cwd,
             bifrost,
             skills: RwLock::new(skills),
+            agents: RwLock::new(agents),
         }
     }
 
@@ -433,6 +464,50 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["name"]
+                }),
+            ));
+        }
+        drop(skills);
+
+        // Append `task` only when at least one subagent is discovered.
+        // The enum constraint keeps the model from guessing names not in
+        // the catalog (mirrors `activate_skill`).
+        let agents = self.agents.read().await;
+        if !agents.is_empty() {
+            let names: Vec<String> = agents.iter_sorted().map(|m| m.name.clone()).collect();
+            let catalog: String = agents
+                .iter_sorted()
+                .map(|m| format!("- {}: {}", m.name, m.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            defs.push(tool_def(
+                "task",
+                &format!(
+                    "Delegate a focused task to a specialized subagent. The subagent runs in an \
+                     isolated context with the same tools as you; only its final text answer comes \
+                     back. Use when the work is well-defined and self-contained, or when you want \
+                     to keep its tool-call noise out of the main conversation. The subagent does \
+                     NOT see this conversation -- give it a self-contained prompt.\n\n\
+                     Available subagents:\n{catalog}"
+                ),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "subagent_type": {
+                            "type": "string",
+                            "enum": names,
+                            "description": "Name of the subagent from the catalog."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Short (3-5 word) label describing the delegation."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Self-contained task prompt for the subagent."
+                        }
+                    },
+                    "required": ["subagent_type", "description", "prompt"]
                 }),
             ));
         }
@@ -825,6 +900,20 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             bifrost: None,
             skills: RwLock::new(Arc::new(reg)),
+            agents: RwLock::new(Arc::new(AgentRegistry::default())),
+        }
+    }
+
+    fn registry_with_agents(agents: Vec<crate::agents::AgentMeta>) -> ToolRegistry {
+        let mut reg = AgentRegistry::default();
+        for meta in agents {
+            reg.insert_for_test(meta);
+        }
+        ToolRegistry {
+            cwd: PathBuf::from("/tmp"),
+            bifrost: None,
+            skills: RwLock::new(Arc::new(SkillRegistry::default())),
+            agents: RwLock::new(Arc::new(reg)),
         }
     }
 
@@ -919,6 +1008,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             bifrost: None,
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
+            agents: RwLock::new(Arc::new(AgentRegistry::default())),
         };
         let advertised: Vec<String> = registry
             .tool_definitions()
@@ -946,5 +1036,70 @@ mod tests {
                 "tool_definitions() advertises '{advertised_name}' but it is missing from the TOOLS metadata table"
             );
         }
+    }
+
+    /// `task` is gated on having at least one discovered subagent.
+    /// With an empty `AgentRegistry`, the LLM shouldn't see the tool at
+    /// all -- exposing it with an empty `enum` would just teach the
+    /// model to guess names that don't exist.
+    #[tokio::test]
+    async fn task_tool_hidden_when_no_subagents() {
+        let registry = registry_with_skills(vec![]);
+        let advertised: Vec<String> = registry
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|d| d.function.name)
+            .collect();
+        assert!(
+            !advertised.iter().any(|n| n == "task"),
+            "task should not be advertised without subagents; got {advertised:?}"
+        );
+    }
+
+    /// Once at least one subagent is in the registry, `task` is
+    /// advertised with `subagent_type` constrained to the discovered
+    /// names via JSON-schema `enum` (mirrors `activate_skill`).
+    #[tokio::test]
+    async fn task_tool_exposed_with_subagent_enum() {
+        use crate::agents::{AgentMeta, AgentScope};
+        let registry = registry_with_agents(vec![
+            AgentMeta {
+                name: "doc-writer".into(),
+                description: "Drafts docs from code".into(),
+                location: PathBuf::from("/tmp/doc-writer.md"),
+                scope: AgentScope::Project,
+            },
+            AgentMeta {
+                name: "bug-hunter".into(),
+                description: "Hunts for regressions".into(),
+                location: PathBuf::from("/tmp/bug-hunter.md"),
+                scope: AgentScope::User,
+            },
+        ]);
+        let defs = registry.tool_definitions().await;
+        let task_def = defs
+            .iter()
+            .find(|d| d.function.name == "task")
+            .expect("task tool should be advertised");
+
+        // Enum must contain the discovered names.
+        let enum_vals = task_def.function.parameters["properties"]["subagent_type"]["enum"]
+            .as_array()
+            .expect("subagent_type should constrain via enum");
+        let mut got: Vec<String> = enum_vals
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["bug-hunter", "doc-writer"]);
+
+        // Description should surface the catalog so the model can pick.
+        assert!(
+            task_def.function.description.contains("doc-writer"),
+            "catalog should mention each subagent; got: {}",
+            task_def.function.description
+        );
+        assert!(task_def.function.description.contains("bug-hunter"));
     }
 }

@@ -6,6 +6,7 @@ use clap::Parser;
 use clap::builder::RangedU64ValueParser;
 
 mod agent;
+mod agents;
 mod agents_md;
 mod bifrost_client;
 mod codex_auth;
