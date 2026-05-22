@@ -50,7 +50,7 @@ pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
             output: format!("Failed to create directories for '{}': {}", path, e),
         };
     }
-    match std::fs::write(&resolved, content) {
+    match atomic_write(&resolved, content.as_bytes()) {
         Ok(()) => ToolResult {
             status: ToolStatus::Success,
             output: format!("Written {} bytes to '{}'", content.len(), path),
@@ -60,6 +60,84 @@ pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
             output: format!("Failed to write '{}': {}", path, e),
         },
     }
+}
+
+/// Write `content` to `target` such that the destination either holds the
+/// previous contents or the new contents in full -- never a partial mix.
+///
+/// We write to a sibling tempfile, fsync it, then `rename(2)` over the
+/// destination. `rename(2)` on POSIX (and `MoveFileExW` with REPLACE on
+/// Windows) is the standard primitive for this. If anything fails before
+/// the rename, the temp file is removed via a drop guard and the existing
+/// destination is untouched.
+///
+/// `safe_resolve_for_write` is the caller's responsibility -- this helper
+/// trusts `target` to already be inside the cwd.
+fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path has no parent directory",
+        )
+    })?;
+    let file_name = target.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path has no file name",
+        )
+    })?;
+
+    // Preserve mode of the existing destination so atomic replace doesn't
+    // silently drop e.g. an executable bit. `metadata` follows symlinks,
+    // which matches what plain `fs::write` would have done before this
+    // change; symlink targets already had to land inside cwd to pass
+    // `safe_resolve_for_write`.
+    let existing_perms = std::fs::metadata(target).ok().map(|m| m.permissions());
+
+    // Hidden + uuid suffix keeps the temp invisible to most tools and
+    // collision-free against concurrent writers. Sibling of the target so
+    // `rename` stays on the same filesystem (atomic).
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
+    let tmp_path = parent.join(&tmp_name);
+
+    struct TmpGuard<'a> {
+        path: &'a Path,
+        armed: bool,
+    }
+    impl<'a> Drop for TmpGuard<'a> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::fs::remove_file(self.path);
+            }
+        }
+    }
+    let mut guard = TmpGuard {
+        path: &tmp_path,
+        armed: true,
+    };
+
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        f.write_all(content)?;
+        // sync_all so a power loss between rename and the next fsync still
+        // leaves the file's data on disk, not just its directory entry.
+        f.sync_all()?;
+    }
+
+    if let Some(perms) = existing_perms {
+        std::fs::set_permissions(&tmp_path, perms)?;
+    }
+
+    std::fs::rename(&tmp_path, target)?;
+    guard.armed = false;
+    Ok(())
 }
 
 pub fn list_directory(cwd: &Path, path: &str) -> ToolResult {
@@ -208,6 +286,115 @@ mod tests {
         let w = write_file(&cwd, "a/b/c/note.md", "ok");
         assert!(matches!(w.status, ToolStatus::Success), "{}", w.output);
         assert!(cwd.join("a/b/c/note.md").exists());
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Helper: count sibling temp files left behind by `atomic_write`. They
+    /// are named `.{filename}.tmp.{uuid}` so we look for the prefix.
+    fn count_tmp_siblings(dir: &Path, target_name: &str) -> usize {
+        let prefix = format!(".{}.tmp.", target_name);
+        std::fs::read_dir(dir)
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(prefix.as_str()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Atomic replace: writing over an existing file leaves the new content
+    /// and no `.tmp.*` sibling. The on-disk inode rotates via rename(2);
+    /// existing readers holding the old fd keep their consistent view.
+    #[test]
+    fn write_file_atomically_replaces_existing_file() {
+        let cwd = fresh_tmp_dir("atomic-replace");
+        let first = write_file(&cwd, "doc.txt", "original content");
+        assert!(matches!(first.status, ToolStatus::Success));
+
+        let second = write_file(&cwd, "doc.txt", "replaced content");
+        assert!(matches!(second.status, ToolStatus::Success));
+
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("doc.txt")).unwrap(),
+            "replaced content"
+        );
+        assert_eq!(
+            count_tmp_siblings(&cwd, "doc.txt"),
+            0,
+            "no tempfile should be left behind after a successful write"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Atomic create: a fresh write produces the target file and no stray
+    /// `.tmp.*` sibling. Guards against the temp file leaking when the
+    /// destination did not previously exist.
+    #[test]
+    fn write_file_atomically_creates_new_file() {
+        let cwd = fresh_tmp_dir("atomic-new");
+        let w = write_file(&cwd, "new.txt", "hello");
+        assert!(matches!(w.status, ToolStatus::Success));
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("new.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(count_tmp_siblings(&cwd, "new.txt"), 0);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// Failure simulation: pointing `atomic_write` at a path that is an
+    /// existing directory makes `rename(2)` fail (a regular file cannot
+    /// replace a directory on any supported platform). The contract is:
+    /// the original entry is untouched and the temp file is cleaned up by
+    /// the drop guard.
+    #[test]
+    fn atomic_write_failure_before_rename_preserves_destination_and_cleans_up() {
+        let cwd = fresh_tmp_dir("atomic-fail");
+        let target = cwd.join("entry");
+        std::fs::create_dir(&target).unwrap();
+        let canary = target.join("inside.txt");
+        std::fs::write(&canary, "untouched").unwrap();
+
+        let err = atomic_write(&target, b"new bytes").expect_err("rename over a dir must fail");
+        // Be permissive about the exact io::ErrorKind; behavior varies
+        // across libc/Windows. The structural guarantee is what we test.
+        assert!(
+            !err.to_string().is_empty(),
+            "error should carry a message: {:?}",
+            err
+        );
+
+        assert!(target.is_dir(), "destination directory must survive");
+        assert_eq!(
+            std::fs::read_to_string(&canary).unwrap(),
+            "untouched",
+            "directory contents must survive"
+        );
+        assert_eq!(
+            count_tmp_siblings(&cwd, "entry"),
+            0,
+            "tempfile must be removed by the drop guard on failure"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// On Unix the destination's file mode survives an atomic replace so a
+    /// previously-chmod'd file (e.g. a script with the exec bit set)
+    /// doesn't silently drop permissions when the agent rewrites it.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_preserves_existing_unix_mode_on_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = fresh_tmp_dir("preserve-mode");
+        let path = cwd.join("script.sh");
+        std::fs::write(&path, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let w = write_file(&cwd, "script.sh", "#!/bin/sh\necho new\n");
+        assert!(matches!(w.status, ToolStatus::Success));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "exec/group bits must survive the replace");
         std::fs::remove_dir_all(&cwd).ok();
     }
 
