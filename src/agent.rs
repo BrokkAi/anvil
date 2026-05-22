@@ -1097,6 +1097,10 @@ pub async fn run_agent(
                         .permission_mode(&session_id)
                         .await
                         .unwrap_or(PermissionMode::Default);
+                    let sandbox_disabled = sessions_prompt
+                        .sandbox_disabled(&session_id)
+                        .await
+                        .unwrap_or(false);
                     // Reuse the per-session ToolRegistry so shell calls
                     // route through the same `runShellCommand` dispatch
                     // (env scrub, sandbox, rlimits) the LLM tool path
@@ -1109,8 +1113,13 @@ pub async fn run_agent(
                             bifrost_binary_prompt.as_deref(),
                         )
                         .await;
-                    let report =
-                        handle_pr_create(&raw_prompt_text, &registry, permission_mode).await;
+                    let report = handle_pr_create(
+                        &raw_prompt_text,
+                        &registry,
+                        permission_mode,
+                        sandbox_disabled,
+                    )
+                    .await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -2460,6 +2469,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         "permissions" | "permission" => {
             handle_setup_permission(ctx.cx, ctx.sessions, session_id, rest).await
         }
+        "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
         "timeout" => {
             let prompt = if rest.is_empty() {
@@ -2716,6 +2726,59 @@ async fn handle_setup_permission(
     apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
 }
 
+/// Toggle the per-session OS shell sandbox. Separate from `/setup
+/// permissions`: this only controls the sandbox boundary, not whether
+/// the user is prompted before each tool call. `/setup permissions
+/// trusted` disables both the prompt and the sandbox; this command
+/// disables only the latter, so the user still approves each shell call
+/// but the command runs without sandbox-exec / bwrap when accepted.
+///
+/// In-memory only: a session reload reverts to `on`, mirroring how
+/// `permission_mode` resets on load.
+async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
+    if rest.is_empty() {
+        let current = sessions.sandbox_disabled(session_id).await;
+        let state = match current {
+            Some(true) => "off",
+            Some(false) => "on",
+            None => return "Error: unknown session.".to_string(),
+        };
+        return format!(
+            "OS shell sandbox is currently `{state}`.\n\n\
+             - `/setup sandbox on` - re-enable the sandbox (default).\n\
+             - `/setup sandbox off` - run `runShellCommand` without sandbox-exec / bwrap. \
+             The per-call permission prompt still fires; only the OS sandbox is skipped."
+        );
+    }
+    let disabled = match rest.to_ascii_lowercase().as_str() {
+        "off" | "disable" | "disabled" | "false" | "no" => true,
+        "on" | "enable" | "enabled" | "true" | "yes" | "default" => false,
+        "status" => {
+            let current = sessions.sandbox_disabled(session_id).await;
+            return match current {
+                Some(true) => "OS shell sandbox is `off`.".to_string(),
+                Some(false) => "OS shell sandbox is `on`.".to_string(),
+                None => "Error: unknown session.".to_string(),
+            };
+        }
+        _ => {
+            return "Unknown sandbox choice. Try `/setup sandbox on`, `off`, or `status`."
+                .to_string();
+        }
+    };
+    if !sessions.set_sandbox_disabled(session_id, disabled).await {
+        return "Error: unknown session.".to_string();
+    }
+    if disabled {
+        "OS shell sandbox disabled for this session. \
+         `runShellCommand` now executes without sandbox-exec / bwrap; \
+         per-call permission prompts are unchanged."
+            .to_string()
+    } else {
+        "OS shell sandbox re-enabled for this session.".to_string()
+    }
+}
+
 async fn handle_setup_mode(
     cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
@@ -2884,6 +2947,14 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         "- Permission mode: `{}`\n",
         session.permission_mode.as_str()
     ));
+    out.push_str(&format!(
+        "- OS shell sandbox: `{}`\n",
+        if session.sandbox_disabled {
+            "off"
+        } else {
+            "on"
+        }
+    ));
     out.push_str(&format!("- Behavior mode: `{}`\n", session.mode.as_str()));
     out.push_str(&format!(
         "- Reasoning effort: `{}`\n",
@@ -2903,6 +2974,9 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     out.push_str("- `/setup model` - list model ids.\n");
     out.push_str("- `/setup model <model id>` - choose a specific model.\n");
     out.push_str("- `/setup permissions` - change edit/command approvals.\n");
+    out.push_str(
+        "- `/setup sandbox on|off` - toggle the OS shell sandbox (per session, not persisted).\n",
+    );
     out.push_str("- `/setup mode` - change assistant behavior.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
     out.push_str("- `/setup reasoning default|<level>` - advanced reasoning setting.\n");
@@ -3009,6 +3083,7 @@ async fn handle_pr_create(
     prompt_text: &str,
     registry: &crate::tools::ToolRegistry,
     permission_mode: PermissionMode,
+    sandbox_disabled: bool,
 ) -> String {
     if matches!(permission_mode, PermissionMode::ReadOnly) {
         return "Error: `/pr-create` is disabled in read-only permission mode. \
@@ -3017,7 +3092,7 @@ async fn handle_pr_create(
             .to_string();
     }
 
-    let policy = crate::tools::sandbox::SandboxPolicy::from_permission_mode(permission_mode);
+    let policy = crate::tools::sandbox::SandboxPolicy::resolve(permission_mode, sandbox_disabled);
 
     let status = match run_or_report(
         registry,
@@ -4598,5 +4673,48 @@ mod tests {
         assert!(bodies.iter().any(|b| b.contains("verbatim agent")));
         // No empty summary block leaked through.
         assert!(bodies.iter().all(|b| !b.contains("<conversation_summary>")));
+    }
+
+    /// `/setup sandbox` round-trip: bare reports current state, `off`
+    /// flips the flag, `on` flips it back, and an unknown choice neither
+    /// mutates state nor panics. Asserts both the user-facing string and
+    /// the store's observable side effect so a future refactor that
+    /// drops one without the other gets caught.
+    #[tokio::test]
+    async fn handle_setup_sandbox_round_trip() {
+        let (store, id) = make_store_with_session("m").await;
+
+        // Bare: reports "on" (default) and surfaces the usage hints.
+        let bare = handle_setup_sandbox(&store, &id, "").await;
+        assert!(bare.contains("currently `on`"), "got: {bare}");
+        assert!(bare.contains("/setup sandbox off"), "got: {bare}");
+        assert_eq!(store.sandbox_disabled(&id).await, Some(false));
+
+        // `off` flips the flag and confirms the per-call prompt is
+        // still in play -- the message wording is part of the contract.
+        let off = handle_setup_sandbox(&store, &id, "off").await;
+        assert!(off.contains("disabled"), "got: {off}");
+        assert!(off.contains("permission prompts"), "got: {off}");
+        assert_eq!(store.sandbox_disabled(&id).await, Some(true));
+
+        // `on` flips it back.
+        let on = handle_setup_sandbox(&store, &id, "on").await;
+        assert!(on.contains("re-enabled"), "got: {on}");
+        assert_eq!(store.sandbox_disabled(&id).await, Some(false));
+
+        // `status` reports without mutating.
+        assert!(store.set_sandbox_disabled(&id, true).await);
+        let status = handle_setup_sandbox(&store, &id, "status").await;
+        assert!(status.contains("`off`"), "got: {status}");
+        assert_eq!(store.sandbox_disabled(&id).await, Some(true));
+
+        // Unknown choice is rejected and leaves state untouched.
+        let bad = handle_setup_sandbox(&store, &id, "maybe").await;
+        assert!(bad.contains("Unknown sandbox choice"), "got: {bad}");
+        assert_eq!(store.sandbox_disabled(&id).await, Some(true));
+
+        // Unknown session id is surfaced rather than silently noop'd.
+        let missing = handle_setup_sandbox(&store, "no-such", "off").await;
+        assert!(missing.contains("unknown session"), "got: {missing}");
     }
 }

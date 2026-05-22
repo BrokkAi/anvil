@@ -76,6 +76,22 @@ impl SandboxPolicy {
         }
     }
 
+    /// Resolve the sandbox tier for a session, factoring in an explicit
+    /// `sandbox_disabled` opt-out. When `disabled` is true the policy
+    /// collapses to `None` regardless of the permission mode -- the
+    /// per-call permission prompt (driven by `PermissionMode`) still
+    /// fires, but the OS sandbox is skipped. This is the session-level
+    /// counterpart to `BypassPermissions`, which disables *both* the
+    /// prompt and the sandbox; `sandbox_disabled` only disables the
+    /// sandbox.
+    pub fn resolve(mode: PermissionMode, disabled: bool) -> Self {
+        if disabled {
+            Self::None
+        } else {
+            Self::from_permission_mode(mode)
+        }
+    }
+
     pub fn allows_workspace_writes(self) -> bool {
         matches!(self, Self::WorkspaceWrite)
     }
