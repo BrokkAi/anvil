@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
 use crate::llm_client::{
     ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata, ReasoningLevelPreset,
-    StreamChatRequest, ToolCall, ToolDefinition,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 
 // Codex CLI's `chatgpt_base_url` default is
@@ -807,11 +807,65 @@ struct StreamEvent {
 
 /// Body of a `response.completed` / `response.failed` event. Most
 /// fields are unused; we keep the struct minimal so server-side
-/// schema additions don't break parsing.
+/// schema additions don't break parsing. Usage is read out of
+/// `response.completed` so we can populate the ACP `Usage` field on
+/// `PromptResponse`.
 #[derive(Debug, Deserialize)]
 struct ResponseFinal {
     #[serde(default)]
     error: Option<ResponseError>,
+    #[serde(default)]
+    usage: Option<ResponseUsage>,
+}
+
+/// Responses API usage block. Field shape differs from chat
+/// completions: `input_tokens` / `output_tokens` instead of
+/// `prompt_tokens` / `completion_tokens`, and details are nested
+/// under `input_tokens_details` / `output_tokens_details`.
+#[derive(Debug, Deserialize)]
+struct ResponseUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
+}
+
+impl ResponseUsage {
+    fn into_usage(self) -> TokenUsage {
+        let cached = self
+            .input_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning = self
+            .output_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        TokenUsage {
+            input_tokens: self.input_tokens.saturating_sub(cached),
+            output_tokens: self.output_tokens.saturating_sub(reasoning),
+            thought_tokens: reasoning,
+            cached_read_tokens: cached,
+            cached_write_tokens: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -883,6 +937,9 @@ where
     let mut deadline = tokio::time::Instant::now() + idle;
     let mut completed = false;
     let mut failure: Option<anyhow::Error> = None;
+    // Captured from `response.completed.usage`. Zeroed when the server
+    // doesn't emit a usage block (older Responses-API versions did not).
+    let mut usage = TokenUsage::default();
     // Track whether any text deltas were actually delivered so the
     // output_item.done backfill below can distinguish "no deltas yet"
     // from "deltas arrived but happened to be empty strings". Using
@@ -1002,6 +1059,11 @@ where
                             }
                         }
                         "response.completed" => {
+                            if let Some(final_body) = event.response
+                                && let Some(u) = final_body.usage
+                            {
+                                usage = u.into_usage();
+                            }
                             completed = true;
                             break;
                         }
@@ -1062,15 +1124,22 @@ where
     }
 
     if cancel.is_cancelled() {
-        return Ok(LlmResponse::Text(full_text));
+        return Ok(LlmResponse::Text {
+            text: full_text,
+            usage,
+        });
     }
 
     if tool_calls.is_empty() {
-        Ok(LlmResponse::Text(full_text))
+        Ok(LlmResponse::Text {
+            text: full_text,
+            usage,
+        })
     } else {
         Ok(LlmResponse::ToolCalls {
             text: full_text,
             calls: tool_calls,
+            usage,
         })
     }
 }
@@ -1265,7 +1334,7 @@ mod tests {
                 .await
                 .expect("stream completes");
         match resp {
-            LlmResponse::ToolCalls { text, calls } => {
+            LlmResponse::ToolCalls { text, calls, .. } => {
                 assert_eq!(text, "hello");
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].function.name, "search");
@@ -1294,7 +1363,7 @@ mod tests {
                 .await
                 .expect("stream completes");
         match resp {
-            LlmResponse::Text(text) => assert_eq!(text, "ok"),
+            LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(collected.lock().unwrap().as_str(), "ok");
@@ -1322,7 +1391,7 @@ mod tests {
                 .await
                 .expect("stream completes");
         match resp {
-            LlmResponse::Text(text) => assert_eq!(text, "hello"),
+            LlmResponse::Text { text, .. } => assert_eq!(text, "hello"),
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(collected.lock().unwrap().as_str(), "hello");
@@ -1368,7 +1437,7 @@ mod tests {
                 .await
                 .expect("stream completes");
         match resp {
-            LlmResponse::Text(text) => assert_eq!(text, "hi"),
+            LlmResponse::Text { text, .. } => assert_eq!(text, "hi"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -1402,7 +1471,7 @@ mod tests {
         .await
         .expect("stream completes");
         match resp {
-            LlmResponse::Text(t) => assert_eq!(t, "answer is A"),
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, "answer is A"),
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(text.lock().unwrap().as_str(), "answer is A");
