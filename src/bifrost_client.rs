@@ -40,7 +40,7 @@ pub struct BifrostToolDef {
     pub input_schema: Value,
 }
 
-/// JSON-RPC client for a long-lived `bifrost --server searchtools` subprocess.
+/// JSON-RPC client for a long-lived `bifrost --server core` subprocess.
 ///
 /// Holds the child process for the lifetime of the client; the process is
 /// killed when the client is dropped (`kill_on_drop(true)`).
@@ -66,7 +66,7 @@ impl BifrostClient {
             .arg("--root")
             .arg(cwd)
             .arg("--server")
-            .arg("searchtools")
+            .arg("core")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -298,7 +298,7 @@ mod tests {
     /// edit here, not whatever happens to be on a contributor's `$PATH`.
     /// Must stay in sync with `BUNDLED_BIFROST_VERSION` in
     /// `brokk-code/brokk_code/rust_acp_install.py`.
-    const TEST_BIFROST_VERSION: &str = "0.3.0";
+    const TEST_BIFROST_VERSION: &str = "0.4.1";
 
     const TEST_BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 
