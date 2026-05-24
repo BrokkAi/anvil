@@ -8,6 +8,7 @@ use clap::builder::RangedU64ValueParser;
 mod agent;
 mod agents;
 mod agents_md;
+mod bedrock_client;
 mod bifrost_client;
 mod codex_auth;
 mod codex_client;
@@ -318,6 +319,26 @@ fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
+fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
+    let token = match bedrock_client::bearer_token_from_env_or_secrets() {
+        Ok(Some(token)) => token,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("failed to read Bedrock credentials: {e:#}");
+            return None;
+        }
+    };
+    let region = bedrock_client::region_from_env();
+    let model = bedrock_client::model_from_env();
+    tracing::info!(
+        "Bedrock backend wired from {} or ~/.secrets at region {region}; default model {model}",
+        bedrock_client::BEDROCK_API_KEY_ENV
+    );
+    Some(Arc::new(bedrock_client::BedrockClient::new(
+        token, region, model,
+    )))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Configure tracing to stderr only (stdout is reserved for JSON-RPC)
@@ -365,10 +386,17 @@ async fn main() -> Result<()> {
         );
     }
 
+    let bedrock_backend = build_bedrock_backend();
     let codex_backend = build_codex_backend().await;
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
 
+    if bedrock_backend.is_none() {
+        tracing::info!(
+            "Bedrock backend not available; set {} or add ~/.secrets/bedrock_api_key to enable it.",
+            bedrock_client::BEDROCK_API_KEY_ENV
+        );
+    }
     if codex_backend.is_none() {
         tracing::info!(
             "Codex backend not available; the picker will fall back to Ollama \
@@ -386,6 +414,7 @@ async fn main() -> Result<()> {
     }
 
     let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(
+        bedrock_backend,
         codex_backend,
         openrouter_backend,
         ollama_backend,

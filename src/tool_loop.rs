@@ -26,6 +26,7 @@ const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 /// Without a bound, an unattended IDE leaves the tool loop, cancellation token,
 /// and spawned task parked indefinitely with no operator-visible signal.
 const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
+const TRACE_JSONL_ENV: &str = "ANVIL_TRACE_JSONL";
 
 /// Result of approving a permission request.
 ///
@@ -36,6 +37,108 @@ const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 struct PermissionGrant {
     allow_always: bool,
     sandbox_policy_override: Option<SandboxPolicy>,
+}
+
+fn append_trace_record(record: serde_json::Value) {
+    let Ok(path) = std::env::var(TRACE_JSONL_ENV) else {
+        return;
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    let mut record = record;
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert(
+            "timestamp".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::warn!("failed to serialize LLM trace record: {e:#}");
+            return;
+        }
+    };
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!("failed to append LLM trace record to {path}: {e:#}");
+    }
+}
+
+fn trace_llm_request(
+    turn: usize,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    messages: &[ChatMessage],
+    tools: Option<&Vec<ToolDefinition>>,
+) {
+    append_trace_record(serde_json::json!({
+        "type": "llm_request",
+        "turn": turn,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "messages": messages,
+        "tools": tools,
+    }));
+}
+
+fn trace_llm_text_response(turn: usize, text: &str, usage: TokenUsage) {
+    append_trace_record(serde_json::json!({
+        "type": "llm_response",
+        "turn": turn,
+        "response": {
+            "kind": "text",
+            "text": text,
+        },
+        "usage": trace_usage(usage),
+    }));
+}
+
+fn trace_llm_tool_response(
+    turn: usize,
+    text: &str,
+    calls: &[crate::llm_client::ToolCall],
+    usage: TokenUsage,
+) {
+    append_trace_record(serde_json::json!({
+        "type": "llm_response",
+        "turn": turn,
+        "response": {
+            "kind": "tool_calls",
+            "text": text,
+            "tool_calls": calls,
+        },
+        "usage": trace_usage(usage),
+    }));
+}
+
+fn trace_llm_error(turn: usize, error: &anyhow::Error) {
+    append_trace_record(serde_json::json!({
+        "type": "llm_error",
+        "turn": turn,
+        "error": format!("{error:#}"),
+    }));
+}
+
+fn trace_usage(usage: TokenUsage) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "thought_tokens": usage.thought_tokens,
+        "cached_read_tokens": usage.cached_read_tokens,
+        "cached_write_tokens": usage.cached_write_tokens,
+        "total_tokens": usage.total_tokens(),
+    })
 }
 
 fn permission_options(tool_name: &str) -> Vec<PermissionOption> {
@@ -359,11 +462,20 @@ pub(crate) async fn run(
         // the SSE driver via `idle_timeout`, threaded here from
         // `--llm-idle-timeout-secs` and the per-session `/idle-timeout`
         // override.
+        let request_tools = turn_tools.clone();
+        trace_llm_request(
+            turn,
+            model,
+            reasoning_effort,
+            &messages,
+            request_tools.as_ref(),
+        );
+
         let response = llm
             .stream_chat(StreamChatRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: turn_tools,
+                tools: request_tools,
                 reasoning_effort: reasoning_effort.map(str::to_string),
                 on_token,
                 on_thought: on_thought_cb,
@@ -374,12 +486,14 @@ pub(crate) async fn run(
 
         match response {
             Ok(LlmResponse::Text { text, usage }) => {
+                trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
                 full_response.push_str(&text);
                 // Final text response -- we're done
                 break;
             }
             Ok(LlmResponse::ToolCalls { text, calls, usage }) => {
+                trace_llm_tool_response(turn, &text, &calls, usage);
                 turn_usage.add(usage);
                 // Any text emitted before tool calls
                 if !text.is_empty() {
@@ -679,6 +793,7 @@ pub(crate) async fn run(
                 }
             }
             Err(e) => {
+                trace_llm_error(turn, &e);
                 let err_msg = format!("\n**Error:** LLM request failed: {e}\n");
                 if let Ok(mut cb) = on_text.lock() {
                     cb(&err_msg);
