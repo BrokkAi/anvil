@@ -1023,7 +1023,7 @@ mod tests {
     async fn drive_sse_stream_returns_tool_calls_on_done() {
         let chunks: Vec<Result<Vec<u8>>> = vec![
             Ok(
-                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"readFile\",\"arguments\":\"{\\\"pa\"}}]}}]}\n"
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"file_pa\"}}]}}]}\n"
                     .to_vec(),
             ),
             Ok(
@@ -1043,8 +1043,8 @@ mod tests {
                 assert!(text.is_empty());
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "call_1");
-                assert_eq!(calls[0].function.name, "readFile");
-                assert_eq!(calls[0].function.arguments, r#"{"path":"a.txt"}"#);
+                assert_eq!(calls[0].function.name, "read_file");
+                assert_eq!(calls[0].function.arguments, r#"{"file_path":"a.txt"}"#);
             }
             other => panic!("expected tool calls, got {other:?}"),
         }
@@ -1207,11 +1207,11 @@ mod tests {
         let m = ChatMessage::assistant("ok");
         assert_eq!(serde_json::to_value(&m).unwrap()["role"], "assistant");
 
-        let m = ChatMessage::tool_result("call_1", "readFile", "contents");
+        let m = ChatMessage::tool_result("call_1", "read_file", "contents");
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "call_1");
-        assert_eq!(v["name"], "readFile");
+        assert_eq!(v["name"], "read_file");
         assert_eq!(v["content"], "contents");
     }
 
@@ -1224,8 +1224,8 @@ mod tests {
             id: "id_0".into(),
             r#type: "function".into(),
             function: FunctionCall {
-                name: "readFile".into(),
-                arguments: r#"{"path":"x"}"#.into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"x"}"#.into(),
             },
         }];
         let m = ChatMessage::assistant_tool_calls(calls);
@@ -1254,8 +1254,8 @@ mod tests {
             index: 0,
             id: None,
             function: Some(ChunkFunctionCall {
-                name: Some("readFile".into()),
-                arguments: Some(r#"{"pa"#.into()),
+                name: Some("read_file".into()),
+                arguments: Some(r#"{"file_pa"#.into()),
             }),
         });
         acc.push(&ChunkToolCall {
@@ -1271,18 +1271,18 @@ mod tests {
             index: 1,
             id: Some("call_1".into()),
             function: Some(ChunkFunctionCall {
-                name: Some("writeFile".into()),
-                arguments: Some(r#"{"path":"y.txt","content":""}"#.into()),
+                name: Some("write_file".into()),
+                arguments: Some(r#"{"file_path":"y.txt","content":""}"#.into()),
             }),
         });
 
         let calls = acc.into_tool_calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_0");
-        assert_eq!(calls[0].function.name, "readFile");
-        assert_eq!(calls[0].function.arguments, r#"{"path":"x.txt"}"#);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"file_path":"x.txt"}"#);
         assert_eq!(calls[1].id, "call_1");
-        assert_eq!(calls[1].function.name, "writeFile");
+        assert_eq!(calls[1].function.name, "write_file");
     }
 
     /// `OpenAiClient::with_default_headers` produces an instance that

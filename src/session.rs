@@ -395,7 +395,7 @@ pub struct Session {
     pub history: Vec<ConversationTurn>,
     pub manifest: SessionManifest,
     pub permission_mode: PermissionMode,
-    /// When true, `runShellCommand` runs without the OS sandbox
+    /// When true, `run_shell_command` runs without the OS sandbox
     /// (sandbox-exec / bwrap) regardless of `permission_mode`. The
     /// permission prompt still fires -- this flag controls the sandbox
     /// boundary, not user approval. Set via `/setup sandbox off`.
@@ -3332,13 +3332,13 @@ mod tests {
         ));
         let s = store.create_session(cwd.clone()).await;
 
-        assert!(!store.is_always_allowed(&s.id, "writeFile").await);
-        store.add_always_allow(&s.id, "writeFile").await;
-        assert!(store.is_always_allowed(&s.id, "writeFile").await);
+        assert!(!store.is_always_allowed(&s.id, "write_file").await);
+        store.add_always_allow(&s.id, "write_file").await;
+        assert!(store.is_always_allowed(&s.id, "write_file").await);
         // Different tool name, same session: still false.
-        assert!(!store.is_always_allowed(&s.id, "runShellCommand").await);
+        assert!(!store.is_always_allowed(&s.id, "run_shell_command").await);
         // Unknown session never reports allowed.
-        assert!(!store.is_always_allowed("no-such", "writeFile").await);
+        assert!(!store.is_always_allowed("no-such", "write_file").await);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -3962,13 +3962,13 @@ done
         let exchanges = vec![
             ToolExchange {
                 call_id: "call_abc".into(),
-                tool_name: "readFile".into(),
-                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                tool_name: "read_file".into(),
+                arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                 result: "fn main() {}\n".into(),
             },
             ToolExchange {
                 call_id: "call_xyz".into(),
-                tool_name: "searchFileContents".into(),
+                tool_name: "grep_search".into(),
                 arguments: r#"{"pattern":"TODO"}"#.into(),
                 result: "no matches".into(),
             },
@@ -4003,13 +4003,13 @@ done
             .map(|e| (e.call_id.as_str(), e))
             .collect();
 
-        let abc = by_id.get("call_abc").expect("readFile exchange present");
-        assert_eq!(abc.tool_name, "readFile");
-        assert_eq!(abc.arguments, r#"{"path":"src/lib.rs"}"#);
+        let abc = by_id.get("call_abc").expect("read_file exchange present");
+        assert_eq!(abc.tool_name, "read_file");
+        assert_eq!(abc.arguments, r#"{"file_path":"src/lib.rs"}"#);
         assert_eq!(abc.result, "fn main() {}\n");
 
         let xyz = by_id.get("call_xyz").expect("search exchange present");
-        assert_eq!(xyz.tool_name, "searchFileContents");
+        assert_eq!(xyz.tool_name, "grep_search");
         assert_eq!(xyz.arguments, r#"{"pattern":"TODO"}"#);
         assert_eq!(xyz.result, "no matches");
 

@@ -31,7 +31,7 @@ dirs (~/.cargo/bin, ~/.local/bin, ~/.local/share/mise/shims, ~/.asdf/shims, ~/.p
 If your tool's install dir is none of these, export BROKK_ACP_PATH=\"<dirs>\" in the parent \
 shell before launching brokk-acp to replace the discovered PATH.";
 
-/// Per-process rlimit caps applied to every `runShellCommand` child on Unix.
+/// Per-process rlimit caps applied to every `run_shell_command` child on Unix.
 ///
 /// These are a parallel safety net to the OS sandbox: the sandbox bounds
 /// *what* the command can touch (filesystem, namespaces); these bound *how
@@ -345,7 +345,7 @@ pub async fn run_shell_command(
         cwd = %cwd.display(),
         sandboxed = wrapped.sandboxed,
         argv0 = %wrapped.argv[0],
-        "runShellCommand: wrapped command ready",
+        "run_shell_command: wrapped command ready",
     );
 
     // The user requested a sandbox tier (ReadOnly / WorkspaceWrite) but the
@@ -370,7 +370,7 @@ pub async fn run_shell_command(
     // and the home-tool-dir / Homebrew layout makes no sense, so we
     // fall back to the historic hardcoded Unix-style PATH the platform
     // already had. The point is to keep Windows on its prior path of
-    // behavior; deciding what `runShellCommand` *should* do on Windows
+    // behavior; deciding what `run_shell_command` *should* do on Windows
     // is a separate concern from this issue.
     #[cfg(unix)]
     let sandbox_path = sandbox::discover_sandbox_path();

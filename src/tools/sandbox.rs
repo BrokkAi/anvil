@@ -1,4 +1,4 @@
-//! OS-level sandbox for `runShellCommand`.
+//! OS-level sandbox for `run_shell_command`.
 //!
 //! Mirrors the Java executor's three-tier `SandboxPolicy`
 //! (`app/src/main/java/ai/brokk/util/SandboxPolicy.java`) and the
@@ -59,7 +59,7 @@ impl SandboxPolicy {
     ///
     /// `Default` resolves to `WorkspaceWrite` so the per-call permission
     /// prompt is the meaningful gate -- when the user clicks "Allow" the
-    /// shell call can actually write under cwd, mirroring what `writeFile`
+    /// shell call can actually write under cwd, mirroring what `write_file`
     /// (which bypasses the sandbox entirely) already does in this mode.
     /// Previously `Default` mapped to `ReadOnly`, which silently turned the
     /// "Allow" prompt into a no-op for shell writes and contradicted the
@@ -795,7 +795,7 @@ fn warn_missing_bwrap_once() {
     static WARN: Once = Once::new();
     WARN.call_once(|| {
         tracing::warn!(
-            "Bubblewrap (bwrap) not found on PATH; runShellCommand will execute without an OS sandbox. \
+            "Bubblewrap (bwrap) not found on PATH; run_shell_command will execute without an OS sandbox. \
              Install with `apt install bubblewrap` (Debian/Ubuntu) or your distro's equivalent."
         );
     });
@@ -807,7 +807,7 @@ fn warn_unsupported_os_once() {
     static WARN: Once = Once::new();
     WARN.call_once(|| {
         tracing::warn!(
-            "OS-level shell sandbox is not implemented on this platform; runShellCommand will execute without a sandbox"
+            "OS-level shell sandbox is not implemented on this platform; run_shell_command will execute without a sandbox"
         );
     });
 }
@@ -843,7 +843,7 @@ mod tests {
     /// Regression for the bug where Default mode produced a seatbelt profile
     /// with no `file-write*` rule, so clicking "Allow" on the per-call
     /// permission prompt could not actually let shell writes through.
-    /// `writeFile` (which bypasses the sandbox entirely) succeeded in the
+    /// `write_file` (which bypasses the sandbox entirely) succeeded in the
     /// same mode, making the user experience appear arbitrary.
     #[test]
     fn default_mode_seatbelt_profile_grants_workspace_writes() {

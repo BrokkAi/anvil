@@ -202,7 +202,7 @@ impl SandboxBackend {
         }
     }
 
-    /// Run `searchFileContents` (regex match across a directory tree)
+    /// Run `grep_search` (regex match across a directory tree)
     /// through the sandbox. The user-controlled regex pattern is the
     /// load-bearing threat: the `regex` crate is linear-time by
     /// design, but the wasm fuel cap + linear-memory limit are a
@@ -484,7 +484,7 @@ impl WasmSandbox {
         }
     }
 
-    /// Run `searchFileContents` through the sandbox. Preopen the
+    /// Run `grep_search` through the sandbox. Preopen the
     /// search root read-only, ask the guest to walk it and apply the
     /// pattern, return the structured outcome. The guest's wasm
     /// memory cap and fuel budget bound the worst case for a

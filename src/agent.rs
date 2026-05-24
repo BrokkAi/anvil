@@ -1102,7 +1102,7 @@ pub async fn run_agent(
                         .await
                         .unwrap_or(false);
                     // Reuse the per-session ToolRegistry so shell calls
-                    // route through the same `runShellCommand` dispatch
+                    // route through the same `run_shell_command` dispatch
                     // (env scrub, sandbox, rlimits) the LLM tool path
                     // uses. The registry is created on demand if this is
                     // the session's first prompt.
@@ -2778,7 +2778,7 @@ async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &
         return format!(
             "OS shell sandbox is currently `{state}`.\n\n\
              - `/setup sandbox on` - re-enable the sandbox (default).\n\
-             - `/setup sandbox off` - run `runShellCommand` without sandbox-exec / bwrap. \
+             - `/setup sandbox off` - run `run_shell_command` without sandbox-exec / bwrap. \
              The per-call permission prompt still fires; only the OS sandbox is skipped."
         );
     }
@@ -2803,7 +2803,7 @@ async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &
     }
     if disabled {
         "OS shell sandbox disabled for this session. \
-         `runShellCommand` now executes without sandbox-exec / bwrap; \
+         `run_shell_command` now executes without sandbox-exec / bwrap; \
          per-call permission prompts are unchanged."
             .to_string()
     } else {
@@ -3047,19 +3047,19 @@ fn parse_pr_create_arg(prompt_text: &str) -> Option<String> {
 
 /// Quote a string for `sh -c` by wrapping in single quotes and
 /// escaping any embedded single quote via the standard `'\''` trick.
-/// `runShellCommand` invokes `sh -c` with a single argv element, so
+/// `run_shell_command` invokes `sh -c` with a single argv element, so
 /// command parts that come from user input (PR title) or external
 /// lookups (default branch name) need shell-safe quoting.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Per-shell-call timeout for slash-command-driven `runShellCommand`
+/// Per-shell-call timeout for slash-command-driven `run_shell_command`
 /// invocations. Generous enough for `gh pr create` over a slow link
 /// without leaving a stuck child for minutes.
 const HANDLER_SHELL_TIMEOUT_SECS: u64 = 60;
 
-/// Run `cmd` via `runShellCommand` on the per-session `ToolRegistry`
+/// Run `cmd` via `run_shell_command` on the per-session `ToolRegistry`
 /// and return its stdout/stderr blob on success, or a pre-formatted
 /// `Error: ...` string on failure. `label` is the short command name
 /// shown in the error message.
@@ -3071,8 +3071,8 @@ async fn run_or_report(
 ) -> Result<String, String> {
     let result = registry
         .execute(
-            "runShellCommand",
-            serde_json::json!({ "command": cmd, "timeoutSeconds": HANDLER_SHELL_TIMEOUT_SECS }),
+            "run_shell_command",
+            serde_json::json!({ "command": cmd, "timeout": HANDLER_SHELL_TIMEOUT_SECS * 1000 }),
             policy,
         )
         .await;
@@ -3101,7 +3101,7 @@ async fn run_or_report(
 ///   5. Invoke `gh pr create --base <default> --fill [--title <user-arg>]`
 ///      and surface the resulting PR URL.
 ///
-/// All shell calls go through `ToolRegistry::execute("runShellCommand")`
+/// All shell calls go through `ToolRegistry::execute("run_shell_command")`
 /// so they share the LLM tool path's env scrubbing, sandbox policy,
 /// rlimits, and output truncation. The user typed `/pr-create`, so the
 /// `consult_gate` step the LLM path requires is unnecessary -- the
@@ -3151,10 +3151,10 @@ async fn handle_pr_create(
     // remediation is the same: push manually and re-run.
     let upstream = registry
         .execute(
-            "runShellCommand",
+            "run_shell_command",
             serde_json::json!({
                 "command": "git rev-parse --abbrev-ref --symbolic-full-name @{u}",
-                "timeoutSeconds": HANDLER_SHELL_TIMEOUT_SECS,
+                "timeout": HANDLER_SHELL_TIMEOUT_SECS * 1000,
             }),
             policy,
         )
@@ -3979,14 +3979,14 @@ mod tests {
                 tool_exchanges: vec![
                     ToolExchange {
                         call_id: "c1".into(),
-                        tool_name: "searchFileContents".into(),
+                        tool_name: "grep_search".into(),
                         arguments: r#"{"pattern":"TODO"}"#.into(),
                         result: "src/lib.rs:42: // TODO".into(),
                     },
                     ToolExchange {
                         call_id: "c2".into(),
-                        tool_name: "readFile".into(),
-                        arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                        tool_name: "read_file".into(),
+                        arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                         result: "fn main() {}".into(),
                     },
                 ],
@@ -4014,9 +4014,9 @@ mod tests {
         let calls = msgs[2].tool_calls.as_ref().expect("tool_calls present");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "c1");
-        assert_eq!(calls[0].function.name, "searchFileContents");
+        assert_eq!(calls[0].function.name, "grep_search");
         assert_eq!(calls[1].id, "c2");
-        assert_eq!(calls[1].function.name, "readFile");
+        assert_eq!(calls[1].function.name, "read_file");
 
         // tool_result messages, paired by call_id and in original order.
         assert_eq!(msgs[3].role, "tool");
@@ -4109,7 +4109,7 @@ mod tests {
                 agent_response: String::new(),
                 tool_exchanges: vec![ToolExchange {
                     call_id: "c1".into(),
-                    tool_name: "searchFileContents".into(),
+                    tool_name: "grep_search".into(),
                     arguments: r#"{"pattern":"x"}"#.into(),
                     result: "no matches".into(),
                 }],

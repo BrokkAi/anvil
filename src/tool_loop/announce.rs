@@ -138,7 +138,7 @@ pub(super) fn update_failed(
     ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields)
 }
 
-/// Terminal `Completed` update. Pass `Some(diff)` for `writeFile` to
+/// Terminal `Completed` update. Pass `Some(diff)` for `write_file` to
 /// render an inline diff; otherwise the `output` is shown as text.
 pub(super) fn update_completed(
     tool_call_id: &str,
@@ -162,23 +162,27 @@ pub(super) fn update_completed(
 pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     let display = ToolRegistry::display_name(tool_name);
     let path = raw_input.get("path").and_then(Value::as_str);
+    let file_path = raw_input.get("file_path").and_then(Value::as_str);
     let pattern = raw_input.get("pattern").and_then(Value::as_str);
     let command = raw_input.get("command").and_then(Value::as_str);
 
     match tool_name {
-        "readFile" => path
+        "read_file" => file_path
             .map(|p| format!("Read `{p}`"))
             .unwrap_or_else(|| display.to_string()),
-        "writeFile" => path
+        "write_file" => file_path
             .map(|p| format!("Write `{p}`"))
             .unwrap_or_else(|| display.to_string()),
-        "listDirectory" => path
+        "edit" => file_path
+            .map(|p| format!("Edit `{p}`"))
+            .unwrap_or_else(|| display.to_string()),
+        "list_directory" => path
             .map(|p| format!("List `{p}`"))
             .unwrap_or_else(|| display.to_string()),
-        "searchFileContents" => pattern
+        "grep_search" => pattern
             .map(|p| format!("Search `{p}`"))
             .unwrap_or_else(|| display.to_string()),
-        "runShellCommand" => command
+        "run_shell_command" => command
             .map(|c| format!("Run `{}`", first_line(c)))
             .unwrap_or_else(|| display.to_string()),
         "think" => "Think".to_string(),
@@ -216,7 +220,12 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
 /// v1: only the obvious `path` arg on filesystem tools. Bifrost JSON
 /// outputs may carry locations, but parsing them is out of scope here.
 pub(super) fn tool_locations(tool_name: &str, raw_input: &Value) -> Vec<ToolCallLocation> {
-    if matches!(tool_name, "readFile" | "writeFile" | "listDirectory")
+    if matches!(tool_name, "read_file" | "write_file" | "edit")
+        && let Some(path) = raw_input.get("file_path").and_then(Value::as_str)
+    {
+        return vec![ToolCallLocation::new(PathBuf::from(path))];
+    }
+    if matches!(tool_name, "list_directory")
         && let Some(path) = raw_input.get("path").and_then(Value::as_str)
     {
         return vec![ToolCallLocation::new(PathBuf::from(path))];
@@ -291,32 +300,44 @@ mod tests {
 
     #[test]
     fn read_file_title_shows_path() {
-        let title = tool_title("readFile", &json!({"path": "src/lib.rs"}));
+        let title = tool_title("read_file", &json!({"file_path": "src/lib.rs"}));
         assert_eq!(title, "Read `src/lib.rs`");
     }
 
     #[test]
     fn write_file_title_shows_path() {
-        let title = tool_title("writeFile", &json!({"path": "a/b.txt", "content": "x"}));
+        let title = tool_title(
+            "write_file",
+            &json!({"file_path": "a/b.txt", "content": "x"}),
+        );
         assert_eq!(title, "Write `a/b.txt`");
     }
 
     #[test]
+    fn edit_title_shows_path() {
+        let title = tool_title(
+            "edit",
+            &json!({"file_path": "a/b.txt", "old_string": "x", "new_string": "y"}),
+        );
+        assert_eq!(title, "Edit `a/b.txt`");
+    }
+
+    #[test]
     fn list_directory_title_shows_path() {
-        let title = tool_title("listDirectory", &json!({"path": "src"}));
+        let title = tool_title("list_directory", &json!({"path": "src"}));
         assert_eq!(title, "List `src`");
     }
 
     #[test]
     fn search_title_shows_pattern() {
-        let title = tool_title("searchFileContents", &json!({"pattern": "TODO"}));
+        let title = tool_title("grep_search", &json!({"pattern": "TODO"}));
         assert_eq!(title, "Search `TODO`");
     }
 
     #[test]
     fn run_shell_title_shows_first_line() {
         let title = tool_title(
-            "runShellCommand",
+            "run_shell_command",
             &json!({"command": "cargo test\n# extra junk"}),
         );
         assert_eq!(title, "Run `cargo test`");
@@ -345,7 +366,7 @@ mod tests {
 
     #[test]
     fn missing_path_uses_display_name() {
-        let title = tool_title("readFile", &json!({}));
+        let title = tool_title("read_file", &json!({}));
         assert_eq!(title, "Reading file");
     }
 
@@ -376,23 +397,30 @@ mod tests {
 
     #[test]
     fn locations_include_path_for_filesystem_tools() {
-        let locs = tool_locations("readFile", &json!({"path": "src/lib.rs"}));
+        let locs = tool_locations("read_file", &json!({"file_path": "src/lib.rs"}));
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, PathBuf::from("src/lib.rs"));
 
-        let locs = tool_locations("writeFile", &json!({"path": "a.txt", "content": ""}));
+        let locs = tool_locations("write_file", &json!({"file_path": "a.txt", "content": ""}));
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, PathBuf::from("a.txt"));
 
-        let locs = tool_locations("listDirectory", &json!({"path": "."}));
+        let locs = tool_locations(
+            "edit",
+            &json!({"file_path": "b.txt", "old_string": "x", "new_string": "y"}),
+        );
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, PathBuf::from("b.txt"));
+
+        let locs = tool_locations("list_directory", &json!({"path": "."}));
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0].path, PathBuf::from("."));
     }
 
     #[test]
     fn locations_empty_for_non_filesystem_tools() {
-        assert!(tool_locations("runShellCommand", &json!({"command": "ls"})).is_empty());
-        assert!(tool_locations("searchFileContents", &json!({"pattern": "x"})).is_empty());
+        assert!(tool_locations("run_shell_command", &json!({"command": "ls"})).is_empty());
+        assert!(tool_locations("grep_search", &json!({"pattern": "x"})).is_empty());
         assert!(tool_locations("think", &json!({"thought": "..."})).is_empty());
         assert!(tool_locations("search_symbols", &json!({"patterns": ["x"]})).is_empty());
     }
@@ -405,12 +433,12 @@ mod tests {
         // cap in practice.
         let cmd = "echo ".to_string() + &"a".repeat(MAX_TOOL_TITLE_CHARS);
         let reason =
-            rejection_for_oversized_title("runShellCommand", &json!({"command": cmd.clone()}));
+            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd.clone()}));
         assert!(reason.is_some(), "title >1024 chars must be rejected");
 
         let cmd_short = "echo hello".to_string();
         let reason_short =
-            rejection_for_oversized_title("runShellCommand", &json!({"command": cmd_short}));
+            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd_short}));
         assert!(reason_short.is_none(), "short title must pass");
     }
 
@@ -421,13 +449,13 @@ mod tests {
         let chrome = "Read ``".chars().count();
         let path_len = MAX_TOOL_TITLE_CHARS - chrome;
         let path = "a".repeat(path_len);
-        let title = tool_title("readFile", &json!({"path": path.clone()}));
+        let title = tool_title("read_file", &json!({"file_path": path.clone()}));
         assert_eq!(title.chars().count(), MAX_TOOL_TITLE_CHARS);
-        assert!(rejection_for_oversized_title("readFile", &json!({"path": path})).is_none());
+        assert!(rejection_for_oversized_title("read_file", &json!({"file_path": path})).is_none());
 
         let path_over = "a".repeat(path_len + 1);
         assert!(
-            rejection_for_oversized_title("readFile", &json!({"path": path_over})).is_some(),
+            rejection_for_oversized_title("read_file", &json!({"file_path": path_over})).is_some(),
             "title MAX+1 chars must be rejected"
         );
     }
@@ -439,7 +467,7 @@ mod tests {
         // message has to follow.
         let cmd = "echo ".to_string() + &"a".repeat(MAX_TOOL_TITLE_CHARS);
         let reason =
-            rejection_for_oversized_title("runShellCommand", &json!({"command": cmd})).unwrap();
+            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd})).unwrap();
         assert!(
             reason.contains(&MAX_TOOL_TITLE_CHARS.to_string()),
             "rejection message must quote the cap; got: {reason}"
@@ -455,7 +483,7 @@ mod tests {
         let huge = "x".repeat(MAX_TOOL_TITLE_CHARS * 2);
         let card = rejected_initial_tool_call(
             "tc1",
-            "runShellCommand",
+            "run_shell_command",
             ToolKind::Execute,
             &json!({"command": huge}),
         );

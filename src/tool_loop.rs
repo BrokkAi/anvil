@@ -40,7 +40,7 @@ struct PermissionGrant {
 
 fn permission_options(tool_name: &str) -> Vec<PermissionOption> {
     let mut options = Vec::with_capacity(4);
-    if tool_name == "runShellCommand" {
+    if tool_name == "run_shell_command" {
         options.push(PermissionOption::new(
             PermissionOptionId::new("allow"),
             "Allow in sandbox",
@@ -89,7 +89,7 @@ fn permission_grant_for_selection(
             allow_always: false,
             sandbox_policy_override: None,
         }),
-        "allow_outside_sandbox" if tool_name == "runShellCommand" => Ok(PermissionGrant {
+        "allow_outside_sandbox" if tool_name == "run_shell_command" => Ok(PermissionGrant {
             allow_always: false,
             sandbox_policy_override: Some(SandboxPolicy::None),
         }),
@@ -236,7 +236,7 @@ fn pure_gate_decision(
 }
 
 fn always_allow_key(tool_name: &str, raw_input: &Value, cwd: &Path) -> String {
-    if tool_name == "runShellCommand"
+    if tool_name == "run_shell_command"
         && let Some(command) = raw_input.get("command").and_then(Value::as_str)
     {
         return serde_json::json!({
@@ -558,17 +558,18 @@ pub(crate) async fn run(
                                 )),
                             );
 
-                            // Capture pre-write content so writeFile gets a
-                            // real Diff card. Outer None == not a writeFile,
+                            // Capture pre-write content so write/edit tools get a
+                            // real Diff card. Outer None == not an edit tool,
                             // or prior content unavailable (binary, missing
                             // parent dir we can't resolve, etc) -- in either
                             // case we fall back to text content. Inner None
                             // (per ACP `Diff.old_text` schema) == new file.
-                            let pre_write: Option<Option<String>> = if tool_name == "writeFile" {
-                                capture_pre_write_text(registry.cwd(), &parsed_input)
-                            } else {
-                                None
-                            };
+                            let pre_write: Option<Option<String>> =
+                                if matches!(tool_name.as_str(), "write_file" | "edit") {
+                                    capture_pre_write_text(registry.cwd(), &parsed_input)
+                                } else {
+                                    None
+                                };
 
                             // Resolve the sandbox tier from the session's permission mode.
                             // If the session disappeared between gate-accept and exec
@@ -644,7 +645,7 @@ pub(crate) async fn run(
                             };
 
                             // Build the terminal update -- Completed (with a
-                            // Diff for writeFile when we have prior content)
+                            // Diff for write/edit tools when we have prior content)
                             // or Failed (for tool-reported errors).
                             let update = if exec.failed {
                                 announce::update_failed(
@@ -653,8 +654,9 @@ pub(crate) async fn run(
                                     Some(Value::String(exec.output.clone())),
                                 )
                             } else {
-                                let diff = pre_write
-                                    .and_then(|prior| build_write_diff(&parsed_input, prior));
+                                let diff = pre_write.and_then(|prior| {
+                                    build_editing_diff(&tool_name, &parsed_input, prior)
+                                });
                                 announce::update_completed(&call.id, &exec.output, diff)
                             };
                             maybe_send_session_update(
@@ -1069,7 +1071,7 @@ fn send_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: Sess
     }
 }
 
-/// Read the existing file content for a `writeFile` call so the diff
+/// Read the existing file content for a file-editing call so the diff
 /// card can show before/after text.
 ///
 /// Returns `Some(Some(text))` when we read the prior content, `Some(None)`
@@ -1079,7 +1081,10 @@ fn send_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: Sess
 /// against cwd. The outer `None` tells the caller to fall back to text
 /// content for the card.
 fn capture_pre_write_text(cwd: &Path, parsed_input: &Value) -> Option<Option<String>> {
-    let path = parsed_input.get("path").and_then(Value::as_str)?;
+    let path = parsed_input
+        .get("file_path")
+        .or_else(|| parsed_input.get("path"))
+        .and_then(Value::as_str)?;
     let resolved = safe_resolve_for_write(cwd, path).ok()?;
     if !resolved.exists() {
         return Some(None);
@@ -1090,15 +1095,40 @@ fn capture_pre_write_text(cwd: &Path, parsed_input: &Value) -> Option<Option<Str
     }
 }
 
-/// Assemble a `Diff` block for a successful `writeFile` from the parsed
+/// Assemble a `Diff` block for a successful write/edit call from the parsed
 /// args plus the captured prior content. Returns `None` if we couldn't
 /// pull the path/content (in which case the caller falls back to text).
-fn build_write_diff(parsed_input: &Value, prior: Option<String>) -> Option<Diff> {
-    let path = parsed_input.get("path").and_then(Value::as_str)?;
-    let new_text = parsed_input
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+fn build_editing_diff(
+    tool_name: &str,
+    parsed_input: &Value,
+    prior: Option<String>,
+) -> Option<Diff> {
+    let path = parsed_input
+        .get("file_path")
+        .or_else(|| parsed_input.get("path"))
+        .and_then(Value::as_str)?;
+    let new_text = match tool_name {
+        "write_file" => parsed_input
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "edit" => {
+            let prior_text = prior.as_ref()?;
+            let old = parsed_input.get("old_string").and_then(Value::as_str)?;
+            let new = parsed_input.get("new_string").and_then(Value::as_str)?;
+            let replace_all = parsed_input
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if replace_all {
+                prior_text.replace(old, new)
+            } else {
+                prior_text.replacen(old, new, 1)
+            }
+        }
+        _ => return None,
+    };
     let mut diff = Diff::new(PathBuf::from(path), new_text);
     diff.old_text = prior;
     Some(diff)
@@ -1193,7 +1223,7 @@ mod tests {
     #[test]
     fn default_prompts_for_edit_without_always_allow() {
         assert_eq!(
-            decide(PermissionMode::Default, ToolKind::Edit, "writeFile", false),
+            decide(PermissionMode::Default, ToolKind::Edit, "write_file", false),
             PureGateDecision::Prompt
         );
     }
@@ -1201,7 +1231,7 @@ mod tests {
     #[test]
     fn default_uses_always_allow_for_edit() {
         assert_eq!(
-            decide(PermissionMode::Default, ToolKind::Edit, "writeFile", true),
+            decide(PermissionMode::Default, ToolKind::Edit, "write_file", true),
             PureGateDecision::Allow
         );
     }
@@ -1212,7 +1242,7 @@ mod tests {
             decide(
                 PermissionMode::AcceptEdits,
                 ToolKind::Edit,
-                "writeFile",
+                "write_file",
                 false
             ),
             PureGateDecision::Allow
@@ -1225,7 +1255,7 @@ mod tests {
             decide(
                 PermissionMode::AcceptEdits,
                 ToolKind::Execute,
-                "runShellCommand",
+                "run_shell_command",
                 false
             ),
             PureGateDecision::Prompt
@@ -1238,9 +1268,9 @@ mod tests {
         // may trust a positive lookup without granting every shell command.
         for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert_eq!(
-                decide(mode, ToolKind::Execute, "runShellCommand", true),
+                decide(mode, ToolKind::Execute, "run_shell_command", true),
                 PureGateDecision::Allow,
-                "runShellCommand should honor scoped approval in {:?}",
+                "run_shell_command should honor scoped approval in {:?}",
                 mode
             );
         }
@@ -1248,7 +1278,7 @@ mod tests {
 
     #[test]
     fn shell_permission_prompt_includes_explicit_outside_sandbox_choice() {
-        let options = permission_options("runShellCommand");
+        let options = permission_options("run_shell_command");
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -1267,7 +1297,7 @@ mod tests {
 
     #[test]
     fn shell_allow_always_choice_maps_to_sandboxed_session_approval() {
-        let grant = permission_grant_for_selection("runShellCommand", "allow_always")
+        let grant = permission_grant_for_selection("run_shell_command", "allow_always")
             .expect("shell sticky sandbox approval should be accepted");
 
         assert_eq!(
@@ -1283,22 +1313,22 @@ mod tests {
     fn shell_always_allow_key_is_command_and_cwd_scoped() {
         let cwd = Path::new("/tmp/project");
         let first = always_allow_key(
-            "runShellCommand",
-            &serde_json::json!({"command": "cargo test", "timeoutSeconds": 60}),
+            "run_shell_command",
+            &serde_json::json!({"command": "cargo test", "timeout": 60}),
             cwd,
         );
         let same_without_timeout = always_allow_key(
-            "runShellCommand",
+            "run_shell_command",
             &serde_json::json!({"command": "cargo test"}),
             cwd,
         );
         let different_command = always_allow_key(
-            "runShellCommand",
+            "run_shell_command",
             &serde_json::json!({"command": "cargo check"}),
             cwd,
         );
         let different_cwd = always_allow_key(
-            "runShellCommand",
+            "run_shell_command",
             &serde_json::json!({"command": "cargo test"}),
             Path::new("/tmp/other"),
         );
@@ -1310,7 +1340,7 @@ mod tests {
 
     #[test]
     fn shell_outside_sandbox_choice_maps_to_policy_override() {
-        let grant = permission_grant_for_selection("runShellCommand", "allow_outside_sandbox")
+        let grant = permission_grant_for_selection("run_shell_command", "allow_outside_sandbox")
             .expect("shell override should be accepted");
 
         assert_eq!(
@@ -1378,7 +1408,7 @@ mod tests {
 
     #[test]
     fn non_shell_permission_prompt_keeps_sticky_allow_and_no_override() {
-        let options = permission_options("writeFile");
+        let options = permission_options("write_file");
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -1387,13 +1417,13 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                ("allow_always", "Always allow writeFile"),
+                ("allow_always", "Always allow write_file"),
                 ("allow", "Allow"),
                 ("reject", "Reject"),
             ]
         );
 
-        let grant = permission_grant_for_selection("writeFile", "allow_always")
+        let grant = permission_grant_for_selection("write_file", "allow_always")
             .expect("non-shell sticky allow should still be accepted");
         assert_eq!(
             grant,

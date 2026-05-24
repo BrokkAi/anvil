@@ -44,27 +44,32 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Thinking",
     },
     ToolMeta {
-        name: "readFile",
+        name: "read_file",
         kind: ToolKind::Read,
         display_name: "Reading file",
     },
     ToolMeta {
-        name: "writeFile",
+        name: "write_file",
         kind: ToolKind::Edit,
         display_name: "Writing file",
     },
     ToolMeta {
-        name: "listDirectory",
+        name: "edit",
+        kind: ToolKind::Edit,
+        display_name: "Editing file",
+    },
+    ToolMeta {
+        name: "list_directory",
         kind: ToolKind::Read,
         display_name: "Listing directory",
     },
     ToolMeta {
-        name: "searchFileContents",
+        name: "grep_search",
         kind: ToolKind::Search,
         display_name: "Searching file contents",
     },
     ToolMeta {
-        name: "runShellCommand",
+        name: "run_shell_command",
         kind: ToolKind::Execute,
         display_name: "Running shell command",
     },
@@ -242,11 +247,12 @@ pub(crate) fn is_known_tool(name: &str) -> bool {
 #[cfg(test)]
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "think",
-    "readFile",
-    "writeFile",
-    "listDirectory",
-    "searchFileContents",
-    "runShellCommand",
+    "read_file",
+    "write_file",
+    "edit",
+    "list_directory",
+    "grep_search",
+    "run_shell_command",
 ];
 
 /// Unified tool registry: filesystem tools + shell + think + (optionally)
@@ -343,76 +349,113 @@ impl ToolRegistry {
                 }),
             ),
             tool_def(
-                "readFile",
-                "Read the contents of a file. Path is relative to the working directory.",
+                "read_file",
+                "Reads and returns the content of a specified text file. Paths may be relative to the working directory or absolute paths inside it. For text files, it can read specific line ranges.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "path": {
+                        "file_path": {
                             "type": "string",
-                            "description": "Relative path to the file to read."
+                            "description": "Path to the file to read. Relative paths are resolved against the working directory; absolute paths must remain inside it."
+                        },
+                        "offset": {
+                            "type": "number",
+                            "description": "Optional 0-based line number to start reading from."
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Optional maximum number of lines to read."
                         }
                     },
-                    "required": ["path"]
+                    "required": ["file_path"]
                 }),
             ),
             tool_def(
-                "writeFile",
-                "Write content to a file, creating it if it does not exist. Path is relative to the working directory.",
+                "write_file",
+                "Writes content to a specified file in the local filesystem. Paths may be relative to the working directory or absolute paths inside it.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "path": {
+                        "file_path": {
                             "type": "string",
-                            "description": "Relative path to the file to write."
+                            "description": "Path to the file to write. Relative paths are resolved against the working directory; absolute paths must remain inside it."
                         },
                         "content": {
                             "type": "string",
                             "description": "Content to write to the file."
                         }
                     },
-                    "required": ["path", "content"]
+                    "required": ["file_path", "content"]
                 }),
             ),
             tool_def(
-                "listDirectory",
-                "List files and directories at the given path. Path is relative to the working directory.",
+                "edit",
+                "Replaces exact literal text within a file. By default, replaces a single occurrence. Set `replace_all` to true to replace every matching occurrence.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the file to modify. Relative paths are resolved against the working directory; absolute paths must remain inside it."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "The exact literal text to replace, including whitespace and indentation."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "The exact literal text to replace `old_string` with."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace all occurrences of old_string. Defaults to false."
+                        }
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }),
+            ),
+            tool_def(
+                "list_directory",
+                "Lists the names of files and subdirectories directly within a specified directory path. Paths may be relative to the working directory or absolute paths inside it.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative path to the directory to list. Use '.' for the working directory root."
+                            "description": "Path to the directory to list. Use '.' for the working directory root. Absolute paths must remain inside the working directory."
                         }
                     },
                     "required": ["path"]
                 }),
             ),
             tool_def(
-                "searchFileContents",
-                "Search for a regex pattern across files in the working directory. Returns matching lines with file paths and line numbers.",
+                "grep_search",
+                "A powerful search tool for finding regex patterns in files under the working directory.",
                 json!({
                     "type": "object",
                     "properties": {
                         "pattern": {
                             "type": "string",
-                            "description": "Regex pattern to search for."
+                            "description": "The regular expression pattern to search for in file contents."
                         },
                         "glob": {
                             "type": "string",
-                            "description": "Optional glob to filter files (e.g. '*.rs', '**/*.java'). Defaults to all files."
+                            "description": "Optional glob pattern to filter files (e.g. '*.rs', '**/*.java')."
                         },
-                        "maxResults": {
-                            "type": "integer",
-                            "default": 50,
-                            "description": "Maximum number of matching lines to return."
+                        "path": {
+                            "type": "string",
+                            "description": "Optional file or directory to search in. Relative paths are resolved against the working directory; absolute paths must remain inside it. Defaults to the working directory."
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Optional limit on matching lines. Defaults to 50."
                         }
                     },
                     "required": ["pattern"]
                 }),
             ),
             tool_def(
-                "runShellCommand",
+                "run_shell_command",
                 "Execute a shell command in the working directory. Returns stdout and stderr. Use for build, test, git, or other CLI operations.",
                 json!({
                     "type": "object",
@@ -421,10 +464,17 @@ impl ToolRegistry {
                             "type": "string",
                             "description": "The shell command to execute (passed to sh -c)."
                         },
-                        "timeoutSeconds": {
-                            "type": "integer",
-                            "default": 60,
-                            "description": "Maximum execution time in seconds."
+                        "timeout": {
+                            "type": "number",
+                            "description": "Optional timeout in milliseconds."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Brief description of the command for the user. Accepted for compatibility and not used for execution."
+                        },
+                        "directory": {
+                            "type": "string",
+                            "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
                         }
                     },
                     "required": ["command"]
@@ -524,7 +574,7 @@ impl ToolRegistry {
     /// intentional -- external crates must not be able to dispatch tools
     /// at all.
     ///
-    /// `policy` controls the OS-level sandbox applied to `runShellCommand`.
+    /// `policy` controls the OS-level sandbox applied to `run_shell_command`.
     /// Other tools ignore it (their own seams, e.g. `safe_resolve_for_write`,
     /// enforce path containment).
     pub(crate) async fn execute(
@@ -538,7 +588,7 @@ impl ToolRegistry {
     }
 
     /// Same as `execute`, but lets the caller attach a one-time shell audit
-    /// marker for `runShellCommand`. Other tools ignore the extra flag.
+    /// marker for `run_shell_command`. Other tools ignore the extra flag.
     pub(crate) async fn execute_with_shell_notice(
         &self,
         name: &str,
@@ -554,36 +604,86 @@ impl ToolRegistry {
                     output: format!("Thought noted: {thought}"),
                 }
             }
-            "readFile" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                filesystem::read_file(&self.cwd, path)
+            "read_file" => {
+                let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+                let offset = args
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                filesystem::read_file(&self.cwd, path, offset, limit)
             }
-            "writeFile" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            "write_file" => {
+                let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 filesystem::write_file(&self.cwd, path, content)
             }
-            "listDirectory" => {
+            "edit" => {
+                let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+                let old = args
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new = args
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                filesystem::edit_file(&self.cwd, path, old, new, replace_all)
+            }
+            "list_directory" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 filesystem::list_directory(&self.cwd, path)
             }
-            "searchFileContents" => {
+            "grep_search" => {
                 let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
                 let glob = args.get("glob").and_then(|v| v.as_str());
-                let max_results = args
-                    .get("maxResults")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as usize;
-                filesystem::search_file_contents(&self.cwd, pattern, glob, max_results)
+                let max_results = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let path = args.get("path").and_then(|v| v.as_str());
+                filesystem::search_file_contents(&self.cwd, pattern, glob, path, max_results)
             }
-            "runShellCommand" => {
+            "run_shell_command" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                let timeout = args
-                    .get("timeoutSeconds")
+                let timeout_seconds = args
+                    .get("timeout")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(60);
-                shell::run_shell_command(&self.cwd, command, timeout, policy, outside_sandbox_once)
-                    .await
+                    .map(|ms| ms.saturating_add(999) / 1000)
+                    .unwrap_or(60)
+                    .max(1);
+                let command_cwd = match args.get("directory").and_then(|v| v.as_str()) {
+                    Some(directory) if !directory.trim().is_empty() => {
+                        match safe_resolve(&self.cwd, directory) {
+                            Ok(path) if path.is_dir() => path,
+                            Ok(_) => {
+                                return ToolResult {
+                                    status: ToolStatus::RequestError,
+                                    output: format!("Directory is not a directory: {directory}"),
+                                };
+                            }
+                            Err(e) => {
+                                return ToolResult {
+                                    status: ToolStatus::RequestError,
+                                    output: e,
+                                };
+                            }
+                        }
+                    }
+                    _ => self.cwd.clone(),
+                };
+                shell::run_shell_command(
+                    &command_cwd,
+                    command,
+                    timeout_seconds,
+                    policy,
+                    outside_sandbox_once,
+                )
+                .await
             }
             "activate_skill" => self.execute_activate_skill(args).await,
             // Any name not handled above is delegated to the bifrost

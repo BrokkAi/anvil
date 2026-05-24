@@ -436,7 +436,7 @@ pub fn read_skill_body(path: &Path) -> std::io::Result<String> {
 /// recommendation.
 ///
 /// Paths are normalized to POSIX-style forward slashes regardless of
-/// host OS. The LLM sees these paths and passes them back to `readFile`,
+/// host OS. The LLM sees these paths and passes them back to `read_file`,
 /// and the spec's examples use `/`; consistent separators across hosts
 /// avoid teaching the model platform-specific path syntax.
 pub fn list_bundled_resources(skill_dir: &Path) -> Vec<String> {
