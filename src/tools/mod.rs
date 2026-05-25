@@ -241,17 +241,16 @@ pub(crate) fn is_known_tool(name: &str) -> bool {
     tool_meta(name).is_some()
 }
 
-/// Built-in tool names handled by the inline `match` in
-/// `ToolRegistry::execute`. Used by tests to keep the metadata table
-/// in sync with the actual builtin dispatch.
+/// Built-in tool names that should be surfaced to the model via
+/// `tool_definitions()`. This is narrower than the inline `match` in
+/// `ToolRegistry::execute`: some compatibility tools remain executable
+/// but intentionally hidden from the advertised catalog.
 #[cfg(test)]
-const BUILTIN_TOOL_NAMES: &[&str] = &[
+const ADVERTISED_BUILTIN_TOOL_NAMES: &[&str] = &[
     "think",
-    "read_file",
     "write_file",
     "edit",
     "list_directory",
-    "grep_search",
     "run_shell_command",
 ];
 
@@ -349,28 +348,6 @@ impl ToolRegistry {
                 }),
             ),
             tool_def(
-                "read_file",
-                "Reads and returns the content of a specified text file. Paths may be relative to the working directory or absolute paths inside it. For text files, it can read specific line ranges.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "Path to the file to read. Relative paths are resolved against the working directory; absolute paths must remain inside it."
-                        },
-                        "offset": {
-                            "type": "number",
-                            "description": "Optional 0-based line number to start reading from."
-                        },
-                        "limit": {
-                            "type": "number",
-                            "description": "Optional maximum number of lines to read."
-                        }
-                    },
-                    "required": ["file_path"]
-                }),
-            ),
-            tool_def(
                 "write_file",
                 "Writes content to a specified file in the local filesystem. Paths may be relative to the working directory or absolute paths inside it.",
                 json!({
@@ -426,32 +403,6 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["path"]
-                }),
-            ),
-            tool_def(
-                "grep_search",
-                "A powerful search tool for finding regex patterns in files under the working directory.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "The regular expression pattern to search for in file contents."
-                        },
-                        "glob": {
-                            "type": "string",
-                            "description": "Optional glob pattern to filter files (e.g. '*.rs', '**/*.java')."
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Optional file or directory to search in. Relative paths are resolved against the working directory; absolute paths must remain inside it. Defaults to the working directory."
-                        },
-                        "limit": {
-                            "type": "number",
-                            "description": "Optional limit on matching lines. Defaults to 50."
-                        }
-                    },
-                    "required": ["pattern"]
                 }),
             ),
             tool_def(
@@ -1103,7 +1054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_tools_have_metadata_and_are_advertised() {
+    async fn advertised_builtin_tools_have_metadata_and_only_expected_tools_are_exposed() {
         let registry = ToolRegistry {
             cwd: PathBuf::from("/tmp"),
             bifrost: None,
@@ -1117,7 +1068,7 @@ mod tests {
             .map(|d| d.function.name)
             .collect();
 
-        for name in BUILTIN_TOOL_NAMES {
+        for name in ADVERTISED_BUILTIN_TOOL_NAMES {
             assert!(
                 TOOLS.iter().any(|t| t.name == *name),
                 "built-in tool '{name}' is missing from the TOOLS metadata table"
@@ -1136,6 +1087,15 @@ mod tests {
                 "tool_definitions() advertises '{advertised_name}' but it is missing from the TOOLS metadata table"
             );
         }
+
+        assert!(
+            !advertised.iter().any(|n| n == "read_file"),
+            "read_file should remain executable but hidden from the advertised tool catalog"
+        );
+        assert!(
+            !advertised.iter().any(|n| n == "grep_search"),
+            "grep_search should remain executable but hidden from the advertised tool catalog"
+        );
     }
 
     /// `task` is gated on having at least one discovered subagent.
