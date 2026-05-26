@@ -1149,9 +1149,8 @@ pub async fn run_agent(
                 {
                     Ok(renamed_title) => {
                         if renamed_title.is_some() {
-                            if let Some(metadata) = sessions_prompt
-                                .session_metadata(&session_id)
-                                .await
+                            if let Some(metadata) =
+                                sessions_prompt.session_metadata(&session_id).await
                             {
                                 send_session_info_update(
                                     &cx,
