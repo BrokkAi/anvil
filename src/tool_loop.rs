@@ -257,13 +257,13 @@ fn always_allow_key(tool_name: &str, raw_input: &Value, cwd: &Path) -> String {
 /// `ReadOnly` and drop the override.
 fn resolve_execution_policy(
     permission_mode: Option<PermissionMode>,
-    sandbox_disabled: bool,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     sandbox_policy_override: Option<SandboxPolicy>,
 ) -> (SandboxPolicy, bool) {
     match (sandbox_policy_override, permission_mode) {
         (Some(policy), Some(_)) => (policy, true),
         (Some(_), None) => (SandboxPolicy::ReadOnly, false),
-        (None, Some(mode)) => (SandboxPolicy::resolve(mode, sandbox_disabled), false),
+        (None, Some(mode)) => (SandboxPolicy::resolve(mode, sandbox_mode), false),
         (None, None) => (SandboxPolicy::ReadOnly, false),
     }
 }
@@ -576,10 +576,7 @@ pub(crate) async fn run(
                             // (race), fail safe to ReadOnly: the gate already cleared
                             // the call but we no longer trust the mode lookup.
                             let permission_mode = sessions.permission_mode(&session_id).await;
-                            let sandbox_disabled = sessions
-                                .sandbox_disabled(&session_id)
-                                .await
-                                .unwrap_or(false);
+                            let sandbox_mode = sessions.sandbox_mode(&session_id).await.flatten();
                             if permission_mode.is_none() {
                                 tracing::warn!(
                                     session_id,
@@ -590,7 +587,7 @@ pub(crate) async fn run(
                             }
                             let (policy, outside_sandbox_once) = resolve_execution_policy(
                                 permission_mode,
-                                sandbox_disabled,
+                                sandbox_mode,
                                 sandbox_policy_override,
                             );
 
@@ -640,6 +637,7 @@ pub(crate) async fn run(
                                     parsed_input.clone(),
                                     policy,
                                     outside_sandbox_once,
+                                    sandbox_mode,
                                 )
                                 .await
                             };
@@ -866,9 +864,10 @@ async fn execute_tool(
     args: Value,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
 ) -> ToolExecution {
     let result = registry
-        .execute_with_shell_notice(tool_name, args, policy, outside_sandbox_once)
+        .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
         .await;
     let (status_prefix, failed) = match result.status {
         ToolStatus::Success => ("", false),
@@ -1355,7 +1354,7 @@ mod tests {
     #[test]
     fn shell_outside_sandbox_choice_is_dropped_if_session_is_missing() {
         assert_eq!(
-            resolve_execution_policy(None, false, Some(SandboxPolicy::None)),
+            resolve_execution_policy(None, None, Some(SandboxPolicy::None)),
             (SandboxPolicy::ReadOnly, false)
         );
     }
@@ -1365,7 +1364,7 @@ mod tests {
         assert_eq!(
             resolve_execution_policy(
                 Some(PermissionMode::Default),
-                false,
+                None,
                 Some(SandboxPolicy::None)
             ),
             (SandboxPolicy::None, true)
@@ -1373,33 +1372,39 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_disabled_flag_collapses_policy_to_none() {
-        // Without an override, `sandbox_disabled=true` returns `None`
+    fn sandbox_mode_off_collapses_policy_to_none() {
+        use crate::sandbox_backend::SandboxMode;
+        // Without an override, `sandbox_mode=Some(Off)` returns `None`
         // regardless of the permission mode -- the per-call prompt still
         // fires upstream, but the OS sandbox is skipped.
         assert_eq!(
-            resolve_execution_policy(Some(PermissionMode::Default), true, None),
+            resolve_execution_policy(Some(PermissionMode::Default), Some(SandboxMode::Off), None),
             (SandboxPolicy::None, false)
         );
         assert_eq!(
-            resolve_execution_policy(Some(PermissionMode::AcceptEdits), true, None),
+            resolve_execution_policy(
+                Some(PermissionMode::AcceptEdits),
+                Some(SandboxMode::Off),
+                None
+            ),
             (SandboxPolicy::None, false)
         );
         assert_eq!(
-            resolve_execution_policy(Some(PermissionMode::ReadOnly), true, None),
+            resolve_execution_policy(Some(PermissionMode::ReadOnly), Some(SandboxMode::Off), None),
             (SandboxPolicy::None, false)
         );
     }
 
     #[test]
-    fn sandbox_disabled_flag_is_ignored_when_override_present() {
+    fn sandbox_mode_is_ignored_when_override_present() {
+        use crate::sandbox_backend::SandboxMode;
         // A per-call override (the "Allow outside sandbox" choice) is
         // narrower than the session-wide flag, so it wins -- the override
         // path already carries `outside_sandbox_once = true`.
         assert_eq!(
             resolve_execution_policy(
                 Some(PermissionMode::Default),
-                true,
+                Some(SandboxMode::Off),
                 Some(SandboxPolicy::WorkspaceWrite)
             ),
             (SandboxPolicy::WorkspaceWrite, true)

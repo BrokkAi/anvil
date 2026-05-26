@@ -278,6 +278,54 @@ pub fn search_file_contents(
     search_path: Option<&str>,
     max_results: usize,
 ) -> ToolResult {
+    search_file_contents_with_backend(
+        cwd,
+        pattern,
+        glob_filter,
+        search_path,
+        max_results,
+        crate::sandbox_backend::global(),
+    )
+}
+
+pub fn search_file_contents_with_sandbox_mode(
+    cwd: &Path,
+    pattern: &str,
+    glob_filter: Option<&str>,
+    search_path: Option<&str>,
+    max_results: usize,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> ToolResult {
+    if sandbox_mode.is_none() {
+        return search_file_contents(cwd, pattern, glob_filter, search_path, max_results);
+    }
+    let backend = match crate::sandbox_backend::backend_for_mode(sandbox_mode) {
+        Ok(backend) => backend,
+        Err(e) => {
+            return ToolResult {
+                status: ToolStatus::InternalError,
+                output: format!("Failed to initialize sandbox backend: {e}"),
+            };
+        }
+    };
+    search_file_contents_with_backend(
+        cwd,
+        pattern,
+        glob_filter,
+        search_path,
+        max_results,
+        &backend,
+    )
+}
+
+fn search_file_contents_with_backend(
+    cwd: &Path,
+    pattern: &str,
+    glob_filter: Option<&str>,
+    search_path: Option<&str>,
+    max_results: usize,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> ToolResult {
     let root = match search_path {
         Some(path) if !path.trim().is_empty() => match safe_resolve(cwd, path) {
             Ok(p) => p,
@@ -291,10 +339,10 @@ pub fn search_file_contents(
         _ => cwd.to_path_buf(),
     };
     if root.is_file() {
-        return search_single_file(cwd, &root, pattern, max_results);
+        return search_single_file_with_backend(cwd, &root, pattern, max_results, backend);
     }
 
-    let outcome = match crate::sandbox_backend::global().search_file_contents(
+    let outcome = match backend.search_file_contents(
         &root,
         pattern,
         glob_filter,
@@ -323,6 +371,14 @@ pub fn search_file_contents(
         }
     };
 
+    format_search_outcome(pattern, max_results, outcome)
+}
+
+fn format_search_outcome(
+    pattern: &str,
+    max_results: usize,
+    outcome: brokk_acp_sandbox::SearchOutcome,
+) -> ToolResult {
     if outcome.matches.is_empty() {
         return ToolResult {
             status: ToolStatus::Success,
@@ -342,6 +398,116 @@ pub fn search_file_contents(
         status: ToolStatus::Success,
         output: lines.join("\n"),
     }
+}
+
+fn search_single_file_with_backend(
+    cwd: &Path,
+    path: &Path,
+    pattern: &str,
+    max_results: usize,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> ToolResult {
+    match backend {
+        crate::sandbox_backend::SandboxBackend::OsNative => {
+            search_single_file(cwd, path, pattern, max_results)
+        }
+        crate::sandbox_backend::SandboxBackend::WasmFallback(_) => {
+            search_single_file_in_wasm(cwd, path, pattern, max_results, backend)
+        }
+    }
+}
+
+fn search_single_file_in_wasm(
+    cwd: &Path,
+    path: &Path,
+    pattern: &str,
+    max_results: usize,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> ToolResult {
+    let Some(parent) = path.parent() else {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!(
+                "Cannot search '{}': file has no parent directory",
+                path.display()
+            ),
+        };
+    };
+    let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!(
+                "Cannot search '{}': file name is not valid UTF-8",
+                path.display()
+            ),
+        };
+    };
+    let Some(glob) = exact_simple_glob_for_file_name(file_name) else {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!(
+                "Cannot search '{}' in wasm sandbox: file names containing '*' are unsupported",
+                path.display()
+            ),
+        };
+    };
+
+    let mut outcome = match backend.search_file_contents(
+        parent,
+        pattern,
+        Some(&glob),
+        max_results as u64,
+        SEARCH_MAX_FILE_BYTES,
+        SEARCH_MAX_TOTAL_BYTES,
+    ) {
+        Ok(o) => o,
+        Err(brokk_acp_sandbox::SearchError::InvalidRegex(msg)) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: format!("Invalid regex '{}': {}", pattern, msg),
+            };
+        }
+        Err(brokk_acp_sandbox::SearchError::InvalidGlob(msg)) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: format!("Invalid glob: {msg}"),
+            };
+        }
+        Err(brokk_acp_sandbox::SearchError::Walk(msg)) => {
+            return ToolResult {
+                status: ToolStatus::InternalError,
+                output: msg,
+            };
+        }
+    };
+
+    let display_path = path.strip_prefix(cwd).unwrap_or(path).display().to_string();
+    for m in &mut outcome.matches {
+        if m.path == file_name {
+            m.path = display_path.clone();
+        }
+    }
+    format_search_outcome(pattern, max_results, outcome)
+}
+
+fn exact_simple_glob_for_file_name(name: &str) -> Option<String> {
+    if name.contains('*') {
+        return None;
+    }
+    let mut out = String::from("^");
+    for ch in name.chars() {
+        match ch {
+            // `compile_glob` in brokk_acp_sandbox escapes `.` and expands
+            // `*`, then treats the result as a regex. Escape all other regex
+            // metacharacters here so the generated glob remains exact.
+            '?' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    Some(out)
 }
 
 fn search_single_file(cwd: &Path, path: &Path, pattern: &str, max_results: usize) -> ToolResult {
@@ -853,6 +1019,30 @@ mod tests {
         assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
         assert!(r.output.contains("hit.txt:1: needle"));
         assert!(!r.output.contains("miss.txt"));
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn search_file_contents_scoped_file_uses_requested_wasm_backend() {
+        let cwd = fresh_tmp_dir("search-file-wasm");
+        std::fs::write(cwd.join("hit+one.txt"), "needle\n").unwrap();
+        std::fs::write(cwd.join("miss.txt"), "needle\n").unwrap();
+
+        let r = search_file_contents_with_sandbox_mode(
+            &cwd,
+            "needle",
+            None,
+            Some("hit+one.txt"),
+            100,
+            Some(crate::sandbox_backend::SandboxMode::Wasm),
+        );
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert!(r.output.contains("hit+one.txt:1: needle"));
+        assert!(
+            !r.output.contains("miss.txt"),
+            "wasm single-file search must stay scoped to the requested file, got: {}",
+            r.output
+        );
         std::fs::remove_dir_all(&cwd).ok();
     }
 

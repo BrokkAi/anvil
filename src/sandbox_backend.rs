@@ -1,20 +1,29 @@
 //! Dispatch layer between the native parsing fallback and the
 //! wasmtime-hosted sandbox.
 //!
-//! `SandboxBackend::Native` calls into `brokk_acp_sandbox` directly --
+//! The agent has exactly one sandbox strategy per process, chosen at
+//! startup and immutable for the lifetime of the process. The wasm
+//! sandbox and the OS sandbox (bwrap / seatbelt) are treated as
+//! **mutually exclusive strategies**, never layered on top of each
+//! other.
+//!
+//! `SandboxBackend::OsNative` calls into `brokk_acp_sandbox` directly --
 //! same process, full speed, but a panic or pathological input in a
 //! third-party parser (YAML bomb, ReDoS, etc.) takes down the agent.
 //!
-//! `SandboxBackend::Wasm` spawns a wasmtime store running the embedded
+//! `SandboxBackend::WasmFallback` spawns a wasmtime store running the embedded
 //! `brokk-acp-sandbox.wasm` artifact, exchanges newline-delimited JSON
 //! over the wasm module's stdin/stdout, and tears the store down after
 //! each batch. The host imposes a per-call fuel budget (CPU bound), a
 //! memory cap, and no preopens beyond stdio so the parser cannot touch
 //! the filesystem even if it tries.
 //!
-//! Switching between the two is controlled by `--no-wasm-sandbox` /
-//! `BROKK_ACP_NO_WASM_SANDBOX` at startup; the rest of the codebase
-//! sees only the trait object.
+//! Startup chooses the process default. Session code can then request an
+//! effective backend with [`backend_for_mode`] when a per-session
+//! `/setup sandbox os|wasm|off` override is in play.
+//!
+//! Per-session override (`/setup sandbox os|wasm|off`) controls both
+//! shell sandboxing and parsing backend for that session.
 //!
 //! Failure policy: the wasm backend treats sandbox infrastructure
 //! errors (wasmtime instantiation failure, fuel exhaustion, panic
@@ -32,6 +41,57 @@ use anyhow::{Context, Result, anyhow};
 use brokk_acp_sandbox::ParsedFrontmatter;
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// SandboxMode — per-session override that controls BOTH shell sandboxing
+// and parsing backend.
+// ---------------------------------------------------------------------------
+
+/// Per-session sandbox mode. Controls both shell command wrapping
+/// (OS sandbox) and parsing backend (wasm vs native).
+///
+/// Session-level override: `None` means use the global default;
+/// `Some(mode)` forces that mode for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// OS-level sandbox for shell commands (bwrap on Linux, seatbelt on
+    /// macOS), native parsing. The preferred strategy whenever the OS
+    /// sandbox is available -- it's the real security boundary and
+    /// running wasm for parsing on top of it is redundant overhead.
+    Os,
+    /// Wasmtime-hosted sandbox for parsing. Fallback strategy when no
+    /// OS-level sandbox is available (Windows, Linux without bwrap).
+    /// Shell commands run bare; parsing goes through the wasm guest so
+    /// YAML bombs, regex, and zip parsers at least have the wasm
+    /// linear-memory limit and fuel budget as a safety net.
+    Wasm,
+    /// No sandbox of any kind. Parsing runs natively in-process;
+    /// shell commands run without OS sandboxing. Use with caution --
+    /// intended for trusted environments or debugging.
+    Off,
+}
+
+impl SandboxMode {
+    /// Human-readable label for display in `/setup sandbox status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::Wasm => "wasm",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Get the default sandbox mode for the process, derived from the
+/// installed global backend.
+pub fn default_mode() -> SandboxMode {
+    match global() {
+        SandboxBackend::OsNative => SandboxMode::Os,
+        SandboxBackend::WasmFallback(_) => SandboxMode::Wasm,
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Process-wide singleton, initialized once in `main` from CLI flags
 /// and read by everything that needs to parse untrusted input
 /// (`skills`, `agents_md`, `session`, `tools/filesystem`). We keep a
@@ -42,6 +102,7 @@ use serde::{Deserialize, Serialize};
 /// same process to disagree about whether the sandbox is enabled,
 /// and (c) avoiding the global would touch dozens of constructors.
 static GLOBAL: OnceLock<SandboxBackend> = OnceLock::new();
+static SESSION_WASM: OnceLock<Result<Arc<WasmSandbox>, String>> = OnceLock::new();
 
 /// Install the process-wide backend. Called once from `main` before
 /// any session is created. Subsequent calls are a no-op (the first
@@ -51,38 +112,78 @@ pub fn install_global(backend: SandboxBackend) {
     let _ = GLOBAL.set(backend);
 }
 
-/// Access the global backend. Falls back to `Native` if `install_global`
+/// Access the global backend. Falls back to `OsNative` if `install_global`
 /// was never called (unit tests, `cargo run --example`, etc.). The
 /// fallback is deliberately silent: callers that need the wasm path
 /// to have actually started should check the install path in `main`.
 pub fn global() -> &'static SandboxBackend {
-    GLOBAL.get_or_init(|| SandboxBackend::Native)
+    GLOBAL.get_or_init(SandboxBackend::os_default)
 }
 
-/// Single entry point for parsers in this crate. Pick `Native` for
-/// raw speed, `Wasm` for isolated execution.
+/// Resolve a session-level override against the process default.
+pub fn resolve_mode(mode: Option<SandboxMode>) -> SandboxMode {
+    mode.unwrap_or_else(default_mode)
+}
+
+/// Return a parser backend for the effective session mode.
+///
+/// `None` means "use the process default". `Os` and `Off` both parse
+/// natively; they differ in shell sandbox policy, not parser dispatch.
+/// `Wasm` lazily initializes a shared wasmtime backend even when the
+/// process default is `OsNative`, so `/setup sandbox wasm` can force wasm
+/// parsing for a single session.
+pub fn backend_for_mode(mode: Option<SandboxMode>) -> Result<SandboxBackend, String> {
+    match mode {
+        None => Ok(global().clone()),
+        Some(SandboxMode::Os | SandboxMode::Off) => Ok(SandboxBackend::OsNative),
+        Some(SandboxMode::Wasm) => match global() {
+            SandboxBackend::WasmFallback(w) => Ok(SandboxBackend::WasmFallback(w.clone())),
+            SandboxBackend::OsNative => SESSION_WASM
+                .get_or_init(|| WasmSandbox::new().map(Arc::new).map_err(|e| e.to_string()))
+                .clone()
+                .map(SandboxBackend::WasmFallback),
+        },
+    }
+}
+
+/// Single entry point for parsers in this crate. Pick `OsNative` for
+/// raw speed, `WasmFallback` for isolated execution.
 #[derive(Clone)]
 pub enum SandboxBackend {
-    Native,
-    Wasm(Arc<WasmSandbox>),
+    /// OS-level sandbox (bwrap / seatbelt) + native parsing
+    OsNative,
+    /// Wasm parsing, no OS sandbox for shell commands
+    WasmFallback(Arc<WasmSandbox>),
 }
 
 impl SandboxBackend {
-    /// Construct the wasm backend, embedding the bytes produced by
-    /// `build.rs`. Returns the native fallback (with a logged warning)
-    /// if wasmtime initialization fails; this keeps a misconfigured
-    /// host from making the agent unusable.
-    pub fn wasm_or_native() -> Self {
-        match WasmSandbox::new() {
-            Ok(w) => Self::Wasm(Arc::new(w)),
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    "wasm sandbox failed to initialize; falling back to native parsers \
-                     (lose memory/crash/CPU isolation). Set BROKK_ACP_NO_WASM_SANDBOX=1 to \
-                     silence this warning if running natively is intentional."
-                );
-                Self::Native
+    /// Default: OS sandbox + native parsing (no wasm).
+    pub fn os_default() -> Self {
+        Self::OsNative
+    }
+
+    /// Detect the best strategy based on OS availability and user preference.
+    ///
+    /// - wasm disabled → `OsNative` (native parsing, regardless of OS sandbox availability)
+    /// - OS available → `OsNative` (OS sandbox + native parsing)
+    /// - OS unavailable → `WasmFallback` (wasm parsing)
+    ///
+    /// Falls back to `OsNative` with a warning if wasm initialization fails.
+    pub fn detect(os_available: bool, wasm_disabled: bool) -> Self {
+        if wasm_disabled || os_available {
+            Self::OsNative
+        } else {
+            match WasmSandbox::new() {
+                Ok(w) => Self::WasmFallback(Arc::new(w)),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "wasm sandbox failed to initialize; falling back to native parsers \
+                         (lose memory/crash/CPU isolation). Set ANVIL_NO_WASM_SANDBOX=1 to \
+                         silence this warning if running natively is intentional."
+                    );
+                    Self::OsNative
+                }
             }
         }
     }
@@ -91,8 +192,8 @@ impl SandboxBackend {
     /// direct library call; wasm dispatch sends one JSON-RPC request.
     pub fn parse_skill_frontmatter(&self, yaml: &str) -> Result<ParsedFrontmatter, String> {
         match self {
-            Self::Native => brokk_acp_sandbox::parse_frontmatter(yaml),
-            Self::Wasm(w) => w.parse_skill_frontmatter(yaml).map_err(|e| e.to_string()),
+            Self::OsNative => brokk_acp_sandbox::parse_frontmatter(yaml),
+            Self::WasmFallback(w) => w.parse_skill_frontmatter(yaml).map_err(|e| e.to_string()),
         }
     }
 
@@ -118,8 +219,8 @@ impl SandboxBackend {
         max_bytes: u64,
     ) -> std::io::Result<Option<String>> {
         match self {
-            Self::Native => read_file_bounded_native(path, max_bytes),
-            Self::Wasm(w) => w.read_file_bounded(path, max_bytes),
+            Self::OsNative => read_file_bounded_native(path, max_bytes),
+            Self::WasmFallback(w) => w.read_file_bounded(path, max_bytes),
         }
     }
 
@@ -145,10 +246,10 @@ impl SandboxBackend {
         max_entry_bytes: u64,
     ) -> std::io::Result<Option<String>> {
         match self {
-            Self::Native => {
+            Self::OsNative => {
                 read_zip_entry_text_native(zip_path, entry_name, max_archive_bytes, max_entry_bytes)
             }
-            Self::Wasm(w) => {
+            Self::WasmFallback(w) => {
                 w.read_zip_entry_text(zip_path, entry_name, max_archive_bytes, max_entry_bytes)
             }
         }
@@ -165,8 +266,8 @@ impl SandboxBackend {
         max_archive_bytes: u64,
     ) -> std::io::Result<Vec<String>> {
         match self {
-            Self::Native => list_zip_entry_names_native(zip_path, max_archive_bytes),
-            Self::Wasm(w) => w.list_zip_entry_names(zip_path, max_archive_bytes),
+            Self::OsNative => list_zip_entry_names_native(zip_path, max_archive_bytes),
+            Self::WasmFallback(w) => w.list_zip_entry_names(zip_path, max_archive_bytes),
         }
     }
 
@@ -185,14 +286,14 @@ impl SandboxBackend {
         max_total_bytes: u64,
     ) -> std::io::Result<std::collections::HashMap<String, String>> {
         match self {
-            Self::Native => read_zip_entries_with_prefix_native(
+            Self::OsNative => read_zip_entries_with_prefix_native(
                 zip_path,
                 prefix,
                 max_archive_bytes,
                 max_entry_bytes,
                 max_total_bytes,
             ),
-            Self::Wasm(w) => w.read_zip_entries_with_prefix(
+            Self::WasmFallback(w) => w.read_zip_entries_with_prefix(
                 zip_path,
                 prefix,
                 max_archive_bytes,
@@ -223,7 +324,7 @@ impl SandboxBackend {
         max_total_bytes: u64,
     ) -> Result<brokk_acp_sandbox::SearchOutcome, brokk_acp_sandbox::SearchError> {
         match self {
-            Self::Native => brokk_acp_sandbox::search_file_contents(
+            Self::OsNative => brokk_acp_sandbox::search_file_contents(
                 root,
                 pattern,
                 glob,
@@ -231,7 +332,7 @@ impl SandboxBackend {
                 max_file_bytes,
                 max_total_bytes,
             ),
-            Self::Wasm(w) => w.search_file_contents(
+            Self::WasmFallback(w) => w.search_file_contents(
                 root,
                 pattern,
                 glob,
@@ -1072,6 +1173,26 @@ enum SandboxBody<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn detect_no_wasm_sandbox_forces_native_even_without_os_sandbox() {
+        assert!(matches!(
+            SandboxBackend::detect(false, true),
+            SandboxBackend::OsNative
+        ));
+    }
+
+    #[test]
+    fn backend_for_mode_off_and_os_use_native_parser() {
+        assert!(matches!(
+            backend_for_mode(Some(SandboxMode::Off)).expect("off mode should resolve"),
+            SandboxBackend::OsNative
+        ));
+        assert!(matches!(
+            backend_for_mode(Some(SandboxMode::Os)).expect("os mode should resolve"),
+            SandboxBackend::OsNative
+        ));
+    }
+
     /// End-to-end smoke test: the wasm sandbox boots, parses a valid
     /// SKILL.md frontmatter through the JSON-RPC wire, and returns
     /// the expected `ParsedFrontmatter` to the host. This is the
@@ -1110,7 +1231,7 @@ mod tests {
         );
     }
 
-    /// `SandboxBackend::Native` and `SandboxBackend::Wasm` must produce
+    /// `SandboxBackend::OsNative` and `SandboxBackend::WasmFallback` must produce
     /// identical results for valid input. Pins the wire contract --
     /// if the wasm guest evolves and the JSON shape drifts, this test
     /// flags the mismatch before the production parser disagrees with
@@ -1118,9 +1239,9 @@ mod tests {
     #[test]
     fn native_and_wasm_agree_on_valid_frontmatter() {
         let yaml = "name: agree\ndescription: same parse on both backends\n";
-        let native_result = SandboxBackend::Native.parse_skill_frontmatter(yaml);
+        let native_result = SandboxBackend::OsNative.parse_skill_frontmatter(yaml);
         let wasm_sandbox = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let wasm = SandboxBackend::Wasm(Arc::new(wasm_sandbox));
+        let wasm = SandboxBackend::WasmFallback(Arc::new(wasm_sandbox));
         let wasm_result = wasm.parse_skill_frontmatter(yaml);
         assert_eq!(
             native_result
@@ -1144,7 +1265,7 @@ mod tests {
         std::fs::write(&path, "wasm-roundtrip\n").unwrap();
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let content = backend
             .read_file_bounded(&path, 1024)
             .expect("read should succeed")
@@ -1165,7 +1286,7 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let err = backend
             .read_file_bounded(&path, 1024)
             .expect_err("oversize file must be rejected");
@@ -1184,7 +1305,7 @@ mod tests {
         let path = tmp.path().join("does-not-exist.txt");
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let result = backend.read_file_bounded(&path, 1024);
         assert!(
             matches!(result, Ok(None)),
@@ -1201,11 +1322,11 @@ mod tests {
         let path = tmp.path().join("agree.txt");
         std::fs::write(&path, "same content on both backends\n").unwrap();
 
-        let native = SandboxBackend::Native
+        let native = SandboxBackend::OsNative
             .read_file_bounded(&path, 1024)
             .unwrap();
         let wasm_sandbox = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let wasm = SandboxBackend::Wasm(Arc::new(wasm_sandbox))
+        let wasm = SandboxBackend::WasmFallback(Arc::new(wasm_sandbox))
             .read_file_bounded(&path, 1024)
             .unwrap();
         assert_eq!(native, wasm);
@@ -1240,11 +1361,11 @@ mod tests {
             ],
         );
 
-        let native = SandboxBackend::Native
+        let native = SandboxBackend::OsNative
             .read_zip_entry_text(&zip_path, "manifest.json", 1 << 20, 1 << 20)
             .unwrap();
         let wasm_sandbox = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let wasm = SandboxBackend::Wasm(Arc::new(wasm_sandbox))
+        let wasm = SandboxBackend::WasmFallback(Arc::new(wasm_sandbox))
             .read_zip_entry_text(&zip_path, "manifest.json", 1 << 20, 1 << 20)
             .unwrap();
         assert_eq!(native, wasm);
@@ -1262,7 +1383,7 @@ mod tests {
         build_session_fixture_zip(&zip_path, &[("manifest.json", "{}")]);
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let result = backend
             .read_zip_entry_text(&zip_path, "missing.json", 1 << 20, 1 << 20)
             .expect("read should not error for a missing entry");
@@ -1280,11 +1401,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("a.txt"), "hello\nworld\nfoo bar\n").unwrap();
         std::fs::write(tmp.path().join("b.md"), "# title\nworld peace\n").unwrap();
-        let native = SandboxBackend::Native
+        let native = SandboxBackend::OsNative
             .search_file_contents(tmp.path(), "world", None, 100, 1 << 20, 1 << 30)
             .expect("native search should succeed");
         let wasm_sandbox = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let wasm = SandboxBackend::Wasm(Arc::new(wasm_sandbox))
+        let wasm = SandboxBackend::WasmFallback(Arc::new(wasm_sandbox))
             .search_file_contents(tmp.path(), "world", None, 100, 1 << 20, 1 << 30)
             .expect("wasm search should succeed");
         let mut native_paths: Vec<_> = native
@@ -1311,7 +1432,7 @@ mod tests {
     fn wasm_search_file_contents_invalid_regex_is_surfaced() {
         let tmp = tempfile::TempDir::new().unwrap();
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let err = backend
             .search_file_contents(tmp.path(), "(unclosed", None, 100, 1 << 20, 1 << 30)
             .expect_err("invalid regex must fail");
@@ -1334,7 +1455,7 @@ mod tests {
         let body = "a".repeat(8 * 1024) + "x\n";
         std::fs::write(tmp.path().join("payload.txt"), &body).unwrap();
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let outcome = backend
             .search_file_contents(tmp.path(), "(a+)+b", None, 100, 1 << 20, 1 << 30)
             .expect("regex crate is linear-time; this must not hang");
@@ -1352,7 +1473,7 @@ mod tests {
         build_session_fixture_zip(&zip_path, &[("big.txt", &body)]);
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let err = backend
             .read_zip_entry_text(&zip_path, "big.txt", 1 << 20, 1024)
             .expect_err("oversize entry must be rejected");
@@ -1377,7 +1498,7 @@ mod tests {
         std::fs::write(&path, "from-tokio\n").unwrap();
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let content = backend
             .read_file_bounded(&path, 1024)
             .expect("read should succeed even with ambient tokio runtime")
@@ -1398,7 +1519,7 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
 
         let wasm = WasmSandbox::new().expect("wasm sandbox should initialize");
-        let backend = SandboxBackend::Wasm(Arc::new(wasm));
+        let backend = SandboxBackend::WasmFallback(Arc::new(wasm));
         let err = backend
             .read_file_bounded(&path, 1024)
             .expect_err("oversize file must surface as an error, not be silently dropped");

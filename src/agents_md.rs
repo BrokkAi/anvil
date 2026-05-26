@@ -41,11 +41,37 @@ const FALLBACK: &str = "CLAUDE.md";
 /// stop and the offending file is truncated on a UTF-8 char boundary
 /// with a `tracing::warn!`.
 pub fn discover(cwd: &Path) -> String {
-    let global = read_global_default();
-    discover_inner(cwd, global)
+    discover_with_backend(cwd, crate::sandbox_backend::global())
 }
 
+pub fn discover_with_sandbox_mode(
+    cwd: &Path,
+    mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> String {
+    match crate::sandbox_backend::backend_for_mode(mode) {
+        Ok(backend) => discover_with_backend(cwd, &backend),
+        Err(e) => {
+            tracing::warn!("failed to initialize sandbox backend for AGENTS.md discovery: {e}");
+            String::new()
+        }
+    }
+}
+
+fn discover_with_backend(cwd: &Path, backend: &crate::sandbox_backend::SandboxBackend) -> String {
+    let global = read_global_default(backend);
+    discover_inner_with_backend(cwd, global, backend)
+}
+
+#[cfg(test)]
 fn discover_inner(cwd: &Path, global: Option<(PathBuf, String)>) -> String {
+    discover_inner_with_backend(cwd, global, crate::sandbox_backend::global())
+}
+
+fn discover_inner_with_backend(
+    cwd: &Path,
+    global: Option<(PathBuf, String)>,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> String {
     let cwd = normalize_path(cwd);
     let mut slots: Vec<(PathBuf, String)> = Vec::new();
 
@@ -57,7 +83,7 @@ fn discover_inner(cwd: &Path, global: Option<(PathBuf, String)>) -> String {
     let dir_chain = build_dir_chain(&cwd, git_root.as_deref());
     let display_base = git_root.as_deref().unwrap_or(&cwd);
     for dir in dir_chain {
-        if let Some((path, content)) = read_preferred(&dir) {
+        if let Some((path, content)) = read_preferred(&dir, backend) {
             slots.push((path, content));
         }
     }
@@ -160,20 +186,26 @@ fn normalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn read_preferred(dir: &Path) -> Option<(PathBuf, String)> {
-    if let Some(hit) = read_if_exists(&dir.join(PRIMARY)) {
+fn read_preferred(
+    dir: &Path,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> Option<(PathBuf, String)> {
+    if let Some(hit) = read_if_exists(&dir.join(PRIMARY), backend) {
         return Some(hit);
     }
-    read_if_exists(&dir.join(FALLBACK))
+    read_if_exists(&dir.join(FALLBACK), backend)
 }
 
-fn read_if_exists(path: &Path) -> Option<(PathBuf, String)> {
+fn read_if_exists(
+    path: &Path,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> Option<(PathBuf, String)> {
     // Route the read through the parser sandbox so an uncapped or
     // malicious file size cannot OOM the agent: the wasm backend
     // enforces both a metadata-size cap and a wasm linear-memory
     // limit, and the native backend honours the same `max_bytes`
     // pre-read check.
-    match crate::sandbox_backend::global().read_file_bounded(path, MAX_FILE_BYTES) {
+    match backend.read_file_bounded(path, MAX_FILE_BYTES) {
         Ok(Some(content)) => Some((path.to_path_buf(), content)),
         Ok(None) => None,
         Err(e) if e.kind() == ErrorKind::FileTooLarge => {
@@ -195,14 +227,16 @@ fn read_if_exists(path: &Path) -> Option<(PathBuf, String)> {
 
 /// Global slot: try `AGENTS.md` at the XDG/APPDATA location first, fall
 /// back to `~/.claude/CLAUDE.md` (the Claude Code convention path).
-fn read_global_default() -> Option<(PathBuf, String)> {
+fn read_global_default(
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> Option<(PathBuf, String)> {
     if let Some(p) = global_agents_path()
-        && let Some(hit) = read_if_exists(&p)
+        && let Some(hit) = read_if_exists(&p, backend)
     {
         return Some(hit);
     }
     if let Some(p) = global_claude_path()
-        && let Some(hit) = read_if_exists(&p)
+        && let Some(hit) = read_if_exists(&p, backend)
     {
         return Some(hit);
     }

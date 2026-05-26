@@ -395,15 +395,15 @@ pub struct Session {
     pub history: Vec<ConversationTurn>,
     pub manifest: SessionManifest,
     pub permission_mode: PermissionMode,
-    /// When true, `run_shell_command` runs without the OS sandbox
-    /// (sandbox-exec / bwrap) regardless of `permission_mode`. The
-    /// permission prompt still fires -- this flag controls the sandbox
-    /// boundary, not user approval. Set via `/setup sandbox off`.
+    /// Per-session sandbox mode override. Controls both shell command
+    /// wrapping (OS sandbox: bwrap / seatbelt) and parsing backend
+    /// (wasm vs native). `None` means use the global default detected
+    /// at startup.
     ///
-    /// In-memory only: reset on reload so a tampered or stale zip
-    /// cannot silently re-enable an opt-out the user never made in the
-    /// current session. Mirrors `permission_mode` / `always_allow_tools`.
-    pub sandbox_disabled: bool,
+    /// Set via `/setup sandbox os|wasm|off`. In-memory only: reset on
+    /// reload so a tampered or stale zip cannot silently re-enable an
+    /// opt-out the user never made in the current session.
+    pub sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     /// Approval keys the user has chosen "Always allow" for this session.
     /// Most tools use the tool name; shell commands use a scoped key.
     /// In-memory only (matches `claude-agent-acp` behavior).
@@ -483,7 +483,7 @@ impl Session {
             history: Vec::new(),
             manifest,
             permission_mode,
-            sandbox_disabled: false,
+            sandbox_mode: None,
             always_allow_tools: HashSet::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
@@ -534,7 +534,7 @@ impl Session {
             history,
             manifest,
             permission_mode: PermissionMode::Default,
-            sandbox_disabled: false,
+            sandbox_mode: None,
             always_allow_tools: HashSet::new(),
             // Reset reasoning effort on load -- it's a transient
             // per-session preference (per issue scope), so a
@@ -2006,9 +2006,22 @@ impl SessionStore {
         // I/O off the lock keeps prompt turns and other session
         // mutations unblocked. The discovery results are then swapped
         // in atomically alongside the cwd.
-        let project_instructions = crate::agents_md::discover(&cwd);
-        let skills = Arc::new(crate::skills::discover(&cwd));
-        let agents = Arc::new(crate::agents::discover(&cwd));
+        let sandbox_mode = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return;
+            };
+            session.sandbox_mode
+        };
+        let project_instructions = crate::agents_md::discover_with_sandbox_mode(&cwd, sandbox_mode);
+        let skills = Arc::new(crate::skills::discover_with_sandbox_mode(
+            &cwd,
+            sandbox_mode,
+        ));
+        let agents = Arc::new(crate::agents::discover_with_sandbox_mode(
+            &cwd,
+            sandbox_mode,
+        ));
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
             session.project_instructions = project_instructions;
@@ -2055,29 +2068,54 @@ impl SessionStore {
             .map(|s| s.permission_mode)
     }
 
-    /// Update the session's sandbox-disabled flag. Returns false if the
+    /// Update the session's sandbox mode override. Returns false if the
     /// session is unknown. Like `permission_mode`, this is session-only
     /// (not persisted to the manifest) so a stale zip can never re-enable
     /// an opt-out on reload.
-    pub async fn set_sandbox_disabled(&self, id: &str, disabled: bool) -> bool {
+    ///
+    /// `None` clears the override (revert to global default).
+    pub async fn set_sandbox_mode(
+        &self,
+        id: &str,
+        mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> bool {
+        let cwd = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return false;
+            };
+            session.cwd.clone()
+        };
+
+        // Re-discover per-session context under the new parser backend so
+        // `/setup sandbox wasm|off|os` takes effect immediately for future
+        // prompts, not just after a cwd change.
+        let project_instructions = crate::agents_md::discover_with_sandbox_mode(&cwd, mode);
+        let skills = Arc::new(crate::skills::discover_with_sandbox_mode(&cwd, mode));
+        let agents = Arc::new(crate::agents::discover_with_sandbox_mode(&cwd, mode));
+
         let mut sessions = self.sessions.write().await;
         match sessions.get_mut(id) {
             Some(session) => {
-                session.sandbox_disabled = disabled;
+                session.sandbox_mode = mode;
+                session.project_instructions = project_instructions;
+                session.skills = skills;
+                session.agents = agents;
+                session.activated_skills.clear();
                 true
             }
             None => false,
         }
     }
 
-    /// Read the current `sandbox_disabled` flag for a session. Returns
-    /// None if the session is unknown.
-    pub async fn sandbox_disabled(&self, id: &str) -> Option<bool> {
-        self.sessions
-            .read()
-            .await
-            .get(id)
-            .map(|s| s.sandbox_disabled)
+    /// Read the current sandbox mode override for a session. Returns
+    /// `None` if the session is unknown, and `Some(None)` if it is known
+    /// and using the process default.
+    pub async fn sandbox_mode(
+        &self,
+        id: &str,
+    ) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+        self.sessions.read().await.get(id).map(|s| s.sandbox_mode)
     }
 
     /// True if the session has previously chosen "Always allow" for `approval_key`.
@@ -3247,38 +3285,46 @@ mod tests {
         assert_eq!(reloaded.id, id);
         assert_eq!(reloaded.mode, SessionMode::Plan);
         assert_eq!(reloaded.permission_mode, PermissionMode::Default);
-        assert!(!reloaded.sandbox_disabled);
+        assert!(reloaded.sandbox_mode.is_none());
         assert!(reloaded.always_allow_tools.is_empty());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `sandbox_disabled` round-trips through the setter, defaults to
-    /// `false`, and reports `false` from the setter on an unknown session
+    /// `sandbox_mode` round-trips through the setter, defaults to
+    /// `None`, and reports `None` from the setter on an unknown session
     /// (matching the `set_permission_mode` contract). The flag is
     /// in-memory only, so it must also reset on a cold reload -- covered
     /// implicitly by `get_session_loads_from_disk_when_cold` above, which
-    /// asserts `!reloaded.sandbox_disabled` for a session that never set
+    /// asserts `reloaded.sandbox_mode.is_none()` for a session that never set
     /// it; the dedicated reload check lives there to keep the "transient
     /// fields reset on load" invariants in one place.
     #[tokio::test]
-    async fn sandbox_disabled_setter_and_getter_round_trip() {
+    async fn sandbox_mode_setter_and_getter_round_trip() {
+        use crate::sandbox_backend::SandboxMode;
         let store = SessionStore::new("m".to_string());
         let cwd =
             std::env::temp_dir().join(format!("brokk-acp-rust-sandbox-{}", uuid::Uuid::new_v4()));
         let session = store.create_session(cwd.clone()).await;
         let id = session.id.clone();
 
-        assert_eq!(store.sandbox_disabled(&id).await, Some(false));
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
-        assert!(store.set_sandbox_disabled(&id, true).await);
-        assert_eq!(store.sandbox_disabled(&id).await, Some(true));
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
 
-        assert!(store.set_sandbox_disabled(&id, false).await);
-        assert_eq!(store.sandbox_disabled(&id).await, Some(false));
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Wasm)).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
 
-        assert!(!store.set_sandbox_disabled("no-such", true).await);
-        assert_eq!(store.sandbox_disabled("no-such").await, None);
+        assert!(store.set_sandbox_mode(&id, None).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
+
+        assert!(
+            !store
+                .set_sandbox_mode("no-such", Some(SandboxMode::Off))
+                .await
+        );
+        assert_eq!(store.sandbox_mode("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
