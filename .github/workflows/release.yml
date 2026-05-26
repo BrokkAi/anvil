@@ -1,60 +1,28 @@
-name: Release
+name: GitHub Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset_name: anvil-linux-x86_64
-            binary_name: anvil
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset_name: anvil-linux-aarch64
-            binary_name: anvil
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset_name: anvil-macos-aarch64
-            binary_name: anvil
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset_name: anvil-windows-x86_64.exe
-            binary_name: anvil.exe
-    runs-on: ${{ matrix.os }}
-
-    permissions:
-      contents: write
-
+  build-linux:
+    name: Build x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          # `wasm32-wasip2` is required by `build.rs` to cross-compile
-          # the sandboxed parser crate; the host target comes from the
-          # matrix.
-          targets: ${{ matrix.target }}, wasm32-wasip2
+          targets: x86_64-unknown-linux-gnu,wasm32-wasip2
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
 
       - name: Verify tag matches Cargo.toml version
         if: github.event_name == 'push'
@@ -70,34 +38,203 @@ jobs:
           echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
-      - name: Stage artifact
+      - name: Package archive
         shell: bash
         run: |
-          mkdir -p staging
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "staging/${{ matrix.asset_name }}"
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-anvil-${ref}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp "target/x86_64-unknown-linux-gnu/release/anvil" "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
 
-      - name: Smoke-test --version
-        shell: bash
-        run: |
-          "./staging/${{ matrix.asset_name }}" --version
-
-      - name: Upload to GitHub Release
-        if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          files: staging/${{ matrix.asset_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifact (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset_name }}
-          path: staging/${{ matrix.asset_name }}
+          name: x86_64-unknown-linux-gnu
+          path: |
+            brokk-anvil-*.zip
+            brokk-anvil-*.zip.sha256
           if-no-files-found: error
+
+  build-linux-arm64:
+    name: Build aarch64-unknown-linux-gnu
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu,wasm32-wasip2
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Package archive
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-anvil-${ref}-aarch64-unknown-linux-gnu"
+          mkdir "$name"
+          cp "target/aarch64-unknown-linux-gnu/release/anvil" "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-unknown-linux-gnu
+          path: |
+            brokk-anvil-*.zip
+            brokk-anvil-*.zip.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Build x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc,wasm32-wasip2
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME -replace '/', '-'
+          $name = "brokk-anvil-$ref-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\anvil.exe" -Destination $name
+          Copy-Item "README.md" -Destination $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Path "$name.zip.sha256" -NoNewline
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: x86_64-pc-windows-msvc
+          path: |
+            brokk-anvil-*.zip
+            brokk-anvil-*.zip.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build universal-apple-darwin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin,wasm32-wasip2
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build x86_64 binary
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Build aarch64 binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/anvil \
+            target/aarch64-apple-darwin/release/anvil \
+            -output target/universal-apple-darwin/release/anvil
+          lipo -info target/universal-apple-darwin/release/anvil
+
+      - name: Package archive
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-anvil-${ref}-universal-apple-darwin"
+          mkdir "$name"
+          cp target/universal-apple-darwin/release/anvil "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          shasum -a 256 "$name.zip" > "$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: universal-apple-darwin
+          path: |
+            brokk-anvil-*.zip
+            brokk-anvil-*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    if: github.event_name == 'push'
+    needs: [build-linux, build-linux-arm64, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/brokk-anvil-*.zip
+            artifacts/brokk-anvil-*.zip.sha256

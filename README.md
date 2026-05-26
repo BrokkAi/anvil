@@ -160,10 +160,10 @@ When configured with `--bifrost-binary`, the server spawns a Bifrost subprocess 
 
 ## Releases
 
-Release binaries are published on GitHub Releases. The `brokk-anvil` crate is published to crates.io through trusted publishing from `.github/workflows/publish-crate.yml` using the `release` environment. Tags follow `vX.Y.Z`; the workflows validate that the tag matches `Cargo.toml`'s `version` before publishing.
+Release binaries are published as zipped archives on GitHub Releases, with `.sha256` sidecars for verification. The `brokk-anvil` crate is published to crates.io through trusted publishing from `.github/workflows/publish-crate.yml` using the `release` environment. Tags follow `vX.Y.Z`; the workflows validate that the tag matches `Cargo.toml`'s `version` before publishing.
 
 Asset names per platform:
-- `anvil-linux-x86_64`
-- `anvil-linux-aarch64`
-- `anvil-macos-aarch64`
-- `anvil-windows-x86_64.exe`
+- `brokk-anvil-vX.Y.Z-x86_64-unknown-linux-gnu.zip`
+- `brokk-anvil-vX.Y.Z-aarch64-unknown-linux-gnu.zip`
+- `brokk-anvil-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+- `brokk-anvil-vX.Y.Z-universal-apple-darwin.zip`
