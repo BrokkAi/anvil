@@ -1139,6 +1139,37 @@ pub async fn run_agent(
                     .filter(|text| !text.trim().is_empty())
                     .unwrap_or_else(|| raw_prompt_text.clone());
 
+                // Rename the session from its first prompt *before* any LLM
+                // work starts. The title depends only on the user's text, not
+                // on the model response, so there is no reason to defer it
+                // past the spawn below.
+                match sessions_prompt
+                    .maybe_rename_from_prompt(&session_id, &title_seed)
+                    .await
+                {
+                    Ok(renamed_title) => {
+                        if renamed_title.is_some() {
+                            if let Some(metadata) = sessions_prompt
+                                .session_metadata(&session_id)
+                                .await
+                            {
+                                send_session_info_update(
+                                    &cx,
+                                    &session_id,
+                                    renamed_title,
+                                    metadata.updated_at,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "failed to update session title: {e:#}"
+                        );
+                    }
+                }
+
                 let prompt_text = if let Some((name, args)) = parse_slash_command(&raw_prompt_text)
                     && let Some(meta) = snap.skills.get(&name)
                 {
@@ -1265,7 +1296,6 @@ pub async fn run_agent(
                 let cx_for_loop = cx.clone();
                 let session_id_for_loop = session_id.clone();
                 let prompt_text_for_turn = prompt_text;
-                let title_seed_for_turn = title_seed;
                 let model_for_loop = snap.model;
                 let reasoning_effort_for_loop = snap.reasoning_effort;
                 // Resolve per-turn idle timeout: the session override wins,
@@ -1389,32 +1419,6 @@ pub async fn run_agent(
                                  it will not survive a session reload: {e}\n"
                             ),
                         );
-                    } else {
-                        let renamed_title = match sessions_for_loop
-                            .maybe_rename_from_prompt(&session_id_for_loop, &title_seed_for_turn)
-                            .await
-                        {
-                            Ok(title) => title,
-                            Err(e) => {
-                                tracing::warn!(
-                                    session_id = %session_id_for_loop,
-                                    "failed to update session title: {e:#}"
-                                );
-                                None
-                            }
-                        };
-
-                        if let Some(metadata) = sessions_for_loop
-                            .session_metadata(&session_id_for_loop)
-                            .await
-                        {
-                            send_session_info_update(
-                                &cx_for_loop,
-                                &session_id_for_loop,
-                                renamed_title,
-                                metadata.updated_at,
-                            );
-                        }
                     }
 
                     // Clean up cancellation token even on panic / persistence failure.
