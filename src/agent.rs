@@ -1148,17 +1148,16 @@ pub async fn run_agent(
                     .await
                 {
                     Ok(renamed_title) => {
-                        if renamed_title.is_some() {
-                            if let Some(metadata) =
+                        if renamed_title.is_some()
+                            && let Some(metadata) =
                                 sessions_prompt.session_metadata(&session_id).await
-                            {
-                                send_session_info_update(
-                                    &cx,
-                                    &session_id,
-                                    renamed_title,
-                                    metadata.updated_at,
-                                );
-                            }
+                        {
+                            send_session_info_update(
+                                &cx,
+                                &session_id,
+                                renamed_title,
+                                metadata.updated_at,
+                            );
                         }
                     }
                     Err(e) => {
