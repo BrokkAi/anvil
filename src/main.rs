@@ -344,9 +344,7 @@ async fn main() -> Result<()> {
         crate::sandbox_backend::SandboxBackend::detect(os_available, args.no_wasm_sandbox);
     match &strategy {
         crate::sandbox_backend::SandboxBackend::OsNative if os_available => {
-            tracing::info!(
-                "sandbox strategy: OsNative (OS sandbox + native parsing)"
-            );
+            tracing::info!("sandbox strategy: OsNative (OS sandbox + native parsing)");
         }
         crate::sandbox_backend::SandboxBackend::OsNative => {
             tracing::info!(
@@ -354,9 +352,7 @@ async fn main() -> Result<()> {
             );
         }
         crate::sandbox_backend::SandboxBackend::WasmFallback(_) => {
-            tracing::info!(
-                "sandbox strategy: WasmFallback (no OS sandbox; parsing through wasm)"
-            );
+            tracing::info!("sandbox strategy: WasmFallback (no OS sandbox; parsing through wasm)");
         }
     }
     sandbox_backend::install_global(strategy);

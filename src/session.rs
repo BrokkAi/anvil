@@ -2082,11 +2082,7 @@ impl SessionStore {
         &self,
         id: &str,
     ) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
-        self.sessions
-            .read()
-            .await
-            .get(id)
-            .map(|s| s.sandbox_mode)
+        self.sessions.read().await.get(id).map(|s| s.sandbox_mode)
     }
 
     /// True if the session has previously chosen "Always allow" for `approval_key`.
@@ -3282,25 +3278,19 @@ mod tests {
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
         assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
-        assert_eq!(
-            store.sandbox_mode(&id).await,
-            Some(Some(SandboxMode::Off))
-        );
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
 
-        assert!(store
-            .set_sandbox_mode(&id, Some(SandboxMode::Wasm))
-            .await);
-        assert_eq!(
-            store.sandbox_mode(&id).await,
-            Some(Some(SandboxMode::Wasm))
-        );
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Wasm)).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
 
         assert!(store.set_sandbox_mode(&id, None).await);
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
-        assert!(!store
-            .set_sandbox_mode("no-such", Some(SandboxMode::Off))
-            .await);
+        assert!(
+            !store
+                .set_sandbox_mode("no-such", Some(SandboxMode::Off))
+                .await
+        );
         assert_eq!(store.sandbox_mode("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);

@@ -576,10 +576,7 @@ pub(crate) async fn run(
                             // (race), fail safe to ReadOnly: the gate already cleared
                             // the call but we no longer trust the mode lookup.
                             let permission_mode = sessions.permission_mode(&session_id).await;
-                            let sandbox_mode = sessions
-                                .sandbox_mode(&session_id)
-                                .await
-                                .flatten();
+                            let sandbox_mode = sessions.sandbox_mode(&session_id).await.flatten();
                             if permission_mode.is_none() {
                                 tracing::warn!(
                                     session_id,
@@ -1383,7 +1380,11 @@ mod tests {
             (SandboxPolicy::None, false)
         );
         assert_eq!(
-            resolve_execution_policy(Some(PermissionMode::AcceptEdits), Some(SandboxMode::Off), None),
+            resolve_execution_policy(
+                Some(PermissionMode::AcceptEdits),
+                Some(SandboxMode::Off),
+                None
+            ),
             (SandboxPolicy::None, false)
         );
         assert_eq!(

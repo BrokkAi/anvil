@@ -1097,10 +1097,7 @@ pub async fn run_agent(
                         .permission_mode(&session_id)
                         .await
                         .unwrap_or(PermissionMode::Default);
-                    let sandbox_mode = sessions_prompt
-                        .sandbox_mode(&session_id)
-                        .await
-                        .flatten();
+                    let sandbox_mode = sessions_prompt.sandbox_mode(&session_id).await.flatten();
                     // Reuse the per-session ToolRegistry so shell calls
                     // route through the same `run_shell_command` dispatch
                     // (env scrub, sandbox, rlimits) the LLM tool path
@@ -4731,37 +4728,71 @@ mod tests {
 
         // Bare: reports "on" (default) and surfaces the usage hints.
         let bare = handle_setup_sandbox(&store, &id, "").await;
-        assert!(bare.contains("currently `on`") || bare.contains("currently `os`"), "got: {bare}");
-        assert!(bare.contains("/setup sandbox off") || bare.contains("/setup sandbox wasm"), "got: {bare}");
+        assert!(
+            bare.contains("currently `on`") || bare.contains("currently `os`"),
+            "got: {bare}"
+        );
+        assert!(
+            bare.contains("/setup sandbox off") || bare.contains("/setup sandbox wasm"),
+            "got: {bare}"
+        );
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
         // `off` flips the flag and confirms the per-call prompt is
         // still in play -- the message wording is part of the contract.
         let off = handle_setup_sandbox(&store, &id, "off").await;
-        assert!(off.contains("set to `off`") || off.contains("No sandboxing"), "got: {off}");
+        assert!(
+            off.contains("set to `off`") || off.contains("No sandboxing"),
+            "got: {off}"
+        );
         assert!(off.contains("permission prompts"), "got: {off}");
-        assert_eq!(store.sandbox_mode(&id).await, Some(Some(crate::sandbox_backend::SandboxMode::Off)));
+        assert_eq!(
+            store.sandbox_mode(&id).await,
+            Some(Some(crate::sandbox_backend::SandboxMode::Off))
+        );
 
         // `on` flips it back.
         let on = handle_setup_sandbox(&store, &id, "on").await;
-        assert!(on.contains("reset to default") || on.contains("default"), "got: {on}");
+        assert!(
+            on.contains("reset to default") || on.contains("default"),
+            "got: {on}"
+        );
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
         // `status` reports without mutating.
-        assert!(store.set_sandbox_mode(&id, Some(crate::sandbox_backend::SandboxMode::Off)).await);
+        assert!(
+            store
+                .set_sandbox_mode(&id, Some(crate::sandbox_backend::SandboxMode::Off))
+                .await
+        );
         let status = handle_setup_sandbox(&store, &id, "status").await;
         assert!(status.contains("`off`"), "got: {status}");
-        assert_eq!(store.sandbox_mode(&id).await, Some(Some(crate::sandbox_backend::SandboxMode::Off)));
+        assert_eq!(
+            store.sandbox_mode(&id).await,
+            Some(Some(crate::sandbox_backend::SandboxMode::Off))
+        );
 
         // `wasm` sets sandbox mode to Wasm.
         let wasm = handle_setup_sandbox(&store, &id, "wasm").await;
-        assert!(wasm.contains("set to `wasm`") || wasm.contains("WASM sandbox"), "got: {wasm}");
-        assert_eq!(store.sandbox_mode(&id).await, Some(Some(crate::sandbox_backend::SandboxMode::Wasm)));
+        assert!(
+            wasm.contains("set to `wasm`") || wasm.contains("WASM sandbox"),
+            "got: {wasm}"
+        );
+        assert_eq!(
+            store.sandbox_mode(&id).await,
+            Some(Some(crate::sandbox_backend::SandboxMode::Wasm))
+        );
 
         // Unknown choice is rejected and leaves state untouched.
         let bad = handle_setup_sandbox(&store, &id, "maybe").await;
-        assert!(bad.contains("Unknown choice") || bad.contains("Unknown sandbox choice"), "got: {bad}");
-        assert_eq!(store.sandbox_mode(&id).await, Some(Some(crate::sandbox_backend::SandboxMode::Wasm)));
+        assert!(
+            bad.contains("Unknown choice") || bad.contains("Unknown sandbox choice"),
+            "got: {bad}"
+        );
+        assert_eq!(
+            store.sandbox_mode(&id).await,
+            Some(Some(crate::sandbox_backend::SandboxMode::Wasm))
+        );
 
         // Unknown session id is surfaced rather than silently noop'd.
         let missing = handle_setup_sandbox(&store, "no-such", "off").await;
