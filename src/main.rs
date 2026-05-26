@@ -107,9 +107,11 @@ struct Args {
 
     /// Disable the wasmtime-hosted parser sandbox and run all parsing
     /// (SKILL.md YAML, AGENTS.md, session zip, regex search) natively
-    /// in-process. The sandbox guards against YAML bombs, ReDoS, and
-    /// parser panics taking down the agent; disabling it trades that
-    /// isolation for ~5-20ms per call and the host's full memory pool.
+    /// in-process. Normally the wasm sandbox is used as a fallback
+    /// when no OS-level sandbox (bwrap / seatbelt) is available;
+    /// this flag forces native parsing regardless. On platforms
+    /// without an OS sandbox, this also means `run_shell_command`
+    /// runs without any sandbox of any kind.
     #[arg(long, env = "ANVIL_NO_WASM_SANDBOX", default_value_t = false)]
     no_wasm_sandbox: bool,
 }
@@ -336,14 +338,28 @@ async fn main() -> Result<()> {
     // every parse goes through the chosen backend from the first call.
     // The wasm backend is the default; `--no-wasm-sandbox` is the explicit
     // opt-out that trades isolation for raw speed.
-    if args.no_wasm_sandbox {
-        tracing::info!(
-            "wasm parser sandbox disabled by flag; YAML/zip/regex parses run natively in-process"
-        );
-        sandbox_backend::install_global(sandbox_backend::SandboxBackend::Native);
-    } else {
-        sandbox_backend::install_global(sandbox_backend::SandboxBackend::wasm_or_native());
+    // Determine sandbox strategy: OS sandbox (preferred) or wasm fallback
+    let os_available = tools::sandbox::is_os_sandbox_available();
+    let strategy =
+        crate::sandbox_backend::SandboxBackend::detect(os_available, args.no_wasm_sandbox);
+    match &strategy {
+        crate::sandbox_backend::SandboxBackend::OsNative if os_available => {
+            tracing::info!(
+                "sandbox strategy: OsNative (OS sandbox + native parsing)"
+            );
+        }
+        crate::sandbox_backend::SandboxBackend::OsNative => {
+            tracing::info!(
+                "sandbox strategy: OsNative (no OS sandbox available, wasm disabled by flag)"
+            );
+        }
+        crate::sandbox_backend::SandboxBackend::WasmFallback(_) => {
+            tracing::info!(
+                "sandbox strategy: WasmFallback (no OS sandbox; parsing through wasm)"
+            );
+        }
     }
+    sandbox_backend::install_global(strategy);
 
     if args.endpoint_url.is_some() {
         tracing::warn!(

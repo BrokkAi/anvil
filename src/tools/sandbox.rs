@@ -76,19 +76,28 @@ impl SandboxPolicy {
         }
     }
 
-    /// Resolve the sandbox tier for a session, factoring in an explicit
-    /// `sandbox_disabled` opt-out. When `disabled` is true the policy
-    /// collapses to `None` regardless of the permission mode -- the
-    /// per-call permission prompt (driven by `PermissionMode`) still
-    /// fires, but the OS sandbox is skipped. This is the session-level
-    /// counterpart to `BypassPermissions`, which disables *both* the
-    /// prompt and the sandbox; `sandbox_disabled` only disables the
-    /// sandbox.
-    pub fn resolve(mode: PermissionMode, disabled: bool) -> Self {
-        if disabled {
-            Self::None
+    /// Resolve the sandbox tier for a session, factoring in the per-session
+    /// sandbox mode override. When `sandbox_mode` is `Some(Off)` or
+    /// `Some(Wasm)` the policy collapses to `None` regardless of the
+    /// permission mode -- the per-call permission prompt (driven by
+    /// `PermissionMode`) still fires, but the OS sandbox is skipped.
+    /// When `sandbox_mode` is `Some(Os)` or `None`, the permission mode
+    /// is the sole determinant. This is the session-level counterpart
+    /// to `BypassPermissions`, which disables *both* the prompt and
+    /// the sandbox; `sandbox_mode` only disables the OS sandbox.
+    pub fn resolve(
+        permission_mode: PermissionMode,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> Self {
+        let os_enabled = match sandbox_mode {
+            Some(crate::sandbox_backend::SandboxMode::Os) | None => true,
+            Some(crate::sandbox_backend::SandboxMode::Wasm) => false,
+            Some(crate::sandbox_backend::SandboxMode::Off) => false,
+        };
+        if os_enabled {
+            Self::from_permission_mode(permission_mode)
         } else {
-            Self::from_permission_mode(mode)
+            Self::None
         }
     }
 
@@ -772,6 +781,41 @@ fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<Str
     a.push(command.into());
 
     a
+}
+
+// ---------------------------------------------------------------------------
+// Cross-platform OS sandbox availability probe
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the OS-level shell sandbox is currently available on
+/// this host. Used by `main.rs` at startup to decide which
+/// `sandbox_backend::SandboxStrategy` to install:
+///
+/// - `true`  → `OsNative`: shell commands get wrapped by bwrap / seatbelt,
+///   parsing runs natively (the OS sandbox is the security boundary).
+/// - `false` → `WasmFallback`: shell commands run bare, parsing goes
+///   through the wasm sandbox so at least the YAML / regex / zip parsers
+///   run in an isolated linear-memory sandbox.
+///
+/// Platform semantics:
+/// - **macOS**: seatbelt (`sandbox-exec`) ships with the OS, so this is
+///   always `true`.
+/// - **Linux**: `true` iff `bwrap` is on `PATH` (same check used by
+///   `wrap_platform`).
+/// - **Other**: `false` (no sandbox implementation exists).
+pub fn is_os_sandbox_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        is_bubblewrap_available()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
 #[cfg(target_os = "linux")]

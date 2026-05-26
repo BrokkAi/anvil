@@ -265,7 +265,7 @@ pub fn list_directory(cwd: &Path, path: &str) -> ToolResult {
     }
 }
 
-/// `grep_search` tool, routed through `SandboxBackend` so the
+/// `grep_search` tool, routed through `SandboxStrategy` so the
 /// user-controlled regex runs inside the wasm sandbox by default.
 /// The `regex` crate is engineered to be linear-time, but a future
 /// engine bug or accidental enabling of a backtracking feature
