@@ -149,10 +149,36 @@ impl SkillRegistry {
 /// dir. Returns an empty registry when nothing is found.
 pub fn discover(cwd: &Path) -> SkillRegistry {
     let home = dirs::home_dir();
-    discover_inner(cwd, home.as_deref())
+    discover_with_backend(cwd, home.as_deref(), crate::sandbox_backend::global())
 }
 
+pub fn discover_with_sandbox_mode(
+    cwd: &Path,
+    mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> SkillRegistry {
+    let home = dirs::home_dir();
+    match crate::sandbox_backend::backend_for_mode(mode) {
+        Ok(backend) => discover_with_backend(cwd, home.as_deref(), &backend),
+        Err(e) => {
+            let mut reg = SkillRegistry::default();
+            reg.push_diagnostic(format!(
+                "failed to initialize sandbox backend for SKILL.md discovery: {e}"
+            ));
+            reg
+        }
+    }
+}
+
+#[cfg(test)]
 fn discover_inner(cwd: &Path, home: Option<&Path>) -> SkillRegistry {
+    discover_with_backend(cwd, home, crate::sandbox_backend::global())
+}
+
+fn discover_with_backend(
+    cwd: &Path,
+    home: Option<&Path>,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> SkillRegistry {
     let cwd = normalize_path(cwd);
     let mut reg = SkillRegistry::default();
 
@@ -163,11 +189,13 @@ fn discover_inner(cwd: &Path, home: Option<&Path>) -> SkillRegistry {
             &h.join(CLAUDE_DIR).join(SKILLS_SUBDIR),
             SkillScope::User,
             &mut reg,
+            backend,
         );
         scan_root(
             &h.join(AGENTS_DIR).join(SKILLS_SUBDIR),
             SkillScope::User,
             &mut reg,
+            backend,
         );
     }
 
@@ -180,11 +208,13 @@ fn discover_inner(cwd: &Path, home: Option<&Path>) -> SkillRegistry {
             &dir.join(CLAUDE_DIR).join(SKILLS_SUBDIR),
             SkillScope::Project,
             &mut reg,
+            backend,
         );
         scan_root(
             &dir.join(AGENTS_DIR).join(SKILLS_SUBDIR),
             SkillScope::Project,
             &mut reg,
+            backend,
         );
     }
 
@@ -195,7 +225,12 @@ fn discover_inner(cwd: &Path, home: Option<&Path>) -> SkillRegistry {
     reg
 }
 
-fn scan_root(root: &Path, scope: SkillScope, reg: &mut SkillRegistry) {
+fn scan_root(
+    root: &Path,
+    scope: SkillScope,
+    reg: &mut SkillRegistry,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) {
     // Empty/missing root is the common case (no `.agents/skills/`
     // anywhere). Distinguish from real errors so we don't spam warnings.
     let entries = match std::fs::read_dir(root) {
@@ -242,7 +277,7 @@ fn scan_root(root: &Path, scope: SkillScope, reg: &mut SkillRegistry) {
         if entry.file_name() != OsStr::new(SKILL_FILE) {
             continue;
         }
-        load_skill(entry.path(), scope, reg);
+        load_skill(entry.path(), scope, reg, backend);
     }
 }
 
@@ -267,7 +302,12 @@ fn is_excluded_dir(entry: &walkdir::DirEntry) -> bool {
     name.starts_with('.')
 }
 
-fn load_skill(path: &Path, scope: SkillScope, reg: &mut SkillRegistry) {
+fn load_skill(
+    path: &Path,
+    scope: SkillScope,
+    reg: &mut SkillRegistry,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -294,7 +334,7 @@ fn load_skill(path: &Path, scope: SkillScope, reg: &mut SkillRegistry) {
         }
     };
 
-    let parsed = match crate::sandbox_backend::global().parse_skill_frontmatter(front) {
+    let parsed = match backend.parse_skill_frontmatter(front) {
         Ok(p) => p,
         Err(e) => {
             reg.push_diagnostic(format!(
@@ -375,7 +415,7 @@ fn load_skill(path: &Path, scope: SkillScope, reg: &mut SkillRegistry) {
 
 // Frontmatter parsing (`split_frontmatter`, `parse_frontmatter`, and the
 // YAML recovery helpers) moved to the `brokk-acp-sandbox` crate so the
-// same code can run in a wasm sandbox via `SandboxBackend::Wasm`. The
+// same code can run in a wasm sandbox via `SandboxBackend::WasmFallback`. The
 // host calls those entry points through `SandboxBackend` above and
 // `brokk_acp_sandbox::split_frontmatter` directly (the splitter does no
 // untrusted-format parsing, only newline scanning, so it is safe to keep

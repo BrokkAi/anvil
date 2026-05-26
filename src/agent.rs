@@ -2757,68 +2757,88 @@ async fn handle_setup_permission(
     apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
 }
 
-/// Toggle the per-session OS shell sandbox. Separate from `/setup
-/// permissions`: this only controls the sandbox boundary, not whether
-/// the user is prompted before each tool call. `/setup permissions
-/// trusted` disables both the prompt and the sandbox; this command
-/// disables only the latter, so the user still approves each shell call
-/// but the command runs without sandbox-exec / bwrap when accepted.
+/// Configure the per-session sandbox mode. Separate from `/setup
+/// permissions`: this controls the sandbox boundary and parser backend,
+/// not whether the user is prompted before each tool call. `/setup
+/// permissions trusted` disables both the prompt and the sandbox; this
+/// command keeps the permission prompt behavior unchanged.
 ///
-/// In-memory only: a session reload reverts to `on`, mirroring how
-/// `permission_mode` resets on load.
+/// In-memory only: a session reload reverts to the process default,
+/// mirroring how `permission_mode` resets on load.
 async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
     use crate::sandbox_backend::SandboxMode;
 
     if rest.is_empty() {
         let current = sessions.sandbox_mode(session_id).await;
-        let state = match current {
-            Some(Some(SandboxMode::Wasm)) => "wasm",
-            Some(Some(SandboxMode::Off)) => "off",
-            Some(Some(SandboxMode::Os)) | Some(None) => "on",
+        let (state, suffix) = match current {
+            Some(mode) => (
+                crate::sandbox_backend::resolve_mode(mode).as_str(),
+                if mode.is_none() { " (default)" } else { "" },
+            ),
             None => return "Error: unknown session.".to_string(),
         };
         return format!(
-            "Sandbox is currently `{state}`.\n\n\
-             - `/setup sandbox on`     - OS sandbox + native parsing (default).\n\
+            "Sandbox is currently `{state}`{suffix}.\n\n\
+             - `/setup sandbox default` - use the process default.\n\
+             - `/setup sandbox os`     - OS sandbox + native parsing.\n\
              - `/setup sandbox wasm`   - wasm parsing, no OS sandbox for shell commands.\n\
              - `/setup sandbox off`    - no sandbox at all.\n\
              - `/setup sandbox status` - report current mode."
         );
     }
     let mode = match rest.to_ascii_lowercase().as_str() {
-        "os" | "on" | "enable" | "enabled" | "true" | "yes" | "default" => {
+        "default" | "on" | "enable" | "enabled" | "true" | "yes" => {
             None // clear override -> use global default
         }
+        "os" => Some(SandboxMode::Os),
         "wasm" => Some(SandboxMode::Wasm),
         "off" | "disable" | "disabled" | "false" | "no" => Some(SandboxMode::Off),
         "status" => {
             let current = sessions.sandbox_mode(session_id).await;
-            return match current {
-                Some(Some(SandboxMode::Wasm)) => {
-                    "Sandbox is `wasm`. Parsing goes through WASM; shell commands have no OS sandbox.".to_string()
-                }
-                Some(Some(SandboxMode::Off)) => {
-                    "Sandbox is `off`. No sandboxing at all.".to_string()
-                }
-                Some(Some(SandboxMode::Os)) | Some(None) => {
-                    "Sandbox is `os` (default). Shell commands use the OS sandbox; parsing is native.".to_string()
-                }
-                None => "Error: unknown session.".to_string(),
+            let Some(mode) = current else {
+                return "Error: unknown session.".to_string();
             };
+            return describe_sandbox_mode(
+                crate::sandbox_backend::resolve_mode(mode),
+                mode.is_none(),
+            );
         }
         _ => {
-            return "Unknown choice. Try `/setup sandbox`, `/setup sandbox os`, `/setup sandbox wasm`, `/setup sandbox off`, or `/setup sandbox status`.".to_string();
+            return "Unknown choice. Try `/setup sandbox`, `/setup sandbox default`, `/setup sandbox os`, `/setup sandbox wasm`, `/setup sandbox off`, or `/setup sandbox status`.".to_string();
         }
     };
+    if let Err(e) = crate::sandbox_backend::backend_for_mode(mode) {
+        return format!("Error: failed to initialize requested sandbox backend: {e}");
+    }
     if !sessions.set_sandbox_mode(session_id, mode).await {
         return "Error: unknown session.".to_string();
     }
     match mode {
+        Some(SandboxMode::Os) => "Sandbox set to `os`. Shell commands use the OS sandbox; parsing runs natively. Per-call permission prompts are unchanged.".to_string(),
         Some(SandboxMode::Wasm) => "Sandbox set to `wasm`. Parsing goes through WASM sandbox; shell commands will run without OS sandbox. Per-call permission prompts are unchanged.".to_string(),
         Some(SandboxMode::Off) => "Sandbox set to `off`. No sandboxing at all. Per-call permission prompts are unchanged.".to_string(),
         _ => {
             let default = crate::sandbox_backend::default_mode();
             format!("Sandbox reset to default (`{}`).", default.as_str())
+        }
+    }
+}
+
+fn describe_sandbox_mode(mode: crate::sandbox_backend::SandboxMode, is_default: bool) -> String {
+    let suffix = if is_default { " (default)" } else { "" };
+    match mode {
+        crate::sandbox_backend::SandboxMode::Os => {
+            format!(
+                "Sandbox is `os`{suffix}. Shell commands use the OS sandbox; parsing is native."
+            )
+        }
+        crate::sandbox_backend::SandboxMode::Wasm => {
+            format!(
+                "Sandbox is `wasm`{suffix}. Parsing goes through WASM; shell commands have no OS sandbox."
+            )
+        }
+        crate::sandbox_backend::SandboxMode::Off => {
+            format!("Sandbox is `off`{suffix}. No sandboxing at all.")
         }
     }
 }
@@ -2993,11 +3013,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     ));
     out.push_str(&format!(
         "- Sandbox mode: `{}`\n",
-        match session.sandbox_mode {
-            Some(crate::sandbox_backend::SandboxMode::Wasm) => "wasm",
-            Some(crate::sandbox_backend::SandboxMode::Off) => "off",
-            Some(crate::sandbox_backend::SandboxMode::Os) | None => "on",
-        }
+        crate::sandbox_backend::resolve_mode(session.sandbox_mode).as_str()
     ));
     out.push_str(&format!("- Behavior mode: `{}`\n", session.mode.as_str()));
     out.push_str(&format!(
@@ -4726,18 +4742,14 @@ mod tests {
     /// drops one without the other gets caught.
     #[tokio::test]
     async fn handle_setup_sandbox_round_trip() {
+        use crate::sandbox_backend::SandboxMode;
         let (store, id) = make_store_with_session("m").await;
 
-        // Bare: reports "on" (default) and surfaces the usage hints.
+        // Bare: reports the effective default and surfaces the usage hints.
         let bare = handle_setup_sandbox(&store, &id, "").await;
-        assert!(
-            bare.contains("currently `on`") || bare.contains("currently `os`"),
-            "got: {bare}"
-        );
-        assert!(
-            bare.contains("/setup sandbox off") || bare.contains("/setup sandbox wasm"),
-            "got: {bare}"
-        );
+        assert!(bare.contains("currently `os`"), "got: {bare}");
+        assert!(bare.contains("/setup sandbox default"), "got: {bare}");
+        assert!(bare.contains("/setup sandbox wasm"), "got: {bare}");
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
         // `off` flips the flag and confirms the per-call prompt is
@@ -4748,10 +4760,12 @@ mod tests {
             "got: {off}"
         );
         assert!(off.contains("permission prompts"), "got: {off}");
-        assert_eq!(
-            store.sandbox_mode(&id).await,
-            Some(Some(crate::sandbox_backend::SandboxMode::Off))
-        );
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
+
+        // `os` is a real override, distinct from clearing to default.
+        let os = handle_setup_sandbox(&store, &id, "os").await;
+        assert!(os.contains("set to `os`"), "got: {os}");
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Os)));
 
         // `on` flips it back.
         let on = handle_setup_sandbox(&store, &id, "on").await;
@@ -4762,17 +4776,10 @@ mod tests {
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
         // `status` reports without mutating.
-        assert!(
-            store
-                .set_sandbox_mode(&id, Some(crate::sandbox_backend::SandboxMode::Off))
-                .await
-        );
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
         let status = handle_setup_sandbox(&store, &id, "status").await;
         assert!(status.contains("`off`"), "got: {status}");
-        assert_eq!(
-            store.sandbox_mode(&id).await,
-            Some(Some(crate::sandbox_backend::SandboxMode::Off))
-        );
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
 
         // `wasm` sets sandbox mode to Wasm.
         let wasm = handle_setup_sandbox(&store, &id, "wasm").await;
@@ -4780,10 +4787,7 @@ mod tests {
             wasm.contains("set to `wasm`") || wasm.contains("WASM sandbox"),
             "got: {wasm}"
         );
-        assert_eq!(
-            store.sandbox_mode(&id).await,
-            Some(Some(crate::sandbox_backend::SandboxMode::Wasm))
-        );
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
 
         // Unknown choice is rejected and leaves state untouched.
         let bad = handle_setup_sandbox(&store, &id, "maybe").await;
@@ -4791,10 +4795,7 @@ mod tests {
             bad.contains("Unknown choice") || bad.contains("Unknown sandbox choice"),
             "got: {bad}"
         );
-        assert_eq!(
-            store.sandbox_mode(&id).await,
-            Some(Some(crate::sandbox_backend::SandboxMode::Wasm))
-        );
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
 
         // Unknown session id is surfaced rather than silently noop'd.
         let missing = handle_setup_sandbox(&store, "no-such", "off").await;

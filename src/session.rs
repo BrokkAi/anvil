@@ -19,7 +19,7 @@ use crate::tools::ToolRegistry;
 
 /// Upper bound on the size of a session zip we will read off disk. Any
 /// archive larger than this is rejected before bytes flow through
-/// `SandboxStrategy::read_zip_entry_text`, so a corrupted or hostile
+/// `SandboxBackend::read_zip_entry_text`, so a corrupted or hostile
 /// `~/.brokk/sessions/<id>.zip` cannot OOM the agent. 256 MiB is well
 /// above what `write_new_session_zip` produces in practice (sessions
 /// dominated by conversation text rarely cross a few MB).
@@ -2006,9 +2006,22 @@ impl SessionStore {
         // I/O off the lock keeps prompt turns and other session
         // mutations unblocked. The discovery results are then swapped
         // in atomically alongside the cwd.
-        let project_instructions = crate::agents_md::discover(&cwd);
-        let skills = Arc::new(crate::skills::discover(&cwd));
-        let agents = Arc::new(crate::agents::discover(&cwd));
+        let sandbox_mode = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return;
+            };
+            session.sandbox_mode
+        };
+        let project_instructions = crate::agents_md::discover_with_sandbox_mode(&cwd, sandbox_mode);
+        let skills = Arc::new(crate::skills::discover_with_sandbox_mode(
+            &cwd,
+            sandbox_mode,
+        ));
+        let agents = Arc::new(crate::agents::discover_with_sandbox_mode(
+            &cwd,
+            sandbox_mode,
+        ));
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
             session.project_instructions = project_instructions;
@@ -2066,10 +2079,29 @@ impl SessionStore {
         id: &str,
         mode: Option<crate::sandbox_backend::SandboxMode>,
     ) -> bool {
+        let cwd = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return false;
+            };
+            session.cwd.clone()
+        };
+
+        // Re-discover per-session context under the new parser backend so
+        // `/setup sandbox wasm|off|os` takes effect immediately for future
+        // prompts, not just after a cwd change.
+        let project_instructions = crate::agents_md::discover_with_sandbox_mode(&cwd, mode);
+        let skills = Arc::new(crate::skills::discover_with_sandbox_mode(&cwd, mode));
+        let agents = Arc::new(crate::agents::discover_with_sandbox_mode(&cwd, mode));
+
         let mut sessions = self.sessions.write().await;
         match sessions.get_mut(id) {
             Some(session) => {
                 session.sandbox_mode = mode;
+                session.project_instructions = project_instructions;
+                session.skills = skills;
+                session.agents = agents;
+                session.activated_skills.clear();
                 true
             }
             None => false,
@@ -2077,7 +2109,8 @@ impl SessionStore {
     }
 
     /// Read the current sandbox mode override for a session. Returns
-    /// `None` if the session is unknown or has no override.
+    /// `None` if the session is unknown, and `Some(None)` if it is known
+    /// and using the process default.
     pub async fn sandbox_mode(
         &self,
         id: &str,

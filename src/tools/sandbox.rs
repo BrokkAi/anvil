@@ -81,18 +81,30 @@ impl SandboxPolicy {
     /// `Some(Wasm)` the policy collapses to `None` regardless of the
     /// permission mode -- the per-call permission prompt (driven by
     /// `PermissionMode`) still fires, but the OS sandbox is skipped.
-    /// When `sandbox_mode` is `Some(Os)` or `None`, the permission mode
-    /// is the sole determinant. This is the session-level counterpart
+    /// When the effective mode is `Os`, the permission mode is the sole
+    /// determinant. This is the session-level counterpart
     /// to `BypassPermissions`, which disables *both* the prompt and
     /// the sandbox; `sandbox_mode` only disables the OS sandbox.
     pub fn resolve(
         permission_mode: PermissionMode,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     ) -> Self {
-        let os_enabled = match sandbox_mode {
-            Some(crate::sandbox_backend::SandboxMode::Os) | None => true,
-            Some(crate::sandbox_backend::SandboxMode::Wasm) => false,
-            Some(crate::sandbox_backend::SandboxMode::Off) => false,
+        Self::resolve_with_default(
+            permission_mode,
+            sandbox_mode,
+            crate::sandbox_backend::default_mode(),
+        )
+    }
+
+    fn resolve_with_default(
+        permission_mode: PermissionMode,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        default_mode: crate::sandbox_backend::SandboxMode,
+    ) -> Self {
+        let os_enabled = match sandbox_mode.unwrap_or(default_mode) {
+            crate::sandbox_backend::SandboxMode::Os => true,
+            crate::sandbox_backend::SandboxMode::Wasm => false,
+            crate::sandbox_backend::SandboxMode::Off => false,
         };
         if os_enabled {
             Self::from_permission_mode(permission_mode)
@@ -789,7 +801,7 @@ fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<Str
 
 /// Returns `true` if the OS-level shell sandbox is currently available on
 /// this host. Used by `main.rs` at startup to decide which
-/// `sandbox_backend::SandboxStrategy` to install:
+/// `sandbox_backend::SandboxBackend` to install:
 ///
 /// - `true`  → `OsNative`: shell commands get wrapped by bwrap / seatbelt,
 ///   parsing runs natively (the OS sandbox is the security boundary).
@@ -880,6 +892,34 @@ mod tests {
         );
         assert_eq!(
             SandboxPolicy::from_permission_mode(PermissionMode::AcceptEdits),
+            SandboxPolicy::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn resolve_uses_process_default_when_session_has_no_override() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert_eq!(
+            SandboxPolicy::resolve_with_default(PermissionMode::Default, None, SandboxMode::Wasm),
+            SandboxPolicy::None
+        );
+        assert_eq!(
+            SandboxPolicy::resolve_with_default(PermissionMode::Default, None, SandboxMode::Os),
+            SandboxPolicy::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn resolve_os_override_enables_os_policy_even_when_default_is_wasm() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert_eq!(
+            SandboxPolicy::resolve_with_default(
+                PermissionMode::Default,
+                Some(SandboxMode::Os),
+                SandboxMode::Wasm
+            ),
             SandboxPolicy::WorkspaceWrite
         );
     }

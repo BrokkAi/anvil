@@ -596,6 +596,20 @@ impl ToolRegistry {
         policy: SandboxPolicy,
         outside_sandbox_once: bool,
     ) -> ToolResult {
+        self.execute_with_sandbox_mode(name, args, policy, outside_sandbox_once, None)
+            .await
+    }
+
+    /// Same as `execute_with_shell_notice`, with the session sandbox mode
+    /// threaded through tools that parse untrusted input (`grep_search`).
+    pub(crate) async fn execute_with_sandbox_mode(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        policy: SandboxPolicy,
+        outside_sandbox_once: bool,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> ToolResult {
         match name {
             "think" => {
                 let thought = args.get("thought").and_then(|v| v.as_str()).unwrap_or("");
@@ -646,7 +660,14 @@ impl ToolRegistry {
                 let glob = args.get("glob").and_then(|v| v.as_str());
                 let max_results = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let path = args.get("path").and_then(|v| v.as_str());
-                filesystem::search_file_contents(&self.cwd, pattern, glob, path, max_results)
+                filesystem::search_file_contents_with_sandbox_mode(
+                    &self.cwd,
+                    pattern,
+                    glob,
+                    path,
+                    max_results,
+                    sandbox_mode,
+                )
             }
             "run_shell_command" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");

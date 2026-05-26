@@ -637,6 +637,7 @@ pub(crate) async fn run(
                                     parsed_input.clone(),
                                     policy,
                                     outside_sandbox_once,
+                                    sandbox_mode,
                                 )
                                 .await
                             };
@@ -863,9 +864,10 @@ async fn execute_tool(
     args: Value,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
 ) -> ToolExecution {
     let result = registry
-        .execute_with_shell_notice(tool_name, args, policy, outside_sandbox_once)
+        .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
         .await;
     let (status_prefix, failed) = match result.status {
         ToolStatus::Success => ("", false),

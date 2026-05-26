@@ -336,8 +336,8 @@ async fn main() -> Result<()> {
     // Install the parser sandbox before any code that might load a SKILL.md
     // (or, eventually, parse AGENTS.md / session zips / regex queries) so
     // every parse goes through the chosen backend from the first call.
-    // The wasm backend is the default; `--no-wasm-sandbox` is the explicit
-    // opt-out that trades isolation for raw speed.
+    // The OS sandbox is preferred when available. Otherwise wasm is the
+    // parser-sandbox fallback unless `--no-wasm-sandbox` explicitly opts out.
     // Determine sandbox strategy: OS sandbox (preferred) or wasm fallback
     let os_available = tools::sandbox::is_os_sandbox_available();
     let strategy =

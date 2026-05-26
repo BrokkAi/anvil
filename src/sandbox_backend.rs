@@ -11,16 +11,16 @@
 //! same process, full speed, but a panic or pathological input in a
 //! third-party parser (YAML bomb, ReDoS, etc.) takes down the agent.
 //!
-//! `SandboxBackend::Wasm` spawns a wasmtime store running the embedded
+//! `SandboxBackend::WasmFallback` spawns a wasmtime store running the embedded
 //! `brokk-acp-sandbox.wasm` artifact, exchanges newline-delimited JSON
 //! over the wasm module's stdin/stdout, and tears the store down after
 //! each batch. The host imposes a per-call fuel budget (CPU bound), a
 //! memory cap, and no preopens beyond stdio so the parser cannot touch
 //! the filesystem even if it tries.
 //!
-//! Switching between the two is controlled by `--no-wasm-sandbox` /
-//! `ANVIL_NO_WASM_SANDBOX` at startup; the rest of the codebase sees
-//! only the trait object.
+//! Startup chooses the process default. Session code can then request an
+//! effective backend with [`backend_for_mode`] when a per-session
+//! `/setup sandbox os|wasm|off` override is in play.
 //!
 //! Per-session override (`/setup sandbox os|wasm|off`) controls both
 //! shell sandboxing and parsing backend for that session.
@@ -102,6 +102,7 @@ pub fn default_mode() -> SandboxMode {
 /// same process to disagree about whether the sandbox is enabled,
 /// and (c) avoiding the global would touch dozens of constructors.
 static GLOBAL: OnceLock<SandboxBackend> = OnceLock::new();
+static SESSION_WASM: OnceLock<Result<Arc<WasmSandbox>, String>> = OnceLock::new();
 
 /// Install the process-wide backend. Called once from `main` before
 /// any session is created. Subsequent calls are a no-op (the first
@@ -111,7 +112,7 @@ pub fn install_global(backend: SandboxBackend) {
     let _ = GLOBAL.set(backend);
 }
 
-/// Access the global backend. Falls back to `Native` if `install_global`
+/// Access the global backend. Falls back to `OsNative` if `install_global`
 /// was never called (unit tests, `cargo run --example`, etc.). The
 /// fallback is deliberately silent: callers that need the wasm path
 /// to have actually started should check the install path in `main`.
@@ -119,8 +120,34 @@ pub fn global() -> &'static SandboxBackend {
     GLOBAL.get_or_init(SandboxBackend::os_default)
 }
 
-/// Single entry point for parsers in this crate. Pick `Native` for
-/// raw speed, `Wasm` for isolated execution.
+/// Resolve a session-level override against the process default.
+pub fn resolve_mode(mode: Option<SandboxMode>) -> SandboxMode {
+    mode.unwrap_or_else(default_mode)
+}
+
+/// Return a parser backend for the effective session mode.
+///
+/// `None` means "use the process default". `Os` and `Off` both parse
+/// natively; they differ in shell sandbox policy, not parser dispatch.
+/// `Wasm` lazily initializes a shared wasmtime backend even when the
+/// process default is `OsNative`, so `/setup sandbox wasm` can force wasm
+/// parsing for a single session.
+pub fn backend_for_mode(mode: Option<SandboxMode>) -> Result<SandboxBackend, String> {
+    match mode {
+        None => Ok(global().clone()),
+        Some(SandboxMode::Os | SandboxMode::Off) => Ok(SandboxBackend::OsNative),
+        Some(SandboxMode::Wasm) => match global() {
+            SandboxBackend::WasmFallback(w) => Ok(SandboxBackend::WasmFallback(w.clone())),
+            SandboxBackend::OsNative => SESSION_WASM
+                .get_or_init(|| WasmSandbox::new().map(Arc::new).map_err(|e| e.to_string()))
+                .clone()
+                .map(SandboxBackend::WasmFallback),
+        },
+    }
+}
+
+/// Single entry point for parsers in this crate. Pick `OsNative` for
+/// raw speed, `WasmFallback` for isolated execution.
 #[derive(Clone)]
 pub enum SandboxBackend {
     /// OS-level sandbox (bwrap / seatbelt) + native parsing
@@ -137,24 +164,13 @@ impl SandboxBackend {
 
     /// Detect the best strategy based on OS availability and user preference.
     ///
-    /// - OS available + not forced wasm → `OsNative` (OS sandbox + native parsing)
-    /// - OS unavailable + not forced wasm → `WasmFallback` (wasm parsing)
-    /// - forced wasm → `WasmFallback` regardless
+    /// - wasm disabled → `OsNative` (native parsing, regardless of OS sandbox availability)
+    /// - OS available → `OsNative` (OS sandbox + native parsing)
+    /// - OS unavailable → `WasmFallback` (wasm parsing)
     ///
     /// Falls back to `OsNative` with a warning if wasm initialization fails.
-    pub fn detect(os_available: bool, force_wasm: bool) -> Self {
-        if force_wasm {
-            match WasmSandbox::new() {
-                Ok(w) => Self::WasmFallback(Arc::new(w)),
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        "wasm sandbox requested but failed to initialize; falling back to OsNative"
-                    );
-                    Self::OsNative
-                }
-            }
-        } else if os_available {
+    pub fn detect(os_available: bool, wasm_disabled: bool) -> Self {
+        if wasm_disabled || os_available {
             Self::OsNative
         } else {
             match WasmSandbox::new() {
@@ -1157,6 +1173,26 @@ enum SandboxBody<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn detect_no_wasm_sandbox_forces_native_even_without_os_sandbox() {
+        assert!(matches!(
+            SandboxBackend::detect(false, true),
+            SandboxBackend::OsNative
+        ));
+    }
+
+    #[test]
+    fn backend_for_mode_off_and_os_use_native_parser() {
+        assert!(matches!(
+            backend_for_mode(Some(SandboxMode::Off)).expect("off mode should resolve"),
+            SandboxBackend::OsNative
+        ));
+        assert!(matches!(
+            backend_for_mode(Some(SandboxMode::Os)).expect("os mode should resolve"),
+            SandboxBackend::OsNative
+        ));
+    }
+
     /// End-to-end smoke test: the wasm sandbox boots, parses a valid
     /// SKILL.md frontmatter through the JSON-RPC wire, and returns
     /// the expected `ParsedFrontmatter` to the host. This is the
@@ -1195,7 +1231,7 @@ mod tests {
         );
     }
 
-    /// `SandboxBackend::OsNative` and `SandboxBackend::Wasm` must produce
+    /// `SandboxBackend::OsNative` and `SandboxBackend::WasmFallback` must produce
     /// identical results for valid input. Pins the wire contract --
     /// if the wasm guest evolves and the JSON shape drifts, this test
     /// flags the mismatch before the production parser disagrees with
