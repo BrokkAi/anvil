@@ -164,5 +164,6 @@ Release binaries are published on GitHub Releases. The `brokk-anvil` crate is pu
 
 Asset names per platform:
 - `anvil-linux-x86_64`
+- `anvil-linux-aarch64`
 - `anvil-macos-aarch64`
 - `anvil-windows-x86_64.exe`
