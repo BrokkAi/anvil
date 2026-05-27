@@ -51,7 +51,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Session-level override: `None` means use the global default;
 /// `Some(mode)` forces that mode for the session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     /// OS-level sandbox for shell commands (bwrap on Linux, seatbelt on
     /// macOS), native parsing. The preferred strategy whenever the OS

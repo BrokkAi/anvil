@@ -99,6 +99,10 @@ The server supports a variety of tools, including `readFile`, `writeFile`, `list
 - **Read-only**: Strictly forbids any tool that modifies the filesystem or executes commands.
 - **Bypass Permissions**: Trust the agent to execute all tools without interruption.
 
+Sandbox strategy is separate from permission prompts. Use `/setup sandbox
+default|os|wasm|off` to choose the shell/parser sandbox strategy for the
+current session and future sessions on the same install.
+
 ## Subagents
 
 A subagent is a markdown file that the LLM can delegate a focused task to via the `task` tool. Each delegation runs in an isolated tool loop with its own message history; only the subagent's final assistant text comes back to the parent conversation. Use them to keep noisy multi-step work (deep research, long greps, repetitive refactors) out of the main transcript.

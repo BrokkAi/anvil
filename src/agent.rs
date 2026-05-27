@@ -2757,14 +2757,15 @@ async fn handle_setup_permission(
     apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
 }
 
-/// Configure the per-session sandbox mode. Separate from `/setup
+/// Configure the session's effective sandbox mode. Separate from `/setup
 /// permissions`: this controls the sandbox boundary and parser backend,
 /// not whether the user is prompted before each tool call. `/setup
 /// permissions trusted` disables both the prompt and the sandbox; this
 /// command keeps the permission prompt behavior unchanged.
 ///
-/// In-memory only: a session reload reverts to the process default,
-/// mirroring how `permission_mode` resets on load.
+/// The choice is saved as an install-level setup preference and seeds new
+/// sessions and cold reloads. It is still kept out of session manifests so
+/// an old zip cannot impose a sandbox policy.
 async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
     use crate::sandbox_backend::SandboxMode;
 
@@ -2814,12 +2815,15 @@ async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &
         return "Error: unknown session.".to_string();
     }
     match mode {
-        Some(SandboxMode::Os) => "Sandbox set to `os`. Shell commands use the OS sandbox; parsing runs natively. Per-call permission prompts are unchanged.".to_string(),
-        Some(SandboxMode::Wasm) => "Sandbox set to `wasm`. Parsing goes through WASM sandbox; shell commands will run without OS sandbox. Per-call permission prompts are unchanged.".to_string(),
-        Some(SandboxMode::Off) => "Sandbox set to `off`. No sandboxing at all. Per-call permission prompts are unchanged.".to_string(),
+        Some(SandboxMode::Os) => "Sandbox set to `os`. Shell commands use the OS sandbox; parsing runs natively. Per-call permission prompts are unchanged. This preference will apply to future sessions.".to_string(),
+        Some(SandboxMode::Wasm) => "Sandbox set to `wasm`. Parsing goes through WASM sandbox; shell commands will run without OS sandbox. Per-call permission prompts are unchanged. This preference will apply to future sessions.".to_string(),
+        Some(SandboxMode::Off) => "Sandbox set to `off`. No sandboxing at all. Per-call permission prompts are unchanged. This preference will apply to future sessions.".to_string(),
         _ => {
             let default = crate::sandbox_backend::default_mode();
-            format!("Sandbox reset to default (`{}`).", default.as_str())
+            format!(
+                "Sandbox reset to default (`{}`). This preference will apply to future sessions.",
+                default.as_str()
+            )
         }
     }
 }
@@ -3035,7 +3039,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     out.push_str("- `/setup model <model id>` - choose a specific model.\n");
     out.push_str("- `/setup permissions` - change edit/command approvals.\n");
     out.push_str(
-        "- `/setup sandbox on|off` - toggle the OS shell sandbox (per session, not persisted).\n",
+        "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
     );
     out.push_str("- `/setup mode` - change assistant behavior.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");

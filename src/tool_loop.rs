@@ -38,24 +38,37 @@ struct PermissionGrant {
     sandbox_policy_override: Option<SandboxPolicy>,
 }
 
-fn permission_options(tool_name: &str) -> Vec<PermissionOption> {
+fn permission_options(tool_name: &str, shell_sandboxed: bool) -> Vec<PermissionOption> {
     let mut options = Vec::with_capacity(4);
     if tool_name == "run_shell_command" {
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow"),
-            "Allow in sandbox",
-            PermissionOptionKind::AllowOnce,
-        ));
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow_always"),
-            "Always allow this command in sandbox",
-            PermissionOptionKind::AllowAlways,
-        ));
-        options.push(PermissionOption::new(
-            PermissionOptionId::new("allow_outside_sandbox"),
-            "Run outside sandbox once",
-            PermissionOptionKind::AllowOnce,
-        ));
+        if shell_sandboxed {
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("allow"),
+                "Allow in sandbox",
+                PermissionOptionKind::AllowOnce,
+            ));
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("allow_always"),
+                "Always allow this command in sandbox",
+                PermissionOptionKind::AllowAlways,
+            ));
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("allow_outside_sandbox"),
+                "Run outside sandbox once",
+                PermissionOptionKind::AllowOnce,
+            ));
+        } else {
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("allow"),
+                "Allow",
+                PermissionOptionKind::AllowOnce,
+            ));
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("allow_always"),
+                "Always allow this command",
+                PermissionOptionKind::AllowAlways,
+            ));
+        }
     } else {
         options.push(PermissionOption::new(
             PermissionOptionId::new("allow_always"),
@@ -79,6 +92,7 @@ fn permission_options(tool_name: &str) -> Vec<PermissionOption> {
 fn permission_grant_for_selection(
     tool_name: &str,
     option_id: &str,
+    shell_sandboxed: bool,
 ) -> Result<PermissionGrant, String> {
     match option_id {
         "allow_always" => Ok(PermissionGrant {
@@ -89,10 +103,12 @@ fn permission_grant_for_selection(
             allow_always: false,
             sandbox_policy_override: None,
         }),
-        "allow_outside_sandbox" if tool_name == "run_shell_command" => Ok(PermissionGrant {
-            allow_always: false,
-            sandbox_policy_override: Some(SandboxPolicy::None),
-        }),
+        "allow_outside_sandbox" if tool_name == "run_shell_command" && shell_sandboxed => {
+            Ok(PermissionGrant {
+                allow_always: false,
+                sandbox_policy_override: Some(SandboxPolicy::None),
+            })
+        }
         "reject" => Err("Tool use denied by user.".to_string()),
         other => {
             tracing::warn!(
@@ -140,6 +156,7 @@ enum GateDecision {
     /// Run the tool without prompting.
     Allow {
         sandbox_policy_override: Option<SandboxPolicy>,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     },
     /// Refuse the call; feed the LLM the given denial message instead.
     Reject(String),
@@ -235,7 +252,22 @@ fn pure_gate_decision(
     PureGateDecision::Prompt
 }
 
-fn always_allow_key(tool_name: &str, raw_input: &Value, cwd: &Path) -> String {
+fn shell_command_will_run_sandboxed(
+    permission_mode: PermissionMode,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> bool {
+    !matches!(
+        SandboxPolicy::resolve(permission_mode, sandbox_mode),
+        SandboxPolicy::None
+    )
+}
+
+fn always_allow_key(
+    tool_name: &str,
+    raw_input: &Value,
+    cwd: &Path,
+    shell_sandboxed: bool,
+) -> String {
     if tool_name == "run_shell_command"
         && let Some(command) = raw_input.get("command").and_then(Value::as_str)
     {
@@ -243,6 +275,7 @@ fn always_allow_key(tool_name: &str, raw_input: &Value, cwd: &Path) -> String {
             "tool": tool_name,
             "cwd": cwd.display().to_string(),
             "command": command,
+            "shellSandboxed": shell_sandboxed,
         })
         .to_string();
     }
@@ -548,6 +581,7 @@ pub(crate) async fn run(
                         }
                         GateDecision::Allow {
                             sandbox_policy_override,
+                            sandbox_mode,
                         } => {
                             maybe_send_session_update(
                                 notifications,
@@ -576,7 +610,6 @@ pub(crate) async fn run(
                             // (race), fail safe to ReadOnly: the gate already cleared
                             // the call but we no longer trust the mode lookup.
                             let permission_mode = sessions.permission_mode(&session_id).await;
-                            let sandbox_mode = sessions.sandbox_mode(&session_id).await.flatten();
                             if permission_mode.is_none() {
                                 tracing::warn!(
                                     session_id,
@@ -719,7 +752,10 @@ async fn consult_gate(
             );
         }
     };
-    let always_allow_key = always_allow_key(tool_name, raw_input, cwd);
+    let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
+    let shell_sandboxed =
+        tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
+    let always_allow_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
     let is_always_allowed = sessions
         .is_always_allowed(session_id, &always_allow_key)
         .await;
@@ -727,17 +763,21 @@ async fn consult_gate(
     match pure_gate_decision(mode, kind, tool_name, is_always_allowed) {
         PureGateDecision::Allow => GateDecision::Allow {
             sandbox_policy_override: None,
+            sandbox_mode,
         },
         PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
         PureGateDecision::Prompt => {
             match request_user_permission(
                 spawned_cx,
                 cancel,
-                session_id,
-                tool_name,
-                kind,
-                tool_call_id,
-                raw_input,
+                PermissionRequest {
+                    session_id,
+                    tool_name,
+                    kind,
+                    tool_call_id,
+                    raw_input,
+                    shell_sandboxed,
+                },
             )
             .await
             {
@@ -751,6 +791,7 @@ async fn consult_gate(
                     }
                     GateDecision::Allow {
                         sandbox_policy_override: grant.sandbox_policy_override,
+                        sandbox_mode,
                     }
                 }
                 Err(reason) => GateDecision::Reject(reason),
@@ -762,15 +803,29 @@ async fn consult_gate(
 /// Send `session/request_permission` to the client and await the outcome.
 /// Returns `Ok(grant)` if the user approved (with or without remembering),
 /// or `Err(reason)` describing the rejection or transport failure.
+struct PermissionRequest<'a> {
+    session_id: &'a str,
+    tool_name: &'a str,
+    kind: ToolKind,
+    tool_call_id: &'a str,
+    raw_input: &'a Value,
+    shell_sandboxed: bool,
+}
+
 async fn request_user_permission(
     spawned_cx: &SpawnedCx<'_>,
     cancel: &CancellationToken,
-    session_id: &str,
-    tool_name: &str,
-    kind: ToolKind,
-    tool_call_id: &str,
-    raw_input: &Value,
+    request: PermissionRequest<'_>,
 ) -> Result<PermissionGrant, String> {
+    let PermissionRequest {
+        session_id,
+        tool_name,
+        kind,
+        tool_call_id,
+        raw_input,
+        shell_sandboxed,
+    } = request;
+
     // The permission modal needs to show *what* is being approved, not just
     // the tool kind. Reuse the same title-builder the standalone tool-call
     // card uses so e.g. ``Run `cargo test` `` appears in the prompt.
@@ -792,7 +847,7 @@ async fn request_user_permission(
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 
-    let options = permission_options(tool_name);
+    let options = permission_options(tool_name, shell_sandboxed);
 
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
 
@@ -831,7 +886,7 @@ async fn request_user_permission(
         Ok(resp) => match resp.outcome {
             RequestPermissionOutcome::Selected(selected) => {
                 let id: &str = &selected.option_id.0;
-                permission_grant_for_selection(tool_name, id)
+                permission_grant_for_selection(tool_name, id, shell_sandboxed)
             }
             RequestPermissionOutcome::Cancelled => Err(
                 "Tool use denied: the prompt was cancelled before the user responded.".to_string(),
@@ -1277,7 +1332,7 @@ mod tests {
 
     #[test]
     fn shell_permission_prompt_includes_explicit_outside_sandbox_choice() {
-        let options = permission_options("run_shell_command");
+        let options = permission_options("run_shell_command", true);
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -1295,8 +1350,26 @@ mod tests {
     }
 
     #[test]
+    fn shell_permission_prompt_omits_sandbox_language_when_disabled() {
+        let options = permission_options("run_shell_command", false);
+        let labels: Vec<_> = options
+            .iter()
+            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                ("allow", "Allow"),
+                ("allow_always", "Always allow this command"),
+                ("reject", "Reject"),
+            ]
+        );
+    }
+
+    #[test]
     fn shell_allow_always_choice_maps_to_sandboxed_session_approval() {
-        let grant = permission_grant_for_selection("run_shell_command", "allow_always")
+        let grant = permission_grant_for_selection("run_shell_command", "allow_always", true)
             .expect("shell sticky sandbox approval should be accepted");
 
         assert_eq!(
@@ -1315,32 +1388,44 @@ mod tests {
             "run_shell_command",
             &serde_json::json!({"command": "cargo test", "timeout": 60}),
             cwd,
+            true,
         );
         let same_without_timeout = always_allow_key(
             "run_shell_command",
             &serde_json::json!({"command": "cargo test"}),
             cwd,
+            true,
         );
         let different_command = always_allow_key(
             "run_shell_command",
             &serde_json::json!({"command": "cargo check"}),
             cwd,
+            true,
         );
         let different_cwd = always_allow_key(
             "run_shell_command",
             &serde_json::json!({"command": "cargo test"}),
             Path::new("/tmp/other"),
+            true,
+        );
+        let different_sandbox_mode = always_allow_key(
+            "run_shell_command",
+            &serde_json::json!({"command": "cargo test"}),
+            cwd,
+            false,
         );
 
         assert_eq!(first, same_without_timeout);
         assert_ne!(first, different_command);
         assert_ne!(first, different_cwd);
+        assert_ne!(first, different_sandbox_mode);
     }
 
     #[test]
     fn shell_outside_sandbox_choice_maps_to_policy_override() {
-        let grant = permission_grant_for_selection("run_shell_command", "allow_outside_sandbox")
-            .expect("shell override should be accepted");
+        let grant =
+            permission_grant_for_selection("run_shell_command", "allow_outside_sandbox", true)
+                .expect("shell override should be accepted");
 
         assert_eq!(
             grant,
@@ -1349,6 +1434,16 @@ mod tests {
                 sandbox_policy_override: Some(SandboxPolicy::None),
             }
         );
+    }
+
+    #[test]
+    fn shell_outside_sandbox_choice_is_rejected_when_shell_sandbox_disabled() {
+        let err =
+            permission_grant_for_selection("run_shell_command", "allow_outside_sandbox", false)
+                .expect_err(
+                    "outside-sandbox option is not valid when shell sandboxing is disabled",
+                );
+        assert!(err.contains("unknown option"), "got: {err}");
     }
 
     #[test]
@@ -1413,7 +1508,7 @@ mod tests {
 
     #[test]
     fn non_shell_permission_prompt_keeps_sticky_allow_and_no_override() {
-        let options = permission_options("write_file");
+        let options = permission_options("write_file", false);
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -1428,7 +1523,7 @@ mod tests {
             ]
         );
 
-        let grant = permission_grant_for_selection("write_file", "allow_always")
+        let grant = permission_grant_for_selection("write_file", "allow_always", false)
             .expect("non-shell sticky allow should still be accepted");
         assert_eq!(
             grant,
