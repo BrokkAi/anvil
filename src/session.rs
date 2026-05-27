@@ -442,7 +442,13 @@ pub struct Session {
     /// install-level setup preference for new or reloaded sessions. It is
     /// intentionally not persisted in the session zip, so a tampered or
     /// stale zip cannot silently impose a sandbox policy.
+    ///
+    /// The `sandbox_mode_explicitly_set` flag tracks whether this value
+    /// was set explicitly in the current session (via `/setup sandbox`)
+    /// vs inherited from setup state. Only inherited modes are subject
+    /// to auto-sync from external setup state changes.
     pub sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    sandbox_mode_explicitly_set: bool,
     /// Approval keys the user has chosen "Always allow" for this session.
     /// Most tools use the tool name; shell commands use a scoped key.
     /// In-memory only (matches `claude-agent-acp` behavior).
@@ -531,6 +537,7 @@ impl Session {
             manifest,
             permission_mode,
             sandbox_mode,
+            sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
@@ -592,6 +599,7 @@ impl Session {
             manifest,
             permission_mode: PermissionMode::Default,
             sandbox_mode,
+            sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
             // Reset reasoning effort on load -- it's a transient
             // per-session preference (per issue scope), so a
@@ -2180,6 +2188,7 @@ impl SessionStore {
         let updated = match sessions.get_mut(id) {
             Some(session) => {
                 session.sandbox_mode = mode;
+                session.sandbox_mode_explicitly_set = true;
                 session.project_instructions = project_instructions;
                 session.skills = skills;
                 session.agents = agents;
@@ -2202,6 +2211,18 @@ impl SessionStore {
         &self,
         id: &str,
     ) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+        // If the session explicitly set its sandbox mode in this session,
+        // respect that choice and don't auto-sync from external setup state.
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(id) {
+            if session.sandbox_mode_explicitly_set {
+                let mode = session.sandbox_mode;
+                drop(sessions);
+                return Some(mode);
+            }
+        }
+        drop(sessions);
+
         let Some(persisted_mode) = crate::setup_state::read_sandbox_mode_preference() else {
             return self.sessions.read().await.get(id).map(|s| s.sandbox_mode);
         };

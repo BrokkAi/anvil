@@ -151,7 +151,7 @@ fn write_inner(state: &SetupState) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("setup.json");
-    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(state).context("serializing setup state")?;
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
