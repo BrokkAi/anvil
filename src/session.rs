@@ -2214,12 +2214,12 @@ impl SessionStore {
         // If the session explicitly set its sandbox mode in this session,
         // respect that choice and don't auto-sync from external setup state.
         let sessions = self.sessions.read().await;
-        if let Some(session) = sessions.get(id) {
-            if session.sandbox_mode_explicitly_set {
-                let mode = session.sandbox_mode;
-                drop(sessions);
-                return Some(mode);
-            }
+        if let Some(session) = sessions.get(id)
+            && session.sandbox_mode_explicitly_set
+        {
+            let mode = session.sandbox_mode;
+            drop(sessions);
+            return Some(mode);
         }
         drop(sessions);
 
