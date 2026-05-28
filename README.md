@@ -84,8 +84,8 @@ Run it directly if you want to see the stdio server start:
 
 Most users connect Anvil through an ACP client rather than running it directly.
 The first session shows setup guidance; use `/setup` to choose a model provider,
-log in, refresh model discovery, change permission mode, or adjust advanced
-settings.
+log in, refresh model discovery, or adjust advanced settings. Use `/permissions`
+to change permission mode.
 
 ## Editor Setup
 
@@ -180,8 +180,10 @@ last. You can also select a specific model with `/setup model <wire id>`.
 
 Built-in commands:
 
-- `/setup`: model login, provider selection, permissions, behavior mode,
-  sandbox mode, timeout, and advanced settings.
+- `/setup`: model login, provider selection, behavior mode, sandbox mode,
+  timeout, and advanced settings.
+- `/permissions`: change edit/command approvals and remembered Always allow
+  entries.
 - `/context`: show the current session context snapshot and token estimate.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
@@ -234,19 +236,19 @@ Permission mode controls whether Anvil asks before tool calls:
 Use:
 
 ```text
-/setup permissions ask
-/setup permissions auto-edits
-/setup permissions read-only
-/setup permissions trusted
+/permissions ask
+/permissions auto-edits
+/permissions read-only
+/permissions trusted
 ```
 
 Approvals remembered through an **Always allow** prompt are session-scoped and
 can be inspected or revoked with:
 
 ```text
-/setup permissions list
-/setup permissions revoke <number-or-key>
-/setup permissions clear
+/permissions list
+/permissions revoke <number-or-key>
+/permissions clear
 ```
 
 Sandbox mode is a separate execution boundary. This matters because Anvil runs
@@ -315,7 +317,7 @@ You can override the effective mode per session:
 ```
 
 `/setup sandbox off` disables sandboxing; permission prompts remain controlled
-by `/setup permissions`.
+by `/permissions`.
 
 ## Tools
 
