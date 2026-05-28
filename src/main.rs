@@ -8,12 +8,12 @@ use clap::builder::RangedU64ValueParser;
 mod agent;
 mod agents;
 mod agents_md;
-mod bifrost_client;
 mod codex_auth;
 mod codex_client;
 mod context_manager;
 mod discovery;
 mod llm_client;
+mod mcp;
 mod multi_backend;
 mod openrouter_auth;
 mod sandbox_backend;
@@ -61,9 +61,9 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     max_history_turns: usize,
 
-    /// Path to the bifrost binary (or just "bifrost" to look it up on $PATH).
-    /// When unset, code-intelligence tools (search_symbols, etc.) are disabled.
-    #[arg(long, env = "BROKK_BIFROST_BINARY")]
+    /// DEPRECATED. MCP servers are configured with `/mcp`; Bifrost is preinstalled
+    /// there as `bifrost --root {cwd} --server core`.
+    #[arg(long, env = "BROKK_BIFROST_BINARY", hide = true)]
     bifrost_binary: Option<PathBuf>,
 
     /// Seconds of SSE inactivity before aborting a streaming LLM response.
@@ -376,6 +376,12 @@ async fn main() -> Result<()> {
              ~/.codex/auth.json exists, alongside Ollama."
         );
     }
+    if args.bifrost_binary.is_some() {
+        tracing::warn!(
+            "--bifrost-binary is deprecated and ignored. Bifrost is now the preinstalled \
+             MCP server; use `/mcp` to view or change MCP server configuration."
+        );
+    }
 
     let codex_backend = build_codex_backend().await;
     let openrouter_backend = build_openrouter_backend();
@@ -412,16 +418,10 @@ async fn main() -> Result<()> {
     let max_turns = args.max_turns.max(1);
     // Bounds on `llm_idle_timeout_secs` are enforced by the clap
     // `value_parser`, so the value reaches us already validated.
-    agent::run_agent(
-        llm,
-        sessions,
-        max_turns,
-        args.llm_idle_timeout_secs,
-        args.bifrost_binary,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("agent error: {e}");
-        anyhow::anyhow!("agent error: {e}")
-    })
+    agent::run_agent(llm, sessions, max_turns, args.llm_idle_timeout_secs)
+        .await
+        .map_err(|e| {
+            tracing::error!("agent error: {e}");
+            anyhow::anyhow!("agent error: {e}")
+        })
 }

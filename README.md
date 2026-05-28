@@ -9,7 +9,7 @@
 - **Rich Feedback**: Streams text responses and tool-call lifecycle notifications (Pending, InProgress, Completed/Failed) with inline diffs for file writes.
 - **First-Run Setup**: Starts sessions with setup guidance and keeps model/provider configuration behind one `/setup` command.
 - **Permission Gating**: Configurable security policies (Default, Accept Edits, Read-only, Bypass) to control tool execution.
-- **Code Intelligence**: Optional integration with Bifrost for symbol search, cross-references, and structural analysis.
+- **MCP Servers**: Configurable stdio MCP servers via `/mcp`, with Bifrost preinstalled for symbol search, cross-references, and structural analysis.
 - **Session Persistence**: Saves and resumes conversation history and session state from disk.
 - **Context Management**: `/context` reports current token usage against the model's window; `/compress` summarizes prior turns via the LLM (with hierarchical fallback for turns too large for one summarization call) and persists the result so reloads send the same compressed prompt. Compression also fires automatically when a prompt would overflow the configured budget.
 
@@ -22,7 +22,7 @@ The server is composed of several specialized modules:
 - **`llm_client`**: Handles communication with OpenAI-compatible APIs, including tool-calling SSE stream parsing.
 - **`session`**: Manages session state, conversation history persistence, and model/mode selection.
 - **`tools`**: Implementation of built-in filesystem tools (read, write, list) and shell execution.
-- **`bifrost_client`**: Manages the lifecycle of the Bifrost subprocess for advanced code analysis tools.
+- **`mcp`**: Manages persisted MCP server configuration and stdio MCP subprocess lifecycles.
 
 ## Configuration / CLI Options
 
@@ -36,7 +36,6 @@ There are no flags to point at a different Ollama URL or restrict the picker. If
 |------|---------|---------|-------------|
 | `--default-model` | - | - | Override the default model id for new sessions. Accepts wire form (`codex::<id>`, `ollama::<id>`, `openrouter::<id>`) or a bare id. |
 | `--max-turns` | - | `25` | Max tool-calling iterations per prompt before forcing a final response. |
-| `--bifrost-binary`| `BROKK_BIFROST_BINARY` | - | Path to the `bifrost` executable to enable code-intel tools. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | (see source) | Seconds of SSE inactivity before aborting a streaming LLM response. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 
@@ -63,10 +62,6 @@ changes — the entry is rewritten in place.
 
 Both subcommands accept:
 - `--config <path>` — override the editor config path (mostly for tests).
-- `--bifrost-binary <name|path>` — value passed via `--bifrost-binary`
-  in the entry's args. Defaults to the literal `bifrost` (assumed to be
-  on the editor's `PATH`); pass an absolute path if Bifrost lives
-  somewhere `PATH` does not reach.
 
 ### Manual / advanced
 
@@ -155,9 +150,25 @@ The model calls the `task` tool with three arguments:
 - **Silent execution.** The subagent's intermediate tool calls and streamed tokens are not sent to the client. Permission prompts still surface when required.
 - **Cancellation propagates.** Cancelling the parent prompt cancels the active subagent.
 
-## Bifrost Integration
+## MCP Servers
 
-When configured with `--bifrost-binary`, the server spawns a Bifrost subprocess to provide structural code intelligence. This enables advanced tools such as:
+Anvil reads MCP server configuration from its config file and manages stdio MCP subprocesses per session. Bifrost is preinstalled as an MCP server:
+
+```text
+bifrost --root {cwd} --server core
+```
+
+Use `/mcp` in the editor to list or change MCP servers:
+
+- `/mcp list`
+- `/mcp add <name> <command> [args...]`
+- `/mcp enable <name>`
+- `/mcp disable <name>`
+- `/mcp remove <name>`
+- `/mcp reset`
+
+The `{cwd}` placeholder in arguments expands to the session workspace root. Bifrost provides structural code-intelligence tools such as:
+
 - `search_symbols`: Find definitions across the workspace.
 - `get_symbol_sources`: Fetch source code for specific symbols.
 - `most_relevant_files`: Identify related files using import analysis and git history.

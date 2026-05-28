@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -11,36 +12,78 @@ use tokio::sync::Mutex;
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[derive(Debug)]
-pub enum BifrostError {
+pub enum McpError {
     Spawn(String),
     Io(String),
     Protocol(String),
     JsonRpc { code: i64, message: String },
 }
 
-impl fmt::Display for BifrostError {
+impl fmt::Display for McpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BifrostError::Spawn(s) => write!(f, "spawn failed: {s}"),
-            BifrostError::Io(s) => write!(f, "io error: {s}"),
-            BifrostError::Protocol(s) => write!(f, "protocol error: {s}"),
-            BifrostError::JsonRpc { code, message } => {
+            McpError::Spawn(s) => write!(f, "spawn failed: {s}"),
+            McpError::Io(s) => write!(f, "io error: {s}"),
+            McpError::Protocol(s) => write!(f, "protocol error: {s}"),
+            McpError::JsonRpc { code, message } => {
                 write!(f, "jsonrpc error {code}: {message}")
             }
         }
     }
 }
 
-impl std::error::Error for BifrostError {}
+impl std::error::Error for McpError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl McpServerConfig {
+    pub fn bifrost() -> Self {
+        Self {
+            name: "bifrost".to_string(),
+            command: "bifrost".to_string(),
+            args: vec![
+                "--root".to_string(),
+                "{cwd}".to_string(),
+                "--server".to_string(),
+                "core".to_string(),
+            ],
+            enabled: true,
+        }
+    }
+
+    pub fn rendered_args(&self, cwd: &Path) -> Vec<String> {
+        let cwd = cwd.display().to_string();
+        self.args
+            .iter()
+            .map(|arg| arg.replace("{cwd}", &cwd))
+            .collect()
+    }
+}
+
+pub fn default_servers() -> Vec<McpServerConfig> {
+    vec![McpServerConfig::bifrost()]
+}
 
 #[derive(Debug, Clone)]
-pub struct BifrostToolDef {
+pub struct McpToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
 }
 
-/// JSON-RPC client for a long-lived `bifrost --server core` subprocess.
+/// JSON-RPC client for a long-lived stdio MCP subprocess.
 ///
 /// Holds the child process for the lifetime of the client; the process is
 /// killed when the client is dropped (`kill_on_drop(true)`).
@@ -48,44 +91,43 @@ pub struct BifrostToolDef {
 /// The MCP stdio protocol is one JSON message per line. Reads and writes are
 /// serialized through a single mutex because the existing tool loop dispatches
 /// tool calls sequentially within a session.
-pub struct BifrostClient {
+pub struct McpClient {
+    name: String,
     _child: Mutex<Child>,
-    io: Mutex<BifrostIo>,
+    io: Mutex<McpIo>,
     next_id: AtomicI64,
-    tools: Vec<BifrostToolDef>,
+    tools: Vec<McpToolDef>,
 }
 
-struct BifrostIo {
+struct McpIo {
     writer: ChildStdin,
     reader: BufReader<ChildStdout>,
 }
 
-impl BifrostClient {
-    pub async fn spawn(binary: &Path, cwd: &Path) -> Result<Self, BifrostError> {
-        let mut child = Command::new(binary)
-            .arg("--root")
-            .arg(cwd)
-            .arg("--server")
-            .arg("core")
+impl McpClient {
+    pub async fn spawn(config: &McpServerConfig, cwd: &Path) -> Result<Self, McpError> {
+        let rendered_args = config.rendered_args(cwd);
+        let mut child = Command::new(&config.command)
+            .args(&rendered_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| BifrostError::Spawn(format!("{}: {e}", binary.display())))?;
+            .map_err(|e| McpError::Spawn(format!("{}: {e}", config.command)))?;
 
         let writer = child
             .stdin
             .take()
-            .ok_or_else(|| BifrostError::Spawn("missing stdin pipe".into()))?;
+            .ok_or_else(|| McpError::Spawn("missing stdin pipe".into()))?;
         let reader = BufReader::new(
             child
                 .stdout
                 .take()
-                .ok_or_else(|| BifrostError::Spawn("missing stdout pipe".into()))?,
+                .ok_or_else(|| McpError::Spawn("missing stdout pipe".into()))?,
         );
 
-        let mut io = BifrostIo { writer, reader };
+        let mut io = McpIo { writer, reader };
         let next_id = AtomicI64::new(1);
 
         let init_id = next_id.fetch_add(1, Ordering::SeqCst);
@@ -113,13 +155,16 @@ impl BifrostClient {
         let tools = parse_tool_list(list)?;
 
         tracing::info!(
-            binary = %binary.display(),
+            server = %config.name,
+            command = %config.command,
+            args = ?rendered_args,
             cwd = %cwd.display(),
             tool_count = tools.len(),
-            "bifrost subprocess ready"
+            "mcp server ready"
         );
 
         Ok(Self {
+            name: config.name.clone(),
             _child: Mutex::new(child),
             io: Mutex::new(io),
             next_id,
@@ -127,11 +172,15 @@ impl BifrostClient {
         })
     }
 
-    pub fn tools(&self) -> &[BifrostToolDef] {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn tools(&self) -> &[McpToolDef] {
         &self.tools
     }
 
-    pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, BifrostError> {
+    pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut io = self.io.lock().await;
         write_request(
@@ -153,9 +202,9 @@ impl BifrostClient {
                 .and_then(|c| c.get(0))
                 .and_then(|m| m.get("text"))
                 .and_then(Value::as_str)
-                .unwrap_or("Unknown bifrost tool error")
+                .unwrap_or("Unknown MCP tool error")
                 .to_string();
-            return Err(BifrostError::Protocol(msg));
+            return Err(McpError::Protocol(msg));
         }
 
         if let Some(structured) = result.get("structuredContent") {
@@ -173,11 +222,11 @@ impl BifrostClient {
 }
 
 async fn write_request(
-    io: &mut BifrostIo,
+    io: &mut McpIo,
     id: i64,
     method: &str,
     params: Value,
-) -> Result<(), BifrostError> {
+) -> Result<(), McpError> {
     write_message(
         io,
         &json!({
@@ -190,11 +239,7 @@ async fn write_request(
     .await
 }
 
-async fn write_notification(
-    io: &mut BifrostIo,
-    method: &str,
-    params: Value,
-) -> Result<(), BifrostError> {
+async fn write_notification(io: &mut McpIo, method: &str, params: Value) -> Result<(), McpError> {
     write_message(
         io,
         &json!({
@@ -206,40 +251,39 @@ async fn write_notification(
     .await
 }
 
-async fn write_message(io: &mut BifrostIo, msg: &Value) -> Result<(), BifrostError> {
-    let mut bytes =
-        serde_json::to_vec(msg).map_err(|e| BifrostError::Io(format!("serialize: {e}")))?;
+async fn write_message(io: &mut McpIo, msg: &Value) -> Result<(), McpError> {
+    let mut bytes = serde_json::to_vec(msg).map_err(|e| McpError::Io(format!("serialize: {e}")))?;
     bytes.push(b'\n');
     io.writer
         .write_all(&bytes)
         .await
-        .map_err(|e| BifrostError::Io(format!("write: {e}")))?;
+        .map_err(|e| McpError::Io(format!("write: {e}")))?;
     io.writer
         .flush()
         .await
-        .map_err(|e| BifrostError::Io(format!("flush: {e}")))?;
+        .map_err(|e| McpError::Io(format!("flush: {e}")))?;
     Ok(())
 }
 
-async fn read_response(io: &mut BifrostIo, expected_id: i64) -> Result<Value, BifrostError> {
+async fn read_response(io: &mut McpIo, expected_id: i64) -> Result<Value, McpError> {
     loop {
         let mut line = String::new();
         let n = io
             .reader
             .read_line(&mut line)
             .await
-            .map_err(|e| BifrostError::Io(format!("read: {e}")))?;
+            .map_err(|e| McpError::Io(format!("read: {e}")))?;
         if n == 0 {
-            return Err(BifrostError::Io("bifrost subprocess closed stdout".into()));
+            return Err(McpError::Io("mcp server closed stdout".into()));
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let value: Value = serde_json::from_str(trimmed)
-            .map_err(|e| BifrostError::Protocol(format!("parse: {e} (line: {trimmed})")))?;
+            .map_err(|e| McpError::Protocol(format!("parse: {e} (line: {trimmed})")))?;
         if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
-            tracing::debug!(?value, "skipping bifrost message with unexpected id");
+            tracing::debug!(?value, "skipping mcp message with unexpected id");
             continue;
         }
         if let Some(error) = value.get("error") {
@@ -249,27 +293,27 @@ async fn read_response(io: &mut BifrostIo, expected_id: i64) -> Result<Value, Bi
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            return Err(BifrostError::JsonRpc { code, message });
+            return Err(McpError::JsonRpc { code, message });
         }
         return value
             .get("result")
             .cloned()
-            .ok_or_else(|| BifrostError::Protocol("response missing result".into()));
+            .ok_or_else(|| McpError::Protocol("response missing result".into()));
     }
 }
 
-fn parse_tool_list(result: Value) -> Result<Vec<BifrostToolDef>, BifrostError> {
+fn parse_tool_list(result: Value) -> Result<Vec<McpToolDef>, McpError> {
     let tools_array = result
         .get("tools")
         .and_then(Value::as_array)
-        .ok_or_else(|| BifrostError::Protocol("tools/list missing 'tools' array".into()))?;
+        .ok_or_else(|| McpError::Protocol("tools/list missing 'tools' array".into()))?;
     tools_array
         .iter()
         .map(|tool| {
             let name = tool
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| BifrostError::Protocol("tool missing name".into()))?
+                .ok_or_else(|| McpError::Protocol("tool missing name".into()))?
                 .to_string();
             let description = tool
                 .get("description")
@@ -280,7 +324,7 @@ fn parse_tool_list(result: Value) -> Result<Vec<BifrostToolDef>, BifrostError> {
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object" }));
-            Ok(BifrostToolDef {
+            Ok(McpToolDef {
                 name,
                 description,
                 input_schema,
@@ -488,7 +532,13 @@ mod tests {
             .canonicalize()
             .expect("canonicalize");
 
-        let client = BifrostClient::spawn(&binary, &cwd)
+        let config = McpServerConfig {
+            name: "bifrost".to_string(),
+            command: binary.display().to_string(),
+            args: McpServerConfig::bifrost().args,
+            enabled: true,
+        };
+        let client = McpClient::spawn(&config, &cwd)
             .await
             .expect("bifrost subprocess should start");
 
@@ -529,7 +579,7 @@ mod tests {
         // of the JSON-RPC reader/writer mutex (id correlation, sequential
         // dispatch, response-shape branching) -- not just one-shot dispatch.
         let result = client
-            .call_tool("search_symbols", json!({ "patterns": ["BifrostClient"] }))
+            .call_tool("search_symbols", json!({ "patterns": ["McpClient"] }))
             .await
             .expect("search_symbols call should succeed");
         eprintln!(
@@ -540,7 +590,7 @@ mod tests {
         let result = client
             .call_tool(
                 "list_symbols",
-                json!({ "file_patterns": ["brokk-acp-rust/src/bifrost_client.rs"] }),
+                json!({ "file_patterns": ["brokk-acp-rust/src/mcp.rs"] }),
             )
             .await
             .expect("list_symbols call should succeed");

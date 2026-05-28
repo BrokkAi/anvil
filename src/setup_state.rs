@@ -5,7 +5,8 @@
 //! The file only records whether the user has already seen the first-run
 //! setup screen and the last selected model/reasoning effort/sandbox mode so
 //! configured installs get a short hint instead of the full welcome on every
-//! new session.
+//! new session. It also stores user-configured MCP servers; when that field is
+//! absent, Anvil seeds the config with its preinstalled servers.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,8 @@ pub struct SetupState {
     pub last_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
 }
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -100,6 +103,20 @@ pub fn remember_last_reasoning_effort(reasoning_effort: Option<String>) -> Resul
 
 pub fn remember_sandbox_mode(mode: Option<crate::sandbox_backend::SandboxMode>) -> Result<()> {
     update(|state| state.last_sandbox_mode = mode)
+}
+
+pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
+    #[cfg(test)]
+    if path().is_err() {
+        return Vec::new();
+    }
+    read()
+        .mcp_servers
+        .unwrap_or_else(crate::mcp::default_servers)
+}
+
+pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
+    update(|state| state.mcp_servers = Some(servers))
 }
 
 pub fn remember_last_selection(
