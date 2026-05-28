@@ -219,15 +219,19 @@ fn permission_response(
 }
 
 pub fn run_gh(args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("gh")
+    run_command("gh", args)
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new(program)
         .args(args)
         .output()
-        .with_context(|| format!("run gh {}", args.join(" ")))?;
+        .with_context(|| format!("run {program} {}", args.join(" ")))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("gh {} failed: {}", args.join(" "), stderr.trim());
+        anyhow::bail!("{program} {} failed: {}", args.join(" "), stderr.trim());
     }
 }

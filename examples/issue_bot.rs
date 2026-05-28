@@ -2,7 +2,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use common::{AnvilRun, default_agent_command, run_gh, run_prompt};
 
@@ -13,8 +13,16 @@ struct Args {
     #[arg(long)]
     repo: String,
 
-    /// Issue number to analyze.
-    issue: u64,
+    /// Issue number to fetch with gh. Optional when --issue-file or --issue-text is supplied.
+    issue: Option<u64>,
+
+    /// Read issue text from a local file instead of GitHub.
+    #[arg(long, conflicts_with = "issue_text")]
+    issue_file: Option<PathBuf>,
+
+    /// Use this literal issue text instead of GitHub.
+    #[arg(long, conflicts_with = "issue_file")]
+    issue_text: Option<String>,
 
     /// Workspace path Anvil should inspect.
     #[arg(long, default_value = ".")]
@@ -24,7 +32,7 @@ struct Args {
     #[arg(long)]
     agent: Option<String>,
 
-    /// Post Anvil's answer back to the issue as a comment.
+    /// Post Anvil's answer back to the GitHub issue. Requires an issue number.
     #[arg(long)]
     post_comment: bool,
 }
@@ -32,15 +40,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let issue_number = args.issue.to_string();
-    let issue = run_gh(&[
-        "issue",
-        "view",
-        &issue_number,
-        "--repo",
-        &args.repo,
-        "--comments",
-    ])?;
+    let issue = load_issue(&args)?;
 
     let prompt = format!(
         "You are an issue triage bot for `{repo}`.\n\
@@ -58,6 +58,10 @@ async fn main() -> Result<()> {
     let response = run_prompt(config, prompt).await?;
 
     if args.post_comment {
+        let issue_number = args
+            .issue
+            .context("--post-comment requires an issue number")?
+            .to_string();
         run_gh(&[
             "issue",
             "comment",
@@ -71,4 +75,28 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_issue(args: &Args) -> Result<String> {
+    if let Some(text) = &args.issue_text {
+        return Ok(text.clone());
+    }
+
+    if let Some(path) = &args.issue_file {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("read issue file {}", path.display()));
+    }
+
+    let issue_number = args
+        .issue
+        .context("provide an issue number, --issue-file, or --issue-text")?
+        .to_string();
+    run_gh(&[
+        "issue",
+        "view",
+        &issue_number,
+        "--repo",
+        &args.repo,
+        "--comments",
+    ])
 }

@@ -25,6 +25,10 @@ struct Args {
     /// Print the draft without creating the GitHub issue.
     #[arg(long)]
     dry_run: bool,
+
+    /// Non-interactive issue description.
+    #[arg(long)]
+    prompt: Option<String>,
 }
 
 #[tokio::main]
@@ -34,10 +38,16 @@ async fn main() -> Result<()> {
     let cwd = args.cwd.canonicalize()?;
 
     println!("Anvil issue writer for {}", args.repo);
-    println!("Describe the issue. Finish with an empty line.\n");
+    let mut initial_description = args.prompt.clone();
+    if initial_description.is_none() {
+        println!("Describe the issue. Finish with an empty line.\n");
+    }
 
     loop {
-        let description = read_multiline("> ")?;
+        let description = match initial_description.take() {
+            Some(text) => text,
+            None => read_multiline("> ")?,
+        };
         if description.trim().is_empty() {
             println!("No description entered.");
             return Ok(());
