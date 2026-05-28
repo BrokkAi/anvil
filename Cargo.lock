@@ -403,6 +403,7 @@ dependencies = [
  "futures",
  "libc",
  "oauth2",
+ "rand 0.9.4",
  "regex",
  "reqwest",
  "serde",

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -449,6 +449,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "compress",
             "Summarize uncompressed turns to free up context window",
         ),
+        AvailableCommand::new("mcp", "List and configure MCP servers"),
         AvailableCommand::new(
             "pr-create",
             "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
@@ -461,7 +462,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
 /// filtered skills entirely" guidance: don't expose a slash that won't
 /// actually dispatch to the skill).
 fn builtin_command_names() -> std::collections::HashSet<&'static str> {
-    ["context", "setup", "compress", "pr-create"]
+    ["context", "setup", "compress", "mcp", "pr-create"]
         .into_iter()
         .collect()
 }
@@ -762,7 +763,6 @@ pub async fn run_agent(
     sessions: SessionStore,
     max_turns: usize,
     default_idle_timeout_secs: u64,
-    bifrost_binary: Option<PathBuf>,
 ) -> agent_client_protocol::Result<()> {
     let llm_init = llm.clone();
     let sessions_init = sessions.clone();
@@ -790,7 +790,6 @@ pub async fn run_agent(
     let llm_login = llm.clone();
     let sessions_prompt = sessions.clone();
     let sessions_login = sessions.clone();
-    let bifrost_binary_prompt = bifrost_binary.clone();
 
     let sessions_cancel = sessions.clone();
     let sessions_mode = sessions.clone();
@@ -1092,6 +1091,12 @@ pub async fn run_agent(
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
+                if is_slash_command(&raw_prompt_text, "mcp") {
+                    let report = handle_mcp(&raw_prompt_text, &sessions_prompt, &session_id).await;
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+
                 if is_slash_command(&raw_prompt_text, "pr-create") {
                     let permission_mode = sessions_prompt
                         .permission_mode(&session_id)
@@ -1104,11 +1109,7 @@ pub async fn run_agent(
                     // uses. The registry is created on demand if this is
                     // the session's first prompt.
                     let registry = sessions_prompt
-                        .get_or_create_registry(
-                            &session_id,
-                            snap.cwd.clone(),
-                            bifrost_binary_prompt.as_deref(),
-                        )
+                        .get_or_create_registry(&session_id, snap.cwd.clone())
                         .await;
                     let report = handle_pr_create(
                         &raw_prompt_text,
@@ -1274,7 +1275,7 @@ pub async fn run_agent(
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
                 let registry = sessions_prompt
-                    .get_or_create_registry(&session_id, snap.cwd, bifrost_binary_prompt.as_deref())
+                    .get_or_create_registry(&session_id, snap.cwd)
                     .await;
 
                 // Capture everything the spawned task needs before we move into it.
@@ -2376,6 +2377,259 @@ fn parse_idle_timeout_arg(prompt_text: &str) -> Result<IdleTimeoutAction, String
     }
 }
 
+fn parse_shell_words(input: &str) -> Result<Vec<String>, String> {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = Quote::None;
+    let mut current_started = false;
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::None => match ch {
+                c if c.is_whitespace() => {
+                    if current_started {
+                        words.push(std::mem::take(&mut current));
+                        current_started = false;
+                    }
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    current_started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    current_started = true;
+                }
+                '\\' => {
+                    let Some(next) = chars.next() else {
+                        return Err("Trailing backslash in MCP command.".to_string());
+                    };
+                    current.push(next);
+                    current_started = true;
+                }
+                _ => {
+                    current.push(ch);
+                    current_started = true;
+                }
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    let Some(next) = chars.next() else {
+                        return Err("Trailing backslash in MCP command.".to_string());
+                    };
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                        current.push(next);
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    match quote {
+        Quote::Single => return Err("Unclosed single quote in MCP command.".to_string()),
+        Quote::Double => return Err("Unclosed double quote in MCP command.".to_string()),
+        Quote::None => {}
+    }
+    if current_started {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str) -> String {
+    let trimmed = slash_command_args(prompt_text);
+    if trimmed.is_empty() {
+        return render_mcp_servers();
+    }
+
+    let words = match parse_shell_words(&trimmed) {
+        Ok(words) => words,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let command = words
+        .first()
+        .map(|word| word.to_ascii_lowercase())
+        .unwrap_or_default();
+    if command == "list" {
+        return render_mcp_servers();
+    }
+    let result = match command.as_str() {
+        "add" | "set" => {
+            let mut framing = crate::mcp::McpFraming::ContentLength;
+            let mut idx = 1;
+            if words.get(idx).is_some_and(|word| word == "--framing") {
+                let Some(raw_framing) = words.get(idx + 1) else {
+                    return mcp_usage();
+                };
+                let Some(parsed) = crate::mcp::McpFraming::parse(raw_framing) else {
+                    return "Unknown MCP framing. Use `content-length` or `line`.".to_string();
+                };
+                framing = parsed;
+                idx += 2;
+            }
+            if words.len() < idx + 2 {
+                return mcp_usage();
+            }
+            let name = &words[idx];
+            let server_command = &words[idx + 1];
+            if !valid_mcp_name(name) {
+                return "MCP server names may contain only letters, numbers, `_`, `-`, and `.`."
+                    .to_string();
+            }
+            let mut servers = crate::setup_state::read_mcp_servers();
+            let server = crate::mcp::McpServerConfig {
+                name: name.to_string(),
+                command: server_command.to_string(),
+                args: words[idx + 2..].to_vec(),
+                framing,
+                enabled: true,
+            };
+            if let Some(existing) = servers.iter_mut().find(|s| s.name == *name) {
+                *existing = server;
+            } else {
+                servers.push(server);
+            }
+            crate::setup_state::remember_mcp_servers(servers)
+                .map(|_| format!("MCP server `{name}` saved and enabled."))
+        }
+        "remove" | "delete" | "rm" => {
+            let Some(name) = words.get(1) else {
+                return mcp_usage();
+            };
+            let mut servers = crate::setup_state::read_mcp_servers();
+            let before = servers.len();
+            servers.retain(|s| s.name != *name);
+            if servers.len() == before {
+                return format!("No MCP server named `{name}` is configured.");
+            }
+            crate::setup_state::remember_mcp_servers(servers)
+                .map(|_| format!("MCP server `{name}` removed."))
+        }
+        "enable" | "disable" => {
+            let Some(name) = words.get(1) else {
+                return mcp_usage();
+            };
+            let enabled = command == "enable";
+            let mut servers = crate::setup_state::read_mcp_servers();
+            let Some(server) = servers.iter_mut().find(|s| s.name == *name) else {
+                return format!("No MCP server named `{name}` is configured.");
+            };
+            server.enabled = enabled;
+            crate::setup_state::remember_mcp_servers(servers).map(|_| {
+                format!(
+                    "MCP server `{name}` {}.",
+                    if enabled { "enabled" } else { "disabled" }
+                )
+            })
+        }
+        "reset" => crate::setup_state::remember_mcp_servers(crate::mcp::default_servers())
+            .map(|_| "MCP servers reset to Anvil defaults.".to_string()),
+        "help" => return mcp_usage(),
+        _ => return format!("Unknown MCP command `{command}`.\n\n{}", mcp_usage()),
+    };
+
+    match result {
+        Ok(message) => {
+            sessions.invalidate_registry(session_id).await;
+            format!("{message}\n\nChanges take effect on the next tool-capable prompt.")
+        }
+        Err(e) => format!("Error: failed to save MCP configuration: {e:#}"),
+    }
+}
+
+fn valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn render_mcp_servers() -> String {
+    let servers = crate::setup_state::read_mcp_servers();
+    let mut out = String::from("MCP servers\n\n");
+    if servers.is_empty() {
+        out.push_str("No MCP servers are configured.\n\n");
+    } else {
+        for server in servers {
+            let status = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let args = if server.args.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {}",
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| shell_quote(arg))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+            out.push_str(&format!(
+                "- `{}` ({status}, {}): `{}{args}`\n",
+                server.name,
+                server.framing.as_str(),
+                shell_quote(&server.command)
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str(&mcp_usage());
+    out
+}
+
+fn mcp_usage() -> String {
+    "Commands:\n\
+     - `/mcp list`\n\
+     - `/mcp add [--framing content-length|line] <name> <command> [args...]`\n\
+     - `/mcp enable <name>`\n\
+     - `/mcp disable <name>`\n\
+     - `/mcp remove <name>`\n\
+     - `/mcp reset`\n\n\
+     `content-length` is the standard MCP stdio framing and is the default for new \
+     servers. Use `line` only for NDJSON-speaking servers. Use shell-style quoting \
+     for commands or args that contain spaces, and use `{cwd}` in args to pass the \
+     current workspace root. Bifrost is preinstalled as \
+     `/mcp add --framing line bifrost bifrost --root '{cwd}' --server core`."
+        .to_string()
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '{' | '}')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Handle the `/idle-timeout` slash command. Reads/sets the per-session
 /// LLM SSE idle timeout (in seconds). The session override is in-memory
 /// only -- it does not survive a session reload or a server restart.
@@ -2740,8 +2994,22 @@ async fn handle_setup_permission(
                 - `/setup permissions ask` - Ask before edits and commands.\n\
                 - `/setup permissions auto-edits` - Edit files automatically, ask for commands.\n\
                 - `/setup permissions read-only` - Do not change files or run commands.\n\
-                - `/setup permissions trusted` - Allow tool calls without prompting."
+                - `/setup permissions trusted` - Allow tool calls without prompting.\n\
+                - `/setup permissions list` - Show remembered Always allow approvals.\n\
+                - `/setup permissions revoke <number-or-key>` - Forget one remembered approval.\n\
+                - `/setup permissions clear` - Forget all remembered approvals for this session."
             .to_string();
+    }
+    let (action, arg) = split_setup_action(rest);
+    match action.to_ascii_lowercase().as_str() {
+        "list" | "show" | "always" | "remembered" => {
+            return render_always_allowed_permissions(sessions, session_id).await;
+        }
+        "revoke" | "remove" | "forget" => {
+            return revoke_always_allowed_permission(sessions, session_id, arg).await;
+        }
+        "clear" | "reset" => return clear_always_allowed_permissions(sessions, session_id).await,
+        _ => {}
     }
     let value = match rest.to_ascii_lowercase().as_str() {
         "ask" | "default" => "default",
@@ -2750,11 +3018,117 @@ async fn handle_setup_permission(
         "trusted" | "bypass" | "bypass-permissions" => "bypassPermissions",
         _ => {
             return "Unknown permission choice. Try `/setup permissions ask`, \
-                    `auto-edits`, `read-only`, or `trusted`."
+                    `auto-edits`, `read-only`, `trusted`, `list`, `revoke`, or `clear`."
                 .to_string();
         }
     };
     apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
+}
+
+fn split_setup_action(input: &str) -> (&str, &str) {
+    let trimmed = input.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => {
+            let (action, rest) = trimmed.split_at(idx);
+            (action, rest.trim())
+        }
+        None => (trimmed, ""),
+    }
+}
+
+async fn render_always_allowed_permissions(sessions: &SessionStore, session_id: &str) -> String {
+    let Some(keys) = sessions.always_allow_keys(session_id).await else {
+        return "Error: unknown session.".to_string();
+    };
+    if keys.is_empty() {
+        return "No remembered Always allow approvals for this session.".to_string();
+    }
+
+    let mut out = String::from("Remembered Always allow approvals for this session:\n\n");
+    for (idx, key) in keys.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {}\n",
+            idx + 1,
+            describe_always_allow_key(key)
+        ));
+        out.push_str(&format!("   Key: `{key}`\n"));
+    }
+    out.push_str(
+        "\nUse `/setup permissions revoke <number>` to forget one, or \
+         `/setup permissions clear` to forget all.",
+    );
+    out
+}
+
+async fn revoke_always_allowed_permission(
+    sessions: &SessionStore,
+    session_id: &str,
+    arg: &str,
+) -> String {
+    if arg.is_empty() {
+        return "Usage: `/setup permissions revoke <number-or-key>`.\n\
+                Run `/setup permissions list` to see remembered approvals."
+            .to_string();
+    }
+
+    let Some(keys) = sessions.always_allow_keys(session_id).await else {
+        return "Error: unknown session.".to_string();
+    };
+    let key = match arg.parse::<usize>() {
+        Ok(index) if (1..=keys.len()).contains(&index) => keys[index - 1].clone(),
+        Ok(_) => {
+            return format!(
+                "No remembered Always allow approval numbered `{arg}`. \
+                 Run `/setup permissions list` to see valid numbers."
+            );
+        }
+        Err(_) => arg.to_string(),
+    };
+
+    match sessions.remove_always_allow(session_id, &key).await {
+        Some(true) => format!(
+            "Forgot Always allow approval: {}",
+            describe_always_allow_key(&key)
+        ),
+        Some(false) => "No matching remembered Always allow approval was found.".to_string(),
+        None => "Error: unknown session.".to_string(),
+    }
+}
+
+async fn clear_always_allowed_permissions(sessions: &SessionStore, session_id: &str) -> String {
+    match sessions.clear_always_allow(session_id).await {
+        Some(0) => "No remembered Always allow approvals to clear.".to_string(),
+        Some(1) => "Forgot 1 remembered Always allow approval.".to_string(),
+        Some(count) => format!("Forgot {count} remembered Always allow approvals."),
+        None => "Error: unknown session.".to_string(),
+    }
+}
+
+fn describe_always_allow_key(key: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(key).ok();
+    if let Some(value) = parsed
+        && value.get("tool").and_then(serde_json::Value::as_str) == Some("run_shell_command")
+    {
+        let command = value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(unknown command)");
+        let cwd = value
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(unknown cwd)");
+        let sandbox = match value
+            .get("shellSandboxed")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => "sandboxed",
+            Some(false) => "unsandboxed",
+            None => "sandbox unknown",
+        };
+        return format!("run_shell_command `{command}` in `{cwd}` ({sandbox})");
+    }
+
+    format!("tool `{key}`")
 }
 
 /// Configure the session's effective sandbox mode. Separate from `/setup
@@ -3513,6 +3887,7 @@ fn render_context_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn is_slash_command_matches_bare_and_with_args() {
@@ -3580,6 +3955,35 @@ mod tests {
     fn parse_idle_timeout_arg_rejects_non_numeric_junk() {
         let err = parse_idle_timeout_arg("/idle-timeout banana").expect_err("junk must reject");
         assert!(err.contains("Unknown subcommand"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_shell_words_supports_quotes_and_escapes() {
+        assert_eq!(
+            parse_shell_words(
+                r#"add --framing content-length win "C:\Program Files\server.exe" --arg '{"k":"v v"}'"#
+            )
+            .unwrap(),
+            vec![
+                "add",
+                "--framing",
+                "content-length",
+                "win",
+                r#"C:\Program Files\server.exe"#,
+                "--arg",
+                r#"{"k":"v v"}"#
+            ]
+        );
+        assert_eq!(
+            parse_shell_words(r#"add local command\ with\ spaces --flag"#).unwrap(),
+            vec!["add", "local", "command with spaces", "--flag"]
+        );
+    }
+
+    #[test]
+    fn parse_shell_words_rejects_unclosed_quotes() {
+        let err = parse_shell_words(r#"add bad "unterminated"#).expect_err("must reject");
+        assert!(err.contains("Unclosed double quote"), "got: {err}");
     }
 
     #[test]
@@ -4276,6 +4680,7 @@ mod tests {
                 "context",
                 "setup",
                 "compress",
+                "mcp",
                 "pr-create",
                 "apple",
                 "zebra"
@@ -4494,6 +4899,49 @@ mod tests {
             std::env::temp_dir().join(format!("brokk-acp-configure-{}", uuid::Uuid::new_v4()));
         let session = store.create_session(cwd).await;
         (store, session.id)
+    }
+
+    #[test]
+    fn describe_always_allow_key_formats_shell_keys() {
+        let key = serde_json::json!({
+            "tool": "run_shell_command",
+            "cwd": "/work/repo",
+            "command": "cargo test",
+            "shellSandboxed": true,
+        })
+        .to_string();
+
+        assert_eq!(
+            describe_always_allow_key(&key),
+            "run_shell_command `cargo test` in `/work/repo` (sandboxed)"
+        );
+        assert_eq!(describe_always_allow_key("write_file"), "tool `write_file`");
+    }
+
+    #[tokio::test]
+    async fn remembered_permissions_can_be_listed_revoked_and_cleared() {
+        let (store, id) = make_store_with_session("m").await;
+        store.add_always_allow(&id, "write_file").await;
+        store.add_always_allow(&id, "run_shell_command").await;
+
+        let listed = render_always_allowed_permissions(&store, &id).await;
+        assert!(listed.contains("1. tool `write_file`"), "{listed}");
+        assert!(listed.contains("2. tool `run_shell_command`"), "{listed}");
+
+        let revoked = revoke_always_allowed_permission(&store, &id, "1").await;
+        assert_eq!(revoked, "Forgot Always allow approval: tool `write_file`");
+        assert!(!store.is_always_allowed(&id, "write_file").await);
+        assert!(store.is_always_allowed(&id, "run_shell_command").await);
+
+        let missing = revoke_always_allowed_permission(&store, &id, "99").await;
+        assert!(missing.contains("No remembered Always allow approval numbered `99`"));
+
+        let cleared = clear_always_allowed_permissions(&store, &id).await;
+        assert_eq!(cleared, "Forgot 1 remembered Always allow approval.");
+        assert_eq!(
+            render_always_allowed_permissions(&store, &id).await,
+            "No remembered Always allow approvals for this session."
+        );
     }
 
     #[tokio::test]

@@ -22,11 +22,6 @@ use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 
-/// Cap on how long we wait for the user to respond to `session/request_permission`.
-/// Without a bound, an unattended IDE leaves the tool loop, cancellation token,
-/// and spawned task parked indefinitely with no operator-visible signal.
-const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
-
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
@@ -852,14 +847,11 @@ async fn request_user_permission(
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
 
     // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
-    // on `run` above. We also race against cancellation so a `session/cancel`
-    // notification doesn't leave us hanging on a prompt the user has abandoned.
-    // ACP 0.11's `SentRequest` has no per-request cancel API. When our cancel
-    // token fires, we drop the future on our side; the client is expected to
-    // dismiss any stale permission modal on receipt of `session/cancel` (the
-    // notification it sent us in the first place). If a buggy client leaves
-    // the modal up and the user later clicks Allow, we'll log the orphan
-    // arrival but otherwise ignore it -- the gate has already moved on.
+    // on `run` above. We deliberately do not apply a local timeout here: ACP
+    // has no per-request cancel API, and dropping an in-flight SentRequest can
+    // leave the client free to answer a request whose receiver no longer
+    // exists. A user-visible permission prompt is allowed to wait indefinitely
+    // until the user either chooses an option or cancels the prompt/session.
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -869,15 +861,6 @@ async fn request_user_permission(
                 "permission request abandoned due to session cancel; client should dismiss the modal"
             );
             return Err("Tool use denied: the prompt was cancelled before the user responded.".to_string());
-        }
-        _ = tokio::time::sleep(PERMISSION_REQUEST_TIMEOUT) => {
-            tracing::warn!(
-                session_id,
-                tool_name,
-                "permission request timed out after {:?}",
-                PERMISSION_REQUEST_TIMEOUT
-            );
-            return Err("Tool use denied: permission request timed out.".to_string());
         }
         r = spawned_cx.cx().send_request(request).block_task() => r,
     };

@@ -4,8 +4,8 @@ Anvil is a Rust Agent Client Protocol (ACP) server.
 
 It is intentionally **just the ACP server**: the agent runtime, model routing,
 tool loop, permission gate, session store, context compression, sandboxing, and
-code-intelligence hooks live here, while the UI can be anything that knows how
-to speak ACP over stdio.
+MCP tool bridge live here, while the UI can be anything that speaks ACP over
+stdio.
 
 That separation is the point. Instead of rebuilding an agent loop inside every
 editor, bot, TUI, review workflow, or internal automation, you can run Anvil as
@@ -23,9 +23,12 @@ one reusable ACP subprocess and put a small client in front of it.
   Ollama, and OpenRouter, then exposes collision-free wire ids such as
   `codex::gpt-5-codex`, `ollama::llama3:latest`, and
   `openrouter::anthropic/claude-sonnet-4.5`.
+- **MCP-native extensibility.** Anvil manages stdio MCP servers per session.
+  Bifrost is preinstalled as an MCP server for symbol search, cross-references,
+  and structural analysis.
 - **Real agent tooling.** Built-in file reads/writes, grep, directory listing,
-  shell execution, explicit `think`, optional Bifrost structural code
-  intelligence, subagents, and skill slash commands.
+  shell execution, explicit `think`, MCP tools, subagents, and skill slash
+  commands.
 - **Designed for unattended and attended flows.** Clients can run read-only,
   ask before edits, auto-accept edits, or trust all tool calls. Permission
   prompts are protocol messages, not hardcoded UI.
@@ -41,14 +44,28 @@ agent backend those things can share.
 ACP client              stdio / JSON-RPC              Anvil
 ----------              ----------------              -----
 Zed        ----------------------------------------->  agent loop
-JetBrains   --------------------------------------->  tools
-issue bot   --------------------------------------->  model routing
-review bot  --------------------------------------->  permission gate
+JetBrains   --------------------------------------->  model routing
+issue bot   --------------------------------------->  permission gate
+review bot  --------------------------------------->  tools + MCP
 custom TUI  --------------------------------------->  session store
 ```
 
 The client owns the experience. Anvil owns the agent protocol and execution
 semantics.
+
+Core modules:
+
+- `agent`: ACP JSON-RPC dispatch, session lifecycle, slash commands, and prompt
+  handling.
+- `tool_loop`: the agentic engine that streams LLM output, executes tools, and
+  applies the permission gate.
+- `llm_client`: OpenAI-compatible API calls, tool-calling SSE parsing, and idle
+  timeouts.
+- `session`: persisted session state, conversation history, model/mode
+  selection, and context compression storage.
+- `tools`: built-in filesystem, grep, edit, think, and shell tools.
+- `mcp`: persisted MCP server configuration and stdio MCP subprocess
+  lifecycles.
 
 ## Quick Start
 
@@ -86,11 +103,7 @@ cargo xtask build-acp-for-jetbrains
 Both commands run `cargo build --release --bin anvil` and point the editor at
 `target/release/anvil`. Existing unrelated config entries are preserved.
 
-Options:
-
-- `--config <path>`: write a specific editor config file.
-- `--bifrost-binary <name|path>`: pass a Bifrost analyzer binary to Anvil.
-  Defaults to `bifrost`.
+Both subcommands accept `--config <path>` to override the editor config path.
 
 Manual wiring is also simple: configure your ACP client to run the absolute
 path to `target/release/anvil` as a stdio server.
@@ -171,11 +184,43 @@ Built-in commands:
   sandbox mode, timeout, and advanced settings.
 - `/context`: show the current session context snapshot and token estimate.
 - `/compress`: summarize uncompressed history turns to free context window.
+- `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
 
 Skill slash commands are discovered from `SKILL.md` files. If a skill name
 collides with a built-in command, the built-in command wins and the skill slash
 entry is hidden from autocomplete.
+
+## MCP Servers
+
+Anvil reads MCP server configuration from its config file and manages stdio MCP
+subprocesses per session. New servers default to standard `Content-Length` MCP
+stdio framing; use `--framing line` only for NDJSON-speaking servers.
+
+Bifrost is preinstalled as an enabled MCP server:
+
+```text
+bifrost --root {cwd} --server core  # line framing
+```
+
+Use `/mcp` in the editor to list or change MCP servers:
+
+- `/mcp list`
+- `/mcp add [--framing content-length|line] <name> <command> [args...]`
+- `/mcp enable <name>`
+- `/mcp disable <name>`
+- `/mcp remove <name>`
+- `/mcp reset`
+
+The `{cwd}` placeholder in arguments expands to the session workspace root. Use
+shell-style quoting for commands or args that contain spaces. Changes take
+effect on the next tool-capable prompt.
+
+Bifrost provides structural code-intelligence tools such as:
+
+- `search_symbols`: find definitions across the workspace.
+- `get_symbol_sources`: fetch source code for specific symbols.
+- `most_relevant_files`: identify related files using imports and git history.
 
 ## Permissions And Sandboxing
 
@@ -195,25 +240,38 @@ Use:
 /setup permissions trusted
 ```
 
+Approvals remembered through an **Always allow** prompt are session-scoped and
+can be inspected or revoked with:
+
+```text
+/setup permissions list
+/setup permissions revoke <number-or-key>
+/setup permissions clear
+```
+
 Sandbox mode is a separate execution boundary. This matters because Anvil runs
-in more places than a single blessed desktop environment: macOS has Seatbelt,
-many Linux installs have Bubblewrap, and some environments have neither.
+in more places than a single blessed desktop environment: macOS has the Seatbelt
+sandbox exposed through `sandbox-exec`, many Linux installs have Bubblewrap
+(`bwrap`), and some environments have neither.
 
-Anvil has two sandbox layers with different jobs:
+Anvil chooses one effective sandbox strategy per session:
 
-- **OS sandbox for shell commands.** On macOS Anvil uses Seatbelt through
-  `sandbox-exec -f <profile.sb> -- sh -c <cmd>`. On Linux it uses
-  Bubblewrap through `bwrap`. This is the strongest boundary for
-  `run_shell_command`: filesystem access is restricted according to the
-  session permission mode.
-- **WASM parser sandbox for untrusted project data.** When an OS sandbox is not
-  available, Anvil can still run parsing and search work inside an embedded
+- **`os`: OS sandbox for shell commands.** On macOS Anvil uses Seatbelt through
+  `sandbox-exec -f <profile.sb> -- sh -c <cmd>`. On Linux it uses Bubblewrap
+  through `bwrap`. This is the strongest boundary for `run_shell_command`:
+  filesystem access is restricted according to the session permission mode, and
+  parsing runs natively for speed.
+- **`wasm`: WASM fallback for untrusted project data.** When the OS sandbox is
+  not available, Anvil can still run parsing and search work inside an embedded
   Wasmtime component, `brokk-acp-sandbox.wasm`. This is the `WasmFallback`
-  strategy in the code.
+  strategy in the code. In this mode, shell commands are permission-gated but
+  not wrapped in Seatbelt or Bubblewrap.
+- **`off`: no sandboxing.** Parsing runs in-process and shell commands are only
+  controlled by the ACP permission gate.
 
-The WASM fallback is intentionally narrower than the OS sandbox, but it is still
-useful: it protects the host process from risky parsing workloads even when the
-platform cannot isolate shell commands.
+These strategies are mutually exclusive. WASM is not layered on top of
+Seatbelt/Bubblewrap; it is the fallback Anvil uses when those OS-level shell
+sandboxes are unavailable or when `/setup sandbox wasm` is selected.
 
 WASM-sandboxed work includes:
 
@@ -230,12 +288,11 @@ and read-only per-call preopens only when a file or directory must be inspected.
 If the guest traps, exhausts fuel, or hits the memory limit, Anvil reports a
 sandbox error instead of silently retrying natively.
 
-What WASM does **not** do:
+In `wasm` mode:
 
-- It does not sandbox `run_shell_command`; without Seatbelt or Bubblewrap,
-  shell commands run without OS isolation, though the ACP permission gate still
-  applies.
-- It does not replace path validation for file tools. Built-in file reads,
+- `run_shell_command` is not OS-sandboxed because Seatbelt/Bubblewrap are not
+  active in this strategy; the ACP permission gate still applies.
+- WASM does not replace path validation for file tools. Built-in file reads,
   writes, and edits still use `safe_resolve` / `safe_resolve_for_write` to keep
   paths inside the session `cwd`.
 
@@ -272,9 +329,9 @@ Core tools include:
 - `grep_search`
 - `run_shell_command`
 
-When `--bifrost-binary` is configured, Anvil also exposes structural code
-intelligence tools through Bifrost, including symbol search, source lookup,
-usage scanning, relevant-file discovery, file search, git-log inspection, JSON
+MCP servers can add more tools at runtime. The default Bifrost MCP server adds
+workspace-aware code intelligence such as symbol search, source lookup, usage
+scanning, relevant-file discovery, file search, git-log inspection, JSON
 querying, and XML skimming.
 
 ## Sessions And Context
@@ -343,7 +400,6 @@ anvil [OPTIONS]
 | `--max-turns` | - | `25` | Maximum tool-calling iterations per prompt. |
 | `--max-sessions` | - | `50` | Maximum resident sessions before LRU eviction. `0` disables the cap. |
 | `--max-history-turns` | - | `50` | Maximum in-memory history turns per session. `0` disables the cap. |
-| `--bifrost-binary` | `BROKK_BIFROST_BINARY` | - | Bifrost executable used for code-intelligence tools. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | SSE inactivity timeout for LLM streaming. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 
@@ -363,6 +419,9 @@ cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+On Linux, install Bubblewrap (`bwrap`) for OS-level `run_shell_command`
+sandboxing.
 
 ## Releases
 

@@ -486,6 +486,8 @@ fn pack_atoms_into_chunks(atoms: Vec<String>, per_chunk_budget: usize) -> Vec<St
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_tokens = 0usize;
+    let separator = "\n\n";
+    let separator_tokens = approximate_tokens(separator);
 
     let push_current =
         |current: &mut String, current_tokens: &mut usize, chunks: &mut Vec<String>| {
@@ -498,14 +500,20 @@ fn pack_atoms_into_chunks(atoms: Vec<String>, per_chunk_budget: usize) -> Vec<St
     for atom in atoms {
         let atom_tokens = approximate_tokens(&atom);
         if atom_tokens <= per_chunk_budget {
-            if current_tokens + atom_tokens > per_chunk_budget && !current.is_empty() {
+            let extra_tokens = if current.is_empty() {
+                atom_tokens
+            } else {
+                separator_tokens + atom_tokens
+            };
+            if current_tokens + extra_tokens > per_chunk_budget && !current.is_empty() {
                 push_current(&mut current, &mut current_tokens, &mut chunks);
             }
             if !current.is_empty() {
-                current.push_str("\n\n");
+                current.push_str(separator);
+                current_tokens += separator_tokens;
             }
             current.push_str(&atom);
-            current_tokens = approximate_tokens(&current);
+            current_tokens += atom_tokens;
         } else {
             // Atom too big for one chunk on its own. Flush whatever's
             // pending, then split this atom and emit each piece as
@@ -549,9 +557,10 @@ fn split_single_atom(atom: &str, per_chunk_budget: usize) -> Vec<String> {
         }
         if current_tokens + line_tokens > per_chunk_budget && !current.is_empty() {
             out.push(std::mem::take(&mut current));
+            current_tokens = 0;
         }
         current.push_str(line);
-        current_tokens = approximate_tokens(&current);
+        current_tokens += line_tokens;
     }
     if !current.is_empty() {
         out.push(current);
@@ -573,10 +582,13 @@ fn split_string_by_chars(s: &str, per_chunk_budget: usize) -> Vec<String> {
     let target_chars = per_chunk_budget.saturating_mul(4).max(256);
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
+    let mut buf_chars = 0usize;
     for ch in s.chars() {
         buf.push(ch);
-        if buf.chars().count() >= target_chars {
+        buf_chars += 1;
+        if buf_chars >= target_chars {
             out.push(std::mem::take(&mut buf));
+            buf_chars = 0;
         }
     }
     if !buf.is_empty() {
