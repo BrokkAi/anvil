@@ -7,7 +7,7 @@ use agent_client_protocol::schema::{
     InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    TextContent,
+    StopReason, TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
 use anyhow::{Context, Result};
@@ -104,13 +104,22 @@ pub async fn run_prompt(config: AnvilRun, prompt: String) -> Result<String> {
             )
             .await?;
 
-            connection
+            let prompt_response = connection
                 .send_request(PromptRequest::new(
                     session.session_id,
                     vec![ContentBlock::Text(TextContent::new(prompt))],
                 ))
                 .block_task()
                 .await?;
+            if !matches!(prompt_response.stop_reason, StopReason::EndTurn) {
+                return Err(agent_client_protocol::Error::new(
+                    -32603,
+                    format!(
+                        "agent stopped before completing the turn: {:?}",
+                        prompt_response.stop_reason
+                    ),
+                ));
+            }
 
             Ok(())
         })
@@ -201,9 +210,7 @@ fn permission_response(
             )
         )
     });
-    let fallback = request.options.first();
-
-    match preferred.or(fallback) {
+    match preferred {
         Some(option) => RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
             SelectedPermissionOutcome::new(option.option_id.clone()),
         )),
