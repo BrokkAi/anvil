@@ -443,7 +443,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
         AvailableCommand::new("context", "Show current session context snapshot"),
         AvailableCommand::new(
             "setup",
-            "Set up models, login, permissions, and advanced options",
+            "Set up models, login, behavior mode, sandboxing, and advanced options",
         ),
         AvailableCommand::new(
             "compress",
@@ -2751,9 +2751,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         "openrouter" => {
             handle_setup_openrouter(rest, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await
         }
-        "permissions" | "permission" => {
-            handle_setup_permission(ctx.cx, ctx.sessions, session_id, rest).await
-        }
+        "permissions" | "permission" => handle_legacy_setup_permission(ctx.sessions, session_id).await,
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
         "timeout" => {
@@ -2980,6 +2978,19 @@ fn render_openrouter_setup_help() -> String {
          - `/setup openrouter disconnect`\n\
          - `/setup openrouter refresh`\n\n\
          Choose for me: `/setup choose`."
+    )
+}
+
+async fn handle_legacy_setup_permission(
+    sessions: &SessionStore,
+    session_id: &str,
+) -> String {
+    format!(
+        "Permission setup moved to the editor's slash-command menu. \
+         Open the slash commands and choose `permissions`.
+
+{}",
+        render_current_setup(sessions, session_id).await
     )
 }
 
@@ -4070,6 +4081,20 @@ mod tests {
         assert!(!builtin_command_names().contains("configure"));
     }
 
+    #[test]
+    fn builtin_commands_include_permissions_alias() {
+        let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "permissions"),
+            "builtin_commands() missing permissions; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            builtin_command_names().contains("permissions"),
+            "builtin_command_names() missing permissions"
+        );
+    }
+
     /// `/compress` must appear in autocomplete (`builtin_commands`)
     /// and in the collision set (`builtin_command_names`) so a skill
     /// named "compress" can't shadow the built-in.
@@ -4679,6 +4704,7 @@ mod tests {
             vec![
                 "context",
                 "setup",
+                "permissions",
                 "compress",
                 "mcp",
                 "pr-create",
@@ -4717,6 +4743,7 @@ mod tests {
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
 
         assert!(names.contains(&"setup"));
+        assert!(names.contains(&"permissions"));
         assert!(!names.contains(&"codex-login"));
         assert!(!names.contains(&"openrouter-login"));
         assert!(!names.contains(&"idle-timeout"));
