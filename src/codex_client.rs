@@ -276,16 +276,20 @@ impl CodexClient {
         cancel: CancellationToken,
         idle_timeout: Duration,
     ) -> Result<LlmResponse> {
-        let req = self
-            .http
-            .post(CHATGPT_RESPONSES_URL)
-            .header("Authorization", format!("Bearer {}", creds.access_token))
-            .header("ChatGPT-Account-ID", &creds.account_id)
-            .header("originator", ORIGINATOR)
-            .header("Accept", "text/event-stream")
-            .json(body);
-
-        let resp = req.send().await.context("posting Responses API request")?;
+        let resp = crate::http_retry::send_with_retries(
+            "posting Responses API request",
+            || {
+                self.http
+                    .post(CHATGPT_RESPONSES_URL)
+                    .header("Authorization", format!("Bearer {}", creds.access_token))
+                    .header("ChatGPT-Account-ID", &creds.account_id)
+                    .header("originator", ORIGINATOR)
+                    .header("Accept", "text/event-stream")
+                    .json(body)
+            },
+            Some(&cancel),
+        )
+        .await?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -356,15 +360,18 @@ async fn fetch_chatgpt_models(
         "{CHATGPT_MODELS_URL}?client_version={}",
         urlencode(CODEX_COMPAT_CLIENT_VERSION)
     );
-    let resp = http
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", creds.access_token))
-        .header("ChatGPT-Account-ID", &creds.account_id)
-        .header("originator", ORIGINATOR)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .context("GET /models")?;
+    let resp = crate::http_retry::send_with_retries(
+        "GET /models",
+        || {
+            http.get(&url)
+                .header("Authorization", format!("Bearer {}", creds.access_token))
+                .header("ChatGPT-Account-ID", &creds.account_id)
+                .header("originator", ORIGINATOR)
+                .header("Accept", "application/json")
+        },
+        None,
+    )
+    .await?;
     let status = resp.status();
     let content_type = resp
         .headers()
