@@ -684,12 +684,18 @@ impl OpenAiClient {
     async fn fetch_models_response(&self) -> Result<ModelsResponse> {
         let url = self.api_url("/models");
 
-        let mut req = self.http.get(&url);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = req.send().await.context("failed to fetch models")?;
+        let resp = crate::http_retry::send_with_retries(
+            "fetching models",
+            || {
+                let mut req = self.http.get(&url);
+                if let Some(key) = &self.api_key {
+                    req = req.bearer_auth(key);
+                }
+                req
+            },
+            None,
+        )
+        .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -757,12 +763,18 @@ impl OpenAiClient {
             reasoning,
         };
 
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = req.send().await.context("failed to send chat request")?;
+        let resp = crate::http_retry::send_with_retries(
+            "sending chat completion request",
+            || {
+                let mut req = self.http.post(&url).json(&body);
+                if let Some(key) = &self.api_key {
+                    req = req.bearer_auth(key);
+                }
+                req
+            },
+            Some(&cancel),
+        )
+        .await?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -917,7 +929,10 @@ where
 mod tests {
     use super::*;
     use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn collect_tokens() -> (TokenSink, Arc<Mutex<Vec<String>>>) {
         let collected = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -926,6 +941,64 @@ mod tests {
             inner.lock().unwrap().push(t.to_string());
         });
         (cb, collected)
+    }
+
+    struct RetryThenSseResponder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl wiremock::Respond for RetryThenSseResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                ResponseTemplate::new(500).set_body_string("temporary overload")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
+                         \n\
+                         data: [DONE]\n\n",
+                    )
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_client_retries_transient_5xx_before_streaming() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RetryThenSseResponder {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let client = OpenAiClient::new(server.uri(), None);
+        let (on_token, tokens) = collect_tokens();
+        let result = client
+            .stream_chat(StreamChatRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage::user("hello")],
+                tools: None,
+                reasoning_effort: None,
+                on_token,
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(30),
+            })
+            .await
+            .expect("retry should recover");
+
+        match result {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*tokens.lock().unwrap(), vec!["ok".to_string()]);
     }
 
     /// A stream that emits only SSE keepalive comments (`:\n`) must trip

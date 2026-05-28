@@ -13,6 +13,7 @@ mod codex_auth;
 mod codex_client;
 mod context_manager;
 mod discovery;
+mod http_retry;
 mod llm_client;
 mod multi_backend;
 mod openrouter_auth;
