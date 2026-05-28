@@ -4062,6 +4062,7 @@ done
             name: "bifrost".to_string(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
+            framing: crate::mcp::McpFraming::Line,
             enabled: true,
         }])
         .expect("remember mcp config");

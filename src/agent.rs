@@ -2377,22 +2377,121 @@ fn parse_idle_timeout_arg(prompt_text: &str) -> Result<IdleTimeoutAction, String
     }
 }
 
+fn parse_shell_words(input: &str) -> Result<Vec<String>, String> {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = Quote::None;
+    let mut current_started = false;
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::None => match ch {
+                c if c.is_whitespace() => {
+                    if current_started {
+                        words.push(std::mem::take(&mut current));
+                        current_started = false;
+                    }
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    current_started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    current_started = true;
+                }
+                '\\' => {
+                    let Some(next) = chars.next() else {
+                        return Err("Trailing backslash in MCP command.".to_string());
+                    };
+                    current.push(next);
+                    current_started = true;
+                }
+                _ => {
+                    current.push(ch);
+                    current_started = true;
+                }
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    let Some(next) = chars.next() else {
+                        return Err("Trailing backslash in MCP command.".to_string());
+                    };
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                        current.push(next);
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    match quote {
+        Quote::Single => return Err("Unclosed single quote in MCP command.".to_string()),
+        Quote::Double => return Err("Unclosed double quote in MCP command.".to_string()),
+        Quote::None => {}
+    }
+    if current_started {
+        words.push(current);
+    }
+    Ok(words)
+}
+
 async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str) -> String {
     let trimmed = slash_command_args(prompt_text);
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") {
+    if trimmed.is_empty() {
         return render_mcp_servers();
     }
 
-    let mut parts = trimmed.split_whitespace();
-    let command = parts.next().unwrap_or("").to_ascii_lowercase();
+    let words = match parse_shell_words(&trimmed) {
+        Ok(words) => words,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let command = words
+        .first()
+        .map(|word| word.to_ascii_lowercase())
+        .unwrap_or_default();
+    if command == "list" {
+        return render_mcp_servers();
+    }
     let result = match command.as_str() {
         "add" | "set" => {
-            let Some(name) = parts.next() else {
+            let mut framing = crate::mcp::McpFraming::ContentLength;
+            let mut idx = 1;
+            if words.get(idx).is_some_and(|word| word == "--framing") {
+                let Some(raw_framing) = words.get(idx + 1) else {
+                    return mcp_usage();
+                };
+                let Some(parsed) = crate::mcp::McpFraming::parse(raw_framing) else {
+                    return "Unknown MCP framing. Use `content-length` or `line`.".to_string();
+                };
+                framing = parsed;
+                idx += 2;
+            }
+            if words.len() < idx + 2 {
                 return mcp_usage();
-            };
-            let Some(command) = parts.next() else {
-                return mcp_usage();
-            };
+            }
+            let name = &words[idx];
+            let server_command = &words[idx + 1];
             if !valid_mcp_name(name) {
                 return "MCP server names may contain only letters, numbers, `_`, `-`, and `.`."
                     .to_string();
@@ -2400,11 +2499,12 @@ async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str
             let mut servers = crate::setup_state::read_mcp_servers();
             let server = crate::mcp::McpServerConfig {
                 name: name.to_string(),
-                command: command.to_string(),
-                args: parts.map(str::to_string).collect(),
+                command: server_command.to_string(),
+                args: words[idx + 2..].to_vec(),
+                framing,
                 enabled: true,
             };
-            if let Some(existing) = servers.iter_mut().find(|s| s.name == name) {
+            if let Some(existing) = servers.iter_mut().find(|s| s.name == *name) {
                 *existing = server;
             } else {
                 servers.push(server);
@@ -2413,12 +2513,12 @@ async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str
                 .map(|_| format!("MCP server `{name}` saved and enabled."))
         }
         "remove" | "delete" | "rm" => {
-            let Some(name) = parts.next() else {
+            let Some(name) = words.get(1) else {
                 return mcp_usage();
             };
             let mut servers = crate::setup_state::read_mcp_servers();
             let before = servers.len();
-            servers.retain(|s| s.name != name);
+            servers.retain(|s| s.name != *name);
             if servers.len() == before {
                 return format!("No MCP server named `{name}` is configured.");
             }
@@ -2426,12 +2526,12 @@ async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str
                 .map(|_| format!("MCP server `{name}` removed."))
         }
         "enable" | "disable" => {
-            let Some(name) = parts.next() else {
+            let Some(name) = words.get(1) else {
                 return mcp_usage();
             };
             let enabled = command == "enable";
             let mut servers = crate::setup_state::read_mcp_servers();
-            let Some(server) = servers.iter_mut().find(|s| s.name == name) else {
+            let Some(server) = servers.iter_mut().find(|s| s.name == *name) else {
                 return format!("No MCP server named `{name}` is configured.");
             };
             server.enabled = enabled;
@@ -2479,11 +2579,21 @@ fn render_mcp_servers() -> String {
             let args = if server.args.is_empty() {
                 String::new()
             } else {
-                format!(" {}", server.args.join(" "))
+                format!(
+                    " {}",
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| shell_quote(arg))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
             };
             out.push_str(&format!(
-                "- `{}` ({status}): `{}{args}`\n",
-                server.name, server.command
+                "- `{}` ({status}, {}): `{}{args}`\n",
+                server.name,
+                server.framing.as_str(),
+                shell_quote(&server.command)
             ));
         }
         out.push('\n');
@@ -2495,14 +2605,29 @@ fn render_mcp_servers() -> String {
 fn mcp_usage() -> String {
     "Commands:\n\
      - `/mcp list`\n\
-     - `/mcp add <name> <command> [args...]`\n\
+     - `/mcp add [--framing content-length|line] <name> <command> [args...]`\n\
      - `/mcp enable <name>`\n\
      - `/mcp disable <name>`\n\
      - `/mcp remove <name>`\n\
      - `/mcp reset`\n\n\
-     Use `{cwd}` in args to pass the current workspace root. Bifrost is preinstalled as \
-     `/mcp add bifrost bifrost --root {cwd} --server core`."
+     `content-length` is the standard MCP stdio framing and is the default for new \
+     servers. Use `line` only for NDJSON-speaking servers. Use shell-style quoting \
+     for commands or args that contain spaces, and use `{cwd}` in args to pass the \
+     current workspace root. Bifrost is preinstalled as \
+     `/mcp add --framing line bifrost bifrost --root '{cwd}' --server core`."
         .to_string()
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '{' | '}')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Handle the `/idle-timeout` slash command. Reads/sets the per-session
@@ -3710,6 +3835,35 @@ mod tests {
     fn parse_idle_timeout_arg_rejects_non_numeric_junk() {
         let err = parse_idle_timeout_arg("/idle-timeout banana").expect_err("junk must reject");
         assert!(err.contains("Unknown subcommand"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_shell_words_supports_quotes_and_escapes() {
+        assert_eq!(
+            parse_shell_words(
+                r#"add --framing content-length win "C:\Program Files\server.exe" --arg '{"k":"v v"}'"#
+            )
+            .unwrap(),
+            vec![
+                "add",
+                "--framing",
+                "content-length",
+                "win",
+                r#"C:\Program Files\server.exe"#,
+                "--arg",
+                r#"{"k":"v v"}"#
+            ]
+        );
+        assert_eq!(
+            parse_shell_words(r#"add local command\ with\ spaces --flag"#).unwrap(),
+            vec!["add", "local", "command with spaces", "--flag"]
+        );
+    }
+
+    #[test]
+    fn parse_shell_words_rejects_unclosed_quotes() {
+        let err = parse_shell_words(r#"add bad "unterminated"#).expect_err("must reject");
+        assert!(err.contains("Unclosed double quote"), "got: {err}");
     }
 
     #[test]

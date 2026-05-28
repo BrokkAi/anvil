@@ -152,22 +152,22 @@ The model calls the `task` tool with three arguments:
 
 ## MCP Servers
 
-Anvil reads MCP server configuration from its config file and manages stdio MCP subprocesses per session. Bifrost is preinstalled as an MCP server:
+Anvil reads MCP server configuration from its config file and manages stdio MCP subprocesses per session. New servers default to standard `Content-Length` MCP stdio framing; use `--framing line` only for NDJSON-speaking servers. Bifrost is preinstalled as an MCP server:
 
 ```text
-bifrost --root {cwd} --server core
+bifrost --root {cwd} --server core  # line framing
 ```
 
 Use `/mcp` in the editor to list or change MCP servers:
 
 - `/mcp list`
-- `/mcp add <name> <command> [args...]`
+- `/mcp add [--framing content-length|line] <name> <command> [args...]`
 - `/mcp enable <name>`
 - `/mcp disable <name>`
 - `/mcp remove <name>`
 - `/mcp reset`
 
-The `{cwd}` placeholder in arguments expands to the session workspace root. Bifrost provides structural code-intelligence tools such as:
+The `{cwd}` placeholder in arguments expands to the session workspace root. Use shell-style quoting for commands or args that contain spaces. Bifrost provides structural code-intelligence tools such as:
 
 - `search_symbols`: Find definitions across the workspace.
 - `get_symbol_sources`: Fetch source code for specific symbols.

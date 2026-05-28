@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -40,8 +40,35 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub framing: McpFraming,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpFraming {
+    #[default]
+    ContentLength,
+    Line,
+}
+
+impl McpFraming {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "content-length" | "contentlength" | "framed" | "standard" => Some(Self::ContentLength),
+            "line" | "line-delimited" | "ndjson" => Some(Self::Line),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentLength => "content-length",
+            Self::Line => "line",
+        }
+    }
 }
 
 fn default_enabled() -> bool {
@@ -59,6 +86,7 @@ impl McpServerConfig {
                 "--server".to_string(),
                 "core".to_string(),
             ],
+            framing: McpFraming::Line,
             enabled: true,
         }
     }
@@ -88,9 +116,9 @@ pub struct McpToolDef {
 /// Holds the child process for the lifetime of the client; the process is
 /// killed when the client is dropped (`kill_on_drop(true)`).
 ///
-/// The MCP stdio protocol is one JSON message per line. Reads and writes are
-/// serialized through a single mutex because the existing tool loop dispatches
-/// tool calls sequentially within a session.
+/// The MCP stdio protocol uses `Content-Length` framed JSON-RPC messages.
+/// Reads and writes are serialized through a single mutex because the existing
+/// tool loop dispatches tool calls sequentially within a session.
 pub struct McpClient {
     name: String,
     _child: Mutex<Child>,
@@ -102,6 +130,7 @@ pub struct McpClient {
 struct McpIo {
     writer: ChildStdin,
     reader: BufReader<ChildStdout>,
+    framing: McpFraming,
 }
 
 impl McpClient {
@@ -127,7 +156,11 @@ impl McpClient {
                 .ok_or_else(|| McpError::Spawn("missing stdout pipe".into()))?,
         );
 
-        let mut io = McpIo { writer, reader };
+        let mut io = McpIo {
+            writer,
+            reader,
+            framing: config.framing,
+        };
         let next_id = AtomicI64::new(1);
 
         let init_id = next_id.fetch_add(1, Ordering::SeqCst);
@@ -158,6 +191,7 @@ impl McpClient {
             server = %config.name,
             command = %config.command,
             args = ?rendered_args,
+            framing = %config.framing.as_str(),
             cwd = %cwd.display(),
             tool_count = tools.len(),
             "mcp server ready"
@@ -252,12 +286,30 @@ async fn write_notification(io: &mut McpIo, method: &str, params: Value) -> Resu
 }
 
 async fn write_message(io: &mut McpIo, msg: &Value) -> Result<(), McpError> {
-    let mut bytes = serde_json::to_vec(msg).map_err(|e| McpError::Io(format!("serialize: {e}")))?;
-    bytes.push(b'\n');
-    io.writer
-        .write_all(&bytes)
-        .await
-        .map_err(|e| McpError::Io(format!("write: {e}")))?;
+    let bytes = serde_json::to_vec(msg).map_err(|e| McpError::Io(format!("serialize: {e}")))?;
+    match io.framing {
+        McpFraming::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", bytes.len());
+            io.writer
+                .write_all(header.as_bytes())
+                .await
+                .map_err(|e| McpError::Io(format!("write header: {e}")))?;
+            io.writer
+                .write_all(&bytes)
+                .await
+                .map_err(|e| McpError::Io(format!("write body: {e}")))?;
+        }
+        McpFraming::Line => {
+            io.writer
+                .write_all(&bytes)
+                .await
+                .map_err(|e| McpError::Io(format!("write body: {e}")))?;
+            io.writer
+                .write_all(b"\n")
+                .await
+                .map_err(|e| McpError::Io(format!("write newline: {e}")))?;
+        }
+    }
     io.writer
         .flush()
         .await
@@ -267,21 +319,7 @@ async fn write_message(io: &mut McpIo, msg: &Value) -> Result<(), McpError> {
 
 async fn read_response(io: &mut McpIo, expected_id: i64) -> Result<Value, McpError> {
     loop {
-        let mut line = String::new();
-        let n = io
-            .reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| McpError::Io(format!("read: {e}")))?;
-        if n == 0 {
-            return Err(McpError::Io("mcp server closed stdout".into()));
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|e| McpError::Protocol(format!("parse: {e} (line: {trimmed})")))?;
+        let value = read_message(io).await?;
         if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
             tracing::debug!(?value, "skipping mcp message with unexpected id");
             continue;
@@ -300,6 +338,62 @@ async fn read_response(io: &mut McpIo, expected_id: i64) -> Result<Value, McpErr
             .cloned()
             .ok_or_else(|| McpError::Protocol("response missing result".into()));
     }
+}
+
+async fn read_message(io: &mut McpIo) -> Result<Value, McpError> {
+    if io.framing == McpFraming::Line {
+        return read_line_message(io).await;
+    }
+
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let n = io
+            .reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| McpError::Io(format!("read header: {e}")))?;
+        if n == 0 {
+            return Err(McpError::Io("mcp server closed stdout".into()));
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(McpError::Protocol(format!("malformed MCP header: {line}")));
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            let len = value.trim().parse::<usize>().map_err(|e| {
+                McpError::Protocol(format!("invalid Content-Length `{}`: {e}", value.trim()))
+            })?;
+            content_length = Some(len);
+        }
+    }
+
+    let len =
+        content_length.ok_or_else(|| McpError::Protocol("missing Content-Length header".into()))?;
+    let mut body = vec![0; len];
+    io.reader
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| McpError::Io(format!("read body: {e}")))?;
+    serde_json::from_slice(&body).map_err(|e| McpError::Protocol(format!("parse body: {e}")))
+}
+
+async fn read_line_message(io: &mut McpIo) -> Result<Value, McpError> {
+    let mut line = String::new();
+    let n = io
+        .reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| McpError::Io(format!("read line: {e}")))?;
+    if n == 0 {
+        return Err(McpError::Io("mcp server closed stdout".into()));
+    }
+    let trimmed = line.trim();
+    serde_json::from_str(trimmed)
+        .map_err(|e| McpError::Protocol(format!("parse line: {e} (line: {trimmed})")))
 }
 
 fn parse_tool_list(result: Value) -> Result<Vec<McpToolDef>, McpError> {
@@ -536,6 +630,7 @@ mod tests {
             name: "bifrost".to_string(),
             command: binary.display().to_string(),
             args: McpServerConfig::bifrost().args,
+            framing: McpFraming::Line,
             enabled: true,
         };
         let client = McpClient::spawn(&config, &cwd)

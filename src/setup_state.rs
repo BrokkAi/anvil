@@ -110,9 +110,20 @@ pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
     if path().is_err() {
         return Vec::new();
     }
-    read()
+    let mut servers = read()
         .mcp_servers
-        .unwrap_or_else(crate::mcp::default_servers)
+        .unwrap_or_else(crate::mcp::default_servers);
+    let bifrost = crate::mcp::McpServerConfig::bifrost();
+    for server in &mut servers {
+        if server.name == bifrost.name
+            && server.command == bifrost.command
+            && server.args == bifrost.args
+            && server.framing == crate::mcp::McpFraming::ContentLength
+        {
+            server.framing = bifrost.framing;
+        }
+    }
+    servers
 }
 
 pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
