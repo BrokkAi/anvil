@@ -1631,6 +1631,13 @@ fn normalize_cwd(path: &Path) -> PathBuf {
 pub struct SessionStore {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_model: Arc<RwLock<String>>,
+    /// Process-local replacement for the install-level setup preference
+    /// file. When present, model/reasoning/sandbox choices still seed later
+    /// sessions in this server process, but they are never read from or
+    /// written to `setup.json`. This is useful for scripts that pass an
+    /// explicit model/sandbox choice and must not mutate the user's global
+    /// Brokk configuration.
+    transient_setup_state: Option<Arc<std::sync::Mutex<crate::setup_state::SetupState>>>,
     /// Last-known catalog of models, populated by `set_available_models`
     /// from the LLM endpoint. Used to fulfil `session/new` without
     /// re-fetching on every call, and to look up per-model reasoning
@@ -1663,10 +1670,24 @@ impl SessionStore {
         Self::with_limits(default_model, SessionLimits::default())
     }
 
+    #[cfg(test)]
     pub fn with_limits(default_model: String, limits: SessionLimits) -> Self {
+        Self::with_limits_and_transient_setup(default_model, limits, false)
+    }
+
+    pub fn with_limits_and_transient_setup(
+        default_model: String,
+        limits: SessionLimits,
+        transient_setup: bool,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_model: Arc::new(RwLock::new(default_model)),
+            transient_setup_state: transient_setup.then(|| {
+                Arc::new(std::sync::Mutex::new(
+                    crate::setup_state::SetupState::default(),
+                ))
+            }),
             available_models: Arc::new(RwLock::new(Vec::new())),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
@@ -1685,6 +1706,89 @@ impl SessionStore {
             .lock()
             .expect("last_accessed mutex poisoned")
             .insert(id.to_string(), counter);
+    }
+
+    pub(crate) fn setup_state_snapshot(&self) -> crate::setup_state::SetupState {
+        match &self.transient_setup_state {
+            Some(state) => state
+                .lock()
+                .expect("transient setup state mutex poisoned")
+                .clone(),
+            None => crate::setup_state::read(),
+        }
+    }
+
+    pub(crate) fn remember_first_run_seen(&self) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .first_run_seen = true;
+                Ok(())
+            }
+            None => crate::setup_state::mark_first_run_seen(),
+        }
+    }
+
+    fn read_sandbox_mode_preference(&self) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+        match &self.transient_setup_state {
+            Some(state) => Some(
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_sandbox_mode,
+            ),
+            None => crate::setup_state::read_sandbox_mode_preference(),
+        }
+    }
+
+    fn remember_last_selection(
+        &self,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                let mut state = state.lock().expect("transient setup state mutex poisoned");
+                state.last_model = model;
+                state.last_reasoning_effort = reasoning_effort;
+                Ok(())
+            }
+            None => crate::setup_state::remember_last_selection(model, reasoning_effort),
+        }
+    }
+
+    fn remember_last_reasoning_effort(
+        &self,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_reasoning_effort = reasoning_effort;
+                Ok(())
+            }
+            None => crate::setup_state::remember_last_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    fn remember_sandbox_mode(
+        &self,
+        mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_sandbox_mode = mode;
+                Ok(())
+            }
+            None => crate::setup_state::remember_sandbox_mode(mode),
+        }
     }
 
     /// If `sessions.len()` exceeds `limits.max_sessions`, evict the least
@@ -1821,7 +1925,7 @@ impl SessionStore {
     /// Create a new session and write it to disk as a zip.
     pub async fn create_session(&self, cwd: PathBuf) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
-        let prefs = crate::setup_state::read();
+        let prefs = self.setup_state_snapshot();
         let default_model = self.default_model.read().await.clone();
         let catalog = self.available_models.read().await.clone();
         let model = select_session_model(prefs.last_model, default_model, &catalog);
@@ -1928,7 +2032,7 @@ impl SessionStore {
         };
 
         let sandbox_mode =
-            usable_sandbox_mode_preference(crate::setup_state::read().last_sandbox_mode);
+            usable_sandbox_mode_preference(self.setup_state_snapshot().last_sandbox_mode);
         let loaded_session = match sandbox_mode {
             Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
                 id.to_string(),
@@ -2210,7 +2314,7 @@ impl SessionStore {
             None => false,
         };
         drop(sessions);
-        if updated && let Err(e) = crate::setup_state::remember_sandbox_mode(mode) {
+        if updated && let Err(e) = self.remember_sandbox_mode(mode) {
             tracing::warn!(
                 session_id = %id,
                 "failed to persist sandbox preference: {e:#}"
@@ -2235,7 +2339,7 @@ impl SessionStore {
         }
         drop(sessions);
 
-        let Some(persisted_mode) = crate::setup_state::read_sandbox_mode_preference() else {
+        let Some(persisted_mode) = self.read_sandbox_mode_preference() else {
             return self.sessions.read().await.get(id).map(|s| s.sandbox_mode);
         };
         let mode = usable_sandbox_mode_preference(persisted_mode);
@@ -2522,7 +2626,7 @@ impl SessionStore {
                         // arbiter rather than dropping silently.
                         _ => None,
                     };
-                    if let Err(e) = crate::setup_state::remember_last_selection(
+                    if let Err(e) = self.remember_last_selection(
                         if model.is_empty() {
                             None
                         } else {
@@ -2566,9 +2670,9 @@ impl SessionStore {
         match sessions.get_mut(id) {
             Some(session) => {
                 session.selected_reasoning_effort = effort;
-                if let Err(e) = crate::setup_state::remember_last_reasoning_effort(
-                    session.selected_reasoning_effort.clone(),
-                ) {
+                if let Err(e) =
+                    self.remember_last_reasoning_effort(session.selected_reasoning_effort.clone())
+                {
                     tracing::warn!(
                         session_id = %id,
                         "failed to persist last reasoning preference: {e:#}"
@@ -3565,6 +3669,112 @@ mod tests {
 
         let reloaded = store
             .get_session(&id, cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
+    }
+
+    /// Transient setup mode keeps model/reasoning/sandbox choices process-local:
+    /// they seed later sessions and cold reloads in this `SessionStore`, but the
+    /// on-disk setup file is neither read nor written for those preferences.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_setup_keeps_model_and_sandbox_preferences_in_memory_only() {
+        use crate::llm_client::ReasoningLevelPreset;
+        use crate::sandbox_backend::SandboxMode;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_selection(
+            Some("persisted-model".to_string()),
+            Some("high".to_string()),
+        )
+        .expect("seed persistent model preference");
+        crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Wasm))
+            .expect("seed persistent sandbox preference");
+
+        let store = SessionStore::with_limits_and_transient_setup(
+            "default-model".to_string(),
+            SessionLimits::default(),
+            true,
+        );
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "default-model".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![
+                        ReasoningLevelPreset {
+                            effort: "medium".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "high".to_string(),
+                            description: "".to_string(),
+                        },
+                    ],
+                    context_length: None,
+                },
+                ModelMetadata {
+                    id: "runtime-model".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    }],
+                    context_length: None,
+                },
+                ModelMetadata::id_only("persisted-model"),
+            ])
+            .await;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first = store.create_session(cwd.path().to_path_buf()).await;
+        assert_eq!(
+            first.model, "default-model",
+            "transient stores must ignore persisted model preferences"
+        );
+        assert_eq!(
+            first.sandbox_mode, None,
+            "transient stores must ignore persisted sandbox preferences"
+        );
+
+        assert!(
+            store
+                .set_sandbox_mode(&first.id, Some(SandboxMode::Off))
+                .await
+        );
+        let (ok, cleared) = store
+            .set_model(&first.id, "runtime-model".to_string())
+            .await;
+        assert!(ok);
+        assert!(cleared.is_none());
+        assert!(
+            store
+                .set_reasoning_effort(&first.id, Some("high".to_string()))
+                .await
+        );
+
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.model, "runtime-model");
+        assert_eq!(next.selected_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(next.sandbox_mode, Some(SandboxMode::Off));
+
+        assert_eq!(
+            crate::setup_state::read().last_model.as_deref(),
+            Some("persisted-model"),
+            "transient choices must not overwrite setup.json model preference"
+        );
+        assert_eq!(
+            crate::setup_state::read().last_sandbox_mode,
+            Some(SandboxMode::Wasm),
+            "transient choices must not overwrite setup.json sandbox preference"
+        );
+
+        store.sessions.write().await.remove(&first.id);
+        store.registries.write().await.remove(&first.id);
+        let reloaded = store
+            .get_session(&first.id, cwd.path())
             .await
             .expect("session must reload from disk");
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));

@@ -645,14 +645,15 @@ fn spawn_delayed_setup_notice(
     cx: ConnectionTo<Client>,
     session: Session,
     catalog: Vec<ModelMetadata>,
+    sessions: SessionStore,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let state = crate::setup_state::read();
+        let state = sessions.setup_state_snapshot();
         let message = render_session_start_setup_notice(&session, &catalog, state.first_run_seen);
         send_message(&cx, &session.id, &message);
         if !state.first_run_seen
-            && let Err(e) = crate::setup_state::mark_first_run_seen()
+            && let Err(e) = sessions.remember_first_run_seen()
         {
             tracing::warn!("failed to persist first-run setup state: {e:#}");
         }
@@ -900,7 +901,12 @@ pub async fn run_agent(
                     session.id.clone(),
                     session.skills.clone(),
                 );
-                spawn_delayed_setup_notice(cx.clone(), setup_session, setup_catalog);
+                spawn_delayed_setup_notice(
+                    cx.clone(),
+                    setup_session,
+                    setup_catalog,
+                    sessions_new.clone(),
+                );
                 result
             },
             on_receive_request!(),
@@ -959,7 +965,12 @@ pub async fn run_agent(
                     session_id.clone(),
                     session.skills.clone(),
                 );
-                spawn_delayed_setup_notice(cx.clone(), setup_session, setup_catalog);
+                spawn_delayed_setup_notice(
+                    cx.clone(),
+                    setup_session,
+                    setup_catalog,
+                    sessions_load.clone(),
+                );
                 result
             },
             on_receive_request!(),
@@ -998,7 +1009,12 @@ pub async fn run_agent(
                             session_id.clone(),
                             session.skills.clone(),
                         );
-                        spawn_delayed_setup_notice(cx.clone(), setup_session, setup_catalog);
+                        spawn_delayed_setup_notice(
+                            cx.clone(),
+                            setup_session,
+                            setup_catalog,
+                            sessions_resume.clone(),
+                        );
                         result
                     }
                     None => {
