@@ -195,7 +195,60 @@ Use:
 /setup permissions trusted
 ```
 
-Sandbox mode is separate from permission prompts:
+Sandbox mode is a separate execution boundary. This matters because Anvil runs
+in more places than a single blessed desktop environment: macOS has Seatbelt,
+many Linux installs have Bubblewrap, and some environments have neither.
+
+Anvil has two sandbox layers with different jobs:
+
+- **OS sandbox for shell commands.** On macOS Anvil uses Seatbelt through
+  `sandbox-exec -f <profile.sb> -- sh -c <cmd>`. On Linux it uses
+  Bubblewrap through `bwrap`. This is the strongest boundary for
+  `run_shell_command`: filesystem access is restricted according to the
+  session permission mode.
+- **WASM parser sandbox for untrusted project data.** When an OS sandbox is not
+  available, Anvil can still run parsing and search work inside an embedded
+  Wasmtime component, `brokk-acp-sandbox.wasm`. This is the `WasmFallback`
+  strategy in the code.
+
+The WASM fallback is intentionally narrower than the OS sandbox, but it is still
+useful: it protects the host process from risky parsing workloads even when the
+platform cannot isolate shell commands.
+
+WASM-sandboxed work includes:
+
+- `SKILL.md` YAML frontmatter parsing.
+- `AGENTS.md` / `CLAUDE.md` and subagent file reads with byte caps.
+- Session zip reads and rewrites, including bounded entry reads and prefix
+  reads for `content/*.txt`.
+- `grep_search` / file-content search, including user-controlled regexes and
+  bounded file reads.
+
+The WASM sandbox gives these operations a fresh Wasmtime store per request, a
+fuel budget for CPU, a 64 MiB linear-memory cap, bounded stdout/stderr pipes,
+and read-only per-call preopens only when a file or directory must be inspected.
+If the guest traps, exhausts fuel, or hits the memory limit, Anvil reports a
+sandbox error instead of silently retrying natively.
+
+What WASM does **not** do:
+
+- It does not sandbox `run_shell_command`; without Seatbelt or Bubblewrap,
+  shell commands run without OS isolation, though the ACP permission gate still
+  applies.
+- It does not replace path validation for file tools. Built-in file reads,
+  writes, and edits still use `safe_resolve` / `safe_resolve_for_write` to keep
+  paths inside the session `cwd`.
+
+Sandbox selection:
+
+- If an OS sandbox is available, Anvil defaults to `os`: shell commands are
+  wrapped by Seatbelt/Bubblewrap and parsing runs natively for speed.
+- If no OS sandbox is available, Anvil defaults to `wasm`: shell commands are
+  not OS-sandboxed, but parser/search/archive work goes through the WASM
+  sandbox.
+- `--no-wasm-sandbox` disables the WASM fallback and forces native parsing.
+
+You can override the effective mode per session:
 
 ```text
 /setup sandbox default
@@ -204,10 +257,8 @@ Sandbox mode is separate from permission prompts:
 /setup sandbox off
 ```
 
-The sandbox protects parsing of project-controlled files and, when available,
-shell execution. On Linux, OS-level shell sandboxing requires `bubblewrap`
-(`bwrap`). On platforms without an OS sandbox, Anvil can still route risky
-archive and parsing work through the WASM sandbox.
+`/setup sandbox off` disables sandboxing; permission prompts remain controlled
+by `/setup permissions`.
 
 ## Tools
 
