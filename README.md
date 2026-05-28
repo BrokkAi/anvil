@@ -90,6 +90,28 @@ Then add the binary path to your editor's agent server config:
 - JetBrains: `~/.jetbrains/acp.json` under `agent_servers`, same shape
   minus the `type` field.
 
+## ACP Client Examples
+
+The `examples/` directory contains small Rust ACP clients that use Anvil as a
+subprocess. They default to `ANVIL_AGENT`, then `target/debug/anvil`, then
+`cargo run --quiet --bin anvil --`. Pass `--agent '<command>'` to override that
+per run.
+
+```bash
+# Analyze an existing GitHub issue and print a triage note.
+cargo run --example issue_bot -- --repo BrokkAi/anvil 123
+
+# Review a pull request diff and print findings.
+cargo run --example review_bot -- --repo BrokkAi/anvil 456
+
+# Interactively draft and create a GitHub issue.
+cargo run --example issue_writer_tui -- --repo BrokkAi/anvil
+```
+
+The issue and review bots run Anvil in read-only permission mode and only post
+comments when `--post-comment` is supplied. The issue writer shows the draft and
+asks before calling `gh issue create`; use `--dry-run` to stop after drafting.
+
 ## Tool Calling and Permissions
 
 The server supports a variety of tools, including `readFile`, `writeFile`, `listDirectory`, and `runShellCommand`. Execution is governed by a **Permission Mode** selectable in the client:
