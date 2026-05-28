@@ -180,8 +180,8 @@ last. You can also select a specific model with `/setup model <wire id>`.
 
 Built-in commands:
 
-- `/setup`: model login, provider selection, permissions, behavior mode,
-  sandbox mode, timeout, and advanced settings.
+- `/setup`: model login, provider selection, behavior mode, sandbox mode,
+  timeout, and advanced settings.
 - `/context`: show the current session context snapshot and token estimate.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
@@ -231,23 +231,13 @@ Permission mode controls whether Anvil asks before tool calls:
 - `readOnly`: block edits and shell commands.
 - `bypassPermissions`: allow tool calls without prompting.
 
-Use:
+Change the current session's permission mode from your ACP client's session
+configuration UI. Anvil advertises it as the `Permission` selector alongside
+other session options such as model and behavior mode.
 
-```text
-/setup permissions ask
-/setup permissions auto-edits
-/setup permissions read-only
-/setup permissions trusted
-```
-
-Approvals remembered through an **Always allow** prompt are session-scoped and
-can be inspected or revoked with:
-
-```text
-/setup permissions list
-/setup permissions revoke <number-or-key>
-/setup permissions clear
-```
+Approvals remembered through an **Always allow** prompt are session-scoped. They
+remain in effect for the current session; start a new session to return to a
+fresh approval set.
 
 Sandbox mode is a separate execution boundary. This matters because Anvil runs
 in more places than a single blessed desktop environment: macOS has the Seatbelt
@@ -315,7 +305,7 @@ You can override the effective mode per session:
 ```
 
 `/setup sandbox off` disables sandboxing; permission prompts remain controlled
-by `/setup permissions`.
+by the session's `Permission` setting.
 
 ## Tools
 

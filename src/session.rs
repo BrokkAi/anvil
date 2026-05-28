@@ -454,8 +454,8 @@ pub struct Session {
     /// In-memory only (matches `claude-agent-acp` behavior).
     pub always_allow_tools: HashSet<String>,
     /// Approval keys in the order they were first remembered. This keeps
-    /// `/setup permissions list` and `revoke <number>` stable without
-    /// weakening the fast membership check above.
+    /// permission prompt behavior deterministic without weakening the fast
+    /// membership check above.
     always_allow_order: Vec<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
     /// `None` means "use the active model's `default_reasoning_level`";
