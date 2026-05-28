@@ -39,7 +39,7 @@ pub(crate) async fn send_with_retries(
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error()
+    status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error()
 }
 
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
@@ -101,10 +101,11 @@ mod tests {
     }
 
     #[test]
-    fn status_retry_policy_matches_codex_default() {
+    fn status_retry_policy_includes_transient_failures() {
         assert!(is_retryable_status(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
+        assert!(is_retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
         assert!(!is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
     }
