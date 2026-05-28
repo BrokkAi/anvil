@@ -453,6 +453,10 @@ pub struct Session {
     /// Most tools use the tool name; shell commands use a scoped key.
     /// In-memory only (matches `claude-agent-acp` behavior).
     pub always_allow_tools: HashSet<String>,
+    /// Approval keys in the order they were first remembered. This keeps
+    /// `/setup permissions list` and `revoke <number>` stable without
+    /// weakening the fast membership check above.
+    always_allow_order: Vec<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
     /// `None` means "use the active model's `default_reasoning_level`";
     /// `Some(_)` means "honor this exact level, fail if unsupported".
@@ -539,6 +543,7 @@ impl Session {
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
+            always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions,
@@ -552,10 +557,11 @@ impl Session {
     /// Construct a `Session` from data loaded off disk.
     ///
     /// SECURITY: transient fields that intentionally do NOT survive a reload
-    /// (`permission_mode`, `always_allow_tools`) are reset here, mirroring
-    /// `claude-agent-acp`. Going through this constructor guarantees a stale
-    /// or tampered manifest cannot silently auto-allow tool calls on launch,
-    /// and that any future "reset on reload" field is added in one place.
+    /// (`permission_mode`, `always_allow_tools`, `always_allow_order`) are
+    /// reset here, mirroring `claude-agent-acp`. Going through this
+    /// constructor guarantees a stale or tampered manifest cannot silently
+    /// auto-allow tool calls on launch, and that any future "reset on reload"
+    /// field is added in one place.
     ///
     /// Also rejects a mismatch between `id` (the caller's requested id, used
     /// to locate the zip and to key the in-memory map) and `manifest.id`
@@ -601,6 +607,7 @@ impl Session {
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
+            always_allow_order: Vec::new(),
             // Reset reasoning effort on load -- it's a transient
             // per-session preference (per issue scope), so a
             // reloaded zip starts at "use model default" until the
@@ -2273,9 +2280,39 @@ impl SessionStore {
 
     /// Add `approval_key` to the session's in-memory always-allow set.
     pub async fn add_always_allow(&self, id: &str, approval_key: &str) {
-        if let Some(session) = self.sessions.write().await.get_mut(id) {
-            session.always_allow_tools.insert(approval_key.to_string());
+        if let Some(session) = self.sessions.write().await.get_mut(id)
+            && session.always_allow_tools.insert(approval_key.to_string())
+        {
+            session.always_allow_order.push(approval_key.to_string());
         }
+    }
+
+    /// Return the session's in-memory always-allow keys in approval order.
+    pub async fn always_allow_keys(&self, id: &str) -> Option<Vec<String>> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(id)?;
+        Some(session.always_allow_order.clone())
+    }
+
+    /// Remove one in-memory always-allow key. Returns `None` if the session is unknown.
+    pub async fn remove_always_allow(&self, id: &str, approval_key: &str) -> Option<bool> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        let removed = session.always_allow_tools.remove(approval_key);
+        if removed {
+            session.always_allow_order.retain(|key| key != approval_key);
+        }
+        Some(removed)
+    }
+
+    /// Clear all in-memory always-allow keys for a session.
+    pub async fn clear_always_allow(&self, id: &str) -> Option<usize> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        let count = session.always_allow_tools.len();
+        session.always_allow_tools.clear();
+        session.always_allow_order.clear();
+        Some(count)
     }
 
     /// Fold a turn's token usage into the session running total and
@@ -2800,10 +2837,11 @@ mod tests {
     }
 
     /// `Session::from_persisted` must always reset the transient security
-    /// fields (`permission_mode`, `always_allow_tools`), even when the
-    /// caller's data was reconstructed from a manifest that may be stale or
-    /// tampered. Persisted-side fields (id/cwd/mode/model/history/manifest)
-    /// must round-trip unchanged when ids match.
+    /// fields (`permission_mode`, `always_allow_tools`, `always_allow_order`),
+    /// even when the caller's data was reconstructed from a manifest that may
+    /// be stale or tampered. Persisted-side fields
+    /// (id/cwd/mode/model/history/manifest) must round-trip unchanged when ids
+    /// match.
     #[test]
     fn from_persisted_resets_transient_security_fields() {
         let manifest = SessionManifest {
@@ -2833,6 +2871,7 @@ mod tests {
 
         assert_eq!(session.permission_mode, PermissionMode::Default);
         assert!(session.always_allow_tools.is_empty());
+        assert!(session.always_allow_order.is_empty());
 
         assert_eq!(session.id, "abc");
         assert_eq!(session.cwd, PathBuf::from("/tmp/x"));
@@ -3452,6 +3491,7 @@ mod tests {
         assert_eq!(reloaded.permission_mode, PermissionMode::Default);
         assert!(reloaded.sandbox_mode.is_none());
         assert!(reloaded.always_allow_tools.is_empty());
+        assert!(reloaded.always_allow_order.is_empty());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -3606,6 +3646,44 @@ mod tests {
         assert!(!store.is_always_allowed(&s.id, "run_shell_command").await);
         // Unknown session never reports allowed.
         assert!(!store.is_always_allowed("no-such", "write_file").await);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn always_allow_keys_can_be_listed_removed_and_cleared() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-always-allow-manage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+
+        store.add_always_allow(&s.id, "write_file").await;
+        store.add_always_allow(&s.id, "run_shell_command").await;
+        store.add_always_allow(&s.id, "write_file").await;
+
+        assert_eq!(
+            store.always_allow_keys(&s.id).await,
+            Some(vec![
+                "write_file".to_string(),
+                "run_shell_command".to_string()
+            ])
+        );
+        assert_eq!(
+            store.remove_always_allow(&s.id, "write_file").await,
+            Some(true)
+        );
+        assert_eq!(
+            store.remove_always_allow(&s.id, "write_file").await,
+            Some(false)
+        );
+        assert_eq!(store.clear_always_allow(&s.id).await, Some(1));
+        assert_eq!(store.always_allow_keys(&s.id).await, Some(Vec::new()));
+
+        assert_eq!(store.always_allow_keys("no-such").await, None);
+        assert_eq!(store.remove_always_allow("no-such", "x").await, None);
+        assert_eq!(store.clear_always_allow("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
