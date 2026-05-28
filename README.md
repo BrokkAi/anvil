@@ -401,6 +401,7 @@ anvil [OPTIONS]
 | `--max-sessions` | - | `50` | Maximum resident sessions before LRU eviction. `0` disables the cap. |
 | `--max-history-turns` | - | `50` | Maximum in-memory history turns per session. `0` disables the cap. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | SSE inactivity timeout for LLM streaming. |
+| `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep setup preferences process-local; model/reasoning/sandbox choices for this run do not read or update the global setup file. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 
 ## Build And Test
