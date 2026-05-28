@@ -4640,10 +4640,10 @@ mod tests {
         store.add_always_allow(&id, "run_shell_command").await;
 
         let listed = render_always_allowed_permissions(&store, &id).await;
-        assert!(listed.contains("1. tool `run_shell_command`"), "{listed}");
-        assert!(listed.contains("2. tool `write_file`"), "{listed}");
+        assert!(listed.contains("1. tool `write_file`"), "{listed}");
+        assert!(listed.contains("2. tool `run_shell_command`"), "{listed}");
 
-        let revoked = revoke_always_allowed_permission(&store, &id, "2").await;
+        let revoked = revoke_always_allowed_permission(&store, &id, "1").await;
         assert_eq!(revoked, "Forgot Always allow approval: tool `write_file`");
         assert!(!store.is_always_allowed(&id, "write_file").await);
         assert!(store.is_always_allowed(&id, "run_shell_command").await);
