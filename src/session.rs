@@ -2278,6 +2278,31 @@ impl SessionStore {
         }
     }
 
+    /// Return the session's in-memory always-allow keys in a stable order.
+    pub async fn always_allow_keys(&self, id: &str) -> Option<Vec<String>> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(id)?;
+        let mut keys: Vec<_> = session.always_allow_tools.iter().cloned().collect();
+        keys.sort();
+        Some(keys)
+    }
+
+    /// Remove one in-memory always-allow key. Returns `None` if the session is unknown.
+    pub async fn remove_always_allow(&self, id: &str, approval_key: &str) -> Option<bool> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        Some(session.always_allow_tools.remove(approval_key))
+    }
+
+    /// Clear all in-memory always-allow keys for a session.
+    pub async fn clear_always_allow(&self, id: &str) -> Option<usize> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        let count = session.always_allow_tools.len();
+        session.always_allow_tools.clear();
+        Some(count)
+    }
+
     /// Fold a turn's token usage into the session running total and
     /// return the new cumulative figure. Used by the prompt handler to
     /// populate `PromptResponse.usage` after `tool_loop::run` reports
@@ -3606,6 +3631,43 @@ mod tests {
         assert!(!store.is_always_allowed(&s.id, "run_shell_command").await);
         // Unknown session never reports allowed.
         assert!(!store.is_always_allowed("no-such", "write_file").await);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn always_allow_keys_can_be_listed_removed_and_cleared() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-always-allow-manage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+
+        store.add_always_allow(&s.id, "write_file").await;
+        store.add_always_allow(&s.id, "run_shell_command").await;
+
+        assert_eq!(
+            store.always_allow_keys(&s.id).await,
+            Some(vec![
+                "run_shell_command".to_string(),
+                "write_file".to_string()
+            ])
+        );
+        assert_eq!(
+            store.remove_always_allow(&s.id, "write_file").await,
+            Some(true)
+        );
+        assert_eq!(
+            store.remove_always_allow(&s.id, "write_file").await,
+            Some(false)
+        );
+        assert_eq!(store.clear_always_allow(&s.id).await, Some(1));
+        assert_eq!(store.always_allow_keys(&s.id).await, Some(Vec::new()));
+
+        assert_eq!(store.always_allow_keys("no-such").await, None);
+        assert_eq!(store.remove_always_allow("no-such", "x").await, None);
+        assert_eq!(store.clear_always_allow("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

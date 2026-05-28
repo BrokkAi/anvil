@@ -2740,8 +2740,22 @@ async fn handle_setup_permission(
                 - `/setup permissions ask` - Ask before edits and commands.\n\
                 - `/setup permissions auto-edits` - Edit files automatically, ask for commands.\n\
                 - `/setup permissions read-only` - Do not change files or run commands.\n\
-                - `/setup permissions trusted` - Allow tool calls without prompting."
+                - `/setup permissions trusted` - Allow tool calls without prompting.\n\
+                - `/setup permissions list` - Show remembered Always allow approvals.\n\
+                - `/setup permissions revoke <number-or-key>` - Forget one remembered approval.\n\
+                - `/setup permissions clear` - Forget all remembered approvals for this session."
             .to_string();
+    }
+    let (action, arg) = split_setup_action(rest);
+    match action.to_ascii_lowercase().as_str() {
+        "list" | "show" | "always" | "remembered" => {
+            return render_always_allowed_permissions(sessions, session_id).await;
+        }
+        "revoke" | "remove" | "forget" => {
+            return revoke_always_allowed_permission(sessions, session_id, arg).await;
+        }
+        "clear" | "reset" => return clear_always_allowed_permissions(sessions, session_id).await,
+        _ => {}
     }
     let value = match rest.to_ascii_lowercase().as_str() {
         "ask" | "default" => "default",
@@ -2750,11 +2764,117 @@ async fn handle_setup_permission(
         "trusted" | "bypass" | "bypass-permissions" => "bypassPermissions",
         _ => {
             return "Unknown permission choice. Try `/setup permissions ask`, \
-                    `auto-edits`, `read-only`, or `trusted`."
+                    `auto-edits`, `read-only`, `trusted`, `list`, `revoke`, or `clear`."
                 .to_string();
         }
     };
     apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
+}
+
+fn split_setup_action(input: &str) -> (&str, &str) {
+    let trimmed = input.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => {
+            let (action, rest) = trimmed.split_at(idx);
+            (action, rest.trim())
+        }
+        None => (trimmed, ""),
+    }
+}
+
+async fn render_always_allowed_permissions(sessions: &SessionStore, session_id: &str) -> String {
+    let Some(keys) = sessions.always_allow_keys(session_id).await else {
+        return "Error: unknown session.".to_string();
+    };
+    if keys.is_empty() {
+        return "No remembered Always allow approvals for this session.".to_string();
+    }
+
+    let mut out = String::from("Remembered Always allow approvals for this session:\n\n");
+    for (idx, key) in keys.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {}\n",
+            idx + 1,
+            describe_always_allow_key(key)
+        ));
+        out.push_str(&format!("   Key: `{key}`\n"));
+    }
+    out.push_str(
+        "\nUse `/setup permissions revoke <number>` to forget one, or \
+         `/setup permissions clear` to forget all.",
+    );
+    out
+}
+
+async fn revoke_always_allowed_permission(
+    sessions: &SessionStore,
+    session_id: &str,
+    arg: &str,
+) -> String {
+    if arg.is_empty() {
+        return "Usage: `/setup permissions revoke <number-or-key>`.\n\
+                Run `/setup permissions list` to see remembered approvals."
+            .to_string();
+    }
+
+    let Some(keys) = sessions.always_allow_keys(session_id).await else {
+        return "Error: unknown session.".to_string();
+    };
+    let key = match arg.parse::<usize>() {
+        Ok(index) if (1..=keys.len()).contains(&index) => keys[index - 1].clone(),
+        Ok(_) => {
+            return format!(
+                "No remembered Always allow approval numbered `{arg}`. \
+                 Run `/setup permissions list` to see valid numbers."
+            );
+        }
+        Err(_) => arg.to_string(),
+    };
+
+    match sessions.remove_always_allow(session_id, &key).await {
+        Some(true) => format!(
+            "Forgot Always allow approval: {}",
+            describe_always_allow_key(&key)
+        ),
+        Some(false) => "No matching remembered Always allow approval was found.".to_string(),
+        None => "Error: unknown session.".to_string(),
+    }
+}
+
+async fn clear_always_allowed_permissions(sessions: &SessionStore, session_id: &str) -> String {
+    match sessions.clear_always_allow(session_id).await {
+        Some(0) => "No remembered Always allow approvals to clear.".to_string(),
+        Some(1) => "Forgot 1 remembered Always allow approval.".to_string(),
+        Some(count) => format!("Forgot {count} remembered Always allow approvals."),
+        None => "Error: unknown session.".to_string(),
+    }
+}
+
+fn describe_always_allow_key(key: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(key).ok();
+    if let Some(value) = parsed
+        && value.get("tool").and_then(serde_json::Value::as_str) == Some("run_shell_command")
+    {
+        let command = value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(unknown command)");
+        let cwd = value
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(unknown cwd)");
+        let sandbox = match value
+            .get("shellSandboxed")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => "sandboxed",
+            Some(false) => "unsandboxed",
+            None => "sandbox unknown",
+        };
+        return format!("run_shell_command `{command}` in `{cwd}` ({sandbox})");
+    }
+
+    format!("tool `{key}`")
 }
 
 /// Configure the session's effective sandbox mode. Separate from `/setup
@@ -4494,6 +4614,49 @@ mod tests {
             std::env::temp_dir().join(format!("brokk-acp-configure-{}", uuid::Uuid::new_v4()));
         let session = store.create_session(cwd).await;
         (store, session.id)
+    }
+
+    #[test]
+    fn describe_always_allow_key_formats_shell_keys() {
+        let key = serde_json::json!({
+            "tool": "run_shell_command",
+            "cwd": "/work/repo",
+            "command": "cargo test",
+            "shellSandboxed": true,
+        })
+        .to_string();
+
+        assert_eq!(
+            describe_always_allow_key(&key),
+            "run_shell_command `cargo test` in `/work/repo` (sandboxed)"
+        );
+        assert_eq!(describe_always_allow_key("write_file"), "tool `write_file`");
+    }
+
+    #[tokio::test]
+    async fn remembered_permissions_can_be_listed_revoked_and_cleared() {
+        let (store, id) = make_store_with_session("m").await;
+        store.add_always_allow(&id, "write_file").await;
+        store.add_always_allow(&id, "run_shell_command").await;
+
+        let listed = render_always_allowed_permissions(&store, &id).await;
+        assert!(listed.contains("1. tool `run_shell_command`"), "{listed}");
+        assert!(listed.contains("2. tool `write_file`"), "{listed}");
+
+        let revoked = revoke_always_allowed_permission(&store, &id, "2").await;
+        assert_eq!(revoked, "Forgot Always allow approval: tool `write_file`");
+        assert!(!store.is_always_allowed(&id, "write_file").await);
+        assert!(store.is_always_allowed(&id, "run_shell_command").await);
+
+        let missing = revoke_always_allowed_permission(&store, &id, "99").await;
+        assert!(missing.contains("No remembered Always allow approval numbered `99`"));
+
+        let cleared = clear_always_allowed_permissions(&store, &id).await;
+        assert_eq!(cleared, "Forgot 1 remembered Always allow approval.");
+        assert_eq!(
+            render_always_allowed_permissions(&store, &id).await,
+            "No remembered Always allow approvals for this session."
+        );
     }
 
     #[tokio::test]

@@ -99,6 +99,10 @@ The server supports a variety of tools, including `readFile`, `writeFile`, `list
 - **Read-only**: Strictly forbids any tool that modifies the filesystem or executes commands.
 - **Bypass Permissions**: Trust the agent to execute all tools without interruption.
 
+Approvals remembered through an **Always allow** prompt are session-scoped and
+can be inspected or revoked with `/setup permissions list`,
+`/setup permissions revoke <number-or-key>`, and `/setup permissions clear`.
+
 Sandbox strategy is separate from permission prompts. Use `/setup sandbox
 default|os|wasm|off` to choose the shell/parser sandbox strategy for the
 current session and future sessions on the same install.
