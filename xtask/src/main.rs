@@ -32,10 +32,6 @@ struct BuildArgs {
     /// Override the editor config path. Defaults to the editor's standard location under $HOME.
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Path or PATH name of the bifrost analyzer binary to pass via --bifrost-binary in the
-    /// editor entry's args. The `brokk-acp` binary needs this to find its analyzer backend.
-    #[arg(long, default_value = "bifrost")]
-    bifrost_binary: String,
 }
 
 #[derive(Copy, Clone)]
@@ -66,16 +62,16 @@ fn run(kind: EditorKind, args: BuildArgs) -> Result<()> {
     let root = workspace_root();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(&cargo)
-        .args(["build", "--release", "--bin", "brokk-acp"])
+        .args(["build", "--release", "--bin", "anvil"])
         .current_dir(root)
         .status()
         .context("failed to invoke cargo build")?;
     ensure!(
         status.success(),
-        "cargo build --release --bin brokk-acp failed (status: {status})"
+        "cargo build --release --bin anvil failed (status: {status})"
     );
 
-    let binary = root.join("target/release/brokk-acp");
+    let binary = root.join("target/release/anvil");
     ensure!(
         binary.exists(),
         "expected binary not found at {}",
@@ -87,7 +83,7 @@ fn run(kind: EditorKind, args: BuildArgs) -> Result<()> {
         EditorKind::Jetbrains => home_dir().join(".jetbrains/acp.json"),
     });
 
-    write_entry(&config_path, kind, &binary, &args.bifrost_binary)?;
+    write_entry(&config_path, kind, &binary)?;
     println!(
         "Updated '{ENTRY_NAME}' in {} -> {}",
         config_path.display(),
@@ -102,12 +98,7 @@ fn home_dir() -> PathBuf {
         .expect("HOME env var must be set")
 }
 
-fn write_entry(
-    config_path: &Path,
-    kind: EditorKind,
-    binary: &Path,
-    bifrost_binary: &str,
-) -> Result<()> {
+fn write_entry(config_path: &Path, kind: EditorKind, binary: &Path) -> Result<()> {
     let mut root: Value = if config_path.exists() && std::fs::metadata(config_path)?.len() > 0 {
         let txt = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
@@ -137,7 +128,7 @@ fn write_entry(
         "command".into(),
         json!(binary.to_str().context("binary path is not valid UTF-8")?),
     );
-    entry.insert("args".into(), json!(["--bifrost-binary", bifrost_binary]));
+    entry.insert("args".into(), json!([]));
     entry.insert("env".into(), json!({}));
     agent_servers.insert(ENTRY_NAME.into(), Value::Object(entry));
 

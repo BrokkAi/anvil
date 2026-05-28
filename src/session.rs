@@ -1641,8 +1641,8 @@ pub struct SessionStore {
     /// parallel cache to avoid drift.
     available_models: Arc<RwLock<Vec<ModelMetadata>>>,
     cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    /// One ToolRegistry per session, kept warm across turns so any bifrost
-    /// subprocess survives. Populated lazily on first prompt.
+    /// One ToolRegistry per session, kept warm across turns so any MCP
+    /// subprocesses survive. Populated lazily on first prompt.
     registries: Arc<RwLock<HashMap<String, Arc<ToolRegistry>>>>,
     /// Per-session monotonic access counter used for LRU eviction. Held
     /// behind a sync `Mutex` because every touch is a fast in-memory bump
@@ -1746,7 +1746,8 @@ impl SessionStore {
     }
 
     /// Return the cached ToolRegistry for `session_id`, or build one and cache it.
-    /// `bifrost_binary` is consulted only on the first call for a given cwd.
+    /// MCP server config is consulted only when the registry is built. If
+    /// config changes, callers should invalidate the registry first.
     ///
     /// If the session cwd is unchanged, refresh the cached `SkillRegistry`
     /// in place so `activate_skill` sees the latest on-disk skills without
@@ -1758,7 +1759,6 @@ impl SessionStore {
         &self,
         session_id: &str,
         cwd: PathBuf,
-        bifrost_binary: Option<&Path>,
     ) -> Arc<ToolRegistry> {
         let normalized_cwd = normalize_cwd(&cwd);
         let (skills, agents) = {
@@ -1779,13 +1779,18 @@ impl SessionStore {
             existing.set_agents(agents).await;
             return existing;
         }
+        let mcp_servers = crate::setup_state::read_mcp_servers();
         let registry =
-            Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills, agents).await);
+            Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
         self.registries
             .write()
             .await
             .insert(session_id.to_string(), registry.clone());
         registry
+    }
+
+    pub async fn invalidate_registry(&self, session_id: &str) {
+        self.registries.write().await.remove(session_id);
     }
 
     pub async fn set_available_models(&self, models: Vec<ModelMetadata>) {
@@ -4056,11 +4061,9 @@ mod tests {
         let canonical_cwd = normalize_cwd(cwd.path());
 
         let registry1 = store
-            .get_or_create_registry(&session.id, cwd.path().to_path_buf(), None)
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
             .await;
-        let registry2 = store
-            .get_or_create_registry(&session.id, cwd_alias, None)
-            .await;
+        let registry2 = store.get_or_create_registry(&session.id, cwd_alias).await;
 
         assert!(
             Arc::ptr_eq(&registry1, &registry2),
@@ -4128,19 +4131,25 @@ done
         let store = SessionStore::new("m".to_string());
         let cwd1 = tempfile::tempdir().expect("cwd1");
         let cwd2 = tempfile::tempdir().expect("cwd2");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
         let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
         let session = store.create_session(cwd1.path().to_path_buf()).await;
         let canonical_cwd1 = normalize_cwd(cwd1.path());
         let canonical_cwd2 = normalize_cwd(cwd2.path());
 
         let registry1 = store
-            .get_or_create_registry(
-                &session.id,
-                cwd1.path().to_path_buf(),
-                Some(fake_bifrost.as_path()),
-            )
+            .get_or_create_registry(&session.id, cwd1.path().to_path_buf())
             .await;
         assert_eq!(registry1.cwd(), canonical_cwd1.as_path());
         assert_eq!(
@@ -4153,11 +4162,7 @@ done
             .await;
 
         let registry2 = store
-            .get_or_create_registry(
-                &session.id,
-                cwd2.path().to_path_buf(),
-                Some(fake_bifrost.as_path()),
-            )
+            .get_or_create_registry(&session.id, cwd2.path().to_path_buf())
             .await;
 
         assert!(

@@ -3,12 +3,13 @@ pub mod sandbox;
 mod shell;
 
 use crate::agents::AgentRegistry;
-use crate::bifrost_client::BifrostClient;
 use crate::llm_client::{FunctionDef, ToolDefinition};
+use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::SkillRegistry;
 use agent_client_protocol::schema::ToolKind;
 use sandbox::SandboxPolicy;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -73,11 +74,11 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Execute,
         display_name: "Running shell command",
     },
-    // --- Bifrost-loaded tools (dispatched via `execute_bifrost`) -----------
+    // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
     // Listed here so the permission gate can classify them; their actual
-    // execution is delegated to the bifrost subprocess. The cross-check
-    // in `bifrost_client::tests::handshake_and_call_search_tools` keeps
-    // this list in sync with what the running bifrost subprocess exposes.
+    // execution is delegated to the configured MCP server. The cross-check
+    // in `mcp::tests::handshake_and_call_search_tools` keeps this list in
+    // sync with what the running Bifrost MCP server exposes.
     ToolMeta {
         name: "get_summaries",
         kind: ToolKind::Read,
@@ -244,7 +245,6 @@ pub(crate) fn is_known_tool(name: &str) -> bool {
 /// Built-in tool names handled by the inline `match` in
 /// `ToolRegistry::execute`. Used by tests to keep the metadata table
 /// in sync with the actual builtin dispatch.
-#[cfg(test)]
 const BUILTIN_TOOL_NAMES: &[&str] = &[
     "think",
     "read_file",
@@ -255,15 +255,20 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "run_shell_command",
 ];
 
-/// Unified tool registry: filesystem tools + shell + think + (optionally)
-/// bifrost code-intelligence tools + Agent Skills activation.
+fn is_builtin_tool(name: &str) -> bool {
+    BUILTIN_TOOL_NAMES.contains(&name)
+}
+
+/// Unified tool registry: filesystem tools + shell + think + configured
+/// MCP tools + Agent Skills activation.
 ///
 /// `skills` is wrapped in `RwLock` so the session can swap in a fresh
 /// `SkillRegistry` after `update_cwd` without rebuilding the registry
-/// (which would re-spawn the bifrost subprocess).
+/// (which would re-spawn MCP subprocesses).
 pub struct ToolRegistry {
     cwd: PathBuf,
-    bifrost: Option<Arc<BifrostClient>>,
+    mcp_clients: Vec<Arc<McpClient>>,
+    mcp_tool_servers: HashMap<String, Arc<McpClient>>,
     skills: RwLock<Arc<SkillRegistry>>,
     agents: RwLock<Arc<AgentRegistry>>,
 }
@@ -296,7 +301,7 @@ impl ToolRegistry {
 
     pub async fn new(
         cwd: PathBuf,
-        bifrost_binary: Option<&Path>,
+        mcp_servers: Vec<McpServerConfig>,
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
     ) -> Self {
@@ -305,27 +310,49 @@ impl ToolRegistry {
         // profile from a concurrent in-flight shell call.
         sandbox::cleanup_stale_policy_files();
 
-        let bifrost = match bifrost_binary {
-            Some(bin) => match BifrostClient::spawn(bin, &cwd).await {
-                Ok(client) => Some(Arc::new(client)),
+        let mut mcp_clients = Vec::new();
+        let mut mcp_tool_servers = HashMap::new();
+        for config in mcp_servers.iter().filter(|server| server.enabled) {
+            match McpClient::spawn(config, &cwd).await {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    for tool in client.tools() {
+                        if is_builtin_tool(&tool.name) {
+                            tracing::warn!(
+                                server = %client.name(),
+                                tool = %tool.name,
+                                "mcp tool name collides with a built-in tool; ignoring server tool"
+                            );
+                            continue;
+                        }
+                        if mcp_tool_servers
+                            .insert(tool.name.clone(), client.clone())
+                            .is_some()
+                        {
+                            tracing::warn!(
+                                server = %client.name(),
+                                tool = %tool.name,
+                                "mcp tool name collision; later server wins"
+                            );
+                        }
+                    }
+                    mcp_clients.push(client);
+                }
                 Err(err) => {
                     tracing::warn!(
                         cwd = %cwd.display(),
-                        binary = %bin.display(),
+                        server = %config.name,
+                        command = %config.command,
                         %err,
-                        "bifrost subprocess failed to start; code-intelligence tools disabled for this session"
+                        "mcp server failed to start; its tools are disabled for this session"
                     );
-                    None
                 }
-            },
-            None => {
-                tracing::debug!("bifrost binary not configured; code-intelligence tools disabled");
-                None
             }
-        };
+        }
         Self {
             cwd,
-            bifrost,
+            mcp_clients,
+            mcp_tool_servers,
             skills: RwLock::new(skills),
             agents: RwLock::new(agents),
         }
@@ -481,8 +508,18 @@ impl ToolRegistry {
                 }),
             ),
         ];
-        if let Some(client) = self.bifrost.as_ref() {
+        let mut advertised_names: HashSet<String> =
+            defs.iter().map(|def| def.function.name.clone()).collect();
+        for client in &self.mcp_clients {
             for tool in client.tools() {
+                if !advertised_names.insert(tool.name.clone()) {
+                    tracing::warn!(
+                        server = %client.name(),
+                        tool = %tool.name,
+                        "mcp tool name collision; skipping duplicate tool definition"
+                    );
+                    continue;
+                }
                 defs.push(tool_def(
                     &tool.name,
                     &tool.description,
@@ -707,13 +744,10 @@ impl ToolRegistry {
                 .await
             }
             "activate_skill" => self.execute_activate_skill(args).await,
-            // Any name not handled above is delegated to the bifrost
-            // subprocess. This avoids a hardcoded list of bifrost tool
-            // names drifting out of sync with what bifrost actually
-            // exposes (`tool_definitions` already iterates bifrost tools
-            // dynamically via `client.tools()`). If bifrost is not
-            // running, `execute_bifrost` returns a clear error.
-            _ => self.execute_bifrost(name, args).await,
+            // Any name not handled above is delegated to a configured MCP
+            // server. This avoids a hardcoded list of server tool names
+            // drifting out of sync with what each server actually exposes.
+            _ => self.execute_mcp(name, args).await,
         }
     }
 
@@ -749,12 +783,12 @@ impl ToolRegistry {
         }
     }
 
-    async fn execute_bifrost(&self, name: &str, args: serde_json::Value) -> ToolResult {
-        let Some(client) = self.bifrost.clone() else {
+    async fn execute_mcp(&self, name: &str, args: serde_json::Value) -> ToolResult {
+        let Some(client) = self.mcp_tool_servers.get(name).cloned() else {
             return ToolResult {
                 status: ToolStatus::RequestError,
                 output: format!(
-                    "Code-intelligence tool '{name}' is unavailable: bifrost subprocess not running."
+                    "MCP tool '{name}' is unavailable: no configured server exposed it."
                 ),
             };
         };
@@ -764,7 +798,7 @@ impl ToolRegistry {
                     s.to_string()
                 } else {
                     serde_json::to_string_pretty(&value)
-                        .unwrap_or_else(|e| format!("<failed to serialize bifrost result: {e}>"))
+                        .unwrap_or_else(|e| format!("<failed to serialize MCP result: {e}>"))
                 };
                 ToolResult {
                     status: ToolStatus::Success,
@@ -773,7 +807,7 @@ impl ToolRegistry {
             }
             Err(err) => ToolResult {
                 status: ToolStatus::InternalError,
-                output: format!("Bifrost tool '{name}' failed: {err}"),
+                output: format!("MCP tool '{name}' on '{}' failed: {err}", client.name()),
             },
         }
     }
@@ -1019,7 +1053,8 @@ mod tests {
         }
         ToolRegistry {
             cwd: PathBuf::from("/tmp"),
-            bifrost: None,
+            mcp_clients: Vec::new(),
+            mcp_tool_servers: HashMap::new(),
             skills: RwLock::new(Arc::new(reg)),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
         }
@@ -1032,7 +1067,8 @@ mod tests {
         }
         ToolRegistry {
             cwd: PathBuf::from("/tmp"),
-            bifrost: None,
+            mcp_clients: Vec::new(),
+            mcp_tool_servers: HashMap::new(),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(reg)),
         }
@@ -1127,7 +1163,8 @@ mod tests {
     async fn builtin_tools_have_metadata_and_are_advertised() {
         let registry = ToolRegistry {
             cwd: PathBuf::from("/tmp"),
-            bifrost: None,
+            mcp_clients: Vec::new(),
+            mcp_tool_servers: HashMap::new(),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
         };
