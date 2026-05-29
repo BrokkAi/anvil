@@ -3,8 +3,10 @@
 //! This is intentionally not the source of truth for whether models work.
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
-//! setup screen and the last selected model/reasoning effort so configured
-//! installs get a short hint instead of the full welcome on every new session.
+//! setup screen and the last selected model/reasoning effort/sandbox mode so
+//! configured installs get a short hint instead of the full welcome on every
+//! new session. It also stores user-configured MCP servers; when that field is
+//! absent, Anvil seeds the config with its preinstalled servers.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,10 @@ pub struct SetupState {
     pub last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
 }
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -79,12 +85,49 @@ pub fn read() -> SetupState {
     read_inner()
 }
 
+pub fn read_sandbox_mode_preference() -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+    let path = path().ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice::<SetupState>(&bytes)
+        .ok()
+        .map(|state| state.last_sandbox_mode)
+}
+
 pub fn mark_first_run_seen() -> Result<()> {
     update(|state| state.first_run_seen = true)
 }
 
 pub fn remember_last_reasoning_effort(reasoning_effort: Option<String>) -> Result<()> {
     update(|state| state.last_reasoning_effort = reasoning_effort)
+}
+
+pub fn remember_sandbox_mode(mode: Option<crate::sandbox_backend::SandboxMode>) -> Result<()> {
+    update(|state| state.last_sandbox_mode = mode)
+}
+
+pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
+    #[cfg(test)]
+    if path().is_err() {
+        return Vec::new();
+    }
+    let mut servers = read()
+        .mcp_servers
+        .unwrap_or_else(crate::mcp::default_servers);
+    let bifrost = crate::mcp::McpServerConfig::bifrost();
+    for server in &mut servers {
+        if server.name == bifrost.name
+            && server.command == bifrost.command
+            && server.args == bifrost.args
+            && server.framing == crate::mcp::McpFraming::ContentLength
+        {
+            server.framing = bifrost.framing;
+        }
+    }
+    servers
+}
+
+pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
+    update(|state| state.mcp_servers = Some(servers))
 }
 
 pub fn remember_last_selection(
@@ -132,7 +175,11 @@ fn write_inner(state: &SetupState) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating setup state dir {}", parent.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("setup.json");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(state).context("serializing setup state")?;
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)

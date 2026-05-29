@@ -124,10 +124,36 @@ impl AgentRegistry {
 /// home directory. Returns an empty registry when nothing is found.
 pub fn discover(cwd: &Path) -> AgentRegistry {
     let home = dirs::home_dir();
-    discover_inner(cwd, home.as_deref())
+    discover_with_backend(cwd, home.as_deref(), crate::sandbox_backend::global())
 }
 
+pub fn discover_with_sandbox_mode(
+    cwd: &Path,
+    mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> AgentRegistry {
+    let home = dirs::home_dir();
+    match crate::sandbox_backend::backend_for_mode(mode) {
+        Ok(backend) => discover_with_backend(cwd, home.as_deref(), &backend),
+        Err(e) => {
+            let mut reg = AgentRegistry::default();
+            reg.push_diagnostic(format!(
+                "failed to initialize sandbox backend for subagent discovery: {e}"
+            ));
+            reg
+        }
+    }
+}
+
+#[cfg(test)]
 fn discover_inner(cwd: &Path, home: Option<&Path>) -> AgentRegistry {
+    discover_with_backend(cwd, home, crate::sandbox_backend::global())
+}
+
+fn discover_with_backend(
+    cwd: &Path,
+    home: Option<&Path>,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> AgentRegistry {
     let cwd = normalize_path(cwd);
     let mut reg = AgentRegistry::default();
 
@@ -137,11 +163,13 @@ fn discover_inner(cwd: &Path, home: Option<&Path>) -> AgentRegistry {
             &h.join(CLAUDE_DIR).join(AGENTS_SUBDIR),
             AgentScope::User,
             &mut reg,
+            backend,
         );
         scan_root(
             &h.join(AGENTS_DIR).join(AGENTS_SUBDIR),
             AgentScope::User,
             &mut reg,
+            backend,
         );
     }
 
@@ -152,11 +180,13 @@ fn discover_inner(cwd: &Path, home: Option<&Path>) -> AgentRegistry {
             &dir.join(CLAUDE_DIR).join(AGENTS_SUBDIR),
             AgentScope::Project,
             &mut reg,
+            backend,
         );
         scan_root(
             &dir.join(AGENTS_DIR).join(AGENTS_SUBDIR),
             AgentScope::Project,
             &mut reg,
+            backend,
         );
     }
 
@@ -167,7 +197,12 @@ fn discover_inner(cwd: &Path, home: Option<&Path>) -> AgentRegistry {
     reg
 }
 
-fn scan_root(root: &Path, scope: AgentScope, reg: &mut AgentRegistry) {
+fn scan_root(
+    root: &Path,
+    scope: AgentScope,
+    reg: &mut AgentRegistry,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) {
     let entries = match std::fs::read_dir(root) {
         Ok(it) => it,
         Err(e) if e.kind() == ErrorKind::NotFound => return,
@@ -215,11 +250,16 @@ fn scan_root(root: &Path, scope: AgentScope, reg: &mut AgentRegistry) {
         if !is_md {
             continue;
         }
-        load_agent(&path, scope, reg);
+        load_agent(&path, scope, reg, backend);
     }
 }
 
-fn load_agent(path: &Path, scope: AgentScope, reg: &mut AgentRegistry) {
+fn load_agent(
+    path: &Path,
+    scope: AgentScope,
+    reg: &mut AgentRegistry,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -249,7 +289,7 @@ fn load_agent(path: &Path, scope: AgentScope, reg: &mut AgentRegistry) {
     // Reuse the skills frontmatter parser: it extracts `{name, description}`,
     // which is exactly what we need. Anything beyond (tools, model) is ignored
     // in this v1.
-    let parsed = match crate::sandbox_backend::global().parse_skill_frontmatter(front) {
+    let parsed = match backend.parse_skill_frontmatter(front) {
         Ok(p) => p,
         Err(e) => {
             reg.push_diagnostic(format!(

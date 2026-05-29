@@ -119,7 +119,7 @@ pub fn write_auth_dot_json(auth: &AuthDotJson) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(auth).context("serializing AuthDotJson")?;
     std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
     set_user_only_perms(&tmp)?;

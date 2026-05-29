@@ -209,6 +209,44 @@ fn select_session_reasoning_effort(
     }
 }
 
+fn usable_sandbox_mode_preference(
+    mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> Option<crate::sandbox_backend::SandboxMode> {
+    let mode = mode?;
+    match crate::sandbox_backend::backend_for_mode(Some(mode)) {
+        Ok(_) => Some(mode),
+        Err(e) => {
+            tracing::warn!(
+                sandbox_mode = mode.as_str(),
+                "ignoring persisted sandbox preference because the backend is unavailable: {e}"
+            );
+            None
+        }
+    }
+}
+
+fn discover_session_context(
+    cwd: &Path,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> (
+    String,
+    Arc<crate::skills::SkillRegistry>,
+    Arc<crate::agents::AgentRegistry>,
+) {
+    match sandbox_mode {
+        Some(mode) => (
+            crate::agents_md::discover_with_sandbox_mode(cwd, Some(mode)),
+            Arc::new(crate::skills::discover_with_sandbox_mode(cwd, Some(mode))),
+            Arc::new(crate::agents::discover_with_sandbox_mode(cwd, Some(mode))),
+        ),
+        None => (
+            crate::agents_md::discover(cwd),
+            Arc::new(crate::skills::discover(cwd)),
+            Arc::new(crate::agents::discover(cwd)),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session modes
 // ---------------------------------------------------------------------------
@@ -395,19 +433,30 @@ pub struct Session {
     pub history: Vec<ConversationTurn>,
     pub manifest: SessionManifest,
     pub permission_mode: PermissionMode,
-    /// When true, `run_shell_command` runs without the OS sandbox
-    /// (sandbox-exec / bwrap) regardless of `permission_mode`. The
-    /// permission prompt still fires -- this flag controls the sandbox
-    /// boundary, not user approval. Set via `/setup sandbox off`.
+    /// Effective sandbox mode override for this session. Controls both
+    /// shell command wrapping (OS sandbox: bwrap / seatbelt) and parsing
+    /// backend (wasm vs native). `None` means use the global default
+    /// detected at startup.
     ///
-    /// In-memory only: reset on reload so a tampered or stale zip
-    /// cannot silently re-enable an opt-out the user never made in the
-    /// current session. Mirrors `permission_mode` / `always_allow_tools`.
-    pub sandbox_disabled: bool,
+    /// Set via `/setup sandbox os|wasm|off` and seeded from the
+    /// install-level setup preference for new or reloaded sessions. It is
+    /// intentionally not persisted in the session zip, so a tampered or
+    /// stale zip cannot silently impose a sandbox policy.
+    ///
+    /// The `sandbox_mode_explicitly_set` flag tracks whether this value
+    /// was set explicitly in the current session (via `/setup sandbox`)
+    /// vs inherited from setup state. Only inherited modes are subject
+    /// to auto-sync from external setup state changes.
+    pub sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    sandbox_mode_explicitly_set: bool,
     /// Approval keys the user has chosen "Always allow" for this session.
     /// Most tools use the tool name; shell commands use a scoped key.
     /// In-memory only (matches `claude-agent-acp` behavior).
     pub always_allow_tools: HashSet<String>,
+    /// Approval keys in the order they were first remembered. This keeps
+    /// `/setup permissions list` and `revoke <number>` stable without
+    /// weakening the fast membership check above.
+    always_allow_order: Vec<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
     /// `None` means "use the active model's `default_reasoning_level`";
     /// `Some(_)` means "honor this exact level, fail if unsupported".
@@ -456,6 +505,16 @@ pub struct Session {
 
 impl Session {
     pub fn new(id: String, cwd: PathBuf, model: String, name: String) -> Self {
+        Self::new_with_sandbox_mode(id, cwd, model, name, None)
+    }
+
+    fn new_with_sandbox_mode(
+        id: String,
+        cwd: PathBuf,
+        model: String,
+        name: String,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> Self {
         let now = current_timestamp_millis();
         let mode = SessionMode::Lutz;
         let permission_mode = PermissionMode::Default;
@@ -472,9 +531,7 @@ impl Session {
                 Some(model.clone())
             },
         };
-        let project_instructions = crate::agents_md::discover(&cwd);
-        let skills = Arc::new(crate::skills::discover(&cwd));
-        let agents = Arc::new(crate::agents::discover(&cwd));
+        let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         Self {
             id,
             cwd,
@@ -483,8 +540,10 @@ impl Session {
             history: Vec::new(),
             manifest,
             permission_mode,
-            sandbox_disabled: false,
+            sandbox_mode,
+            sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
+            always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions,
@@ -498,10 +557,11 @@ impl Session {
     /// Construct a `Session` from data loaded off disk.
     ///
     /// SECURITY: transient fields that intentionally do NOT survive a reload
-    /// (`permission_mode`, `always_allow_tools`) are reset here, mirroring
-    /// `claude-agent-acp`. Going through this constructor guarantees a stale
-    /// or tampered manifest cannot silently auto-allow tool calls on launch,
-    /// and that any future "reset on reload" field is added in one place.
+    /// (`permission_mode`, `always_allow_tools`, `always_allow_order`) are
+    /// reset here, mirroring `claude-agent-acp`. Going through this
+    /// constructor guarantees a stale or tampered manifest cannot silently
+    /// auto-allow tool calls on launch, and that any future "reset on reload"
+    /// field is added in one place.
     ///
     /// Also rejects a mismatch between `id` (the caller's requested id, used
     /// to locate the zip and to key the in-memory map) and `manifest.id`
@@ -517,15 +577,25 @@ impl Session {
         history: Vec<ConversationTurn>,
         manifest: SessionManifest,
     ) -> Result<Self, SessionIdMismatch> {
+        Self::from_persisted_with_sandbox_mode(id, cwd, mode, model, history, manifest, None)
+    }
+
+    fn from_persisted_with_sandbox_mode(
+        id: String,
+        cwd: PathBuf,
+        mode: SessionMode,
+        model: String,
+        history: Vec<ConversationTurn>,
+        manifest: SessionManifest,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> Result<Self, SessionIdMismatch> {
         if manifest.id != id {
             return Err(SessionIdMismatch {
                 requested: id,
                 loaded: manifest.id,
             });
         }
-        let project_instructions = crate::agents_md::discover(&cwd);
-        let skills = Arc::new(crate::skills::discover(&cwd));
-        let agents = Arc::new(crate::agents::discover(&cwd));
+        let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         Ok(Self {
             id,
             cwd,
@@ -534,8 +604,10 @@ impl Session {
             history,
             manifest,
             permission_mode: PermissionMode::Default,
-            sandbox_disabled: false,
+            sandbox_mode,
+            sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
+            always_allow_order: Vec::new(),
             // Reset reasoning effort on load -- it's a transient
             // per-session preference (per issue scope), so a
             // reloaded zip starts at "use model default" until the
@@ -1559,6 +1631,13 @@ fn normalize_cwd(path: &Path) -> PathBuf {
 pub struct SessionStore {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_model: Arc<RwLock<String>>,
+    /// Process-local replacement for the install-level setup preference
+    /// file. When present, model/reasoning/sandbox choices still seed later
+    /// sessions in this server process, but they are never read from or
+    /// written to `setup.json`. This is useful for scripts that pass an
+    /// explicit model/sandbox choice and must not mutate the user's global
+    /// Brokk configuration.
+    transient_setup_state: Option<Arc<std::sync::Mutex<crate::setup_state::SetupState>>>,
     /// Last-known catalog of models, populated by `set_available_models`
     /// from the LLM endpoint. Used to fulfil `session/new` without
     /// re-fetching on every call, and to look up per-model reasoning
@@ -1569,8 +1648,8 @@ pub struct SessionStore {
     /// parallel cache to avoid drift.
     available_models: Arc<RwLock<Vec<ModelMetadata>>>,
     cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    /// One ToolRegistry per session, kept warm across turns so any bifrost
-    /// subprocess survives. Populated lazily on first prompt.
+    /// One ToolRegistry per session, kept warm across turns so any MCP
+    /// subprocesses survive. Populated lazily on first prompt.
     registries: Arc<RwLock<HashMap<String, Arc<ToolRegistry>>>>,
     /// Per-session monotonic access counter used for LRU eviction. Held
     /// behind a sync `Mutex` because every touch is a fast in-memory bump
@@ -1591,10 +1670,24 @@ impl SessionStore {
         Self::with_limits(default_model, SessionLimits::default())
     }
 
+    #[cfg(test)]
     pub fn with_limits(default_model: String, limits: SessionLimits) -> Self {
+        Self::with_limits_and_transient_setup(default_model, limits, false)
+    }
+
+    pub fn with_limits_and_transient_setup(
+        default_model: String,
+        limits: SessionLimits,
+        transient_setup: bool,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_model: Arc::new(RwLock::new(default_model)),
+            transient_setup_state: transient_setup.then(|| {
+                Arc::new(std::sync::Mutex::new(
+                    crate::setup_state::SetupState::default(),
+                ))
+            }),
             available_models: Arc::new(RwLock::new(Vec::new())),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
@@ -1613,6 +1706,89 @@ impl SessionStore {
             .lock()
             .expect("last_accessed mutex poisoned")
             .insert(id.to_string(), counter);
+    }
+
+    pub(crate) fn setup_state_snapshot(&self) -> crate::setup_state::SetupState {
+        match &self.transient_setup_state {
+            Some(state) => state
+                .lock()
+                .expect("transient setup state mutex poisoned")
+                .clone(),
+            None => crate::setup_state::read(),
+        }
+    }
+
+    pub(crate) fn remember_first_run_seen(&self) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .first_run_seen = true;
+                Ok(())
+            }
+            None => crate::setup_state::mark_first_run_seen(),
+        }
+    }
+
+    fn read_sandbox_mode_preference(&self) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+        match &self.transient_setup_state {
+            Some(state) => Some(
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_sandbox_mode,
+            ),
+            None => crate::setup_state::read_sandbox_mode_preference(),
+        }
+    }
+
+    fn remember_last_selection(
+        &self,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                let mut state = state.lock().expect("transient setup state mutex poisoned");
+                state.last_model = model;
+                state.last_reasoning_effort = reasoning_effort;
+                Ok(())
+            }
+            None => crate::setup_state::remember_last_selection(model, reasoning_effort),
+        }
+    }
+
+    fn remember_last_reasoning_effort(
+        &self,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_reasoning_effort = reasoning_effort;
+                Ok(())
+            }
+            None => crate::setup_state::remember_last_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    fn remember_sandbox_mode(
+        &self,
+        mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_sandbox_mode = mode;
+                Ok(())
+            }
+            None => crate::setup_state::remember_sandbox_mode(mode),
+        }
     }
 
     /// If `sessions.len()` exceeds `limits.max_sessions`, evict the least
@@ -1674,7 +1850,8 @@ impl SessionStore {
     }
 
     /// Return the cached ToolRegistry for `session_id`, or build one and cache it.
-    /// `bifrost_binary` is consulted only on the first call for a given cwd.
+    /// MCP server config is consulted only when the registry is built. If
+    /// config changes, callers should invalidate the registry first.
     ///
     /// If the session cwd is unchanged, refresh the cached `SkillRegistry`
     /// in place so `activate_skill` sees the latest on-disk skills without
@@ -1686,7 +1863,6 @@ impl SessionStore {
         &self,
         session_id: &str,
         cwd: PathBuf,
-        bifrost_binary: Option<&Path>,
     ) -> Arc<ToolRegistry> {
         let normalized_cwd = normalize_cwd(&cwd);
         let (skills, agents) = {
@@ -1707,13 +1883,18 @@ impl SessionStore {
             existing.set_agents(agents).await;
             return existing;
         }
+        let mcp_servers = crate::setup_state::read_mcp_servers();
         let registry =
-            Arc::new(ToolRegistry::new(normalized_cwd, bifrost_binary, skills, agents).await);
+            Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
         self.registries
             .write()
             .await
             .insert(session_id.to_string(), registry.clone());
         registry
+    }
+
+    pub async fn invalidate_registry(&self, session_id: &str) {
+        self.registries.write().await.remove(session_id);
     }
 
     pub async fn set_available_models(&self, models: Vec<ModelMetadata>) {
@@ -1744,18 +1925,28 @@ impl SessionStore {
     /// Create a new session and write it to disk as a zip.
     pub async fn create_session(&self, cwd: PathBuf) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
-        let prefs = crate::setup_state::read();
+        let prefs = self.setup_state_snapshot();
         let default_model = self.default_model.read().await.clone();
         let catalog = self.available_models.read().await.clone();
         let model = select_session_model(prefs.last_model, default_model, &catalog);
         let reasoning_effort =
             select_session_reasoning_effort(&model, prefs.last_reasoning_effort, &catalog);
-        let mut session = Session::new(
-            id.clone(),
-            cwd.clone(),
-            model,
-            DEFAULT_SESSION_NAME.to_string(),
-        );
+        let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
+        let mut session = match sandbox_mode {
+            Some(mode) => Session::new_with_sandbox_mode(
+                id.clone(),
+                cwd.clone(),
+                model,
+                DEFAULT_SESSION_NAME.to_string(),
+                Some(mode),
+            ),
+            None => Session::new(
+                id.clone(),
+                cwd.clone(),
+                model,
+                DEFAULT_SESSION_NAME.to_string(),
+            ),
+        };
         session.selected_reasoning_effort = reasoning_effort;
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
@@ -1830,7 +2021,7 @@ impl SessionStore {
         trim_history(&mut history, self.limits.max_history_turns);
 
         // Prefer persisted mode/model; fall back to server defaults.
-        let mode = manifest
+        let session_mode = manifest
             .mode
             .as_deref()
             .and_then(SessionMode::parse)
@@ -1840,14 +2031,28 @@ impl SessionStore {
             _ => self.default_model.read().await.clone(),
         };
 
-        let session = match Session::from_persisted(
-            id.to_string(),
-            cwd.to_path_buf(),
-            mode,
-            model,
-            history,
-            manifest,
-        ) {
+        let sandbox_mode =
+            usable_sandbox_mode_preference(self.setup_state_snapshot().last_sandbox_mode);
+        let loaded_session = match sandbox_mode {
+            Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
+                id.to_string(),
+                cwd.to_path_buf(),
+                session_mode,
+                model,
+                history,
+                manifest,
+                Some(sandbox_mode),
+            ),
+            None => Session::from_persisted(
+                id.to_string(),
+                cwd.to_path_buf(),
+                session_mode,
+                model,
+                history,
+                manifest,
+            ),
+        };
+        let session = match loaded_session {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "rejecting persisted session");
@@ -2006,9 +2211,22 @@ impl SessionStore {
         // I/O off the lock keeps prompt turns and other session
         // mutations unblocked. The discovery results are then swapped
         // in atomically alongside the cwd.
-        let project_instructions = crate::agents_md::discover(&cwd);
-        let skills = Arc::new(crate::skills::discover(&cwd));
-        let agents = Arc::new(crate::agents::discover(&cwd));
+        let sandbox_mode = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return;
+            };
+            session.sandbox_mode
+        };
+        let project_instructions = crate::agents_md::discover_with_sandbox_mode(&cwd, sandbox_mode);
+        let skills = Arc::new(crate::skills::discover_with_sandbox_mode(
+            &cwd,
+            sandbox_mode,
+        ));
+        let agents = Arc::new(crate::agents::discover_with_sandbox_mode(
+            &cwd,
+            sandbox_mode,
+        ));
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
             session.project_instructions = project_instructions;
@@ -2055,29 +2273,108 @@ impl SessionStore {
             .map(|s| s.permission_mode)
     }
 
-    /// Update the session's sandbox-disabled flag. Returns false if the
-    /// session is unknown. Like `permission_mode`, this is session-only
-    /// (not persisted to the manifest) so a stale zip can never re-enable
-    /// an opt-out on reload.
-    pub async fn set_sandbox_disabled(&self, id: &str, disabled: bool) -> bool {
+    /// Update the session's sandbox mode override. Returns false if the
+    /// session is unknown. The choice is also saved as an install-level
+    /// setup preference for future new/reloaded sessions, but it is not
+    /// persisted to the session manifest so a stale zip can never impose a
+    /// sandbox policy on reload.
+    ///
+    /// `None` clears the override (revert to global default).
+    pub async fn set_sandbox_mode(
+        &self,
+        id: &str,
+        mode: Option<crate::sandbox_backend::SandboxMode>,
+    ) -> bool {
+        let cwd = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return false;
+            };
+            session.cwd.clone()
+        };
+
+        // Re-discover per-session context under the new parser backend so
+        // `/setup sandbox wasm|off|os` takes effect immediately for future
+        // prompts, not just after a cwd change.
+        let project_instructions = crate::agents_md::discover_with_sandbox_mode(&cwd, mode);
+        let skills = Arc::new(crate::skills::discover_with_sandbox_mode(&cwd, mode));
+        let agents = Arc::new(crate::agents::discover_with_sandbox_mode(&cwd, mode));
+
         let mut sessions = self.sessions.write().await;
-        match sessions.get_mut(id) {
+        let updated = match sessions.get_mut(id) {
             Some(session) => {
-                session.sandbox_disabled = disabled;
+                session.sandbox_mode = mode;
+                session.sandbox_mode_explicitly_set = true;
+                session.project_instructions = project_instructions;
+                session.skills = skills;
+                session.agents = agents;
+                session.activated_skills.clear();
                 true
             }
             None => false,
+        };
+        drop(sessions);
+        if updated && let Err(e) = self.remember_sandbox_mode(mode) {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist sandbox preference: {e:#}"
+            );
         }
+        updated
     }
 
-    /// Read the current `sandbox_disabled` flag for a session. Returns
-    /// None if the session is unknown.
-    pub async fn sandbox_disabled(&self, id: &str) -> Option<bool> {
-        self.sessions
-            .read()
-            .await
-            .get(id)
-            .map(|s| s.sandbox_disabled)
+    async fn sync_sandbox_mode_from_setup_state(
+        &self,
+        id: &str,
+    ) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+        // If the session explicitly set its sandbox mode in this session,
+        // respect that choice and don't auto-sync from external setup state.
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(id)
+            && session.sandbox_mode_explicitly_set
+        {
+            let mode = session.sandbox_mode;
+            drop(sessions);
+            return Some(mode);
+        }
+        drop(sessions);
+
+        let Some(persisted_mode) = self.read_sandbox_mode_preference() else {
+            return self.sessions.read().await.get(id).map(|s| s.sandbox_mode);
+        };
+        let mode = usable_sandbox_mode_preference(persisted_mode);
+        let cwd = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(id)?;
+            if session.sandbox_mode == mode {
+                return Some(mode);
+            }
+            session.cwd.clone()
+        };
+
+        let (project_instructions, skills, agents) = discover_session_context(&cwd, mode);
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        if session.sandbox_mode != mode {
+            session.sandbox_mode = mode;
+            session.project_instructions = project_instructions;
+            session.skills = skills;
+            session.agents = agents;
+            session.activated_skills.clear();
+        }
+        Some(session.sandbox_mode)
+    }
+
+    /// Read the current sandbox mode override for a session, first
+    /// syncing from the install-level setup preference if it is readable.
+    /// Returns `None` if the session is unknown, and `Some(None)` if it is
+    /// known and using the process default.
+    pub async fn sandbox_mode(
+        &self,
+        id: &str,
+    ) -> Option<Option<crate::sandbox_backend::SandboxMode>> {
+        self.sync_sandbox_mode_from_setup_state(id).await
     }
 
     /// True if the session has previously chosen "Always allow" for `approval_key`.
@@ -2092,9 +2389,39 @@ impl SessionStore {
 
     /// Add `approval_key` to the session's in-memory always-allow set.
     pub async fn add_always_allow(&self, id: &str, approval_key: &str) {
-        if let Some(session) = self.sessions.write().await.get_mut(id) {
-            session.always_allow_tools.insert(approval_key.to_string());
+        if let Some(session) = self.sessions.write().await.get_mut(id)
+            && session.always_allow_tools.insert(approval_key.to_string())
+        {
+            session.always_allow_order.push(approval_key.to_string());
         }
+    }
+
+    /// Return the session's in-memory always-allow keys in approval order.
+    pub async fn always_allow_keys(&self, id: &str) -> Option<Vec<String>> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(id)?;
+        Some(session.always_allow_order.clone())
+    }
+
+    /// Remove one in-memory always-allow key. Returns `None` if the session is unknown.
+    pub async fn remove_always_allow(&self, id: &str, approval_key: &str) -> Option<bool> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        let removed = session.always_allow_tools.remove(approval_key);
+        if removed {
+            session.always_allow_order.retain(|key| key != approval_key);
+        }
+        Some(removed)
+    }
+
+    /// Clear all in-memory always-allow keys for a session.
+    pub async fn clear_always_allow(&self, id: &str) -> Option<usize> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(id)?;
+        let count = session.always_allow_tools.len();
+        session.always_allow_tools.clear();
+        session.always_allow_order.clear();
+        Some(count)
     }
 
     /// Fold a turn's token usage into the session running total and
@@ -2299,7 +2626,7 @@ impl SessionStore {
                         // arbiter rather than dropping silently.
                         _ => None,
                     };
-                    if let Err(e) = crate::setup_state::remember_last_selection(
+                    if let Err(e) = self.remember_last_selection(
                         if model.is_empty() {
                             None
                         } else {
@@ -2343,9 +2670,9 @@ impl SessionStore {
         match sessions.get_mut(id) {
             Some(session) => {
                 session.selected_reasoning_effort = effort;
-                if let Err(e) = crate::setup_state::remember_last_reasoning_effort(
-                    session.selected_reasoning_effort.clone(),
-                ) {
+                if let Err(e) =
+                    self.remember_last_reasoning_effort(session.selected_reasoning_effort.clone())
+                {
                     tracing::warn!(
                         session_id = %id,
                         "failed to persist last reasoning preference: {e:#}"
@@ -2619,10 +2946,11 @@ mod tests {
     }
 
     /// `Session::from_persisted` must always reset the transient security
-    /// fields (`permission_mode`, `always_allow_tools`), even when the
-    /// caller's data was reconstructed from a manifest that may be stale or
-    /// tampered. Persisted-side fields (id/cwd/mode/model/history/manifest)
-    /// must round-trip unchanged when ids match.
+    /// fields (`permission_mode`, `always_allow_tools`, `always_allow_order`),
+    /// even when the caller's data was reconstructed from a manifest that may
+    /// be stale or tampered. Persisted-side fields
+    /// (id/cwd/mode/model/history/manifest) must round-trip unchanged when ids
+    /// match.
     #[test]
     fn from_persisted_resets_transient_security_fields() {
         let manifest = SessionManifest {
@@ -2652,6 +2980,7 @@ mod tests {
 
         assert_eq!(session.permission_mode, PermissionMode::Default);
         assert!(session.always_allow_tools.is_empty());
+        assert!(session.always_allow_order.is_empty());
 
         assert_eq!(session.id, "abc");
         assert_eq!(session.cwd, PathBuf::from("/tmp/x"));
@@ -3205,6 +3534,28 @@ mod tests {
         assert_eq!(snap.reasoning_effort.as_deref(), Some("medium"));
     }
 
+    /// A persisted install-level sandbox preference should seed the next
+    /// new session instead of always falling back to the process default.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_reuses_persisted_sandbox_mode() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Off))
+            .expect("persist sandbox preference");
+
+        let store = SessionStore::new("model-a".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        assert_eq!(session.sandbox_mode, Some(SandboxMode::Off));
+        assert_eq!(
+            store.sandbox_mode(&session.id).await,
+            Some(Some(SandboxMode::Off))
+        );
+    }
+
     /// `get_session` for an unknown id (with no on-disk zip either) must
     /// return None, not panic or allocate a session under the wrong id.
     #[tokio::test]
@@ -3247,40 +3598,211 @@ mod tests {
         assert_eq!(reloaded.id, id);
         assert_eq!(reloaded.mode, SessionMode::Plan);
         assert_eq!(reloaded.permission_mode, PermissionMode::Default);
-        assert!(!reloaded.sandbox_disabled);
+        assert!(reloaded.sandbox_mode.is_none());
         assert!(reloaded.always_allow_tools.is_empty());
+        assert!(reloaded.always_allow_order.is_empty());
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `sandbox_disabled` round-trips through the setter, defaults to
-    /// `false`, and reports `false` from the setter on an unknown session
-    /// (matching the `set_permission_mode` contract). The flag is
-    /// in-memory only, so it must also reset on a cold reload -- covered
-    /// implicitly by `get_session_loads_from_disk_when_cold` above, which
-    /// asserts `!reloaded.sandbox_disabled` for a session that never set
-    /// it; the dedicated reload check lives there to keep the "transient
-    /// fields reset on load" invariants in one place.
+    /// `sandbox_mode` round-trips through the setter, defaults to
+    /// `None`, and reports `false` from the setter on an unknown session
+    /// (matching the `set_permission_mode` contract).
     #[tokio::test]
-    async fn sandbox_disabled_setter_and_getter_round_trip() {
+    async fn sandbox_mode_setter_and_getter_round_trip() {
+        use crate::sandbox_backend::SandboxMode;
         let store = SessionStore::new("m".to_string());
         let cwd =
             std::env::temp_dir().join(format!("brokk-acp-rust-sandbox-{}", uuid::Uuid::new_v4()));
         let session = store.create_session(cwd.clone()).await;
         let id = session.id.clone();
 
-        assert_eq!(store.sandbox_disabled(&id).await, Some(false));
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
 
-        assert!(store.set_sandbox_disabled(&id, true).await);
-        assert_eq!(store.sandbox_disabled(&id).await, Some(true));
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
 
-        assert!(store.set_sandbox_disabled(&id, false).await);
-        assert_eq!(store.sandbox_disabled(&id).await, Some(false));
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Wasm)).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
 
-        assert!(!store.set_sandbox_disabled("no-such", true).await);
-        assert_eq!(store.sandbox_disabled("no-such").await, None);
+        assert!(store.set_sandbox_mode(&id, None).await);
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
+
+        assert!(
+            !store
+                .set_sandbox_mode("no-such", Some(SandboxMode::Off))
+                .await
+        );
+        assert_eq!(store.sandbox_mode("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The `/setup sandbox` setter persists an install-level preference:
+    /// future sessions and cold reloads should inherit it even though the
+    /// session zip itself does not contain sandbox state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_mode_setter_seeds_future_sessions_and_cold_reloads() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first = store.create_session(cwd.path().to_path_buf()).await;
+        let id = first.id.clone();
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
+
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
+        assert_eq!(
+            crate::setup_state::read().last_sandbox_mode,
+            Some(SandboxMode::Off)
+        );
+
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.sandbox_mode, Some(SandboxMode::Off));
+
+        store.sessions.write().await.remove(&id);
+        store.registries.write().await.remove(&id);
+
+        let reloaded = store
+            .get_session(&id, cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
+    }
+
+    /// Transient setup mode keeps model/reasoning/sandbox choices process-local:
+    /// they seed later sessions and cold reloads in this `SessionStore`, but the
+    /// on-disk setup file is neither read nor written for those preferences.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_setup_keeps_model_and_sandbox_preferences_in_memory_only() {
+        use crate::llm_client::ReasoningLevelPreset;
+        use crate::sandbox_backend::SandboxMode;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_selection(
+            Some("persisted-model".to_string()),
+            Some("high".to_string()),
+        )
+        .expect("seed persistent model preference");
+        crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Wasm))
+            .expect("seed persistent sandbox preference");
+
+        let store = SessionStore::with_limits_and_transient_setup(
+            "default-model".to_string(),
+            SessionLimits::default(),
+            true,
+        );
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "default-model".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![
+                        ReasoningLevelPreset {
+                            effort: "medium".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "high".to_string(),
+                            description: "".to_string(),
+                        },
+                    ],
+                    context_length: None,
+                },
+                ModelMetadata {
+                    id: "runtime-model".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    }],
+                    context_length: None,
+                },
+                ModelMetadata::id_only("persisted-model"),
+            ])
+            .await;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first = store.create_session(cwd.path().to_path_buf()).await;
+        assert_eq!(
+            first.model, "default-model",
+            "transient stores must ignore persisted model preferences"
+        );
+        assert_eq!(
+            first.sandbox_mode, None,
+            "transient stores must ignore persisted sandbox preferences"
+        );
+
+        assert!(
+            store
+                .set_sandbox_mode(&first.id, Some(SandboxMode::Off))
+                .await
+        );
+        let (ok, cleared) = store
+            .set_model(&first.id, "runtime-model".to_string())
+            .await;
+        assert!(ok);
+        assert!(cleared.is_none());
+        assert!(
+            store
+                .set_reasoning_effort(&first.id, Some("high".to_string()))
+                .await
+        );
+
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.model, "runtime-model");
+        assert_eq!(next.selected_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(next.sandbox_mode, Some(SandboxMode::Off));
+
+        assert_eq!(
+            crate::setup_state::read().last_model.as_deref(),
+            Some("persisted-model"),
+            "transient choices must not overwrite setup.json model preference"
+        );
+        assert_eq!(
+            crate::setup_state::read().last_sandbox_mode,
+            Some(SandboxMode::Wasm),
+            "transient choices must not overwrite setup.json sandbox preference"
+        );
+
+        store.sessions.write().await.remove(&first.id);
+        store.registries.write().await.remove(&first.id);
+        let reloaded = store
+            .get_session(&first.id, cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
+    }
+
+    /// Existing sessions should pick up sandbox changes written by another
+    /// Anvil process on the next sandbox-mode read. That read happens on
+    /// every tool execution path, so cross-process changes become effective
+    /// without waiting for session reload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_mode_reads_external_setup_state_changes() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let id = session.id.clone();
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
+
+        crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Off))
+            .expect("external sandbox preference write");
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
+
+        crate::setup_state::remember_sandbox_mode(None).expect("external sandbox preference clear");
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
     }
 
     /// Permission-mode setters/getters round-trip, default to `Default`,
@@ -3339,6 +3861,44 @@ mod tests {
         assert!(!store.is_always_allowed(&s.id, "run_shell_command").await);
         // Unknown session never reports allowed.
         assert!(!store.is_always_allowed("no-such", "write_file").await);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn always_allow_keys_can_be_listed_removed_and_cleared() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-always-allow-manage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+
+        store.add_always_allow(&s.id, "write_file").await;
+        store.add_always_allow(&s.id, "run_shell_command").await;
+        store.add_always_allow(&s.id, "write_file").await;
+
+        assert_eq!(
+            store.always_allow_keys(&s.id).await,
+            Some(vec![
+                "write_file".to_string(),
+                "run_shell_command".to_string()
+            ])
+        );
+        assert_eq!(
+            store.remove_always_allow(&s.id, "write_file").await,
+            Some(true)
+        );
+        assert_eq!(
+            store.remove_always_allow(&s.id, "write_file").await,
+            Some(false)
+        );
+        assert_eq!(store.clear_always_allow(&s.id).await, Some(1));
+        assert_eq!(store.always_allow_keys(&s.id).await, Some(Vec::new()));
+
+        assert_eq!(store.always_allow_keys("no-such").await, None);
+        assert_eq!(store.remove_always_allow("no-such", "x").await, None);
+        assert_eq!(store.clear_always_allow("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -3711,11 +4271,9 @@ mod tests {
         let canonical_cwd = normalize_cwd(cwd.path());
 
         let registry1 = store
-            .get_or_create_registry(&session.id, cwd.path().to_path_buf(), None)
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
             .await;
-        let registry2 = store
-            .get_or_create_registry(&session.id, cwd_alias, None)
-            .await;
+        let registry2 = store.get_or_create_registry(&session.id, cwd_alias).await;
 
         assert!(
             Arc::ptr_eq(&registry1, &registry2),
@@ -3783,19 +4341,25 @@ done
         let store = SessionStore::new("m".to_string());
         let cwd1 = tempfile::tempdir().expect("cwd1");
         let cwd2 = tempfile::tempdir().expect("cwd2");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
         let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
         let session = store.create_session(cwd1.path().to_path_buf()).await;
         let canonical_cwd1 = normalize_cwd(cwd1.path());
         let canonical_cwd2 = normalize_cwd(cwd2.path());
 
         let registry1 = store
-            .get_or_create_registry(
-                &session.id,
-                cwd1.path().to_path_buf(),
-                Some(fake_bifrost.as_path()),
-            )
+            .get_or_create_registry(&session.id, cwd1.path().to_path_buf())
             .await;
         assert_eq!(registry1.cwd(), canonical_cwd1.as_path());
         assert_eq!(
@@ -3808,11 +4372,7 @@ done
             .await;
 
         let registry2 = store
-            .get_or_create_registry(
-                &session.id,
-                cwd2.path().to_path_buf(),
-                Some(fake_bifrost.as_path()),
-            )
+            .get_or_create_registry(&session.id, cwd2.path().to_path_buf())
             .await;
 
         assert!(
