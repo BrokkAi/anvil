@@ -47,6 +47,12 @@ struct Args {
     #[arg(long, default_value = "")]
     default_model: String,
 
+    /// Seed new sessions with a reasoning effort such as `low`,
+    /// `medium`, or `high`. Models that do not support configurable
+    /// reasoning ignore this and fall back to their default behavior.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
+
     /// Maximum number of tool-calling turns per prompt before the server forces a final text response.
     #[arg(long, default_value_t = 25)]
     max_turns: usize,
@@ -132,6 +138,7 @@ impl std::fmt::Debug for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Args")
             .field("default_model", &self.default_model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
             .field("max_sessions", &self.max_sessions)
             .field("max_history_turns", &self.max_history_turns)
@@ -459,6 +466,9 @@ async fn main() -> Result<()> {
         limits,
         args.transient_setup,
     );
+    sessions
+        .set_default_reasoning_effort(args.reasoning_effort)
+        .await;
 
     let max_turns = args.max_turns.max(1);
     // Bounds on `llm_idle_timeout_secs` are enforced by the clap
