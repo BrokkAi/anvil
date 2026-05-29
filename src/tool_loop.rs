@@ -479,24 +479,26 @@ pub(crate) async fn run(
                         }
                     };
 
-                    // Refuse outright if the rendered title would exceed the
-                    // dialog-safe cap. An oversized title wraps the approval
-                    // modal across multiple lines and pushes Approve/Reject
-                    // off-screen, so the user could authorize a call they
-                    // can't fully read. We reject instead of truncating so
-                    // nothing is silently hidden from the approver; the LLM
-                    // gets a clear error and is expected to retry with
-                    // smaller arguments.
-                    if let Some(reason) =
-                        announce::rejection_for_oversized_title(&tool_name, &parsed_input)
-                    {
+                    // Refuse outright if the permission card would hide
+                    // input. Oversized titles wrap the approval modal and
+                    // oversized multiline shell content gets truncated, so in
+                    // both cases the user could authorize a call they can't
+                    // fully read. Reject instead of hiding details; the LLM can
+                    // retry with smaller arguments.
+                    if let Some(reason) = announce::rejection_for_oversized_title(
+                        &tool_name,
+                        &parsed_input,
+                    )
+                    .or_else(|| {
+                        announce::rejection_for_oversized_input_content(&tool_name, &parsed_input)
+                    }) {
                         tracing::warn!(
                             session_id = %session_id,
                             tool_name = %tool_name,
                             title_chars = announce::tool_title(&tool_name, &parsed_input)
                                 .chars()
                                 .count(),
-                            "rejecting tool call: rendered title exceeds MAX_TOOL_TITLE_CHARS",
+                            "rejecting tool call: rendered permission card would hide input",
                         );
                         maybe_send_session_update(
                             notifications,

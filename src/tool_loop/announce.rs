@@ -55,6 +55,14 @@ fn title_too_long_reason() -> String {
     )
 }
 
+fn input_content_too_long_reason() -> String {
+    format!(
+        "Tool use denied: the rendered tool-call content would exceed {MAX_INLINE_OUTPUT_BYTES} \
+         bytes, which would hide part of the command from the approval dialog. Retry with a \
+         shorter command or split it into smaller steps."
+    )
+}
+
 /// Build the initial `Pending` tool call -- the card the client renders
 /// before we run the permission gate.
 ///
@@ -93,6 +101,19 @@ pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) 
     } else {
         None
     }
+}
+
+/// If the extra approval content would be truncated, reject before showing the
+/// permission prompt. Multiline shell commands rely on this content because
+/// their title intentionally shows only the first line.
+pub(super) fn rejection_for_oversized_input_content(
+    tool_name: &str,
+    raw_input: &Value,
+) -> Option<String> {
+    multiline_shell_command(tool_name, raw_input)
+        .map(command_input_text)
+        .filter(|content| content.len() > MAX_INLINE_OUTPUT_BYTES)
+        .map(|_| input_content_too_long_reason())
 }
 
 /// Pending card for a call we're about to refuse because its full title
@@ -185,10 +206,7 @@ pub(super) fn update_completed(
 /// shell commands, where the title intentionally shows only the first line.
 pub(super) fn tool_input_content(tool_name: &str, raw_input: &Value) -> Vec<ToolCallContent> {
     match multiline_shell_command(tool_name, raw_input) {
-        Some(command) => vec![text_content(&truncate(&format!(
-            "Command:\n{}",
-            command.trim_end()
-        )))],
+        Some(command) => vec![text_content(&truncate(&command_input_text(command)))],
         None => Vec::new(),
     }
 }
@@ -304,6 +322,10 @@ fn output_text_for_tool(tool_name: &str, raw_input: &Value, output: &str) -> Str
     } else {
         truncate(output)
     }
+}
+
+fn command_input_text(command: &str) -> String {
+    format!("Command:\n{}", command.trim_end())
 }
 
 fn multiline_shell_command<'a>(tool_name: &str, raw_input: &'a Value) -> Option<&'a str> {
@@ -604,6 +626,34 @@ mod tests {
         // raw_input is still attached so the user can inspect what was
         // attempted; it lives in a scrollable region client-side.
         assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn oversized_multiline_shell_input_content_is_rejected() {
+        let command = format!(
+            "python3 - <<'PY'\n{}\nPY",
+            "a".repeat(MAX_INLINE_OUTPUT_BYTES)
+        );
+        let reason = rejection_for_oversized_input_content(
+            "run_shell_command",
+            &json!({"command": command}),
+        )
+        .expect("oversized multiline command content should be rejected");
+
+        assert!(
+            reason.contains(&MAX_INLINE_OUTPUT_BYTES.to_string()),
+            "rejection message must quote the content cap; got: {reason}"
+        );
+    }
+
+    #[test]
+    fn short_multiline_shell_input_content_is_allowed() {
+        let reason = rejection_for_oversized_input_content(
+            "run_shell_command",
+            &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
+        );
+
+        assert!(reason.is_none(), "short multiline command must pass");
     }
 
     #[test]
