@@ -1,6 +1,7 @@
-//! Auto-discover available LLM models from Codex (`~/.codex/auth.json`),
-//! a local Ollama daemon (`http://localhost:11434/v1/models`), and
-//! OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
+//! Auto-discover available LLM models from Bedrock, Codex
+//! (`~/.codex/auth.json`), a local Ollama daemon
+//! (`http://localhost:11434/v1/models`), and OpenRouter
+//! (`https://openrouter.ai/api/v1/models`, gated on the
 //! `OPENROUTER_API_KEY` env var).
 //!
 //! Zero-config by design: the Ollama URL is fixed at the daemon's default
@@ -37,6 +38,7 @@ use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
 /// wire id so the routing backend doesn't need a per-request map lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelSource {
+    Bedrock,
     Codex,
     Ollama,
     OpenRouter,
@@ -45,6 +47,7 @@ pub enum ModelSource {
 impl ModelSource {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Bedrock => "bedrock",
             Self::Codex => "codex",
             Self::Ollama => "ollama",
             Self::OpenRouter => "openrouter",
@@ -74,6 +77,7 @@ impl DiscoveredModel {
 pub fn split_wire_id(wire: &str) -> Option<(ModelSource, &str)> {
     let (prefix, rest) = wire.split_once("::")?;
     let source = match prefix {
+        "bedrock" => ModelSource::Bedrock,
         "codex" => ModelSource::Codex,
         "ollama" => ModelSource::Ollama,
         "openrouter" => ModelSource::OpenRouter,
@@ -283,18 +287,37 @@ pub async fn discover_ollama_model_metadata(
 /// default elsewhere -- keeping ordering deterministic stops users from
 /// seeing a different default just because one source happened to be
 /// slow on a given boot.
-pub async fn discover_all<FC, FutC, FOR, FutOR>(
+pub async fn discover_all<FB, FutB, FC, FutC, FOR, FutOR>(
     http: &reqwest::Client,
     ollama_url: &str,
+    bedrock_lookup: FB,
     codex_lookup: FC,
     openrouter_lookup: FOR,
 ) -> Vec<DiscoveredModel>
 where
+    FB: FnOnce() -> FutB,
+    FutB: std::future::Future<Output = Result<Vec<String>>>,
     FC: FnOnce() -> FutC,
     FutC: std::future::Future<Output = Result<Vec<String>>>,
     FOR: FnOnce() -> FutOR,
     FutOR: std::future::Future<Output = Result<Vec<String>>>,
 {
+    let bedrock_fut = async {
+        match bedrock_lookup().await {
+            Ok(ids) => ids
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    source: ModelSource::Bedrock,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::info!("bedrock model discovery skipped: {e:#}");
+                Vec::new()
+            }
+        }
+    };
+
     let codex_fut = async {
         match codex_lookup().await {
             Ok(ids) => ids
@@ -337,8 +360,10 @@ where
         }
     };
 
-    let (codex, openrouter, ollama) = tokio::join!(codex_fut, openrouter_fut, ollama_fut);
-    let mut all = Vec::with_capacity(codex.len() + openrouter.len() + ollama.len());
+    let (bedrock, codex, openrouter, ollama) =
+        tokio::join!(bedrock_fut, codex_fut, openrouter_fut, ollama_fut);
+    let mut all = Vec::with_capacity(bedrock.len() + codex.len() + openrouter.len() + ollama.len());
+    all.extend(bedrock);
     all.extend(codex);
     all.extend(ollama);
     all.extend(openrouter);
@@ -445,6 +470,16 @@ mod tests {
     /// `anthropic/claude-3.5-sonnet`).
     #[test]
     fn wire_id_round_trips_for_every_source() {
+        let bedrock = DiscoveredModel {
+            id: "us.anthropic.claude-sonnet-4-6".into(),
+            source: ModelSource::Bedrock,
+        };
+        let bedrock_wire = bedrock.wire_id();
+        assert_eq!(bedrock_wire, "bedrock::us.anthropic.claude-sonnet-4-6");
+        let (src, id) = split_wire_id(&bedrock_wire).expect("must parse");
+        assert_eq!(src, ModelSource::Bedrock);
+        assert_eq!(id, "us.anthropic.claude-sonnet-4-6");
+
         let codex = DiscoveredModel {
             id: "gpt-5-codex".into(),
             source: ModelSource::Codex,
@@ -499,7 +534,7 @@ mod tests {
     /// happens to have a real Ollama running on the default port.
     const TEST_DEAD_OLLAMA_URL: &str = "http://127.0.0.1:1";
 
-    /// `discover_all` returns Codex first, then Ollama, then OpenRouter,
+    /// `discover_all` returns Bedrock first, then Codex, Ollama, then OpenRouter,
     /// regardless of which future resolves first. Stable ordering matters
     /// because the first model in the catalog is auto-selected as the
     /// session default; OpenRouter stays last because it is the explicit
@@ -522,6 +557,7 @@ mod tests {
         let models = discover_all(
             &http,
             &server.uri(),
+            || async { Ok(vec!["us.anthropic.claude-sonnet-4-6".to_string()]) },
             || async { Ok(vec!["gpt-5-codex".to_string(), "gpt-4o".to_string()]) },
             || async {
                 Ok(vec![
@@ -531,16 +567,18 @@ mod tests {
             },
         )
         .await;
-        // Codex returned 2; Ollama returned 1; OpenRouter returned 2.
-        assert_eq!(models.len(), 5);
-        assert_eq!(models[0].source, ModelSource::Codex);
-        assert_eq!(models[0].id, "gpt-5-codex");
+        // Bedrock returned 1; Codex returned 2; Ollama returned 1; OpenRouter returned 2.
+        assert_eq!(models.len(), 6);
+        assert_eq!(models[0].source, ModelSource::Bedrock);
+        assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
         assert_eq!(models[1].source, ModelSource::Codex);
-        assert_eq!(models[2].source, ModelSource::Ollama);
-        assert_eq!(models[2].id, "llama3:latest");
-        assert_eq!(models[3].source, ModelSource::OpenRouter);
-        assert_eq!(models[3].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[1].id, "gpt-5-codex");
+        assert_eq!(models[2].source, ModelSource::Codex);
+        assert_eq!(models[3].source, ModelSource::Ollama);
+        assert_eq!(models[3].id, "llama3:latest");
         assert_eq!(models[4].source, ModelSource::OpenRouter);
+        assert_eq!(models[4].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[5].source, ModelSource::OpenRouter);
     }
 
     /// When every source fails, the merged vec is empty rather than an
@@ -553,6 +591,7 @@ mod tests {
         let models = discover_all(
             &http,
             TEST_DEAD_OLLAMA_URL,
+            || async { anyhow::bail!("no Bedrock token") },
             || async { anyhow::bail!("no auth.json") },
             || async { anyhow::bail!("no OPENROUTER_API_KEY") },
         )
@@ -571,6 +610,7 @@ mod tests {
         let models = discover_all(
             &http,
             TEST_DEAD_OLLAMA_URL,
+            || async { anyhow::bail!("no Bedrock token") },
             || async { anyhow::bail!("no auth.json") },
             || async { Ok(vec!["anthropic/claude-3.5-sonnet".to_string()]) },
         )

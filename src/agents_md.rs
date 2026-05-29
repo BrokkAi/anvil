@@ -429,7 +429,10 @@ mod tests {
 
     #[test]
     fn no_git_ancestor_uses_cwd_only_no_parent_walk() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("anvil-agents-md")
+            .tempdir()
+            .unwrap();
         // Sibling AGENTS.md outside the cwd subdir; if we wrongly walked
         // up to the fs root we'd pick it up.
         write(&tmp.path().join(PRIMARY), "should not appear");

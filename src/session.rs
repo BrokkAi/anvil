@@ -1631,6 +1631,7 @@ fn normalize_cwd(path: &Path) -> PathBuf {
 pub struct SessionStore {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_model: Arc<RwLock<String>>,
+    default_reasoning_effort: Arc<RwLock<Option<String>>>,
     /// Process-local replacement for the install-level setup preference
     /// file. When present, model/reasoning/sandbox choices still seed later
     /// sessions in this server process, but they are never read from or
@@ -1683,6 +1684,7 @@ impl SessionStore {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_model: Arc::new(RwLock::new(default_model)),
+            default_reasoning_effort: Arc::new(RwLock::new(None)),
             transient_setup_state: transient_setup.then(|| {
                 Arc::new(std::sync::Mutex::new(
                     crate::setup_state::SetupState::default(),
@@ -1927,10 +1929,14 @@ impl SessionStore {
         let id = uuid::Uuid::new_v4().to_string();
         let prefs = self.setup_state_snapshot();
         let default_model = self.default_model.read().await.clone();
+        let default_reasoning_effort = self.default_reasoning_effort.read().await.clone();
         let catalog = self.available_models.read().await.clone();
         let model = select_session_model(prefs.last_model, default_model, &catalog);
-        let reasoning_effort =
-            select_session_reasoning_effort(&model, prefs.last_reasoning_effort, &catalog);
+        let reasoning_effort = select_session_reasoning_effort(
+            &model,
+            default_reasoning_effort.or(prefs.last_reasoning_effort),
+            &catalog,
+        );
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let mut session = match sandbox_mode {
             Some(mode) => Session::new_with_sandbox_mode(
@@ -2700,6 +2706,14 @@ impl SessionStore {
 
     pub async fn set_default_model(&self, model: String) {
         *self.default_model.write().await = model;
+    }
+
+    pub async fn set_default_reasoning_effort(&self, effort: Option<String>) {
+        *self.default_reasoning_effort.write().await = effort;
+    }
+
+    pub async fn default_model(&self) -> String {
+        self.default_model.read().await.clone()
     }
 
     /// Add a conversation turn and persist it to the session zip.
@@ -3975,6 +3989,46 @@ mod tests {
             std::env::temp_dir().join(format!("brokk-acp-rust-default-{}", uuid::Uuid::new_v4()));
         let s = store.create_session(cwd.clone()).await;
         assert_eq!(s.model, "second");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A configured default reasoning effort should seed later
+    /// `create_session` calls without polluting persisted setup state.
+    #[tokio::test]
+    async fn set_default_reasoning_effort_drives_subsequent_create_session() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let store = SessionStore::new("gpt-mini".to_string());
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "gpt-mini".to_string(),
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevelPreset {
+                        effort: "low".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "medium".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    },
+                ],
+                context_length: None,
+            }])
+            .await;
+        store
+            .set_default_reasoning_effort(Some("high".to_string()))
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-default-reasoning-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+        assert_eq!(s.selected_reasoning_effort.as_deref(), Some("high"));
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
