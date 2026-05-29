@@ -46,8 +46,19 @@ pub fn approximate_tokens(text: &str) -> usize {
 pub fn approximate_tokens_messages(messages: &[ChatMessage]) -> usize {
     let mut total = 0usize;
     for msg in messages {
-        if let Some(content) = msg.content.as_deref() {
-            total += approximate_tokens(content);
+        for part in &msg.content {
+            match part {
+                crate::llm_client::ChatContentPart::Text { text } => {
+                    total += approximate_tokens(text);
+                }
+                // Image tokenization is model/provider specific. Count
+                // only the small transport marker here instead of the
+                // base64 payload, which would wildly overestimate context
+                // usage and trigger unnecessary compression.
+                crate::llm_client::ChatContentPart::Image { .. } => {
+                    total += approximate_tokens("[image]");
+                }
+            }
         }
         if let Some(calls) = msg.tool_calls.as_ref() {
             for call in calls {

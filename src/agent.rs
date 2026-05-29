@@ -21,7 +21,7 @@ use agent_client_protocol::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
-use crate::llm_client::{ChatMessage, LlmBackend, ModelMetadata};
+use crate::llm_client::{ChatContentPart, ChatMessage, LlmBackend, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
@@ -831,7 +831,9 @@ pub async fn run_agent(
 
                 let capabilities = AgentCapabilities::new()
                     .load_session(true)
-                    .prompt_capabilities(PromptCapabilities::new().embedded_context(true))
+                    .prompt_capabilities(
+                        PromptCapabilities::new().embedded_context(true).image(true),
+                    )
                     .session_capabilities(
                         SessionCapabilities::new()
                             .list(SessionListCapabilities::new())
@@ -1066,9 +1068,11 @@ pub async fn run_agent(
                 let session_id = req.session_id.to_string();
                 tracing::info!("ACP session/prompt session={session_id}");
 
-                // Extract prompt text from content blocks
+                // Extract prompt content from ACP blocks. Text drives slash-command
+                // parsing and session titles; images are preserved for the LLM turn.
                 let raw_prompt_text = extract_prompt_text(&req.prompt);
-                if raw_prompt_text.is_empty() {
+                let raw_prompt_parts = extract_prompt_parts(&req.prompt);
+                if raw_prompt_parts.is_empty() {
                     send_message(&cx, &session_id, "Error: empty prompt");
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -1169,7 +1173,7 @@ pub async fn run_agent(
                     .first()
                     .map(|turn| turn.user_prompt.clone())
                     .filter(|text| !text.trim().is_empty())
-                    .unwrap_or_else(|| raw_prompt_text.clone());
+                    .unwrap_or_else(|| prompt_text_for_title(&raw_prompt_text, &raw_prompt_parts));
 
                 // Rename the session from its first prompt *before* any LLM
                 // work starts. The title depends only on the user's text, not
@@ -1214,7 +1218,12 @@ pub async fn run_agent(
                         format!("{body}\n\nUser input: {args}")
                     }
                 } else {
-                    raw_prompt_text
+                    raw_prompt_text.clone()
+                };
+                let prompt_parts = if prompt_text == raw_prompt_text {
+                    raw_prompt_parts
+                } else {
+                    vec![ChatContentPart::text(prompt_text.clone())]
                 };
 
                 // Validate model is configured
@@ -1298,6 +1307,7 @@ pub async fn run_agent(
                 let messages = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
+                    &prompt_parts,
                     llm_prompt.as_ref(),
                     &sessions_prompt,
                     &session_id,
@@ -1665,6 +1675,46 @@ fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+/// Convert ACP prompt blocks into the internal multimodal chat content
+/// representation. Baseline text is preserved verbatim; images are
+/// forwarded as either data URLs (for inline base64) or URLs (when the
+/// client supplied a URI without inline bytes). Other ACP content types
+/// are intentionally ignored here because the agent has not advertised
+/// audio support and resource links are handled through textual context.
+fn extract_prompt_parts(blocks: &[ContentBlock]) -> Vec<ChatContentPart> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(t) if !t.text.is_empty() => Some(ChatContentPart::text(&t.text)),
+            ContentBlock::Image(image) if !image.data.is_empty() => Some(
+                ChatContentPart::image_data(image.data.clone(), image.mime_type.as_str()),
+            ),
+            ContentBlock::Image(image) => image
+                .uri
+                .as_ref()
+                .map(|uri| ChatContentPart::image_url(uri.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn prompt_text_for_title(text: &str, parts: &[ChatContentPart]) -> String {
+    if !text.trim().is_empty() {
+        return text.to_string();
+    }
+    let image_count = parts
+        .iter()
+        .filter(|part| matches!(part, ChatContentPart::Image { .. }))
+        .count();
+    if image_count == 1 {
+        "[image]".to_string()
+    } else if image_count > 1 {
+        format!("[{image_count} images]")
+    } else {
+        String::new()
+    }
+}
+
 /// Send an agent_message_chunk session update to the client.
 fn send_message(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
@@ -1717,7 +1767,16 @@ fn send_thought(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
 ///
 /// Pure -- exposed for unit testing the replay shape without spinning
 /// up an LLM.
+#[cfg(test)]
 fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMessage> {
+    build_prompt_messages_with_parts(snap, new_prompt, &[ChatContentPart::text(new_prompt)])
+}
+
+fn build_prompt_messages_with_parts(
+    snap: &SessionSnapshot,
+    new_prompt_text: &str,
+    new_prompt_parts: &[ChatContentPart],
+) -> Vec<ChatMessage> {
     let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
     messages.push(ChatMessage::system(build_system_prompt(
         &snap.mode, &snap.cwd,
@@ -1807,7 +1866,11 @@ fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMe
             messages.push(ChatMessage::assistant(turn.agent_response.clone()));
         }
     }
-    messages.push(ChatMessage::user(new_prompt.to_string()));
+    if new_prompt_parts.is_empty() {
+        messages.push(ChatMessage::user(new_prompt_text.to_string()));
+    } else {
+        messages.push(ChatMessage::user_parts(new_prompt_parts.to_vec()));
+    }
     messages
 }
 
@@ -1834,6 +1897,7 @@ fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMe
 async fn build_prompt_messages_with_compression(
     snap: &mut SessionSnapshot,
     prompt_text: &str,
+    prompt_parts: &[ChatContentPart],
     llm: &dyn crate::llm_client::LlmBackend,
     sessions: &SessionStore,
     session_id: &str,
@@ -1844,7 +1908,7 @@ async fn build_prompt_messages_with_compression(
     use crate::context_manager::{context_budget, summarize_turn};
 
     let budget = context_budget(context_length);
-    let mut messages = build_prompt_messages(snap, prompt_text);
+    let mut messages = build_prompt_messages_with_parts(snap, prompt_text, prompt_parts);
 
     loop {
         let projected = crate::tokens::approximate_tokens_messages(&messages);
@@ -1891,7 +1955,7 @@ async fn build_prompt_messages_with_compression(
                     );
                 }
                 snap.history[idx].summary = Some(new_summary);
-                messages = build_prompt_messages(snap, prompt_text);
+                messages = build_prompt_messages_with_parts(snap, prompt_text, prompt_parts);
             }
             Err(e) => {
                 tracing::warn!(
@@ -4434,11 +4498,11 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content.as_deref(), Some("what is rust?"));
+        assert_eq!(msgs[1].text_content(), Some("what is rust?"));
         assert_eq!(msgs[2].role, "assistant");
-        assert_eq!(msgs[2].content.as_deref(), Some("a language"));
+        assert_eq!(msgs[2].text_content(), Some("a language"));
         assert_eq!(msgs[3].role, "user");
-        assert_eq!(msgs[3].content.as_deref(), Some("follow up"));
+        assert_eq!(msgs[3].text_content(), Some("follow up"));
     }
 
     /// History with tool_exchanges must replay as user → assistant_tool_calls
@@ -4484,12 +4548,12 @@ mod tests {
         assert_eq!(msgs.len(), 7);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content.as_deref(), Some("find TODOs"));
+        assert_eq!(msgs[1].text_content(), Some("find TODOs"));
 
         // assistant_tool_calls: no content, tool_calls present, both calls
         // bundled into a single batch (the conservative collapse).
         assert_eq!(msgs[2].role, "assistant");
-        assert!(msgs[2].content.is_none());
+        assert!(msgs[2].content.is_empty());
         let calls = msgs[2].tool_calls.as_ref().expect("tool_calls present");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "c1");
@@ -4500,16 +4564,16 @@ mod tests {
         // tool_result messages, paired by call_id and in original order.
         assert_eq!(msgs[3].role, "tool");
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("c1"));
-        assert_eq!(msgs[3].content.as_deref(), Some("src/lib.rs:42: // TODO"));
+        assert_eq!(msgs[3].text_content(), Some("src/lib.rs:42: // TODO"));
         assert_eq!(msgs[4].role, "tool");
         assert_eq!(msgs[4].tool_call_id.as_deref(), Some("c2"));
-        assert_eq!(msgs[4].content.as_deref(), Some("fn main() {}"));
+        assert_eq!(msgs[4].text_content(), Some("fn main() {}"));
 
         // Final assistant text and new user prompt.
         assert_eq!(msgs[5].role, "assistant");
-        assert_eq!(msgs[5].content.as_deref(), Some("found 3 in src/lib.rs"));
+        assert_eq!(msgs[5].text_content(), Some("found 3 in src/lib.rs"));
         assert_eq!(msgs[6].role, "user");
-        assert_eq!(msgs[6].content.as_deref(), Some("now fix them"));
+        assert_eq!(msgs[6].text_content(), Some("now fix them"));
     }
 
     /// Empty history: just system + the new user prompt. Establishes the
@@ -4531,7 +4595,7 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content.as_deref(), Some("hi"));
+        assert_eq!(msgs[1].text_content(), Some("hi"));
     }
 
     #[test]
@@ -4554,18 +4618,17 @@ mod tests {
         assert_eq!(msgs[0].role, "system");
         assert!(
             !msgs[0]
-                .content
-                .as_deref()
+                .text_content()
                 .expect("system prompt")
                 .contains("Use the local style."),
             "project-controlled AGENTS.md content must not be system instructions"
         );
         assert_eq!(msgs[1].role, "user");
-        let project_context = msgs[1].content.as_deref().expect("project context");
+        let project_context = msgs[1].text_content().expect("project context");
         assert!(project_context.starts_with("# AGENTS.md instructions for "));
         assert!(project_context.contains("<INSTRUCTIONS>\nUse the local style.\n</INSTRUCTIONS>"));
         assert_eq!(msgs[2].role, "user");
-        assert_eq!(msgs[2].content.as_deref(), Some("hi"));
+        assert_eq!(msgs[2].text_content(), Some("hi"));
     }
 
     /// A turn that ended without final assistant text (e.g. tool_loop hit
@@ -4608,11 +4671,11 @@ mod tests {
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
         assert_eq!(msgs[2].role, "assistant");
-        assert!(msgs[2].content.is_none());
+        assert!(msgs[2].content.is_empty());
         assert!(msgs[2].tool_calls.is_some());
         assert_eq!(msgs[3].role, "tool");
         assert_eq!(msgs[4].role, "user");
-        assert_eq!(msgs[4].content.as_deref(), Some("next"));
+        assert_eq!(msgs[4].text_content(), Some("next"));
     }
 
     // ---------------------------------------------------------------
@@ -4669,10 +4732,7 @@ mod tests {
         let msgs = build_prompt_messages(&snap, "hi");
         // system, catalog (user context), user(new) -> 3
         assert_eq!(msgs.len(), 3);
-        let catalog = msgs[1]
-            .content
-            .as_ref()
-            .expect("catalog message has content");
+        let catalog = msgs[1].text_content().expect("catalog message has content");
         assert!(catalog.contains("<available_skills>"));
         assert!(catalog.contains("<name>hello-world</name>"));
         assert!(catalog.contains("<name>pdf-processing</name>"));
@@ -4701,7 +4761,7 @@ mod tests {
         // Just system + the user prompt -- no catalog message.
         assert_eq!(msgs.len(), 2);
         for m in &msgs {
-            if let Some(c) = m.content.as_deref() {
+            if let Some(c) = m.text_content() {
                 assert!(
                     !c.contains("<available_skills>"),
                     "empty registry must not emit an empty catalog block"
@@ -5181,7 +5241,7 @@ mod tests {
         let msgs = build_prompt_messages(&snap, "next");
         // system + summary(turn 0) + user(turn 1) + assistant(turn 1) + user(new) = 5
         assert_eq!(msgs.len(), 5);
-        let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.content.as_deref()).collect();
+        let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.text_content()).collect();
         // Verbatim OLD content must NOT appear -- the summary replaces it.
         assert!(
             bodies.iter().all(|b| !b.contains("OLD user")),
@@ -5225,7 +5285,7 @@ mod tests {
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "next");
-        let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.content.as_deref()).collect();
+        let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.text_content()).collect();
         assert!(bodies.iter().any(|b| b.contains("verbatim user")));
         assert!(bodies.iter().any(|b| b.contains("verbatim agent")));
         // No empty summary block leaked through.
