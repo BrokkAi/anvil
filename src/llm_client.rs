@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use futures::Stream;
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -159,8 +160,8 @@ pub struct StreamChatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub content: Vec<ChatContentPart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,7 +174,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
-            content: Some(content.into()),
+            content: vec![ChatContentPart::text(content)],
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -183,7 +184,17 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: Some(content.into()),
+            content: vec![ChatContentPart::text(content)],
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn user_parts(content: Vec<ChatContentPart>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -193,7 +204,7 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: Some(content.into()),
+            content: vec![ChatContentPart::text(content)],
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -203,7 +214,7 @@ impl ChatMessage {
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: None,
+            content: Vec::new(),
             tool_calls: Some(calls),
             tool_call_id: None,
             name: None,
@@ -217,10 +228,89 @@ impl ChatMessage {
     ) -> Self {
         Self {
             role: "tool".to_string(),
-            content: Some(content.into()),
+            content: vec![ChatContentPart::text(content)],
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
+        }
+    }
+
+    pub fn text_content(&self) -> Option<&str> {
+        self.content.iter().find_map(|part| match part {
+            ChatContentPart::Text { text } => Some(text.as_str()),
+            ChatContentPart::Image { .. } => None,
+        })
+    }
+
+    pub fn content_text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ChatContentPart::Text { text } => Some(text.as_str()),
+                ChatContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn has_content(&self) -> bool {
+        !self.content.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text { text: String },
+    Image { image_url: String },
+}
+
+impl ChatContentPart {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    pub fn image_data(data: impl Into<String>, mime_type: impl AsRef<str>) -> Self {
+        let data = data.into();
+        let mime_type = mime_type.as_ref();
+        let image_url = if data.starts_with("data:") {
+            data
+        } else {
+            format!("data:{mime_type};base64,{data}")
+        };
+        Self::Image { image_url }
+    }
+
+    pub fn image_url(url: impl Into<String>) -> Self {
+        Self::Image {
+            image_url: url.into(),
+        }
+    }
+}
+
+impl Serialize for ChatContentPart {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ChatContentPart::Text { text } => {
+                let mut state = serializer.serialize_struct("ChatContentPart", 2)?;
+                state.serialize_field("type", "text")?;
+                state.serialize_field("text", text)?;
+                state.end()
+            }
+            ChatContentPart::Image { image_url } => {
+                #[derive(Serialize)]
+                struct ImageUrl<'a> {
+                    url: &'a str,
+                }
+
+                let mut state = serializer.serialize_struct("ChatContentPart", 2)?;
+                state.serialize_field("type", "image_url")?;
+                state.serialize_field("image_url", &ImageUrl { url: image_url })?;
+                state.end()
+            }
         }
     }
 }
@@ -304,9 +394,72 @@ pub trait LlmBackend: Send + Sync {
 // Request/response types for the OpenAI-compatible API
 // ---------------------------------------------------------------------------
 
+fn serialize_chat_completion_messages<S>(
+    messages: &[ChatMessage],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(messages.len()))?;
+    for message in messages {
+        seq.serialize_element(&ChatCompletionMessage(message))?;
+    }
+    seq.end()
+}
+
+struct ChatCompletionMessage<'a>(&'a ChatMessage);
+
+impl Serialize for ChatCompletionMessage<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let message = self.0;
+        let mut len = 1;
+        if !message.content.is_empty() {
+            len += 1;
+        }
+        if message.tool_calls.is_some() {
+            len += 1;
+        }
+        if message.tool_call_id.is_some() {
+            len += 1;
+        }
+        if message.name.is_some() {
+            len += 1;
+        }
+
+        let mut state = serializer.serialize_struct("ChatCompletionMessage", len)?;
+        state.serialize_field("role", &message.role)?;
+        if !message.content.is_empty() {
+            if message.content.len() == 1 {
+                if let ChatContentPart::Text { text } = &message.content[0] {
+                    state.serialize_field("content", text)?;
+                } else {
+                    state.serialize_field("content", &message.content)?;
+                }
+            } else {
+                state.serialize_field("content", &message.content)?;
+            }
+        }
+        if let Some(tool_calls) = &message.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            state.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(name) = &message.name {
+            state.serialize_field("name", name)?;
+        }
+        state.end()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
+    #[serde(serialize_with = "serialize_chat_completion_messages")]
     messages: Vec<ChatMessage>,
     stream: bool,
     /// OpenAI's opt-in to receive a final `usage` payload on a streamed
@@ -1270,7 +1423,10 @@ mod tests {
         let m = ChatMessage::system("you are helpful");
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
         assert_eq!(v["role"], "system");
-        assert_eq!(v["content"], "you are helpful");
+        assert_eq!(
+            v["content"],
+            serde_json::json!([{ "type": "text", "text": "you are helpful" }])
+        );
         assert!(v.get("tool_calls").is_none(), "system has no tool_calls");
         assert!(v.get("tool_call_id").is_none());
 
@@ -1285,7 +1441,10 @@ mod tests {
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "call_1");
         assert_eq!(v["name"], "read_file");
-        assert_eq!(v["content"], "contents");
+        assert_eq!(
+            v["content"],
+            serde_json::json!([{ "type": "text", "text": "contents" }])
+        );
     }
 
     /// `assistant_tool_calls` omits `content` entirely (not `null`),

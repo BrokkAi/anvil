@@ -35,8 +35,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
 use crate::llm_client::{
-    ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata, ReasoningLevelPreset,
-    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
+    ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 
 // Codex CLI's `chatgpt_base_url` default is
@@ -662,6 +662,7 @@ pub(crate) enum ResponsesInputItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponsesContent {
     InputText { text: String },
+    InputImage { image_url: String },
     OutputText { text: String },
 }
 
@@ -694,19 +695,33 @@ pub(crate) fn build_responses_request(
     for msg in messages {
         match msg.role.as_str() {
             "system" => {
-                if let Some(text) = &msg.content {
-                    instructions_parts.push(text.clone());
+                let text = msg.content_text();
+                if !text.is_empty() {
+                    instructions_parts.push(text);
                 } else {
                     tracing::debug!(
-                        "dropping system message with no content when building Responses input"
+                        "dropping system message with no text content when building Responses input"
                     );
                 }
             }
             "user" => {
-                if let Some(text) = &msg.content {
+                if !msg.content.is_empty() {
                     input.push(ResponsesInputItem::Message {
                         role: "user".to_string(),
-                        content: vec![ResponsesContent::InputText { text: text.clone() }],
+                        content: msg
+                            .content
+                            .iter()
+                            .map(|part| match part {
+                                ChatContentPart::Text { text } => {
+                                    ResponsesContent::InputText { text: text.clone() }
+                                }
+                                ChatContentPart::Image { image_url } => {
+                                    ResponsesContent::InputImage {
+                                        image_url: image_url.clone(),
+                                    }
+                                }
+                            })
+                            .collect(),
                     });
                 } else {
                     tracing::debug!(
@@ -723,10 +738,11 @@ pub(crate) fn build_responses_request(
                             call_id: call.id.clone(),
                         });
                     }
-                } else if let Some(text) = &msg.content {
+                } else if msg.has_content() {
+                    let text = msg.content_text();
                     input.push(ResponsesInputItem::Message {
                         role: "assistant".to_string(),
-                        content: vec![ResponsesContent::OutputText { text: text.clone() }],
+                        content: vec![ResponsesContent::OutputText { text }],
                     });
                 } else {
                     tracing::debug!(
@@ -736,17 +752,18 @@ pub(crate) fn build_responses_request(
                 }
             }
             "tool" => {
-                if let (Some(call_id), Some(output)) = (&msg.tool_call_id, &msg.content) {
+                let output = msg.content_text();
+                if let Some(call_id) = &msg.tool_call_id {
                     input.push(ResponsesInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
-                        output: output.clone(),
+                        output,
                     });
                 } else {
                     tracing::warn!(
                         "dropping malformed tool message when building Responses input: \
                          tool_call_id_present={} content_present={}",
                         msg.tool_call_id.is_some(),
-                        msg.content.is_some()
+                        msg.has_content()
                     );
                 }
             }
@@ -1273,7 +1290,7 @@ mod tests {
         // the assistant's pre-tool text. Match that here.
         let messages = vec![ChatMessage {
             role: "assistant".to_string(),
-            content: Some("ignored preamble".to_string()),
+            content: vec![crate::llm_client::ChatContentPart::text("ignored preamble")],
             tool_calls: Some(vec![ToolCall {
                 id: "fc_1".to_string(),
                 r#type: "function".to_string(),
