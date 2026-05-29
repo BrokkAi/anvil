@@ -2702,6 +2702,10 @@ impl SessionStore {
         *self.default_model.write().await = model;
     }
 
+    pub async fn default_model(&self) -> String {
+        self.default_model.read().await.clone()
+    }
+
     /// Add a conversation turn and persist it to the session zip.
     ///
     /// Returns `Ok(())` on successful persistence, or `Err` if the zip

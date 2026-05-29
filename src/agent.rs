@@ -832,7 +832,10 @@ pub async fn run_agent(
                         vec![]
                     }
                 };
-                if let Some(first) = models.first() {
+                let current_default_model = sessions_init.default_model().await;
+                if current_default_model.trim().is_empty()
+                    && let Some(first) = models.first()
+                {
                     sessions_init.set_default_model(first.id.clone()).await;
                 }
                 sessions_init.set_available_models(models).await;
