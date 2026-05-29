@@ -699,6 +699,7 @@ fn source_count(catalog: &[ModelMetadata], source: ModelSource) -> usize {
 
 fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
     [
+        ModelSource::Bedrock,
         ModelSource::Codex,
         ModelSource::Ollama,
         ModelSource::OpenRouter,
@@ -724,6 +725,7 @@ fn render_setup_home_from_snapshot(snap: &SessionSnapshot, catalog: &[ModelMetad
 }
 
 fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String {
+    let bedrock_count = source_count(catalog, ModelSource::Bedrock);
     let codex_count = source_count(catalog, ModelSource::Codex);
     let ollama_count = source_count(catalog, ModelSource::Ollama);
     let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
@@ -744,10 +746,16 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          - `/setup openrouter` - Use OpenRouter.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
          Found now:\n\
+         - Bedrock: {bedrock_status}\n\
          - Codex: {codex_status}\n\
          - Local models: {local_status}\n\
          - OpenRouter: {openrouter_status}\n\n\
          You can run `/setup` anytime.",
+        bedrock_status = if bedrock_count > 0 {
+            "ready".to_string()
+        } else {
+            "not connected".to_string()
+        },
         codex_status = if codex_count > 0 {
             "ready".to_string()
         } else {
@@ -824,7 +832,10 @@ pub async fn run_agent(
                         vec![]
                     }
                 };
-                if let Some(first) = models.first() {
+                let current_default_model = sessions_init.default_model().await;
+                if current_default_model.trim().is_empty()
+                    && let Some(first) = models.first()
+                {
                     sessions_init.set_default_model(first.id.clone()).await;
                 }
                 sessions_init.set_available_models(models).await;
@@ -3399,6 +3410,11 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
         };
 
         write_group(
+            "Bedrock",
+            source_model_ids(catalog, ModelSource::Bedrock, 12),
+            "No Bedrock models found. Set AWS_BEARER_TOKEN_BEDROCK or ~/.secrets/bedrock_api_key.",
+        );
+        write_group(
             "Codex",
             source_model_ids(catalog, ModelSource::Codex, 12),
             "No Codex models found. Run `/setup codex`.",
@@ -4897,7 +4913,9 @@ mod tests {
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
 
         let store = SessionStore::new("m".into());
-        let llm = std::sync::Arc::new(crate::multi_backend::MultiBackend::new(None, None, None));
+        let llm = std::sync::Arc::new(crate::multi_backend::MultiBackend::new(
+            None, None, None, None,
+        ));
         let refresh = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
         let bare = handle_openrouter_login("/openrouter-login", &llm, &store, &refresh).await;

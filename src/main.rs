@@ -8,6 +8,7 @@ use clap::builder::RangedU64ValueParser;
 mod agent;
 mod agents;
 mod agents_md;
+mod bedrock_client;
 mod codex_auth;
 mod codex_client;
 mod context_manager;
@@ -24,6 +25,7 @@ mod skills;
 mod tokens;
 mod tool_loop;
 mod tools;
+mod trace_logging;
 
 use crate::llm_client::LlmBackend;
 use crate::multi_backend::MultiBackend;
@@ -44,6 +46,12 @@ struct Args {
     /// Ollama). When unset, the first discovered model wins.
     #[arg(long, default_value = "")]
     default_model: String,
+
+    /// Seed new sessions with a reasoning effort such as `low`,
+    /// `medium`, or `high`. Models that do not support configurable
+    /// reasoning ignore this and fall back to their default behavior.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
 
     /// Maximum number of tool-calling turns per prompt before the server forces a final text response.
     #[arg(long, default_value_t = 25)]
@@ -130,6 +138,7 @@ impl std::fmt::Debug for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Args")
             .field("default_model", &self.default_model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
             .field("max_sessions", &self.max_sessions)
             .field("max_history_turns", &self.max_history_turns)
@@ -331,6 +340,26 @@ fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
+fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
+    let token = match bedrock_client::bearer_token_from_env_or_secrets() {
+        Ok(Some(token)) => token,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("failed to read Bedrock credentials: {e:#}");
+            return None;
+        }
+    };
+    let region = bedrock_client::region_from_env();
+    let model = bedrock_client::model_from_env();
+    tracing::info!(
+        "Bedrock backend wired from {} or ~/.secrets at region {region}; default model {model}",
+        bedrock_client::BEDROCK_API_KEY_ENV
+    );
+    Some(Arc::new(bedrock_client::BedrockClient::new(
+        token, region, model,
+    )))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Configure tracing to stderr only (stdout is reserved for JSON-RPC)
@@ -394,10 +423,17 @@ async fn main() -> Result<()> {
         );
     }
 
+    let bedrock_backend = build_bedrock_backend();
     let codex_backend = build_codex_backend().await;
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
 
+    if bedrock_backend.is_none() {
+        tracing::info!(
+            "Bedrock backend not available; set {} or add ~/.secrets/bedrock_api_key to enable it.",
+            bedrock_client::BEDROCK_API_KEY_ENV
+        );
+    }
     if codex_backend.is_none() {
         tracing::info!(
             "Codex backend not available; the picker will fall back to Ollama \
@@ -415,6 +451,7 @@ async fn main() -> Result<()> {
     }
 
     let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(
+        bedrock_backend,
         codex_backend,
         openrouter_backend,
         ollama_backend,
@@ -429,6 +466,9 @@ async fn main() -> Result<()> {
         limits,
         args.transient_setup,
     );
+    sessions
+        .set_default_reasoning_effort(args.reasoning_effort)
+        .await;
 
     let max_turns = args.max_turns.max(1);
     // Bounds on `llm_idle_timeout_secs` are enforced by the clap
