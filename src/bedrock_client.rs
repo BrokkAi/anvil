@@ -9,6 +9,7 @@ use crate::llm_client::{
     ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest,
     TokenUsage, ToolCall, ToolDefinition,
 };
+use crate::trace_logging::append_trace_record;
 
 /// Returns true when the model supports Anthropic-style prompt caching
 /// and needs explicit `cache_control` breakpoints in the request body.
@@ -31,6 +32,7 @@ fn trace_bedrock_request(body: &BedrockAnthropicRequest) {
         return;
     }
     let Ok(body_json) = serde_json::to_value(body) else {
+        tracing::warn!("failed to serialize Bedrock trace request body");
         return;
     };
     let system_cache = body_json
@@ -48,7 +50,11 @@ fn trace_bedrock_request(body: &BedrockAnthropicRequest) {
     let user_cache = body_json
         .get("messages")
         .and_then(|m| m.as_array())
-        .and_then(|msgs| msgs.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")))
+        .and_then(|msgs| {
+            msgs.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
         .and_then(|blocks| blocks.last())
@@ -65,10 +71,7 @@ fn trace_bedrock_request(body: &BedrockAnthropicRequest) {
         "tool_count": body_json.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0),
         "full_body": body_json,
     });
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{}", serde_json::to_string(&record).unwrap_or_default());
-    }
+    append_trace_record(record);
 }
 
 pub const BEDROCK_API_KEY_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
@@ -529,6 +532,8 @@ fn percent_encode_path_segment(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::llm_client::FunctionDef;
+
     use super::*;
 
     #[test]

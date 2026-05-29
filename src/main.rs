@@ -24,6 +24,7 @@ mod skills;
 mod tokens;
 mod tool_loop;
 mod tools;
+mod trace_logging;
 
 use crate::llm_client::LlmBackend;
 use crate::multi_backend::MultiBackend;
