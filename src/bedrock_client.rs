@@ -402,10 +402,10 @@ fn convert_messages(
     for msg in messages {
         match msg.role.as_str() {
             "system" => {
-                if let Some(content) = msg.content {
-                    if !content.trim().is_empty() {
-                        system_texts.push(content);
-                    }
+                if let Some(content) = msg.content
+                    && !content.trim().is_empty()
+                {
+                    system_texts.push(content);
                 }
             }
             "user" => {
@@ -421,13 +421,13 @@ fn convert_messages(
             }
             "assistant" => {
                 let mut content = Vec::new();
-                if let Some(text) = msg.content {
-                    if !text.is_empty() {
-                        content.push(BedrockContentOut::Text {
-                            text,
-                            cache_control: None,
-                        });
-                    }
+                if let Some(text) = msg.content
+                    && !text.is_empty()
+                {
+                    content.push(BedrockContentOut::Text {
+                        text,
+                        cache_control: None,
+                    });
                 }
                 if let Some(calls) = msg.tool_calls {
                     for call in calls {
@@ -471,10 +471,8 @@ fn convert_messages(
             cache_control: None,
         })
         .collect();
-    if enable_cache {
-        if let Some(last) = system_blocks.last_mut() {
-            last.cache_control = Some(CACHE_CONTROL);
-        }
+    if enable_cache && let Some(last) = system_blocks.last_mut() {
+        last.cache_control = Some(CACHE_CONTROL);
     }
 
     // When caching is enabled, attach cache_control to the last content
@@ -482,10 +480,9 @@ fn convert_messages(
     if enable_cache {
         for msg in converted.iter_mut().rev() {
             if msg.role == "user" {
-                if let Some(last_block) = msg.content.last_mut() {
-                    if let BedrockContentOut::Text { cache_control, .. } = last_block {
-                        *cache_control = Some(CACHE_CONTROL);
-                    }
+                if let Some(BedrockContentOut::Text { cache_control, .. }) = msg.content.last_mut()
+                {
+                    *cache_control = Some(CACHE_CONTROL);
                 }
                 break;
             }
@@ -505,10 +502,8 @@ fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockT
             cache_control: None,
         })
         .collect();
-    if enable_cache {
-        if let Some(last) = converted.last_mut() {
-            last.cache_control = Some(CACHE_CONTROL);
-        }
+    if enable_cache && let Some(last) = converted.last_mut() {
+        last.cache_control = Some(CACHE_CONTROL);
     }
     converted
 }
@@ -654,11 +649,8 @@ mod tests {
         for msg in &converted {
             if msg.role == "user" {
                 for block in &msg.content {
-                    match block {
-                        BedrockContentOut::Text { cache_control, .. } => {
-                            assert!(cache_control.is_none());
-                        }
-                        _ => {}
+                    if let BedrockContentOut::Text { cache_control, .. } = block {
+                        assert!(cache_control.is_none());
                     }
                 }
             }
