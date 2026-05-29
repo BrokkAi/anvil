@@ -10,6 +10,67 @@ use crate::llm_client::{
     TokenUsage, ToolCall, ToolDefinition,
 };
 
+/// Returns true when the model supports Anthropic-style prompt caching
+/// and needs explicit `cache_control` breakpoints in the request body.
+/// All Bedrock-hosted Claude models have "anthropic" in their id
+/// (e.g. `us.anthropic.claude-sonnet-4-6`).
+fn requires_explicit_caching(model: &str) -> bool {
+    model.contains("anthropic")
+}
+
+const CACHE_CONTROL: CacheControl = CacheControl {
+    r#type: "ephemeral",
+};
+
+fn trace_bedrock_request(body: &BedrockAnthropicRequest) {
+    let Ok(path) = std::env::var("ANVIL_TRACE_JSONL") else {
+        return;
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    let Ok(body_json) = serde_json::to_value(body) else {
+        return;
+    };
+    let system_cache = body_json
+        .get("system")
+        .and_then(|s| s.as_array())
+        .and_then(|blocks| blocks.last())
+        .and_then(|b| b.get("cache_control"))
+        .is_some();
+    let tool_cache = body_json
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .and_then(|tools| tools.last())
+        .and_then(|t| t.get("cache_control"))
+        .is_some();
+    let user_cache = body_json
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| msgs.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|blocks| blocks.last())
+        .and_then(|b| b.get("cache_control"))
+        .is_some();
+    let record = serde_json::json!({
+        "type": "bedrock_request_body",
+        "enable_cache": system_cache || tool_cache || user_cache,
+        "system_cache_control": system_cache,
+        "tool_cache_control": tool_cache,
+        "user_cache_control": user_cache,
+        "system_blocks": body_json.get("system").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0),
+        "message_count": body_json.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0),
+        "tool_count": body_json.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0),
+        "full_body": body_json,
+    });
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{}", serde_json::to_string(&record).unwrap_or_default());
+    }
+}
+
 pub const BEDROCK_API_KEY_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub const BEDROCK_REGION_ENV: &str = "BEDROCK_REGION";
 pub const BEDROCK_MODEL_ENV: &str = "ANVIL_BEDROCK_MODEL";
@@ -71,16 +132,23 @@ impl BedrockClient {
             cancel,
             idle_timeout: _,
         } = request;
-        let (system, messages) = convert_messages(messages)?;
+        let enable_cache = requires_explicit_caching(&model);
+        let (system_blocks, messages) = convert_messages(messages, enable_cache)?;
+        let system = if system_blocks.is_empty() {
+            None
+        } else {
+            Some(system_blocks)
+        };
         let body = BedrockAnthropicRequest {
             anthropic_version: ANTHROPIC_VERSION,
-            system: empty_to_none(system),
+            system,
             messages,
-            tools: tools.map(convert_tools),
+            tools: tools.map(|t| convert_tools(t, enable_cache)),
             max_tokens: MAX_TOKENS,
             temperature: None,
         };
         let url = self.invoke_url(&model);
+        trace_bedrock_request(&body);
         let send = self
             .http
             .post(&url)
@@ -214,13 +282,27 @@ fn read_secret_file(name: &str) -> Result<Option<String>> {
 struct BedrockAnthropicRequest {
     anthropic_version: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<BedrockTextBlock>>,
     messages: Vec<BedrockMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<BedrockTool>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct CacheControl {
+    r#type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct BedrockTextBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,7 +315,11 @@ struct BedrockMessage {
 #[serde(tag = "type")]
 enum BedrockContentOut {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -252,6 +338,8 @@ struct BedrockTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,8 +389,11 @@ impl BedrockUsage {
     }
 }
 
-fn convert_messages(messages: Vec<ChatMessage>) -> Result<(String, Vec<BedrockMessage>)> {
-    let mut system = Vec::new();
+fn convert_messages(
+    messages: Vec<ChatMessage>,
+    enable_cache: bool,
+) -> Result<(Vec<BedrockTextBlock>, Vec<BedrockMessage>)> {
+    let mut system_texts = Vec::new();
     let mut converted = Vec::new();
 
     for msg in messages {
@@ -310,7 +401,7 @@ fn convert_messages(messages: Vec<ChatMessage>) -> Result<(String, Vec<BedrockMe
             "system" => {
                 if let Some(content) = msg.content {
                     if !content.trim().is_empty() {
-                        system.push(content);
+                        system_texts.push(content);
                     }
                 }
             }
@@ -318,7 +409,10 @@ fn convert_messages(messages: Vec<ChatMessage>) -> Result<(String, Vec<BedrockMe
                 if let Some(content) = msg.content {
                     converted.push(BedrockMessage {
                         role: "user".to_string(),
-                        content: vec![BedrockContentOut::Text { text: content }],
+                        content: vec![BedrockContentOut::Text {
+                            text: content,
+                            cache_control: None,
+                        }],
                     });
                 }
             }
@@ -326,7 +420,10 @@ fn convert_messages(messages: Vec<ChatMessage>) -> Result<(String, Vec<BedrockMe
                 let mut content = Vec::new();
                 if let Some(text) = msg.content {
                     if !text.is_empty() {
-                        content.push(BedrockContentOut::Text { text });
+                        content.push(BedrockContentOut::Text {
+                            text,
+                            cache_control: None,
+                        });
                     }
                 }
                 if let Some(calls) = msg.tool_calls {
@@ -361,26 +458,60 @@ fn convert_messages(messages: Vec<ChatMessage>) -> Result<(String, Vec<BedrockMe
         }
     }
 
-    Ok((system.join("\n\n"), converted))
+    // Build system text blocks and attach cache_control to the last one
+    // when caching is enabled.
+    let mut system_blocks: Vec<BedrockTextBlock> = system_texts
+        .into_iter()
+        .map(|text| BedrockTextBlock {
+            block_type: "text",
+            text,
+            cache_control: None,
+        })
+        .collect();
+    if enable_cache {
+        if let Some(last) = system_blocks.last_mut() {
+            last.cache_control = Some(CACHE_CONTROL);
+        }
+    }
+
+    // When caching is enabled, attach cache_control to the last content
+    // block of the last user message (text or tool_result).
+    if enable_cache {
+        for msg in converted.iter_mut().rev() {
+            if msg.role == "user" {
+                if let Some(last_block) = msg.content.last_mut() {
+                    if let BedrockContentOut::Text { cache_control, .. } = last_block {
+                        *cache_control = Some(CACHE_CONTROL);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    Ok((system_blocks, converted))
 }
 
-fn convert_tools(tools: Vec<ToolDefinition>) -> Vec<BedrockTool> {
-    tools
+fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockTool> {
+    let mut converted: Vec<BedrockTool> = tools
         .into_iter()
         .map(|tool| BedrockTool {
             name: tool.function.name,
             description: tool.function.description,
             input_schema: tool.function.parameters,
+            cache_control: None,
         })
-        .collect()
+        .collect();
+    if enable_cache {
+        if let Some(last) = converted.last_mut() {
+            last.cache_control = Some(CACHE_CONTROL);
+        }
+    }
+    converted
 }
 
 fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
     serde_json::from_str(raw).with_context(|| format!("parse tool arguments as JSON: {raw}"))
-}
-
-fn empty_to_none(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
 }
 
 fn percent_encode_path_segment(input: &str) -> String {
@@ -419,13 +550,113 @@ mod tests {
                 arguments: r#"{"path":"src/main.rs"}"#.to_string(),
             },
         }];
-        let (_, messages) = convert_messages(vec![
-            ChatMessage::assistant_tool_calls(calls),
-            ChatMessage::tool_result("toolu_1", "readFile", "contents"),
-        ])
+        let (_, messages) = convert_messages(
+            vec![
+                ChatMessage::assistant_tool_calls(calls),
+                ChatMessage::tool_result("toolu_1", "readFile", "contents"),
+            ],
+            false,
+        )
         .expect("convert");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn cache_control_on_claude_requests() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there"),
+            ChatMessage::user("What's the weather?"),
+        ];
+        let (system_blocks, converted) =
+            convert_messages(messages, true).expect("convert with cache");
+
+        // Last system block has cache_control
+        assert_eq!(system_blocks.len(), 1);
+        assert!(system_blocks[0].cache_control.is_some());
+
+        // Last user message's content has cache_control
+        let last_user = converted
+            .iter()
+            .rfind(|m| m.role == "user")
+            .expect("last user msg");
+        match last_user.content.last().expect("content") {
+            BedrockContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+
+        // Earlier user message does NOT have cache_control
+        let first_user = converted
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("first user msg");
+        match first_user.content.last().expect("content") {
+            BedrockContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_none());
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_control_on_last_tool() {
+        let tools = vec![
+            ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDef {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({}),
+                },
+            },
+            ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDef {
+                    name: "write_file".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({}),
+                },
+            },
+        ];
+        let converted = convert_tools(tools, true);
+
+        // Last tool has cache_control
+        assert!(converted[1].cache_control.is_some());
+        // First tool does NOT
+        assert!(converted[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn no_cache_control_for_non_claude() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+        let (system_blocks, converted) =
+            convert_messages(messages, false).expect("convert without cache");
+
+        // No system blocks have cache_control
+        for block in &system_blocks {
+            assert!(block.cache_control.is_none());
+        }
+
+        // No user message content has cache_control
+        for msg in &converted {
+            if msg.role == "user" {
+                for block in &msg.content {
+                    match block {
+                        BedrockContentOut::Text { cache_control, .. } => {
+                            assert!(cache_control.is_none());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }
