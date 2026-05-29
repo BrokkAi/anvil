@@ -674,8 +674,10 @@ pub(crate) async fn run(
                             // Diff for write/edit tools when we have prior content)
                             // or Failed (for tool-reported errors).
                             let update = if exec.failed {
-                                announce::update_failed(
+                                announce::update_failed_with_input(
                                     &call.id,
+                                    &tool_name,
+                                    &parsed_input,
                                     &exec.output,
                                     Some(Value::String(exec.output.clone())),
                                 )
@@ -683,7 +685,13 @@ pub(crate) async fn run(
                                 let diff = pre_write.and_then(|prior| {
                                     build_editing_diff(&tool_name, &parsed_input, prior)
                                 });
-                                announce::update_completed(&call.id, &exec.output, diff)
+                                announce::update_completed(
+                                    &call.id,
+                                    &tool_name,
+                                    &parsed_input,
+                                    &exec.output,
+                                    diff,
+                                )
                             };
                             maybe_send_session_update(
                                 notifications,
@@ -839,6 +847,7 @@ async fn request_user_permission(
         .kind(kind)
         .status(ToolCallStatus::Pending)
         .title(title)
+        .content(announce::tool_input_content(tool_name, raw_input))
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 

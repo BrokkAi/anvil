@@ -79,6 +79,7 @@ pub(super) fn initial_tool_call(
     ToolCall::new(ToolCallId::new(tool_call_id.to_string()), title)
         .kind(kind)
         .status(ToolCallStatus::Pending)
+        .content(tool_input_content(tool_name, raw_input))
         .raw_input(raw_input.clone())
         .locations(tool_locations(tool_name, raw_input))
 }
@@ -111,6 +112,7 @@ pub(super) fn rejected_initial_tool_call(
     )
     .kind(kind)
     .status(ToolCallStatus::Pending)
+    .content(tool_input_content(tool_name, raw_input))
     .raw_input(raw_input.clone())
     .locations(tool_locations(tool_name, raw_input))
 }
@@ -138,22 +140,57 @@ pub(super) fn update_failed(
     ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields)
 }
 
+pub(super) fn update_failed_with_input(
+    tool_call_id: &str,
+    tool_name: &str,
+    raw_input: &Value,
+    reason: &str,
+    raw_output: Option<Value>,
+) -> ToolCallUpdate {
+    let mut fields = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::Failed)
+        .content(vec![text_content(&output_text_for_tool(
+            tool_name, raw_input, reason,
+        ))]);
+    if let Some(raw) = raw_output {
+        fields = fields.raw_output(raw);
+    }
+    ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields)
+}
+
 /// Terminal `Completed` update. Pass `Some(diff)` for `write_file` to
 /// render an inline diff; otherwise the `output` is shown as text.
 pub(super) fn update_completed(
     tool_call_id: &str,
+    tool_name: &str,
+    raw_input: &Value,
     output: &str,
     diff: Option<Diff>,
 ) -> ToolCallUpdate {
     let content = match diff {
         Some(diff) => vec![ToolCallContent::Diff(diff)],
-        None => vec![text_content(&truncate(output))],
+        None => vec![text_content(&output_text_for_tool(
+            tool_name, raw_input, output,
+        ))],
     };
     let fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::Completed)
         .content(content)
         .raw_output(Value::String(output.to_string()));
     ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields)
+}
+
+/// Extra human-readable input details for clients that render tool-call
+/// content but do not expose `raw_input`. Keep this focused on multiline
+/// shell commands, where the title intentionally shows only the first line.
+pub(super) fn tool_input_content(tool_name: &str, raw_input: &Value) -> Vec<ToolCallContent> {
+    match multiline_shell_command(tool_name, raw_input) {
+        Some(command) => vec![text_content(&truncate(&format!(
+            "Command:\n{}",
+            command.trim_end()
+        )))],
+        None => Vec::new(),
+    }
 }
 
 /// Human-friendly card title that shows *what* the tool is doing,
@@ -257,6 +294,30 @@ fn text_content(s: &str) -> ToolCallContent {
     ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(s))))
 }
 
+fn output_text_for_tool(tool_name: &str, raw_input: &Value, output: &str) -> String {
+    if let Some(command) = multiline_shell_command(tool_name, raw_input) {
+        truncate(&format!(
+            "Command:\n{}\n\nOutput:\n{}",
+            command.trim_end(),
+            output
+        ))
+    } else {
+        truncate(output)
+    }
+}
+
+fn multiline_shell_command<'a>(tool_name: &str, raw_input: &'a Value) -> Option<&'a str> {
+    if tool_name != "run_shell_command" {
+        return None;
+    }
+    let command = raw_input.get("command").and_then(Value::as_str)?;
+    if command.lines().count() > 1 {
+        Some(command)
+    } else {
+        None
+    }
+}
+
 /// Pull the first non-empty string value out of a JSON object, capped
 /// at ~80 chars. Used to give Bifrost calls a "where am I" hint in the
 /// card title (e.g. `search_symbols` argv -> "main").
@@ -341,6 +402,58 @@ mod tests {
             &json!({"command": "cargo test\n# extra junk"}),
         );
         assert_eq!(title, "Run `cargo test`");
+    }
+
+    #[test]
+    fn multiline_shell_initial_content_shows_full_command() {
+        let card = initial_tool_call(
+            "tc1",
+            "run_shell_command",
+            ToolKind::Execute,
+            &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
+        );
+
+        assert_eq!(card.content.len(), 1);
+        assert_eq!(
+            tool_text(&card.content[0]),
+            "Command:\npython3 - <<'PY'\nprint('hello')\nPY"
+        );
+    }
+
+    #[test]
+    fn completed_multiline_shell_content_shows_command_and_output() {
+        let update = update_completed(
+            "tc1",
+            "run_shell_command",
+            &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
+            "Command completed with exit code 0",
+            None,
+        );
+
+        let content = update.fields.content.expect("content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            tool_text(&content[0]),
+            "Command:\npython3 - <<'PY'\nprint('hello')\nPY\n\nOutput:\nCommand completed with exit code 0"
+        );
+    }
+
+    #[test]
+    fn failed_multiline_shell_content_shows_command_and_output() {
+        let update = update_failed_with_input(
+            "tc1",
+            "run_shell_command",
+            &json!({"command": "python3 - <<'PY'\nraise SystemExit(2)\nPY"}),
+            "Exit code: 2",
+            Some(Value::String("Exit code: 2".to_string())),
+        );
+
+        let content = update.fields.content.expect("content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            tool_text(&content[0]),
+            "Command:\npython3 - <<'PY'\nraise SystemExit(2)\nPY\n\nOutput:\nExit code: 2"
+        );
     }
 
     #[test]
@@ -505,5 +618,15 @@ mod tests {
         // No panic and the output is still valid UTF-8 (truncate already
         // returned a String).
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    fn tool_text(content: &ToolCallContent) -> &str {
+        let ToolCallContent::Content(content) = content else {
+            panic!("expected text content");
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            panic!("expected text block");
+        };
+        &text.text
     }
 }
