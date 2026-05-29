@@ -672,7 +672,7 @@ mod tests {
         let msgs = build_turn_summarization_messages(&t);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
-        let body = msgs[1].content.as_deref().unwrap();
+        let body = msgs[1].text_content().unwrap();
         assert!(body.contains("User: find TODOs"));
         assert!(body.contains("Tool `shell`"));
         assert!(body.contains("Assistant: found 3"));
@@ -818,7 +818,7 @@ mod tests {
             let system = request
                 .messages
                 .first()
-                .and_then(|m| m.content.as_deref())
+                .and_then(|m| m.text_content())
                 .unwrap_or("")
                 .to_string();
             let response = if system.contains("Combine them into ONE coherent summary") {
@@ -1024,7 +1024,7 @@ mod tests {
                 let system = request
                     .messages
                     .first()
-                    .and_then(|m| m.content.as_deref())
+                    .and_then(|m| m.text_content())
                     .unwrap_or("")
                     .to_string();
                 let response = if system.contains("Combine them into ONE coherent summary") {

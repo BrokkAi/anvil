@@ -6,8 +6,8 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::llm_client::{
-    ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest,
-    TokenUsage, ToolCall, ToolDefinition,
+    ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::trace_logging::append_trace_record;
 
@@ -323,6 +323,8 @@ enum BedrockContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: BedrockImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -334,6 +336,14 @@ enum BedrockContentOut {
         tool_use_id: String,
         content: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct BedrockImageSource {
+    #[serde(rename = "type")]
+    source_type: &'static str,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,28 +412,26 @@ fn convert_messages(
     for msg in messages {
         match msg.role.as_str() {
             "system" => {
-                if let Some(content) = msg.content
-                    && !content.trim().is_empty()
-                {
+                reject_images_for_role(&msg, "system")?;
+                let content = msg.content_text();
+                if !content.trim().is_empty() {
                     system_texts.push(content);
                 }
             }
             "user" => {
-                if let Some(content) = msg.content {
+                let content = convert_content_parts(msg.content)?;
+                if !content.is_empty() {
                     converted.push(BedrockMessage {
                         role: "user".to_string(),
-                        content: vec![BedrockContentOut::Text {
-                            text: content,
-                            cache_control: None,
-                        }],
+                        content,
                     });
                 }
             }
             "assistant" => {
                 let mut content = Vec::new();
-                if let Some(text) = msg.content
-                    && !text.is_empty()
-                {
+                reject_images_for_role(&msg, "assistant")?;
+                let text = msg.content_text();
+                if !text.is_empty() {
                     content.push(BedrockContentOut::Text {
                         text,
                         cache_control: None,
@@ -446,6 +454,7 @@ fn convert_messages(
                 }
             }
             "tool" => {
+                let tool_output = msg.content_text();
                 let tool_use_id = msg
                     .tool_call_id
                     .context("tool result missing tool_call_id")?;
@@ -453,7 +462,7 @@ fn convert_messages(
                     role: "user".to_string(),
                     content: vec![BedrockContentOut::ToolResult {
                         tool_use_id,
-                        content: msg.content.unwrap_or_default(),
+                        content: tool_output,
                     }],
                 });
             }
@@ -492,6 +501,58 @@ fn convert_messages(
     Ok((system_blocks, converted))
 }
 
+fn convert_content_parts(parts: Vec<ChatContentPart>) -> Result<Vec<BedrockContentOut>> {
+    parts
+        .into_iter()
+        .map(|part| match part {
+            ChatContentPart::Text { text } => Ok(BedrockContentOut::Text {
+                text,
+                cache_control: None,
+            }),
+            ChatContentPart::Image { image_url } => Ok(BedrockContentOut::Image {
+                source: parse_bedrock_image_source(&image_url)?,
+            }),
+        })
+        .collect()
+}
+
+fn reject_images_for_role(msg: &ChatMessage, role: &str) -> Result<()> {
+    if msg
+        .content
+        .iter()
+        .any(|part| matches!(part, ChatContentPart::Image { .. }))
+    {
+        anyhow::bail!("Bedrock {role} messages do not support image content");
+    }
+    Ok(())
+}
+
+fn parse_bedrock_image_source(image_url: &str) -> Result<BedrockImageSource> {
+    let data_url = image_url.strip_prefix("data:").context(
+        "Bedrock image inputs must be inline data URLs; remote image URLs are not supported",
+    )?;
+    let (metadata, data) = data_url
+        .split_once(',')
+        .context("Bedrock image data URL is missing a base64 payload")?;
+    let mut metadata_parts = metadata.split(';');
+    let media_type = metadata_parts
+        .next()
+        .filter(|media_type| media_type.starts_with("image/"))
+        .context("Bedrock image data URL must include an image/* media type")?;
+    if !metadata.split(';').any(|part| part == "base64") {
+        anyhow::bail!("Bedrock image data URL must be base64 encoded");
+    }
+    if data.is_empty() {
+        anyhow::bail!("Bedrock image data URL has an empty payload");
+    }
+
+    Ok(BedrockImageSource {
+        source_type: "base64",
+        media_type: media_type.to_string(),
+        data: data.to_string(),
+    })
+}
+
 fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockTool> {
     let mut converted: Vec<BedrockTool> = tools
         .into_iter()
@@ -527,7 +588,7 @@ fn percent_encode_path_segment(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::llm_client::FunctionDef;
+    use crate::llm_client::{ChatContentPart, FunctionDef};
 
     use super::*;
 
@@ -561,6 +622,46 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn converts_inline_image_user_parts() {
+        let (_, messages) = convert_messages(
+            vec![ChatMessage::user_parts(vec![
+                ChatContentPart::text("What is in this image?"),
+                ChatContentPart::image_data("aW1hZ2U=", "image/png"),
+            ])],
+            false,
+        )
+        .expect("convert");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.len(), 2);
+        match &messages[0].content[1] {
+            BedrockContentOut::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.data, "aW1hZ2U=");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_remote_image_urls() {
+        let err = convert_messages(
+            vec![ChatMessage::user_parts(vec![ChatContentPart::image_url(
+                "https://example.com/image.png",
+            )])],
+            false,
+        )
+        .expect_err("remote image URLs should not be converted for Bedrock");
+
+        assert!(
+            format!("{err:#}").contains("remote image URLs are not supported"),
+            "got {err:#}"
+        );
     }
 
     #[test]
