@@ -434,16 +434,19 @@ async fn apply_config_option(
     })
 }
 
-/// Slash commands advertised to clients via `available_commands_update`.
-/// `/setup` is the single user-facing configuration entry point; provider
-/// login, model selection, permissions, and advanced settings all route
-/// through it so users do not need to learn internal config ids.
+/// `/setup` remains the model/provider and advanced configuration entry point;
+/// permission mode has its own `/permissions` command so approval controls are
+/// easy to find without entering setup.
 fn builtin_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::new("context", "Show current session context snapshot"),
         AvailableCommand::new(
             "setup",
-            "Set up models, login, permissions, and advanced options",
+            "Set up models, login, behavior, sandboxing, and advanced options",
+        ),
+        AvailableCommand::new(
+            "permissions",
+            "Change edit/command approvals and remembered Always allow entries",
         ),
         AvailableCommand::new(
             "compress",
@@ -462,9 +465,16 @@ fn builtin_commands() -> Vec<AvailableCommand> {
 /// filtered skills entirely" guidance: don't expose a slash that won't
 /// actually dispatch to the skill).
 fn builtin_command_names() -> std::collections::HashSet<&'static str> {
-    ["context", "setup", "compress", "mcp", "pr-create"]
-        .into_iter()
-        .collect()
+    [
+        "context",
+        "setup",
+        "permissions",
+        "compress",
+        "mcp",
+        "pr-create",
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Build the full command list advertised to the client: built-ins plus
@@ -1111,6 +1121,14 @@ pub async fn run_agent(
                         current_session_idle_timeout: snap.idle_timeout_secs,
                     };
                     let report = handle_setup(&setup_ctx, &raw_prompt_text, &session_id).await;
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+
+                if is_slash_command(&raw_prompt_text, "permissions") {
+                    let report =
+                        handle_permissions(&cx, &sessions_prompt, &session_id, &raw_prompt_text)
+                            .await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -2722,10 +2740,12 @@ struct SetupContext<'a> {
     current_session_idle_timeout: Option<u64>,
 }
 
-/// Handle `/setup`, the single user-facing configuration surface.
+/// Handle `/setup`, the model/provider and advanced configuration surface.
 /// The command is intentionally task-oriented: it offers "choose for me",
-/// Codex sign-in, local models, OpenRouter, and an advanced page. Internal
-/// config ids stay hidden unless the user explicitly enters `advanced`.
+/// Codex sign-in, local models, OpenRouter, sandbox/behavior settings, and an
+/// advanced page. Permission mode lives under `/permissions` so approval
+/// controls are easy to find. Internal config ids stay hidden unless the user
+/// explicitly enters `advanced`.
 async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &str) -> String {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
@@ -2774,9 +2794,6 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "openrouter" => {
             handle_setup_openrouter(rest, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await
-        }
-        "permissions" | "permission" => {
-            handle_setup_permission(ctx.cx, ctx.sessions, session_id, rest).await
         }
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
@@ -3007,24 +3024,25 @@ fn render_openrouter_setup_help() -> String {
     )
 }
 
-async fn handle_setup_permission(
+async fn handle_permissions(
     cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
     session_id: &str,
-    rest: &str,
+    prompt_text: &str,
 ) -> String {
+    let rest = slash_command_args(prompt_text);
     if rest.is_empty() {
         return "How should Anvil make changes?\n\n\
-                - `/setup permissions ask` - Ask before edits and commands.\n\
-                - `/setup permissions auto-edits` - Edit files automatically, ask for commands.\n\
-                - `/setup permissions read-only` - Do not change files or run commands.\n\
-                - `/setup permissions trusted` - Allow tool calls without prompting.\n\
-                - `/setup permissions list` - Show remembered Always allow approvals.\n\
-                - `/setup permissions revoke <number-or-key>` - Forget one remembered approval.\n\
-                - `/setup permissions clear` - Forget all remembered approvals for this session."
+                - `/permissions ask` - Ask before edits and commands.\n\
+                - `/permissions auto-edits` - Edit files automatically, ask for commands.\n\
+                - `/permissions read-only` - Do not change files or run commands.\n\
+                - `/permissions trusted` - Allow tool calls without prompting.\n\
+                - `/permissions list` - Show remembered Always allow approvals.\n\
+                - `/permissions revoke <number-or-key>` - Forget one remembered approval.\n\
+                - `/permissions clear` - Forget all remembered approvals for this session."
             .to_string();
     }
-    let (action, arg) = split_setup_action(rest);
+    let (action, arg) = split_setup_action(&rest);
     match action.to_ascii_lowercase().as_str() {
         "list" | "show" | "always" | "remembered" => {
             return render_always_allowed_permissions(sessions, session_id).await;
@@ -3041,7 +3059,7 @@ async fn handle_setup_permission(
         "read-only" | "readonly" => "readOnly",
         "trusted" | "bypass" | "bypass-permissions" => "bypassPermissions",
         _ => {
-            return "Unknown permission choice. Try `/setup permissions ask`, \
+            return "Unknown permission choice. Try `/permissions ask`, \
                     `auto-edits`, `read-only`, `trusted`, `list`, `revoke`, or `clear`."
                 .to_string();
         }
@@ -3078,8 +3096,8 @@ async fn render_always_allowed_permissions(sessions: &SessionStore, session_id: 
         out.push_str(&format!("   Key: `{key}`\n"));
     }
     out.push_str(
-        "\nUse `/setup permissions revoke <number>` to forget one, or \
-         `/setup permissions clear` to forget all.",
+        "\nUse `/permissions revoke <number>` to forget one, or \
+         `/permissions clear` to forget all.",
     );
     out
 }
@@ -3090,8 +3108,8 @@ async fn revoke_always_allowed_permission(
     arg: &str,
 ) -> String {
     if arg.is_empty() {
-        return "Usage: `/setup permissions revoke <number-or-key>`.\n\
-                Run `/setup permissions list` to see remembered approvals."
+        return "Usage: `/permissions revoke <number-or-key>`.\n\
+                Run `/permissions list` to see remembered approvals."
             .to_string();
     }
 
@@ -3103,7 +3121,7 @@ async fn revoke_always_allowed_permission(
         Ok(_) => {
             return format!(
                 "No remembered Always allow approval numbered `{arg}`. \
-                 Run `/setup permissions list` to see valid numbers."
+                 Run `/permissions list` to see valid numbers."
             );
         }
         Err(_) => arg.to_string(),
@@ -3155,11 +3173,11 @@ fn describe_always_allow_key(key: &str) -> String {
     format!("tool `{key}`")
 }
 
-/// Configure the session's effective sandbox mode. Separate from `/setup
-/// permissions`: this controls the sandbox boundary and parser backend,
-/// not whether the user is prompted before each tool call. `/setup
-/// permissions trusted` disables both the prompt and the sandbox; this
-/// command keeps the permission prompt behavior unchanged.
+/// Configure the session's effective sandbox mode. Separate from `/permissions`:
+/// this controls the sandbox boundary and parser backend, not whether the user
+/// is prompted before each tool call. `/permissions trusted` disables both the
+/// prompt and the sandbox; this command keeps the permission prompt behavior
+/// unchanged.
 ///
 /// The choice is saved as an install-level setup preference and seeds new
 /// sessions and cold reloads. It is still kept out of session manifests so
@@ -3283,11 +3301,11 @@ async fn apply_setup_config(
                 SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(outcome.updated_options)),
             );
             if let Err(e) = cx.send_notification(notification) {
-                tracing::warn!("failed to send config_option_update from /setup: {e}");
+                tracing::warn!("failed to send config_option_update from slash command: {e}");
             }
             let mut msg = match key {
                 MODEL_CONFIG_ID => "Model setup updated.".to_string(),
-                PERMISSION_CONFIG_ID => "Permission setup updated.".to_string(),
+                PERMISSION_CONFIG_ID => "Permission mode updated.".to_string(),
                 BEHAVIOR_CONFIG_ID => "Behavior setup updated.".to_string(),
                 REASONING_EFFORT_CONFIG_ID => "Advanced reasoning setup updated.".to_string(),
                 _ => "Setup updated.".to_string(),
@@ -3440,7 +3458,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     out.push_str("Commands:\n");
     out.push_str("- `/setup model` - list model ids.\n");
     out.push_str("- `/setup model <model id>` - choose a specific model.\n");
-    out.push_str("- `/setup permissions` - change edit/command approvals.\n");
+    out.push_str("- `/permissions` - change edit/command approvals.\n");
     out.push_str(
         "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
     );
@@ -4074,13 +4092,18 @@ mod tests {
     }
 
     #[test]
-    fn builtin_commands_include_setup_and_pr_create() {
-        // `/setup` is the single user-facing configuration surface, and
-        // `/pr-create` remains an explicit workflow command.
+    fn builtin_commands_include_setup_permissions_and_pr_create() {
+        // `/setup` owns model/provider configuration, `/permissions` owns
+        // approval controls, and `/pr-create` remains an explicit workflow command.
         let cmds = builtin_commands();
         assert!(
             cmds.iter().any(|c| c.name == "setup"),
             "builtin_commands() missing setup; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            cmds.iter().any(|c| c.name == "permissions"),
+            "builtin_commands() missing permissions; got: {:?}",
             cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
         assert!(
@@ -4091,6 +4114,10 @@ mod tests {
         assert!(
             builtin_command_names().contains("setup"),
             "builtin_command_names() missing setup"
+        );
+        assert!(
+            builtin_command_names().contains("permissions"),
+            "builtin_command_names() missing permissions"
         );
         assert!(
             builtin_command_names().contains("pr-create"),
@@ -4708,6 +4735,7 @@ mod tests {
             vec![
                 "context",
                 "setup",
+                "permissions",
                 "compress",
                 "mcp",
                 "pr-create",
@@ -4736,7 +4764,7 @@ mod tests {
     }
 
     #[test]
-    fn available_commands_only_expose_setup_for_configuration() {
+    fn available_commands_expose_public_configuration_slashes() {
         use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
         let _lock = ENV_GUARD.blocking_lock();
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
@@ -4746,6 +4774,7 @@ mod tests {
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
 
         assert!(names.contains(&"setup"));
+        assert!(names.contains(&"permissions"));
         assert!(!names.contains(&"codex-login"));
         assert!(!names.contains(&"openrouter-login"));
         assert!(!names.contains(&"idle-timeout"));
