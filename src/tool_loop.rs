@@ -14,8 +14,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bifrost_gate::{
-    GateClassifierDecision, GateContext, RecommendedTool, all_priority_symbol_tools_called,
-    classify_text_tool_call, gate_message, should_skip_for_static_text_target,
+    GateClassifierDecision, GateContext, RecommendedTool, classify_text_tool_call, gate_message,
+    should_skip_for_static_text_target,
 };
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolDefinition,
@@ -1005,6 +1005,26 @@ fn is_text_navigation_tool(name: &str) -> bool {
     matches!(name, "read_file" | "grep_search")
 }
 
+fn is_shell_source_reader_command(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let starts_like_reader = [
+        "cat ", "sed ", "nl ", "tail ", "head ", "grep ", "rg ", "awk ", "perl ", "python ",
+        "python3 ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    if !starts_like_reader {
+        return false;
+    }
+    [
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".go", ".java", ".js", ".jsx", ".ts",
+        ".tsx", ".py", ".rs", ".scala", ".php",
+    ]
+    .iter()
+    .any(|extension| lower.contains(extension))
+}
+
 async fn maybe_bifrost_classifier_gate(
     tool_name: &str,
     parsed_input: &Value,
@@ -1109,19 +1129,26 @@ fn bifrost_classifier_skip_reason(
     tool_name: &str,
     parsed_input: &Value,
     tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
+    _tool_exchanges: &[ToolExchange],
     skip_after_prior_gate: bool,
 ) -> Option<&'static str> {
-    if !is_text_navigation_tool(tool_name) {
+    if tool_name == "run_shell_command" {
+        let command = parsed_input
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !is_shell_source_reader_command(command) {
+            return Some("not_text_navigation_tool");
+        }
+    } else if !is_text_navigation_tool(tool_name) {
         return Some("not_text_navigation_tool");
     }
     if skip_after_prior_gate {
         return Some("post_gate_tool_batch");
     }
-    if all_priority_symbol_tools_called(tool_exchanges) {
-        return Some("all_priority_symbol_tools_called");
-    }
-    if should_skip_for_static_text_target(tool_name, parsed_input) {
+    if is_text_navigation_tool(tool_name)
+        && should_skip_for_static_text_target(tool_name, parsed_input)
+    {
         return Some("static_text_target");
     }
     if !has_tool(tools, "search_symbols")
@@ -1634,6 +1661,33 @@ mod tests {
     }
 
     #[test]
+    fn bifrost_classifier_runs_for_shell_source_readers_only() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("run_shell_command"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        assert!(should_consult_bifrost_classifier(
+            "run_shell_command",
+            &serde_json::json!({"command": "nl -ba src/main.rs | sed -n '1,80p'"}),
+            &tools,
+            &[],
+            false,
+        ));
+        assert!(!should_consult_bifrost_classifier(
+            "run_shell_command",
+            &serde_json::json!({"command": "cargo test -q"}),
+            &tools,
+            &[],
+            false,
+        ));
+    }
+
+    #[test]
     fn bifrost_classifier_skip_reasons_are_specific() {
         let tools = vec![
             tool_def_for_test("read_file"),
@@ -1675,7 +1729,7 @@ mod tests {
                 ],
                 false,
             ),
-            Some("all_priority_symbol_tools_called")
+            None
         );
         assert_eq!(
             bifrost_classifier_skip_reason(

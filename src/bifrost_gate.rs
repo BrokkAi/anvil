@@ -139,6 +139,7 @@ pub fn classify_static_text_target(tool_name: &str, args: &Value) -> StaticTextT
     }
 }
 
+#[cfg(test)]
 pub fn all_priority_symbol_tools_called(exchanges: &[ToolExchange]) -> bool {
     ["search_symbols", "scan_usages", "get_summaries"]
         .iter()
@@ -223,11 +224,14 @@ fn parse_openrouter_response(text: &str) -> Result<GateClassifierOutput> {
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("classifier response missing choices[0].message.content"))?;
-    serde_json::from_str(content).with_context(|| format!("parsing classifier JSON: {content}"))
+    let mut output: GateClassifierOutput = serde_json::from_str(content)
+        .with_context(|| format!("parsing classifier JSON: {content}"))?;
+    normalize_classifier_consistency(&mut output);
+    Ok(output)
 }
 
 fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
-    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. Decide whether the pending read_file/grep_search call should run as text navigation or should be replaced by a Bifrost symbol tool. Prefer Bifrost for code declarations, references, callers, tests, and broad code orientation. Allow text for docs, config, logs, build scripts, exact localized line checks, and non-code files. If decision is allow_text, recommended_tool must be none. Output only JSON matching the schema.";
+    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. Decide whether the pending read_file/grep_search/run_shell_command-as-source-reader call should run as text navigation or should be replaced by a Bifrost symbol tool. Prefer Bifrost for code declarations, definitions, implementations, references, callers, related tests, and broad code orientation. Gate if the text call is searching source code for symbol-shaped patterns, function names, type names, method names, call sites, declarations, definitions, or API usage. Gate repeated source reads, broad source globs, and shell file-reader commands after exact symbol source has already been retrieved unless there was an edit/build failure or a need for raw literal/config/macro text. Allow text for docs, config, logs, build scripts, exact localized line checks after the relevant code symbol/file/line is already known, literal string searches not represented as symbols, and non-code files. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. If your reason says or implies that Bifrost/search_symbols/scan_usages/get_summaries would be better, more direct, more appropriate, should be used, or should replace the pending call, decision must be gate_to_symbol_tool. If decision is allow_text, recommended_tool must be none. Output only JSON matching the schema.";
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
     let system_json = serde_json::to_string(system)?;
@@ -262,6 +266,54 @@ fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
   "max_tokens": 512
 }}"#
     ))
+}
+
+fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
+    if output.decision != GateClassifierDecision::AllowText {
+        return;
+    }
+    let reason = output.reason.to_ascii_lowercase();
+    let gate_cues = [
+        "gate_to_symbol_tool",
+        "better served by bifrost",
+        "better answered by bifrost",
+        "should use bifrost",
+        "use bifrost",
+        "more appropriate",
+        "replace the pending",
+        "replaced by",
+        "directly return the declaration",
+        "directly find",
+    ];
+    if !gate_cues.iter().any(|cue| reason.contains(cue)) {
+        return;
+    }
+    output.decision = GateClassifierDecision::GateToSymbolTool;
+    if output.recommended_tool == RecommendedTool::None {
+        output.recommended_tool = infer_recommended_tool_from_reason(&reason);
+    }
+}
+
+fn infer_recommended_tool_from_reason(reason: &str) -> RecommendedTool {
+    if reason.contains("scan_usages")
+        || reason.contains("caller")
+        || reason.contains("call site")
+        || reason.contains("callers")
+        || reason.contains("references")
+        || reason.contains("usages")
+    {
+        RecommendedTool::ScanUsages
+    } else if reason.contains("get_summaries")
+        || reason.contains("orientation")
+        || reason.contains("orienting")
+        || reason.contains("overview")
+        || reason.contains("module")
+        || reason.contains("api usage")
+    {
+        RecommendedTool::GetSummaries
+    } else {
+        RecommendedTool::SearchSymbols
+    }
 }
 
 fn render_context(context: &GateContext) -> Result<String> {
@@ -307,6 +359,7 @@ fn render_context(context: &GateContext) -> Result<String> {
     let prior_counts = json!({
         "read_file": count_tool(&context.tool_exchanges, "read_file"),
         "grep_search": count_tool(&context.tool_exchanges, "grep_search"),
+        "run_shell_command": count_tool(&context.tool_exchanges, "run_shell_command"),
         "search_symbols": count_tool(&context.tool_exchanges, "search_symbols"),
         "scan_usages": count_tool(&context.tool_exchanges, "scan_usages"),
         "get_summaries": count_tool(&context.tool_exchanges, "get_summaries"),
@@ -475,5 +528,33 @@ mod tests {
         let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
         assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(parsed.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn contradictory_allow_text_reason_is_normalized_to_gate() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"The grep is looking for callers and would be better served by Bifrost scan_usages.\",\"decision\":\"allow_text\",\"recommended_tool\":\"none\",\"suggested_args\":{},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
+    fn localized_allow_text_reason_stays_allowed() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"ALLOW_TEXT because this reads exact localized lines in a known source file after symbol discovery.\",\"decision\":\"allow_text\",\"recommended_tool\":\"none\",\"suggested_args\":{},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::AllowText);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::None);
     }
 }
