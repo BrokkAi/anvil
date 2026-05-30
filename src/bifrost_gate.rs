@@ -31,6 +31,7 @@ pub enum RecommendedTool {
     SearchSymbols,
     ScanUsages,
     GetSummaries,
+    GetSymbolSources,
     None,
 }
 
@@ -40,6 +41,7 @@ impl RecommendedTool {
             Self::SearchSymbols => "search_symbols",
             Self::ScanUsages => "scan_usages",
             Self::GetSummaries => "get_summaries",
+            Self::GetSymbolSources => "get_symbol_sources",
             Self::None => "none",
         }
     }
@@ -135,6 +137,11 @@ pub fn classify_static_text_target(tool_name: &str, args: &Value) -> StaticTextT
                 StaticTextTarget::UnknownOrCodeLike
             }
         }
+        "list_directory" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(classify_path_or_glob)
+            .unwrap_or(StaticTextTarget::UnknownOrCodeLike),
         _ => StaticTextTarget::UnknownOrCodeLike,
     }
 }
@@ -157,7 +164,7 @@ pub fn gate_message(output: &GateClassifierOutput, tools: &[ToolDefinition]) -> 
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "{}".to_string());
     format!(
-        "Bifrost gate: {reason}\n\nRecommended next tool: `{tool_name}`.\n\nDescription: {description}\n\nSchema: {schema}\n\nIf you are looking for declarations or definitions by name, use `search_symbols`. If you are looking for callers, references, or related tests for a known symbol, use `scan_usages`. If you are orienting across a module, package, class, API, or file glob, use `get_summaries`. Retry the original text-navigation call only if the target is genuinely docs/config/log text or already localized to exact lines.",
+        "Bifrost gate: {reason}\n\nThe original text-navigation tool call was not executed.\n\nRecommended next tool: `{tool_name}`.\n\nDescription: {description}\n\nSchema: {schema}\n\nIf you are looking for declarations or definitions by name, use `search_symbols`. If you are looking for callers, references, or related tests for a known symbol, use `scan_usages`. If you are orienting across a module, package, class, API, or file glob, use `get_summaries`. If you already know the relevant symbol names and need implementation source, use `get_symbol_sources`. Retry the original text-navigation call only if the target is genuinely docs/config/log text or already localized to exact lines.",
         reason = output.reason,
     )
 }
@@ -231,7 +238,7 @@ fn parse_openrouter_response(text: &str) -> Result<GateClassifierOutput> {
 }
 
 fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
-    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. Decide whether the pending read_file/grep_search/run_shell_command-as-source-reader call should run as text navigation or should be replaced by a Bifrost symbol tool. Prefer Bifrost for code declarations, definitions, implementations, references, callers, related tests, and broad code orientation. Gate if the text call is searching source code for symbol-shaped patterns, function names, type names, method names, call sites, declarations, definitions, or API usage. Gate repeated source reads, broad source globs, and shell file-reader commands after exact symbol source has already been retrieved unless there was an edit/build failure or a need for raw literal/config/macro text. Allow text for docs, config, logs, build scripts, exact localized line checks after the relevant code symbol/file/line is already known, literal string searches not represented as symbols, and non-code files. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. If your reason says or implies that Bifrost/search_symbols/scan_usages/get_summaries would be better, more direct, more appropriate, should be used, or should replace the pending call, decision must be gate_to_symbol_tool. If decision is allow_text, recommended_tool must be none. Output only JSON matching the schema.";
+    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. Decide whether the pending read_file/grep_search/list_directory/run_shell_command-as-source-reader call should run as text navigation or should be replaced by a Bifrost symbol tool. Prefer Bifrost for code declarations, definitions, implementations, references, callers, related tests, and broad code orientation. Gate if the text call is searching or browsing source code for symbol-shaped patterns, function names, type names, method names, call sites, declarations, definitions, directory structure, or API usage. Gate repeated source reads, broad source globs/directories, and shell file-reader commands after exact symbol source has already been retrieved unless there was an edit/build failure or a need for raw literal/config/macro text. Recommend search_symbols for unknown declarations/definitions by name, scan_usages for callers/references/related tests, get_summaries for broad module/package/file-glob orientation, and get_symbol_sources when the relevant symbol names are already known and the agent needs implementation source. Allow text for docs, config, logs, build scripts, exact localized line checks after the relevant code symbol/file/line is already known, literal string searches not represented as symbols, and non-code files. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. If your reason says or implies that Bifrost/search_symbols/scan_usages/get_summaries/get_symbol_sources would be better, more direct, more appropriate, should be used, or should replace the pending call, decision must be gate_to_symbol_tool. If decision is allow_text, recommended_tool must be none. Output only JSON matching the schema.";
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
     let system_json = serde_json::to_string(system)?;
@@ -254,7 +261,7 @@ fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
         "properties": {{
           "reason": {{"type":"string"}},
           "decision": {{"type":"string","enum":["allow_text","gate_to_symbol_tool"]}},
-          "recommended_tool": {{"type":"string","enum":["search_symbols","scan_usages","get_summaries","none"]}},
+          "recommended_tool": {{"type":"string","enum":["search_symbols","scan_usages","get_summaries","get_symbol_sources","none"]}},
           "suggested_args": {{"type":"object"}},
           "confidence": {{"type":"string","enum":["low","medium","high"]}}
         }},
@@ -303,6 +310,15 @@ fn infer_recommended_tool_from_reason(reason: &str) -> RecommendedTool {
         || reason.contains("usages")
     {
         RecommendedTool::ScanUsages
+    } else if reason.contains("get_symbol_sources")
+        || reason.contains("implementation source")
+        || reason.contains("source code")
+        || reason.contains("exact source")
+        || reason.contains("symbol source")
+        || reason.contains("line-by-line source")
+        || reason.contains("line ranges")
+    {
+        RecommendedTool::GetSymbolSources
     } else if reason.contains("get_summaries")
         || reason.contains("orientation")
         || reason.contains("orienting")
@@ -437,6 +453,10 @@ fn text_like_extension(input: &str) -> bool {
         ".ini",
         ".cfg",
         ".conf",
+        ".sbt",
+        ".gradle",
+        ".props",
+        ".targets",
         ".log",
         ".csv",
         ".tsv",
@@ -473,6 +493,10 @@ mod tests {
         assert!(should_skip_for_static_text_target(
             "read_file",
             &json!({"file_path": ".harness/build.sh"})
+        ));
+        assert!(should_skip_for_static_text_target(
+            "read_file",
+            &json!({"file_path": "build.sbt"})
         ));
     }
 
@@ -531,6 +555,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_get_symbol_sources_recommendation() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"GATE_TO_SYMBOL_TOOL because known symbols need implementation source.\",\"decision\":\"gate_to_symbol_tool\",\"recommended_tool\":\"get_symbol_sources\",\"suggested_args\":{\"symbols\":[\"Foo.bar\"]},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::GetSymbolSources);
+    }
+
+    #[test]
     fn contradictory_allow_text_reason_is_normalized_to_gate() {
         let envelope = json!({
             "choices": [{
@@ -542,6 +580,20 @@ mod tests {
         let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
         assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(parsed.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
+    fn contradictory_source_reason_infers_get_symbol_sources() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"The read_file asks for line-by-line source for known symbols and would be better served by Bifrost get_symbol_sources.\",\"decision\":\"allow_text\",\"recommended_tool\":\"none\",\"suggested_args\":{},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::GetSymbolSources);
     }
 
     #[test]

@@ -422,13 +422,36 @@ pub(crate) async fn run(
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
     let mut skip_bifrost_classifier_for_next_tool_batch = false;
+    let mut no_edit_progress_nudge_count = 0usize;
     'outer: for turn in 0..max_turns {
         if cancel.is_cancelled() {
             break;
         }
+        if should_emit_no_edit_progress_nudge(
+            turn,
+            max_turns,
+            &tool_exchanges,
+            no_edit_progress_nudge_count,
+        ) {
+            no_edit_progress_nudge_count += 1;
+            append_trace_record(serde_json::json!({
+                "type": "no_edit_progress_nudge",
+                "turn": turn,
+                "nudge_count": no_edit_progress_nudge_count,
+                "tool_counts": bifrost_gate_tool_counts(&tool_exchanges),
+            }));
+            messages.push(ChatMessage::user(
+                "You have already retrieved exact source context and no successful file edit/write has happened yet. Stop broad exploration and repeated code retrieval. In this turn, make the smallest plausible code change that addresses the task. Use edit/write_file before any further validation or additional investigation.",
+            ));
+        }
 
-        // For the last turn, don't offer tools -- force a text response
-        let turn_tools = if turn < max_turns - 1 {
+        // For the last turn, normally force a text response. If no file
+        // change has succeeded yet, keep tools available so a hard task does
+        // not end with a false "I cannot edit" answer solely because the
+        // harness withheld edit/write tools on the final turn.
+        let force_text_response =
+            turn >= max_turns - 1 && has_successful_file_change(&tool_exchanges);
+        let turn_tools = if !force_text_response {
             Some(tools.clone())
         } else {
             None
@@ -484,6 +507,19 @@ pub(crate) async fn run(
             Ok(LlmResponse::Text { text, usage }) => {
                 trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
+                if should_reject_no_edit_final_answer(turn, max_turns, &tool_exchanges) {
+                    append_trace_record(serde_json::json!({
+                        "type": "no_edit_final_answer_guard",
+                        "turn": turn,
+                        "tool_counts": bifrost_gate_tool_counts(&tool_exchanges),
+                        "text": text,
+                    }));
+                    messages.push(ChatMessage::assistant(text));
+                    messages.push(ChatMessage::user(
+                        "The task is not complete: no successful file edit/write has been executed yet. Do not give a final answer. Use the available edit/write tools to implement the required code change, then run focused validation.",
+                    ));
+                    continue;
+                }
                 full_response.push_str(&text);
                 // Final text response -- we're done
                 break;
@@ -760,6 +796,11 @@ pub(crate) async fn run(
                                     failed: false,
                                 }
                             } else {
+                                trace_bifrost_context_shadow(
+                                    &tool_name,
+                                    &parsed_input,
+                                    &tool_exchanges,
+                                );
                                 execute_tool(
                                     registry,
                                     &tool_name,
@@ -1002,12 +1043,15 @@ fn has_tool(tools: &[ToolDefinition], name: &str) -> bool {
 }
 
 fn is_text_navigation_tool(name: &str) -> bool {
-    matches!(name, "read_file" | "grep_search")
+    matches!(name, "read_file" | "grep_search" | "list_directory")
 }
 
 fn is_shell_source_reader_command(command: &str) -> bool {
     let trimmed = command.trim_start();
     let lower = trimmed.to_ascii_lowercase();
+    if is_shell_mutation_command(&lower) {
+        return false;
+    }
     let starts_like_reader = [
         "cat ", "sed ", "nl ", "tail ", "head ", "grep ", "rg ", "awk ", "perl ", "python ",
         "python3 ",
@@ -1023,6 +1067,32 @@ fn is_shell_source_reader_command(command: &str) -> bool {
     ]
     .iter()
     .any(|extension| lower.contains(extension))
+}
+
+fn is_shell_mutation_command(lower_command: &str) -> bool {
+    [
+        " > ",
+        " >> ",
+        " 1>",
+        " 2>",
+        "sed -i",
+        "sed -e",
+        "perl -pi",
+        "perl -i",
+        "--in-place",
+        "write_text(",
+        ".write(",
+        "open(",
+        "file_put_contents(",
+        "rename(",
+        "unlink(",
+        "copy(",
+        "mv ",
+        "cp ",
+        "rm ",
+    ]
+    .iter()
+    .any(|needle| lower_command.contains(needle))
 }
 
 async fn maybe_bifrost_classifier_gate(
@@ -1164,10 +1234,135 @@ fn bifrost_gate_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
     serde_json::json!({
         "read_file": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "read_file").count(),
         "grep_search": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "grep_search").count(),
+        "list_directory": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "list_directory").count(),
+        "run_shell_command": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "run_shell_command").count(),
         "search_symbols": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "search_symbols").count(),
+        "get_symbol_sources": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "get_symbol_sources").count(),
         "scan_usages": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "scan_usages").count(),
         "get_summaries": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "get_summaries").count(),
     })
+}
+
+fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
+    tool_exchanges.iter().any(|exchange| {
+        matches!(exchange.tool_name.as_str(), "edit" | "write_file")
+            && !tool_result_failed(&exchange.result)
+    })
+}
+
+fn tool_result_failed(result: &str) -> bool {
+    result.starts_with("Error:") || result.starts_with("Internal error:")
+}
+
+fn is_bifrost_context_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "search_symbols"
+            | "get_symbol_sources"
+            | "scan_usages"
+            | "get_summaries"
+            | "list_symbols"
+            | "get_symbol_locations"
+    )
+}
+
+fn trace_bifrost_context_shadow(
+    tool_name: &str,
+    parsed_input: &Value,
+    tool_exchanges: &[ToolExchange],
+) {
+    if !is_bifrost_context_tool(tool_name) {
+        return;
+    }
+    let mut prior_same_tool_count = 0usize;
+    let mut prior_exact_args_count = 0usize;
+    for exchange in tool_exchanges {
+        if exchange.tool_name != tool_name {
+            continue;
+        }
+        prior_same_tool_count += 1;
+        if !tool_result_failed(&exchange.result)
+            && serde_json::from_str::<Value>(&exchange.arguments)
+                .is_ok_and(|prior_args| prior_args == *parsed_input)
+        {
+            prior_exact_args_count += 1;
+        }
+    }
+    append_trace_record(serde_json::json!({
+        "type": "bifrost_context_shadow",
+        "tool": tool_name,
+        "args": parsed_input,
+        "prior_same_tool_count": prior_same_tool_count,
+        "prior_exact_args_count": prior_exact_args_count,
+        "has_successful_file_change": has_successful_file_change(tool_exchanges),
+        "exact_source_count": exact_source_tool_count(tool_exchanges),
+        "tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+    }));
+}
+
+fn should_reject_no_edit_final_answer(
+    turn: usize,
+    max_turns: usize,
+    tool_exchanges: &[ToolExchange],
+) -> bool {
+    if turn >= max_turns - 1 || has_successful_file_change(tool_exchanges) {
+        return false;
+    }
+    tool_exchanges.iter().any(|exchange| {
+        matches!(
+            exchange.tool_name.as_str(),
+            "search_symbols"
+                | "get_symbol_sources"
+                | "scan_usages"
+                | "get_summaries"
+                | "read_file"
+                | "grep_search"
+                | "list_directory"
+        )
+    })
+}
+
+fn should_emit_no_edit_progress_nudge(
+    turn: usize,
+    max_turns: usize,
+    tool_exchanges: &[ToolExchange],
+    nudge_count: usize,
+) -> bool {
+    if nudge_count >= 2 || has_successful_file_change(tool_exchanges) {
+        return false;
+    }
+    let first_nudge_turn = (max_turns / 3).clamp(6, 10);
+    let next_nudge_turn = first_nudge_turn + 4 * nudge_count;
+    turn >= next_nudge_turn
+        && exact_source_tool_count(tool_exchanges) >= 1
+        && code_context_tool_count(tool_exchanges) >= 5
+}
+
+fn code_context_tool_count(tool_exchanges: &[ToolExchange]) -> usize {
+    tool_exchanges
+        .iter()
+        .filter(|exchange| {
+            matches!(
+                exchange.tool_name.as_str(),
+                "search_symbols"
+                    | "get_symbol_sources"
+                    | "scan_usages"
+                    | "get_summaries"
+                    | "list_symbols"
+                    | "get_symbol_locations"
+                    | "read_file"
+                    | "grep_search"
+                    | "list_directory"
+            )
+        })
+        .count()
+}
+
+fn exact_source_tool_count(tool_exchanges: &[ToolExchange]) -> usize {
+    tool_exchanges
+        .iter()
+        .filter(|exchange| exchange.tool_name == "get_symbol_sources")
+        .count()
 }
 
 #[cfg(test)]
@@ -1640,6 +1835,82 @@ mod tests {
     }
 
     #[test]
+    fn no_edit_final_guard_rejects_navigation_only_final_before_last_turn() {
+        let prior = vec![exchange_for_test("search_symbols")];
+
+        assert!(should_reject_no_edit_final_answer(3, 10, &prior));
+    }
+
+    #[test]
+    fn no_edit_final_guard_allows_after_successful_edit() {
+        let prior = vec![ToolExchange {
+            call_id: "edit".to_string(),
+            tool_name: "edit".to_string(),
+            arguments: "{}".to_string(),
+            result: "Edited 'src/lib.rs' (1 replacement)".to_string(),
+        }];
+
+        assert!(!should_reject_no_edit_final_answer(3, 10, &prior));
+        assert!(has_successful_file_change(&prior));
+    }
+
+    #[test]
+    fn no_edit_final_guard_does_not_reject_on_last_turn() {
+        let prior = vec![exchange_for_test("search_symbols")];
+
+        assert!(!should_reject_no_edit_final_answer(9, 10, &prior));
+    }
+
+    #[test]
+    fn no_edit_progress_nudge_triggers_after_enough_context() {
+        let prior = vec![
+            exchange_for_test("search_symbols"),
+            exchange_for_test("get_symbol_sources"),
+            exchange_for_test("scan_usages"),
+            exchange_for_test("get_summaries"),
+            exchange_for_test("read_file"),
+        ];
+
+        assert!(should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(7, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(8, 25, &prior, 2));
+    }
+
+    #[test]
+    fn no_edit_progress_nudge_waits_for_exact_source() {
+        let prior = vec![
+            exchange_for_test("search_symbols"),
+            exchange_for_test("scan_usages"),
+            exchange_for_test("get_summaries"),
+            exchange_for_test("search_symbols"),
+            exchange_for_test("read_file"),
+        ];
+
+        assert!(!should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
+    }
+
+    #[test]
+    fn no_edit_progress_nudge_allows_after_successful_edit() {
+        let prior = vec![
+            exchange_for_test("search_symbols"),
+            exchange_for_test("get_symbol_sources"),
+            exchange_for_test("scan_usages"),
+            exchange_for_test("get_summaries"),
+            exchange_for_test("search_symbols"),
+            exchange_for_test("get_symbol_sources"),
+            exchange_for_test("read_file"),
+            ToolExchange {
+                call_id: "edit".to_string(),
+                tool_name: "edit".to_string(),
+                arguments: "{}".to_string(),
+                result: "Edited 'src/lib.rs' (1 replacement)".to_string(),
+            },
+        ];
+
+        assert!(!should_emit_no_edit_progress_nudge(12, 25, &prior, 0));
+    }
+
+    #[test]
     fn bifrost_classifier_runs_when_not_in_post_gate_batch() {
         let tools = vec![
             tool_def_for_test("read_file"),
@@ -1681,6 +1952,20 @@ mod tests {
         assert!(!should_consult_bifrost_classifier(
             "run_shell_command",
             &serde_json::json!({"command": "cargo test -q"}),
+            &tools,
+            &[],
+            false,
+        ));
+        assert!(!should_consult_bifrost_classifier(
+            "run_shell_command",
+            &serde_json::json!({"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/Foo.php').write_text('x')\nPY"}),
+            &tools,
+            &[],
+            false,
+        ));
+        assert!(!should_consult_bifrost_classifier(
+            "run_shell_command",
+            &serde_json::json!({"command": "sed -i 's/a/b/' src/Foo.php"}),
             &tools,
             &[],
             false,
