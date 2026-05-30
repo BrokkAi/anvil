@@ -377,7 +377,7 @@ impl ToolRegistry {
             ),
             tool_def(
                 "read_file",
-                "Reads and returns the content of a specified text file. Paths may be relative to the working directory or absolute paths inside it. For text files, it can read specific line ranges.",
+                "Reads and returns the content of a specified text file. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -457,7 +457,7 @@ impl ToolRegistry {
             ),
             tool_def(
                 "grep_search",
-                "A powerful search tool for finding regex patterns in files under the working directory.",
+                "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages.",
                 json!({
                     "type": "object",
                     "properties": {

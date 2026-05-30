@@ -13,6 +13,10 @@ use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::bifrost_gate::{
+    GateClassifierDecision, GateContext, RecommendedTool, all_priority_symbol_tools_called,
+    classify_text_tool_call, gate_message, should_skip_for_static_text_target,
+};
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolDefinition,
 };
@@ -417,7 +421,7 @@ pub(crate) async fn run(
     // calls as it dispatches tools). The caller adds this to the
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
-
+    let mut skip_bifrost_classifier_for_next_tool_batch = false;
     'outer: for turn in 0..max_turns {
         if cancel.is_cancelled() {
             break;
@@ -487,6 +491,9 @@ pub(crate) async fn run(
             Ok(LlmResponse::ToolCalls { text, calls, usage }) => {
                 trace_llm_tool_response(turn, &text, &calls, usage);
                 turn_usage.add(usage);
+                let skip_bifrost_classifier_for_this_tool_batch =
+                    skip_bifrost_classifier_for_next_tool_batch;
+                let mut current_tool_batch_triggered_bifrost_gate = false;
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
@@ -736,6 +743,22 @@ pub(crate) async fn run(
                                 // turn, not just the parent's own calls.
                                 turn_usage.add(nested_usage);
                                 exec
+                            } else if let Some(message) = maybe_bifrost_classifier_gate(
+                                &tool_name,
+                                &parsed_input,
+                                &messages,
+                                &tools,
+                                &tool_exchanges,
+                                skip_bifrost_classifier_for_this_tool_batch,
+                                &cancel,
+                            )
+                            .await
+                            {
+                                current_tool_batch_triggered_bifrost_gate = true;
+                                ToolExecution {
+                                    output: message,
+                                    failed: false,
+                                }
                             } else {
                                 execute_tool(
                                     registry,
@@ -781,6 +804,8 @@ pub(crate) async fn run(
                         result: output,
                     });
                 }
+                skip_bifrost_classifier_for_next_tool_batch =
+                    current_tool_batch_triggered_bifrost_gate;
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
@@ -970,6 +995,195 @@ async fn request_user_permission(
 struct ToolExecution {
     output: String,
     failed: bool,
+}
+
+fn has_tool(tools: &[ToolDefinition], name: &str) -> bool {
+    tools.iter().any(|tool| tool.function.name == name)
+}
+
+fn is_text_navigation_tool(name: &str) -> bool {
+    matches!(name, "read_file" | "grep_search")
+}
+
+async fn maybe_bifrost_classifier_gate(
+    tool_name: &str,
+    parsed_input: &Value,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    tool_exchanges: &[ToolExchange],
+    skip_after_prior_gate: bool,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    if let Some(reason) = bifrost_classifier_skip_reason(
+        tool_name,
+        parsed_input,
+        tools,
+        tool_exchanges,
+        skip_after_prior_gate,
+    ) {
+        append_trace_record(serde_json::json!({
+            "type": "bifrost_gate_classifier_skipped",
+            "tool": tool_name,
+            "args": parsed_input,
+            "reason": reason,
+            "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+        }));
+        return None;
+    }
+
+    append_trace_record(serde_json::json!({
+        "type": "bifrost_gate_classifier_call",
+        "tool": tool_name,
+        "args": parsed_input,
+        "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+    }));
+
+    let context = GateContext {
+        tool_name: tool_name.to_string(),
+        args: parsed_input.clone(),
+        messages: messages.to_vec(),
+        tools: tools.to_vec(),
+        tool_exchanges: tool_exchanges.to_vec(),
+    };
+    match classify_text_tool_call(context, cancel).await {
+        Ok(output) if output.decision == GateClassifierDecision::GateToSymbolTool => {
+            let message = gate_message(&output, tools);
+            append_trace_record(serde_json::json!({
+                "type": "bifrost_gate_classifier",
+                "tool": tool_name,
+                "args": parsed_input,
+                "decision": output,
+                "gated": true,
+            }));
+            Some(message)
+        }
+        Ok(mut output) => {
+            let normalized_recommended_tool = output.decision == GateClassifierDecision::AllowText
+                && output.recommended_tool != RecommendedTool::None;
+            if normalized_recommended_tool {
+                output.recommended_tool = RecommendedTool::None;
+                output.suggested_args = serde_json::json!({});
+            }
+            append_trace_record(serde_json::json!({
+                "type": "bifrost_gate_classifier",
+                "tool": tool_name,
+                "args": parsed_input,
+                "decision": output,
+                "gated": false,
+                "normalized_recommended_tool": normalized_recommended_tool,
+            }));
+            None
+        }
+        Err(err) => {
+            tracing::warn!(tool_name, "Bifrost gate classifier failed open: {err:#}");
+            append_trace_record(serde_json::json!({
+                "type": "bifrost_gate_classifier_error",
+                "tool": tool_name,
+                "args": parsed_input,
+                "error": err.to_string(),
+            }));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn should_consult_bifrost_classifier(
+    tool_name: &str,
+    parsed_input: &Value,
+    tools: &[ToolDefinition],
+    tool_exchanges: &[ToolExchange],
+    skip_after_prior_gate: bool,
+) -> bool {
+    bifrost_classifier_skip_reason(
+        tool_name,
+        parsed_input,
+        tools,
+        tool_exchanges,
+        skip_after_prior_gate,
+    )
+    .is_none()
+}
+
+fn bifrost_classifier_skip_reason(
+    tool_name: &str,
+    parsed_input: &Value,
+    tools: &[ToolDefinition],
+    tool_exchanges: &[ToolExchange],
+    skip_after_prior_gate: bool,
+) -> Option<&'static str> {
+    if !is_text_navigation_tool(tool_name) {
+        return Some("not_text_navigation_tool");
+    }
+    if skip_after_prior_gate {
+        return Some("post_gate_tool_batch");
+    }
+    if all_priority_symbol_tools_called(tool_exchanges) {
+        return Some("all_priority_symbol_tools_called");
+    }
+    if should_skip_for_static_text_target(tool_name, parsed_input) {
+        return Some("static_text_target");
+    }
+    if !has_tool(tools, "search_symbols")
+        || !has_tool(tools, "scan_usages")
+        || !has_tool(tools, "get_summaries")
+    {
+        return Some("missing_required_bifrost_tools");
+    }
+    None
+}
+
+fn bifrost_gate_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
+    serde_json::json!({
+        "read_file": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "read_file").count(),
+        "grep_search": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "grep_search").count(),
+        "search_symbols": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "search_symbols").count(),
+        "scan_usages": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "scan_usages").count(),
+        "get_summaries": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "get_summaries").count(),
+    })
+}
+
+#[cfg(test)]
+fn maybe_text_navigation_gate(
+    tool_name: &str,
+    tool_exchanges: &[ToolExchange],
+    tools: &[ToolDefinition],
+    gate_count: u8,
+) -> Option<String> {
+    if gate_count >= 2 {
+        return None;
+    }
+    if !is_text_navigation_tool(tool_name)
+        || !has_tool(tools, "get_summaries")
+        || !has_tool(tools, "scan_usages")
+    {
+        return None;
+    }
+
+    let text_navigation_count = tool_exchanges
+        .iter()
+        .filter(|exchange| is_text_navigation_tool(&exchange.tool_name))
+        .count()
+        + 1;
+    match (gate_count, text_navigation_count) {
+        (0, 4) => Some(
+            "Navigation gate: you have used text/file navigation several times in this turn. \
+             Before another read_file/grep_search call, choose one: call `get_summaries` for the \
+             relevant module, package, class, API, or file glob if you are still orienting; call \
+             `scan_usages` if you are looking for callers, references, or related tests for a known \
+             symbol; or retry the text-navigation call if the needed context is already localized. \
+             Do not call Bifrost ceremonially -- use it only if it answers the current context question."
+                .to_string(),
+        ),
+        (1, 8) => Some(
+            "Summary gate: you are still using text/file navigation after the earlier navigation \
+             gate. If this is still orientation across files or modules, call `get_summaries` now \
+             with the relevant file glob, module, class, or API target. If the remaining question is \
+             already localized to exact lines, retry the text-navigation call."
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// Run the tool against the registry and format the result for the LLM.
@@ -1253,6 +1467,27 @@ fn build_editing_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_client::FunctionDef;
+
+    fn tool_def_for_test(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+
+    fn exchange_for_test(tool_name: &str) -> ToolExchange {
+        ToolExchange {
+            call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.to_string(),
+            arguments: "{}".to_string(),
+            result: String::new(),
+        }
+    }
 
     fn decide(
         mode: PermissionMode,
@@ -1261,6 +1496,197 @@ mod tests {
         allowed: bool,
     ) -> PureGateDecision {
         pure_gate_decision(mode, kind, tool_name, allowed)
+    }
+
+    #[test]
+    fn text_navigation_gate_triggers_on_fourth_text_navigation_call() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("get_summaries"),
+            tool_def_for_test("scan_usages"),
+        ];
+        let prior = vec![
+            exchange_for_test("read_file"),
+            exchange_for_test("grep_search"),
+            exchange_for_test("read_file"),
+        ];
+
+        let output = maybe_text_navigation_gate("read_file", &prior, &tools, 0)
+            .expect("fourth text-navigation call should trip the gate");
+
+        assert!(output.contains("Navigation gate:"));
+        assert!(output.contains("get_summaries"));
+        assert!(output.contains("scan_usages"));
+    }
+
+    #[test]
+    fn text_navigation_gate_does_not_repeat_after_trigger_point() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("get_summaries"),
+            tool_def_for_test("scan_usages"),
+        ];
+        let prior = vec![
+            exchange_for_test("read_file"),
+            exchange_for_test("grep_search"),
+            exchange_for_test("read_file"),
+        ];
+
+        let output = maybe_text_navigation_gate("grep_search", &prior, &tools, 2);
+
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn text_navigation_gate_triggers_summary_followup_after_persistent_navigation() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("get_summaries"),
+            tool_def_for_test("scan_usages"),
+        ];
+        let prior = vec![
+            exchange_for_test("read_file"),
+            exchange_for_test("grep_search"),
+            exchange_for_test("read_file"),
+            exchange_for_test("grep_search"),
+            exchange_for_test("read_file"),
+            exchange_for_test("grep_search"),
+            exchange_for_test("read_file"),
+        ];
+
+        let output = maybe_text_navigation_gate("grep_search", &prior, &tools, 1)
+            .expect("eighth text-navigation call should trip the summary follow-up");
+
+        assert!(output.contains("Summary gate:"));
+        assert!(output.contains("get_summaries"));
+    }
+
+    #[test]
+    fn text_navigation_gate_requires_bifrost_tools() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+        ];
+        let prior = vec![
+            exchange_for_test("read_file"),
+            exchange_for_test("grep_search"),
+            exchange_for_test("read_file"),
+        ];
+
+        let output = maybe_text_navigation_gate("read_file", &prior, &tools, 0);
+
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn bifrost_classifier_is_skipped_immediately_after_gate_prompt() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        let should_consult = should_consult_bifrost_classifier(
+            "read_file",
+            &serde_json::json!({"file_path": "src/lib.rs"}),
+            &tools,
+            &[],
+            true,
+        );
+
+        assert!(!should_consult);
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "read_file",
+                &serde_json::json!({"file_path": "src/lib.rs"}),
+                &tools,
+                &[],
+                true,
+            ),
+            Some("post_gate_tool_batch")
+        );
+    }
+
+    #[test]
+    fn bifrost_classifier_runs_when_not_in_post_gate_batch() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        let should_consult = should_consult_bifrost_classifier(
+            "read_file",
+            &serde_json::json!({"file_path": "src/lib.rs"}),
+            &tools,
+            &[],
+            false,
+        );
+
+        assert!(should_consult);
+    }
+
+    #[test]
+    fn bifrost_classifier_skip_reasons_are_specific() {
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "edit",
+                &serde_json::json!({"file_path": "src/lib.rs"}),
+                &tools,
+                &[],
+                false,
+            ),
+            Some("not_text_navigation_tool")
+        );
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "read_file",
+                &serde_json::json!({"file_path": ".harness/build.sh"}),
+                &tools,
+                &[],
+                false,
+            ),
+            Some("static_text_target")
+        );
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "read_file",
+                &serde_json::json!({"file_path": "src/lib.rs"}),
+                &tools,
+                &[
+                    exchange_for_test("search_symbols"),
+                    exchange_for_test("scan_usages"),
+                    exchange_for_test("get_summaries"),
+                ],
+                false,
+            ),
+            Some("all_priority_symbol_tools_called")
+        );
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "read_file",
+                &serde_json::json!({"file_path": "src/lib.rs"}),
+                &[tool_def_for_test("read_file")],
+                &[],
+                false,
+            ),
+            Some("missing_required_bifrost_tools")
+        );
     }
 
     #[test]
