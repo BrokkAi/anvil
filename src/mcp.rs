@@ -440,8 +440,8 @@ mod tests {
 
     const TEST_BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    const TRIPLE: &str = "aarch64-apple-darwin";
+    #[cfg(target_os = "macos")]
+    const TRIPLE: &str = "universal-apple-darwin";
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     const TRIPLE: &str = "x86_64-unknown-linux-gnu";
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -452,14 +452,14 @@ mod tests {
     const TRIPLE: &str = "aarch64-pc-windows-msvc";
 
     #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "macos",
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "aarch64"),
     )))]
     compile_error!(
-        "bifrost releases only ship binaries for arm64 macOS, x86_64/aarch64 Linux, \
+        "bifrost releases only ship a universal macOS binary, x86_64/aarch64 Linux, \
          and x86_64/aarch64 Windows; this test cannot run on other targets"
     );
 
