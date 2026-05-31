@@ -543,8 +543,8 @@ fn render_context(context: &GateContext) -> Result<String> {
         .messages
         .iter()
         .find(|message| message.role == "user")
-        .and_then(|message| message.content.as_deref())
-        .unwrap_or("");
+        .map(ChatMessage::content_text)
+        .unwrap_or_default();
     let bifrost_tools: Vec<_> = context
         .tools
         .iter()
@@ -588,7 +588,7 @@ fn render_context(context: &GateContext) -> Result<String> {
         "get_summaries": count_tool(&context.tool_exchanges, "get_summaries"),
     });
     let payload = json!({
-        "task_prompt_excerpt": truncate(user_prompt),
+        "task_prompt_excerpt": truncate(&user_prompt),
         "pending_text_call": {
             "tool": context.tool_name,
             "args": context.args,
