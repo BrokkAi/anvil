@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bifrost_gate::{
     GateClassifierDecision, GateContext, RecommendedTool, ShellClassifierDecision,
-    classify_shell_tool_call, classify_text_tool_call, gate_message, shell_gate_message,
-    should_skip_for_static_text_target,
+    classify_shell_tool_call, classify_text_tool_call, encourage_bifrost_enabled, gate_message,
+    shell_gate_message, should_skip_for_static_text_target,
 };
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
@@ -1295,6 +1295,9 @@ fn bifrost_classifier_skip_reason(
     _tool_exchanges: &[ToolExchange],
     skip_after_prior_gate: bool,
 ) -> Option<&'static str> {
+    if !encourage_bifrost_enabled() {
+        return Some("bifrost_encouragement_disabled");
+    }
     if tool_name == "run_shell_command" {
         return shell_classifier_skip_reason(tool_name, tools, skip_after_prior_gate);
     } else if !is_text_navigation_tool(tool_name) {
@@ -2035,6 +2038,63 @@ mod tests {
     }
 
     #[test]
+    fn bifrost_classifier_is_disabled_by_default_without_env_var() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+        );
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "read_file",
+                &serde_json::json!({"file_path": "src/lib.rs"}),
+                &tools,
+                &[],
+                false,
+            ),
+            Some("bifrost_encouragement_disabled")
+        );
+        assert!(!should_consult_bifrost_classifier(
+            "run_shell_command",
+            &serde_json::json!({"command": "cargo test -q"}),
+            &tools,
+            &[],
+            false,
+        ));
+    }
+
+    #[test]
+    fn bifrost_classifier_can_be_enabled_with_env_var() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        assert!(should_consult_bifrost_classifier(
+            "read_file",
+            &serde_json::json!({"file_path": "src/lib.rs"}),
+            &tools,
+            &[],
+            false,
+        ));
+    }
+
+    #[test]
     fn no_edit_final_guard_rejects_navigation_only_final_before_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
 
@@ -2112,6 +2172,11 @@ mod tests {
 
     #[test]
     fn bifrost_classifier_runs_when_not_in_post_gate_batch() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
         let tools = vec![
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
@@ -2133,6 +2198,11 @@ mod tests {
 
     #[test]
     fn shell_classifier_runs_for_all_shell_commands() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
         let tools = vec![
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
@@ -2191,6 +2261,11 @@ mod tests {
 
     #[test]
     fn bifrost_classifier_skip_reasons_are_specific() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
         let tools = vec![
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),

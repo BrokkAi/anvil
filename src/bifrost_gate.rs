@@ -12,6 +12,7 @@ use crate::openrouter_auth;
 use crate::session::ToolExchange;
 
 const DEFAULT_CLASSIFIER_MODEL: &str = "deepseek/deepseek-v4-flash";
+pub const ENCOURAGE_BIFROST_ENV: &str = "BRK_ENCOURAGE_BIFROST";
 const CLASSIFIER_MODEL_ENV: &str = "BROKK_BIFROST_GATE_CLASSIFIER_MODEL";
 const CLASSIFIER_DISABLE_ENV: &str = "BROKK_BIFROST_GATE_CLASSIFIER_DISABLE";
 const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -108,6 +109,10 @@ pub struct GateContext {
 pub enum StaticTextTarget {
     TextLike,
     UnknownOrCodeLike,
+}
+
+pub fn encourage_bifrost_enabled() -> bool {
+    env_var_is_truthy(ENCOURAGE_BIFROST_ENV)
 }
 
 pub async fn classify_text_tool_call(
@@ -252,10 +257,7 @@ pub fn shell_gate_message(output: &ShellClassifierOutput, tools: &[ToolDefinitio
 }
 
 fn classifier_disabled() -> bool {
-    std::env::var(CLASSIFIER_DISABLE_ENV)
-        .ok()
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
+    env_var_is_truthy(CLASSIFIER_DISABLE_ENV)
 }
 
 fn classifier_model() -> String {
@@ -264,6 +266,13 @@ fn classifier_model() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_CLASSIFIER_MODEL.to_string())
+}
+
+fn env_var_is_truthy(var: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn openrouter_api_key() -> Result<String> {
