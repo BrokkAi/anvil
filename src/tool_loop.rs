@@ -14,9 +14,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bifrost_gate::{
-    GateClassifierDecision, GateContext, RecommendedTool, ShellClassifierDecision,
-    classify_shell_tool_call, classify_text_tool_call, encourage_bifrost_enabled, gate_message,
-    shell_gate_message, should_skip_for_static_text_target,
+    GateClassifierDecision, GateConfidence, GateContext, RecommendedTool, ShellClassifierDecision,
+    ShellStaticRoute, classify_shell_tool_call, classify_text_tool_call, encourage_bifrost_enabled,
+    gate_message, shell_gate_message, should_skip_for_static_text_target, static_shell_route,
 };
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
@@ -1178,7 +1178,17 @@ async fn maybe_bifrost_classifier_gate(
     }));
 
     match classify_text_tool_call(context, cancel).await {
-        Ok(output) if output.decision == GateClassifierDecision::GateToSymbolTool => {
+        Ok(output)
+            if output.decision == GateClassifierDecision::GateToSymbolTool
+                && output.confidence == GateConfidence::High
+                && matches!(
+                    output.recommended_tool,
+                    RecommendedTool::SearchSymbols
+                        | RecommendedTool::ScanUsages
+                        | RecommendedTool::GetSummaries
+                        | RecommendedTool::GetSymbolSources
+                ) =>
+        {
             let message = gate_message(&output, tools);
             append_trace_record(serde_json::json!({
                 "type": "bifrost_gate_classifier",
@@ -1212,7 +1222,7 @@ async fn maybe_bifrost_classifier_gate(
                 "type": "bifrost_gate_classifier_error",
                 "tool": tool_name,
                 "args": parsed_input,
-                "error": err.to_string(),
+                "error": format!("{err:#}"),
             }));
             None
         }
@@ -1226,6 +1236,22 @@ async fn maybe_shell_classifier_gate(
     context: GateContext,
     cancel: &CancellationToken,
 ) -> Option<String> {
+    if let Some(route) = static_shell_route(parsed_input) {
+        match route {
+            ShellStaticRoute::AllowShell(reason) => {
+                append_trace_record(serde_json::json!({
+                    "type": "shell_gate_static_route",
+                    "tool": "run_shell_command",
+                    "args": parsed_input,
+                    "route": "allow_shell",
+                    "reason": reason,
+                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+                }));
+                return None;
+            }
+        }
+    }
+
     append_trace_record(serde_json::json!({
         "type": "shell_gate_classifier_call",
         "tool": "run_shell_command",
@@ -1238,7 +1264,7 @@ async fn maybe_shell_classifier_gate(
             if matches!(
                 output.decision,
                 ShellClassifierDecision::UseBuiltinTool | ShellClassifierDecision::UseBifrostTool
-            ) =>
+            ) && output.confidence == GateConfidence::High =>
         {
             let message = shell_gate_message(&output, tools);
             append_trace_record(serde_json::json!({
@@ -1274,7 +1300,7 @@ async fn maybe_shell_classifier_gate(
                 "type": "shell_gate_classifier_error",
                 "tool": "run_shell_command",
                 "args": parsed_input,
-                "error": err.to_string(),
+                "error": format!("{err:#}"),
             }));
             None
         }
@@ -1303,7 +1329,7 @@ fn bifrost_classifier_skip_reason(
     tool_name: &str,
     parsed_input: &Value,
     tools: &[ToolDefinition],
-    _tool_exchanges: &[ToolExchange],
+    tool_exchanges: &[ToolExchange],
     skip_after_prior_gate: bool,
 ) -> Option<&'static str> {
     if !encourage_bifrost_enabled() {
@@ -1317,10 +1343,21 @@ fn bifrost_classifier_skip_reason(
     if skip_after_prior_gate {
         return Some("post_gate_tool_batch");
     }
+    if tool_name == "list_directory" {
+        return Some("list_directory_default_allow");
+    }
     if is_text_navigation_tool(tool_name)
         && should_skip_for_static_text_target(tool_name, parsed_input)
     {
         return Some("static_text_target");
+    }
+    if tool_name == "read_file" && has_targeted_recent_bifrost_miss(parsed_input, tool_exchanges) {
+        return Some("targeted_bifrost_miss_fallback");
+    }
+    if tool_name == "grep_search"
+        && has_targeted_recent_bifrost_miss_for_grep(parsed_input, tool_exchanges)
+    {
+        return Some("targeted_bifrost_miss_fallback");
     }
     if !has_tool(tools, "search_symbols")
         || !has_tool(tools, "scan_usages")
@@ -1329,6 +1366,75 @@ fn bifrost_classifier_skip_reason(
         return Some("missing_required_bifrost_tools");
     }
     None
+}
+
+fn has_targeted_recent_bifrost_miss(parsed_input: &Value, tool_exchanges: &[ToolExchange]) -> bool {
+    let Some(path) = parsed_input.get("file_path").and_then(Value::as_str) else {
+        return false;
+    };
+    if path.len() < 3 {
+        return false;
+    }
+    tool_exchanges.iter().rev().take(8).any(|exchange| {
+        matches!(
+            exchange.tool_name.as_str(),
+            "search_symbols" | "scan_usages" | "get_summaries" | "get_symbol_sources"
+        ) && tool_result_looks_like_bifrost_miss(&exchange.result)
+            && (exchange.arguments.contains(path) || exchange.result.contains(path))
+    })
+}
+
+fn has_targeted_recent_bifrost_miss_for_grep(
+    parsed_input: &Value,
+    tool_exchanges: &[ToolExchange],
+) -> bool {
+    let Some(pattern) = parsed_input.get("pattern").and_then(Value::as_str) else {
+        return false;
+    };
+    let tokens = identifier_terms(pattern);
+    if tokens.is_empty() {
+        return false;
+    }
+    tool_exchanges.iter().rev().take(8).any(|exchange| {
+        matches!(
+            exchange.tool_name.as_str(),
+            "search_symbols" | "scan_usages" | "get_summaries" | "get_symbol_sources"
+        ) && tool_result_looks_like_bifrost_miss(&exchange.result)
+            && tokens
+                .iter()
+                .any(|token| exchange.arguments.contains(token) || exchange.result.contains(token))
+    })
+}
+
+fn identifier_terms(pattern: &str) -> Vec<String> {
+    pattern
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| token.len() >= 3)
+        .take(12)
+        .map(str::to_string)
+        .collect()
+}
+
+fn tool_result_looks_like_bifrost_miss(result: &str) -> bool {
+    let trimmed = result.trim();
+    if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        "not_found",
+        "not found",
+        "no match",
+        "no matches",
+        "no symbol",
+        "no symbols",
+        "no usages",
+        "no references",
+        "empty result",
+        "returned empty",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn shell_classifier_skip_reason(
@@ -2019,6 +2125,11 @@ mod tests {
 
     #[test]
     fn bifrost_classifier_is_skipped_immediately_after_gate_prompt() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
         let tools = vec![
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
@@ -2103,6 +2214,90 @@ mod tests {
             &[],
             false,
         ));
+    }
+
+    #[test]
+    fn list_directory_always_skips_bifrost_classifier() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
+        let tools = vec![
+            tool_def_for_test("list_directory"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "list_directory",
+                &serde_json::json!({"path": "src"}),
+                &tools,
+                &[],
+                false,
+            ),
+            Some("list_directory_default_allow")
+        );
+    }
+
+    #[test]
+    fn read_file_allows_targeted_bifrost_miss_fallback() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
+        let tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+        let mut miss = exchange_for_test("search_symbols");
+        miss.arguments = "{\"patterns\":[\"src/lib.rs\"]}".to_string();
+        miss.result = "No symbols found for src/lib.rs".to_string();
+
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "read_file",
+                &serde_json::json!({"file_path": "src/lib.rs"}),
+                &tools,
+                &[miss],
+                false,
+            ),
+            Some("targeted_bifrost_miss_fallback")
+        );
+    }
+
+    #[test]
+    fn grep_search_allows_targeted_bifrost_miss_fallback() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
+        let tools = vec![
+            tool_def_for_test("grep_search"),
+            tool_def_for_test("search_symbols"),
+            tool_def_for_test("scan_usages"),
+            tool_def_for_test("get_summaries"),
+        ];
+        let mut miss = exchange_for_test("search_symbols");
+        miss.arguments = "{\"patterns\":[\"RenameFileAsync\"]}".to_string();
+        miss.result = "No symbols found for RenameFileAsync".to_string();
+
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "grep_search",
+                &serde_json::json!({"glob": "**/*.cs", "pattern": "RenameFileAsync"}),
+                &tools,
+                &[miss],
+                false,
+            ),
+            Some("targeted_bifrost_miss_fallback")
+        );
     }
 
     #[test]
