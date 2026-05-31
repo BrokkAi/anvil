@@ -28,6 +28,11 @@ pub enum GateClassifierDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendedTool {
+    ReadFile,
+    GrepSearch,
+    ListDirectory,
+    Edit,
+    WriteFile,
     SearchSymbols,
     ScanUsages,
     GetSummaries,
@@ -38,6 +43,11 @@ pub enum RecommendedTool {
 impl RecommendedTool {
     pub fn as_tool_name(&self) -> &'static str {
         match self {
+            Self::ReadFile => "read_file",
+            Self::GrepSearch => "grep_search",
+            Self::ListDirectory => "list_directory",
+            Self::Edit => "edit",
+            Self::WriteFile => "write_file",
             Self::SearchSymbols => "search_symbols",
             Self::ScanUsages => "scan_usages",
             Self::GetSummaries => "get_summaries",
@@ -56,11 +66,29 @@ pub enum GateConfidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellClassifierDecision {
+    AllowShell,
+    UseBuiltinTool,
+    UseBifrostTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateClassifierOutput {
     // Keep this first. The request schema also serializes this first so the
     // classifier commits the rationale before emitting its decision.
     pub reason: String,
     pub decision: GateClassifierDecision,
+    pub recommended_tool: RecommendedTool,
+    pub suggested_args: Value,
+    pub confidence: GateConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellClassifierOutput {
+    // Keep this first so the model commits reasoning before the routing decision.
+    pub reason: String,
+    pub decision: ShellClassifierDecision,
     pub recommended_tool: RecommendedTool,
     pub suggested_args: Value,
     pub confidence: GateConfidence,
@@ -105,7 +133,9 @@ pub async fn classify_text_tool_call(
         if cancel.is_cancelled() {
             return Err(anyhow!("classification cancelled"));
         }
-        match send_classifier_request(&client, &api_key, &body, cancel).await {
+        match send_classifier_request(&client, &api_key, &body, parse_openrouter_response, cancel)
+            .await
+        {
             Ok(output) => return Ok(output),
             Err(err) => {
                 last_err = Some(err.context(format!("classifier attempt {}", attempt + 1)));
@@ -113,6 +143,47 @@ pub async fn classify_text_tool_call(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("classifier failed without error")))
+}
+
+pub async fn classify_shell_tool_call(
+    context: GateContext,
+    cancel: &CancellationToken,
+) -> Result<ShellClassifierOutput> {
+    if classifier_disabled() {
+        return Err(anyhow!(
+            "{CLASSIFIER_DISABLE_ENV} disables Bifrost gate classifier"
+        ));
+    }
+    let api_key = openrouter_api_key().context("OpenRouter API key unavailable")?;
+    let model = classifier_model();
+    let body = build_shell_request_body(&model, &context)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(CLASSIFIER_TIMEOUT)
+        .build()
+        .context("building OpenRouter shell classifier client")?;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..2 {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("classification cancelled"));
+        }
+        match send_classifier_request(
+            &client,
+            &api_key,
+            &body,
+            parse_shell_openrouter_response,
+            cancel,
+        )
+        .await
+        {
+            Ok(output) => return Ok(output),
+            Err(err) => {
+                last_err = Some(err.context(format!("shell classifier attempt {}", attempt + 1)));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("shell classifier failed without error")))
 }
 
 pub fn should_skip_for_static_text_target(tool_name: &str, args: &Value) -> bool {
@@ -146,13 +217,6 @@ pub fn classify_static_text_target(tool_name: &str, args: &Value) -> StaticTextT
     }
 }
 
-#[cfg(test)]
-pub fn all_priority_symbol_tools_called(exchanges: &[ToolExchange]) -> bool {
-    ["search_symbols", "scan_usages", "get_summaries"]
-        .iter()
-        .all(|name| exchanges.iter().any(|exchange| exchange.tool_name == *name))
-}
-
 pub fn gate_message(output: &GateClassifierOutput, tools: &[ToolDefinition]) -> String {
     let tool_name = output.recommended_tool.as_tool_name();
     let tool = tools.iter().find(|tool| tool.function.name == tool_name);
@@ -165,6 +229,24 @@ pub fn gate_message(output: &GateClassifierOutput, tools: &[ToolDefinition]) -> 
         .unwrap_or_else(|| "{}".to_string());
     format!(
         "Bifrost gate: {reason}\n\nThe original text-navigation tool call was not executed. This is a navigation hint, not a final decision. If this hint is wrong and you need exact text, raw bytes, docs/config/log content, localized lines, or recovery after an edit/build/Bifrost miss, retry the original text tool call in your next tool batch; it will be allowed.\n\nRecommended next tool: `{tool_name}`.\n\nDescription: {description}\n\nSchema: {schema}\n\nIf you are looking for declarations or definitions by name, use `search_symbols`. If you are looking for callers, references, or related tests for a known symbol, use `scan_usages`. If you are orienting across a module, package, class, API, or file glob, use `get_summaries`. If you already know the relevant symbol names and need implementation source, use `get_symbol_sources`.",
+        reason = output.reason,
+    )
+}
+
+pub fn shell_gate_message(output: &ShellClassifierOutput, tools: &[ToolDefinition]) -> String {
+    let tool_name = output.recommended_tool.as_tool_name();
+    let tool = tools.iter().find(|tool| tool.function.name == tool_name);
+    let description = tool
+        .map(|tool| tool.function.description.as_str())
+        .unwrap_or(
+            "Use the recommended built-in or Bifrost tool instead of shell for this operation.",
+        );
+    let schema = tool
+        .map(|tool| serde_json::to_string(&tool.function.parameters).unwrap_or_default())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "{}".to_string());
+    format!(
+        "Shell routing hint: {reason}\n\nThe original shell command was not executed. This is a routing hint, not a final decision. If this hint is wrong and you intentionally need shell semantics, a pipeline, raw bytes, build/test/git/package-manager behavior, or fallback after a Bifrost miss, retry the original shell command in your next tool batch; it will be allowed.\n\nRecommended next tool: `{tool_name}`.\n\nDescription: {description}\n\nSchema: {schema}\n\nUse built-in tools for ordinary file reads, file searches, directory listings, edits, and writes. Use Bifrost tools for source declarations, definitions, callers, references, related tests, and broad code orientation. Use shell for commands whose shell behavior is the point.",
         reason = output.reason,
     )
 }
@@ -200,12 +282,13 @@ fn openrouter_api_key() -> Result<String> {
     Err(anyhow!("no OpenRouter credential configured"))
 }
 
-async fn send_classifier_request(
+async fn send_classifier_request<T>(
     client: &reqwest::Client,
     api_key: &str,
     body: &str,
+    parse: fn(&str) -> Result<T>,
     cancel: &CancellationToken,
-) -> Result<GateClassifierOutput> {
+) -> Result<T> {
     let request = client
         .post(format!("{OPENROUTER_BASE_URL}/chat/completions"))
         .bearer_auth(api_key)
@@ -221,7 +304,7 @@ async fn send_classifier_request(
     if status != StatusCode::OK {
         return Err(anyhow!("classifier HTTP {status}: {text}"));
     }
-    parse_openrouter_response(&text)
+    parse(&text)
 }
 
 fn parse_openrouter_response(text: &str) -> Result<GateClassifierOutput> {
@@ -237,8 +320,21 @@ fn parse_openrouter_response(text: &str) -> Result<GateClassifierOutput> {
     Ok(output)
 }
 
+fn parse_shell_openrouter_response(text: &str) -> Result<ShellClassifierOutput> {
+    let value: Value =
+        serde_json::from_str(text).context("parsing shell classifier response envelope")?;
+    let content = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("shell classifier response missing choices[0].message.content"))?;
+    let mut output: ShellClassifierOutput = serde_json::from_str(content)
+        .with_context(|| format!("parsing shell classifier JSON: {content}"))?;
+    normalize_shell_classifier_consistency(&mut output);
+    Ok(output)
+}
+
 fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
-    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it; gate only when a Bifrost symbol tool is clearly a better first step than the pending text call. Decide whether the pending read_file/grep_search/list_directory/run_shell_command-as-source-reader call should run as text navigation or should be replaced by a Bifrost symbol tool. Prefer Bifrost for code declarations, definitions, implementations, references, callers, related tests, and broad code orientation. Gate if the text call is searching or browsing source code for symbol-shaped patterns, function names, type names, method names, call sites, declarations, definitions, directory structure, or API usage. Gate repeated source reads, broad source globs/directories, and shell file-reader commands after exact symbol source has already been retrieved unless there was an edit/build failure, a prior Bifrost miss, or a need for raw literal/config/macro text. Recommend search_symbols for unknown declarations/definitions by name, scan_usages for callers/references/related tests, get_summaries for broad module/package/file-glob orientation, and get_symbol_sources when the relevant symbol names are already known and the agent needs implementation source. Allow text for docs, config, logs, build scripts, exact localized line checks after the relevant code symbol/file/line is already known, literal string searches not represented as symbols, non-code files, verification of recent edits, recovery from failed edits, and targeted fallback after Bifrost returned empty/not_found. When uncertain, allow text. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. If your reason says or implies that Bifrost/search_symbols/scan_usages/get_summaries/get_symbol_sources would be better, more direct, more appropriate, should be used, or should replace the pending call, decision must be gate_to_symbol_tool. If decision is allow_text, recommended_tool must be none. Output only JSON matching the schema.";
+    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it; gate only when a Bifrost symbol tool is clearly a better first step than the pending text call. Decide whether the pending read_file/grep_search/list_directory call should run as text navigation or should be replaced by a Bifrost symbol tool. Prefer Bifrost for code declarations, definitions, implementations, references, callers, related tests, and broad code orientation. Gate if the text call is searching or browsing source code for symbol-shaped patterns, function names, type names, method names, call sites, declarations, definitions, directory structure, or API usage. Gate repeated source reads and broad source globs/directories after exact symbol source has already been retrieved unless there was an edit/build failure, a prior Bifrost miss, or a need for raw literal/config/macro text. Recommend search_symbols for unknown declarations/definitions by name, scan_usages for callers/references/related tests, get_summaries for broad module/package/file-glob orientation, and get_symbol_sources when the relevant symbol names are already known and the agent needs implementation source. Allow text for docs, config, logs, build scripts, exact localized line checks after the relevant code symbol/file/line is already known, literal string searches not represented as symbols, non-code files, verification of recent edits, recovery from failed edits, and targeted fallback after Bifrost returned empty/not_found. Use recent_bifrost_misses to recognize targeted fallbacks for the same unresolved token/path. When uncertain, allow text. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. If your reason says or implies that Bifrost/search_symbols/scan_usages/get_summaries/get_symbol_sources would be better, more direct, more appropriate, should be used, or should replace the pending call, decision must be gate_to_symbol_tool. If decision is allow_text, recommended_tool must be none. Output only JSON matching the schema.";
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
     let system_json = serde_json::to_string(system)?;
@@ -275,6 +371,44 @@ fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
     ))
 }
 
+fn build_shell_request_body(model: &str, context: &GateContext) -> Result<String> {
+    let system = "You are a shell routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it; gate only when a built-in tool or Bifrost symbol tool is clearly better than the pending run_shell_command. Decide whether the command should run as shell, should be replaced by a built-in tool, or should be replaced by a Bifrost symbol tool. Allow shell for build, test, git, package manager, project CLI, environment inspection, raw-byte/format probes such as cat -A, xxd, od, hexdump, pipeline-specific debugging, command substitution behavior, and cases where shell semantics are the point. Prefer built-ins for ordinary file reads, directory listings, file-content searches, edits, and writes, including docs/config/harness files. Prefer Bifrost for source declarations, definitions, implementations, references, callers, related tests, and broad source orientation. Use recent_bifrost_misses to allow targeted shell fallback for the same unresolved token/path after a real Bifrost miss. Do not overrule the pending command just because a different route might also work; gate only when the alternative is clearly more appropriate for high-quality coding-agent behavior. When uncertain, allow shell. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. If decision is allow_shell, recommended_tool must be none. If decision is use_builtin_tool, recommended_tool must be one of read_file, grep_search, list_directory, edit, write_file. If decision is use_bifrost_tool, recommended_tool must be one of search_symbols, scan_usages, get_summaries, get_symbol_sources. Output only JSON matching the schema.";
+    let user = render_context(context)?;
+    let model_json = serde_json::to_string(model)?;
+    let system_json = serde_json::to_string(system)?;
+    let user_json = serde_json::to_string(&user)?;
+    Ok(format!(
+        r#"{{
+  "model": {model_json},
+  "messages": [
+    {{"role":"system","content":{system_json}}},
+    {{"role":"user","content":{user_json}}}
+  ],
+  "response_format": {{
+    "type": "json_schema",
+    "json_schema": {{
+      "name": "shell_routing_decision",
+      "strict": true,
+      "schema": {{
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {{
+          "reason": {{"type":"string"}},
+          "decision": {{"type":"string","enum":["allow_shell","use_builtin_tool","use_bifrost_tool"]}},
+          "recommended_tool": {{"type":"string","enum":["read_file","grep_search","list_directory","edit","write_file","search_symbols","scan_usages","get_summaries","get_symbol_sources","none"]}},
+          "suggested_args": {{"type":"object"}},
+          "confidence": {{"type":"string","enum":["low","medium","high"]}}
+        }},
+        "required": ["reason","decision","recommended_tool","suggested_args","confidence"]
+      }}
+    }}
+  }},
+  "temperature": 0,
+  "max_tokens": 512
+}}"#
+    ))
+}
+
 fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
     if output.decision != GateClassifierDecision::AllowText {
         return;
@@ -298,6 +432,69 @@ fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
     output.decision = GateClassifierDecision::GateToSymbolTool;
     if output.recommended_tool == RecommendedTool::None {
         output.recommended_tool = infer_recommended_tool_from_reason(&reason);
+    }
+}
+
+fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
+    match output.decision {
+        ShellClassifierDecision::AllowShell => {
+            output.recommended_tool = RecommendedTool::None;
+            output.suggested_args = json!({});
+        }
+        ShellClassifierDecision::UseBuiltinTool
+            if !is_builtin_recommendation(&output.recommended_tool) =>
+        {
+            output.recommended_tool =
+                infer_shell_recommended_tool_from_reason(&output.reason, true);
+        }
+        ShellClassifierDecision::UseBifrostTool
+            if !is_bifrost_recommendation(&output.recommended_tool) =>
+        {
+            output.recommended_tool =
+                infer_shell_recommended_tool_from_reason(&output.reason, false);
+        }
+        _ => {}
+    }
+}
+
+fn is_builtin_recommendation(tool: &RecommendedTool) -> bool {
+    matches!(
+        tool,
+        RecommendedTool::ReadFile
+            | RecommendedTool::GrepSearch
+            | RecommendedTool::ListDirectory
+            | RecommendedTool::Edit
+            | RecommendedTool::WriteFile
+    )
+}
+
+fn is_bifrost_recommendation(tool: &RecommendedTool) -> bool {
+    matches!(
+        tool,
+        RecommendedTool::SearchSymbols
+            | RecommendedTool::ScanUsages
+            | RecommendedTool::GetSummaries
+            | RecommendedTool::GetSymbolSources
+    )
+}
+
+fn infer_shell_recommended_tool_from_reason(reason: &str, builtin: bool) -> RecommendedTool {
+    let reason = reason.to_ascii_lowercase();
+    if builtin {
+        if reason.contains("grep") || reason.contains("search") {
+            RecommendedTool::GrepSearch
+        } else if reason.contains("list") || reason.contains("directory") || reason.contains("ls") {
+            RecommendedTool::ListDirectory
+        } else if reason.contains("write") || reason.contains("create") {
+            RecommendedTool::WriteFile
+        } else if reason.contains("edit") || reason.contains("replace") || reason.contains("patch")
+        {
+            RecommendedTool::Edit
+        } else {
+            RecommendedTool::ReadFile
+        }
+    } else {
+        infer_recommended_tool_from_reason(&reason)
     }
 }
 
@@ -345,7 +542,7 @@ fn render_context(context: &GateContext) -> Result<String> {
         .filter(|tool| {
             matches!(
                 tool.function.name.as_str(),
-                "search_symbols" | "scan_usages" | "get_summaries"
+                "search_symbols" | "scan_usages" | "get_summaries" | "get_symbol_sources"
             )
         })
         .map(|tool| {
@@ -372,6 +569,7 @@ fn render_context(context: &GateContext) -> Result<String> {
             })
         })
         .collect();
+    let recent_bifrost_misses = recent_bifrost_misses(&context.tool_exchanges);
     let prior_counts = json!({
         "read_file": count_tool(&context.tool_exchanges, "read_file"),
         "grep_search": count_tool(&context.tool_exchanges, "grep_search"),
@@ -388,10 +586,61 @@ fn render_context(context: &GateContext) -> Result<String> {
         },
         "prior_tool_counts": prior_counts,
         "recent_tool_calls": recent,
+        "recent_bifrost_misses": recent_bifrost_misses,
         "bifrost_tools": bifrost_tools,
         "static_text_target": classify_static_text_target(&context.tool_name, &context.args),
     });
     serde_json::to_string_pretty(&payload).context("rendering classifier context")
+}
+
+fn recent_bifrost_misses(exchanges: &[ToolExchange]) -> Vec<Value> {
+    exchanges
+        .iter()
+        .rev()
+        .filter(|exchange| {
+            is_bifrost_tool(&exchange.tool_name) && looks_like_bifrost_miss(&exchange.result)
+        })
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|exchange| {
+            json!({
+                "tool": exchange.tool_name,
+                "args": exchange.arguments,
+                "result_excerpt": truncate(&exchange.result),
+            })
+        })
+        .collect()
+}
+
+fn is_bifrost_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "search_symbols" | "scan_usages" | "get_summaries" | "get_symbol_sources"
+    )
+}
+
+fn looks_like_bifrost_miss(result: &str) -> bool {
+    let trimmed = result.trim();
+    if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        "not_found",
+        "not found",
+        "no match",
+        "no matches",
+        "no symbol",
+        "no symbols",
+        "no usages",
+        "no references",
+        "empty result",
+        "returned empty",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn count_tool(exchanges: &[ToolExchange], name: &str) -> usize {
@@ -513,19 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn priority_symbol_tool_stop_condition_requires_all_three() {
-        assert!(!all_priority_symbol_tools_called(&[
-            exchange("search_symbols"),
-            exchange("scan_usages"),
-        ]));
-        assert!(all_priority_symbol_tools_called(&[
-            exchange("search_symbols"),
-            exchange("scan_usages"),
-            exchange("get_summaries"),
-        ]));
-    }
-
-    #[test]
     fn request_schema_puts_reason_before_decision() {
         let context = GateContext {
             tool_name: "grep_search".to_string(),
@@ -552,8 +788,27 @@ mod tests {
         let body = build_request_body("deepseek/deepseek-v4-flash", &context).unwrap();
 
         assert!(body.contains("advising a stronger coding model"));
-        assert!(body.contains("gate only when a Bifrost symbol tool is clearly a better first step"));
+        assert!(
+            body.contains("gate only when a Bifrost symbol tool is clearly a better first step")
+        );
         assert!(body.contains("When uncertain, allow text"));
+    }
+
+    #[test]
+    fn shell_request_schema_puts_reason_before_decision() {
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": "cat src/lib.rs"}),
+            messages: vec![ChatMessage::user("Read lib.rs")],
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+        let body = build_shell_request_body("deepseek/deepseek-v4-flash", &context).unwrap();
+        let reason_pos = body.find(r#""reason""#).unwrap();
+        let decision_pos = body.find(r#""decision""#).unwrap();
+        assert!(reason_pos < decision_pos, "{body}");
+        assert!(body.contains("shell routing classifier"));
+        assert!(body.contains("When uncertain, allow shell"));
     }
 
     #[test]
@@ -573,6 +828,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_gate_message_explains_retry_override() {
+        let output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because cat is an ordinary file read.".to_string(),
+            decision: ShellClassifierDecision::UseBuiltinTool,
+            recommended_tool: RecommendedTool::ReadFile,
+            suggested_args: json!({"file_path": "src/lib.rs"}),
+            confidence: GateConfidence::High,
+        };
+        let message = shell_gate_message(&output, &[]);
+
+        assert!(message.contains("routing hint, not a final decision"));
+        assert!(message.contains("retry the original shell command in your next tool batch"));
+        assert!(message.contains("it will be allowed"));
+        assert!(message.contains("Recommended next tool: `read_file`"));
+    }
+
+    #[test]
     fn parses_classifier_content() {
         let envelope = json!({
             "choices": [{
@@ -584,6 +856,74 @@ mod tests {
         let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
         assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(parsed.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn parses_shell_classifier_builtin_content() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"USE_BUILTIN_TOOL because cat is an ordinary file read.\",\"decision\":\"use_builtin_tool\",\"recommended_tool\":\"read_file\",\"suggested_args\":{\"file_path\":\"src/lib.rs\"},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_shell_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, ShellClassifierDecision::UseBuiltinTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::ReadFile);
+    }
+
+    #[test]
+    fn parses_shell_classifier_bifrost_content() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"USE_BIFROST_TOOL because this grep is looking for callers.\",\"decision\":\"use_bifrost_tool\",\"recommended_tool\":\"scan_usages\",\"suggested_args\":{\"symbols\":[\"Foo\"]},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_shell_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, ShellClassifierDecision::UseBifrostTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
+    fn shell_allow_normalizes_recommended_tool_to_none() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"reason\":\"ALLOW_SHELL because cargo test needs CLI semantics.\",\"decision\":\"allow_shell\",\"recommended_tool\":\"read_file\",\"suggested_args\":{\"file_path\":\"Cargo.toml\"},\"confidence\":\"high\"}"
+                }
+            }]
+        });
+        let parsed = parse_shell_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, ShellClassifierDecision::AllowShell);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::None);
+        assert_eq!(parsed.suggested_args, json!({}));
+    }
+
+    #[test]
+    fn rendered_context_includes_recent_bifrost_misses() {
+        let mut miss = exchange("search_symbols");
+        miss.arguments = "{\"patterns\":[\"FOO_MACRO\"]}".to_string();
+        miss.result = "No symbols found for FOO_MACRO".to_string();
+        let mut hit = exchange("scan_usages");
+        hit.arguments = "{\"symbols\":[\"Bar\"]}".to_string();
+        hit.result = "Found usages for Bar".to_string();
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": "rg FOO_MACRO src"}),
+            messages: vec![ChatMessage::user("Find FOO_MACRO")],
+            tools: Vec::new(),
+            tool_exchanges: vec![miss, hit],
+        };
+
+        let rendered: Value = serde_json::from_str(&render_context(&context).unwrap()).unwrap();
+        let misses = rendered
+            .get("recent_bifrost_misses")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(misses.len(), 1);
+        assert!(misses[0].to_string().contains("FOO_MACRO"));
     }
 
     #[test]

@@ -14,7 +14,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bifrost_gate::{
-    GateClassifierDecision, GateContext, RecommendedTool, classify_text_tool_call, gate_message,
+    GateClassifierDecision, GateContext, RecommendedTool, ShellClassifierDecision,
+    classify_shell_tool_call, classify_text_tool_call, gate_message, shell_gate_message,
     should_skip_for_static_text_target,
 };
 use crate::llm_client::{
@@ -1115,55 +1116,6 @@ fn is_text_navigation_tool(name: &str) -> bool {
     matches!(name, "read_file" | "grep_search" | "list_directory")
 }
 
-fn is_shell_source_reader_command(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    let lower = trimmed.to_ascii_lowercase();
-    if is_shell_mutation_command(&lower) {
-        return false;
-    }
-    let starts_like_reader = [
-        "cat ", "sed ", "nl ", "tail ", "head ", "grep ", "rg ", "awk ", "perl ", "python ",
-        "python3 ",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix));
-    if !starts_like_reader {
-        return false;
-    }
-    [
-        ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".go", ".java", ".js", ".jsx", ".ts",
-        ".tsx", ".py", ".rs", ".scala", ".php",
-    ]
-    .iter()
-    .any(|extension| lower.contains(extension))
-}
-
-fn is_shell_mutation_command(lower_command: &str) -> bool {
-    [
-        " > ",
-        " >> ",
-        " 1>",
-        " 2>",
-        "sed -i",
-        "sed -e",
-        "perl -pi",
-        "perl -i",
-        "--in-place",
-        "write_text(",
-        ".write(",
-        "open(",
-        "file_put_contents(",
-        "rename(",
-        "unlink(",
-        "copy(",
-        "mv ",
-        "cp ",
-        "rm ",
-    ]
-    .iter()
-    .any(|needle| lower_command.contains(needle))
-}
-
 async fn maybe_bifrost_classifier_gate(
     tool_name: &str,
     parsed_input: &Value,
@@ -1180,14 +1132,31 @@ async fn maybe_bifrost_classifier_gate(
         tool_exchanges,
         skip_after_prior_gate,
     ) {
+        let trace_type = if tool_name == "run_shell_command" {
+            "shell_gate_classifier_skipped"
+        } else {
+            "bifrost_gate_classifier_skipped"
+        };
         append_trace_record(serde_json::json!({
-            "type": "bifrost_gate_classifier_skipped",
+            "type": trace_type,
             "tool": tool_name,
             "args": parsed_input,
             "reason": reason,
             "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
         }));
         return None;
+    }
+
+    let context = GateContext {
+        tool_name: tool_name.to_string(),
+        args: parsed_input.clone(),
+        messages: messages.to_vec(),
+        tools: tools.to_vec(),
+        tool_exchanges: tool_exchanges.to_vec(),
+    };
+    if tool_name == "run_shell_command" {
+        return maybe_shell_classifier_gate(parsed_input, tools, tool_exchanges, context, cancel)
+            .await;
     }
 
     append_trace_record(serde_json::json!({
@@ -1197,13 +1166,6 @@ async fn maybe_bifrost_classifier_gate(
         "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
     }));
 
-    let context = GateContext {
-        tool_name: tool_name.to_string(),
-        args: parsed_input.clone(),
-        messages: messages.to_vec(),
-        tools: tools.to_vec(),
-        tool_exchanges: tool_exchanges.to_vec(),
-    };
     match classify_text_tool_call(context, cancel).await {
         Ok(output) if output.decision == GateClassifierDecision::GateToSymbolTool => {
             let message = gate_message(&output, tools);
@@ -1246,6 +1208,68 @@ async fn maybe_bifrost_classifier_gate(
     }
 }
 
+async fn maybe_shell_classifier_gate(
+    parsed_input: &Value,
+    tools: &[ToolDefinition],
+    tool_exchanges: &[ToolExchange],
+    context: GateContext,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    append_trace_record(serde_json::json!({
+        "type": "shell_gate_classifier_call",
+        "tool": "run_shell_command",
+        "args": parsed_input,
+        "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+    }));
+
+    match classify_shell_tool_call(context, cancel).await {
+        Ok(output)
+            if matches!(
+                output.decision,
+                ShellClassifierDecision::UseBuiltinTool | ShellClassifierDecision::UseBifrostTool
+            ) =>
+        {
+            let message = shell_gate_message(&output, tools);
+            append_trace_record(serde_json::json!({
+                "type": "shell_gate_classifier",
+                "tool": "run_shell_command",
+                "args": parsed_input,
+                "decision": output,
+                "gated": true,
+            }));
+            Some(message)
+        }
+        Ok(mut output) => {
+            let normalized_recommended_tool = output.decision
+                == ShellClassifierDecision::AllowShell
+                && output.recommended_tool != RecommendedTool::None;
+            if normalized_recommended_tool {
+                output.recommended_tool = RecommendedTool::None;
+                output.suggested_args = serde_json::json!({});
+            }
+            append_trace_record(serde_json::json!({
+                "type": "shell_gate_classifier",
+                "tool": "run_shell_command",
+                "args": parsed_input,
+                "decision": output,
+                "gated": false,
+                "normalized_recommended_tool": normalized_recommended_tool,
+            }));
+            None
+        }
+        Err(err) => {
+            tracing::warn!("Shell routing classifier failed open: {err:#}");
+            append_trace_record(serde_json::json!({
+                "type": "shell_gate_classifier_error",
+                "tool": "run_shell_command",
+                "args": parsed_input,
+                "error": err.to_string(),
+            }));
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 fn should_consult_bifrost_classifier(
     tool_name: &str,
@@ -1272,13 +1296,7 @@ fn bifrost_classifier_skip_reason(
     skip_after_prior_gate: bool,
 ) -> Option<&'static str> {
     if tool_name == "run_shell_command" {
-        let command = parsed_input
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !is_shell_source_reader_command(command) {
-            return Some("not_text_navigation_tool");
-        }
+        return shell_classifier_skip_reason(tool_name, tools, skip_after_prior_gate);
     } else if !is_text_navigation_tool(tool_name) {
         return Some("not_text_navigation_tool");
     }
@@ -1295,6 +1313,20 @@ fn bifrost_classifier_skip_reason(
         || !has_tool(tools, "get_summaries")
     {
         return Some("missing_required_bifrost_tools");
+    }
+    None
+}
+
+fn shell_classifier_skip_reason(
+    tool_name: &str,
+    _tools: &[ToolDefinition],
+    skip_after_prior_gate: bool,
+) -> Option<&'static str> {
+    if tool_name != "run_shell_command" {
+        return Some("not_shell_tool");
+    }
+    if skip_after_prior_gate {
+        return Some("post_gate_tool_batch");
     }
     None
 }
@@ -2100,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn bifrost_classifier_runs_for_shell_source_readers_only() {
+    fn shell_classifier_runs_for_all_shell_commands() {
         let tools = vec![
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
@@ -2117,27 +2149,44 @@ mod tests {
             &[],
             false,
         ));
-        assert!(!should_consult_bifrost_classifier(
+        assert!(should_consult_bifrost_classifier(
             "run_shell_command",
             &serde_json::json!({"command": "cargo test -q"}),
             &tools,
             &[],
             false,
         ));
-        assert!(!should_consult_bifrost_classifier(
+        assert!(should_consult_bifrost_classifier(
             "run_shell_command",
             &serde_json::json!({"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/Foo.php').write_text('x')\nPY"}),
             &tools,
             &[],
             false,
         ));
-        assert!(!should_consult_bifrost_classifier(
+        assert!(should_consult_bifrost_classifier(
             "run_shell_command",
             &serde_json::json!({"command": "sed -i 's/a/b/' src/Foo.php"}),
             &tools,
             &[],
             false,
         ));
+        assert!(!should_consult_bifrost_classifier(
+            "run_shell_command",
+            &serde_json::json!({"command": "cargo test -q"}),
+            &tools,
+            &[],
+            true,
+        ));
+        assert_eq!(
+            bifrost_classifier_skip_reason(
+                "run_shell_command",
+                &serde_json::json!({"command": "cargo test -q"}),
+                &tools,
+                &[],
+                true,
+            ),
+            Some("post_gate_tool_batch")
+        );
     }
 
     #[test]
