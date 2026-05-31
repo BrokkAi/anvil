@@ -259,6 +259,10 @@ fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOL_NAMES.contains(&name)
 }
 
+fn is_harness_only_mcp_tool(name: &str) -> bool {
+    name == "refresh"
+}
+
 /// Unified tool registry: filesystem tools + shell + think + configured
 /// MCP tools + Agent Skills activation.
 ///
@@ -322,6 +326,14 @@ impl ToolRegistry {
                                 server = %client.name(),
                                 tool = %tool.name,
                                 "mcp tool name collides with a built-in tool; ignoring server tool"
+                            );
+                            continue;
+                        }
+                        if is_harness_only_mcp_tool(&tool.name) {
+                            tracing::info!(
+                                server = %client.name(),
+                                tool = %tool.name,
+                                "mcp tool is reserved for harness use; hiding from model dispatch"
                             );
                             continue;
                         }
@@ -512,6 +524,9 @@ impl ToolRegistry {
             defs.iter().map(|def| def.function.name.clone()).collect();
         for client in &self.mcp_clients {
             for tool in client.tools() {
+                if is_harness_only_mcp_tool(&tool.name) {
+                    continue;
+                }
                 if !advertised_names.insert(tool.name.clone()) {
                     tracing::warn!(
                         server = %client.name(),
@@ -600,6 +615,37 @@ impl ToolRegistry {
         }
 
         defs
+    }
+
+    pub(crate) fn is_bifrost_tool(&self, name: &str) -> bool {
+        self.mcp_tool_servers
+            .get(name)
+            .is_some_and(|client| client.name() == "bifrost")
+    }
+
+    pub(crate) async fn refresh_bifrost(&self) -> ToolResult {
+        let Some(client) = self
+            .mcp_clients
+            .iter()
+            .find(|client| client.name() == "bifrost")
+            .cloned()
+        else {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: "Bifrost refresh failed: no configured bifrost MCP server.".to_string(),
+            };
+        };
+
+        match client.call_tool("refresh", json!({})).await {
+            Ok(_) => ToolResult {
+                status: ToolStatus::Success,
+                output: "Bifrost analyzer index refreshed.".to_string(),
+            },
+            Err(err) => ToolResult {
+                status: ToolStatus::InternalError,
+                output: format!("Bifrost refresh failed: {err}"),
+            },
+        }
     }
 
     /// Execute a tool by name with JSON arguments.
@@ -784,6 +830,12 @@ impl ToolRegistry {
     }
 
     async fn execute_mcp(&self, name: &str, args: serde_json::Value) -> ToolResult {
+        if is_harness_only_mcp_tool(name) {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: format!("MCP tool '{name}' is reserved for harness use."),
+            };
+        }
         let Some(client) = self.mcp_tool_servers.get(name).cloned() else {
             return ToolResult {
                 status: ToolStatus::RequestError,
@@ -1157,6 +1209,19 @@ mod tests {
         assert!(matches!(result.status, ToolStatus::RequestError));
         assert!(result.output.contains("Unknown skill 'nonexistent'"));
         assert!(result.output.contains("real-skill"));
+    }
+
+    #[tokio::test]
+    async fn refresh_is_reserved_for_harness_dispatch() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute("refresh", json!({}), SandboxPolicy::WorkspaceWrite)
+            .await;
+
+        assert!(matches!(result.status, ToolStatus::RequestError));
+        assert!(result.output.contains("reserved for harness use"));
+        assert!(is_harness_only_mcp_tool("refresh"));
+        assert!(!is_harness_only_mcp_tool("search_symbols"));
     }
 
     #[tokio::test]

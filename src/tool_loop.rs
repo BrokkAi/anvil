@@ -18,7 +18,7 @@ use crate::bifrost_gate::{
     should_skip_for_static_text_target,
 };
 use crate::llm_client::{
-    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolDefinition,
+    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::tools::sandbox::SandboxPolicy;
@@ -530,6 +530,8 @@ pub(crate) async fn run(
                 let skip_bifrost_classifier_for_this_tool_batch =
                     skip_bifrost_classifier_for_next_tool_batch;
                 let mut current_tool_batch_triggered_bifrost_gate = false;
+                let mut bifrost_refreshed_this_tool_batch = false;
+                let mut bifrost_refresh_failure: Option<ToolExecution> = None;
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
@@ -539,7 +541,10 @@ pub(crate) async fn run(
                 messages.push(ChatMessage::assistant_tool_calls(calls.clone()));
 
                 // Execute each tool call
-                for call in &calls {
+                for call_index in
+                    ordered_tool_call_indices(&calls, |name| registry.is_bifrost_tool(name))
+                {
+                    let call = &calls[call_index];
                     if cancel.is_cancelled() {
                         // The user cancelled mid-batch; stop issuing more
                         // permission prompts and tool executions.
@@ -801,15 +806,78 @@ pub(crate) async fn run(
                                     &parsed_input,
                                     &tool_exchanges,
                                 );
-                                execute_tool(
-                                    registry,
-                                    &tool_name,
-                                    parsed_input.clone(),
-                                    policy,
-                                    outside_sandbox_once,
-                                    sandbox_mode,
-                                )
-                                .await
+                                if registry.is_bifrost_tool(&tool_name)
+                                    && !bifrost_refreshed_this_tool_batch
+                                {
+                                    tracing::info!(
+                                        session_id = %session_id,
+                                        tool_name = %tool_name,
+                                        "refreshing bifrost before first bifrost tool in batch"
+                                    );
+                                    append_trace_record(serde_json::json!({
+                                        "type": "bifrost_refresh",
+                                        "tool": tool_name,
+                                        "status": "started",
+                                    }));
+                                    let refresh = registry.refresh_bifrost().await;
+                                    let refresh_status = match refresh.status {
+                                        ToolStatus::Success => "success",
+                                        ToolStatus::RequestError => "request_error",
+                                        ToolStatus::InternalError => "internal_error",
+                                    };
+                                    tracing::info!(
+                                        session_id = %session_id,
+                                        tool_name = %tool_name,
+                                        status = refresh_status,
+                                        "bifrost refresh completed before tool batch"
+                                    );
+                                    append_trace_record(serde_json::json!({
+                                        "type": "bifrost_refresh",
+                                        "tool": tool_name,
+                                        "status": refresh_status,
+                                        "output": refresh.output.clone(),
+                                    }));
+                                    bifrost_refreshed_this_tool_batch = true;
+                                    if !matches!(refresh.status, ToolStatus::Success) {
+                                        let exec = tool_result_to_execution(refresh);
+                                        bifrost_refresh_failure = Some(exec.clone());
+                                        exec
+                                    } else {
+                                        execute_tool(
+                                            registry,
+                                            &tool_name,
+                                            parsed_input.clone(),
+                                            policy,
+                                            outside_sandbox_once,
+                                            sandbox_mode,
+                                        )
+                                        .await
+                                    }
+                                } else if registry.is_bifrost_tool(&tool_name) {
+                                    if let Some(exec) = &bifrost_refresh_failure {
+                                        exec.clone()
+                                    } else {
+                                        execute_tool(
+                                            registry,
+                                            &tool_name,
+                                            parsed_input.clone(),
+                                            policy,
+                                            outside_sandbox_once,
+                                            sandbox_mode,
+                                        )
+                                        .await
+                                    }
+                                } else {
+                                    execute_tool(
+                                        registry,
+                                        &tool_name,
+                                        parsed_input.clone(),
+                                        policy,
+                                        outside_sandbox_once,
+                                        sandbox_mode,
+                                    )
+                                    .await
+                                }
                             };
 
                             // Build the terminal update -- Completed (with a
@@ -1033,6 +1101,7 @@ async fn request_user_permission(
 
 /// Outcome of executing a tool, formatted for both the LLM (via `output`)
 /// and the client card (`failed` -> `ToolCallStatus::Failed`).
+#[derive(Clone)]
 struct ToolExecution {
     output: String,
     failed: bool,
@@ -1422,6 +1491,10 @@ async fn execute_tool(
     let result = registry
         .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
         .await;
+    tool_result_to_execution(result)
+}
+
+fn tool_result_to_execution(result: crate::tools::ToolResult) -> ToolExecution {
     let (status_prefix, failed) = match result.status {
         ToolStatus::Success => ("", false),
         ToolStatus::RequestError => ("Error: ", true),
@@ -1686,10 +1759,27 @@ fn build_editing_diff(
     Some(diff)
 }
 
+fn ordered_tool_call_indices(
+    calls: &[ToolCall],
+    is_bifrost_tool: impl Fn(&str) -> bool,
+) -> Vec<usize> {
+    let mut builtin_or_other = Vec::new();
+    let mut bifrost = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        if is_bifrost_tool(&call.function.name) {
+            bifrost.push(index);
+        } else {
+            builtin_or_other.push(index);
+        }
+    }
+    builtin_or_other.extend(bifrost);
+    builtin_or_other
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::FunctionDef;
+    use crate::llm_client::{FunctionCall, FunctionDef};
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -1698,6 +1788,17 @@ mod tests {
                 name: name.to_string(),
                 description: String::new(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+
+    fn tool_call_for_test(name: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call-{name}"),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
             },
         }
     }
@@ -1711,6 +1812,13 @@ mod tests {
         }
     }
 
+    fn ordered_names_for_test(calls: &[ToolCall], bifrost_names: &[&str]) -> Vec<String> {
+        ordered_tool_call_indices(calls, |name| bifrost_names.contains(&name))
+            .into_iter()
+            .map(|index| calls[index].function.name.clone())
+            .collect()
+    }
+
     fn decide(
         mode: PermissionMode,
         kind: ToolKind,
@@ -1718,6 +1826,66 @@ mod tests {
         allowed: bool,
     ) -> PureGateDecision {
         pure_gate_decision(mode, kind, tool_name, allowed)
+    }
+
+    #[test]
+    fn tool_call_order_runs_non_bifrost_before_bifrost() {
+        let calls = vec![
+            tool_call_for_test("search_symbols"),
+            tool_call_for_test("read_file"),
+            tool_call_for_test("get_summaries"),
+            tool_call_for_test("run_shell_command"),
+        ];
+
+        let names = ordered_names_for_test(&calls, &["search_symbols", "get_summaries"]);
+
+        assert_eq!(
+            names,
+            vec![
+                "read_file",
+                "run_shell_command",
+                "search_symbols",
+                "get_summaries"
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_order_preserves_relative_order_within_groups() {
+        let calls = vec![
+            tool_call_for_test("get_summaries"),
+            tool_call_for_test("grep_search"),
+            tool_call_for_test("search_symbols"),
+            tool_call_for_test("read_file"),
+            tool_call_for_test("scan_usages"),
+        ];
+
+        let names =
+            ordered_names_for_test(&calls, &["get_summaries", "search_symbols", "scan_usages"]);
+
+        assert_eq!(
+            names,
+            vec![
+                "grep_search",
+                "read_file",
+                "get_summaries",
+                "search_symbols",
+                "scan_usages"
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_order_leaves_non_bifrost_batch_unchanged() {
+        let calls = vec![
+            tool_call_for_test("think"),
+            tool_call_for_test("read_file"),
+            tool_call_for_test("run_shell_command"),
+        ];
+
+        let names = ordered_names_for_test(&calls, &["search_symbols"]);
+
+        assert_eq!(names, vec!["think", "read_file", "run_shell_command"]);
     }
 
     #[test]
