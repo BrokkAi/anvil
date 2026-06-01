@@ -1094,6 +1094,14 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
     let repair_tool =
         deterministic_source_symbol_repair_tool(pattern, glob, path, file_path, context);
     if repair_blocked_text_grep(pattern, glob, path, file_path, context)
+        || ((output.allow_exception == TextAllowException::NonSourceText
+            || (matches!(output.intent, TextIntent::ExactTextOrLocalizedRead)
+                && output.bifrost_fit == BifrostFit::NotApplicable
+                && output.bifrost_candidate.is_none()))
+            && exact_bare_identifier_text_exception(
+                pattern,
+                output.evidence.exact_text_or_regex_needed,
+            ))
         || (repair_tool.is_none()
             && strong_text_grep_allow_exception(
                 pattern,
@@ -1779,6 +1787,15 @@ fn import_include_or_package_text_target(pattern: &str) -> bool {
 fn single_identifier_pattern(pattern: &str) -> bool {
     let tokens = identifier_tokens(pattern);
     tokens.len() == 1 && tokens[0] == pattern.trim()
+}
+
+fn exact_bare_identifier_text_exception(pattern: &str, exact_text_or_regex_needed: bool) -> bool {
+    exact_text_or_regex_needed
+        && single_identifier_pattern(pattern)
+        && !declaration_search_pattern(pattern)
+        && !symbol_call_or_member(pattern)
+        && !source_static_or_member_access(pattern)
+        && !source_call_navigation_pattern(pattern)
 }
 
 fn exact_error_constant_search(pattern: &str, path: &str, file_path: &str) -> bool {
@@ -5496,6 +5513,49 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn exact_bare_identifier_grep_with_text_evidence_stays_allowed() {
+        let mut output = GateClassifierOutput {
+            reason: "Bifrost could find the attribute symbol.".to_string(),
+            intent: TextIntent::SymbolUsageLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::NonSourceText,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["InternalsVisibleTo".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: true,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["InternalsVisibleTo"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({"patterns":["InternalsVisibleTo"]}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": "source",
+                "glob": "**/*.cs",
+                "pattern": "InternalsVisibleTo"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
