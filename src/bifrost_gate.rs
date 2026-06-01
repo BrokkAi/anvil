@@ -1943,6 +1943,33 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
             return;
         }
     }
+    if output.decision == ShellClassifierDecision::AllowShell
+        && route_prefix(&output.reason) == Some(RoutePrefix::UseBuiltin)
+        && !output.shell_semantics_required
+        && output.builtin_preserves_intent
+        && conservative_shell_read_search_inspection(command)
+    {
+        output.decision = ShellClassifierDecision::UseBuiltinTool;
+        output.recommended_tool = builtin_tool_for_shell_command(command);
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "USE_BUILTIN_TOOL because `{}` is conservative file/search/list inspection and the classifier's allow_original route contradicted its builtin policy fields.",
+            truncate_to(command, 160)
+        );
+        let lower = command.to_ascii_lowercase();
+        output.intent = if simple_shell_search_like(command) {
+            ShellIntent::LiteralTextSearch
+        } else if lower.contains("find ") || lower.contains("ls ") {
+            ShellIntent::DirectoryOrFileDiscovery
+        } else {
+            ShellIntent::OrdinaryFileRead
+        };
+        output.allow_exception = ShellAllowException::None;
+        output.replacement_class = ShellReplacementClass::UseBuiltinInspection;
+        output.bifrost_fit = BifrostFit::NotApplicable;
+        output.confidence = GateConfidence::High;
+        return;
+    }
     if output.decision == ShellClassifierDecision::UseBuiltinTool && xargs_content_grep(command) {
         if let Some(tool) = strong_shell_source_symbol_search(command) {
             output.decision = ShellClassifierDecision::UseBifrostTool;
@@ -3261,6 +3288,56 @@ fn simple_shell_search_like(command: &str) -> bool {
             || lower.starts_with("git grep ")
             || xargs_content_grep(&lower)
     })
+}
+
+fn conservative_shell_read_search_inspection(command: &str) -> bool {
+    if shell_semantics_required(command)
+        || shell_search_stream(command) == ShellSearchStream::FilePaths
+    {
+        return false;
+    }
+    let mut saw_part = false;
+    for part in command_segments(command)
+        .iter()
+        .flat_map(|segment| segment.split(" | "))
+    {
+        let name = shell_segment_executable_name(part);
+        if name.is_empty() {
+            continue;
+        }
+        saw_part = true;
+        if !matches!(
+            name.as_str(),
+            "grep"
+                | "egrep"
+                | "fgrep"
+                | "rg"
+                | "ag"
+                | "ack"
+                | "cat"
+                | "head"
+                | "tail"
+                | "wc"
+                | "ls"
+                | "nl"
+                | "sed"
+        ) {
+            return false;
+        }
+    }
+    saw_part
+}
+
+fn shell_segment_executable_name(segment: &str) -> String {
+    strip_harmless_shell_prefixes(segment)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(['"', '\''])
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 fn xargs_content_grep(command: &str) -> bool {
@@ -5071,6 +5148,42 @@ mod tests {
 
         assert_eq!(output.decision, ShellClassifierDecision::UseBuiltinTool);
         assert_eq!(output.recommended_tool, RecommendedTool::GrepSearch);
+    }
+
+    #[test]
+    fn shell_allow_with_builtin_policy_quorum_repairs_to_builtin() {
+        let mut output = ShellClassifierOutput {
+            reason:
+                "USE_BUILTIN_TOOL because grep on build.sbt is config-scoped literal text search."
+                    .to_string(),
+            intent: ShellIntent::BuildTestGitPackageOrProjectCli,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: ShellAllowException::BuildTestGitPackageOrProjectCli,
+            replacement_class: ShellReplacementClass::AllowShellUncertain,
+            decision: ShellClassifierDecision::AllowShell,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": "grep -R -n \"lazy val .*tests\\|lazy val .*core\\|lazy val .*domain\" build.sbt project/*.sbt"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        assert!(conservative_shell_read_search_inspection(
+            "grep -R -n \"lazy val .*tests\\|lazy val .*core\\|lazy val .*domain\" build.sbt project/*.sbt"
+        ));
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::UseBuiltinTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::GrepSearch);
+        assert_eq!(output.allow_exception, ShellAllowException::None);
     }
 
     #[test]
