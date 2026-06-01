@@ -985,9 +985,9 @@ fn build_shell_request_body_with_mode(
     json_only_retry: bool,
 ) -> Result<String> {
     let system = if json_only_retry {
-        "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify by purpose from pending_call_features and compact_evidence. Use builtins for ordinary file reads/searches/listings when they preserve intent. Use Bifrost only for clear source-code symbol discovery. Allow shell only for concrete shell semantics such as build/test/git/package commands, env/path probes, raw bytes, mutation, generated artifacts, or meaningful pipeline behavior. If uncertain, choose allow_original with confidence low."
+        "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify by purpose from pending_call_features and compact_evidence. Use builtins for ordinary file reads/searches/listings when they preserve intent. Use Bifrost only for clear source-code symbol discovery. Allow shell only for concrete shell semantics such as build/test/git/package commands, env/path probes, compiler/preprocessor transformations, raw bytes, mutation, generated artifacts, or meaningful pipeline behavior. If uncertain, choose allow_original with confidence low."
     } else {
-        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Distinguish grep over file contents from grep filtering file paths: rg, git grep, grep -R, and find ... | xargs grep search contents; find ... | grep PATTERN without xargs/-exec grep filters paths. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, path-only filtering, or a pipeline whose transformation or exit behavior matters. Do not treat a pipeline as shell semantics when it only limits, counts, sorts, or pretty-prints inspection output. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is path inspection, not Bifrost and not content grep_search. For grep/rg/git-grep/find-xargs-grep commands over broad source contents, choose Bifrost when the pattern is bare source-symbol discovery: declarations, definitions, call sites, references, related tests, or broad code orientation. Choose builtin grep_search for exact text, exact-file scope, config/docs/log/error/header/import/wire/literal searches, counts, or paired literal token checks. Tie breakers: broad source/root symbol or declaration/call/reference search uses Bifrost; bounded config/test/exact-file/concrete-code-shape content search uses builtin; real execution behavior uses shell. Do not allow shell unless concrete shell execution semantics are required. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
+        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Distinguish grep over file contents from grep filtering file paths: rg, git grep, grep -R, and find ... | xargs grep search contents; find ... | grep PATTERN without xargs/-exec grep filters paths. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, compiler/preprocessor transformations, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, path-only filtering, or a pipeline whose transformation or exit behavior matters. Do not treat a pipeline as shell semantics when it only limits, counts, sorts, or pretty-prints inspection output. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is path inspection, not Bifrost and not content grep_search. For grep/rg/git-grep/find-xargs-grep commands over broad source contents, choose Bifrost when the pattern is bare source-symbol discovery: declarations, definitions, call sites, references, related tests, or broad code orientation. Choose builtin grep_search for exact text, exact-file scope, config/docs/log/error/header/import/wire/literal searches, counts, or paired literal token checks. Tie breakers: broad source/root symbol or declaration/call/reference search uses Bifrost; bounded config/test/exact-file/concrete-code-shape content search uses builtin; real execution behavior uses shell. Do not allow shell unless concrete shell execution semantics are required. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -2735,6 +2735,10 @@ fn shell_semantics_required(command: &str) -> bool {
     command_segments(command).iter().any(|segment| {
         build_test_git_package_like(segment)
             || process_control_or_inspection(segment)
+            || shell_conditional_probe_like(
+                &strip_harmless_shell_prefixes(segment).to_ascii_lowercase(),
+            )
+            || compiler_preprocessor_probe(segment)
             || raw_byte_probe(segment)
             || shell_mutates_files(segment)
             || script_raw_byte_or_format_probe(segment)
@@ -3004,6 +3008,26 @@ fn env_probe_like(lower: &str) -> bool {
         || normalized.starts_with("command -v ")
         || normalized.starts_with("go version")
         || normalized.starts_with("java -version")
+        || shell_conditional_probe_like(&normalized)
+}
+
+fn shell_conditional_probe_like(lower: &str) -> bool {
+    (lower.starts_with("if [[") || lower.starts_with("if [") || lower.starts_with("test "))
+        && (lower.contains(" -x ")
+            || lower.contains(" -e ")
+            || lower.contains(" -f ")
+            || lower.contains("command -v")
+            || lower.contains("which "))
+}
+
+fn compiler_preprocessor_probe(command: &str) -> bool {
+    let lower = strip_harmless_shell_prefixes(command).to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let name = words.next().unwrap_or("");
+    matches!(
+        name,
+        "cc" | "gcc" | "clang" | "cpp" | "c++" | "g++" | "clang++"
+    ) && words.any(|word| word == "-e" || word.starts_with("-e"))
 }
 
 fn raw_byte_probe(command: &str) -> bool {
@@ -5459,6 +5483,18 @@ mod tests {
         ));
         assert!(matches!(
             static_shell_route(&json!({"command": "./tool/go test -count=1 ./util/osuser"})),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(
+                &json!({"command": "if [[ -x \"$HOME/.local/share/TheAlgorithms__Java/jdk/current/bin/java\" ]]; then \"$HOME/.local/share/TheAlgorithms__Java/jdk/current/bin/java\" -version; else echo missing; fi"})
+            ),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(
+                &json!({"command": "cc -E -P -Iinclude -Isrc src/unix/pipe.c | grep -n \"int uv_pipe_chmod\\|int uv_pipe_getsockname\\|int uv_pipe_getpeername\" | head -20"})
+            ),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
