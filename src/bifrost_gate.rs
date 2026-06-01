@@ -1176,6 +1176,7 @@ fn strong_text_grep_allow_exception(
     if package_declaration_literal(pattern)
         || uppercase_error_constant_set(pattern)
         || mixed_error_constant_text_search(pattern)
+        || external_api_word_boundary_text_search(pattern)
         || config_or_build_text_scope(glob, path, file_path)
         || diagnostic_or_status_constant_text(pattern)
     {
@@ -1293,6 +1294,7 @@ fn hard_text_grep_allow_before_force(
     let kind = grep_pattern_kind(pattern, glob, path);
     config_or_build_text_scope(glob, path, file_path)
         || diagnostic_or_status_constant_text(pattern)
+        || external_api_word_boundary_text_search(pattern)
         || post_edit_scope_verification(pattern, glob, path, file_path, &context.tool_exchanges)
         || (test_only_literal_scope(glob, path, file_path)
             && (lower_snake_literal_token_count(pattern) > 0
@@ -1625,6 +1627,9 @@ fn deterministic_source_symbol_repair_tool(
     {
         return Some((RecommendedTool::SearchSymbols, "symbol discovery"));
     }
+    if broad_nav_scope && uppercase_constant_token_count(pattern) >= 2 {
+        return Some((RecommendedTool::SearchSymbols, "constant symbol discovery"));
+    }
     if broad_nav_scope && symbols.len() >= 3 {
         return Some((RecommendedTool::GetSummaries, "multi-symbol survey"));
     }
@@ -1799,6 +1804,19 @@ fn lower_snake_literal_token_count(pattern: &str) -> usize {
         .into_iter()
         .filter(|token| lowercase_wire_key_like(token) && !short_prefixed_source_symbol_like(token))
         .count()
+}
+
+fn external_api_word_boundary_text_search(pattern: &str) -> bool {
+    if !pattern.contains('|') || !pattern.contains("\\b") {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    tokens.len() >= 2
+        && tokens.iter().all(|token| {
+            token.len() >= 3
+                && token.chars().all(|ch| ch.is_ascii_lowercase())
+                && !token.contains('_')
+        })
 }
 
 fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
@@ -5374,6 +5392,100 @@ mod tests {
                 "path": ".",
                 "glob": "src/**/*.c",
                 "pattern": "uv_pipe_bind2|uv_pipe_connect2|pipe_bind2|pipe_connect2"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn external_api_word_boundary_grep_stays_allowed() {
+        let mut output = GateClassifierOutput {
+            reason: "Bifrost scan_usages would find call sites.".to_string(),
+            intent: TextIntent::SymbolUsageLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec![
+                    "futimens".to_string(),
+                    "fchown".to_string(),
+                    "fchmod".to_string(),
+                ],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["futimens", "fchown", "fchmod"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::ScanUsages,
+            suggested_args: json!({"symbols":["futimens", "fchown", "fchmod"]}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "src/unix/*.c",
+                "pattern": "\\bfutimens\\b|\\bfchown\\b|\\bfchmod\\b"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn uppercase_constant_symbol_glob_uses_search_symbols() {
+        let mut output = GateClassifierOutput {
+            reason: "Bifrost should find constant symbols.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec![
+                    "CHANNEL_RGB".to_string(),
+                    "CHANNEL_ALPHA".to_string(),
+                    "CHANNEL_ALL".to_string(),
+                ],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["CHANNEL_RGB", "CHANNEL_ALPHA", "CHANNEL_ALL"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({"patterns":["CHANNEL_RGB", "CHANNEL_ALPHA", "CHANNEL_ALL"]}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "src/**/*.php",
+                "pattern": "CHANNEL_RGB|CHANNEL_ALPHA|CHANNEL_ALL"
             }),
             messages: Vec::new(),
             tools: Vec::new(),
