@@ -72,7 +72,8 @@ struct Args {
     max_history_turns: usize,
 
     /// DEPRECATED. MCP servers are configured with `/mcp`; Bifrost is preinstalled
-    /// there as `bifrost --root {cwd} --server core`.
+    /// there as `bifrost --root {cwd} --server core` plus a separate
+    /// `bifrost-code-quality` bucket backed by `--server slopcop`.
     #[arg(long, env = "BROKK_BIFROST_BINARY", hide = true)]
     bifrost_binary: Option<PathBuf>,
 

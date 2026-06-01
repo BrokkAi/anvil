@@ -24,8 +24,8 @@ one reusable ACP subprocess and put a small client in front of it.
   `codex::gpt-5-codex`, `ollama::llama3:latest`, and
   `openrouter::anthropic/claude-sonnet-4.5`.
 - **MCP-native extensibility.** Anvil manages stdio MCP servers per session.
-  Bifrost is preinstalled as an MCP server for symbol search, cross-references,
-  and structural analysis.
+  Bifrost is preinstalled as MCP servers for symbol search, cross-references,
+  structural analysis, and a separate code-quality tool bucket.
 - **Real agent tooling.** Built-in file reads/writes, grep, directory listing,
   shell execution, explicit `think`, MCP tools, subagents, and skill slash
   commands.
@@ -199,10 +199,11 @@ Anvil reads MCP server configuration from its config file and manages stdio MCP
 subprocesses per session. New servers default to standard `Content-Length` MCP
 stdio framing; use `--framing line` only for NDJSON-speaking servers.
 
-Bifrost is preinstalled as an enabled MCP server:
+Bifrost is preinstalled as two enabled MCP servers:
 
 ```text
 bifrost --root {cwd} --server core  # line framing
+bifrost --root {cwd} --server slopcop  # exposed in Anvil as bifrost-code-quality
 ```
 
 Use `/mcp` in the editor to list or change MCP servers:
@@ -216,7 +217,9 @@ Use `/mcp` in the editor to list or change MCP servers:
 
 The `{cwd}` placeholder in arguments expands to the session workspace root. Use
 shell-style quoting for commands or args that contain spaces. Changes take
-effect on the next tool-capable prompt.
+effect on the next tool-capable prompt. The `bifrost` server keeps the core
+navigation and analyzer tools, while `bifrost-code-quality` exposes the
+separate audit-oriented code-quality bucket.
 
 Bifrost provides structural code-intelligence tools such as:
 

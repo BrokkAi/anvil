@@ -25,9 +25,12 @@ pub struct SetupState {
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_defaults_version: Option<u32>,
 }
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+const CURRENT_MCP_DEFAULTS_VERSION: u32 = 2;
 
 #[cfg(test)]
 thread_local! {
@@ -110,24 +113,81 @@ pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
     if path().is_err() {
         return Vec::new();
     }
-    let mut servers = read()
-        .mcp_servers
-        .unwrap_or_else(crate::mcp::default_servers);
-    let bifrost = crate::mcp::McpServerConfig::bifrost();
-    for server in &mut servers {
-        if server.name == bifrost.name
-            && server.command == bifrost.command
-            && server.args == bifrost.args
-            && server.framing == crate::mcp::McpFraming::ContentLength
-        {
-            server.framing = bifrost.framing;
-        }
+    let mut state = read();
+    let (servers, changed) = migrate_mcp_servers(&mut state);
+    if changed && write_inner(&state).is_err() {
+        tracing::warn!("failed to persist migrated MCP setup state");
     }
     servers
 }
 
+fn migrate_mcp_servers(state: &mut SetupState) -> (Vec<crate::mcp::McpServerConfig>, bool) {
+    let mut servers = state
+        .mcp_servers
+        .clone()
+        .unwrap_or_else(crate::mcp::default_servers);
+    let bifrost = crate::mcp::McpServerConfig::bifrost_core();
+    let bifrost_code_quality = crate::mcp::McpServerConfig::bifrost_code_quality();
+    let mut changed = normalize_builtin_mcp_servers(
+        &mut servers,
+        &[bifrost.clone(), bifrost_code_quality.clone()],
+    );
+
+    let legacy_defaults_need_upgrade = state.mcp_servers.is_some()
+        && state.mcp_defaults_version.unwrap_or(0) < CURRENT_MCP_DEFAULTS_VERSION;
+    if legacy_defaults_need_upgrade
+        && servers
+            .iter()
+            .any(|server| matches_builtin_server(server, &bifrost))
+        && !servers
+            .iter()
+            .any(|server| server.name == bifrost_code_quality.name)
+    {
+        servers.push(bifrost_code_quality);
+        changed = true;
+    }
+
+    if state.mcp_servers.is_some()
+        && (changed || state.mcp_defaults_version != Some(CURRENT_MCP_DEFAULTS_VERSION))
+    {
+        state.mcp_servers = Some(servers.clone());
+        state.mcp_defaults_version = Some(CURRENT_MCP_DEFAULTS_VERSION);
+        changed = true;
+    }
+
+    (servers, changed)
+}
+
+fn normalize_builtin_mcp_servers(
+    servers: &mut [crate::mcp::McpServerConfig],
+    builtins: &[crate::mcp::McpServerConfig],
+) -> bool {
+    let mut changed = false;
+    for server in servers {
+        for builtin in builtins {
+            if matches_builtin_server(server, builtin)
+                && server.framing == crate::mcp::McpFraming::ContentLength
+            {
+                server.framing = builtin.framing;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn matches_builtin_server(
+    server: &crate::mcp::McpServerConfig,
+    builtin: &crate::mcp::McpServerConfig,
+) -> bool {
+    server.name == builtin.name && server.command == builtin.command && server.args == builtin.args
+}
+
 pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
-    update(|state| state.mcp_servers = Some(servers))
+    update(|state| {
+        state.mcp_servers = Some(servers);
+        state.mcp_defaults_version = Some(CURRENT_MCP_DEFAULTS_VERSION);
+    })
 }
 
 pub fn remember_last_selection(
@@ -185,4 +245,106 @@ fn write_inner(state: &SetupState) -> Result<()> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn custom_server() -> crate::mcp::McpServerConfig {
+        crate::mcp::McpServerConfig {
+            name: "custom-search".to_string(),
+            command: "custom-search".to_string(),
+            args: vec!["--serve".to_string()],
+            framing: crate::mcp::McpFraming::ContentLength,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn read_mcp_servers_defaults_to_core_and_code_quality_bifrost() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+
+        assert_eq!(read_mcp_servers(), crate::mcp::default_servers());
+    }
+
+    #[test]
+    fn read_mcp_servers_migrates_legacy_single_bifrost_default() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+
+        write_inner(&SetupState {
+            mcp_servers: Some(vec![crate::mcp::McpServerConfig {
+                framing: crate::mcp::McpFraming::ContentLength,
+                ..crate::mcp::McpServerConfig::bifrost_core()
+            }]),
+            ..SetupState::default()
+        })
+        .expect("write setup state");
+
+        assert_eq!(
+            read_mcp_servers(),
+            vec![
+                crate::mcp::McpServerConfig::bifrost_core(),
+                crate::mcp::McpServerConfig::bifrost_code_quality(),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_mcp_servers_migrates_legacy_core_plus_custom_config() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+
+        write_inner(&SetupState {
+            mcp_servers: Some(vec![
+                crate::mcp::McpServerConfig {
+                    framing: crate::mcp::McpFraming::ContentLength,
+                    ..crate::mcp::McpServerConfig::bifrost_core()
+                },
+                custom_server(),
+            ]),
+            ..SetupState::default()
+        })
+        .expect("write setup state");
+
+        assert_eq!(
+            read_mcp_servers(),
+            vec![
+                crate::mcp::McpServerConfig::bifrost_core(),
+                custom_server(),
+                crate::mcp::McpServerConfig::bifrost_code_quality(),
+            ]
+        );
+    }
+
+    #[test]
+    fn migrated_code_quality_server_can_be_removed_persistently() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+
+        write_inner(&SetupState {
+            mcp_servers: Some(vec![crate::mcp::McpServerConfig::bifrost_core()]),
+            ..SetupState::default()
+        })
+        .expect("write setup state");
+
+        let migrated = read_mcp_servers();
+        assert_eq!(
+            migrated,
+            vec![
+                crate::mcp::McpServerConfig::bifrost_core(),
+                crate::mcp::McpServerConfig::bifrost_code_quality(),
+            ]
+        );
+
+        remember_mcp_servers(vec![crate::mcp::McpServerConfig::bifrost_core()])
+            .expect("persist explicit removal");
+
+        assert_eq!(
+            read_mcp_servers(),
+            vec![crate::mcp::McpServerConfig::bifrost_core()]
+        );
+    }
 }

@@ -76,19 +76,27 @@ fn default_enabled() -> bool {
 }
 
 impl McpServerConfig {
-    pub fn bifrost() -> Self {
+    fn bifrost_server(name: &str, server: &str) -> Self {
         Self {
-            name: "bifrost".to_string(),
+            name: name.to_string(),
             command: "bifrost".to_string(),
             args: vec![
                 "--root".to_string(),
                 "{cwd}".to_string(),
                 "--server".to_string(),
-                "core".to_string(),
+                server.to_string(),
             ],
             framing: McpFraming::Line,
             enabled: true,
         }
+    }
+
+    pub fn bifrost_core() -> Self {
+        Self::bifrost_server("bifrost", "core")
+    }
+
+    pub fn bifrost_code_quality() -> Self {
+        Self::bifrost_server("bifrost-code-quality", "slopcop")
     }
 
     pub fn rendered_args(&self, cwd: &Path) -> Vec<String> {
@@ -101,7 +109,10 @@ impl McpServerConfig {
 }
 
 pub fn default_servers() -> Vec<McpServerConfig> {
-    vec![McpServerConfig::bifrost()]
+    vec![
+        McpServerConfig::bifrost_core(),
+        McpServerConfig::bifrost_code_quality(),
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +443,17 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[test]
+    fn default_servers_include_core_and_code_quality_bifrost() {
+        assert_eq!(
+            default_servers(),
+            vec![
+                McpServerConfig::bifrost_core(),
+                McpServerConfig::bifrost_code_quality(),
+            ]
+        );
+    }
+
     /// Bifrost release the handshake test pins. Bumping bifrost is a deliberate
     /// edit here, not whatever happens to be on a contributor's `$PATH`.
     /// Must stay in sync with `BUNDLED_BIFROST_VERSION` in
@@ -629,7 +651,7 @@ mod tests {
         let config = McpServerConfig {
             name: "bifrost".to_string(),
             command: binary.display().to_string(),
-            args: McpServerConfig::bifrost().args,
+            args: McpServerConfig::bifrost_core().args,
             framing: McpFraming::Line,
             enabled: true,
         };
@@ -691,6 +713,58 @@ mod tests {
             .expect("list_symbols call should succeed");
         eprintln!(
             "list_symbols result: {}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_and_call_code_quality_tools() {
+        let binary = ensure_test_bifrost_binary().await;
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonicalize");
+
+        let config = McpServerConfig {
+            name: "bifrost-code-quality".to_string(),
+            command: binary.display().to_string(),
+            args: McpServerConfig::bifrost_code_quality().args,
+            framing: McpFraming::Line,
+            enabled: true,
+        };
+        let client = McpClient::spawn(&config, &cwd)
+            .await
+            .expect("bifrost code-quality subprocess should start");
+
+        let names: Vec<&str> = client.tools().iter().map(|t| t.name.as_str()).collect();
+        for expected in [
+            "compute_cyclomatic_complexity",
+            "compute_cognitive_complexity",
+            "report_secret_like_code",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing tool {expected} in {names:?}"
+            );
+        }
+
+        for tool_name in &names {
+            assert!(
+                crate::tools::is_known_tool(tool_name),
+                "bifrost code-quality server advertises '{tool_name}' but it is not in the TOOLS metadata table; \
+                 add a ToolMeta row in tools/mod.rs (current bifrost surface: {names:?})"
+            );
+        }
+
+        let result = client
+            .call_tool(
+                "compute_cyclomatic_complexity",
+                json!({ "file_paths": ["src/mcp.rs"] }),
+            )
+            .await
+            .expect("compute_cyclomatic_complexity call should succeed");
+        eprintln!(
+            "compute_cyclomatic_complexity result: {}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
     }

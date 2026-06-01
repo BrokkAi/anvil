@@ -2722,8 +2722,10 @@ fn mcp_usage() -> String {
      `content-length` is the standard MCP stdio framing and is the default for new \
      servers. Use `line` only for NDJSON-speaking servers. Use shell-style quoting \
      for commands or args that contain spaces, and use `{cwd}` in args to pass the \
-     current workspace root. Bifrost is preinstalled as \
-     `/mcp add --framing line bifrost bifrost --root '{cwd}' --server core`."
+     current workspace root. Bifrost is preinstalled as two enabled servers: \
+     `/mcp add --framing line bifrost bifrost --root '{cwd}' --server core` and \
+     `/mcp add --framing line bifrost-code-quality bifrost --root '{cwd}' --server slopcop` \
+     for the separate code-quality tool bucket."
         .to_string()
 }
 

@@ -2019,6 +2019,11 @@ mod tests {
 
     #[test]
     fn bifrost_classifier_is_skipped_immediately_after_gate_prompt() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
+            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
+            "1",
+        );
         let tools = vec![
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),

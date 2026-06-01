@@ -4403,7 +4403,7 @@ done
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
             command: fake_bifrost.display().to_string(),
-            args: crate::mcp::McpServerConfig::bifrost().args,
+            args: crate::mcp::McpServerConfig::bifrost_core().args,
             framing: crate::mcp::McpFraming::Line,
             enabled: true,
         }])
