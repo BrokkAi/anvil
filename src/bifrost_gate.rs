@@ -291,7 +291,6 @@ impl Default for ShellReplacementClass {
 pub enum ShellStaticRoute {
     AllowShell(&'static str),
     UseBuiltin(&'static str, RecommendedTool),
-    UseBifrost(&'static str, RecommendedTool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,7 +499,10 @@ impl From<RawShellClassifierOutput> for ShellClassifierOutput {
 }
 
 fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
-    if raw.confidence != GateConfidence::High {
+    if !matches!(
+        raw.confidence,
+        GateConfidence::High | GateConfidence::Medium
+    ) {
         return false;
     }
     if !matches!(
@@ -528,9 +530,6 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
             | TextScopeClass::MultiFileSourceScope
             | TextScopeClass::RepositoryWide
     ) {
-        return false;
-    }
-    if raw.allow_exception != TextAllowException::None {
         return false;
     }
     raw.bifrost_fit == BifrostFit::SameOrMoreDirect
@@ -662,6 +661,7 @@ pub fn static_text_route(
                 None
             }
         }
+        "list_directory" => Some(TextStaticRoute::AllowText("static_list_directory_allow")),
         _ => None,
     }
 }
@@ -909,7 +909,7 @@ fn build_request_body_with_mode(
     let system = if json_only_retry {
         "Return only a valid JSON object matching the schema. No prose, markdown, hidden commentary, action field, or final decision field. Classify the pending read_file/grep_search call as policy facts from pending_call_features and compact_evidence. The system will compute the executable route from those facts."
     } else {
-        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. Hard allow-text exceptions outrank generic symbol-looking text: exact file/path scope, exact regex/text, natural-language error/log text, diagnostic/status constants, config/build files, import/include/package/API syntax, operator/syntax regexes, bounded concrete test text, post-edit/build/test verification, non-source text, and observed targeted fallback for the same unresolved token/path after Bifrost returned empty/no-match. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Gate only when the pending search is broad source navigation over a bare source symbol or small set of bare source symbols, Bifrost is same-or-more-direct, and no allow-text exception applies. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct. When bifrost_candidate is not null, it must contain both `tool` and `args`; `tool` must exactly be one of search_symbols, scan_usages, get_summaries, or get_symbol_sources. Keep reason concise. Output only JSON matching the schema."
+        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. Always allow list_directory. For read_file, exact file/path/line/range inspection is allowed text; only broad redundant source reading after Bifrost found exact source is a possible symbol-navigation fact. Concrete code shape is not, by itself, an allow-text reason. First decide whether concrete syntax is the user's target, or merely a way to name a source symbol or source relationship. Treat concrete syntax as Bifrost symbol navigation when it encodes a declaration, definition, constructor, method call, static/member access, reference, caller/callee query, related-test query, or small set of source symbols over broad source/test scope. Examples include class Foo, function foo, def foo, new Foo(, Foo::, Foo., foo(, and Foo|Bar|Baz when these are project symbols. Treat concrete syntax as allow-text only when the exact characters, literal value, diagnostic text, config/build text, import/include/package line, operator syntax, assertion text, serialization/snapshot text, or localized post-edit verification text are the object of the search. A test scope does not make a symbol-looking query allow-text. Do not use exact regex as an allow-text reason when stripping regex wrappers leaves recoverable source symbols and the search is over broad source/test scope. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct: search_symbols for declarations/definitions, scan_usages for calls/references/related tests, get_summaries for broad orientation, and get_symbol_sources only when exact symbol names are already known. When bifrost_candidate is not null, it must contain both `tool` and `args`; `args` must be a JSON object; `tool` must exactly be one of search_symbols, scan_usages, get_summaries, or get_symbol_sources. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -987,7 +987,7 @@ fn build_shell_request_body_with_mode(
     let system = if json_only_retry {
         "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify by purpose from pending_call_features and compact_evidence. Use builtins for ordinary file reads/searches/listings when they preserve intent. Use Bifrost only for clear source-code symbol discovery. Allow shell only for concrete shell semantics such as build/test/git/package commands, env/path probes, raw bytes, mutation, generated artifacts, or meaningful pipeline behavior. If uncertain, choose allow_original with confidence low."
     } else {
-        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Distinguish grep over file contents from grep filtering file paths: rg, git grep, grep -R, and find ... | xargs grep search contents; find ... | grep PATTERN without xargs/-exec grep filters paths. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, path-only filtering, or a pipeline whose transformation or exit behavior matters. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is path inspection, not Bifrost and not content grep_search. For grep/rg/git-grep/find-xargs-grep commands over broad source contents, choose Bifrost when the pattern is bare source-symbol discovery: declarations, definitions, call sites, references, related tests, or broad code orientation. Choose builtin grep_search for exact text, exact-file scope, config/docs/log/error/header/import/wire/literal searches, counts, or paired literal token checks. Do not allow shell unless concrete shell execution semantics are required. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
+        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Distinguish grep over file contents from grep filtering file paths: rg, git grep, grep -R, and find ... | xargs grep search contents; find ... | grep PATTERN without xargs/-exec grep filters paths. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, path-only filtering, or a pipeline whose transformation or exit behavior matters. Do not treat a pipeline as shell semantics when it only limits, counts, sorts, or pretty-prints inspection output. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is path inspection, not Bifrost and not content grep_search. For grep/rg/git-grep/find-xargs-grep commands over broad source contents, choose Bifrost when the pattern is bare source-symbol discovery: declarations, definitions, call sites, references, related tests, or broad code orientation. Choose builtin grep_search for exact text, exact-file scope, config/docs/log/error/header/import/wire/literal searches, counts, or paired literal token checks. Tie breakers: broad source/root symbol or declaration/call/reference search uses Bifrost; bounded config/test/exact-file/concrete-code-shape content search uses builtin; real execution behavior uses shell. Do not allow shell unless concrete shell execution semantics are required. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -1038,6 +1038,21 @@ enum RoutePrefix {
 }
 
 fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
+    if !output.suggested_args.is_object() {
+        output.suggested_args = json!({});
+    }
+    if let Some(candidate) = output.bifrost_candidate.as_mut() {
+        if !candidate.args.is_object() {
+            candidate.args = json!({});
+        }
+        if !candidate
+            .tool
+            .as_ref()
+            .is_some_and(is_bifrost_recommendation)
+        {
+            output.bifrost_candidate = None;
+        }
+    }
     let must_allow = output.confidence != GateConfidence::High;
     if output.decision == GateClassifierDecision::AllowText
         || must_allow
@@ -1076,11 +1091,10 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
 
     let real_bifrost_miss =
         recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges);
-    let force_bifrost =
-        text_grep_force_bifrost_pattern(pattern, glob, path, file_path) && !real_bifrost_miss;
-    if must_allow_text_grep(pattern, glob, path, file_path)
-        || hard_text_grep_allow_before_force(pattern, glob, path, file_path, context)
-        || (!force_bifrost
+    let repair_tool =
+        deterministic_source_symbol_repair_tool(pattern, glob, path, file_path, context);
+    if repair_blocked_text_grep(pattern, glob, path, file_path, context)
+        || (repair_tool.is_none()
             && strong_text_grep_allow_exception(
                 pattern,
                 glob,
@@ -1091,6 +1105,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
                 context,
             ))
         || exact_error_constant_search(pattern, path, file_path)
+        || real_bifrost_miss
     {
         output.decision = GateClassifierDecision::AllowText;
         output.recommended_tool = RecommendedTool::None;
@@ -1102,24 +1117,37 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         return;
     }
 
-    if output.decision == GateClassifierDecision::AllowText
-        && !force_bifrost
-        && !record_policy_requires_bifrost(pattern, glob, path, file_path, context)
-    {
+    if let Some((tool, relation)) = repair_tool {
+        output.decision = GateClassifierDecision::GateToSymbolTool;
+        output.recommended_tool = tool;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "GATE_TO_SYMBOL_TOOL because broad source/test grep for `{}` is source-symbol {relation} navigation, not exact text/value search.",
+            truncate_to(pattern, 120)
+        );
+        output.confidence = GateConfidence::High;
         return;
     }
 
-    output.decision = GateClassifierDecision::GateToSymbolTool;
-    output.recommended_tool = deterministic_text_tool_for_grep(&output.intent, pattern, glob, path);
-    output.suggested_args = json!({});
-    output.reason = format!(
-        "GATE_TO_SYMBOL_TOOL because broad source/test grep for symbol-like pattern `{}` lacks a supported allow exception.",
-        truncate_to(pattern, 120)
-    );
+    if output.decision == GateClassifierDecision::AllowText {
+        return;
+    }
+    if !is_bifrost_recommendation(&output.recommended_tool) {
+        output.recommended_tool =
+            deterministic_text_tool_for_grep(&output.intent, pattern, glob, path);
+    }
+    if !is_bifrost_recommendation(&output.recommended_tool) {
+        output.decision = GateClassifierDecision::AllowText;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+    }
 }
 
 fn must_allow_text_grep(pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
     if grep_scope_granularity(glob, path, file_path) == "exact_file" {
+        return true;
+    }
+    if filename_or_resource_regex(pattern) || inline_regex_flag_text_search(pattern) {
         return true;
     }
     matches!(
@@ -1236,65 +1264,11 @@ fn strong_text_grep_allow_exception(
         && !pattern.contains(".*")
         && !pattern.contains("\\(")
     {
-        return true;
+        return !identifier_tokens(pattern)
+            .first()
+            .is_some_and(|token| high_confidence_source_symbol(token));
     }
     false
-}
-
-fn record_policy_requires_bifrost(
-    pattern: &str,
-    glob: &str,
-    path: &str,
-    file_path: &str,
-    context: &GateContext,
-) -> bool {
-    if grep_scope_granularity(glob, path, file_path) == "exact_file"
-        || must_allow_text_grep(pattern, glob, path, file_path)
-        || hard_text_grep_allow_before_force(pattern, glob, path, file_path, context)
-        || exact_error_constant_search(pattern, path, file_path)
-    {
-        return false;
-    }
-
-    if recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges) {
-        return false;
-    }
-
-    if text_grep_force_bifrost_pattern(pattern, glob, path, file_path) {
-        return true;
-    }
-
-    if (!text_grep_force_bifrost_pattern(pattern, glob, path, file_path)
-        && strong_text_grep_allow_exception(
-            pattern,
-            glob,
-            path,
-            file_path,
-            &BifrostFit::Unknown,
-            false,
-            context,
-        ))
-        || exact_error_constant_search(pattern, path, file_path)
-    {
-        return false;
-    }
-
-    let kind = grep_pattern_kind(pattern, glob, path);
-    if source_identifier_alternation(pattern) {
-        return true;
-    }
-    if !bifrost_navigation_scope(glob, path, file_path) && kind != GrepPatternKind::DeclarationForm
-    {
-        return false;
-    }
-
-    match kind {
-        GrepPatternKind::DeclarationForm
-        | GrepPatternKind::SymbolCallOrMember
-        | GrepPatternKind::SymbolFamilyOrRelationship => true,
-        GrepPatternKind::Unknown => symbol_like_pattern(pattern),
-        _ => false,
-    }
 }
 
 fn recent_bifrost_miss_for_grep(
@@ -1317,10 +1291,8 @@ fn hard_text_grep_allow_before_force(
     context: &GateContext,
 ) -> bool {
     let kind = grep_pattern_kind(pattern, glob, path);
-    let tokens = identifier_tokens(pattern);
     config_or_build_text_scope(glob, path, file_path)
         || diagnostic_or_status_constant_text(pattern)
-        || (!tokens.is_empty() && tokens.iter().all(|token| uppercase_constant_like(token)))
         || post_edit_scope_verification(pattern, glob, path, file_path, &context.tool_exchanges)
         || (test_only_literal_scope(glob, path, file_path)
             && (lower_snake_literal_token_count(pattern) > 0
@@ -1337,19 +1309,90 @@ fn hard_text_grep_allow_before_force(
             && !symbol_call_or_member(pattern))
 }
 
-fn text_grep_force_bifrost_pattern(pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
-    let kind = grep_pattern_kind(pattern, glob, path);
-    (bifrost_navigation_scope(glob, path, file_path)
-        && matches!(
-            kind,
-            GrepPatternKind::DeclarationForm
-                | GrepPatternKind::SymbolFamilyOrRelationship
-                | GrepPatternKind::SymbolCallOrMember
-        ))
-        || (bifrost_navigation_scope(glob, path, file_path)
-            && (constructor_or_static_call_usage_pattern(pattern)
-                || symbol_assignment_or_subscription_pattern(pattern)))
-        || source_directory_high_confidence_symbol(pattern, glob, path, file_path, kind)
+fn repair_blocked_text_grep(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    context: &GateContext,
+) -> bool {
+    must_allow_text_grep(pattern, glob, path, file_path)
+        || hard_text_grep_allow_before_force(pattern, glob, path, file_path, context)
+        || config_or_build_text_scope(glob, path, file_path)
+        || exact_file_or_narrow_local_probe(pattern, glob, path, file_path)
+        || bounded_test_literal_probe(pattern, glob, path, file_path)
+        || filename_or_resource_regex(pattern)
+        || inline_regex_flag_text_search(pattern)
+}
+
+fn exact_file_or_narrow_local_probe(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+) -> bool {
+    if grep_scope_granularity(glob, path, file_path) == "exact_file" {
+        return true;
+    }
+    if !narrow_component_scope(glob, path, file_path) || declaration_search_pattern(pattern) {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    (single_identifier_pattern(pattern)
+        && !tokens
+            .first()
+            .is_some_and(|token| high_confidence_source_symbol(token)))
+        || source_call_navigation_pattern(pattern)
+        || exact_member_chain_or_call_text(pattern)
+        || filename_or_resource_regex(pattern)
+        || inline_regex_flag_text_search(pattern)
+        || (regex_text_semantics_material(pattern) && !source_static_or_member_access(pattern))
+}
+
+fn bounded_test_literal_probe(pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
+    if !bounded_test_scope(glob, path, file_path) || declaration_search_pattern(pattern) {
+        return false;
+    }
+    single_identifier_pattern(pattern)
+        || lower_snake_literal_token_count(pattern) > 0
+        || uppercase_constant_token_count(pattern) > 0
+        || filename_or_resource_regex(pattern)
+        || inline_regex_flag_text_search(pattern)
+        || matches!(
+            grep_pattern_kind(pattern, glob, path),
+            GrepPatternKind::CodeIdiom
+                | GrepPatternKind::ExactImportOrInclude
+                | GrepPatternKind::ErrorMessageOrLogText
+                | GrepPatternKind::WireKeyOrSerializationKey
+                | GrepPatternKind::HeaderOrProtocolLiteral
+                | GrepPatternKind::NumericOrCodepointLiteral
+                | GrepPatternKind::TestTextSearch
+                | GrepPatternKind::PackageDeclarationLiteral
+                | GrepPatternKind::NaturalLanguageOrPathLiteral
+                | GrepPatternKind::AssertionOrSerializationText
+                | GrepPatternKind::ExactMemberChainOrCallText
+        )
+}
+
+fn inline_regex_flag_text_search(pattern: &str) -> bool {
+    ["(?i)", "(?-i)", "(?m)", "(?s)"]
+        .iter()
+        .any(|flag| pattern.contains(flag))
+}
+
+fn filename_or_resource_regex(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    if !lower.contains("\\.") {
+        return false;
+    }
+    let has_suffix = [
+        "\\.scala", "\\.java", "\\.cs", "\\.php", "\\.go", "\\.c", "\\.h", "\\.m3u", "\\.json",
+        "\\.xml", "\\.yaml", "\\.yml", "\\.sbt", "\\.md",
+    ]
+    .iter()
+    .any(|suffix| lower.contains(suffix))
+        || lower.ends_with('$');
+    has_suffix && !pattern.contains("\\(") && !declaration_search_pattern(pattern)
 }
 
 fn constructor_or_static_call_usage_pattern(pattern: &str) -> bool {
@@ -1360,11 +1403,77 @@ fn constructor_or_static_call_usage_pattern(pattern: &str) -> bool {
             .any(|token| symbol_like_pattern(token))
 }
 
-fn symbol_assignment_or_subscription_pattern(pattern: &str) -> bool {
-    let tokens = identifier_tokens(pattern);
-    tokens.len() == 1
-        && symbol_like_pattern(&tokens[0])
-        && (pattern.contains("\\+=") || pattern.contains("+="))
+fn deterministic_source_symbol_repair_tool(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    context: &GateContext,
+) -> Option<(RecommendedTool, &'static str)> {
+    if repair_blocked_text_grep(pattern, glob, path, file_path, context)
+        || classify_path_or_glob(&normalized_grep_scope(glob, path, file_path))
+            == StaticTextTarget::TextLike
+        || exact_error_constant_search(pattern, path, file_path)
+        || diagnostic_or_status_constant_text(pattern)
+        || (literal_value_text_target(pattern)
+            && !(declaration_search_pattern(pattern)
+                || constructor_or_static_call_usage_pattern(pattern)
+                || source_static_or_member_access(pattern)
+                || source_call_navigation_pattern(pattern)))
+        || import_include_or_package_text_target(pattern)
+        || assertion_or_serialization_text(pattern)
+        || recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges)
+    {
+        return None;
+    }
+
+    let scope = normalized_grep_scope(glob, path, file_path);
+    let broad_nav_scope = bifrost_navigation_scope(glob, path, file_path);
+    let declaration_component_scope = declaration_search_pattern(pattern)
+        && is_source_like_path(&scope)
+        && !bounded_test_scope(glob, path, file_path)
+        && !broad_test_scope(glob, path, file_path);
+    let high_conf_dir_symbol =
+        source_directory_high_confidence_symbol(pattern, glob, path, file_path);
+    if declaration_keyword_survey_pattern(pattern) && broad_nav_scope {
+        return Some((RecommendedTool::GetSummaries, "declaration-keyword survey"));
+    }
+    if !broad_nav_scope && !declaration_component_scope && !high_conf_dir_symbol {
+        return None;
+    }
+    let symbols = recoverable_source_symbols(pattern);
+    if symbols.is_empty() {
+        return None;
+    }
+
+    if declaration_search_pattern(pattern) {
+        return Some((RecommendedTool::SearchSymbols, "declaration"));
+    }
+    if broad_nav_scope
+        && (constructor_or_static_call_usage_pattern(pattern)
+            || source_static_or_member_access(pattern)
+            || source_call_navigation_pattern(pattern))
+    {
+        return Some((RecommendedTool::ScanUsages, "call/reference"));
+    }
+    if broad_nav_scope
+        && symbols.len() >= 2
+        && symbols
+            .iter()
+            .all(|symbol| symbol.contains('_') && !symbol.chars().all(|ch| ch.is_ascii_uppercase()))
+    {
+        return Some((RecommendedTool::SearchSymbols, "symbol discovery"));
+    }
+    if broad_nav_scope && symbols.len() >= 3 {
+        return Some((RecommendedTool::GetSummaries, "multi-symbol survey"));
+    }
+    if broad_nav_scope && symbols.len() >= 2 {
+        return Some((RecommendedTool::SearchSymbols, "symbol discovery"));
+    }
+    if high_conf_dir_symbol {
+        return Some((RecommendedTool::SearchSymbols, "symbol discovery"));
+    }
+    None
 }
 
 fn source_directory_high_confidence_symbol(
@@ -1372,39 +1481,136 @@ fn source_directory_high_confidence_symbol(
     glob: &str,
     path: &str,
     file_path: &str,
-    kind: GrepPatternKind,
 ) -> bool {
-    matches!(grep_scope_granularity(glob, path, file_path), "directory")
-        && glob.contains('*')
-        && is_source_like_path(glob)
-        && is_source_like_path(&format!("{glob} {path} {file_path}"))
+    let kind = grep_pattern_kind(pattern, glob, path);
+    grep_scope_granularity(glob, path, file_path) == "directory"
+        && is_source_like_path(&normalized_grep_scope(glob, path, file_path))
         && matches!(
             kind,
             GrepPatternKind::SymbolFamilyOrRelationship | GrepPatternKind::DeclarationForm
         )
         && single_identifier_pattern(pattern)
-        && high_confidence_symbol_name(pattern)
+        && identifier_tokens(pattern)
+            .first()
+            .is_some_and(|token| high_confidence_source_symbol(token))
         && !regex_text_semantics_material(pattern)
+}
+
+fn recoverable_source_symbols(pattern: &str) -> Vec<String> {
+    const KEYWORDS: &[&str] = &[
+        "abstract",
+        "case",
+        "class",
+        "def",
+        "enum",
+        "false",
+        "func",
+        "function",
+        "interface",
+        "new",
+        "object",
+        "static",
+        "struct",
+        "trait",
+        "true",
+        "type",
+        "virtual",
+        "void",
+    ];
+    let mut symbols = Vec::new();
+    for token in identifier_tokens(pattern) {
+        let lower = token.to_ascii_lowercase();
+        if KEYWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if token.len() >= 3
+            && (symbol_like_pattern(&token)
+                || (token.contains('_') && short_prefixed_source_symbol_like(&token)))
+            && !symbols.iter().any(|prior| prior == &token)
+        {
+            symbols.push(token);
+        }
+    }
+    symbols
+}
+
+fn high_confidence_source_symbol(token: &str) -> bool {
+    if token.contains('_') {
+        return false;
+    }
+    let Some(first) = token.chars().next() else {
+        return false;
+    };
+    first.is_ascii_uppercase()
+        && !token.chars().all(|ch| ch.is_ascii_uppercase())
+        && (token.len() >= 12 || token.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 3)
+}
+
+fn source_static_or_member_access(pattern: &str) -> bool {
+    let symbols = recoverable_source_symbols(pattern);
+    !symbols.is_empty()
+        && (pattern.contains("::")
+            || pattern.contains("->")
+            || pattern.contains("\\.")
+            || pattern.contains('.'))
+}
+
+fn source_call_navigation_pattern(pattern: &str) -> bool {
+    let symbols = recoverable_source_symbols(pattern);
+    !symbols.is_empty() && (pattern.contains("\\(") || pattern.contains("\\s*\\("))
+}
+
+fn literal_value_text_target(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    numeric_or_codepoint_literal(pattern)
+        || header_or_protocol_literal(pattern, &lower)
+        || wire_key_or_serialization_key(pattern)
+        || natural_language_or_path_literal(pattern)
+        || mixed_lower_snake_serialization_or_config_search(pattern)
+        || assertion_or_build_string_regex_text(pattern)
+}
+
+fn declaration_keyword_survey_pattern(pattern: &str) -> bool {
+    let parts: Vec<String> = pattern
+        .split('|')
+        .map(|part| part.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts.len() >= 2
+        && parts.iter().all(|part| {
+            matches!(
+                part.as_str(),
+                "class"
+                    | "object"
+                    | "trait"
+                    | "interface"
+                    | "enum"
+                    | "def"
+                    | "func"
+                    | "function"
+                    | "struct"
+                    | "type"
+            )
+        })
+}
+
+fn import_include_or_package_text_target(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    lower.contains("#include")
+        || lower.contains("import ")
+        || lower.contains("package ")
+        || lower.contains("using ")
+        || pattern.contains('/')
+        || pattern.contains("\\/")
+        || pattern.contains("\\+")
+        || (pattern.contains("\\.") && pattern.contains("\\+"))
+        || pattern.contains("\\\"")
+        || pattern.contains('"')
 }
 
 fn single_identifier_pattern(pattern: &str) -> bool {
     let tokens = identifier_tokens(pattern);
     tokens.len() == 1 && tokens[0] == pattern.trim()
-}
-
-fn high_confidence_symbol_name(pattern: &str) -> bool {
-    let token = pattern.trim();
-    let Some(first) = token.chars().next() else {
-        return false;
-    };
-    first.is_ascii_uppercase()
-        && symbol_like_pattern(token)
-        && !uppercase_constant_like(token)
-        && (camel_hump_count(token) >= 3 || token.len() >= 16)
-}
-
-fn camel_hump_count(token: &str) -> usize {
-    token.chars().filter(|ch| ch.is_ascii_uppercase()).count()
 }
 
 fn exact_error_constant_search(pattern: &str, path: &str, file_path: &str) -> bool {
@@ -1416,18 +1622,6 @@ fn exact_error_constant_search(pattern: &str, path: &str, file_path: &str) -> bo
         && tokens
             .iter()
             .all(|token| token.chars().all(|ch| ch.is_ascii_uppercase()) && token.contains("ERR"))
-}
-
-fn source_identifier_alternation(pattern: &str) -> bool {
-    let tokens = identifier_tokens(pattern);
-    pattern.contains('|')
-        && tokens.len() >= 2
-        && tokens
-            .iter()
-            .filter(|token| symbol_like_pattern(token))
-            .count()
-            >= 2
-        && !mixed_lower_snake_serialization_or_config_search(pattern)
 }
 
 fn uppercase_constant_token_count(pattern: &str) -> usize {
@@ -1563,30 +1757,31 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
         output.confidence = GateConfidence::High;
         return;
     }
-    if let Some(tool) = strong_shell_source_symbol_search(command) {
-        output.decision = ShellClassifierDecision::UseBifrostTool;
-        output.recommended_tool = tool.clone();
-        output.suggested_args = json!({});
-        output.reason = format!(
-            "USE_BIFROST_TOOL because broad source shell search `{}` is source-symbol discovery with no shell-specific semantic or builtin-only exception.",
-            truncate_to(command, 160)
-        );
-        output.intent = if tool == RecommendedTool::ScanUsages {
-            ShellIntent::SymbolReferenceLookup
-        } else {
-            ShellIntent::SymbolDefinitionLookup
-        };
-        output.shell_semantics_required = false;
-        output.builtin_preserves_intent = false;
-        output.bifrost_fit = BifrostFit::SameOrMoreDirect;
-        output.allow_exception = ShellAllowException::None;
-        output.replacement_class = ShellReplacementClass::UseBifrostSymbol;
-        output.confidence = GateConfidence::High;
-        return;
+    if output.decision == ShellClassifierDecision::AllowShell {
+        if let Some(tool) = strong_shell_source_symbol_search(command) {
+            output.decision = ShellClassifierDecision::UseBifrostTool;
+            let intent = if tool == RecommendedTool::ScanUsages {
+                ShellIntent::SymbolReferenceLookup
+            } else {
+                ShellIntent::SymbolDefinitionLookup
+            };
+            output.recommended_tool = tool;
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "USE_BIFROST_TOOL because `{}` is broad source-content symbol search and no concrete shell semantic is required.",
+                truncate_to(command, 160)
+            );
+            output.intent = intent;
+            output.allow_exception = ShellAllowException::None;
+            output.replacement_class = ShellReplacementClass::UseBifrostSymbol;
+            output.bifrost_fit = BifrostFit::SameOrMoreDirect;
+            output.builtin_preserves_intent = false;
+            output.confidence = GateConfidence::High;
+            return;
+        }
     }
     if output.decision == ShellClassifierDecision::AllowShell
         && (simple_shell_read_like(command)
-            || simple_shell_search_like(command)
             || script_exact_file_text_inspection(command)
             || script_bounded_file_text_inspection(command))
     {
@@ -1839,6 +2034,16 @@ fn grep_search_features(args: &Value, exchanges: &[ToolExchange]) -> Value {
         "recent_bifrost_miss_overlap": overlaps_recent_bifrost_miss(pattern, exchanges),
         "search_scope": search_scope(glob, path),
         "pattern_shape": pattern_shape(pattern),
+        "scope_kind": grep_scope_kind(glob, path, file_path),
+        "is_source_root_wide": is_source_root_wide_grep_scope(glob, path, file_path),
+        "is_test_scope": bounded_test_scope(glob, path, file_path),
+        "is_config_or_build_scope": config_or_build_text_scope(glob, path, file_path),
+        "is_exact_file_scope": scope_granularity == "exact_file",
+        "looks_like_single_identifier": single_identifier_pattern(pattern),
+        "looks_like_call_pattern": symbol_call_or_member(pattern) || constructor_or_static_call_usage_pattern(pattern),
+        "looks_like_declaration_pattern": declaration_search_pattern(pattern),
+        "looks_like_concrete_code_shape": concrete_code_shape_pattern(pattern),
+        "post_edit_or_verification_context": post_edit_scope_verification(pattern, glob, path, file_path, exchanges),
         "prior_bifrost_result_status": prior_bifrost_result_status(pattern, exchanges),
     })
 }
@@ -1931,6 +2136,15 @@ fn shell_command_features(args: &Value) -> Value {
         "simple_search_like": simple_shell_search_like(command),
         "symbol_search_like": shell_symbol_search_like(command),
         "shell_search_stream": shell_search_stream(command),
+        "shell_search_pattern": shell_search_pattern(command),
+        "source_scope": command_has_source_scope(command),
+        "source_root_wide": command_has_source_scope(command) && !shell_search_has_exact_file_scope(command),
+        "exact_file_scope": shell_search_has_exact_file_scope(command),
+        "config_or_build_scope": shell_search_targets_config_or_docs(&command.to_ascii_lowercase()),
+        "looks_like_single_identifier": shell_search_pattern(command).is_some_and(|pattern| single_identifier_pattern(&pattern)),
+        "looks_like_call_pattern": shell_search_pattern(command).is_some_and(|pattern| shell_call_or_member_search(&pattern) || constructor_or_static_call_usage_pattern(&pattern)),
+        "looks_like_declaration_pattern": shell_search_pattern(command).is_some_and(|pattern| declaration_search_pattern(&pattern)),
+        "looks_like_concrete_code_shape": shell_search_pattern(command).is_some_and(|pattern| concrete_code_shape_pattern(&pattern)),
         "script_raw_byte_or_format_probe": script_raw_byte_or_format_probe(command),
         "script_mutates_files": script_mutates_files(command),
         "shell_semantics_required_by_features": shell_semantics_required_by_features(args),
@@ -2055,19 +2269,22 @@ fn search_scope(glob: &str, path: &str) -> &'static str {
 }
 
 fn grep_scope_target(glob: &str, path: &str, file_path: &str) -> String {
-    if !file_path.trim().is_empty() {
-        file_path.trim().to_string()
-    } else if !glob.trim().is_empty()
-        && (path.trim().is_empty() || path.trim() == ".")
-        && !glob.contains('*')
-        && is_source_like_path(glob)
-        && glob.contains('.')
-    {
-        glob.trim().to_string()
-    } else if !path.trim().is_empty() {
-        path.trim().to_string()
+    let glob = glob.trim();
+    let path = path.trim();
+    let file_path = file_path.trim();
+    if !file_path.is_empty() {
+        return file_path.to_string();
+    }
+    if !glob.is_empty() && !glob.contains('*') && glob.contains('.') {
+        if path.is_empty() || path == "." || glob.contains('/') {
+            return glob.to_string();
+        }
+        return format!("{}/{}", path.trim_end_matches('/'), glob);
+    }
+    if !path.is_empty() {
+        path.to_string()
     } else {
-        glob.trim().to_string()
+        glob.to_string()
     }
 }
 
@@ -2095,11 +2312,7 @@ fn normalized_grep_scope(glob: &str, path: &str, file_path: &str) -> String {
 
 fn grep_scope_granularity(glob: &str, path: &str, file_path: &str) -> &'static str {
     let target = grep_scope_target(glob, path, file_path);
-    if target != "."
-        && !target.contains('*')
-        && is_source_like_path(&target)
-        && target.contains('.')
-    {
+    if target != "." && !target.contains('*') && target.contains('.') {
         return "exact_file";
     }
     if target.is_empty() || target == "." {
@@ -2123,6 +2336,36 @@ fn broad_source_or_test_scope(glob: &str, path: &str) -> bool {
         || combined.contains("/test")
         || combined.contains("tests/")
         || combined.contains("/tests")
+}
+
+fn grep_scope_kind(glob: &str, path: &str, file_path: &str) -> &'static str {
+    let granularity = grep_scope_granularity(glob, path, file_path);
+    if granularity == "exact_file" {
+        "exact_file"
+    } else if config_or_build_text_scope(glob, path, file_path) {
+        "config_or_build"
+    } else if bounded_test_scope(glob, path, file_path) {
+        "bounded_test"
+    } else if broad_test_scope(glob, path, file_path) {
+        "broad_test"
+    } else if matches!(granularity, "repo_wide" | "source_glob")
+        || source_root_scope(glob, path, file_path)
+    {
+        "source_root_wide"
+    } else if narrow_component_scope(glob, path, file_path) {
+        "narrow_component"
+    } else if shallow_component_scope(glob, path, file_path) {
+        "shallow_component"
+    } else {
+        "unknown"
+    }
+}
+
+fn is_source_root_wide_grep_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    matches!(
+        grep_scope_kind(glob, path, file_path),
+        "source_root_wide" | "broad_test"
+    )
 }
 
 fn path_is_repo_root(path: &str) -> bool {
@@ -2419,7 +2662,7 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
     if command.is_empty() {
         return None;
     }
-    if script_exact_file_text_inspection(command) {
+    if script_exact_file_text_inspection(command) || script_bounded_file_text_inspection(command) {
         return Some(ShellStaticRoute::UseBuiltin(
             "static_shell_exact_file_inspection",
             RecommendedTool::ReadFile,
@@ -2431,36 +2674,22 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
     if shell_search_stream(command) == ShellSearchStream::FilePaths {
         return Some(ShellStaticRoute::AllowShell("static_shell_path_filter"));
     }
-    if script_broad_source_symbol_search(command) {
-        return Some(ShellStaticRoute::UseBifrost(
-            "static_shell_recursive_symbol_search",
-            RecommendedTool::ScanUsages,
-        ));
+    if shell_search_pattern(command).is_some() {
+        return None;
     }
-    if let Some(tool) = strong_shell_source_symbol_search(command) {
-        return Some(ShellStaticRoute::UseBifrost(
-            "static_shell_symbol_search",
-            tool,
-        ));
-    }
-    if scriptish(&command.to_ascii_lowercase())
-        && recursive_source_traversal(&command.to_ascii_lowercase())
-    {
+    if simple_shell_read_like(command) && !simple_shell_search_like(command) {
         return Some(ShellStaticRoute::UseBuiltin(
-            "static_shell_recursive_text_search",
-            RecommendedTool::GrepSearch,
-        ));
-    }
-    if shell_builtin_inspection_guard(command) {
-        return Some(ShellStaticRoute::UseBuiltin(
-            "static_shell_builtin_guard",
+            "static_shell_builtin_inspection",
             builtin_tool_for_shell_command(command),
         ));
     }
     if ambiguous_source_shell_search(command) {
         return None;
     }
-    if simple_shell_read_like(command) || simple_shell_search_like(command) {
+    if shell_search_stream(command) == ShellSearchStream::FileContents {
+        return None;
+    }
+    if simple_shell_read_like(command) {
         return Some(ShellStaticRoute::UseBuiltin(
             "static_shell_builtin_inspection",
             builtin_tool_for_shell_command(command),
@@ -2683,18 +2912,6 @@ fn script_bounded_file_text_inspection(command: &str) -> bool {
         && source_path_literal_count(&lower) >= 1
 }
 
-fn script_broad_source_symbol_search(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    if !scriptish(&lower)
-        || script_mutates_files(command)
-        || script_raw_byte_or_format_probe(command)
-        || !recursive_source_traversal(&lower)
-    {
-        return false;
-    }
-    script_contains_symbol_call_or_declaration(command)
-}
-
 fn recursive_source_traversal(lower_command: &str) -> bool {
     (lower_command.contains(".rglob(")
         || lower_command.contains(".glob(")
@@ -2728,10 +2945,6 @@ fn true_script_raw_byte_or_format_probe(command: &str) -> bool {
             && (lower.contains(" in text")
                 || lower.contains(" in content")
                 || lower.contains(".count(")))
-}
-
-fn script_contains_symbol_call_or_declaration(command: &str) -> bool {
-    declaration_search_pattern(command)
 }
 
 fn script_recursive_constructor_or_call_search(command: &str) -> bool {
@@ -2823,9 +3036,32 @@ fn simple_shell_search_like(command: &str) -> bool {
         lower.starts_with("rg ")
             || lower.starts_with("grep ")
             || lower.starts_with("git grep ")
-            || lower.contains(" xargs grep ")
-            || lower.contains(" xargs rg ")
+            || xargs_content_grep(&lower)
     })
+}
+
+fn xargs_content_grep(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.trim_matches(['"', '\'']).rsplit('/').next() != Some("xargs") {
+            continue;
+        }
+        let mut probe = index + 1;
+        while probe < tokens.len() && tokens[probe].starts_with('-') {
+            probe += 1;
+        }
+        if probe < tokens.len() {
+            let cmd = tokens[probe]
+                .trim_matches(['"', '\''])
+                .rsplit('/')
+                .next()
+                .unwrap_or(tokens[probe]);
+            if matches!(cmd, "grep" | "rg") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2839,8 +3075,7 @@ enum ShellSearchStream {
 
 fn shell_search_stream(command: &str) -> ShellSearchStream {
     let lower = command.to_ascii_lowercase();
-    if lower.contains(" xargs grep")
-        || lower.contains(" xargs rg")
+    if xargs_content_grep(&lower)
         || lower.contains(" -exec grep")
         || lower.contains(" -exec rg")
         || lower.contains("git grep")
@@ -3356,6 +3591,12 @@ fn config_or_build_text_scope(glob: &str, path: &str, file_path: &str) -> bool {
         ".json",
         ".md",
         ".txt",
+        ".csproj",
+        ".fsproj",
+        ".vbproj",
+        ".sln",
+        ".proj",
+        "project/",
     ]
     .iter()
     .any(|needle| scope.contains(needle))
@@ -3391,6 +3632,20 @@ fn import_api_or_operator_regex_text(pattern: &str) -> bool {
         || pattern.contains("\\s*\"")
         || pattern.contains("::")
         || pattern.contains("->")
+}
+
+fn concrete_code_shape_pattern(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    import_api_or_operator_regex_text(pattern)
+        || assertion_or_build_string_regex_text(pattern)
+        || lower.contains("projectreference")
+        || lower.contains("methodsource")
+        || lower.contains("scheme.")
+        || lower.contains("startobject")
+        || pattern.contains("\\s*=")
+        || pattern.contains(".*=")
+        || pattern.contains("\"")
+        || pattern.contains("'")
 }
 
 fn assertion_or_serialization_text(pattern: &str) -> bool {
@@ -3688,6 +3943,11 @@ fn text_like_extension(input: &str) -> bool {
         ".xml",
         ".html",
         ".css",
+        ".csproj",
+        ".fsproj",
+        ".vbproj",
+        ".sln",
+        ".proj",
     ];
     TEXT_EXTENSIONS.iter().any(|ext| input.ends_with(ext))
 }
@@ -3836,8 +4096,9 @@ mod tests {
         assert!(body.contains("advising a stronger coding model"));
         assert!(body.contains("policy-fact extractor"));
         assert!(body.contains("Do not include an action field or final decision field"));
-        assert!(body.contains("Hard allow-text exceptions outrank generic symbol-looking text"));
-        assert!(body.contains("Gate only when the pending search is broad source navigation"));
+        assert!(body.contains("Concrete code shape is not, by itself, an allow-text reason"));
+        assert!(body.contains("Treat concrete syntax as Bifrost symbol navigation"));
+        assert!(body.contains("Do not use exact regex as an allow-text reason"));
         assert!(body.contains("Keep reason concise"));
     }
 
@@ -4162,7 +4423,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_symbol_grep_with_invalid_allow_facts_is_repaired_to_gate() {
+    fn broad_symbol_grep_with_invalid_allow_facts_is_not_repaired_to_gate() {
         let mut output = GateClassifierOutput {
             reason: "ALLOW_TEXT because regex can find the identifier.".to_string(),
             intent: TextIntent::SymbolDefinitionLookup,
@@ -4246,7 +4507,7 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_declaration_grep_repairs_to_search_symbols() {
+    fn low_confidence_broad_declaration_grep_repairs_to_bifrost() {
         let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
         let context = GateContext {
             tool_name: "grep_search".to_string(),
@@ -4404,26 +4665,30 @@ mod tests {
     }
 
     #[test]
-    fn broad_source_naming_variants_still_gate() {
+    fn broad_source_naming_variants_repair_symbol_navigation() {
         let cases = [
             (
                 json!({"pattern": "uv_udp_try_send\\|uv__udp_try_send", "glob": "**/*.c"}),
+                GateClassifierDecision::GateToSymbolTool,
                 RecommendedTool::SearchSymbols,
             ),
             (
                 json!({"pattern": "Exiting\\s*\\+=", "glob": "*.cs", "path": "src/Notepads"}),
-                RecommendedTool::SearchSymbols,
+                GateClassifierDecision::AllowText,
+                RecommendedTool::None,
             ),
             (
                 json!({"pattern": "new Size\\(|Size::create\\(", "glob": "tests/**/*.php", "path": "."}),
+                GateClassifierDecision::GateToSymbolTool,
                 RecommendedTool::ScanUsages,
             ),
             (
                 json!({"pattern": "NewInvalidArgumentError", "glob": "*.go", "path": "modules/util"}),
+                GateClassifierDecision::GateToSymbolTool,
                 RecommendedTool::SearchSymbols,
             ),
         ];
-        for (args, expected_tool) in cases {
+        for (args, expected_decision, expected_tool) in cases {
             let context = GateContext {
                 tool_name: "grep_search".to_string(),
                 args,
@@ -4436,7 +4701,7 @@ mod tests {
 
             enforce_text_classifier_policy(&mut output, &context);
 
-            assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+            assert_eq!(output.decision, expected_decision);
             assert_eq!(output.recommended_tool, expected_tool);
         }
     }
@@ -4450,10 +4715,6 @@ mod tests {
             ("Size", "modules/util"),
             ("TODO", "modules/util"),
             ("Status", "modules/util"),
-            (
-                "RichEditBoxDefaultLineEnding",
-                "src/Notepads/Controls/TextEditor",
-            ),
         ] {
             let context = GateContext {
                 tool_name: "grep_search".to_string(),
@@ -4486,10 +4747,23 @@ mod tests {
             );
             assert_eq!(output.recommended_tool, RecommendedTool::None, "{pattern}");
         }
+
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "RichEditBoxDefaultLineEnding", "glob": "", "path": "src/Notepads/Controls/TextEditor"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+        let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
+        output.confidence = GateConfidence::High;
+        enforce_text_classifier_policy(&mut output, &context);
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
     }
 
     #[test]
-    fn shell_content_symbol_search_routes_to_bifrost_not_builtin() {
+    fn shell_content_symbol_search_respects_classifier_route() {
         let mut output = ShellClassifierOutput {
             reason: "USE_BUILTIN_TOOL because grep_search can search text.".to_string(),
             intent: ShellIntent::SymbolDefinitionLookup,
@@ -4513,8 +4787,8 @@ mod tests {
 
         enforce_shell_classifier_policy(&mut output, &context);
 
-        assert_eq!(output.decision, ShellClassifierDecision::UseBifrostTool);
-        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+        assert_eq!(output.decision, ShellClassifierDecision::UseBuiltinTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::GrepSearch);
     }
 
     #[test]
@@ -4649,7 +4923,7 @@ mod tests {
     }
 
     #[test]
-    fn c_api_lower_snake_symbol_grep_is_not_serialization_text() {
+    fn c_api_lower_snake_symbol_grep_repairs_to_bifrost() {
         let mut output = GateClassifierOutput {
             reason: "ALLOW_TEXT because exact regex text was requested.".to_string(),
             intent: TextIntent::SymbolDefinitionLookup,
@@ -4804,14 +5078,14 @@ mod tests {
             ),
             Some(TextStaticRoute::AllowText("static_exact_file_grep"))
         ));
-        assert!(
+        assert!(matches!(
             static_text_route(
                 "grep_search",
                 &json!({"path": "README.md", "pattern": "error: file not found"}),
                 &[]
-            )
-            .is_none()
-        );
+            ),
+            Some(TextStaticRoute::AllowText("static_exact_file_grep"))
+        ));
     }
 
     #[test]
@@ -4838,28 +5112,19 @@ mod tests {
             static_shell_route(
                 &json!({"command": "cat build.sbt | grep -E \"project|tests\" | head -30"})
             ),
-            Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_builtin_guard",
-                RecommendedTool::GrepSearch
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "grep -RIn \"EnsureCertLoops|TerminateTLS|type TCPPortHandler\" kube ipn . | head -200"})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::SearchSymbols
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "grep -rn \"uv_os_homedir\\|uv_os_tmpdir\" /tmp/work --include=\"*.c\" -l"})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::SearchSymbols
-            ))
+            None
         ));
     }
 
@@ -4872,16 +5137,13 @@ mod tests {
         assert!(matches!(
             static_shell_route(&json!({"command": "nl -ba src/main.rs | sed -n '1,80p'"})),
             Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_builtin_guard",
+                "static_shell_builtin_inspection",
                 RecommendedTool::ReadFile
             ))
         ));
         assert!(matches!(
             static_shell_route(&json!({"command": "rg FooService src"})),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::SearchSymbols
-            ))
+            None
         ));
     }
 
@@ -4891,37 +5153,25 @@ mod tests {
             static_shell_route(
                 &json!({"command": "rg -n \"RichEditBoxDefaultLineEnding|ApplyTabAndLineEndingFix\" src/Notepads/Controls/TextEditor"})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::SearchSymbols
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "find src -name '*.cs' | xargs grep -n \"RemoveExecutableNameOrPathFromCommandLineArgs|Notepads-Dev\""})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::SearchSymbols
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "grep -R -n \"StopTokenFilter(\" elastic4s-*/src/main/scala 2>/dev/null | head -100"})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::ScanUsages
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "grep -RIn \"failed to encode|invalid path\" tests -g '*.php' | head"})
             ),
-            Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_builtin_inspection",
-                RecommendedTool::GrepSearch
-            ))
+            None
         ));
     }
 
@@ -4931,19 +5181,13 @@ mod tests {
             static_shell_route(
                 &json!({"command": "python - <<'PY'\nfrom pathlib import Path\nfor p in Path('.').rglob('*.scala'):\n    txt = p.read_text(errors='ignore')\n    if 'StopTokenFilter' in txt:\n        print(p)\nPY"})
             ),
-            Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_recursive_text_search",
-                RecommendedTool::GrepSearch
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "python - <<'PY'\nimport pathlib\nfor path in pathlib.Path('.').rglob('*.scala'):\n    text = path.read_text()\n    if 'ChunkingSettings(' in text:\n        print(path)\nPY"})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::ScanUsages
-            ))
+            None
         ));
     }
 

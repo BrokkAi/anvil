@@ -1287,24 +1287,6 @@ async fn maybe_shell_classifier_gate(
                 }));
                 return Some(message);
             }
-            ShellStaticRoute::UseBifrost(reason, recommended_tool) => {
-                let output = static_shell_route_output(
-                    reason,
-                    ShellClassifierDecision::UseBifrostTool,
-                    recommended_tool,
-                );
-                let message = shell_gate_message(&output, tools);
-                append_trace_record(serde_json::json!({
-                    "type": "shell_gate_static_route",
-                    "tool": "run_shell_command",
-                    "args": parsed_input,
-                    "route": "use_bifrost_tool",
-                    "reason": reason,
-                    "decision": output,
-                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-                }));
-                return Some(message);
-            }
         }
     }
 
