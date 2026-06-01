@@ -1050,7 +1050,7 @@ fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
 }
 
 fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &GateContext) {
-    if context.tool_name != "grep_search" || output.confidence == GateConfidence::Low {
+    if context.tool_name != "grep_search" {
         return;
     }
     let pattern = context
@@ -1103,7 +1103,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
     }
 
     output.decision = GateClassifierDecision::GateToSymbolTool;
-    output.recommended_tool = bifrost_tool_for_text_intent(&output.intent);
+    output.recommended_tool = deterministic_text_tool_for_grep(&output.intent, pattern, glob, path);
     output.suggested_args = json!({});
     output.reason = format!(
         "GATE_TO_SYMBOL_TOOL because broad source/test grep for symbol-like pattern `{}` lacks a supported allow exception.",
@@ -1460,10 +1460,25 @@ fn builtin_tool_for_shell_intent(intent: &ShellIntent) -> RecommendedTool {
 fn bifrost_tool_for_text_intent(intent: &TextIntent) -> RecommendedTool {
     match intent {
         TextIntent::KnownSymbolSource => RecommendedTool::GetSymbolSources,
-        TextIntent::SymbolReferenceLookup => RecommendedTool::ScanUsages,
+        TextIntent::SymbolReferenceLookup | TextIntent::SymbolUsageLookup => {
+            RecommendedTool::ScanUsages
+        }
         TextIntent::BroadSemanticOrientation => RecommendedTool::GetSummaries,
         TextIntent::SymbolDefinitionLookup => RecommendedTool::SearchSymbols,
         _ => RecommendedTool::SearchSymbols,
+    }
+}
+
+fn deterministic_text_tool_for_grep(
+    intent: &TextIntent,
+    pattern: &str,
+    glob: &str,
+    path: &str,
+) -> RecommendedTool {
+    match grep_pattern_kind(pattern, glob, path) {
+        GrepPatternKind::SymbolCallOrMember => RecommendedTool::ScanUsages,
+        GrepPatternKind::DeclarationForm => RecommendedTool::SearchSymbols,
+        _ => bifrost_tool_for_text_intent(intent),
     }
 }
 
@@ -3892,6 +3907,149 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn symbol_usage_intent_recommends_scan_usages() {
+        assert_eq!(
+            bifrost_tool_for_text_intent(&TextIntent::SymbolUsageLookup),
+            RecommendedTool::ScanUsages
+        );
+    }
+
+    fn low_confidence_allow_output(intent: TextIntent) -> GateClassifierOutput {
+        GateClassifierOutput {
+            reason: "ALLOW_TEXT because classifier was uncertain.".to_string(),
+            intent,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["Foo".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: None,
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::Low,
+        }
+    }
+
+    #[test]
+    fn low_confidence_symbol_usage_grep_repairs_to_scan_usages() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "RenameFileAsync\\s*\\(", "path": "src/Notepads", "glob": "*.cs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
+    fn low_confidence_declaration_grep_repairs_to_search_symbols() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "pattern": "case class ElisionTokenFilter|object ElisionTokenFilter|trait ElisionTokenFilter|ElisionTokenFilter\\(",
+                "path": "elastic4s-core",
+                "glob": "**/*.scala"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn low_confidence_exact_file_grep_stays_allowed() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "RenameFileAsync\\s*\\(", "path": ".", "glob": "src/Notepads/App.xaml.cs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn low_confidence_text_literal_grep_stays_allowed() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "import java.util.List", "path": "src", "glob": "*.java"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn low_confidence_post_edit_verification_grep_stays_allowed() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
+        let mut edit = exchange("edit");
+        edit.arguments = r#"{"file_path":"src/Notepads/Main.cs"}"#.to_string();
+        edit.result = "ok".to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "Handle\\(", "path": "src/Notepads", "glob": "*.cs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![edit],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn low_confidence_bifrost_miss_grep_stays_allowed() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
+        let mut miss = exchange("search_symbols");
+        miss.arguments = r#"{"patterns":["FooSymbol"]}"#.to_string();
+        miss.result = "No symbols found for FooSymbol".to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "FooSymbol", "path": "src", "glob": "**/*.rs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![miss],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
