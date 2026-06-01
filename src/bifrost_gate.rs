@@ -1017,6 +1017,16 @@ fn must_gate_symbol_grep(
 
 fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
     if output.confidence != GateConfidence::High {
+        if output.confidence == GateConfidence::Medium
+            && !output.shell_semantics_required
+            && output.builtin_preserves_intent
+            && (output.decision == ShellClassifierDecision::UseBuiltinTool
+                || route_prefix(&output.reason) == Some(RoutePrefix::UseBuiltin))
+        {
+            output.decision = ShellClassifierDecision::UseBuiltinTool;
+            output.recommended_tool = builtin_tool_for_shell_intent(&output.intent);
+            return;
+        }
         output.decision = ShellClassifierDecision::AllowShell;
         output.recommended_tool = RecommendedTool::None;
         output.suggested_args = json!({});
@@ -1682,19 +1692,37 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
     if command.is_empty() {
         return None;
     }
-    if shell_semantics_required(command) {
-        return Some(ShellStaticRoute::AllowShell("static_shell_semantics"));
-    }
     if script_exact_file_text_inspection(command) {
         return Some(ShellStaticRoute::UseBuiltin(
             "static_shell_exact_file_inspection",
             RecommendedTool::ReadFile,
         ));
     }
+    if shell_semantics_required(command) {
+        return Some(ShellStaticRoute::AllowShell("static_shell_semantics"));
+    }
     if script_broad_source_symbol_search(command) {
         return Some(ShellStaticRoute::UseBifrost(
             "static_shell_recursive_symbol_search",
             RecommendedTool::ScanUsages,
+        ));
+    }
+    if scriptish(&command.to_ascii_lowercase()) && recursive_source_traversal(&command.to_ascii_lowercase()) {
+        return Some(ShellStaticRoute::UseBuiltin(
+            "static_shell_recursive_text_search",
+            RecommendedTool::GrepSearch,
+        ));
+    }
+    if shell_builtin_inspection_guard(command) {
+        return Some(ShellStaticRoute::UseBuiltin(
+            "static_shell_builtin_guard",
+            builtin_tool_for_shell_command(command),
+        ));
+    }
+    if shell_symbol_search_like(command) {
+        return Some(ShellStaticRoute::UseBifrost(
+            "static_shell_symbol_search",
+            bifrost_tool_for_shell_search(command),
         ));
     }
     if simple_shell_read_like(command) || simple_shell_search_like(command) {
@@ -1895,7 +1923,7 @@ fn script_exact_file_text_inspection(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     if !scriptish(&lower)
         || script_mutates_files(command)
-        || script_raw_byte_or_format_probe(command)
+        || true_script_raw_byte_or_format_probe(command)
         || recursive_source_traversal(&lower)
     {
         return false;
@@ -1913,9 +1941,7 @@ fn script_broad_source_symbol_search(command: &str) -> bool {
     {
         return false;
     }
-    identifier_tokens(command)
-        .iter()
-        .any(|token| symbol_like_pattern(token) && !lowercase_wire_key_like(token))
+    script_contains_symbol_call_or_declaration(command)
 }
 
 fn recursive_source_traversal(lower_command: &str) -> bool {
@@ -1928,10 +1954,39 @@ fn recursive_source_traversal(lower_command: &str) -> bool {
 }
 
 fn source_path_literal_count(lower_command: &str) -> usize {
-    SOURCE_EXTENSIONS
-        .iter()
-        .map(|ext| lower_command.matches(ext).count())
-        .sum()
+    lower_command
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ')' | '('))
+        .map(|token| token.trim_matches(|ch: char| matches!(ch, ';' | ':' | '[' | ']')))
+        .filter(|token| {
+            token.contains('.')
+                && SOURCE_EXTENSIONS
+                    .iter()
+                    .any(|ext| token.ends_with(ext) || token.contains(&format!("{ext}:")))
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+fn true_script_raw_byte_or_format_probe(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    script_raw_byte_or_format_probe(command)
+        && !(lower.contains("decode(")
+            && (lower.contains(".read()") || lower.contains("open("))
+            && (lower.contains(" in text") || lower.contains(" in content") || lower.contains(".count(")))
+}
+
+fn script_contains_symbol_call_or_declaration(command: &str) -> bool {
+    declaration_search_pattern(command) || quoted_symbol_call_literal(command)
+}
+
+fn quoted_symbol_call_literal(command: &str) -> bool {
+    command.split(['"', '\'']).enumerate().any(|(index, part)| {
+        index % 2 == 1
+            && part.contains('(')
+            && identifier_tokens(part)
+                .iter()
+                .any(|token| symbol_like_pattern(token) && !lowercase_wire_key_like(token))
+    })
 }
 
 fn command_segments(command: &str) -> Vec<String> {
@@ -2011,11 +2066,70 @@ fn simple_shell_search_like(command: &str) -> bool {
     })
 }
 
+fn shell_builtin_inspection_guard(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    grep_count_like(&lower)
+        || shell_search_has_exact_file_scope(command)
+        || shell_search_targets_config_or_docs(&lower)
+}
+
+fn grep_count_like(lower_command: &str) -> bool {
+    lower_command
+        .split([';', '\n'])
+        .any(|segment| segment.contains("grep -c ") || segment.contains("rg -c "))
+}
+
+fn shell_search_has_exact_file_scope(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let cleaned = token.trim_matches(|ch: char| {
+            matches!(ch, '"' | '\'' | ';' | '|' | ')' | '(' | ',')
+        });
+        !cleaned.contains('*') && is_source_like_file(cleaned)
+    })
+}
+
+fn shell_search_targets_config_or_docs(lower_command: &str) -> bool {
+    [
+        "build.sbt",
+        "pom.xml",
+        "package.json",
+        "composer.json",
+        "readme",
+        ".md",
+        ".txt",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+    ]
+    .iter()
+    .any(|needle| lower_command.contains(needle))
+}
+
 fn shell_symbol_search_like(command: &str) -> bool {
     let Some(pattern) = shell_search_pattern(command) else {
         return false;
     };
-    symbol_like_pattern(&pattern) && command_has_source_scope(command)
+    if !command_has_source_scope(command) {
+        return false;
+    }
+    !matches!(
+        grep_pattern_kind(&pattern, "", command),
+        GrepPatternKind::ExactImportOrInclude
+            | GrepPatternKind::ErrorMessageOrLogText
+            | GrepPatternKind::WireKeyOrSerializationKey
+            | GrepPatternKind::HeaderOrProtocolLiteral
+            | GrepPatternKind::NumericOrCodepointLiteral
+            | GrepPatternKind::NamingVariantTextSearch
+            | GrepPatternKind::TestTextSearch
+            | GrepPatternKind::CodeIdiom
+    ) && (symbol_like_pattern(&pattern)
+        || matches!(
+            grep_pattern_kind(&pattern, "", command),
+            GrepPatternKind::DeclarationForm
+                | GrepPatternKind::SymbolCallOrMember
+                | GrepPatternKind::SymbolFamilyOrRelationship
+        ))
 }
 
 const SOURCE_EXTENSIONS: &[&str] = &[
@@ -2030,6 +2144,17 @@ fn builtin_tool_for_shell_command(command: &str) -> RecommendedTool {
         RecommendedTool::ListDirectory
     } else {
         RecommendedTool::ReadFile
+    }
+}
+
+fn bifrost_tool_for_shell_search(command: &str) -> RecommendedTool {
+    let Some(pattern) = shell_search_pattern(command) else {
+        return RecommendedTool::SearchSymbols;
+    };
+    if pattern.contains("\\(") || pattern.contains('(') || pattern.contains("->") {
+        RecommendedTool::ScanUsages
+    } else {
+        RecommendedTool::SearchSymbols
     }
 }
 
@@ -2081,6 +2206,10 @@ fn is_source_like_path(path: &str) -> bool {
         return true;
     }
     !matches!(classify_path_or_glob(&lower), StaticTextTarget::TextLike)
+}
+
+fn is_source_like_file(path: &str) -> bool {
+    SOURCE_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
 }
 
 fn symbol_like_pattern(pattern: &str) -> bool {
@@ -2322,7 +2451,6 @@ fn contains_text_word(lower: &str) -> bool {
         "invalid",
         "panic",
         "recover",
-        "path",
         "url",
     ]
     .iter()
@@ -3075,7 +3203,7 @@ mod tests {
                 &json!({"command": "cat build.sbt | grep -E \"project|tests\" | head -30"})
             ),
             Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_builtin_inspection",
+                "static_shell_builtin_guard",
                 RecommendedTool::GrepSearch
             ))
         ));
@@ -3083,9 +3211,9 @@ mod tests {
             static_shell_route(
                 &json!({"command": "grep -RIn \"EnsureCertLoops|TerminateTLS|type TCPPortHandler\" kube ipn . | head -200"})
             ),
-            Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_builtin_inspection",
-                RecommendedTool::GrepSearch
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_symbol_search",
+                RecommendedTool::SearchSymbols
             ))
         ));
     }
@@ -3099,15 +3227,65 @@ mod tests {
         assert!(matches!(
             static_shell_route(&json!({"command": "nl -ba src/main.rs | sed -n '1,80p'"})),
             Some(ShellStaticRoute::UseBuiltin(
-                "static_shell_builtin_inspection",
+                "static_shell_builtin_guard",
                 RecommendedTool::ReadFile
             ))
         ));
         assert!(matches!(
             static_shell_route(&json!({"command": "rg FooService src"})),
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_symbol_search",
+                RecommendedTool::SearchSymbols
+            ))
+        ));
+    }
+
+    #[test]
+    fn static_shell_route_splits_symbol_search_from_literal_inspection() {
+        assert!(matches!(
+            static_shell_route(&json!({"command": "rg -n \"RichEditBoxDefaultLineEnding|ApplyTabAndLineEndingFix\" src/Notepads/Controls/TextEditor"})),
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_symbol_search",
+                RecommendedTool::SearchSymbols
+            ))
+        ));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "find src -name '*.cs' | xargs grep -n \"RemoveExecutableNameOrPathFromCommandLineArgs|Notepads-Dev\""})),
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_symbol_search",
+                RecommendedTool::SearchSymbols
+            ))
+        ));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "grep -R -n \"StopTokenFilter(\" elastic4s-*/src/main/scala 2>/dev/null | head -100"})),
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_symbol_search",
+                RecommendedTool::ScanUsages
+            ))
+        ));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "grep -RIn \"failed to encode|invalid path\" tests -g '*.php' | head"})),
             Some(ShellStaticRoute::UseBuiltin(
                 "static_shell_builtin_inspection",
                 RecommendedTool::GrepSearch
+            ))
+        ));
+    }
+
+    #[test]
+    fn static_shell_route_keeps_literal_recursive_scripts_builtin() {
+        assert!(matches!(
+            static_shell_route(&json!({"command": "python - <<'PY'\nfrom pathlib import Path\nfor p in Path('.').rglob('*.scala'):\n    txt = p.read_text(errors='ignore')\n    if 'StopTokenFilter' in txt:\n        print(p)\nPY"})),
+            Some(ShellStaticRoute::UseBuiltin(
+                "static_shell_recursive_text_search",
+                RecommendedTool::GrepSearch
+            ))
+        ));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "python - <<'PY'\nimport pathlib\nfor path in pathlib.Path('.').rglob('*.scala'):\n    text = path.read_text()\n    if 'ChunkingSettings(' in text:\n        print(path)\nPY"})),
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_recursive_symbol_search",
+                RecommendedTool::ScanUsages
             ))
         ));
     }
