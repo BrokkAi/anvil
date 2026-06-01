@@ -1321,6 +1321,12 @@ fn repair_blocked_text_grep(
         || config_or_build_text_scope(glob, path, file_path)
         || exact_file_or_narrow_local_probe(pattern, glob, path, file_path)
         || bounded_test_literal_probe(pattern, glob, path, file_path)
+        || test_scope_single_identifier_text_probe(pattern, glob, path, file_path)
+        || env_or_errno_constant_text(pattern)
+        || regex_wildcard_text_probe(pattern)
+        || exact_member_or_call_expression_text_probe(pattern)
+        || path_or_protocol_construction_text_probe(pattern)
+        || boolean_assignment_value_text_probe(pattern)
         || filename_or_resource_regex(pattern)
         || inline_regex_flag_text_search(pattern)
 }
@@ -1349,29 +1355,81 @@ fn exact_file_or_narrow_local_probe(
         || (regex_text_semantics_material(pattern) && !source_static_or_member_access(pattern))
 }
 
-fn bounded_test_literal_probe(pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
-    if !bounded_test_scope(glob, path, file_path) || declaration_search_pattern(pattern) {
+fn bounded_test_literal_probe(_pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
+    bounded_test_scope(glob, path, file_path)
+}
+
+fn test_scope_single_identifier_text_probe(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+) -> bool {
+    bounded_test_scope(glob, path, file_path)
+        && single_identifier_pattern(pattern)
+        && !declaration_search_pattern(pattern)
+        && !source_call_navigation_pattern(pattern)
+}
+
+fn env_or_errno_constant_text(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    if tokens.len() != 1 {
         return false;
     }
-    single_identifier_pattern(pattern)
-        || lower_snake_literal_token_count(pattern) > 0
-        || uppercase_constant_token_count(pattern) > 0
-        || filename_or_resource_regex(pattern)
-        || inline_regex_flag_text_search(pattern)
-        || matches!(
-            grep_pattern_kind(pattern, glob, path),
-            GrepPatternKind::CodeIdiom
-                | GrepPatternKind::ExactImportOrInclude
-                | GrepPatternKind::ErrorMessageOrLogText
-                | GrepPatternKind::WireKeyOrSerializationKey
-                | GrepPatternKind::HeaderOrProtocolLiteral
-                | GrepPatternKind::NumericOrCodepointLiteral
-                | GrepPatternKind::TestTextSearch
-                | GrepPatternKind::PackageDeclarationLiteral
-                | GrepPatternKind::NaturalLanguageOrPathLiteral
-                | GrepPatternKind::AssertionOrSerializationText
-                | GrepPatternKind::ExactMemberChainOrCallText
+    let original = &tokens[0];
+    let token = original.to_ascii_uppercase();
+    if original.len() >= 5
+        && original.starts_with('E')
+        && original
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return true;
+    }
+    if !token.contains('_')
+        || token.starts_with("UV_")
+        || token.starts_with("ERR_")
+        || token.starts_with("ERROR_")
+    {
+        return false;
+    }
+    token.split('_').any(|part| {
+        matches!(
+            part,
+            "ADDR" | "PORT" | "POD" | "HOST" | "IP" | "IPS" | "URL" | "KEY" | "SECRET" | "TOKEN"
         )
+    })
+}
+
+fn regex_wildcard_text_probe(pattern: &str) -> bool {
+    pattern.contains(".*")
+        && !declaration_search_pattern(pattern)
+        && !constructor_or_static_call_usage_pattern(pattern)
+        && !source_call_navigation_pattern(pattern)
+}
+
+fn exact_member_or_call_expression_text_probe(pattern: &str) -> bool {
+    if declaration_search_pattern(pattern) || pattern.contains("::") || pattern.contains("->") {
+        return false;
+    }
+    if exact_member_chain_or_call_text(pattern) {
+        return true;
+    }
+    single_identifier_pattern(&pattern.replace("\\.", "")) && pattern.ends_with("\\.")
+}
+
+fn path_or_protocol_construction_text_probe(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    (pattern.contains("\\.") || pattern.contains('.'))
+        && ["uri", "path", "encoded", "render", "scheme", "protocol"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+fn boolean_assignment_value_text_probe(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    lower.contains("\\s*=\\s*")
+        && (lower.contains("true") || lower.contains("false") || lower.contains("null"))
 }
 
 fn inline_regex_flag_text_search(pattern: &str) -> bool {
@@ -1403,6 +1461,15 @@ fn constructor_or_static_call_usage_pattern(pattern: &str) -> bool {
             .any(|token| symbol_like_pattern(token))
 }
 
+fn symbol_assignment_or_subscription_pattern(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    tokens.len() == 1
+        && high_confidence_source_symbol(&tokens[0])
+        && (pattern.contains(" =") || pattern.contains("\\s*="))
+        && !pattern.contains("+=")
+        && !pattern.contains("\\+=")
+}
+
 fn deterministic_source_symbol_repair_tool(
     pattern: &str,
     glob: &str,
@@ -1419,7 +1486,8 @@ fn deterministic_source_symbol_repair_tool(
             && !(declaration_search_pattern(pattern)
                 || constructor_or_static_call_usage_pattern(pattern)
                 || source_static_or_member_access(pattern)
-                || source_call_navigation_pattern(pattern)))
+                || source_call_navigation_pattern(pattern)
+                || recoverable_source_symbols(pattern).len() >= 3))
         || import_include_or_package_text_target(pattern)
         || assertion_or_serialization_text(pattern)
         || recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges)
@@ -1452,7 +1520,8 @@ fn deterministic_source_symbol_repair_tool(
     if broad_nav_scope
         && (constructor_or_static_call_usage_pattern(pattern)
             || source_static_or_member_access(pattern)
-            || source_call_navigation_pattern(pattern))
+            || source_call_navigation_pattern(pattern)
+            || symbol_assignment_or_subscription_pattern(pattern))
     {
         return Some((RecommendedTool::ScanUsages, "call/reference"));
     }
@@ -1483,12 +1552,14 @@ fn source_directory_high_confidence_symbol(
     file_path: &str,
 ) -> bool {
     let kind = grep_pattern_kind(pattern, glob, path);
-    grep_scope_granularity(glob, path, file_path) == "directory"
-        && is_source_like_path(&normalized_grep_scope(glob, path, file_path))
-        && matches!(
+    matches!(
+        grep_scope_granularity(glob, path, file_path),
+        "directory" | "source_glob"
+    ) && is_source_like_path(&normalized_grep_scope(glob, path, file_path))
+        && (matches!(
             kind,
             GrepPatternKind::SymbolFamilyOrRelationship | GrepPatternKind::DeclarationForm
-        )
+        ) || symbol_like_pattern(pattern))
         && single_identifier_pattern(pattern)
         && identifier_tokens(pattern)
             .first()
@@ -1772,6 +1843,28 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
                 truncate_to(command, 160)
             );
             output.intent = intent;
+            output.allow_exception = ShellAllowException::None;
+            output.replacement_class = ShellReplacementClass::UseBifrostSymbol;
+            output.bifrost_fit = BifrostFit::SameOrMoreDirect;
+            output.builtin_preserves_intent = false;
+            output.confidence = GateConfidence::High;
+            return;
+        }
+    }
+    if output.decision == ShellClassifierDecision::UseBuiltinTool && xargs_content_grep(command) {
+        if let Some(tool) = strong_shell_source_symbol_search(command) {
+            output.decision = ShellClassifierDecision::UseBifrostTool;
+            output.intent = if tool == RecommendedTool::ScanUsages {
+                ShellIntent::SymbolReferenceLookup
+            } else {
+                ShellIntent::SymbolDefinitionLookup
+            };
+            output.recommended_tool = tool;
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "USE_BIFROST_TOOL because `{}` is find-xargs source-content symbol search and no concrete shell semantic is required.",
+                truncate_to(command, 160)
+            );
             output.allow_exception = ShellAllowException::None;
             output.replacement_class = ShellReplacementClass::UseBifrostSymbol;
             output.bifrost_fit = BifrostFit::SameOrMoreDirect;
@@ -2274,6 +2367,12 @@ fn grep_scope_target(glob: &str, path: &str, file_path: &str) -> String {
     let file_path = file_path.trim();
     if !file_path.is_empty() {
         return file_path.to_string();
+    }
+    if !glob.is_empty() && !path.is_empty() && path != "." {
+        if glob.contains('/') {
+            return glob.to_string();
+        }
+        return format!("{}/{}", path.trim_end_matches('/'), glob);
     }
     if !glob.is_empty() && !glob.contains('*') && glob.contains('.') {
         if path.is_empty() || path == "." || glob.contains('/') {
@@ -3610,6 +3709,11 @@ fn diagnostic_or_status_constant_text(pattern: &str) -> bool {
             upper.starts_with("ERROR_")
                 || upper.starts_with("ERR_")
                 || upper.starts_with("UV_E")
+                || (token.len() >= 5
+                    && token.starts_with('E')
+                    && token
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'))
                 || upper.contains("_ERROR")
                 || upper.contains("EACCES")
                 || upper.contains("EINVAL")
@@ -4528,6 +4632,48 @@ mod tests {
     }
 
     #[test]
+    fn broad_source_scope_repairs_surviving_literal_claims() {
+        let cases = [
+            (
+                "class\\s+Plugin|abstract class\\s+Plugin|virtual\\s+void\\s+OnGameSelected|OnControllerButtonStateChanged|OnFullscreenViewChanged|FullscreenView|GameDetailsVisible|FullscreenAppViewModel",
+                "source",
+                "*.cs",
+                TextIntent::BroadSemanticOrientation,
+                RecommendedTool::GetSummaries,
+            ),
+            (
+                "GameDetailsVisible =",
+                "source",
+                "*.cs",
+                TextIntent::SymbolUsageLookup,
+                RecommendedTool::ScanUsages,
+            ),
+            (
+                "object|class|def",
+                "elastic4s-client-http4s/src",
+                "*.scala",
+                TextIntent::BroadSemanticOrientation,
+                RecommendedTool::GetSummaries,
+            ),
+        ];
+        for (pattern, path, glob, intent, expected_tool) in cases {
+            let mut output = low_confidence_allow_output(intent);
+            let context = GateContext {
+                tool_name: "grep_search".to_string(),
+                args: json!({"pattern": pattern, "path": path, "glob": glob}),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                tool_exchanges: Vec::new(),
+            };
+
+            enforce_text_classifier_policy(&mut output, &context);
+
+            assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+            assert_eq!(output.recommended_tool, expected_tool);
+        }
+    }
+
+    #[test]
     fn low_confidence_exact_file_grep_stays_allowed() {
         let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
         let context = GateContext {
@@ -4619,6 +4765,9 @@ mod tests {
             ("UV_EINVAL|udp_try_send|try_send", "test/**/*.c", "."),
             ("ERROR_NOACCESS", "**/*", "."),
             ("ERROR_BUFFER_OVERFLOW", "**/*", "."),
+            ("ENAMETOOLONG", "src/win/*.c", "."),
+            ("TS_LOCAL_ADDR_PORT", "*.go", "."),
+            ("POD_IPS", "*.go", "."),
             (
                 "sync/atomic|atomic\\.AddInt64|atomic\\.LoadInt64\"",
                 "**/*.go",
@@ -4629,6 +4778,7 @@ mod tests {
                 "**/*_test.go",
                 ".",
             ),
+            ("Path.*Without|FileInfo.*M3U", "*.cs", "source"),
         ];
         for (pattern, glob, path) in cases {
             let context = GateContext {
@@ -4847,6 +4997,32 @@ mod tests {
             strong_shell_source_symbol_search(command),
             Some(RecommendedTool::SearchSymbols)
         );
+
+        let mut output = ShellClassifierOutput {
+            reason: "ALLOW_SHELL because classifier was uncertain.".to_string(),
+            intent: ShellIntent::SymbolReferenceLookup,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: ShellAllowException::BuildTestGitPackageOrProjectCli,
+            replacement_class: ShellReplacementClass::AllowShellUncertain,
+            decision: ShellClassifierDecision::AllowShell,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::Low,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": "find source -name '*.cs' -print0 | xargs -0 grep -n \"GameControllerManager\""}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::UseBifrostTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
     }
 
     #[test]
