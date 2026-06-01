@@ -18,7 +18,7 @@ use crate::bifrost_gate::{
     ShellStaticRoute, TextStaticRoute, classify_shell_tool_call, classify_text_tool_call,
     encourage_bifrost_enabled, gate_message, shell_gate_message,
     should_skip_for_static_text_target, static_shell_route, static_shell_route_output,
-    static_text_gate_output, static_text_route,
+    static_text_route,
 };
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
@@ -1185,20 +1185,6 @@ async fn maybe_bifrost_classifier_gate(
                 }));
                 return None;
             }
-            TextStaticRoute::GateToSymbolTool(reason, recommended_tool) => {
-                let output = static_text_gate_output(reason, recommended_tool);
-                let message = gate_message(&output, tools);
-                append_trace_record(serde_json::json!({
-                    "type": "bifrost_gate_static_route",
-                    "tool": tool_name,
-                    "args": parsed_input,
-                    "route": "gate_to_symbol_tool",
-                    "reason": reason,
-                    "decision": output,
-                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-                }));
-                return Some(message);
-            }
         }
     }
 
@@ -1295,24 +1281,6 @@ async fn maybe_shell_classifier_gate(
                     "tool": "run_shell_command",
                     "args": parsed_input,
                     "route": "use_builtin_tool",
-                    "reason": reason,
-                    "decision": output,
-                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-                }));
-                return Some(message);
-            }
-            ShellStaticRoute::UseBifrost(reason, recommended_tool) => {
-                let output = static_shell_route_output(
-                    reason,
-                    ShellClassifierDecision::UseBifrostTool,
-                    recommended_tool,
-                );
-                let message = shell_gate_message(&output, tools);
-                append_trace_record(serde_json::json!({
-                    "type": "shell_gate_static_route",
-                    "tool": "run_shell_command",
-                    "args": parsed_input,
-                    "route": "use_bifrost_tool",
                     "reason": reason,
                     "decision": output,
                     "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
