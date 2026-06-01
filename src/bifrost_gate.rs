@@ -522,6 +522,16 @@ pub fn static_text_route(
         "read_file" if exact_localized_read_file(args, exchanges) => {
             Some(TextStaticRoute::AllowText("static_exact_localized_read"))
         }
+        "grep_search" => {
+            let glob = args.get("glob").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let file_path = args.get("file_path").and_then(Value::as_str).unwrap_or("");
+            if grep_scope_granularity(glob, path, file_path) == "exact_file" {
+                Some(TextStaticRoute::AllowText("static_exact_file_grep"))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -754,7 +764,7 @@ fn parse_shell_openrouter_response(text: &str) -> Result<ShellClassifierOutput> 
 }
 
 fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
-    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it. Decide whether the pending read_file/grep_search call should run as text navigation or should be replaced by a Bifrost symbol tool. Use pending_call_features and compact_evidence first, prose excerpts second. Target policy: gate to Bifrost only when it is clearly the same-or-more-direct answer to a specific source-code symbol/navigation intent; otherwise allow exact text. Do not allow text merely because the agent wants to double-check or distrust Bifrost. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Allow exact/localized file reads, bounded reads, top-of-file orientation, post edit/build/test verification, non-source text, exact literal/regex semantics, and observed targeted fallback for the same unresolved token/path after Bifrost returned empty/inadequate. For grep_search, broad source/test glob or repo-wide scope plus identifier-like terms and no observed targeted Bifrost miss is usually a Bifrost action, even if the pattern uses alternation, C signatures, macros, or test identifiers. Exact-file scope, post-edit verification, exact literal/regex semantics, or fallback after observed Bifrost miss is allow_original. Use use_search_symbols for unknown declarations/definitions by name, use_scan_usages for callers/references/related tests, use_get_summaries for broad module/package/API orientation, and use_get_symbol_sources when relevant symbol names are already known and implementation source is needed. The action field is the only route the gate will execute. If Bifrost is preferred, choose the corresponding Bifrost action; never choose allow_original while saying Bifrost is preferred. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. Keep reason concise. Output only JSON matching the schema.";
+    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it. Decide whether the pending read_file/grep_search call should run as text navigation or should be replaced by a Bifrost symbol tool. Use pending_call_features and compact_evidence first, prose excerpts second. Target policy: gate to Bifrost only when it is clearly the same-or-more-direct answer to a specific source-code symbol/navigation intent; otherwise allow exact text. Do not allow text merely because the agent wants to double-check or distrust Bifrost. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses; do not allow text solely because of them. Allow exact/localized file reads, bounded reads, top-of-file orientation, post edit/build/test verification, non-source text, exact literal/regex semantics, and observed targeted fallback for the same unresolved token/path after Bifrost returned an empty/no-match result. For grep_search, broad source/test glob or repo-wide scope plus identifier-like terms and no observed targeted Bifrost empty/no-match is usually a Bifrost action, even if the pattern uses alternation, C signatures, macros, or test identifiers. Exact-file scope, post-edit verification, exact literal/regex semantics, or fallback after observed Bifrost empty/no-match is allow_original. Use use_search_symbols for unknown declarations/definitions by name, use_scan_usages for callers/references/related tests, use_get_summaries for broad module/package/API orientation, and use_get_symbol_sources when relevant symbol names are already known and implementation source is needed. The action field is the only route the gate will execute. If Bifrost is preferred, choose the corresponding Bifrost action; never choose allow_original while saying Bifrost is preferred. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. Keep reason concise. Output only JSON matching the schema.";
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
     let system_json = serde_json::to_string(system)?;
@@ -1345,6 +1355,13 @@ fn search_scope(glob: &str, path: &str) -> &'static str {
 fn grep_scope_target(glob: &str, path: &str, file_path: &str) -> String {
     if !file_path.trim().is_empty() {
         file_path.trim().to_string()
+    } else if !glob.trim().is_empty()
+        && (path.trim().is_empty() || path.trim() == ".")
+        && !glob.contains('*')
+        && is_source_like_path(glob)
+        && glob.contains('.')
+    {
+        glob.trim().to_string()
     } else if !path.trim().is_empty() {
         path.trim().to_string()
     } else {
@@ -2423,6 +2440,17 @@ mod tests {
             Some(true)
         );
 
+        let glob_exact = grep_search_features(
+            &json!({"path": ".", "glob": "src/win/udp.c", "pattern": "uv_udp_try_send"}),
+            &[],
+        );
+        assert_eq!(
+            glob_exact
+                .get("scope_granularity")
+                .and_then(Value::as_str),
+            Some("exact_file")
+        );
+
         let broad =
             grep_search_features(&json!({"glob": "**/*.c", "pattern": "uv_pipe_bind2"}), &[]);
         assert_eq!(
@@ -2475,6 +2503,14 @@ mod tests {
             )
             .is_none()
         );
+        assert!(matches!(
+            static_text_route(
+                "grep_search",
+                &json!({"path": ".", "glob": "src/win/udp.c", "pattern": "uv_udp_try_send"}),
+                &[]
+            ),
+            Some(TextStaticRoute::AllowText("static_exact_file_grep"))
+        ));
         assert!(
             static_text_route(
                 "grep_search",
