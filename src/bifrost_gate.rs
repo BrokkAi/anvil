@@ -1356,7 +1356,30 @@ fn exact_file_or_narrow_local_probe(
 }
 
 fn bounded_test_literal_probe(_pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
-    bounded_test_scope(glob, path, file_path)
+    test_only_source_scope(glob, path, file_path)
+        && !constructor_or_static_call_usage_pattern(_pattern)
+}
+
+fn test_only_source_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path).to_ascii_lowercase();
+    if scope.is_empty() {
+        return false;
+    }
+    if scope
+        .split(['/', '\\'])
+        .any(|part| matches!(part, "test" | "tests" | "spec" | "specs"))
+    {
+        return true;
+    }
+    let name = scope.rsplit('/').next().unwrap_or(&scope);
+    name.contains("_test.")
+        || name.starts_with("test_")
+        || name.contains("test*.")
+        || name.contains("*test.")
+        || name.contains("*tests.")
+        || name.contains("*test*.")
+        || name.contains("*spec.")
+        || name.contains("*spec*.")
 }
 
 fn test_scope_single_identifier_text_probe(
@@ -4779,6 +4802,14 @@ mod tests {
                 ".",
             ),
             ("Path.*Without|FileInfo.*M3U", "*.cs", "source"),
+            ("OnesComplement", "**/*Test.java", "src/test/java"),
+            ("MethodSource", "src/test/java/**/*.java", "."),
+            ("InnerHit", "**/*Test*.scala", "."),
+            (
+                "canSkipStatus|status queue|QueueStatus|skip status|LoginFinished|LoggedIn",
+                "**/*_test.go",
+                ".",
+            ),
         ];
         for (pattern, glob, path) in cases {
             let context = GateContext {
