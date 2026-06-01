@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bifrost_gate::{
     GateClassifierDecision, GateConfidence, GateContext, RecommendedTool, ShellClassifierDecision,
-    ShellStaticRoute, TextStaticRoute, classify_shell_tool_call, classify_text_tool_call,
-    encourage_bifrost_enabled, gate_message, shell_gate_message,
+    ShellStaticRoute, TextStaticRoute, classifier_trace_context, classify_shell_tool_call,
+    classify_text_tool_call, encourage_bifrost_enabled, gate_message, shell_gate_message,
     should_skip_for_static_text_target, static_shell_route, static_shell_route_output,
     static_text_route,
 };
@@ -1167,6 +1167,7 @@ async fn maybe_bifrost_classifier_gate(
         tools: tools.to_vec(),
         tool_exchanges: tool_exchanges.to_vec(),
     };
+    let trace_context = classifier_trace_context(&context);
     if tool_name == "run_shell_command" {
         return maybe_shell_classifier_gate(parsed_input, tools, tool_exchanges, context, cancel)
             .await;
@@ -1193,6 +1194,7 @@ async fn maybe_bifrost_classifier_gate(
         "tool": tool_name,
         "args": parsed_input,
         "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+        "classifier_context": trace_context,
     }));
 
     match classify_text_tool_call(context, cancel).await {
@@ -1295,6 +1297,7 @@ async fn maybe_shell_classifier_gate(
         "tool": "run_shell_command",
         "args": parsed_input,
         "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+        "classifier_context": classifier_trace_context(&context),
     }));
 
     match classify_shell_tool_call(context, cancel).await {
