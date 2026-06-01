@@ -238,6 +238,7 @@ impl Default for ShellReplacementClass {
 pub enum ShellStaticRoute {
     AllowShell(&'static str),
     UseBuiltin(&'static str, RecommendedTool),
+    UseBifrost(&'static str, RecommendedTool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -911,15 +912,6 @@ enum RoutePrefix {
 }
 
 fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
-    if output.decision == GateClassifierDecision::AllowText
-        && route_prefix(&output.reason) == Some(RoutePrefix::UseBifrost)
-        && output.confidence == GateConfidence::High
-    {
-        output.decision = GateClassifierDecision::GateToSymbolTool;
-        output.recommended_tool = bifrost_tool_for_text_intent(&output.intent);
-        return;
-    }
-
     let must_allow = output.confidence != GateConfidence::High;
     if output.decision == GateClassifierDecision::AllowText
         || must_allow
@@ -932,10 +924,7 @@ fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
 }
 
 fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &GateContext) {
-    if context.tool_name != "grep_search"
-        || output.decision != GateClassifierDecision::AllowText
-        || output.confidence != GateConfidence::High
-    {
+    if context.tool_name != "grep_search" || output.confidence != GateConfidence::High {
         return;
     }
     let pattern = context
@@ -943,9 +932,6 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         .get("pattern")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if !symbol_like_pattern(pattern) {
-        return;
-    }
     let glob = context.args.get("glob").and_then(Value::as_str).unwrap_or("");
     let path = context.args.get("path").and_then(Value::as_str).unwrap_or("");
     let file_path = context
@@ -953,14 +939,24 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         .get("file_path")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if grep_scope_granularity(glob, path, file_path) == "exact_file"
-        || !broad_source_or_test_scope(glob, path)
+
+    if must_allow_text_grep(pattern, glob, path, file_path) {
+        output.decision = GateClassifierDecision::AllowText;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "ALLOW_TEXT because `{}` is an exact text/regex search whose intent would be lost by symbol routing.",
+            truncate_to(pattern, 120)
+        );
+        return;
+    }
+
+    if output.decision == GateClassifierDecision::AllowText
+        && !must_gate_symbol_grep(pattern, glob, path, file_path, context)
     {
         return;
     }
-    if supported_broad_symbol_grep_allow(output, pattern, glob, path, file_path, context) {
-        return;
-    }
+
     output.decision = GateClassifierDecision::GateToSymbolTool;
     output.recommended_tool = bifrost_tool_for_text_intent(&output.intent);
     output.suggested_args = json!({});
@@ -970,39 +966,53 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
     );
 }
 
-fn supported_broad_symbol_grep_allow(
-    output: &GateClassifierOutput,
+fn must_allow_text_grep(pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
+    if grep_scope_granularity(glob, path, file_path) == "exact_file" {
+        return true;
+    }
+    matches!(
+        grep_pattern_kind(pattern, glob, path),
+        GrepPatternKind::ExactImportOrInclude
+            | GrepPatternKind::ErrorMessageOrLogText
+            | GrepPatternKind::WireKeyOrSerializationKey
+            | GrepPatternKind::HeaderOrProtocolLiteral
+            | GrepPatternKind::NumericOrCodepointLiteral
+            | GrepPatternKind::NamingVariantTextSearch
+            | GrepPatternKind::TestTextSearch
+            | GrepPatternKind::CodeIdiom
+    )
+}
+
+fn must_gate_symbol_grep(
     pattern: &str,
     glob: &str,
     path: &str,
     file_path: &str,
     context: &GateContext,
 ) -> bool {
+    if grep_scope_granularity(glob, path, file_path) == "exact_file"
+        || !(broad_source_or_test_scope(glob, path)
+            || is_source_like_path(glob)
+            || is_source_like_path(path))
+        || must_allow_text_grep(pattern, glob, path, file_path)
+    {
+        return false;
+    }
+
     let scope_target = grep_scope_target(glob, path, file_path);
-    if output.evidence.same_token_or_path_bifrost_miss
-        || overlaps_recent_bifrost_miss(pattern, &context.tool_exchanges)
+    if overlaps_recent_bifrost_miss(pattern, &context.tool_exchanges)
         || overlaps_recent_bifrost_miss(&scope_target, &context.tool_exchanges)
     {
-        return true;
+        return false;
     }
-    if output.evidence.same_path_recent_edit_or_write
-        || recent_edit_or_build_failure(&context.tool_exchanges)
-        || same_path_recent_tool(&scope_target, &context.tool_exchanges, &["edit", "write_file"])
-    {
-        return true;
+
+    match grep_pattern_kind(pattern, glob, path) {
+        GrepPatternKind::DeclarationForm
+        | GrepPatternKind::SymbolCallOrMember
+        | GrepPatternKind::SymbolFamilyOrRelationship => true,
+        GrepPatternKind::Unknown => symbol_like_pattern(pattern),
+        _ => false,
     }
-    if matches!(
-        output.allow_exception,
-        TextAllowException::LocalizedOrSequentialRead
-            | TextAllowException::WholeFileOrTopOfFileOrientation
-    ) && (same_path_recent_tool(&scope_target, &context.tool_exchanges, &["read_file"])
-        || !scope_target.trim().is_empty() && scope_target != ".")
-    {
-        return true;
-    }
-    matches!(output.allow_exception, TextAllowException::ExactLiteralOrRegex)
-        && literal_like_pattern(pattern)
-        && !symbol_like_pattern(pattern)
 }
 
 fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
@@ -1675,6 +1685,18 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
     if shell_semantics_required(command) {
         return Some(ShellStaticRoute::AllowShell("static_shell_semantics"));
     }
+    if script_exact_file_text_inspection(command) {
+        return Some(ShellStaticRoute::UseBuiltin(
+            "static_shell_exact_file_inspection",
+            RecommendedTool::ReadFile,
+        ));
+    }
+    if script_broad_source_symbol_search(command) {
+        return Some(ShellStaticRoute::UseBifrost(
+            "static_shell_recursive_symbol_search",
+            RecommendedTool::ScanUsages,
+        ));
+    }
     if simple_shell_read_like(command) || simple_shell_search_like(command) {
         return Some(ShellStaticRoute::UseBuiltin(
             "static_shell_builtin_inspection",
@@ -1723,6 +1745,9 @@ fn build_test_git_package_like(command: &str) -> bool {
     let normalized = strip_shell_wrappers(command);
     let trimmed = normalized.trim();
     let lower = trimmed.to_ascii_lowercase();
+    if env_probe_like(&lower) {
+        return true;
+    }
     const PREFIXES: &[&str] = &[
         "cargo ",
         "composer ",
@@ -1750,8 +1775,11 @@ fn build_test_git_package_like(command: &str) -> bool {
         "uv run python -m pytest",
         "dotnet build",
         "dotnet test",
+        "dotnet --info",
+        "dotnet --version",
         "sbt ",
         "bash .harness/",
+        "bash ./.harness/",
         "make ",
         "cmake ",
         "ctest ",
@@ -1772,6 +1800,16 @@ fn build_test_git_package_like(command: &str) -> bool {
         || lower.contains("bin/sbt")
         || lower.contains("uv_run_tests")
         || lower.contains(" testonly")
+}
+
+fn env_probe_like(lower: &str) -> bool {
+    let normalized = lower.replace("~/", "").replace("./", "");
+    normalized.contains("dotnet --info")
+        || normalized.contains("dotnet --version")
+        || normalized.starts_with("which ")
+        || normalized.starts_with("command -v ")
+        || normalized.starts_with("go version")
+        || normalized.starts_with("java -version")
 }
 
 fn raw_byte_probe(command: &str) -> bool {
@@ -1851,6 +1889,49 @@ fn scriptish(lower_command: &str) -> bool {
         || lower_command.contains("python -c")
         || lower_command.contains("python3 -c")
         || lower_command.contains("<<")
+}
+
+fn script_exact_file_text_inspection(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !scriptish(&lower)
+        || script_mutates_files(command)
+        || script_raw_byte_or_format_probe(command)
+        || recursive_source_traversal(&lower)
+    {
+        return false;
+    }
+    (lower.contains(".read_text(") || lower.contains("open("))
+        && source_path_literal_count(&lower) == 1
+}
+
+fn script_broad_source_symbol_search(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !scriptish(&lower)
+        || script_mutates_files(command)
+        || script_raw_byte_or_format_probe(command)
+        || !recursive_source_traversal(&lower)
+    {
+        return false;
+    }
+    identifier_tokens(command)
+        .iter()
+        .any(|token| symbol_like_pattern(token) && !lowercase_wire_key_like(token))
+}
+
+fn recursive_source_traversal(lower_command: &str) -> bool {
+    (lower_command.contains(".rglob(")
+        || lower_command.contains(".glob(")
+        || lower_command.contains("os.walk")
+        || lower_command.contains("walkdir")
+        || lower_command.contains("find "))
+        && SOURCE_EXTENSIONS.iter().any(|ext| lower_command.contains(ext))
+}
+
+fn source_path_literal_count(lower_command: &str) -> usize {
+    SOURCE_EXTENSIONS
+        .iter()
+        .map(|ext| lower_command.matches(ext).count())
+        .sum()
 }
 
 fn command_segments(command: &str) -> Vec<String> {
@@ -2028,6 +2109,281 @@ fn literal_like_pattern(pattern: &str) -> bool {
         || lower.contains('\'')
         || lower.contains("error")
         || lower.contains("assert")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepPatternKind {
+    DeclarationForm,
+    SymbolCallOrMember,
+    SymbolFamilyOrRelationship,
+    CodeIdiom,
+    ExactImportOrInclude,
+    ErrorMessageOrLogText,
+    WireKeyOrSerializationKey,
+    HeaderOrProtocolLiteral,
+    NumericOrCodepointLiteral,
+    NamingVariantTextSearch,
+    TestTextSearch,
+    Unknown,
+}
+
+fn grep_pattern_kind(pattern: &str, glob: &str, path: &str) -> GrepPatternKind {
+    let trimmed = pattern.trim_matches(['"', '\'']).trim();
+    if trimmed.is_empty() {
+        return GrepPatternKind::Unknown;
+    }
+    if declaration_search_pattern(trimmed) {
+        return GrepPatternKind::DeclarationForm;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if exact_import_or_include_pattern(&lower) {
+        return GrepPatternKind::ExactImportOrInclude;
+    }
+    if numeric_or_codepoint_literal(trimmed) {
+        return GrepPatternKind::NumericOrCodepointLiteral;
+    }
+    if header_or_protocol_literal(trimmed, &lower) {
+        return GrepPatternKind::HeaderOrProtocolLiteral;
+    }
+    if error_or_log_text_pattern(&lower, trimmed) {
+        return GrepPatternKind::ErrorMessageOrLogText;
+    }
+    if naming_variant_search(trimmed) {
+        return GrepPatternKind::NamingVariantTextSearch;
+    }
+    if wire_key_or_serialization_key(trimmed) {
+        return GrepPatternKind::WireKeyOrSerializationKey;
+    }
+    if localized_code_idiom(trimmed) {
+        return GrepPatternKind::CodeIdiom;
+    }
+    if test_scope(glob, path) && test_text_search(trimmed) {
+        return GrepPatternKind::TestTextSearch;
+    }
+    if symbol_call_or_member(trimmed) {
+        return GrepPatternKind::SymbolCallOrMember;
+    }
+    if symbol_family_or_relationship(trimmed) {
+        return GrepPatternKind::SymbolFamilyOrRelationship;
+    }
+    if test_scope(glob, path) && !symbol_like_pattern(trimmed) {
+        return GrepPatternKind::TestTextSearch;
+    }
+    GrepPatternKind::Unknown
+}
+
+fn exact_import_or_include_pattern(lower: &str) -> bool {
+    lower.starts_with("import")
+        || lower.contains(" import")
+        || lower.starts_with("#include")
+        || lower.contains("#include")
+}
+
+fn numeric_or_codepoint_literal(pattern: &str) -> bool {
+    let stripped: String = pattern
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit() || *ch == 'x' || *ch == 'X')
+        .collect();
+    stripped.len() >= 3 && stripped.len() == pattern.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
+fn header_or_protocol_literal(pattern: &str, lower: &str) -> bool {
+    ["csrf", "sec-fetch", "content-type", "accept-"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || (lower.contains("http") && pattern.chars().all(|ch| !ch.is_ascii_uppercase()))
+        || (lower.contains("header") && pattern.contains('-'))
+}
+
+fn error_or_log_text_pattern(lower: &str, pattern: &str) -> bool {
+    if all_same_prefixed_error_constants(pattern) {
+        return false;
+    }
+    contains_text_word(lower)
+        && (pattern.contains(' ')
+            || pattern.contains('|')
+            || pattern.contains('"')
+            || pattern.contains('\'')
+            || pattern.contains('[')
+            || pattern.contains(']'))
+}
+
+fn wire_key_or_serialization_key(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            lowercase_wire_key_like(token)
+                && !short_prefixed_source_symbol_like(token)
+                && !token.contains("__")
+                && !token.ends_with("_t")
+        })
+}
+
+fn naming_variant_search(pattern: &str) -> bool {
+    if pattern.contains("[_ ]") || pattern.contains("[_\\s]") {
+        return true;
+    }
+    let parts: Vec<_> = pattern
+        .split('|')
+        .map(|part| part.trim_matches(['"', '\'']).trim())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let mut normalized = std::collections::HashSet::new();
+    parts.iter().any(|part| {
+        let key: String = part
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(|ch| ch.to_lowercase())
+            .collect();
+        !key.is_empty() && !normalized.insert(key)
+    })
+}
+
+fn localized_code_idiom(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    (pattern.contains("\\.") && (pattern.contains("\\(") || pattern.contains("\\.(")))
+        && (lower.contains("\\(async") || lower.contains("(async") || lower.contains("\\.("))
+}
+
+fn test_text_search(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    if contains_text_word(&lower)
+        || header_or_protocol_literal(pattern, &lower)
+        || numeric_or_codepoint_literal(pattern)
+        || naming_variant_search(pattern)
+        || wire_key_or_serialization_key(pattern)
+    {
+        return true;
+    }
+    let tokens = identifier_tokens(pattern);
+    if tokens.len() >= 2 && tokens.iter().all(|token| !symbol_like_pattern(token)) {
+        return true;
+    }
+    tokens.len() >= 2
+        && tokens.iter().all(|token| !token.chars().any(|ch| ch.is_ascii_uppercase()))
+        && tokens.iter().any(|token| !symbol_like_pattern(token))
+        && (pattern.contains('|') || pattern.contains(' '))
+}
+
+fn symbol_call_or_member(pattern: &str) -> bool {
+    if localized_code_idiom(pattern) {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    (pattern.contains("\\(") || pattern.contains("\\s*\\(") || pattern.contains("::"))
+        && tokens
+            .iter()
+            .any(|token| symbol_like_pattern(token) && !lowercase_wire_key_like(token))
+}
+
+fn symbol_family_or_relationship(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    if tokens.is_empty() {
+        return false;
+    }
+    if pattern.contains(".*") && tokens.iter().any(|token| symbol_like_pattern(token)) {
+        return true;
+    }
+    if pattern.contains('|') {
+        let parts: Vec<_> = pattern
+            .split('|')
+            .map(|part| identifier_tokens(part))
+            .filter(|part_tokens| !part_tokens.is_empty())
+            .collect();
+        if parts.len() >= 2
+            && parts.iter().all(|part_tokens| {
+                part_tokens
+                    .iter()
+                    .all(|token| symbol_like_pattern(token) && !uppercase_constant_like(token))
+            })
+            && !naming_variant_search(pattern)
+        {
+            return true;
+        }
+    }
+    tokens.len() == 1 && symbol_like_pattern(&tokens[0]) && !lowercase_wire_key_like(&tokens[0])
+}
+
+fn test_scope(glob: &str, path: &str) -> bool {
+    let lower = format!("{} {}", glob, path).to_ascii_lowercase();
+    lower.contains("test") || lower.contains("spec")
+}
+
+fn contains_text_word(lower: &str) -> bool {
+    [
+        "failed",
+        "exception",
+        "warning",
+        "message",
+        "invalid",
+        "panic",
+        "recover",
+        "path",
+        "url",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+        || lower.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| matches!(word, "error" | "assert" | "log"))
+}
+
+fn declaration_search_pattern(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    if lower.starts_with("#define ") || lower.contains("|#define ") {
+        return true;
+    }
+    [
+        "class ",
+        "static class ",
+        "case class ",
+        "object ",
+        "trait ",
+        "sealed trait ",
+        "interface ",
+        "enum ",
+        "typedef",
+        "def ",
+        "func ",
+        "function ",
+    ]
+    .iter()
+    .any(|needle| lower.starts_with(needle) || lower.contains(&format!("|{needle}")))
+}
+
+fn uppercase_constant_like(token: &str) -> bool {
+    token.len() >= 3
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && token.chars().any(|ch| ch.is_ascii_uppercase())
+}
+
+fn lowercase_wire_key_like(token: &str) -> bool {
+    token.len() >= 3
+        && token.contains('_')
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        && token.chars().any(|ch| ch.is_ascii_lowercase())
+}
+
+fn short_prefixed_source_symbol_like(token: &str) -> bool {
+    token
+        .split_once('_')
+        .map(|(prefix, _)| prefix.len() <= 3)
+        .unwrap_or(false)
+}
+
+fn all_same_prefixed_error_constants(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    tokens.len() >= 2
+        && tokens
+            .iter()
+            .all(|token| token.starts_with("ERROR_") && uppercase_constant_like(token))
 }
 
 fn overlaps_recent_bifrost_miss(needle: &str, exchanges: &[ToolExchange]) -> bool {
