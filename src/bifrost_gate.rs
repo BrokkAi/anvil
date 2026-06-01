@@ -627,7 +627,10 @@ pub async fn classify_shell_tool_call(
         )
         .await
         {
-            Ok(output) => return Ok(output),
+            Ok(mut output) => {
+                enforce_shell_classifier_policy(&mut output, &context);
+                return Ok(output);
+            }
             Err(err) => {
                 last_err = Some(err.context(format!("shell classifier attempt {}", attempt + 1)));
             }
@@ -984,7 +987,7 @@ fn build_shell_request_body_with_mode(
     let system = if json_only_retry {
         "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify by purpose from pending_call_features and compact_evidence. Use builtins for ordinary file reads/searches/listings when they preserve intent. Use Bifrost only for clear source-code symbol discovery. Allow shell only for concrete shell semantics such as build/test/git/package commands, env/path probes, raw bytes, mutation, generated artifacts, or meaningful pipeline behavior. If uncertain, choose allow_original with confidence low."
     } else {
-        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, or a pipeline whose transformation or exit behavior matters. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is builtin inspection, not Bifrost. Grep/rg/git-grep-like shell commands should usually use use_grep_search first; choose a Bifrost action only when the command's primary purpose is clearly source-code symbol discovery and builtin grep_search would be a worse route. Do not allow shell merely because the user used shell syntax, heredoc, Python, grep, sed, head, tail, xargs, or a pipe. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. When uncertain between Bifrost and builtin/text, prefer builtin/text unless the command is clearly source symbol discovery. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
+        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, or a pipeline whose transformation or exit behavior matters. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is builtin inspection, not Bifrost. For grep/rg/git-grep-like commands over broad source scope, choose Bifrost when the pattern is source-symbol discovery: declarations, definitions, call sites, references, related tests, or broad code orientation. Choose builtin grep_search for exact text, exact-file scope, config/docs/log/error/header/import/wire/literal searches, filename/path searches, counts, or paired literal token checks. Do not allow shell unless concrete shell execution semantics are required. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -1159,6 +1162,9 @@ fn strong_text_grep_allow_exception(
     {
         return true;
     }
+    if assertion_or_build_string_regex_text(pattern) {
+        return true;
+    }
     if regex_text_semantics_material(pattern)
         && narrow_component_scope(glob, path, file_path)
         && !declaration_search_pattern(pattern)
@@ -1178,6 +1184,9 @@ fn strong_text_grep_allow_exception(
     {
         return true;
     }
+    if bounded_test_scope(glob, path, file_path) && lower_snake_literal_token_count(pattern) > 0 {
+        return true;
+    }
     if narrow_component_scope(glob, path, file_path)
         && matches!(
             kind,
@@ -1186,6 +1195,11 @@ fn strong_text_grep_allow_exception(
                 | GrepPatternKind::NaturalLanguageOrPathLiteral
                 | GrepPatternKind::UppercaseErrorConstantSet
         )
+    {
+        return true;
+    }
+    if narrow_component_scope(glob, path, file_path)
+        && lower_snake_literal_token_count(pattern) >= 2
     {
         return true;
     }
@@ -1231,6 +1245,9 @@ fn record_policy_requires_bifrost(
     }
 
     let kind = grep_pattern_kind(pattern, glob, path);
+    if source_identifier_alternation(pattern) {
+        return true;
+    }
     if !bifrost_navigation_scope(glob, path, file_path) && kind != GrepPatternKind::DeclarationForm
     {
         return false;
@@ -1256,7 +1273,44 @@ fn exact_error_constant_search(pattern: &str, path: &str, file_path: &str) -> bo
             .all(|token| token.chars().all(|ch| !ch.is_ascii_lowercase()) && token.contains("ERR"))
 }
 
+fn source_identifier_alternation(pattern: &str) -> bool {
+    if !pattern.contains('|') {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    tokens.len() >= 2
+        && tokens
+            .iter()
+            .filter(|token| symbol_like_pattern(token))
+            .count()
+            >= 2
+        && !mixed_lower_snake_serialization_or_config_search(pattern)
+}
+
+fn lower_snake_literal_token_count(pattern: &str) -> usize {
+    identifier_tokens(pattern)
+        .into_iter()
+        .filter(|token| lowercase_wire_key_like(token) && !short_prefixed_source_symbol_like(token))
+        .count()
+}
+
 fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
+    if output.shell_semantics_required
+        || matches!(
+            output.allow_exception,
+            ShellAllowException::BuildTestGitPackageOrProjectCli
+                | ShellAllowException::ShellSemanticsRequired
+                | ShellAllowException::RawByteOrHiddenWhitespace
+                | ShellAllowException::MutationOrWriteOrDelete
+                | ShellAllowException::HeredocOrCommandSubstitution
+                | ShellAllowException::GeneratedArtifactOrExitBehavior
+        )
+    {
+        output.decision = ShellClassifierDecision::AllowShell;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        return;
+    }
     if output.confidence != GateConfidence::High {
         if output.confidence == GateConfidence::Medium
             && !output.shell_semantics_required
@@ -1274,20 +1328,6 @@ fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
         return;
     }
 
-    match route_prefix(&output.reason) {
-        Some(RoutePrefix::UseBifrost) => {
-            output.decision = ShellClassifierDecision::UseBifrostTool;
-            output.recommended_tool = bifrost_tool_for_shell_intent(&output.intent);
-            return;
-        }
-        Some(RoutePrefix::UseBuiltin) => {
-            output.decision = ShellClassifierDecision::UseBuiltinTool;
-            output.recommended_tool = builtin_tool_for_shell_intent(&output.intent);
-            return;
-        }
-        _ => {}
-    }
-
     match output.decision {
         ShellClassifierDecision::UseBifrostTool
             if is_bifrost_recommendation(&output.recommended_tool) => {}
@@ -1302,6 +1342,92 @@ fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
             output.recommended_tool = RecommendedTool::None;
             output.suggested_args = json!({});
         }
+    }
+}
+
+fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: &GateContext) {
+    if context.tool_name != "run_shell_command" {
+        return;
+    }
+    let command = context
+        .args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if command.is_empty() || shell_semantics_required(command) {
+        return;
+    }
+    if output.decision == ShellClassifierDecision::UseBifrostTool
+        && shell_search_pattern(command).is_some_and(|pattern| {
+            shell_source_search_builtin_exception(
+                &pattern,
+                grep_pattern_kind(&pattern, "", command),
+            )
+        })
+    {
+        output.decision = ShellClassifierDecision::UseBuiltinTool;
+        output.recommended_tool = builtin_tool_for_shell_command(command);
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "USE_BUILTIN_TOOL because `{}` is exact/literal shell search and no concrete shell semantic is required.",
+            truncate_to(command, 160)
+        );
+        output.intent = ShellIntent::LiteralTextSearch;
+        output.allow_exception = ShellAllowException::None;
+        output.replacement_class = ShellReplacementClass::UseBuiltinInspection;
+        output.bifrost_fit = BifrostFit::NotApplicable;
+        output.builtin_preserves_intent = true;
+        output.confidence = GateConfidence::High;
+        return;
+    }
+    if let Some(tool) = strong_shell_source_symbol_search(command) {
+        output.decision = ShellClassifierDecision::UseBifrostTool;
+        output.recommended_tool = tool.clone();
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "USE_BIFROST_TOOL because broad source shell search `{}` is source-symbol discovery with no shell-specific semantic or builtin-only exception.",
+            truncate_to(command, 160)
+        );
+        output.intent = if tool == RecommendedTool::ScanUsages {
+            ShellIntent::SymbolReferenceLookup
+        } else {
+            ShellIntent::SymbolDefinitionLookup
+        };
+        output.shell_semantics_required = false;
+        output.builtin_preserves_intent = false;
+        output.bifrost_fit = BifrostFit::SameOrMoreDirect;
+        output.allow_exception = ShellAllowException::None;
+        output.replacement_class = ShellReplacementClass::UseBifrostSymbol;
+        output.confidence = GateConfidence::High;
+        return;
+    }
+    if output.decision == ShellClassifierDecision::AllowShell
+        && (simple_shell_read_like(command)
+            || simple_shell_search_like(command)
+            || script_exact_file_text_inspection(command)
+            || script_bounded_file_text_inspection(command))
+    {
+        output.decision = ShellClassifierDecision::UseBuiltinTool;
+        output.recommended_tool = builtin_tool_for_shell_command(command);
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "USE_BUILTIN_TOOL because `{}` is file/search/list inspection and no concrete shell semantic is required.",
+            truncate_to(command, 160)
+        );
+        let lower = command.to_ascii_lowercase();
+        output.intent = if simple_shell_search_like(command) {
+            ShellIntent::LiteralTextSearch
+        } else if lower.contains("find ") || lower.contains("ls ") {
+            ShellIntent::DirectoryOrFileDiscovery
+        } else {
+            ShellIntent::OrdinaryFileRead
+        };
+        output.allow_exception = ShellAllowException::None;
+        output.replacement_class = ShellReplacementClass::UseBuiltinInspection;
+        output.bifrost_fit = BifrostFit::NotApplicable;
+        output.builtin_preserves_intent = true;
+        output.confidence = GateConfidence::High;
     }
 }
 
@@ -1337,15 +1463,6 @@ fn bifrost_tool_for_text_intent(intent: &TextIntent) -> RecommendedTool {
         TextIntent::SymbolReferenceLookup => RecommendedTool::ScanUsages,
         TextIntent::BroadSemanticOrientation => RecommendedTool::GetSummaries,
         TextIntent::SymbolDefinitionLookup => RecommendedTool::SearchSymbols,
-        _ => RecommendedTool::SearchSymbols,
-    }
-}
-
-fn bifrost_tool_for_shell_intent(intent: &ShellIntent) -> RecommendedTool {
-    match intent {
-        ShellIntent::SymbolReferenceLookup => RecommendedTool::ScanUsages,
-        ShellIntent::BroadSemanticOrientation => RecommendedTool::GetSummaries,
-        ShellIntent::SymbolDefinitionLookup => RecommendedTool::SearchSymbols,
         _ => RecommendedTool::SearchSymbols,
     }
 }
@@ -2100,6 +2217,12 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
             RecommendedTool::ScanUsages,
         ));
     }
+    if let Some(tool) = strong_shell_source_symbol_search(command) {
+        return Some(ShellStaticRoute::UseBifrost(
+            "static_shell_symbol_search",
+            tool,
+        ));
+    }
     if scriptish(&command.to_ascii_lowercase())
         && recursive_source_traversal(&command.to_ascii_lowercase())
     {
@@ -2114,11 +2237,8 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
             builtin_tool_for_shell_command(command),
         ));
     }
-    if shell_symbol_search_like(command) {
-        return Some(ShellStaticRoute::UseBifrost(
-            "static_shell_symbol_search",
-            bifrost_tool_for_shell_search(command),
-        ));
+    if ambiguous_source_shell_search(command) {
+        return None;
     }
     if simple_shell_read_like(command) || simple_shell_search_like(command) {
         return Some(ShellStaticRoute::UseBuiltin(
@@ -2221,6 +2341,9 @@ fn build_test_git_package_like(command: &str) -> bool {
         || lower.contains("/phpcs")
         || lower.contains("/sbt")
         || lower.contains("bin/sbt")
+        || lower.contains("sbt_bin")
+        || lower.contains("-batch \"projects\"")
+        || lower.contains("-batch projects")
         || lower.contains("uv_run_tests")
         || lower.contains(" testonly")
 }
@@ -2327,6 +2450,19 @@ fn script_exact_file_text_inspection(command: &str) -> bool {
         && source_path_literal_count(&lower) == 1
 }
 
+fn script_bounded_file_text_inspection(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !scriptish(&lower)
+        || script_mutates_files(command)
+        || true_script_raw_byte_or_format_probe(command)
+        || recursive_source_traversal(&lower)
+    {
+        return false;
+    }
+    (lower.contains(".read_text(") || lower.contains("open("))
+        && source_path_literal_count(&lower) >= 1
+}
+
 fn script_broad_source_symbol_search(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     if !scriptish(&lower)
@@ -2375,17 +2511,24 @@ fn true_script_raw_byte_or_format_probe(command: &str) -> bool {
 }
 
 fn script_contains_symbol_call_or_declaration(command: &str) -> bool {
-    declaration_search_pattern(command) || quoted_symbol_call_literal(command)
+    declaration_search_pattern(command)
 }
 
-fn quoted_symbol_call_literal(command: &str) -> bool {
-    command.split(['"', '\'']).enumerate().any(|(index, part)| {
-        index % 2 == 1
-            && part.contains('(')
-            && identifier_tokens(part)
-                .iter()
-                .any(|token| symbol_like_pattern(token) && !lowercase_wire_key_like(token))
-    })
+fn script_recursive_constructor_or_call_search(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    scriptish(&lower)
+        && !script_mutates_files(command)
+        && !script_raw_byte_or_format_probe(command)
+        && recursive_source_traversal(&lower)
+        && command.split(['"', '\'']).enumerate().any(|(index, part)| {
+            index % 2 == 1
+                && (part.contains('(') || part.contains("::") || part.contains("->"))
+                && identifier_tokens(part).iter().any(|token| {
+                    token.len() >= 8
+                        && symbol_like_pattern(token)
+                        && !lowercase_wire_key_like(token)
+                })
+        })
 }
 
 fn command_segments(command: &str) -> Vec<String> {
@@ -2518,7 +2661,6 @@ fn shell_symbol_search_like(command: &str) -> bool {
             | GrepPatternKind::WireKeyOrSerializationKey
             | GrepPatternKind::HeaderOrProtocolLiteral
             | GrepPatternKind::NumericOrCodepointLiteral
-            | GrepPatternKind::NamingVariantTextSearch
             | GrepPatternKind::TestTextSearch
             | GrepPatternKind::CodeIdiom
     ) && (symbol_like_pattern(&pattern)
@@ -2528,6 +2670,130 @@ fn shell_symbol_search_like(command: &str) -> bool {
                 | GrepPatternKind::SymbolCallOrMember
                 | GrepPatternKind::SymbolFamilyOrRelationship
         ))
+}
+
+fn strong_shell_source_symbol_search(command: &str) -> Option<RecommendedTool> {
+    if shell_semantics_required(command) {
+        return None;
+    }
+    if script_recursive_constructor_or_call_search(command) {
+        return Some(RecommendedTool::ScanUsages);
+    }
+    let pattern = shell_search_pattern(command)?;
+    if !command_has_source_scope(command) || shell_builtin_inspection_guard(command) {
+        return None;
+    }
+    let kind = grep_pattern_kind(&pattern, "", command);
+    if shell_source_search_builtin_exception(&pattern, kind) {
+        return None;
+    }
+    if declaration_search_pattern(&pattern) {
+        return Some(RecommendedTool::SearchSymbols);
+    }
+    if shell_call_or_member_search(&pattern) {
+        return Some(RecommendedTool::ScanUsages);
+    }
+    if strong_symbol_discovery_pattern(&pattern) {
+        return Some(RecommendedTool::SearchSymbols);
+    }
+    None
+}
+
+fn shell_source_search_builtin_exception(pattern: &str, kind: GrepPatternKind) -> bool {
+    let tokens = identifier_tokens(pattern);
+    if kind == GrepPatternKind::AssertionOrSerializationText
+        && tokens
+            .iter()
+            .all(|token| short_prefixed_source_symbol_like(token))
+    {
+        return false;
+    }
+    matches!(
+        kind,
+        GrepPatternKind::ExactImportOrInclude
+            | GrepPatternKind::ErrorMessageOrLogText
+            | GrepPatternKind::WireKeyOrSerializationKey
+            | GrepPatternKind::HeaderOrProtocolLiteral
+            | GrepPatternKind::NumericOrCodepointLiteral
+            | GrepPatternKind::TestTextSearch
+            | GrepPatternKind::CodeIdiom
+            | GrepPatternKind::PackageDeclarationLiteral
+            | GrepPatternKind::NaturalLanguageOrPathLiteral
+            | GrepPatternKind::AssertionOrSerializationText
+    ) || mixed_env_literal_search(pattern)
+        || exactly_two_plain_symbol_alternatives(pattern)
+}
+
+fn shell_call_or_member_search(pattern: &str) -> bool {
+    (pattern.contains("\\(")
+        || pattern.contains('(')
+        || pattern.contains("::")
+        || pattern.contains("->"))
+        && symbol_like_pattern(pattern)
+}
+
+fn strong_symbol_discovery_pattern(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    if tokens.len() == 1 {
+        return symbol_like_pattern(pattern);
+    }
+    if tokens.len() >= 3 && tokens.iter().any(|token| symbol_like_pattern(token)) {
+        return true;
+    }
+    tokens.len() >= 2
+        && tokens
+            .iter()
+            .all(|token| short_prefixed_source_symbol_like(token))
+}
+
+fn mixed_env_literal_search(pattern: &str) -> bool {
+    pattern.contains("USERPROFILE") || pattern.contains("TMP")
+}
+
+fn exactly_two_plain_symbol_alternatives(pattern: &str) -> bool {
+    if !pattern.contains('|')
+        || pattern.contains("\\(")
+        || pattern.contains('(')
+        || pattern.contains("::")
+        || pattern.contains("->")
+        || declaration_search_pattern(pattern)
+    {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    tokens.len() == 2
+        && tokens.iter().all(|token| symbol_like_pattern(token))
+        && !tokens
+            .iter()
+            .all(|token| short_prefixed_source_symbol_like(token))
+}
+
+fn ambiguous_source_shell_search(command: &str) -> bool {
+    let Some(pattern) = shell_search_pattern(command) else {
+        return false;
+    };
+    if !command_has_source_scope(command) || shell_builtin_inspection_guard(command) {
+        return false;
+    }
+    let kind = grep_pattern_kind(&pattern, "", command);
+    if matches!(
+        kind,
+        GrepPatternKind::ExactImportOrInclude
+            | GrepPatternKind::ErrorMessageOrLogText
+            | GrepPatternKind::WireKeyOrSerializationKey
+            | GrepPatternKind::HeaderOrProtocolLiteral
+            | GrepPatternKind::NumericOrCodepointLiteral
+            | GrepPatternKind::NamingVariantTextSearch
+            | GrepPatternKind::TestTextSearch
+            | GrepPatternKind::CodeIdiom
+    ) {
+        return false;
+    }
+    symbol_like_pattern(&pattern)
+        || matches!(
+            kind,
+            GrepPatternKind::SymbolCallOrMember | GrepPatternKind::SymbolFamilyOrRelationship
+        )
 }
 
 const SOURCE_EXTENSIONS: &[&str] = &[
@@ -2542,17 +2808,6 @@ fn builtin_tool_for_shell_command(command: &str) -> RecommendedTool {
         RecommendedTool::ListDirectory
     } else {
         RecommendedTool::ReadFile
-    }
-}
-
-fn bifrost_tool_for_shell_search(command: &str) -> RecommendedTool {
-    let Some(pattern) = shell_search_pattern(command) else {
-        return RecommendedTool::SearchSymbols;
-    };
-    if pattern.contains("\\(") || pattern.contains('(') || pattern.contains("->") {
-        RecommendedTool::ScanUsages
-    } else {
-        RecommendedTool::SearchSymbols
     }
 }
 
@@ -2846,11 +3101,44 @@ fn assertion_or_serialization_text(pattern: &str) -> bool {
         || mixed_lower_snake_serialization_or_config_search(pattern)
 }
 
+fn assertion_or_build_string_regex_text(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    assertion_or_serialization_text(pattern)
+        && regex_text_semantics_material(pattern)
+        && (lower.contains("should")
+            || lower.contains("\\.string")
+            || lower.contains(".string")
+            || lower.contains("\\.build")
+            || lower.contains(".build"))
+}
+
 fn mixed_lower_snake_serialization_or_config_search(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    let has_serialization_context = [
+        "json",
+        "yaml",
+        "toml",
+        "xml",
+        "config",
+        "setting",
+        "field",
+        "key",
+        "value",
+        "param",
+        "string",
+        "serde",
+        "serializ",
+        "deserializ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !has_serialization_context {
+        return false;
+    }
     let tokens = identifier_tokens(pattern);
     let lower_snake_count = tokens
         .iter()
-        .filter(|token| lowercase_wire_key_like(token))
+        .filter(|token| lowercase_wire_key_like(token) && !short_prefixed_source_symbol_like(token))
         .count();
     lower_snake_count > 0 && tokens.len() >= 2
 }
@@ -3445,6 +3733,20 @@ mod tests {
     }
 
     #[test]
+    fn shell_action_wins_over_contradictory_reason_prefix() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": shell_output_json("USE_BUILTIN_TOOL because prose is contradictory.", "build_test_git_package_or_project_cli", false, false, "not_applicable", "build_test_git_package_or_project_cli", "allow_shell_shell_semantics", "allow_shell", "read_file")
+                }
+            }]
+        });
+        let parsed = parse_shell_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, ShellClassifierDecision::AllowShell);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
     fn rendered_context_includes_compact_bifrost_miss_evidence() {
         let mut miss = exchange("search_symbols");
         miss.arguments = "{\"patterns\":[\"FOO_MACRO\"]}".to_string();
@@ -3623,6 +3925,92 @@ mod tests {
     }
 
     #[test]
+    fn assertion_build_string_regex_grep_stays_allowed() {
+        let mut output = GateClassifierOutput {
+            reason: "GATE_TO_SYMBOL_TOOL because broad source grep mentions a class.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["PatternReplaceTokenFilter".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["PatternReplaceTokenFilter"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({"patterns":["PatternReplaceTokenFilter"]}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "*.scala",
+                "pattern": "\\.build\\.string|\\.string shouldBe .*pattern_replace|PatternReplaceTokenFilter\\(.*\\)\\.build"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn c_api_lower_snake_symbol_grep_is_not_serialization_text() {
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because exact regex text was requested.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::IdentifierLike,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::ExactLiteralOrRegex,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["uv_pipe_bind2".to_string(), "uv_pipe_connect2".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: true,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["uv_pipe_bind2", "uv_pipe_connect2"]}),
+            }),
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::Medium,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "src/**/*.c",
+                "pattern": "uv_pipe_bind2|uv_pipe_connect2|pipe_bind2|pipe_connect2"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
     fn rendered_context_uses_pending_call_and_features() {
         let context = GateContext {
             tool_name: "read_file".to_string(),
@@ -3756,6 +4144,12 @@ mod tests {
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
+            static_shell_route(
+                &json!({"command": "SBT_BIN=/tmp/sbt && \"$SBT_BIN\" -batch \"projects\" | grep -E \"(project|tests)\""})
+            ),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
             static_shell_route(&json!({"command": "./tool/go test -count=1 ./util/osuser"})),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
@@ -3771,6 +4165,15 @@ mod tests {
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "grep -RIn \"EnsureCertLoops|TerminateTLS|type TCPPortHandler\" kube ipn . | head -200"})
+            ),
+            Some(ShellStaticRoute::UseBifrost(
+                "static_shell_symbol_search",
+                RecommendedTool::SearchSymbols
+            ))
+        ));
+        assert!(matches!(
+            static_shell_route(
+                &json!({"command": "grep -rn \"uv_os_homedir\\|uv_os_tmpdir\" /tmp/work --include=\"*.c\" -l"})
             ),
             Some(ShellStaticRoute::UseBifrost(
                 "static_shell_symbol_search",
@@ -3807,10 +4210,7 @@ mod tests {
             static_shell_route(
                 &json!({"command": "rg -n \"RichEditBoxDefaultLineEnding|ApplyTabAndLineEndingFix\" src/Notepads/Controls/TextEditor"})
             ),
-            Some(ShellStaticRoute::UseBifrost(
-                "static_shell_symbol_search",
-                RecommendedTool::SearchSymbols
-            ))
+            None
         ));
         assert!(matches!(
             static_shell_route(
@@ -3857,7 +4257,7 @@ mod tests {
                 &json!({"command": "python - <<'PY'\nimport pathlib\nfor path in pathlib.Path('.').rglob('*.scala'):\n    text = path.read_text()\n    if 'ChunkingSettings(' in text:\n        print(path)\nPY"})
             ),
             Some(ShellStaticRoute::UseBifrost(
-                "static_shell_recursive_symbol_search",
+                "static_shell_symbol_search",
                 RecommendedTool::ScanUsages
             ))
         ));
