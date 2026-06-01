@@ -450,5 +450,6 @@ Asset names:
 
 - `brokk-anvil-vX.Y.Z-x86_64-unknown-linux-gnu.zip`
 - `brokk-anvil-vX.Y.Z-aarch64-unknown-linux-gnu.zip`
+- `brokk-anvil-vX.Y.Z-aarch64-linux-android.zip`
 - `brokk-anvil-vX.Y.Z-x86_64-pc-windows-msvc.zip`
 - `brokk-anvil-vX.Y.Z-universal-apple-darwin.zip`
