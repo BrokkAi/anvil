@@ -992,12 +992,14 @@ fn grep_search_features(args: &Value, exchanges: &[ToolExchange]) -> Value {
     let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
     let glob = args.get("glob").and_then(Value::as_str).unwrap_or("");
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-    let scope_target = grep_scope_target(glob, path);
-    let scope_granularity = grep_scope_granularity(glob, path);
+    let file_path = args.get("file_path").and_then(Value::as_str).unwrap_or("");
+    let scope_target = grep_scope_target(glob, path, file_path);
+    let scope_granularity = grep_scope_granularity(glob, path, file_path);
     json!({
         "pattern": pattern,
         "glob": glob,
         "path": path,
+        "file_path": file_path,
         "scope_granularity": scope_granularity,
         "exact_file_scope": scope_granularity == "exact_file",
         "broad_source_or_test_scope": broad_source_or_test_scope(glob, path),
@@ -1083,6 +1085,10 @@ fn broad_source_symbol_grep(args: &Value, exchanges: &[ToolExchange]) -> bool {
     let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
     let glob = args.get("glob").and_then(Value::as_str).unwrap_or("");
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+    let file_path = args.get("file_path").and_then(Value::as_str).unwrap_or("");
+    if grep_scope_granularity(glob, path, file_path) == "exact_file" {
+        return false;
+    }
     broad_source_or_test_scope(glob, path)
         && source_like_grep_scope(glob, path)
         && source_symbol_search_pattern(pattern)
@@ -1280,21 +1286,27 @@ fn search_scope(glob: &str, path: &str) -> &'static str {
     }
 }
 
-fn grep_scope_target(glob: &str, path: &str) -> String {
-    if !path.trim().is_empty() {
+fn grep_scope_target(glob: &str, path: &str, file_path: &str) -> String {
+    if !file_path.trim().is_empty() {
+        file_path.trim().to_string()
+    } else if !path.trim().is_empty() {
         path.trim().to_string()
     } else {
         glob.trim().to_string()
     }
 }
 
-fn grep_scope_granularity(glob: &str, path: &str) -> &'static str {
-    let target = grep_scope_target(glob, path);
+fn grep_scope_granularity(glob: &str, path: &str, file_path: &str) -> &'static str {
+    let target = grep_scope_target(glob, path, file_path);
+    if target != "."
+        && !target.contains('*')
+        && is_source_like_path(&target)
+        && target.contains('.')
+    {
+        return "exact_file";
+    }
     if target.is_empty() || target == "." {
         return "repo_wide";
-    }
-    if !target.contains('*') && is_source_like_path(&target) {
-        return "exact_file";
     }
     if target.contains('*') && is_source_like_path(&target) {
         return "source_glob";
@@ -1306,7 +1318,7 @@ fn grep_scope_granularity(glob: &str, path: &str) -> &'static str {
 }
 
 fn broad_source_or_test_scope(glob: &str, path: &str) -> bool {
-    let scope = grep_scope_granularity(glob, path);
+    let scope = grep_scope_granularity(glob, path, "");
     let combined = format!("{glob} {path}").to_ascii_lowercase();
     matches!(scope, "repo_wide" | "source_glob")
         || matches!(path, "." | "src" | "source" | "test" | "tests")
@@ -1531,7 +1543,10 @@ fn build_test_git_package_like(command: &str) -> bool {
         "go test",
         "go build",
         "go fmt",
+        "go vet",
         "gofmt ",
+        "apt-get ",
+        "sudo apt-get ",
         "npm ",
         "pnpm ",
         "yarn ",
@@ -1564,8 +1579,12 @@ fn build_test_git_package_like(command: &str) -> bool {
         || lower.contains("/go test")
         || lower.contains("/go build")
         || lower.contains("/go fmt")
+        || lower.contains("/go vet")
         || lower.contains("/phpunit")
         || lower.contains("/phpcs")
+        || lower.contains("/sbt")
+        || lower.contains("bin/sbt")
+        || lower.contains("uv_run_tests")
         || lower.contains(" testonly")
 }
 
@@ -1736,8 +1755,25 @@ fn shell_source_symbol_search_like(command: &str) -> bool {
     let Some(pattern) = shell_search_pattern(command) else {
         return false;
     };
+    if shell_search_has_exact_file_scope(command) {
+        return false;
+    }
     command_has_source_scope(command) && source_symbol_search_pattern(&pattern)
 }
+
+fn shell_search_has_exact_file_scope(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let cleaned = token.trim_matches(['"', '\'', ';', '|']);
+        !cleaned.contains('*')
+            && SOURCE_EXTENSIONS
+                .iter()
+                .any(|ext| cleaned.to_ascii_lowercase().ends_with(ext))
+    })
+}
+
+const SOURCE_EXTENSIONS: &[&str] = &[
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".go", ".java", ".cs", ".php", ".scala", ".rs",
+];
 
 fn builtin_tool_for_shell_command(command: &str) -> RecommendedTool {
     let lower = command.to_ascii_lowercase();
@@ -1756,14 +1792,9 @@ fn command_has_source_scope(command: &str) -> bool {
         || lower.contains("/src")
         || lower.contains("grep -r")
         || lower.contains("rg ")
-        || lower.contains("*.rs")
-        || lower.contains("*.go")
-        || lower.contains("*.java")
-        || lower.contains("*.cs")
-        || lower.contains("*.php")
-        || lower.contains("*.scala")
-        || lower.contains("*.c")
-        || lower.contains("*.h")
+        || SOURCE_EXTENSIONS
+            .iter()
+            .any(|ext| lower.contains(&format!("*{ext}")))
 }
 
 fn shell_search_pattern(command: &str) -> Option<String> {
@@ -2372,12 +2403,14 @@ mod tests {
                 RecommendedTool::SearchSymbols
             ))
         ));
-        assert!(static_text_route(
-            "grep_search",
-            &json!({"path": "README.md", "pattern": "error: file not found"}),
-            &[]
-        )
-        .is_none());
+        assert!(
+            static_text_route(
+                "grep_search",
+                &json!({"path": "README.md", "pattern": "error: file not found"}),
+                &[]
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2395,14 +2428,18 @@ mod tests {
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "cat build.sbt | grep -E \"project|tests\" | head -30"})),
+            static_shell_route(
+                &json!({"command": "cat build.sbt | grep -E \"project|tests\" | head -30"})
+            ),
             Some(ShellStaticRoute::UseBuiltin(
                 "static_shell_builtin_inspection",
                 RecommendedTool::GrepSearch
             ))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "grep -RIn \"EnsureCertLoops|TerminateTLS|type TCPPortHandler\" kube ipn . | head -200"})),
+            static_shell_route(
+                &json!({"command": "grep -RIn \"EnsureCertLoops|TerminateTLS|type TCPPortHandler\" kube ipn . | head -200"})
+            ),
             Some(ShellStaticRoute::UseBifrost(
                 "static_shell_source_symbol_search",
                 RecommendedTool::SearchSymbols
