@@ -565,7 +565,7 @@ pub async fn classify_text_tool_call(
             parse_openrouter_response,
             cancel,
         )
-            .await
+        .await
         {
             Ok(mut output) => {
                 enforce_text_classifier_policy(&mut output, &context);
@@ -1041,8 +1041,16 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         .get("pattern")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let glob = context.args.get("glob").and_then(Value::as_str).unwrap_or("");
-    let path = context.args.get("path").and_then(Value::as_str).unwrap_or("");
+    let glob = context
+        .args
+        .get("glob")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let path = context
+        .args
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let file_path = context
         .args
         .get("file_path")
@@ -1050,6 +1058,15 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         .unwrap_or("");
 
     if must_allow_text_grep(pattern, glob, path, file_path)
+        || strong_text_grep_allow_exception(
+            pattern,
+            glob,
+            path,
+            file_path,
+            &output.bifrost_fit,
+            output.evidence.exact_text_or_regex_needed,
+            context,
+        )
         || exact_error_constant_search(pattern, path, file_path)
     {
         output.decision = GateClassifierDecision::AllowText;
@@ -1090,8 +1107,80 @@ fn must_allow_text_grep(pattern: &str, glob: &str, path: &str, file_path: &str) 
             | GrepPatternKind::NumericOrCodepointLiteral
             | GrepPatternKind::NamingVariantTextSearch
             | GrepPatternKind::TestTextSearch
+            | GrepPatternKind::PackageDeclarationLiteral
             | GrepPatternKind::CodeIdiom
     )
+}
+
+fn strong_text_grep_allow_exception(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    bifrost_fit: &BifrostFit,
+    exact_text_or_regex_needed: bool,
+    context: &GateContext,
+) -> bool {
+    let kind = grep_pattern_kind(pattern, glob, path);
+    if package_declaration_literal(pattern) || uppercase_error_constant_set(pattern) {
+        return true;
+    }
+    if post_edit_scope_verification(pattern, glob, path, file_path, &context.tool_exchanges) {
+        return true;
+    }
+    if natural_language_or_path_literal(pattern) {
+        return true;
+    }
+    if exact_member_chain_or_call_text(pattern) {
+        return true;
+    }
+    if assertion_or_serialization_text(pattern)
+        && (narrow_component_scope(glob, path, file_path)
+            || bounded_test_scope(glob, path, file_path)
+            || bifrost_fit == &BifrostFit::NotApplicable
+            || exact_text_or_regex_needed)
+    {
+        return true;
+    }
+    if regex_text_semantics_material(pattern)
+        && narrow_component_scope(glob, path, file_path)
+        && !declaration_search_pattern(pattern)
+    {
+        return true;
+    }
+    if bounded_test_scope(glob, path, file_path)
+        && (matches!(
+            kind,
+            GrepPatternKind::TestTextSearch
+                | GrepPatternKind::CodeIdiom
+                | GrepPatternKind::ExactMemberChainOrCallText
+                | GrepPatternKind::AssertionOrSerializationText
+                | GrepPatternKind::NaturalLanguageOrPathLiteral
+                | GrepPatternKind::UppercaseErrorConstantSet
+        ) || (pattern.contains("\\(") && !declaration_search_pattern(pattern)))
+    {
+        return true;
+    }
+    if narrow_component_scope(glob, path, file_path)
+        && matches!(
+            kind,
+            GrepPatternKind::ExactMemberChainOrCallText
+                | GrepPatternKind::AssertionOrSerializationText
+                | GrepPatternKind::NaturalLanguageOrPathLiteral
+                | GrepPatternKind::UppercaseErrorConstantSet
+        )
+    {
+        return true;
+    }
+    if narrow_component_scope(glob, path, file_path)
+        && identifier_tokens(pattern).len() == 1
+        && !pattern.contains('|')
+        && !pattern.contains(".*")
+        && !pattern.contains("\\(")
+    {
+        return true;
+    }
+    false
 }
 
 fn record_policy_requires_bifrost(
@@ -1102,10 +1191,16 @@ fn record_policy_requires_bifrost(
     context: &GateContext,
 ) -> bool {
     if grep_scope_granularity(glob, path, file_path) == "exact_file"
-        || !(broad_source_or_test_scope(glob, path)
-            || is_source_like_path(glob)
-            || is_source_like_path(path))
         || must_allow_text_grep(pattern, glob, path, file_path)
+        || strong_text_grep_allow_exception(
+            pattern,
+            glob,
+            path,
+            file_path,
+            &BifrostFit::Unknown,
+            false,
+            context,
+        )
         || exact_error_constant_search(pattern, path, file_path)
     {
         return false;
@@ -1118,7 +1213,13 @@ fn record_policy_requires_bifrost(
         return false;
     }
 
-    match grep_pattern_kind(pattern, glob, path) {
+    let kind = grep_pattern_kind(pattern, glob, path);
+    if !bifrost_navigation_scope(glob, path, file_path) && kind != GrepPatternKind::DeclarationForm
+    {
+        return false;
+    }
+
+    match kind {
         GrepPatternKind::DeclarationForm
         | GrepPatternKind::SymbolCallOrMember
         | GrepPatternKind::SymbolFamilyOrRelationship => true,
@@ -1391,7 +1492,11 @@ fn grep_search_features(args: &Value, exchanges: &[ToolExchange]) -> Value {
         "scope_granularity": scope_granularity,
         "exact_file_scope": scope_granularity == "exact_file",
         "broad_source_or_test_scope": broad_source_or_test_scope(glob, path),
-        "grep_scope_recent_edit_or_write": same_path_recent_tool(&scope_target, exchanges, &["edit", "write_file"]),
+        "bifrost_navigation_scope": bifrost_navigation_scope(glob, path, file_path),
+        "bounded_test_scope": bounded_test_scope(glob, path, file_path),
+        "narrow_component_scope": narrow_component_scope(glob, path, file_path),
+        "grep_scope_recent_edit_or_write": same_scope_recent_edit_or_write(glob, path, file_path, exchanges)
+            || same_path_recent_tool(&scope_target, exchanges, &["edit", "write_file"]),
         "grep_scope_recent_read": same_path_recent_tool(&scope_target, exchanges, &["read_file"]),
         "source_like_scope": is_source_like_path(glob) || is_source_like_path(path) || (glob.is_empty() && path.is_empty()),
         "broad_repo_scope": glob.is_empty() && path.is_empty(),
@@ -1631,6 +1736,28 @@ fn grep_scope_target(glob: &str, path: &str, file_path: &str) -> String {
     }
 }
 
+fn normalized_grep_scope(glob: &str, path: &str, file_path: &str) -> String {
+    if !file_path.trim().is_empty() {
+        return file_path.trim().to_string();
+    }
+    let glob = glob.trim();
+    let path = path.trim();
+    if !glob.is_empty() && (path.is_empty() || path == ".") {
+        return glob.to_string();
+    }
+    if !glob.is_empty() && !path.is_empty() {
+        if glob.contains('/') {
+            glob.to_string()
+        } else {
+            format!("{}/{}", path.trim_end_matches('/'), glob)
+        }
+    } else if !path.is_empty() {
+        path.to_string()
+    } else {
+        glob.to_string()
+    }
+}
+
 fn grep_scope_granularity(glob: &str, path: &str, file_path: &str) -> &'static str {
     let target = grep_scope_target(glob, path, file_path);
     if target != "."
@@ -1661,6 +1788,74 @@ fn broad_source_or_test_scope(glob: &str, path: &str) -> bool {
         || combined.contains("/test")
         || combined.contains("tests/")
         || combined.contains("/tests")
+}
+
+fn path_is_repo_root(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed.is_empty() || trimmed == "."
+}
+
+fn path_component_count(path: &str) -> usize {
+    path.split('/')
+        .filter(|part| {
+            let part = part.trim();
+            !part.is_empty() && part != "." && !part.contains('*')
+        })
+        .count()
+}
+
+fn recursive_source_glob(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path);
+    scope.contains("**") && is_source_like_path(&scope)
+}
+
+fn source_root_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path);
+    matches!(
+        scope.as_str(),
+        "" | "." | "src" | "source" | "test" | "tests"
+    )
+}
+
+fn broad_test_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path).to_ascii_lowercase();
+    (scope.contains("test") || scope.contains("spec"))
+        && (scope.contains("**")
+            || matches!(path.trim(), "." | "test" | "tests" | "spec" | "specs"))
+}
+
+fn bounded_test_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path).to_ascii_lowercase();
+    (scope.contains("test") || scope.contains("spec"))
+        && !scope.contains("**")
+        && !path_is_repo_root(&scope)
+}
+
+fn shallow_component_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path);
+    if path_is_repo_root(&scope) || scope.contains("**") {
+        return false;
+    }
+    let components = path_component_count(&scope);
+    scope.starts_with("src/") && components <= 2
+}
+
+fn narrow_component_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path);
+    if path_is_repo_root(&scope) || scope.contains("**") {
+        return false;
+    }
+    path_component_count(&scope) >= 3
+}
+
+fn bifrost_navigation_scope(glob: &str, path: &str, file_path: &str) -> bool {
+    matches!(
+        grep_scope_granularity(glob, path, file_path),
+        "repo_wide" | "source_glob"
+    ) || recursive_source_glob(glob, path, file_path)
+        || source_root_scope(glob, path, file_path)
+        || shallow_component_scope(glob, path, file_path)
+        || broad_test_scope(glob, path, file_path)
 }
 
 fn prior_bifrost_result_status(needle: &str, exchanges: &[ToolExchange]) -> &'static str {
@@ -1774,6 +1969,64 @@ fn same_path_recent_tool(path: &str, exchanges: &[ToolExchange], tools: &[&str])
     })
 }
 
+fn post_edit_scope_verification(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    exchanges: &[ToolExchange],
+) -> bool {
+    same_scope_recent_edit_or_write(glob, path, file_path, exchanges)
+        && (pattern.contains("\\(")
+            || pattern.contains("\\s*")
+            || exact_member_chain_or_call_text(pattern)
+            || uppercase_error_constant_set(pattern)
+            || identifier_tokens(pattern).len() == 1)
+}
+
+fn same_scope_recent_edit_or_write(
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    exchanges: &[ToolExchange],
+) -> bool {
+    let scope = normalized_grep_scope(glob, path, file_path);
+    if scope.len() < 3 {
+        return false;
+    }
+    exchanges.iter().rev().take(8).any(|exchange| {
+        matches!(exchange.tool_name.as_str(), "edit" | "write_file")
+            && edited_path_matches_scope(&exchange.arguments, &scope)
+    })
+}
+
+fn edited_path_matches_scope(arguments: &str, scope: &str) -> bool {
+    let paths = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .map(|value| {
+            ["file_path", "path"]
+                .iter()
+                .filter_map(|key| value.get(*key).and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty())
+        .unwrap_or_else(|| vec![arguments.to_string()]);
+    paths
+        .iter()
+        .any(|path| path_matches_grep_scope(path, scope))
+}
+
+fn path_matches_grep_scope(path: &str, scope: &str) -> bool {
+    let path = path.trim().trim_start_matches("./");
+    let scope = scope.trim().trim_start_matches("./");
+    if scope.contains('*') {
+        let prefix = scope.split('*').next().unwrap_or("").trim_end_matches('/');
+        return prefix.len() >= 3 && path.starts_with(prefix);
+    }
+    path == scope || path.starts_with(&format!("{}/", scope.trim_end_matches('/')))
+}
+
 fn sequential_read_from_same_file(args: &Value, exchanges: &[ToolExchange]) -> bool {
     let Some(path) = args.get("file_path").and_then(Value::as_str) else {
         return false;
@@ -1830,7 +2083,9 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
             RecommendedTool::ScanUsages,
         ));
     }
-    if scriptish(&command.to_ascii_lowercase()) && recursive_source_traversal(&command.to_ascii_lowercase()) {
+    if scriptish(&command.to_ascii_lowercase())
+        && recursive_source_traversal(&command.to_ascii_lowercase())
+    {
         return Some(ShellStaticRoute::UseBuiltin(
             "static_shell_recursive_text_search",
             RecommendedTool::GrepSearch,
@@ -2073,7 +2328,9 @@ fn recursive_source_traversal(lower_command: &str) -> bool {
         || lower_command.contains("os.walk")
         || lower_command.contains("walkdir")
         || lower_command.contains("find "))
-        && SOURCE_EXTENSIONS.iter().any(|ext| lower_command.contains(ext))
+        && SOURCE_EXTENSIONS
+            .iter()
+            .any(|ext| lower_command.contains(ext))
 }
 
 fn source_path_literal_count(lower_command: &str) -> usize {
@@ -2095,7 +2352,9 @@ fn true_script_raw_byte_or_format_probe(command: &str) -> bool {
     script_raw_byte_or_format_probe(command)
         && !(lower.contains("decode(")
             && (lower.contains(".read()") || lower.contains("open("))
-            && (lower.contains(" in text") || lower.contains(" in content") || lower.contains(".count(")))
+            && (lower.contains(" in text")
+                || lower.contains(" in content")
+                || lower.contains(".count(")))
 }
 
 fn script_contains_symbol_call_or_declaration(command: &str) -> bool {
@@ -2204,9 +2463,8 @@ fn grep_count_like(lower_command: &str) -> bool {
 
 fn shell_search_has_exact_file_scope(command: &str) -> bool {
     command.split_whitespace().any(|token| {
-        let cleaned = token.trim_matches(|ch: char| {
-            matches!(ch, '"' | '\'' | ';' | '|' | ')' | '(' | ',')
-        });
+        let cleaned =
+            token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ';' | '|' | ')' | '(' | ','));
         !cleaned.contains('*') && is_source_like_file(cleaned)
     })
 }
@@ -2369,6 +2627,11 @@ enum GrepPatternKind {
     SymbolCallOrMember,
     SymbolFamilyOrRelationship,
     CodeIdiom,
+    ExactMemberChainOrCallText,
+    AssertionOrSerializationText,
+    NaturalLanguageOrPathLiteral,
+    UppercaseErrorConstantSet,
+    PackageDeclarationLiteral,
     ExactImportOrInclude,
     ErrorMessageOrLogText,
     WireKeyOrSerializationKey,
@@ -2391,6 +2654,21 @@ fn grep_pattern_kind(pattern: &str, glob: &str, path: &str) -> GrepPatternKind {
     let lower = trimmed.to_ascii_lowercase();
     if exact_import_or_include_pattern(&lower) {
         return GrepPatternKind::ExactImportOrInclude;
+    }
+    if package_declaration_literal(trimmed) {
+        return GrepPatternKind::PackageDeclarationLiteral;
+    }
+    if uppercase_error_constant_set(trimmed) {
+        return GrepPatternKind::UppercaseErrorConstantSet;
+    }
+    if natural_language_or_path_literal(trimmed) {
+        return GrepPatternKind::NaturalLanguageOrPathLiteral;
+    }
+    if assertion_or_serialization_text(trimmed) {
+        return GrepPatternKind::AssertionOrSerializationText;
+    }
+    if exact_member_chain_or_call_text(trimmed) {
+        return GrepPatternKind::ExactMemberChainOrCallText;
     }
     if numeric_or_codepoint_literal(trimmed) {
         return GrepPatternKind::NumericOrCodepointLiteral;
@@ -2437,7 +2715,8 @@ fn numeric_or_codepoint_literal(pattern: &str) -> bool {
         .chars()
         .filter(|ch| ch.is_ascii_hexdigit() || *ch == 'x' || *ch == 'X')
         .collect();
-    stripped.len() >= 3 && stripped.len() == pattern.chars().filter(|ch| !ch.is_whitespace()).count()
+    stripped.len() >= 3
+        && stripped.len() == pattern.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
 fn header_or_protocol_literal(pattern: &str, lower: &str) -> bool {
@@ -2501,6 +2780,55 @@ fn localized_code_idiom(pattern: &str) -> bool {
         && (lower.contains("\\(async") || lower.contains("(async") || lower.contains("\\.("))
 }
 
+fn regex_text_semantics_material(pattern: &str) -> bool {
+    [".*", "[^", "\\s", "\\d", "^", "$"]
+        .iter()
+        .any(|needle| pattern.contains(needle))
+}
+
+fn package_declaration_literal(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    (lower.starts_with("package ") || lower.contains("|package ") || lower.contains("package\\s"))
+        && (pattern.contains("\\.") || pattern.contains('.'))
+}
+
+fn uppercase_error_constant_set(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    tokens.len() >= 2 && tokens.iter().all(|token| uppercase_constant_like(token))
+}
+
+fn natural_language_or_path_literal(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    let tokens = identifier_tokens(pattern);
+    lower.contains("drive root")
+        || lower.contains("absolute")
+        || lower.contains("\\\\\\\\")
+        || (pattern.contains(' ') && tokens.iter().all(|token| !symbol_like_pattern(token)))
+}
+
+fn assertion_or_serialization_text(pattern: &str) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    lower.contains("shouldbe")
+        || lower.contains("should be")
+        || lower.contains("\\.string")
+        || lower.contains(".string")
+        || lower.contains("pattern_replace")
+        || lower.contains("articles_path")
+        || lower.contains("articles_case")
+        || lower.contains("stopwords_path")
+        || lower.contains("enable_position_increments")
+}
+
+fn exact_member_chain_or_call_text(pattern: &str) -> bool {
+    if pattern.contains(".*") || pattern.contains('|') || declaration_search_pattern(pattern) {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    tokens.len() >= 2
+        && (pattern.contains("\\.") || pattern.contains('.'))
+        && tokens.iter().all(|token| symbol_like_pattern(token))
+}
+
 fn test_text_search(pattern: &str) -> bool {
     let lower = pattern.to_ascii_lowercase();
     if contains_text_word(&lower)
@@ -2516,7 +2844,9 @@ fn test_text_search(pattern: &str) -> bool {
         return true;
     }
     tokens.len() >= 2
-        && tokens.iter().all(|token| !token.chars().any(|ch| ch.is_ascii_uppercase()))
+        && tokens
+            .iter()
+            .all(|token| !token.chars().any(|ch| ch.is_ascii_uppercase()))
         && tokens.iter().any(|token| !symbol_like_pattern(token))
         && (pattern.contains('|') || pattern.contains(' '))
 }
@@ -2578,7 +2908,8 @@ fn contains_text_word(lower: &str) -> bool {
     ]
     .iter()
     .any(|word| lower.contains(word))
-        || lower.split(|ch: char| !ch.is_ascii_alphanumeric())
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
             .any(|word| matches!(word, "error" | "assert" | "log"))
 }
 
@@ -3242,9 +3573,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            glob_exact
-                .get("scope_granularity")
-                .and_then(Value::as_str),
+            glob_exact.get("scope_granularity").and_then(Value::as_str),
             Some("exact_file")
         );
 
@@ -3377,28 +3706,36 @@ mod tests {
     #[test]
     fn static_shell_route_splits_symbol_search_from_literal_inspection() {
         assert!(matches!(
-            static_shell_route(&json!({"command": "rg -n \"RichEditBoxDefaultLineEnding|ApplyTabAndLineEndingFix\" src/Notepads/Controls/TextEditor"})),
+            static_shell_route(
+                &json!({"command": "rg -n \"RichEditBoxDefaultLineEnding|ApplyTabAndLineEndingFix\" src/Notepads/Controls/TextEditor"})
+            ),
             Some(ShellStaticRoute::UseBifrost(
                 "static_shell_symbol_search",
                 RecommendedTool::SearchSymbols
             ))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "find src -name '*.cs' | xargs grep -n \"RemoveExecutableNameOrPathFromCommandLineArgs|Notepads-Dev\""})),
+            static_shell_route(
+                &json!({"command": "find src -name '*.cs' | xargs grep -n \"RemoveExecutableNameOrPathFromCommandLineArgs|Notepads-Dev\""})
+            ),
             Some(ShellStaticRoute::UseBifrost(
                 "static_shell_symbol_search",
                 RecommendedTool::SearchSymbols
             ))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "grep -R -n \"StopTokenFilter(\" elastic4s-*/src/main/scala 2>/dev/null | head -100"})),
+            static_shell_route(
+                &json!({"command": "grep -R -n \"StopTokenFilter(\" elastic4s-*/src/main/scala 2>/dev/null | head -100"})
+            ),
             Some(ShellStaticRoute::UseBifrost(
                 "static_shell_symbol_search",
                 RecommendedTool::ScanUsages
             ))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "grep -RIn \"failed to encode|invalid path\" tests -g '*.php' | head"})),
+            static_shell_route(
+                &json!({"command": "grep -RIn \"failed to encode|invalid path\" tests -g '*.php' | head"})
+            ),
             Some(ShellStaticRoute::UseBuiltin(
                 "static_shell_builtin_inspection",
                 RecommendedTool::GrepSearch
@@ -3409,14 +3746,18 @@ mod tests {
     #[test]
     fn static_shell_route_keeps_literal_recursive_scripts_builtin() {
         assert!(matches!(
-            static_shell_route(&json!({"command": "python - <<'PY'\nfrom pathlib import Path\nfor p in Path('.').rglob('*.scala'):\n    txt = p.read_text(errors='ignore')\n    if 'StopTokenFilter' in txt:\n        print(p)\nPY"})),
+            static_shell_route(
+                &json!({"command": "python - <<'PY'\nfrom pathlib import Path\nfor p in Path('.').rglob('*.scala'):\n    txt = p.read_text(errors='ignore')\n    if 'StopTokenFilter' in txt:\n        print(p)\nPY"})
+            ),
             Some(ShellStaticRoute::UseBuiltin(
                 "static_shell_recursive_text_search",
                 RecommendedTool::GrepSearch
             ))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "python - <<'PY'\nimport pathlib\nfor path in pathlib.Path('.').rglob('*.scala'):\n    text = path.read_text()\n    if 'ChunkingSettings(' in text:\n        print(path)\nPY"})),
+            static_shell_route(
+                &json!({"command": "python - <<'PY'\nimport pathlib\nfor path in pathlib.Path('.').rglob('*.scala'):\n    text = path.read_text()\n    if 'ChunkingSettings(' in text:\n        print(path)\nPY"})
+            ),
             Some(ShellStaticRoute::UseBifrost(
                 "static_shell_recursive_symbol_search",
                 RecommendedTool::ScanUsages
