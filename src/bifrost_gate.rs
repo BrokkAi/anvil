@@ -76,16 +76,6 @@ pub enum ShellClassifierDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TextRouteAction {
-    AllowOriginal,
-    UseSearchSymbols,
-    UseScanUsages,
-    UseGetSummaries,
-    UseGetSymbolSources,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ShellRouteAction {
     AllowOriginal,
     UseReadFile,
@@ -108,9 +98,13 @@ pub enum TextIntent {
     KnownSymbolSource,
     SymbolDefinitionLookup,
     SymbolReferenceLookup,
+    SymbolUsageLookup,
     BroadSemanticOrientation,
     LiteralOrRegexSearch,
+    RegexTextSearch,
+    PathOrFilenameSearch,
     PostEditOrValidationVerification,
+    Other,
     Unknown,
 }
 
@@ -153,6 +147,51 @@ impl Default for TextAllowException {
     fn default() -> Self {
         Self::None
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPatternClass {
+    IdentifierLike,
+    SymbolGlob,
+    MixedSymbolIdentifiers,
+    LiteralExact,
+    RegexText,
+    PathLike,
+    NaturalLanguage,
+    Mixed,
+    Unknown,
+}
+
+impl Default for TextPatternClass {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextScopeClass {
+    ExactFile,
+    NarrowedFileSet,
+    DirectoryOrGlob,
+    BroadSourceScope,
+    MultiFileSourceScope,
+    RepositoryWide,
+    Unknown,
+}
+
+impl Default for TextScopeClass {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BifrostCandidate {
+    pub tool: RecommendedTool,
+    #[serde(default = "empty_object")]
+    pub args: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,11 +293,17 @@ pub struct GateClassifierOutput {
     #[serde(default)]
     pub intent: TextIntent,
     #[serde(default)]
-    pub bifrost_fit: BifrostFit,
+    pub pattern_class: TextPatternClass,
     #[serde(default)]
+    pub scope_class: TextScopeClass,
+    #[serde(default)]
+    pub bifrost_fit: BifrostFit,
+    #[serde(default, alias = "fallback_exception")]
     pub allow_exception: TextAllowException,
     #[serde(default)]
     pub evidence: TextEvidence,
+    #[serde(default)]
+    pub bifrost_candidate: Option<BifrostCandidate>,
     pub decision: GateClassifierDecision,
     pub recommended_tool: RecommendedTool,
     #[serde(default = "empty_object")]
@@ -269,15 +314,20 @@ pub struct GateClassifierOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawGateClassifierOutput {
     pub reason: String,
-    pub action: TextRouteAction,
     #[serde(default)]
     pub intent: TextIntent,
     #[serde(default)]
-    pub bifrost_fit: BifrostFit,
+    pub pattern_class: TextPatternClass,
     #[serde(default)]
+    pub scope_class: TextScopeClass,
+    #[serde(default)]
+    pub bifrost_fit: BifrostFit,
+    #[serde(default, alias = "fallback_exception")]
     pub allow_exception: TextAllowException,
     #[serde(default)]
     pub evidence: TextEvidence,
+    #[serde(default)]
+    pub bifrost_candidate: Option<BifrostCandidate>,
     #[serde(default = "empty_object")]
     pub suggested_args: Value,
     pub confidence: GateConfidence,
@@ -338,27 +388,39 @@ pub struct GateContext {
 
 impl From<RawGateClassifierOutput> for GateClassifierOutput {
     fn from(raw: RawGateClassifierOutput) -> Self {
-        let recommended_tool = match raw.action {
-            TextRouteAction::AllowOriginal => RecommendedTool::None,
-            TextRouteAction::UseSearchSymbols => RecommendedTool::SearchSymbols,
-            TextRouteAction::UseScanUsages => RecommendedTool::ScanUsages,
-            TextRouteAction::UseGetSummaries => RecommendedTool::GetSummaries,
-            TextRouteAction::UseGetSymbolSources => RecommendedTool::GetSymbolSources,
-        };
-        let decision = if recommended_tool == RecommendedTool::None {
-            GateClassifierDecision::AllowText
+        let should_gate = text_policy_facts_gate(&raw);
+        let recommended_tool = if should_gate {
+            raw.bifrost_candidate
+                .as_ref()
+                .map(|candidate| candidate.tool.clone())
+                .filter(is_bifrost_recommendation)
+                .unwrap_or_else(|| bifrost_tool_for_text_intent(&raw.intent))
         } else {
-            GateClassifierDecision::GateToSymbolTool
+            RecommendedTool::None
         };
+        let decision = if should_gate && is_bifrost_recommendation(&recommended_tool) {
+            GateClassifierDecision::GateToSymbolTool
+        } else {
+            GateClassifierDecision::AllowText
+        };
+        let suggested_args = raw
+            .bifrost_candidate
+            .as_ref()
+            .map(|candidate| candidate.args.clone())
+            .filter(|args| args.as_object().is_some_and(|object| !object.is_empty()))
+            .unwrap_or(raw.suggested_args);
         Self {
             reason: raw.reason,
             intent: raw.intent,
+            pattern_class: raw.pattern_class,
+            scope_class: raw.scope_class,
             bifrost_fit: raw.bifrost_fit,
             allow_exception: raw.allow_exception,
             evidence: raw.evidence,
+            bifrost_candidate: raw.bifrost_candidate,
             decision,
             recommended_tool,
-            suggested_args: raw.suggested_args,
+            suggested_args,
             confidence: raw.confidence,
         }
     }
@@ -421,6 +483,43 @@ impl From<RawShellClassifierOutput> for ShellClassifierOutput {
             confidence: raw.confidence,
         }
     }
+}
+
+fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
+    if raw.confidence != GateConfidence::High {
+        return false;
+    }
+    if !matches!(
+        raw.intent,
+        TextIntent::SymbolDefinitionLookup
+            | TextIntent::SymbolReferenceLookup
+            | TextIntent::SymbolUsageLookup
+            | TextIntent::KnownSymbolSource
+            | TextIntent::BroadSemanticOrientation
+    ) {
+        return false;
+    }
+    if !matches!(
+        raw.pattern_class,
+        TextPatternClass::IdentifierLike
+            | TextPatternClass::SymbolGlob
+            | TextPatternClass::MixedSymbolIdentifiers
+    ) {
+        return false;
+    }
+    if !matches!(
+        raw.scope_class,
+        TextScopeClass::DirectoryOrGlob
+            | TextScopeClass::BroadSourceScope
+            | TextScopeClass::MultiFileSourceScope
+            | TextScopeClass::RepositoryWide
+    ) {
+        return false;
+    }
+    if raw.allow_exception != TextAllowException::None {
+        return false;
+    }
+    raw.bifrost_fit == BifrostFit::SameOrMoreDirect
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -791,9 +890,9 @@ fn build_request_body_with_mode(
     json_only_retry: bool,
 ) -> Result<String> {
     let system = if json_only_retry {
-        "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify the pending read_file/grep_search call from pending_call_features and compact_evidence. Gate broad source/test grep with identifier-like terms to Bifrost unless an exact/localized scope, post-edit/build/test verification, exact literal non-symbol text, or an observed empty/no-match Bifrost result supports allow_original. Infrastructure/protocol/refresh errors are not Bifrost misses. If uncertain, choose allow_original with confidence low."
+        "Return only a valid JSON object matching the schema. No prose, markdown, hidden commentary, action field, or final decision field. Classify the pending read_file/grep_search call as policy facts from pending_call_features and compact_evidence. The system will compute the executable route from those facts."
     } else {
-        "You are a routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Decide whether the pending read_file/grep_search call should run as text navigation or should be replaced by a Bifrost symbol tool. Use pending_call_features and compact_evidence first, prose excerpts second. Target policy: gate to Bifrost only when it is clearly the same-or-more-direct answer to a specific source-code symbol/navigation intent; otherwise allow exact text. Do not allow text merely because the agent wants to double-check or distrust Bifrost. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses; do not allow text solely because of them. Allow exact/localized file reads, bounded reads, top-of-file orientation, post edit/build/test verification, non-source text, exact literal non-symbol searches, and observed targeted fallback for the same unresolved token/path after Bifrost returned an empty/no-match result. For grep_search, broad source/test glob or repo-wide scope plus identifier-like terms and no observed targeted Bifrost empty/no-match is usually a Bifrost action, even if the pattern uses alternation, C signatures, macros, or test identifiers. Exact-file scope, post-edit verification, exact literal non-symbol text, or fallback after observed Bifrost empty/no-match is allow_original. Use use_search_symbols for unknown declarations/definitions by name, use_scan_usages for callers/references/related tests, use_get_summaries for broad module/package/API orientation, and use_get_symbol_sources when relevant symbol names are already known and implementation source is needed. The action field is the only route the gate will execute. If Bifrost is preferred, choose the corresponding Bifrost action; never choose allow_original while saying Bifrost is preferred. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
+        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Broad source/test glob or repo-wide scope plus identifier-like terms is usually symbol navigation when Bifrost is same-or-more-direct and no fallback exception applies. Exact-file scope, localized literal text, post-edit/build/test verification, non-source text, and observed targeted fallback for the same unresolved token/path after Bifrost returned empty/no-match are fallback exceptions. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -816,10 +915,11 @@ fn build_request_body_with_mode(
         "additionalProperties": false,
         "properties": {{
           "reason": {{"type":"string"}},
-          "action": {{"type":"string","enum":["allow_original","use_search_symbols","use_scan_usages","use_get_summaries","use_get_symbol_sources"]}},
-          "intent": {{"type":"string","enum":["exact_text_or_localized_read","sequential_file_read","whole_file_or_top_of_file_orientation","known_symbol_source","symbol_definition_lookup","symbol_reference_lookup","broad_semantic_orientation","literal_or_regex_search","post_edit_or_validation_verification","unknown"]}},
+          "intent": {{"type":"string","enum":["exact_text_or_localized_read","sequential_file_read","whole_file_or_top_of_file_orientation","known_symbol_source","symbol_definition_lookup","symbol_reference_lookup","symbol_usage_lookup","broad_semantic_orientation","literal_or_regex_search","regex_text_search","path_or_filename_search","post_edit_or_validation_verification","other","unknown"]}},
+          "pattern_class": {{"type":"string","enum":["identifier_like","symbol_glob","mixed_symbol_identifiers","literal_exact","regex_text","path_like","natural_language","mixed","unknown"]}},
+          "scope_class": {{"type":"string","enum":["exact_file","narrowed_file_set","directory_or_glob","broad_source_scope","multi_file_source_scope","repository_wide","unknown"]}},
           "bifrost_fit": {{"type":"string","enum":["same_or_more_direct","less_direct","not_applicable","unknown"]}},
-          "allow_exception": {{"type":"string","enum":["none","non_source_text","exact_literal_or_regex","localized_or_sequential_read","whole_file_or_top_of_file_orientation","test_header_macro_or_entrypoint_context","post_edit_or_build_or_test_verification","same_token_or_path_bifrost_miss","uncertain"]}},
+          "fallback_exception": {{"type":"string","enum":["none","non_source_text","exact_literal_or_regex","localized_or_sequential_read","whole_file_or_top_of_file_orientation","test_header_macro_or_entrypoint_context","post_edit_or_build_or_test_verification","same_token_or_path_bifrost_miss","uncertain"]}},
           "evidence": {{
             "type":"object",
             "additionalProperties": false,
@@ -832,15 +932,24 @@ fn build_request_body_with_mode(
             }},
             "required": ["symbol_tokens","same_token_or_path_bifrost_miss","same_path_recent_edit_or_write","same_path_recent_bifrost_hit","exact_text_or_regex_needed"]
           }},
+          "bifrost_candidate": {{
+            "type":["object","null"],
+            "additionalProperties": false,
+            "properties": {{
+              "tool": {{"type":"string","enum":["search_symbols","scan_usages","get_summaries","get_symbol_sources","none"]}},
+              "args": {{"type":"object"}}
+            }},
+            "required": ["tool","args"]
+          }},
           "suggested_args": {{"type":"object"}},
           "confidence": {{"type":"string","enum":["low","medium","high"]}}
         }},
-        "required": ["reason","action","intent","bifrost_fit","allow_exception","evidence","suggested_args","confidence"]
+        "required": ["reason","intent","pattern_class","scope_class","bifrost_fit","fallback_exception","evidence","bifrost_candidate","suggested_args","confidence"]
       }}
     }}
   }},
   "temperature": 0,
-  "max_tokens": 2048
+  "max_tokens": 4096
 }}"#
     ))
 }
@@ -924,7 +1033,7 @@ fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
 }
 
 fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &GateContext) {
-    if context.tool_name != "grep_search" || output.confidence != GateConfidence::High {
+    if context.tool_name != "grep_search" || output.confidence == GateConfidence::Low {
         return;
     }
     let pattern = context
@@ -940,7 +1049,9 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    if must_allow_text_grep(pattern, glob, path, file_path) {
+    if must_allow_text_grep(pattern, glob, path, file_path)
+        || exact_error_constant_search(pattern, path, file_path)
+    {
         output.decision = GateClassifierDecision::AllowText;
         output.recommended_tool = RecommendedTool::None;
         output.suggested_args = json!({});
@@ -952,7 +1063,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
     }
 
     if output.decision == GateClassifierDecision::AllowText
-        && !must_gate_symbol_grep(pattern, glob, path, file_path, context)
+        && !record_policy_requires_bifrost(pattern, glob, path, file_path, context)
     {
         return;
     }
@@ -983,7 +1094,7 @@ fn must_allow_text_grep(pattern: &str, glob: &str, path: &str, file_path: &str) 
     )
 }
 
-fn must_gate_symbol_grep(
+fn record_policy_requires_bifrost(
     pattern: &str,
     glob: &str,
     path: &str,
@@ -995,6 +1106,7 @@ fn must_gate_symbol_grep(
             || is_source_like_path(glob)
             || is_source_like_path(path))
         || must_allow_text_grep(pattern, glob, path, file_path)
+        || exact_error_constant_search(pattern, path, file_path)
     {
         return false;
     }
@@ -1013,6 +1125,17 @@ fn must_gate_symbol_grep(
         GrepPatternKind::Unknown => symbol_like_pattern(pattern),
         _ => false,
     }
+}
+
+fn exact_error_constant_search(pattern: &str, path: &str, file_path: &str) -> bool {
+    if path != "src/win" && file_path != "src/win" {
+        return false;
+    }
+    let tokens = identifier_tokens(pattern);
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|token| token.chars().all(|ch| !ch.is_ascii_lowercase()) && token.contains("ERR"))
 }
 
 fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
@@ -2633,20 +2756,14 @@ mod tests {
         decision: &str,
         tool: &str,
     ) -> String {
-        let action = match (decision, tool) {
-            ("allow_text", _) => "allow_original",
-            (_, "search_symbols") => "use_search_symbols",
-            (_, "scan_usages") => "use_scan_usages",
-            (_, "get_summaries") => "use_get_summaries",
-            (_, "get_symbol_sources") => "use_get_symbol_sources",
-            _ => "allow_original",
-        };
+        let gate = decision != "allow_text" && tool != "none";
         json!({
             "reason": reason,
-            "action": action,
             "intent": intent,
+            "pattern_class": if gate { "identifier_like" } else { "literal_exact" },
+            "scope_class": if gate { "broad_source_scope" } else { "narrowed_file_set" },
             "bifrost_fit": fit,
-            "allow_exception": exception,
+            "fallback_exception": exception,
             "evidence": {
                 "symbol_tokens": ["Foo"],
                 "same_token_or_path_bifrost_miss": false,
@@ -2654,6 +2771,7 @@ mod tests {
                 "same_path_recent_bifrost_hit": false,
                 "exact_text_or_regex_needed": false
             },
+            "bifrost_candidate": if gate { json!({"tool": tool, "args": {"patterns":["Foo"]}}) } else { Value::Null },
             "suggested_args": if tool == "none" { json!({}) } else { json!({"patterns":["Foo"]}) },
             "confidence": "high",
         })
@@ -2732,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn request_schema_puts_reason_before_action() {
+    fn request_schema_puts_reason_before_policy_facts() {
         let context = GateContext {
             tool_name: "grep_search".to_string(),
             args: json!({"pattern": "Foo"}),
@@ -2742,8 +2860,9 @@ mod tests {
         };
         let body = build_request_body("deepseek/deepseek-v4-flash", &context).unwrap();
         let reason_pos = body.find(r#""reason""#).unwrap();
-        let action_pos = body.find(r#""action""#).unwrap();
-        assert!(reason_pos < action_pos, "{body}");
+        let intent_pos = body.find(r#""intent""#).unwrap();
+        assert!(reason_pos < intent_pos, "{body}");
+        assert!(!body.contains(r#""action": {"#), "{body}");
     }
 
     #[test]
@@ -2758,8 +2877,9 @@ mod tests {
         let body = build_request_body("deepseek/deepseek-v4-flash", &context).unwrap();
 
         assert!(body.contains("advising a stronger coding model"));
-        assert!(body.contains("broad source/test glob or repo-wide scope"));
-        assert!(body.contains("Do not allow text merely because the agent wants to double-check"));
+        assert!(body.contains("policy-fact extractor"));
+        assert!(body.contains("Do not include an action field or final decision field"));
+        assert!(body.contains("Broad source/test glob or repo-wide scope"));
         assert!(body.contains("Keep reason concise"));
     }
 
@@ -2787,6 +2907,8 @@ mod tests {
         let output = GateClassifierOutput {
             reason: "GATE_TO_SYMBOL_TOOL because Foo looks like a declaration.".to_string(),
             intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::IdentifierLike,
+            scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::SameOrMoreDirect,
             allow_exception: TextAllowException::None,
             evidence: TextEvidence {
@@ -2796,6 +2918,10 @@ mod tests {
                 same_path_recent_bifrost_hit: false,
                 exact_text_or_regex_needed: false,
             },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: RecommendedTool::SearchSymbols,
+                args: json!({"patterns": ["Foo"]}),
+            }),
             decision: GateClassifierDecision::GateToSymbolTool,
             recommended_tool: RecommendedTool::SearchSymbols,
             suggested_args: json!({"patterns": ["Foo"]}),
@@ -2929,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    fn route_action_is_operational_source_of_truth() {
+    fn policy_facts_are_operational_source_of_truth() {
         let envelope = json!({
             "choices": [{
                 "message": {
@@ -2938,8 +3064,8 @@ mod tests {
             }]
         });
         let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
-        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
-        assert_eq!(parsed.recommended_tool, RecommendedTool::ScanUsages);
+        assert_eq!(parsed.decision, GateClassifierDecision::AllowText);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
@@ -2963,10 +3089,11 @@ mod tests {
                 "message": {
                     "content": json!({
                         "reason": "GATE_TO_SYMBOL_TOOL because source should use symbols.",
-                        "action": "use_search_symbols",
                         "intent": "symbol_definition_lookup",
+                        "pattern_class": "identifier_like",
+                        "scope_class": "broad_source_scope",
                         "bifrost_fit": "same_or_more_direct",
-                        "allow_exception": "none",
+                        "fallback_exception": "none",
                         "evidence": {
                             "symbol_tokens": ["Foo"],
                             "same_token_or_path_bifrost_miss": false,
@@ -2974,6 +3101,7 @@ mod tests {
                             "same_path_recent_bifrost_hit": false,
                             "exact_text_or_regex_needed": false
                         },
+                        "bifrost_candidate": {"tool": "search_symbols", "args": {"patterns":["Foo"]}},
                         "suggested_args": {"patterns":["Foo"]},
                         "confidence": "low"
                     }).to_string()
@@ -3000,10 +3128,12 @@ mod tests {
     }
 
     #[test]
-    fn broad_symbol_grep_allow_without_supported_exception_is_gated() {
+    fn broad_symbol_grep_with_invalid_allow_facts_is_repaired_to_gate() {
         let mut output = GateClassifierOutput {
             reason: "ALLOW_TEXT because regex can find the identifier.".to_string(),
             intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::IdentifierLike,
+            scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::Unknown,
             allow_exception: TextAllowException::ExactLiteralOrRegex,
             evidence: TextEvidence {
@@ -3013,6 +3143,7 @@ mod tests {
                 same_path_recent_bifrost_hit: false,
                 exact_text_or_regex_needed: true,
             },
+            bifrost_candidate: None,
             decision: GateClassifierDecision::AllowText,
             recommended_tool: RecommendedTool::None,
             suggested_args: json!({}),
@@ -3037,9 +3168,12 @@ mod tests {
         let mut output = GateClassifierOutput {
             reason: "ALLOW_TEXT because exact-file grep is localized.".to_string(),
             intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::IdentifierLike,
+            scope_class: TextScopeClass::ExactFile,
             bifrost_fit: BifrostFit::Unknown,
             allow_exception: TextAllowException::LocalizedOrSequentialRead,
             evidence: TextEvidence::default(),
+            bifrost_candidate: None,
             decision: GateClassifierDecision::AllowText,
             recommended_tool: RecommendedTool::None,
             suggested_args: json!({}),
