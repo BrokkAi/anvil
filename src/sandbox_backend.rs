@@ -45,6 +45,7 @@ use anyhow::{Context, Result};
 use brokk_acp_sandbox::ParsedFrontmatter;
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(feature = "wasm-sandbox"))]
 const WASM_SANDBOX_DISABLED_ERR: &str = "wasm sandbox support was not compiled into this build; rebuild with default features or `--features wasm-sandbox`";
 
 pub fn wasm_sandbox_compiled() -> bool {
