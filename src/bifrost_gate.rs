@@ -1107,6 +1107,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         deterministic_source_symbol_repair_tool(pattern, glob, path, file_path, context);
     if text_negative_facts_veto(output)
         && !very_strong_deterministic_symbol_navigation(pattern, glob, path, file_path)
+        && repair_tool.is_none()
         && !same_direct_bifrost_candidate(output)
     {
         output.decision = GateClassifierDecision::AllowText;
@@ -1728,6 +1729,9 @@ fn deterministic_source_symbol_repair_tool(
         return None;
     }
 
+    if broad_nav_scope && declaration_search_pattern(pattern) && symbols.len() >= 3 {
+        return Some((RecommendedTool::GetSummaries, "multi-symbol survey"));
+    }
     if declaration_search_pattern(pattern) {
         return Some((RecommendedTool::SearchSymbols, "declaration"));
     }
@@ -1750,6 +1754,17 @@ fn deterministic_source_symbol_repair_tool(
     }
     if broad_nav_scope && uppercase_constant_token_count(pattern) >= 2 {
         return Some((RecommendedTool::SearchSymbols, "constant symbol discovery"));
+    }
+    if broad_nav_scope
+        && uppercase_constant_token_count(pattern) == 1
+        && symbols
+            .iter()
+            .any(|symbol| overlaps_recent_bifrost_hit(symbol, &context.tool_exchanges))
+    {
+        return Some((
+            RecommendedTool::GetSymbolSources,
+            "known constant source lookup",
+        ));
     }
     if broad_nav_scope && symbols.len() >= 3 {
         return Some((RecommendedTool::GetSummaries, "multi-symbol survey"));
@@ -1950,10 +1965,27 @@ fn external_api_word_boundary_text_search(pattern: &str) -> bool {
 }
 
 fn external_api_or_annotation_names(pattern: &str) -> bool {
-    if !pattern.contains('|') || declaration_search_pattern(pattern) {
+    if declaration_search_pattern(pattern) {
         return false;
     }
     let tokens = identifier_tokens(pattern);
+    if tokens.len() == 1
+        && matches!(
+            tokens[0].as_str(),
+            "InternalsVisibleTo"
+                | "TestFixture"
+                | "TestCase"
+                | "SetUp"
+                | "TearDown"
+                | "PrivateObject"
+        )
+        && !symbol_call_or_member(pattern)
+    {
+        return true;
+    }
+    if !pattern.contains('|') {
+        return false;
+    }
     tokens.len() >= 3
         && tokens.iter().all(|token| {
             token.starts_with("Json")
@@ -2131,7 +2163,10 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
         output.confidence = GateConfidence::High;
         return;
     }
-    if output.decision == ShellClassifierDecision::AllowShell {
+    if matches!(
+        output.decision,
+        ShellClassifierDecision::AllowShell | ShellClassifierDecision::UseBuiltinTool
+    ) {
         if let Some(tool) = strong_shell_source_symbol_search(command) {
             output.decision = ShellClassifierDecision::UseBifrostTool;
             let intent = if tool == RecommendedTool::ScanUsages {
@@ -3000,7 +3035,10 @@ fn process_control_or_inspection(command: &str) -> bool {
 
 fn environment_probe(command: &str) -> bool {
     let lower = command.trim_start().to_ascii_lowercase();
-    matches!(lower.split_whitespace().next().unwrap_or(""), "env" | "printenv")
+    matches!(
+        lower.split_whitespace().next().unwrap_or(""),
+        "env" | "printenv"
+    )
 }
 
 fn same_path_recent_tool(path: &str, exchanges: &[ToolExchange], tools: &[&str]) -> bool {
@@ -4364,6 +4402,21 @@ fn declaration_search_pattern(pattern: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.starts_with(needle) || lower.contains(&format!("|{needle}")))
+        || [
+            "class\\s+",
+            "static\\s+class\\s+",
+            "case\\s+class\\s+",
+            "object\\s+",
+            "trait\\s+",
+            "sealed\\s+trait\\s+",
+            "interface\\s+",
+            "enum\\s+",
+            "def\\s+",
+            "func\\s+",
+            "function\\s+",
+        ]
+        .iter()
+        .any(|needle| lower.starts_with(needle) || lower.contains(&format!("|{needle}")))
 }
 
 fn uppercase_constant_like(token: &str) -> bool {
@@ -5133,6 +5186,46 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::AllowText);
         assert_eq!(output.recommended_tool, RecommendedTool::None);
+
+        let mut output = GateClassifierOutput {
+            reason: "Bifrost can find this C# attribute symbol.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["InternalsVisibleTo".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["InternalsVisibleTo"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({"patterns":["InternalsVisibleTo"]}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": "source",
+                "glob": "source/**/*.cs",
+                "pattern": "InternalsVisibleTo"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
@@ -5455,7 +5548,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_content_symbol_search_respects_classifier_route() {
+    fn shell_content_symbol_search_repairs_builtin_route_to_bifrost() {
         let mut output = ShellClassifierOutput {
             reason: "USE_BUILTIN_TOOL because grep_search can search text.".to_string(),
             intent: ShellIntent::SymbolDefinitionLookup,
@@ -5479,8 +5572,37 @@ mod tests {
 
         enforce_shell_classifier_policy(&mut output, &context);
 
-        assert_eq!(output.decision, ShellClassifierDecision::UseBuiltinTool);
-        assert_eq!(output.recommended_tool, RecommendedTool::GrepSearch);
+        assert_eq!(output.decision, ShellClassifierDecision::UseBifrostTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn shell_php_method_search_repairs_builtin_route_to_scan_usages() {
+        let mut output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because rg can search text.".to_string(),
+            intent: ShellIntent::LiteralTextSearch,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: ShellAllowException::None,
+            replacement_class: ShellReplacementClass::UseBuiltinInspection,
+            decision: ShellClassifierDecision::UseBuiltinTool,
+            recommended_tool: RecommendedTool::GrepSearch,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": "rg -n \"->alignment\\(|->setAlignment\\(|horizontalAlignment\\(|setHorizontalAlignment\\(\" src tests"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::UseBifrostTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
     }
 
     #[test]
@@ -5846,6 +5968,77 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn declaration_regex_search_uses_search_symbols() {
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because exact regex was requested.".to_string(),
+            intent: TextIntent::ExactTextOrLocalizedRead,
+            pattern_class: TextPatternClass::LiteralExact,
+            scope_class: TextScopeClass::DirectoryOrGlob,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence::default(),
+            bifrost_candidate: None,
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": "src",
+                "glob": "*.php",
+                "pattern": "enum\\s+Alignment"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn single_constant_with_recent_bifrost_hit_uses_get_symbol_sources() {
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because this is an exact constant string.".to_string(),
+            intent: TextIntent::ExactTextOrLocalizedRead,
+            pattern_class: TextPatternClass::LiteralExact,
+            scope_class: TextScopeClass::DirectoryOrGlob,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence::default(),
+            bifrost_candidate: None,
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let mut prior = exchange("search_symbols");
+        prior.arguments = r#"{"patterns":["TOP_LEFT"]}"#.to_string();
+        prior.result = "TOP_LEFT enum case found in src/Geometry/Alignment.php".to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": "src",
+                "glob": "*.php",
+                "pattern": "TOP_LEFT"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![prior],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::GetSymbolSources);
     }
 
     #[test]
