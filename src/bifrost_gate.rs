@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::StatusCode;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -189,9 +190,22 @@ impl Default for TextScopeClass {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BifrostCandidate {
-    pub tool: RecommendedTool,
+    #[serde(default, deserialize_with = "deserialize_optional_recommended_tool")]
+    pub tool: Option<RecommendedTool>,
     #[serde(default = "empty_object")]
     pub args: Value,
+}
+
+fn deserialize_optional_recommended_tool<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RecommendedTool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(RecommendedTool::deserialize(value).ok())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,7 +406,7 @@ impl From<RawGateClassifierOutput> for GateClassifierOutput {
         let recommended_tool = if should_gate {
             raw.bifrost_candidate
                 .as_ref()
-                .map(|candidate| candidate.tool.clone())
+                .and_then(|candidate| candidate.tool.clone())
                 .filter(is_bifrost_recommendation)
                 .unwrap_or_else(|| bifrost_tool_for_text_intent(&raw.intent))
         } else {
@@ -892,7 +906,7 @@ fn build_request_body_with_mode(
     let system = if json_only_retry {
         "Return only a valid JSON object matching the schema. No prose, markdown, hidden commentary, action field, or final decision field. Classify the pending read_file/grep_search call as policy facts from pending_call_features and compact_evidence. The system will compute the executable route from those facts."
     } else {
-        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Broad source/test glob or repo-wide scope plus identifier-like terms is usually symbol navigation when Bifrost is same-or-more-direct and no fallback exception applies. Exact-file scope, localized literal text, post-edit/build/test verification, non-source text, and observed targeted fallback for the same unresolved token/path after Bifrost returned empty/no-match are fallback exceptions. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct. Keep reason concise. Output only JSON matching the schema."
+        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Broad source/test glob or repo-wide scope plus identifier-like terms is usually symbol navigation when Bifrost is same-or-more-direct and no fallback exception applies. Exact-file scope, localized literal text, post-edit/build/test verification, non-source text, and observed targeted fallback for the same unresolved token/path after Bifrost returned empty/no-match are fallback exceptions. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct. When bifrost_candidate is not null, it must contain both `tool` and `args`; `tool` must exactly be one of search_symbols, scan_usages, get_summaries, or get_symbol_sources. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -1122,7 +1136,10 @@ fn strong_text_grep_allow_exception(
     context: &GateContext,
 ) -> bool {
     let kind = grep_pattern_kind(pattern, glob, path);
-    if package_declaration_literal(pattern) || uppercase_error_constant_set(pattern) {
+    if package_declaration_literal(pattern)
+        || uppercase_error_constant_set(pattern)
+        || mixed_error_constant_text_search(pattern)
+    {
         return true;
     }
     if post_edit_scope_verification(pattern, glob, path, file_path, &context.tool_exchanges) {
@@ -2797,6 +2814,19 @@ fn uppercase_error_constant_set(pattern: &str) -> bool {
     tokens.len() >= 2 && tokens.iter().all(|token| uppercase_constant_like(token))
 }
 
+fn mixed_error_constant_text_search(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    let uppercase_count = tokens
+        .iter()
+        .filter(|token| uppercase_constant_like(token))
+        .count();
+    uppercase_count >= 2
+        && tokens.iter().any(|token| {
+            let lower = token.to_ascii_lowercase();
+            lower.contains("err") || lower.contains("error") || lower.contains("errno")
+        })
+}
+
 fn natural_language_or_path_literal(pattern: &str) -> bool {
     let lower = pattern.to_ascii_lowercase();
     let tokens = identifier_tokens(pattern);
@@ -2810,13 +2840,19 @@ fn assertion_or_serialization_text(pattern: &str) -> bool {
     let lower = pattern.to_ascii_lowercase();
     lower.contains("shouldbe")
         || lower.contains("should be")
+        || lower.contains(" should")
         || lower.contains("\\.string")
         || lower.contains(".string")
-        || lower.contains("pattern_replace")
-        || lower.contains("articles_path")
-        || lower.contains("articles_case")
-        || lower.contains("stopwords_path")
-        || lower.contains("enable_position_increments")
+        || mixed_lower_snake_serialization_or_config_search(pattern)
+}
+
+fn mixed_lower_snake_serialization_or_config_search(pattern: &str) -> bool {
+    let tokens = identifier_tokens(pattern);
+    let lower_snake_count = tokens
+        .iter()
+        .filter(|token| lowercase_wire_key_like(token))
+        .count();
+    lower_snake_count > 0 && tokens.len() >= 2
 }
 
 fn exact_member_chain_or_call_text(pattern: &str) -> bool {
@@ -3250,7 +3286,7 @@ mod tests {
                 exact_text_or_regex_needed: false,
             },
             bifrost_candidate: Some(BifrostCandidate {
-                tool: RecommendedTool::SearchSymbols,
+                tool: Some(RecommendedTool::SearchSymbols),
                 args: json!({"patterns": ["Foo"]}),
             }),
             decision: GateClassifierDecision::GateToSymbolTool,
@@ -3295,6 +3331,68 @@ mod tests {
             "choices": [{
                 "message": {
                     "content": text_output_json("GATE_TO_SYMBOL_TOOL because symbol lookup", "symbol_definition_lookup", "same_or_more_direct", "none", "gate_to_symbol_tool", "search_symbols")
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn malformed_bifrost_candidate_falls_back_to_intent_tool() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": json!({
+                        "reason": "Broad source symbol grep should use Bifrost.",
+                        "intent": "symbol_definition_lookup",
+                        "pattern_class": "identifier_like",
+                        "scope_class": "broad_source_scope",
+                        "bifrost_fit": "same_or_more_direct",
+                        "fallback_exception": "none",
+                        "evidence": {
+                            "symbol_tokens": ["Foo"],
+                            "same_token_or_path_bifrost_miss": false,
+                            "same_path_recent_edit_or_write": false,
+                            "same_path_recent_bifrost_hit": false,
+                            "exact_text_or_regex_needed": false
+                        },
+                        "bifrost_candidate": {"patterns": ["Foo"]},
+                        "suggested_args": {},
+                        "confidence": "high"
+                    }).to_string()
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn invalid_bifrost_candidate_tool_falls_back_to_intent_tool() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": json!({
+                        "reason": "Broad source symbol grep should use Bifrost.",
+                        "intent": "symbol_definition_lookup",
+                        "pattern_class": "identifier_like",
+                        "scope_class": "broad_source_scope",
+                        "bifrost_fit": "same_or_more_direct",
+                        "fallback_exception": "none",
+                        "evidence": {
+                            "symbol_tokens": ["Foo"],
+                            "same_token_or_path_bifrost_miss": false,
+                            "same_path_recent_edit_or_write": false,
+                            "same_path_recent_bifrost_hit": false,
+                            "exact_text_or_regex_needed": false
+                        },
+                        "bifrost_candidate": {"tool": "searsh_symbols", "args": {"patterns": ["Foo"]}},
+                        "suggested_args": {},
+                        "confidence": "high"
+                    }).to_string()
                 }
             }]
         });
