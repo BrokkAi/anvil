@@ -1095,6 +1095,14 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
 
     let real_bifrost_miss =
         recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges);
+    let lower_snake_text_probe = lower_snake_literal_token_count(pattern) >= 2
+        && !identifier_tokens(pattern)
+            .iter()
+            .any(|token| short_prefixed_source_symbol_like(token))
+        && !declaration_search_pattern(pattern)
+        && !symbol_call_or_member(pattern)
+        && !source_static_or_member_access(pattern)
+        && !source_call_navigation_pattern(pattern);
     let repair_tool =
         deterministic_source_symbol_repair_tool(pattern, glob, path, file_path, context);
     if text_negative_facts_veto(output)
@@ -1119,6 +1127,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
                 pattern,
                 output.evidence.exact_text_or_regex_needed,
             ))
+        || lower_snake_text_probe
         || (repair_tool.is_none()
             && strong_text_grep_allow_exception(
                 pattern,
@@ -1325,6 +1334,17 @@ fn strong_text_grep_allow_exception(
         return true;
     }
     if bounded_test_scope(glob, path, file_path) && lower_snake_literal_token_count(pattern) > 0 {
+        return true;
+    }
+    if lower_snake_literal_token_count(pattern) >= 2
+        && !identifier_tokens(pattern)
+            .iter()
+            .any(|token| short_prefixed_source_symbol_like(token))
+        && !declaration_search_pattern(pattern)
+        && !symbol_call_or_member(pattern)
+        && !source_static_or_member_access(pattern)
+        && !source_call_navigation_pattern(pattern)
+    {
         return true;
     }
     if narrow_component_scope(glob, path, file_path)
@@ -2953,6 +2973,7 @@ fn shell_semantics_required(command: &str) -> bool {
     command_segments(command).iter().any(|segment| {
         go_doc_like(segment)
             || build_test_git_package_like(segment)
+            || environment_probe(segment)
             || process_control_or_inspection(segment)
             || shell_conditional_probe_like(
                 &strip_harmless_shell_prefixes(segment).to_ascii_lowercase(),
@@ -2965,6 +2986,7 @@ fn shell_semantics_required(command: &str) -> bool {
             || inline_runtime_execution(segment)
     }) || script_raw_byte_or_format_probe(command)
         || script_mutates_files(command)
+        || environment_probe(command)
         || command.contains("$(")
 }
 
@@ -2974,6 +2996,11 @@ fn process_control_or_inspection(command: &str) -> bool {
         lower.split_whitespace().next().unwrap_or(""),
         "sleep" | "ps" | "pgrep" | "pkill" | "kill" | "jobs"
     )
+}
+
+fn environment_probe(command: &str) -> bool {
+    let lower = command.trim_start().to_ascii_lowercase();
+    matches!(lower.split_whitespace().next().unwrap_or(""), "env" | "printenv")
 }
 
 fn same_path_recent_tool(path: &str, exchanges: &[ToolExchange], tools: &[&str]) -> bool {
@@ -3295,6 +3322,8 @@ fn shell_mutates_files(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     has_output_redirection(command)
         || lower.contains("sed -i")
+        || lower.contains("perl -pi")
+        || lower.contains("perl -i")
         || lower.starts_with("rm ")
         || lower.starts_with("mv ")
         || lower.starts_with("cp ")
@@ -5905,6 +5934,28 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::AllowText);
         assert_eq!(output.recommended_tool, RecommendedTool::None);
+
+        let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
+        output.decision = GateClassifierDecision::GateToSymbolTool;
+        output.recommended_tool = RecommendedTool::SearchSymbols;
+        output.confidence = GateConfidence::High;
+        output.bifrost_fit = BifrostFit::SameOrMoreDirect;
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "**/*.scala",
+                "pattern": "throttled_millis|version_conflicts|noops|retries"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
@@ -6113,6 +6164,14 @@ mod tests {
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
+            static_shell_route(&json!({"command": "env | grep -E 'JAVA|SBT' | sort"})),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "printenv JAVA_HOME"})),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
             static_shell_route(&json!({"command": "nl -ba src/main.rs | sed -n '1,80p'"})),
             Some(ShellStaticRoute::UseBuiltin(
                 "static_shell_builtin_inspection",
@@ -6180,6 +6239,12 @@ mod tests {
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/lib.rs').write_bytes(b'abc')\nPY"})
+            ),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(
+                &json!({"command": "perl -pi -e 's/\\r$//' source/Playnite/WebView/OffscreenWebView.cs"})
             ),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
