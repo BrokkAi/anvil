@@ -445,6 +445,7 @@ pub async fn classify_text_tool_call(
     let api_key = openrouter_api_key().context("OpenRouter API key unavailable")?;
     let model = classifier_model();
     let body = build_request_body(&model, &context)?;
+    let retry_body = build_request_retry_body(&model, &context)?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(CLASSIFIER_TIMEOUT)
@@ -456,10 +457,20 @@ pub async fn classify_text_tool_call(
         if cancel.is_cancelled() {
             return Err(anyhow!("classification cancelled"));
         }
-        match send_classifier_request(&client, &api_key, &body, parse_openrouter_response, cancel)
+        let request_body = if attempt == 0 { &body } else { &retry_body };
+        match send_classifier_request(
+            &client,
+            &api_key,
+            request_body,
+            parse_openrouter_response,
+            cancel,
+        )
             .await
         {
-            Ok(output) => return Ok(output),
+            Ok(mut output) => {
+                enforce_text_classifier_policy(&mut output, &context);
+                return Ok(output);
+            }
             Err(err) => {
                 last_err = Some(err.context(format!("classifier attempt {}", attempt + 1)));
             }
@@ -480,6 +491,7 @@ pub async fn classify_shell_tool_call(
     let api_key = openrouter_api_key().context("OpenRouter API key unavailable")?;
     let model = classifier_model();
     let body = build_shell_request_body(&model, &context)?;
+    let retry_body = build_shell_request_retry_body(&model, &context)?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(CLASSIFIER_TIMEOUT)
@@ -491,10 +503,11 @@ pub async fn classify_shell_tool_call(
         if cancel.is_cancelled() {
             return Err(anyhow!("classification cancelled"));
         }
+        let request_body = if attempt == 0 { &body } else { &retry_body };
         match send_classifier_request(
             &client,
             &api_key,
-            &body,
+            request_body,
             parse_shell_openrouter_response,
             cancel,
         )
@@ -764,7 +777,23 @@ fn parse_shell_openrouter_response(text: &str) -> Result<ShellClassifierOutput> 
 }
 
 fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
-    let system = "You are a routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it. Decide whether the pending read_file/grep_search call should run as text navigation or should be replaced by a Bifrost symbol tool. Use pending_call_features and compact_evidence first, prose excerpts second. Target policy: gate to Bifrost only when it is clearly the same-or-more-direct answer to a specific source-code symbol/navigation intent; otherwise allow exact text. Do not allow text merely because the agent wants to double-check or distrust Bifrost. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses; do not allow text solely because of them. Allow exact/localized file reads, bounded reads, top-of-file orientation, post edit/build/test verification, non-source text, exact literal/regex semantics, and observed targeted fallback for the same unresolved token/path after Bifrost returned an empty/no-match result. For grep_search, broad source/test glob or repo-wide scope plus identifier-like terms and no observed targeted Bifrost empty/no-match is usually a Bifrost action, even if the pattern uses alternation, C signatures, macros, or test identifiers. Exact-file scope, post-edit verification, exact literal/regex semantics, or fallback after observed Bifrost empty/no-match is allow_original. Use use_search_symbols for unknown declarations/definitions by name, use_scan_usages for callers/references/related tests, use_get_summaries for broad module/package/API orientation, and use_get_symbol_sources when relevant symbol names are already known and implementation source is needed. The action field is the only route the gate will execute. If Bifrost is preferred, choose the corresponding Bifrost action; never choose allow_original while saying Bifrost is preferred. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. Keep reason concise. Output only JSON matching the schema.";
+    build_request_body_with_mode(model, context, false)
+}
+
+fn build_request_retry_body(model: &str, context: &GateContext) -> Result<String> {
+    build_request_body_with_mode(model, context, true)
+}
+
+fn build_request_body_with_mode(
+    model: &str,
+    context: &GateContext,
+    json_only_retry: bool,
+) -> Result<String> {
+    let system = if json_only_retry {
+        "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify the pending read_file/grep_search call from pending_call_features and compact_evidence. Gate broad source/test grep with identifier-like terms to Bifrost unless an exact/localized scope, post-edit/build/test verification, exact literal non-symbol text, or an observed empty/no-match Bifrost result supports allow_original. Infrastructure/protocol/refresh errors are not Bifrost misses. If uncertain, choose allow_original with confidence low."
+    } else {
+        "You are a routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Decide whether the pending read_file/grep_search call should run as text navigation or should be replaced by a Bifrost symbol tool. Use pending_call_features and compact_evidence first, prose excerpts second. Target policy: gate to Bifrost only when it is clearly the same-or-more-direct answer to a specific source-code symbol/navigation intent; otherwise allow exact text. Do not allow text merely because the agent wants to double-check or distrust Bifrost. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses; do not allow text solely because of them. Allow exact/localized file reads, bounded reads, top-of-file orientation, post edit/build/test verification, non-source text, exact literal non-symbol searches, and observed targeted fallback for the same unresolved token/path after Bifrost returned an empty/no-match result. For grep_search, broad source/test glob or repo-wide scope plus identifier-like terms and no observed targeted Bifrost empty/no-match is usually a Bifrost action, even if the pattern uses alternation, C signatures, macros, or test identifiers. Exact-file scope, post-edit verification, exact literal non-symbol text, or fallback after observed Bifrost empty/no-match is allow_original. Use use_search_symbols for unknown declarations/definitions by name, use_scan_usages for callers/references/related tests, use_get_summaries for broad module/package/API orientation, and use_get_symbol_sources when relevant symbol names are already known and implementation source is needed. The action field is the only route the gate will execute. If Bifrost is preferred, choose the corresponding Bifrost action; never choose allow_original while saying Bifrost is preferred. The reason field must commit to one of these forms: 'ALLOW_TEXT because ...' or 'GATE_TO_SYMBOL_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
+    };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
     let system_json = serde_json::to_string(system)?;
@@ -810,13 +839,29 @@ fn build_request_body(model: &str, context: &GateContext) -> Result<String> {
     }}
   }},
   "temperature": 0,
-  "max_tokens": 1024
+  "max_tokens": 2048
 }}"#
     ))
 }
 
 fn build_shell_request_body(model: &str, context: &GateContext) -> Result<String> {
-    let system = "You are a shell routing classifier for an AI coding agent. Think privately before answering. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, or a pipeline whose transformation or exit behavior matters. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is builtin inspection, not Bifrost. Grep/rg/git-grep-like shell commands should usually use use_grep_search first; choose a Bifrost action only when the command's primary purpose is clearly source-code symbol discovery and builtin grep_search would be a worse route. Do not allow shell merely because the user used shell syntax, heredoc, Python, grep, sed, head, tail, xargs, or a pipe. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. When uncertain between Bifrost and builtin/text, prefer builtin/text unless the command is clearly source symbol discovery. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema.";
+    build_shell_request_body_with_mode(model, context, false)
+}
+
+fn build_shell_request_retry_body(model: &str, context: &GateContext) -> Result<String> {
+    build_shell_request_body_with_mode(model, context, true)
+}
+
+fn build_shell_request_body_with_mode(
+    model: &str,
+    context: &GateContext,
+    json_only_retry: bool,
+) -> Result<String> {
+    let system = if json_only_retry {
+        "Return only a valid JSON object matching the schema. No prose, markdown, or hidden commentary. Classify by purpose from pending_call_features and compact_evidence. Use builtins for ordinary file reads/searches/listings when they preserve intent. Use Bifrost only for clear source-code symbol discovery. Allow shell only for concrete shell semantics such as build/test/git/package commands, env/path probes, raw bytes, mutation, generated artifacts, or meaningful pipeline behavior. If uncertain, choose allow_original with confidence low."
+    } else {
+        "You are a shell routing classifier for an AI coding agent. You are advising a stronger coding model, not commanding it. Classify by purpose, not by syntax. Use pending_call_features and compact_evidence first, prose excerpts second. Allow shell when shell semantics are materially part of the task: build/test/git/package/project CLI, env/permission/path probing, raw bytes or hidden whitespace, generated artifacts, command substitution, mutation/write/delete behavior, or a pipeline whose transformation or exit behavior matters. Use builtins when the command only reads, searches, lists, or prints bounded ranges, and shell syntax is only being used to limit, count, or pretty-print inspection output. A filename/path search with find, ls, or path globs is builtin inspection, not Bifrost. Grep/rg/git-grep-like shell commands should usually use use_grep_search first; choose a Bifrost action only when the command's primary purpose is clearly source-code symbol discovery and builtin grep_search would be a worse route. Do not allow shell merely because the user used shell syntax, heredoc, Python, grep, sed, head, tail, xargs, or a pipe. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. When uncertain between builtin and shell, allow shell only if you can identify a concrete shell-specific semantic that may matter. When uncertain between Bifrost and builtin/text, prefer builtin/text unless the command is clearly source symbol discovery. The action field is the only route the gate will execute. If a builtin or Bifrost tool is preferred, choose that action; never choose allow_original while recommending another tool. The reason field must commit to one of these forms: 'ALLOW_SHELL because ...', 'USE_BUILTIN_TOOL because ...', or 'USE_BIFROST_TOOL because ...'. Keep reason concise. Output only JSON matching the schema."
+    };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
     let system_json = serde_json::to_string(system)?;
@@ -853,7 +898,7 @@ fn build_shell_request_body(model: &str, context: &GateContext) -> Result<String
     }}
   }},
   "temperature": 0,
-  "max_tokens": 1024
+  "max_tokens": 2048
 }}"#
     ))
 }
@@ -884,6 +929,80 @@ fn normalize_classifier_consistency(output: &mut GateClassifierOutput) {
         output.recommended_tool = RecommendedTool::None;
         output.suggested_args = json!({});
     }
+}
+
+fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &GateContext) {
+    if context.tool_name != "grep_search"
+        || output.decision != GateClassifierDecision::AllowText
+        || output.confidence != GateConfidence::High
+    {
+        return;
+    }
+    let pattern = context
+        .args
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !symbol_like_pattern(pattern) {
+        return;
+    }
+    let glob = context.args.get("glob").and_then(Value::as_str).unwrap_or("");
+    let path = context.args.get("path").and_then(Value::as_str).unwrap_or("");
+    let file_path = context
+        .args
+        .get("file_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if grep_scope_granularity(glob, path, file_path) == "exact_file"
+        || !broad_source_or_test_scope(glob, path)
+    {
+        return;
+    }
+    if supported_broad_symbol_grep_allow(output, pattern, glob, path, file_path, context) {
+        return;
+    }
+    output.decision = GateClassifierDecision::GateToSymbolTool;
+    output.recommended_tool = bifrost_tool_for_text_intent(&output.intent);
+    output.suggested_args = json!({});
+    output.reason = format!(
+        "GATE_TO_SYMBOL_TOOL because broad source/test grep for symbol-like pattern `{}` lacks a supported allow exception.",
+        truncate_to(pattern, 120)
+    );
+}
+
+fn supported_broad_symbol_grep_allow(
+    output: &GateClassifierOutput,
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    context: &GateContext,
+) -> bool {
+    let scope_target = grep_scope_target(glob, path, file_path);
+    if output.evidence.same_token_or_path_bifrost_miss
+        || overlaps_recent_bifrost_miss(pattern, &context.tool_exchanges)
+        || overlaps_recent_bifrost_miss(&scope_target, &context.tool_exchanges)
+    {
+        return true;
+    }
+    if output.evidence.same_path_recent_edit_or_write
+        || recent_edit_or_build_failure(&context.tool_exchanges)
+        || same_path_recent_tool(&scope_target, &context.tool_exchanges, &["edit", "write_file"])
+    {
+        return true;
+    }
+    if matches!(
+        output.allow_exception,
+        TextAllowException::LocalizedOrSequentialRead
+            | TextAllowException::WholeFileOrTopOfFileOrientation
+    ) && (same_path_recent_tool(&scope_target, &context.tool_exchanges, &["read_file"])
+        || !scope_target.trim().is_empty() && scope_target != ".")
+    {
+        return true;
+    }
+    matches!(output.allow_exception, TextAllowException::ExactLiteralOrRegex)
+        && literal_like_pattern(pattern)
+        && !symbol_like_pattern(pattern)
 }
 
 fn normalize_shell_classifier_consistency(output: &mut ShellClassifierOutput) {
@@ -2394,6 +2513,66 @@ mod tests {
         let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
         assert_eq!(parsed.decision, GateClassifierDecision::AllowText);
         assert_eq!(parsed.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn broad_symbol_grep_allow_without_supported_exception_is_gated() {
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because regex can find the identifier.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            bifrost_fit: BifrostFit::Unknown,
+            allow_exception: TextAllowException::ExactLiteralOrRegex,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["RichEditBoxDefaultLineEnding".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: true,
+            },
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "RichEditBoxDefaultLineEnding", "path": "src", "glob": "**/*.cs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn exact_file_symbol_grep_allow_stays_allowed() {
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because exact-file grep is localized.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            bifrost_fit: BifrostFit::Unknown,
+            allow_exception: TextAllowException::LocalizedOrSequentialRead,
+            evidence: TextEvidence::default(),
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "RichEditBoxDefaultLineEnding", "path": ".", "glob": "src/Notepads/App.xaml.cs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
