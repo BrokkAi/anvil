@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use jsonschema::{ErrorIterator, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 pub const ACP_META_NAMESPACE: &str = "anvil";
 const ACP_META_STRUCTURED_OUTPUT_KEY: &str = "structuredOutput";
@@ -92,6 +93,9 @@ pub fn parse_structured_output_request(
     let schema_for_compile = schema.clone();
     JSONSchema::compile(&schema_for_compile)
         .map_err(|err| anyhow!("invalid structured-output schema: {err}"))?;
+    if allow_coercion {
+        reject_unsupported_coercion_schema_shapes(&schema_for_compile)?;
+    }
     Ok(Some(StructuredOutputRequest {
         schema_name,
         schema,
@@ -163,12 +167,23 @@ pub fn validate_response(
         }
 
         let mut coercions = Vec::new();
-        let coerced = coerce_output_node(&parsed, &request.schema, "response", &mut coercions);
+        let coerced = coerce_output_node(
+            &parsed,
+            &request.schema,
+            &request.schema,
+            "response",
+            &mut coercions,
+        );
         if coercions.is_empty() {
             return validation_error_result(request, original_errors, response_text);
         }
 
         if compiled.is_valid(&coerced) {
+            tracing::warn!(
+                schema_name = %request.schema_name,
+                coercions = ?coercions,
+                "structured output coerced after validation failure"
+            );
             StructuredOutputResult::CoercedSuccess(StructuredOutputCoercedSuccess {
                 schema_name: request.schema_name.clone(),
                 validated_output: coerced,
@@ -230,25 +245,63 @@ fn collect_schema_errors(errors: ErrorIterator<'_>) -> Vec<StructuredOutputSchem
         .collect()
 }
 
+fn reject_unsupported_coercion_schema_shapes(schema: &Value) -> Result<()> {
+    if contains_unsupported_coercion_schema_shapes(schema) {
+        anyhow::bail!(
+            "`allowCoercion` supports inline schemas, local `$ref`, and `type` unions; `anyOf`, `oneOf`, `allOf`, and `not` are unsupported"
+        );
+    }
+    Ok(())
+}
+
+fn contains_unsupported_coercion_schema_shapes(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            if map.contains_key("anyOf")
+                || map.contains_key("oneOf")
+                || map.contains_key("allOf")
+                || map.contains_key("not")
+            {
+                return true;
+            }
+            map.values()
+                .any(contains_unsupported_coercion_schema_shapes)
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(contains_unsupported_coercion_schema_shapes),
+        _ => false,
+    }
+}
+
 fn coerce_output_node(
     value: &Value,
+    root_schema: &Value,
     schema: &Value,
     path: &str,
     changes: &mut Vec<String>,
 ) -> Value {
-    match schema_type(schema) {
-        Some("object") => coerce_output_object(value, schema, path, changes),
-        Some("array") => coerce_output_array(value, schema, path, changes),
-        Some("string") => coerce_output_string(value, schema, path, changes),
-        Some("integer") => coerce_output_integer(value, path, changes),
-        Some("number") => coerce_output_number(value, path, changes),
-        Some("boolean") => coerce_output_boolean(value, path, changes),
+    let resolved_schema = resolve_schema_node(root_schema, schema);
+    match schema_types(resolved_schema.as_ref()).as_slice() {
+        [single] if *single == "object" => {
+            coerce_output_object(value, root_schema, resolved_schema.as_ref(), path, changes)
+        }
+        [single] if *single == "array" => {
+            coerce_output_array(value, root_schema, resolved_schema.as_ref(), path, changes)
+        }
+        types if types.contains(&"string") => {
+            coerce_output_string(value, resolved_schema.as_ref(), path, changes)
+        }
+        types if types.contains(&"integer") => coerce_output_integer(value, path, changes),
+        types if types.contains(&"number") => coerce_output_number(value, path, changes),
+        types if types.contains(&"boolean") => coerce_output_boolean(value, path, changes),
         _ => value.clone(),
     }
 }
 
 fn coerce_output_object(
     value: &Value,
+    root_schema: &Value,
     schema: &Value,
     path: &str,
     changes: &mut Vec<String>,
@@ -266,7 +319,7 @@ fn coerce_output_object(
             let child_path = format!("{path}.{key}");
             out.insert(
                 key.clone(),
-                coerce_output_node(&child, property_schema, &child_path, changes),
+                coerce_output_node(&child, root_schema, property_schema, &child_path, changes),
             );
         }
     }
@@ -275,6 +328,7 @@ fn coerce_output_object(
 
 fn coerce_output_array(
     value: &Value,
+    root_schema: &Value,
     schema: &Value,
     path: &str,
     changes: &mut Vec<String>,
@@ -291,7 +345,13 @@ fn coerce_output_array(
             .iter()
             .enumerate()
             .map(|(index, element)| {
-                coerce_output_node(element, items, &format!("{path}[{index}]"), changes)
+                coerce_output_node(
+                    element,
+                    root_schema,
+                    items,
+                    &format!("{path}[{index}]"),
+                    changes,
+                )
             })
             .collect(),
     )
@@ -391,8 +451,37 @@ fn node_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn schema_type(schema: &Value) -> Option<&str> {
-    schema.get("type").and_then(Value::as_str)
+fn resolve_schema_node<'a>(root_schema: &'a Value, schema: &'a Value) -> Cow<'a, Value> {
+    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+        return Cow::Borrowed(schema);
+    };
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return Cow::Borrowed(schema);
+    };
+    let Some(target) = root_schema.pointer(pointer) else {
+        return Cow::Borrowed(schema);
+    };
+    if let Value::Object(target_map) = target {
+        let mut merged = target_map.clone();
+        if let Value::Object(local_map) = schema {
+            for (key, value) in local_map {
+                if key != "$ref" {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        Cow::Owned(Value::Object(merged))
+    } else {
+        Cow::Borrowed(target)
+    }
+}
+
+fn schema_types(schema: &Value) -> Vec<&str> {
+    match schema.get("type") {
+        Some(Value::String(single)) => vec![single.as_str()],
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn output_type_of(value: &Value) -> &'static str {
@@ -500,6 +589,30 @@ mod tests {
         });
         let err = parse_structured_output_request(meta.as_object()).unwrap_err();
         assert!(err.to_string().contains("allowCoercion"));
+    }
+
+    #[test]
+    fn rejects_unsupported_coercion_schema_shapes() {
+        let meta = serde_json::json!({
+            "anvil": {
+                "structuredOutput": {
+                    "schemaName": "audit_result",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {
+                                "anyOf": [{"type": "string"}, {"type": "integer"}]
+                            }
+                        },
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    },
+                    "allowCoercion": true
+                }
+            }
+        });
+        let err = parse_structured_output_request(meta.as_object()).unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
     }
 
     #[test]
@@ -797,6 +910,55 @@ mod tests {
                 );
             }
             other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerces_nullable_string_field_from_array() {
+        let request = StructuredOutputRequest {
+            schema_name: "audit_result".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": { "type": ["string", "null"] }
+                },
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+            allow_coercion: true,
+        };
+        let result = validate_response(&request, r#"{"answer":["one","two"]}"#);
+        match result {
+            StructuredOutputResult::CoercedSuccess(success) => {
+                assert_eq!(success.validated_output["answer"], "one\ntwo");
+            }
+            other => panic!("expected coerced success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerces_local_ref_string_field_from_array() {
+        let request = StructuredOutputRequest {
+            schema_name: "audit_result".to_string(),
+            schema: serde_json::json!({
+                "$defs": {
+                    "Narrative": { "type": "string" }
+                },
+                "type": "object",
+                "properties": {
+                    "answer": { "$ref": "#/$defs/Narrative" }
+                },
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+            allow_coercion: true,
+        };
+        let result = validate_response(&request, r#"{"answer":["one","two"]}"#);
+        match result {
+            StructuredOutputResult::CoercedSuccess(success) => {
+                assert_eq!(success.validated_output["answer"], "one\ntwo");
+            }
+            other => panic!("expected coerced success, got {other:?}"),
         }
     }
 }
