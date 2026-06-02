@@ -632,11 +632,10 @@ fn spawn_delayed_available_commands_update(
 }
 
 /// Spawn a background discovery refresh that updates the session
-/// store's cached model catalog. Throttled by `refresh_lock`: if a
-/// previous refresh is still in flight the call is a no-op (the
-/// in-flight one will seed the cache anyway). Shared by `session/new`
-/// and the `/codex-login` post-install path so the two can never race.
-fn spawn_throttled_refresh(
+/// store's cached model catalog. Background callers queue on the shared
+/// refresh lock instead of skipping work when another refresh is in
+/// flight. Shared by `session/new` and provider login/logout flows.
+fn spawn_background_refresh(
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     llm: Arc<MultiBackend>,
     sessions: SessionStore,
@@ -648,20 +647,17 @@ fn spawn_throttled_refresh(
             tokio::time::sleep(delay).await;
         }
 
-        let Ok(guard) = refresh_lock.try_lock_owned() else {
-            tracing::trace!(
-                "skipping background model-catalog refresh: another refresh is already in flight"
-            );
-            return;
-        };
-
-        // Hold the guard for the duration of the refresh so the next
-        // try_lock observes "in flight". Drop is implicit at the end
-        // of the spawned future.
-        let _refresh_guard = guard;
         if let Some((cx, session_id, intro)) = &transcript {
             trace_openrouter_refresh(intro.trim_end());
             send_message(cx, session_id, &format!("{intro}\n"));
+            trace_openrouter_refresh("Waiting for model refresh lock...");
+            send_message(cx, session_id, "Waiting for model refresh lock...\n");
+        }
+
+        let _refresh_guard = refresh_lock.lock().await;
+        if let Some((cx, session_id, _)) = &transcript {
+            trace_openrouter_refresh("Refresh lock acquired.");
+            send_message(cx, session_id, "Refresh lock acquired.\n");
         }
 
         let result = match &transcript {
@@ -911,7 +907,7 @@ pub async fn run_agent(
                 // `ollama pull` or signed into Codex). When this session starts
                 // without a usable cached catalog, stream the same progress into
                 // its transcript after the client finishes registering the id.
-                spawn_throttled_refresh(
+                spawn_background_refresh(
                     refresh_lock_new.clone(),
                     llm_new.clone(),
                     sessions_new.clone(),
@@ -2346,7 +2342,7 @@ async fn handle_codex_login(
                 // credentials. Refresh the cached catalog so the picker
                 // stops offering Codex models.
                 llm.uninstall_codex();
-                spawn_throttled_refresh(
+                spawn_background_refresh(
                     refresh_lock.clone(),
                     llm.clone(),
                     sessions.clone(),
@@ -2388,7 +2384,7 @@ async fn handle_codex_login(
                         // same throttle as `session/new` so an
                         // immediate session creation right after login
                         // doesn't race a second probe.
-                        spawn_throttled_refresh(
+                        spawn_background_refresh(
                             refresh_lock.clone(),
                             llm.clone(),
                             sessions.clone(),
@@ -2539,7 +2535,7 @@ async fn handle_openrouter_login(
         "disconnect" => match crate::openrouter_auth::logout() {
             Ok(()) => {
                 llm.uninstall_openrouter();
-                spawn_throttled_refresh(
+                spawn_background_refresh(
                     refresh_lock.clone(),
                     llm.clone(),
                     sessions.clone(),
@@ -2574,7 +2570,7 @@ async fn handle_openrouter_login(
                 Ok(()) => match crate::openrouter_backend_from_key(&key) {
                     Some(backend) => {
                         llm.install_openrouter(backend);
-                        spawn_throttled_refresh(
+                        spawn_background_refresh(
                             refresh_lock.clone(),
                             llm.clone(),
                             sessions.clone(),
