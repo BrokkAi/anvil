@@ -865,6 +865,12 @@ impl LlmBackend for OpenAiClient {
 impl OpenAiClient {
     async fn fetch_models_response(&self) -> Result<ModelsResponse> {
         let url = self.api_url("/models");
+        let trace_openrouter = self.base_url.contains("openrouter.ai");
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: building GET {url}"
+            ));
+        }
         let mut req = self
             .http
             .get(&url)
@@ -872,15 +878,51 @@ impl OpenAiClient {
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: calling req.send()",
+            );
+        }
         let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: req.send() returned",
+            );
+        }
         let status = resp.status();
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: HTTP {status}"
+            ));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            if trace_openrouter {
+                crate::openrouter_auth::append_refresh_log(&format!(
+                    "OpenRouter fetch_models_response: error body length {}",
+                    body.len()
+                ));
+            }
             tracing::warn!("model discovery failed (HTTP {status}): {body}");
             anyhow::bail!("model discovery failed (HTTP {status})");
         }
 
-        resp.json().await.context("failed to parse models response")
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: parsing JSON body",
+            );
+        }
+        let parsed: ModelsResponse = resp
+            .json()
+            .await
+            .context("failed to parse models response")?;
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: parsed {} model entries",
+                parsed.data.len()
+            ));
+        }
+        Ok(parsed)
     }
 
     async fn list_models_impl(&self) -> Result<Vec<String>> {
@@ -889,7 +931,17 @@ impl OpenAiClient {
     }
 
     async fn list_model_metadata_impl(&self) -> Result<Vec<ModelMetadata>> {
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter list_model_metadata_impl: start",
+            );
+        }
         let models = self.fetch_models_response().await?;
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter list_model_metadata_impl: fetched models response",
+            );
+        }
         if !self.supports_reasoning_effort {
             return Ok(models
                 .data
@@ -902,11 +954,18 @@ impl OpenAiClient {
                 })
                 .collect());
         }
-        Ok(models
+        let metadata = models
             .data
             .into_iter()
             .map(|model| model.to_model_metadata())
-            .collect())
+            .collect::<Vec<_>>();
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter list_model_metadata_impl: built {} metadata entries",
+                metadata.len()
+            ));
+        }
+        Ok(metadata)
     }
 
     async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {
