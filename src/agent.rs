@@ -21,7 +21,7 @@ use agent_client_protocol::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
-use crate::llm_client::{ChatContentPart, ChatMessage, LlmBackend, ModelMetadata};
+use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
@@ -632,39 +632,52 @@ fn spawn_delayed_available_commands_update(
 }
 
 /// Spawn a background discovery refresh that updates the session
-/// store's cached model catalog. Throttled by `refresh_lock`: if a
-/// previous refresh is still in flight the call is a no-op (the
-/// in-flight one will seed the cache anyway). Shared by `session/new`
-/// and the `/codex-login` post-install path so the two can never race.
-fn spawn_throttled_refresh(
+/// store's cached model catalog. Background callers queue on the shared
+/// refresh lock instead of skipping work when another refresh is in
+/// flight. Shared by `session/new` and provider login/logout flows.
+fn spawn_background_refresh(
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     llm: Arc<MultiBackend>,
     sessions: SessionStore,
+    transcript: Option<(ConnectionTo<Client>, String, &'static str)>,
+    initial_delay: Option<Duration>,
 ) {
-    if let Ok(guard) = refresh_lock.try_lock_owned() {
-        tokio::spawn(async move {
-            // Hold the guard for the duration of the refresh so the
-            // next try_lock observes "in flight". Drop is implicit at
-            // the end of the spawned future.
-            let _refresh_guard = guard;
-            match llm.list_model_metadata().await {
-                Ok(models) => {
-                    tracing::debug!(
-                        count = models.len(),
-                        "background model-catalog refresh complete"
-                    );
-                    sessions.set_available_models(models).await;
-                }
-                Err(e) => {
-                    tracing::debug!("background model-catalog refresh failed: {e:#}");
-                }
+    tokio::spawn(async move {
+        if let Some(delay) = initial_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        if let Some((cx, session_id, intro)) = &transcript {
+            trace_openrouter_refresh(intro.trim_end());
+            send_message(cx, session_id, &format!("{intro}\n"));
+            trace_openrouter_refresh("Waiting for model refresh lock...");
+            send_message(cx, session_id, "Waiting for model refresh lock...\n");
+        }
+
+        let _refresh_guard = refresh_lock.lock().await;
+        if let Some((cx, session_id, _)) = &transcript {
+            trace_openrouter_refresh("Refresh lock acquired.");
+            send_message(cx, session_id, "Refresh lock acquired.\n");
+        }
+
+        let result = match &transcript {
+            Some((cx, session_id, _)) => {
+                refresh_model_catalog_after_lock(Some(cx), Some(session_id), &llm, &sessions).await
             }
-        });
-    } else {
-        tracing::trace!(
-            "skipping background model-catalog refresh: another refresh is already in flight"
-        );
-    }
+            None => refresh_model_catalog_after_lock(None, None, &llm, &sessions).await,
+        };
+
+        if let Err(e) = result {
+            tracing::debug!("background model-catalog refresh failed: {e}");
+            if let Some((cx, session_id, _)) = &transcript {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!("Model catalog refresh failed: {e}\n"),
+                );
+            }
+        }
+    });
 }
 
 fn spawn_delayed_setup_notice(
@@ -843,7 +856,7 @@ pub async fn run_agent(
                 tracing::info!("ACP initialize");
 
                 // Try to discover models at startup and cache them for session/new.
-                let models = match llm_init.list_model_metadata().await {
+                let models = match llm_init.list_model_metadata_with_progress(None).await {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!("model discovery failed during init: {e}");
@@ -884,22 +897,29 @@ pub async fn run_agent(
                 tracing::info!("ACP session/new, cwd={}", cwd.display());
                 let session = sessions_new.create_session(cwd).await;
 
-                // Re-discover in the background so the next `session/new` picks up
-                // models the user added/removed since startup (e.g. they ran
-                // `ollama pull` or signed into Codex). The current session/new
-                // returns immediately with the cached list -- the refresh seeds
-                // the cache for the next call so we don't pay the discovery RTT
-                // here on the synchronous path.
-                spawn_throttled_refresh(
-                    refresh_lock_new.clone(),
-                    llm_new.clone(),
-                    sessions_new.clone(),
-                );
-
                 // Use the cached catalog populated at init; fall back to a
                 // single-entry catalog from the session's own model so the
                 // dropdown still renders something on a fresh discovery miss.
                 let mut catalog = sessions_new.available_model_metadata().await;
+                let should_stream_refresh = catalog.is_empty() || session.model.is_empty();
+                // Re-discover in the background so the next `session/new` picks up
+                // models the user added/removed since startup (e.g. they ran
+                // `ollama pull` or signed into Codex). When this session starts
+                // without a usable cached catalog, stream the same progress into
+                // its transcript after the client finishes registering the id.
+                spawn_background_refresh(
+                    refresh_lock_new.clone(),
+                    llm_new.clone(),
+                    sessions_new.clone(),
+                    should_stream_refresh.then(|| {
+                        (
+                            cx.clone(),
+                            session.id.clone(),
+                            "Checking model providers for this session...",
+                        )
+                    }),
+                    should_stream_refresh.then_some(Duration::from_millis(150)),
+                );
                 if catalog.is_empty() && !session.model.is_empty() {
                     catalog = vec![ModelMetadata::id_only(&session.model)];
                 }
@@ -1149,7 +1169,10 @@ pub async fn run_agent(
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                if is_slash_command(&raw_prompt_text, "setup") {
+                let stream_setup_openrouter_refresh =
+                    is_streamed_setup_openrouter_refresh(&raw_prompt_text);
+
+                if is_slash_command(&raw_prompt_text, "setup") && !stream_setup_openrouter_refresh {
                     let setup_ctx = SetupContext {
                         cx: &cx,
                         sessions: &sessions_prompt,
@@ -1211,6 +1234,7 @@ pub async fn run_agent(
                 // correctly. Built-ins are checked first so a skill
                 // that happens to name itself e.g. `context` or
                 // `setup` can never shadow them.
+                let slash_command = parse_slash_command(&raw_prompt_text);
                 let title_seed = snap
                     .history
                     .first()
@@ -1222,37 +1246,39 @@ pub async fn run_agent(
                 // work starts. The title depends only on the user's text, not
                 // on the model response, so there is no reason to defer it
                 // past the spawn below.
-                match sessions_prompt
-                    .maybe_rename_from_prompt(&session_id, &title_seed)
-                    .await
-                {
-                    Ok(renamed_title) => {
-                        if renamed_title.is_some()
-                            && let Some(metadata) =
-                                sessions_prompt.session_metadata(&session_id).await
-                        {
-                            send_session_info_update(
-                                &cx,
-                                &session_id,
-                                renamed_title,
-                                metadata.updated_at,
+                if should_auto_rename_session_from_prompt(&raw_prompt_text) {
+                    match sessions_prompt
+                        .maybe_rename_from_prompt(&session_id, &title_seed)
+                        .await
+                    {
+                        Ok(renamed_title) => {
+                            if renamed_title.is_some()
+                                && let Some(metadata) =
+                                    sessions_prompt.session_metadata(&session_id).await
+                            {
+                                send_session_info_update(
+                                    &cx,
+                                    &session_id,
+                                    renamed_title,
+                                    metadata.updated_at,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                "failed to update session title: {e:#}"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            "failed to update session title: {e:#}"
-                        );
-                    }
                 }
 
-                let prompt_text = if let Some((name, args)) = parse_slash_command(&raw_prompt_text)
-                    && let Some(meta) = snap.skills.get(&name)
+                let prompt_text = if let Some((name, args)) = slash_command.as_ref()
+                    && let Some(meta) = snap.skills.get(name)
                 {
                     tracing::info!(skill = %name, "slash-command activating skill");
                     sessions_prompt
-                        .mark_skill_activated(&session_id, &name)
+                        .mark_skill_activated(&session_id, name)
                         .await;
                     let body = build_skill_payload(meta);
                     if args.is_empty() {
@@ -1270,7 +1296,7 @@ pub async fn run_agent(
                 };
 
                 // Validate model is configured
-                if snap.model.is_empty() {
+                if snap.model.is_empty() && !stream_setup_openrouter_refresh {
                     let catalog = sessions_prompt.available_model_metadata().await;
                     send_message(
                         &cx,
@@ -1345,6 +1371,59 @@ pub async fn run_agent(
                     send_message(&cx, &session_id, &report);
                     sessions_prompt.finish_prompt(&session_id).await;
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+
+                if stream_setup_openrouter_refresh {
+                    let llm_for_refresh = llm_login.clone();
+                    let sessions_for_refresh = sessions_prompt.clone();
+                    let cx_for_refresh = cx.clone();
+                    let session_id_for_refresh = session_id.clone();
+                    let refresh_lock_for_refresh = refresh_lock_login.clone();
+
+                    let spawn_result = cx.spawn(async move {
+                        let report = match refresh_model_catalog_now(
+                            Some(&cx_for_refresh),
+                            Some(&session_id_for_refresh),
+                            &llm_for_refresh,
+                            &sessions_for_refresh,
+                            &refresh_lock_for_refresh,
+                        )
+                        .await
+                        {
+                            Ok(catalog) => {
+                                let count = source_count(&catalog, ModelSource::OpenRouter);
+                                if count > 0 {
+                                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
+                                } else {
+                                    format!(
+                                        "OpenRouter is not showing models yet.\n\n{}",
+                                        render_openrouter_setup_help()
+                                    )
+                                }
+                            }
+                            Err(e) => format!(
+                                "Could not check OpenRouter yet: {e}\n\n{}",
+                                render_openrouter_setup_help()
+                            ),
+                        };
+                        send_message(&cx_for_refresh, &session_id_for_refresh, &report);
+                        sessions_for_refresh.finish_prompt(&session_id_for_refresh).await;
+                        if let Err(e) = responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        {
+                            tracing::warn!(
+                                session_id = %session_id_for_refresh,
+                                "failed to deliver PromptResponse: {e}"
+                            );
+                        }
+                        Ok(())
+                    });
+
+                    if let Err(e) = spawn_result {
+                        sessions_prompt.finish_prompt(&session_id).await;
+                        return Err(e);
+                    }
+
+                    return Ok(());
                 }
 
                 let messages = build_prompt_messages_with_compression(
@@ -1775,6 +1854,10 @@ fn send_message(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     }
 }
 
+fn trace_openrouter_refresh(line: &str) {
+    crate::openrouter_auth::append_refresh_log(line);
+}
+
 /// Send a user_message_chunk session update to the client (used when replaying history).
 fn send_user_message(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
@@ -2090,6 +2173,13 @@ fn parse_slash_command(prompt_text: &str) -> Option<(String, String)> {
     Some((head.to_ascii_lowercase(), tail.to_string()))
 }
 
+/// Only plain prompts should auto-title the session. Any slash command,
+/// including skill activations, is an operational turn rather than a
+/// good title seed and should leave the placeholder title alone.
+fn should_auto_rename_session_from_prompt(prompt_text: &str) -> bool {
+    parse_slash_command(prompt_text).is_none()
+}
+
 /// Build the `<available_skills>` tier-1 disclosure block for the system
 /// prompt. Returns `None` when the registry is empty so the caller can
 /// skip the injection entirely (per the spec's "When no skills are
@@ -2193,6 +2283,8 @@ async fn handle_codex_login(
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
 ) -> String {
     let arg = prompt_text
         .trim()
@@ -2250,7 +2342,19 @@ async fn handle_codex_login(
                 // credentials. Refresh the cached catalog so the picker
                 // stops offering Codex models.
                 llm.uninstall_codex();
-                spawn_throttled_refresh(refresh_lock.clone(), llm.clone(), sessions.clone());
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    cx.zip(session_id).map(|(cx, session_id)| {
+                        (
+                            cx.clone(),
+                            session_id.to_string(),
+                            "Refreshing model catalog after Codex disconnect...",
+                        )
+                    }),
+                    None,
+                );
                 "Codex credentials cleared and the in-memory backend was unloaded; \
                  the picker will only show local models until you re-run `/setup codex`."
                     .to_string()
@@ -2280,10 +2384,18 @@ async fn handle_codex_login(
                         // same throttle as `session/new` so an
                         // immediate session creation right after login
                         // doesn't race a second probe.
-                        spawn_throttled_refresh(
+                        spawn_background_refresh(
                             refresh_lock.clone(),
                             llm.clone(),
                             sessions.clone(),
+                            cx.zip(session_id).map(|(cx, session_id)| {
+                                (
+                                    cx.clone(),
+                                    session_id.to_string(),
+                                    "Refreshing model catalog after Codex login...",
+                                )
+                            }),
+                            None,
                         );
                         format!(
                             "Codex login complete (account_id: {acct}). \
@@ -2354,6 +2466,8 @@ async fn handle_openrouter_login(
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
 ) -> String {
     if crate::openrouter_auth::CredentialState::snapshot().env_owns() {
         return openrouter_env_owned_explanation();
@@ -2421,7 +2535,19 @@ async fn handle_openrouter_login(
         "disconnect" => match crate::openrouter_auth::logout() {
             Ok(()) => {
                 llm.uninstall_openrouter();
-                spawn_throttled_refresh(refresh_lock.clone(), llm.clone(), sessions.clone());
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    cx.zip(session_id).map(|(cx, session_id)| {
+                        (
+                            cx.clone(),
+                            session_id.to_string(),
+                            "Refreshing model catalog after OpenRouter disconnect...",
+                        )
+                    }),
+                    None,
+                );
                 "OpenRouter credentials cleared and the in-memory backend was unloaded; \
                  the picker will only show models from other configured backends until \
                  you re-run `/setup openrouter key <key>`."
@@ -2444,10 +2570,18 @@ async fn handle_openrouter_login(
                 Ok(()) => match crate::openrouter_backend_from_key(&key) {
                     Some(backend) => {
                         llm.install_openrouter(backend);
-                        spawn_throttled_refresh(
+                        spawn_background_refresh(
                             refresh_lock.clone(),
                             llm.clone(),
                             sessions.clone(),
+                            cx.zip(session_id).map(|(cx, session_id)| {
+                                (
+                                    cx.clone(),
+                                    session_id.to_string(),
+                                    "Refreshing model catalog after OpenRouter login...",
+                                )
+                            }),
+                            None,
                         );
                         let path = crate::openrouter_auth::auth_path()
                             .map(|p| p.display().to_string())
@@ -2889,9 +3023,15 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             } else {
                 format!("/codex-login {rest}")
             };
-            let mut out =
-                handle_codex_login(&codex_prompt, ctx.llm, ctx.login_sessions, ctx.refresh_lock)
-                    .await;
+            let mut out = handle_codex_login(
+                &codex_prompt,
+                ctx.llm,
+                ctx.login_sessions,
+                ctx.refresh_lock,
+                Some(ctx.cx),
+                Some(session_id),
+            )
+            .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
             out
         }
@@ -2970,6 +3110,16 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
     }
 }
 
+fn is_streamed_setup_openrouter_refresh(prompt_text: &str) -> bool {
+    if !is_slash_command(prompt_text, "setup") {
+        return false;
+    }
+    let trimmed = slash_command_args(prompt_text);
+    let (action, rest) = split_setup_action(&trimmed);
+    action.eq_ignore_ascii_case("openrouter")
+        && matches!(rest.to_ascii_lowercase().as_str(), "refresh" | "try-again")
+}
+
 async fn render_current_setup(sessions: &SessionStore, session_id: &str) -> String {
     let fallback_cwd = std::env::current_dir().unwrap_or_default();
     let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
@@ -2986,6 +3136,13 @@ async fn refresh_model_catalog_now(
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<Vec<ModelMetadata>, String> {
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh("OpenRouter refresh requested.");
+        send_message(cx, session_id, "OpenRouter refresh requested.\n");
+        trace_openrouter_refresh("Waiting for model refresh lock...");
+        send_message(cx, session_id, "Waiting for model refresh lock...\n");
+    }
+
     let _guard = tokio::time::timeout(MODEL_REFRESH_LOCK_WAIT, refresh_lock.lock())
         .await
         .map_err(|_| {
@@ -2993,31 +3150,71 @@ async fn refresh_model_catalog_now(
                 .to_string()
         })?;
 
-    let progress = cx.zip(session_id).map(|(cx, session_id)| {
-        send_message(cx, session_id, "Refreshing model catalog...\n");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let cx = cx.clone();
-        let session_id = session_id.to_string();
-        let relay = tokio::spawn(async move {
-            while let Some(chunk) = rx.recv().await {
-                send_message(&cx, &session_id, &chunk);
-            }
-        });
-        (tx, relay)
-    });
-
-    let models = llm
-        .list_model_metadata_with_progress(progress.as_ref().map(|(tx, _)| tx.clone()))
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-    if let Some((tx, relay)) = progress {
-        drop(tx);
-        let _ = relay.await;
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh("Refresh lock acquired.");
+        send_message(cx, session_id, "Refresh lock acquired.\n");
     }
+
+    refresh_model_catalog_after_lock(cx, session_id, llm, sessions).await
+}
+
+async fn refresh_model_catalog_after_lock(
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
+    llm: &Arc<MultiBackend>,
+    sessions: &SessionStore,
+) -> Result<Vec<ModelMetadata>, String> {
+    let models = if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh("Refreshing model catalog...");
+        send_message(cx, session_id, "Refreshing model catalog...\n");
+        trace_openrouter_refresh("Preparing provider discovery...");
+        send_message(cx, session_id, "Preparing provider discovery...\n");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let list_future = llm.list_model_metadata_with_progress(Some(tx));
+        tokio::pin!(list_future);
+
+        let models = loop {
+            tokio::select! {
+                maybe_chunk = rx.recv() => {
+                    if let Some(chunk) = maybe_chunk {
+                        trace_openrouter_refresh(chunk.trim_end());
+                        send_message(cx, session_id, &chunk);
+                    }
+                }
+                result = &mut list_future => {
+                    break result.map_err(|e| format!("{e:#}"))?;
+                }
+            }
+        };
+
+        while let Ok(chunk) = rx.try_recv() {
+            trace_openrouter_refresh(chunk.trim_end());
+            send_message(cx, session_id, &chunk);
+        }
+        models
+    } else {
+        llm.list_model_metadata_with_progress(None)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+    };
     if let Some(model) = preferred_model(&models) {
         sessions.set_default_model(model).await;
     }
     sessions.set_available_models(models.clone()).await;
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh(&format!(
+            "Catalog refresh complete: {} model(s) total.",
+            models.len()
+        ));
+        send_message(
+            cx,
+            session_id,
+            &format!(
+                "Catalog refresh complete: {} model(s) total.\n",
+                models.len()
+            ),
+        );
+    }
     Ok(models)
 }
 
@@ -3161,7 +3358,15 @@ async fn handle_setup_openrouter(
             );
         }
     };
-    let mut out = handle_openrouter_login(&prompt, llm, sessions, refresh_lock).await;
+    let mut out = handle_openrouter_login(
+        &prompt,
+        llm,
+        sessions,
+        refresh_lock,
+        Some(cx),
+        Some(session_id),
+    )
+    .await;
     out.push_str("\n\nRun `/setup choose` after OpenRouter is connected.");
     out
 }
@@ -5098,10 +5303,17 @@ mod tests {
         ));
         let refresh = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
-        let bare = handle_openrouter_login("/openrouter-login", &llm, &store, &refresh).await;
-        let with_key =
-            handle_openrouter_login("/openrouter-login sk-or-rotated", &llm, &store, &refresh)
-                .await;
+        let bare =
+            handle_openrouter_login("/openrouter-login", &llm, &store, &refresh, None, None).await;
+        let with_key = handle_openrouter_login(
+            "/openrouter-login sk-or-rotated",
+            &llm,
+            &store,
+            &refresh,
+            None,
+            None,
+        )
+        .await;
 
         for (label, msg) in [("bare", bare), ("with key", with_key)] {
             assert!(
@@ -5192,6 +5404,22 @@ mod tests {
         assert_eq!(parse_slash_command("hello"), None);
         assert_eq!(parse_slash_command("/"), None);
         assert_eq!(parse_slash_command(""), None);
+    }
+
+    #[test]
+    fn slash_commands_do_not_auto_rename_sessions() {
+        assert!(should_auto_rename_session_from_prompt(
+            "Investigate session names"
+        ));
+        assert!(should_auto_rename_session_from_prompt(
+            "  Explain the diff  "
+        ));
+        assert!(!should_auto_rename_session_from_prompt(
+            "/setup openrouter refresh"
+        ));
+        assert!(!should_auto_rename_session_from_prompt(
+            "  /my-skill with args  "
+        ));
     }
 
     /// Build a `SessionStore` with one session for the apply/render tests

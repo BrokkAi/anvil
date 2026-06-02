@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    OpenAiClient, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
@@ -141,13 +141,16 @@ impl CodexClient {
             ver = env!("CARGO_PKG_VERSION"),
             os = std::env::consts::OS,
         );
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .cookie_store(true)
-            .user_agent(user_agent)
-            .build()
-            .expect("failed to build HTTP client");
+        let http = OpenAiClient::apply_runtime_tls_workarounds(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600))
+                .cookie_store(true)
+                .user_agent(user_agent),
+            CHATGPT_RESPONSES_URL,
+        )
+        .build()
+        .expect("failed to build HTTP client");
         Self {
             http,
             refresh_lock: Arc::new(Mutex::new(())),

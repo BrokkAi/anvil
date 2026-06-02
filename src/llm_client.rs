@@ -40,6 +40,7 @@ pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
 /// `/models` discovery should fail fast. Chat requests can legitimately
 /// run for minutes; setup refreshes should not inherit that wall-clock.
 const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
+const MODEL_DISCOVERY_TASK_TIMEOUT_SECS: u64 = 20;
 
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
@@ -788,6 +789,58 @@ impl std::fmt::Debug for OpenAiClient {
 }
 
 impl OpenAiClient {
+    #[cfg(target_os = "android")]
+    pub fn apply_runtime_tls_workarounds(
+        mut builder: reqwest::ClientBuilder,
+        target: &str,
+    ) -> reqwest::ClientBuilder {
+        if target.starts_with("https://") {
+            let native = rustls_native_certs::load_native_certs();
+            tracing::info!(
+                target,
+                certs = native.certs.len(),
+                errors = native.errors.len(),
+                "using native certs with tls_certs_only() for Android HTTPS client"
+            );
+            if target.contains("openrouter.ai") {
+                crate::openrouter_auth::append_refresh_log(&format!(
+                    "Android HTTPS workaround for {target}: {} cert(s), {} error(s)",
+                    native.certs.len(),
+                    native.errors.len()
+                ));
+            }
+            let certs = native
+                .certs
+                .into_iter()
+                .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
+                    Ok(cert) => Some(cert),
+                    Err(e) => {
+                        tracing::warn!(
+                            target,
+                            "skipping native cert during reqwest conversion: {e}"
+                        );
+                        if target.contains("openrouter.ai") {
+                            crate::openrouter_auth::append_refresh_log(&format!(
+                                "OpenRouter native cert conversion skipped one cert: {e}"
+                            ));
+                        }
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            builder = builder.tls_certs_only(certs);
+        }
+        builder
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn apply_runtime_tls_workarounds(
+        builder: reqwest::ClientBuilder,
+        _target: &str,
+    ) -> reqwest::ClientBuilder {
+        builder
+    }
+
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
         Self::with_default_headers(base_url, api_key, reqwest::header::HeaderMap::new())
     }
@@ -802,14 +855,26 @@ impl OpenAiClient {
         api_key: Option<String>,
         default_headers: reqwest::header::HeaderMap,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .default_headers(default_headers)
-            .build()
-            .expect("failed to build HTTP client");
         let base_url = base_url.trim_end_matches('/').to_string();
+        let openrouter_mode = base_url.contains("openrouter.ai");
         let supports_native_structured_output = supports_native_structured_output(&base_url);
+        let mut builder = Self::apply_runtime_tls_workarounds(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600))
+                .default_headers(default_headers),
+            &base_url,
+        );
+        if openrouter_mode {
+            crate::openrouter_auth::append_refresh_log(
+                "Configuring OpenRouter reqwest client: native certs + tls_certs_only + http1_only + connection_verbose + no idle pool",
+            );
+            builder = builder
+                .http1_only()
+                .connection_verbose(true)
+                .pool_max_idle_per_host(0);
+        }
+        let http = builder.build().expect("failed to build HTTP client");
         Self {
             base_url,
             api_key,
@@ -865,22 +930,99 @@ impl LlmBackend for OpenAiClient {
 impl OpenAiClient {
     async fn fetch_models_response(&self) -> Result<ModelsResponse> {
         let url = self.api_url("/models");
-        let mut req = self
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS));
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
+        let trace_openrouter = self.base_url.contains("openrouter.ai");
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: building GET {url}"
+            ));
         }
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let url_for_task = url.clone();
+        let trace_for_task = trace_openrouter;
+        let mut send_task = tokio::spawn(async move {
+            let mut req = http
+                .get(&url_for_task)
+                .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS));
+            if let Some(key) = &api_key {
+                req = req.bearer_auth(key);
+            }
+            if trace_for_task {
+                crate::openrouter_auth::append_refresh_log(
+                    "OpenRouter fetch_models_response: calling req.send()",
+                );
+            }
+            req.send()
+                .await
+                .with_context(|| format!("GET {url_for_task}"))
+        });
+        let resp = tokio::select! {
+            joined = &mut send_task => {
+                match joined {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        if trace_openrouter {
+                            crate::openrouter_auth::append_refresh_log(&format!(
+                                "OpenRouter fetch_models_response: send task join error: {e}"
+                            ));
+                        }
+                        anyhow::bail!("OpenRouter /models send task failed: {e}");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(MODEL_DISCOVERY_TASK_TIMEOUT_SECS)) => {
+                if trace_openrouter {
+                    crate::openrouter_auth::append_refresh_log(
+                        "OpenRouter fetch_models_response: send task timed out; aborting task",
+                    );
+                }
+                send_task.abort();
+                anyhow::bail!(
+                    "GET {url} timed out after {}s waiting for req.send task",
+                    MODEL_DISCOVERY_TASK_TIMEOUT_SECS
+                );
+            }
+        };
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: req.send() returned",
+            );
+        }
         let status = resp.status();
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: HTTP {status}"
+            ));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            if trace_openrouter {
+                crate::openrouter_auth::append_refresh_log(&format!(
+                    "OpenRouter fetch_models_response: error body length {}",
+                    body.len()
+                ));
+            }
             tracing::warn!("model discovery failed (HTTP {status}): {body}");
             anyhow::bail!("model discovery failed (HTTP {status})");
         }
 
-        resp.json().await.context("failed to parse models response")
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: parsing JSON body",
+            );
+        }
+        let parsed: ModelsResponse = resp
+            .json()
+            .await
+            .context("failed to parse models response")?;
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: parsed {} model entries",
+                parsed.data.len()
+            ));
+        }
+        Ok(parsed)
     }
 
     async fn list_models_impl(&self) -> Result<Vec<String>> {
@@ -889,7 +1031,17 @@ impl OpenAiClient {
     }
 
     async fn list_model_metadata_impl(&self) -> Result<Vec<ModelMetadata>> {
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter list_model_metadata_impl: start",
+            );
+        }
         let models = self.fetch_models_response().await?;
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter list_model_metadata_impl: fetched models response",
+            );
+        }
         if !self.supports_reasoning_effort {
             return Ok(models
                 .data
@@ -902,11 +1054,18 @@ impl OpenAiClient {
                 })
                 .collect());
         }
-        Ok(models
+        let metadata = models
             .data
             .into_iter()
             .map(|model| model.to_model_metadata())
-            .collect())
+            .collect::<Vec<_>>();
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter list_model_metadata_impl: built {} metadata entries",
+                metadata.len()
+            ));
+        }
+        Ok(metadata)
     }
 
     async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {

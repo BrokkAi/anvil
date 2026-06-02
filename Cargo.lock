@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil"
-version = "0.10.2"
+version = "0.10.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -421,6 +421,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "reqwest 0.13.3",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serde_yaml",
