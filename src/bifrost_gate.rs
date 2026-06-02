@@ -2981,6 +2981,60 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
         }
         ShellSearchStream::FileContents | ShellSearchStream::None => {}
     }
+    if route_prefix(&output.reason) == Some(RoutePrefix::UseBuiltin)
+        && output.builtin_preserves_intent
+    {
+        if let Some(tool) = strong_shell_source_symbol_search(command) {
+            output.decision = ShellClassifierDecision::UseBifrostTool;
+            output.intent = if tool == RecommendedTool::ScanUsages {
+                ShellIntent::SymbolReferenceLookup
+            } else {
+                ShellIntent::SymbolDefinitionLookup
+            };
+            output.recommended_tool = tool;
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "USE_BIFROST_TOOL because `{}` is broad source-content symbol search and no concrete shell semantic is required.",
+                truncate_to(command, 160)
+            );
+            output.allow_exception = ShellAllowException::None;
+            output.replacement_class = ShellReplacementClass::UseBifrostSymbol;
+            output.bifrost_fit = BifrostFit::SameOrMoreDirect;
+            output.builtin_preserves_intent = false;
+            output.confidence = GateConfidence::High;
+            return;
+        }
+        if shell_builtin_route_preserves_intent(command) {
+            output.decision = ShellClassifierDecision::UseBuiltinTool;
+            output.recommended_tool = builtin_tool_for_shell_command(command);
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "USE_BUILTIN_TOOL because `{}` is file/search/list inspection and no concrete shell semantic is required.",
+                truncate_to(command, 160)
+            );
+            output.allow_exception = ShellAllowException::None;
+            output.replacement_class = ShellReplacementClass::UseBuiltinInspection;
+            output.bifrost_fit = BifrostFit::NotApplicable;
+            output.confidence = GateConfidence::High;
+            return;
+        }
+        if output.decision == ShellClassifierDecision::UseBifrostTool {
+            output.decision = ShellClassifierDecision::AllowShell;
+            output.recommended_tool = RecommendedTool::None;
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "ALLOW_SHELL because `{}` is not source-symbol search, and no available builtin preserves the shell command's artifact/probe semantics.",
+                truncate_to(command, 160)
+            );
+            output.intent = ShellIntent::PipelineTransformationOrExitBehavior;
+            output.allow_exception = ShellAllowException::GeneratedArtifactOrExitBehavior;
+            output.replacement_class = ShellReplacementClass::AllowShellUncertain;
+            output.bifrost_fit = BifrostFit::NotApplicable;
+            output.builtin_preserves_intent = false;
+            output.confidence = GateConfidence::High;
+            return;
+        }
+    }
     if output.decision == ShellClassifierDecision::UseBifrostTool
         && shell_search_pattern(command).is_some_and(|pattern| {
             shell_source_search_builtin_exception(
@@ -4127,6 +4181,10 @@ fn command_name(command: &str) -> String {
 }
 
 fn build_test_git_package_like(command: &str) -> bool {
+    let raw_lower = command.trim_start().to_ascii_lowercase();
+    if env_probe_like(&raw_lower) {
+        return true;
+    }
     let normalized = strip_shell_wrappers(command);
     let trimmed = normalized.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -4840,7 +4898,7 @@ fn ambiguous_source_shell_search(command: &str) -> bool {
 }
 
 const SOURCE_EXTENSIONS: &[&str] = &[
-    ".c", ".h", ".cc", ".cpp", ".hpp", ".go", ".java", ".cs", ".php", ".scala", ".rs",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".go", ".java", ".cs", ".php", ".scala", ".rs", ".py",
 ];
 
 fn builtin_tool_for_shell_command(command: &str) -> RecommendedTool {
@@ -7514,6 +7572,88 @@ mod tests {
 
         assert_eq!(output.decision, ShellClassifierDecision::AllowShell);
         assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn shell_python_source_file_inspection_routes_to_read_file() {
+        let command = "python3 - <<'PY'\nfrom pathlib import Path\np = Path('tests/python/test_clang.py')\ntext = p.read_text()\nfor name in ['test_syntax_error', 'test_too_many_args']:\n    idx = text.find(f'def {name}')\n    print(text[idx:])\nPY";
+        assert!(script_exact_file_text_inspection(command));
+        assert!(matches!(
+            static_shell_route(&json!({"command": command})),
+            Some(ShellStaticRoute::UseBuiltin(
+                "static_shell_exact_file_inspection",
+                RecommendedTool::ReadFile
+            ))
+        ));
+    }
+
+    #[test]
+    fn shell_builtin_reason_overrides_contradictory_bifrost_action() {
+        let command = "python3 - <<'PY'\nimport pathlib\np = pathlib.Path('src/python/bcc/table.py')\nfor i, line in enumerate(p.read_text().splitlines(), 1):\n    if 1148 <= i <= 1205:\n        print(f'{i}: {line}')\nPY";
+        let mut output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because the pending call reads a bounded range of a single file.".to_string(),
+            intent: ShellIntent::OrdinaryFileRead,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: ShellAllowException::None,
+            replacement_class: ShellReplacementClass::UseBifrostSymbol,
+            decision: ShellClassifierDecision::UseBifrostTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": command}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::UseBuiltinTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::ReadFile);
+    }
+
+    #[test]
+    fn shell_builtin_reason_does_not_route_archive_reads_to_bifrost() {
+        let command = "python - <<'PY'\nimport zipfile\nz=zipfile.ZipFile('.brokk/sessions/session.zip')\nfor n in z.namelist():\n    print(n)\n    print(z.read(n).decode())\nPY";
+        let mut output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because this command only reads a session zip archive.".to_string(),
+            intent: ShellIntent::OrdinaryFileRead,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: ShellAllowException::None,
+            replacement_class: ShellReplacementClass::UseBifrostSymbol,
+            decision: ShellClassifierDecision::UseBifrostTool,
+            recommended_tool: RecommendedTool::ScanUsages,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": command}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::AllowShell);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn shell_command_v_probe_with_or_true_stays_shell() {
+        assert!(shell_semantics_required("command -v phpunit || true"));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "command -v phpunit || true"})),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
     }
 
     #[test]
