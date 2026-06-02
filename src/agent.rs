@@ -3059,27 +3059,34 @@ async fn refresh_model_catalog_now(
                 .to_string()
         })?;
 
-    let progress = cx.zip(session_id).map(|(cx, session_id)| {
+    let models = if let Some((cx, session_id)) = cx.zip(session_id) {
         send_message(cx, session_id, "Refreshing model catalog...\n");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let cx = cx.clone();
-        let session_id = session_id.to_string();
-        let relay = tokio::spawn(async move {
-            while let Some(chunk) = rx.recv().await {
-                send_message(&cx, &session_id, &chunk);
-            }
-        });
-        (tx, relay)
-    });
+        let list_future = llm.list_model_metadata_with_progress(Some(tx));
+        tokio::pin!(list_future);
 
-    let models = llm
-        .list_model_metadata_with_progress(progress.as_ref().map(|(tx, _)| tx.clone()))
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-    if let Some((tx, relay)) = progress {
-        drop(tx);
-        let _ = relay.await;
-    }
+        let models = loop {
+            tokio::select! {
+                maybe_chunk = rx.recv() => {
+                    if let Some(chunk) = maybe_chunk {
+                        send_message(cx, session_id, &chunk);
+                    }
+                }
+                result = &mut list_future => {
+                    break result.map_err(|e| format!("{e:#}"))?;
+                }
+            }
+        };
+
+        while let Ok(chunk) = rx.try_recv() {
+            send_message(cx, session_id, &chunk);
+        }
+        models
+    } else {
+        llm.list_model_metadata_with_progress(None)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+    };
     if let Some(model) = preferred_model(&models) {
         sessions.set_default_model(model).await;
     }
