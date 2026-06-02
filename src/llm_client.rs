@@ -789,6 +789,58 @@ impl std::fmt::Debug for OpenAiClient {
 }
 
 impl OpenAiClient {
+    #[cfg(target_os = "android")]
+    pub fn apply_runtime_tls_workarounds(
+        mut builder: reqwest::ClientBuilder,
+        target: &str,
+    ) -> reqwest::ClientBuilder {
+        if target.starts_with("https://") {
+            let native = rustls_native_certs::load_native_certs();
+            tracing::info!(
+                target,
+                certs = native.certs.len(),
+                errors = native.errors.len(),
+                "using native certs with tls_certs_only() for Android HTTPS client"
+            );
+            if target.contains("openrouter.ai") {
+                crate::openrouter_auth::append_refresh_log(&format!(
+                    "Android HTTPS workaround for {target}: {} cert(s), {} error(s)",
+                    native.certs.len(),
+                    native.errors.len()
+                ));
+            }
+            let certs = native
+                .certs
+                .into_iter()
+                .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
+                    Ok(cert) => Some(cert),
+                    Err(e) => {
+                        tracing::warn!(
+                            target,
+                            "skipping native cert during reqwest conversion: {e}"
+                        );
+                        if target.contains("openrouter.ai") {
+                            crate::openrouter_auth::append_refresh_log(&format!(
+                                "OpenRouter native cert conversion skipped one cert: {e}"
+                            ));
+                        }
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            builder = builder.tls_certs_only(certs);
+        }
+        builder
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn apply_runtime_tls_workarounds(
+        builder: reqwest::ClientBuilder,
+        _target: &str,
+    ) -> reqwest::ClientBuilder {
+        builder
+    }
+
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
         Self::with_default_headers(base_url, api_key, reqwest::header::HeaderMap::new())
     }
@@ -805,36 +857,19 @@ impl OpenAiClient {
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let openrouter_mode = base_url.contains("openrouter.ai");
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .default_headers(default_headers);
         let supports_native_structured_output = supports_native_structured_output(&base_url);
+        let mut builder = Self::apply_runtime_tls_workarounds(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600))
+                .default_headers(default_headers),
+            &base_url,
+        );
         if openrouter_mode {
             crate::openrouter_auth::append_refresh_log(
                 "Configuring OpenRouter reqwest client: native certs + tls_certs_only + http1_only + connection_verbose + no idle pool",
             );
-            let native = rustls_native_certs::load_native_certs();
-            let cert_count = native.certs.len();
-            let error_count = native.errors.len();
-            crate::openrouter_auth::append_refresh_log(&format!(
-                "OpenRouter native cert load: {cert_count} cert(s), {error_count} error(s)"
-            ));
-            let certs = native
-                .certs
-                .into_iter()
-                .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
-                    Ok(cert) => Some(cert),
-                    Err(e) => {
-                        crate::openrouter_auth::append_refresh_log(&format!(
-                            "OpenRouter native cert conversion skipped one cert: {e}"
-                        ));
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
             builder = builder
-                .tls_certs_only(certs)
                 .http1_only()
                 .connection_verbose(true)
                 .pool_max_idle_per_host(0);
