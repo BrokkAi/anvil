@@ -21,7 +21,7 @@ use agent_client_protocol::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
-use crate::llm_client::{ChatContentPart, ChatMessage, LlmBackend, ModelMetadata};
+use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
@@ -640,31 +640,48 @@ fn spawn_throttled_refresh(
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     llm: Arc<MultiBackend>,
     sessions: SessionStore,
+    transcript: Option<(ConnectionTo<Client>, String, &'static str)>,
+    initial_delay: Option<Duration>,
 ) {
-    if let Ok(guard) = refresh_lock.try_lock_owned() {
-        tokio::spawn(async move {
-            // Hold the guard for the duration of the refresh so the
-            // next try_lock observes "in flight". Drop is implicit at
-            // the end of the spawned future.
-            let _refresh_guard = guard;
-            match llm.list_model_metadata().await {
-                Ok(models) => {
-                    tracing::debug!(
-                        count = models.len(),
-                        "background model-catalog refresh complete"
-                    );
-                    sessions.set_available_models(models).await;
-                }
-                Err(e) => {
-                    tracing::debug!("background model-catalog refresh failed: {e:#}");
-                }
+    tokio::spawn(async move {
+        if let Some(delay) = initial_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        let Ok(guard) = refresh_lock.try_lock_owned() else {
+            tracing::trace!(
+                "skipping background model-catalog refresh: another refresh is already in flight"
+            );
+            return;
+        };
+
+        // Hold the guard for the duration of the refresh so the next
+        // try_lock observes "in flight". Drop is implicit at the end
+        // of the spawned future.
+        let _refresh_guard = guard;
+        if let Some((cx, session_id, intro)) = &transcript {
+            trace_openrouter_refresh(intro.trim_end());
+            send_message(cx, session_id, &format!("{intro}\n"));
+        }
+
+        let result = match &transcript {
+            Some((cx, session_id, _)) => {
+                refresh_model_catalog_after_lock(Some(cx), Some(session_id), &llm, &sessions).await
             }
-        });
-    } else {
-        tracing::trace!(
-            "skipping background model-catalog refresh: another refresh is already in flight"
-        );
-    }
+            None => refresh_model_catalog_after_lock(None, None, &llm, &sessions).await,
+        };
+
+        if let Err(e) = result {
+            tracing::debug!("background model-catalog refresh failed: {e}");
+            if let Some((cx, session_id, _)) = &transcript {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!("Model catalog refresh failed: {e}\n"),
+                );
+            }
+        }
+    });
 }
 
 fn spawn_delayed_setup_notice(
@@ -843,7 +860,7 @@ pub async fn run_agent(
                 tracing::info!("ACP initialize");
 
                 // Try to discover models at startup and cache them for session/new.
-                let models = match llm_init.list_model_metadata().await {
+                let models = match llm_init.list_model_metadata_with_progress(None).await {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!("model discovery failed during init: {e}");
@@ -884,22 +901,29 @@ pub async fn run_agent(
                 tracing::info!("ACP session/new, cwd={}", cwd.display());
                 let session = sessions_new.create_session(cwd).await;
 
-                // Re-discover in the background so the next `session/new` picks up
-                // models the user added/removed since startup (e.g. they ran
-                // `ollama pull` or signed into Codex). The current session/new
-                // returns immediately with the cached list -- the refresh seeds
-                // the cache for the next call so we don't pay the discovery RTT
-                // here on the synchronous path.
-                spawn_throttled_refresh(
-                    refresh_lock_new.clone(),
-                    llm_new.clone(),
-                    sessions_new.clone(),
-                );
-
                 // Use the cached catalog populated at init; fall back to a
                 // single-entry catalog from the session's own model so the
                 // dropdown still renders something on a fresh discovery miss.
                 let mut catalog = sessions_new.available_model_metadata().await;
+                let should_stream_refresh = catalog.is_empty() || session.model.is_empty();
+                // Re-discover in the background so the next `session/new` picks up
+                // models the user added/removed since startup (e.g. they ran
+                // `ollama pull` or signed into Codex). When this session starts
+                // without a usable cached catalog, stream the same progress into
+                // its transcript after the client finishes registering the id.
+                spawn_throttled_refresh(
+                    refresh_lock_new.clone(),
+                    llm_new.clone(),
+                    sessions_new.clone(),
+                    should_stream_refresh.then(|| {
+                        (
+                            cx.clone(),
+                            session.id.clone(),
+                            "Checking model providers for this session...",
+                        )
+                    }),
+                    should_stream_refresh.then_some(Duration::from_millis(150)),
+                );
                 if catalog.is_empty() && !session.model.is_empty() {
                     catalog = vec![ModelMetadata::id_only(&session.model)];
                 }
@@ -2263,6 +2287,8 @@ async fn handle_codex_login(
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
 ) -> String {
     let arg = prompt_text
         .trim()
@@ -2320,7 +2346,19 @@ async fn handle_codex_login(
                 // credentials. Refresh the cached catalog so the picker
                 // stops offering Codex models.
                 llm.uninstall_codex();
-                spawn_throttled_refresh(refresh_lock.clone(), llm.clone(), sessions.clone());
+                spawn_throttled_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    cx.zip(session_id).map(|(cx, session_id)| {
+                        (
+                            cx.clone(),
+                            session_id.to_string(),
+                            "Refreshing model catalog after Codex disconnect...",
+                        )
+                    }),
+                    None,
+                );
                 "Codex credentials cleared and the in-memory backend was unloaded; \
                  the picker will only show local models until you re-run `/setup codex`."
                     .to_string()
@@ -2354,6 +2392,14 @@ async fn handle_codex_login(
                             refresh_lock.clone(),
                             llm.clone(),
                             sessions.clone(),
+                            cx.zip(session_id).map(|(cx, session_id)| {
+                                (
+                                    cx.clone(),
+                                    session_id.to_string(),
+                                    "Refreshing model catalog after Codex login...",
+                                )
+                            }),
+                            None,
                         );
                         format!(
                             "Codex login complete (account_id: {acct}). \
@@ -2424,6 +2470,8 @@ async fn handle_openrouter_login(
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
 ) -> String {
     if crate::openrouter_auth::CredentialState::snapshot().env_owns() {
         return openrouter_env_owned_explanation();
@@ -2491,7 +2539,19 @@ async fn handle_openrouter_login(
         "disconnect" => match crate::openrouter_auth::logout() {
             Ok(()) => {
                 llm.uninstall_openrouter();
-                spawn_throttled_refresh(refresh_lock.clone(), llm.clone(), sessions.clone());
+                spawn_throttled_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    cx.zip(session_id).map(|(cx, session_id)| {
+                        (
+                            cx.clone(),
+                            session_id.to_string(),
+                            "Refreshing model catalog after OpenRouter disconnect...",
+                        )
+                    }),
+                    None,
+                );
                 "OpenRouter credentials cleared and the in-memory backend was unloaded; \
                  the picker will only show models from other configured backends until \
                  you re-run `/setup openrouter key <key>`."
@@ -2518,6 +2578,14 @@ async fn handle_openrouter_login(
                             refresh_lock.clone(),
                             llm.clone(),
                             sessions.clone(),
+                            cx.zip(session_id).map(|(cx, session_id)| {
+                                (
+                                    cx.clone(),
+                                    session_id.to_string(),
+                                    "Refreshing model catalog after OpenRouter login...",
+                                )
+                            }),
+                            None,
                         );
                         let path = crate::openrouter_auth::auth_path()
                             .map(|p| p.display().to_string())
@@ -2959,9 +3027,15 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             } else {
                 format!("/codex-login {rest}")
             };
-            let mut out =
-                handle_codex_login(&codex_prompt, ctx.llm, ctx.login_sessions, ctx.refresh_lock)
-                    .await;
+            let mut out = handle_codex_login(
+                &codex_prompt,
+                ctx.llm,
+                ctx.login_sessions,
+                ctx.refresh_lock,
+                Some(ctx.cx),
+                Some(session_id),
+            )
+            .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
             out
         }
@@ -3080,9 +3154,21 @@ async fn refresh_model_catalog_now(
                 .to_string()
         })?;
 
-    let models = if let Some((cx, session_id)) = cx.zip(session_id) {
+    if let Some((cx, session_id)) = cx.zip(session_id) {
         trace_openrouter_refresh("Refresh lock acquired.");
         send_message(cx, session_id, "Refresh lock acquired.\n");
+    }
+
+    refresh_model_catalog_after_lock(cx, session_id, llm, sessions).await
+}
+
+async fn refresh_model_catalog_after_lock(
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
+    llm: &Arc<MultiBackend>,
+    sessions: &SessionStore,
+) -> Result<Vec<ModelMetadata>, String> {
+    let models = if let Some((cx, session_id)) = cx.zip(session_id) {
         trace_openrouter_refresh("Refreshing model catalog...");
         send_message(cx, session_id, "Refreshing model catalog...\n");
         trace_openrouter_refresh("Preparing provider discovery...");
@@ -3276,7 +3362,15 @@ async fn handle_setup_openrouter(
             );
         }
     };
-    let mut out = handle_openrouter_login(&prompt, llm, sessions, refresh_lock).await;
+    let mut out = handle_openrouter_login(
+        &prompt,
+        llm,
+        sessions,
+        refresh_lock,
+        Some(cx),
+        Some(session_id),
+    )
+    .await;
     out.push_str("\n\nRun `/setup choose` after OpenRouter is connected.");
     out
 }
@@ -5158,10 +5252,17 @@ mod tests {
         ));
         let refresh = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
-        let bare = handle_openrouter_login("/openrouter-login", &llm, &store, &refresh).await;
-        let with_key =
-            handle_openrouter_login("/openrouter-login sk-or-rotated", &llm, &store, &refresh)
-                .await;
+        let bare =
+            handle_openrouter_login("/openrouter-login", &llm, &store, &refresh, None, None).await;
+        let with_key = handle_openrouter_login(
+            "/openrouter-login sk-or-rotated",
+            &llm,
+            &store,
+            &refresh,
+            None,
+            None,
+        )
+        .await;
 
         for (label, msg) in [("bare", bare), ("with key", with_key)] {
             assert!(
