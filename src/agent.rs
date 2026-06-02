@@ -4483,6 +4483,7 @@ mod tests {
             StructuredOutputResult::Success(crate::structured_output::StructuredOutputSuccess {
                 schema_name: "audit_result".into(),
                 validated_output: serde_json::json!({"answer":"ok"}),
+                coercion_requested: false,
             });
         let meta = prompt_response_meta(Some(&result)).expect("meta present");
         assert_eq!(
@@ -4492,6 +4493,60 @@ mod tests {
         assert_eq!(
             meta["anvil"]["structuredOutput"]["validated_output"]["answer"],
             "ok"
+        );
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["coercion_requested"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn prompt_response_meta_includes_structured_output_coerced_success() {
+        let result = StructuredOutputResult::CoercedSuccess(
+            crate::structured_output::StructuredOutputCoercedSuccess {
+                schema_name: "audit_result".into(),
+                validated_output: serde_json::json!({"answer":"one\ntwo"}),
+                coercions: vec!["response.answer array -> string".into()],
+                coercion_requested: true,
+            },
+        );
+        let meta = prompt_response_meta(Some(&result)).expect("meta present");
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["status"],
+            serde_json::Value::String("coerced_success".into())
+        );
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["validated_output"]["answer"],
+            "one\ntwo"
+        );
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["coercions"][0],
+            "response.answer array -> string"
+        );
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["coercion_requested"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn prompt_response_meta_includes_structured_output_validation_error_coercion_flag() {
+        let result = StructuredOutputResult::ValidationError(
+            crate::structured_output::StructuredOutputValidationError {
+                schema_name: "audit_result".into(),
+                errors: vec![],
+                invalid_excerpt: "{\"answer\":null}".into(),
+                coercion_requested: true,
+            },
+        );
+        let meta = prompt_response_meta(Some(&result)).expect("meta present");
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["status"],
+            serde_json::Value::String("validation_error".into())
+        );
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["coercion_requested"],
+            serde_json::Value::Bool(true)
         );
     }
 

@@ -1606,6 +1606,7 @@ mod tests {
                 "properties": {"answer": {"type": "string"}},
                 "required": ["answer"]
             }),
+            allow_coercion: false,
         });
         let body = ChatCompletionRequest {
             model: "gpt-4.1".into(),

@@ -1359,6 +1359,7 @@ mod tests {
                 "properties": {"answer": {"type": "string"}},
                 "required": ["answer"]
             }),
+            allow_coercion: false,
         };
         let req = build_responses_request(
             "gpt-5",
