@@ -4156,10 +4156,14 @@ fn build_test_git_package_like(command: &str) -> bool {
         "vendor/bin/phpcs",
         "php -l",
         "python -m py_compile",
+        "python3 -m py_compile",
         "python -m pytest",
+        "python3 -m pytest",
         "uv run pytest",
         "uv run python -m py_compile",
+        "uv run python3 -m py_compile",
         "uv run python -m pytest",
+        "uv run python3 -m pytest",
         "dotnet build",
         "dotnet test",
         "dotnet --info",
@@ -8264,6 +8268,12 @@ mod tests {
         assert!(matches!(
             static_shell_route(
                 &json!({"command": "python -m py_compile openhands/cli/tui.py tests/unit/test_cli_tui.py"})
+            ),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(
+                &json!({"command": "python3 -m py_compile src/python/bcc/__init__.py"})
             ),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
