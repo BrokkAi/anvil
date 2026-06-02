@@ -3261,11 +3261,16 @@ async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &
             ),
             None => return "Error: unknown session.".to_string(),
         };
+        let wasm_line = if crate::sandbox_backend::wasm_sandbox_compiled() {
+            "- `/setup sandbox wasm`   - wasm parsing, no OS sandbox for shell commands."
+        } else {
+            "- `/setup sandbox wasm`   - unavailable in this build."
+        };
         return format!(
             "Sandbox is currently `{state}`{suffix}.\n\n\
              - `/setup sandbox default` - use the process default.\n\
              - `/setup sandbox os`     - OS sandbox + native parsing.\n\
-             - `/setup sandbox wasm`   - wasm parsing, no OS sandbox for shell commands.\n\
+             {wasm_line}\n\
              - `/setup sandbox off`    - no sandbox at all.\n\
              - `/setup sandbox status` - report current mode."
         );
@@ -5356,13 +5361,19 @@ mod tests {
         assert!(status.contains("`off`"), "got: {status}");
         assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
 
-        // `wasm` sets sandbox mode to Wasm.
+        // `wasm` either sets sandbox mode or reports that the build was
+        // compiled without wasm support.
         let wasm = handle_setup_sandbox(&store, &id, "wasm").await;
-        assert!(
-            wasm.contains("set to `wasm`") || wasm.contains("WASM sandbox"),
-            "got: {wasm}"
-        );
-        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
+        if crate::sandbox_backend::wasm_sandbox_compiled() {
+            assert!(
+                wasm.contains("set to `wasm`") || wasm.contains("WASM sandbox"),
+                "got: {wasm}"
+            );
+            assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
+        } else {
+            assert!(wasm.contains("not compiled into this build"), "got: {wasm}");
+            assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
+        }
 
         // Unknown choice is rejected and leaves state untouched.
         let bad = handle_setup_sandbox(&store, &id, "maybe").await;
@@ -5370,7 +5381,14 @@ mod tests {
             bad.contains("Unknown choice") || bad.contains("Unknown sandbox choice"),
             "got: {bad}"
         );
-        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Wasm)));
+        assert_eq!(
+            store.sandbox_mode(&id).await,
+            Some(Some(if crate::sandbox_backend::wasm_sandbox_compiled() {
+                SandboxMode::Wasm
+            } else {
+                SandboxMode::Off
+            }))
+        );
 
         // Unknown session id is surfaced rather than silently noop'd.
         let missing = handle_setup_sandbox(&store, "no-such", "off").await;

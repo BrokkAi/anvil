@@ -76,6 +76,13 @@ rustup target add wasm32-wasip2
 cargo build --bin anvil
 ```
 
+That default build includes the embedded `wasm-sandbox` feature. For targets
+where the nested `wasm32-wasip2` sandbox build is undesirable, use:
+
+```bash
+cargo build --no-default-features --bin anvil
+```
+
 Run it directly if you want to see the stdio server start:
 
 ```bash
@@ -305,6 +312,9 @@ Sandbox selection:
 - If no OS sandbox is available, Anvil defaults to `wasm`: shell commands are
   not OS-sandboxed, but parser/search/archive work goes through the WASM
   sandbox.
+- If the binary was built without the default `wasm-sandbox` feature, `wasm`
+  mode is unavailable and Anvil falls back to native parsing when no OS
+  sandbox exists.
 - `--no-wasm-sandbox` disables the WASM fallback and forces native parsing.
 
 You can override the effective mode per session:
@@ -414,6 +424,10 @@ First-time prerequisite:
 rustup target add wasm32-wasip2
 ```
 
+This prerequisite applies to the default build, which enables the
+`wasm-sandbox` feature and embeds `brokk-acp-sandbox.wasm`. Builds that opt out
+with `--no-default-features` skip the nested `wasm32-wasip2` compile entirely.
+
 Then run the usual checks:
 
 ```bash
@@ -436,5 +450,6 @@ Asset names:
 
 - `brokk-anvil-vX.Y.Z-x86_64-unknown-linux-gnu.zip`
 - `brokk-anvil-vX.Y.Z-aarch64-unknown-linux-gnu.zip`
+- `brokk-anvil-vX.Y.Z-aarch64-linux-android.zip`
 - `brokk-anvil-vX.Y.Z-x86_64-pc-windows-msvc.zip`
 - `brokk-anvil-vX.Y.Z-universal-apple-darwin.zip`

@@ -1,5 +1,6 @@
-//! Compiles `brokk-acp-sandbox` to `wasm32-wasip2` and exposes the
-//! resulting artifact path via the `BROKK_ACP_SANDBOX_WASM` env var so
+//! When the default `wasm-sandbox` feature is enabled, compiles
+//! `brokk-acp-sandbox` to `wasm32-wasip2` and exposes the resulting
+//! artifact path via the `BROKK_ACP_SANDBOX_WASM` env var so
 //! `src/sandbox_backend.rs` can `include_bytes!` it.
 //!
 //! Why a build script rather than a checked-in `.wasm`:
@@ -38,6 +39,11 @@ const WASM_TARGET: &str = "wasm32-wasip2";
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WASM_SANDBOX");
+
+    if env::var_os("CARGO_FEATURE_WASM_SANDBOX").is_none() {
+        return;
+    }
 
     let sandbox_manifest = find_dependency_manifest(SANDBOX_CRATE);
     if let Some(parent) = sandbox_manifest.parent() {

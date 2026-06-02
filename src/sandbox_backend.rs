@@ -32,14 +32,25 @@
 //! transparently fall back to the native parser on sandbox failure --
 //! that would defeat the point of having a sandbox at all.
 
+#[cfg(feature = "wasm-sandbox")]
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
+#[cfg(feature = "wasm-sandbox")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::anyhow;
+#[cfg(feature = "wasm-sandbox")]
+use anyhow::{Context, Result};
 use brokk_acp_sandbox::ParsedFrontmatter;
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(feature = "wasm-sandbox"))]
+const WASM_SANDBOX_DISABLED_ERR: &str = "wasm sandbox support was not compiled into this build; rebuild with default features or `--features wasm-sandbox`";
+
+pub fn wasm_sandbox_compiled() -> bool {
+    cfg!(feature = "wasm-sandbox")
+}
 
 // ---------------------------------------------------------------------------
 // SandboxMode — per-session override that controls BOTH shell sandboxing
@@ -103,7 +114,7 @@ pub fn default_mode() -> SandboxMode {
 /// same process to disagree about whether the sandbox is enabled,
 /// and (c) avoiding the global would touch dozens of constructors.
 static GLOBAL: OnceLock<SandboxBackend> = OnceLock::new();
-static SESSION_WASM: OnceLock<Result<Arc<WasmSandbox>, String>> = OnceLock::new();
+static SESSION_WASM: OnceLock<std::result::Result<Arc<WasmSandbox>, String>> = OnceLock::new();
 
 /// Install the process-wide backend. Called once from `main` before
 /// any session is created. Subsequent calls are a no-op (the first
@@ -172,6 +183,13 @@ impl SandboxBackend {
     /// Falls back to `OsNative` with a warning if wasm initialization fails.
     pub fn detect(os_available: bool, wasm_disabled: bool) -> Self {
         if wasm_disabled || os_available {
+            Self::OsNative
+        } else if !wasm_sandbox_compiled() {
+            tracing::warn!(
+                "wasm sandbox support was not compiled into this build; falling back to native parsers \
+                 (lose memory/crash/CPU isolation). Rebuild with default features or `--features wasm-sandbox` \
+                 to re-enable it."
+            );
             Self::OsNative
         } else {
             match WasmSandbox::new() {
@@ -463,17 +481,20 @@ fn read_file_bounded_native(
 /// `cargo build --target wasm32-wasip2` on the `brokk-acp-sandbox`
 /// crate. Embedded so the host binary is self-contained -- no extra
 /// file to install, no version skew between binary and wasm.
+#[cfg(feature = "wasm-sandbox")]
 const SANDBOX_WASM: &[u8] = include_bytes!(env!("BROKK_ACP_SANDBOX_WASM"));
 
 /// Fuel budget per single parse request. Cranelift's "fuel" is roughly
 /// "wasm instructions" -- 50M is generous for a YAML parse on a
 /// reasonably sized SKILL.md (<10KB) but small enough to cap a
 /// billion-laughs YAML bomb in milliseconds.
+#[cfg(feature = "wasm-sandbox")]
 const FUEL_PER_REQUEST: u64 = 50_000_000;
 
 /// Memory cap in bytes for the sandboxed module. Generous enough to
 /// hold a SKILL.md plus parser intermediates, snug enough that an
 /// expansion attack fails fast.
+#[cfg(feature = "wasm-sandbox")]
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Wasmtime-backed sandbox. Holds a precompiled component and serves
@@ -481,12 +502,14 @@ const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// each parse boots a fresh wasm store so memory state cannot leak
 /// across requests. Boot cost is amortized by `Module::serialize`
 /// caching in wasmtime's on-disk cache.
+#[cfg(feature = "wasm-sandbox")]
 pub struct WasmSandbox {
     engine: wasmtime::Engine,
     component: wasmtime::component::Component,
     next_id: Mutex<u64>,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 impl WasmSandbox {
     fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
@@ -957,10 +980,76 @@ impl WasmSandbox {
     }
 }
 
+#[cfg(not(feature = "wasm-sandbox"))]
+pub struct WasmSandbox;
+
+#[cfg(not(feature = "wasm-sandbox"))]
+impl WasmSandbox {
+    fn new() -> anyhow::Result<Self> {
+        Err(anyhow!(WASM_SANDBOX_DISABLED_ERR))
+    }
+
+    fn read_file_bounded(
+        &self,
+        _path: &std::path::Path,
+        _max_bytes: u64,
+    ) -> std::io::Result<Option<String>> {
+        Err(std::io::Error::other(WASM_SANDBOX_DISABLED_ERR))
+    }
+
+    fn search_file_contents(
+        &self,
+        _root: &std::path::Path,
+        _pattern: &str,
+        _glob: Option<&str>,
+        _max_results: u64,
+        _max_file_bytes: u64,
+        _max_total_bytes: u64,
+    ) -> std::result::Result<brokk_acp_sandbox::SearchOutcome, brokk_acp_sandbox::SearchError> {
+        Err(brokk_acp_sandbox::SearchError::Walk(
+            WASM_SANDBOX_DISABLED_ERR.to_string(),
+        ))
+    }
+
+    fn list_zip_entry_names(
+        &self,
+        _zip_path: &std::path::Path,
+        _max_archive_bytes: u64,
+    ) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other(WASM_SANDBOX_DISABLED_ERR))
+    }
+
+    fn read_zip_entries_with_prefix(
+        &self,
+        _zip_path: &std::path::Path,
+        _prefix: &str,
+        _max_archive_bytes: u64,
+        _max_entry_bytes: u64,
+        _max_total_bytes: u64,
+    ) -> std::io::Result<std::collections::HashMap<String, String>> {
+        Err(std::io::Error::other(WASM_SANDBOX_DISABLED_ERR))
+    }
+
+    fn read_zip_entry_text(
+        &self,
+        _zip_path: &std::path::Path,
+        _entry_name: &str,
+        _max_archive_bytes: u64,
+        _max_entry_bytes: u64,
+    ) -> std::io::Result<Option<String>> {
+        Err(std::io::Error::other(WASM_SANDBOX_DISABLED_ERR))
+    }
+
+    fn parse_skill_frontmatter(&self, _yaml: &str) -> anyhow::Result<ParsedFrontmatter> {
+        Err(anyhow!(WASM_SANDBOX_DISABLED_ERR))
+    }
+}
+
 /// Execute a single wasmtime round-trip on the current thread, returning
 /// the raw response line. Must be called from a thread that has no
 /// current tokio `Handle` (see `round_trip`'s caller for the scoped
 /// thread that establishes this invariant).
+#[cfg(feature = "wasm-sandbox")]
 fn run_wasm_round_trip(
     engine: &wasmtime::Engine,
     component: &wasmtime::component::Component,
@@ -1072,6 +1161,7 @@ fn run_wasm_round_trip(
 // Wire format -- mirrors `brokk-acp-sandbox/src/bin/sandbox.rs`
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 #[serde(tag = "method", content = "params", rename_all = "camelCase")]
 enum SandboxRequestKind {
@@ -1083,11 +1173,13 @@ enum SandboxRequestKind {
     SearchFileContents(SearchFileContentsParams),
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct ParseSkillFrontmatterParams {
     yaml: String,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct ReadFileBoundedParams {
     // Field names stay snake_case to match the guest deserializer in
@@ -1098,6 +1190,7 @@ struct ReadFileBoundedParams {
     max_bytes: u64,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct ReadZipEntryTextParams {
     guest_path: String,
@@ -1106,6 +1199,7 @@ struct ReadZipEntryTextParams {
     max_entry_bytes: u64,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct ReadZipEntriesWithPrefixParams {
     guest_path: String,
@@ -1115,17 +1209,20 @@ struct ReadZipEntriesWithPrefixParams {
     max_total_bytes: u64,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct ListZipEntryNamesParams {
     guest_path: String,
     max_archive_bytes: u64,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Deserialize)]
 struct NamesResult {
     names: Vec<String>,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct SearchFileContentsParams {
     guest_root: String,
@@ -1136,11 +1233,13 @@ struct SearchFileContentsParams {
     max_total_bytes: u64,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Deserialize)]
 struct ReadEntriesResult {
     entries: std::collections::HashMap<String, String>,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Deserialize)]
 struct ReadFileResult {
     content: String,
@@ -1149,6 +1248,7 @@ struct ReadFileResult {
 /// Newtype wrapper so we can carry the request id alongside the
 /// tagged enum body (serde's adjacently-tagged enum encoding does not
 /// mix with extra sibling fields cleanly).
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Serialize)]
 struct SandboxRequest {
     id: u64,
@@ -1156,6 +1256,7 @@ struct SandboxRequest {
     kind: SandboxRequestKind,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Deserialize)]
 struct SandboxResponse<T> {
     id: u64,
@@ -1163,6 +1264,7 @@ struct SandboxResponse<T> {
     body: SandboxBody<T>,
 }
 
+#[cfg(feature = "wasm-sandbox")]
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SandboxBody<T> {
@@ -1194,12 +1296,22 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "wasm-sandbox"))]
+    #[test]
+    fn backend_for_mode_wasm_is_rejected_when_feature_is_disabled() {
+        match backend_for_mode(Some(SandboxMode::Wasm)) {
+            Ok(_) => panic!("wasm mode should be unavailable without the feature"),
+            Err(err) => assert!(err.contains("not compiled into this build"), "got: {err}"),
+        }
+    }
+
     /// End-to-end smoke test: the wasm sandbox boots, parses a valid
     /// SKILL.md frontmatter through the JSON-RPC wire, and returns
     /// the expected `ParsedFrontmatter` to the host. This is the
     /// canonical test that the build pipeline (build.rs producing
     /// `.wasm`, host embedding via `include_bytes!`, wasmtime hosting
     /// the component) all line up.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_backend_parses_valid_frontmatter() {
         let sandbox = WasmSandbox::new().expect("wasm sandbox should initialize");
@@ -1217,6 +1329,7 @@ mod tests {
     /// Malformed YAML should come back as a structured error from the
     /// sandbox, not a host-side panic. This is the failure mode the
     /// wasm path exists to absorb safely.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_backend_reports_yaml_parse_error() {
         let sandbox = WasmSandbox::new().expect("wasm sandbox should initialize");
@@ -1237,6 +1350,7 @@ mod tests {
     /// if the wasm guest evolves and the JSON shape drifts, this test
     /// flags the mismatch before the production parser disagrees with
     /// its sandbox shadow.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn native_and_wasm_agree_on_valid_frontmatter() {
         let yaml = "name: agree\ndescription: same parse on both backends\n";
@@ -1259,6 +1373,7 @@ mod tests {
 
     /// Happy path for the wasm-backed reader: host preopens the parent,
     /// guest reads the file, contents come back through stdout.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_read_file_bounded_returns_contents() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1279,6 +1394,7 @@ mod tests {
     /// guarantee for callers like `agents_md` that read user-controlled
     /// files in a project tree -- a 10 GB AGENTS.md must not OOM the
     /// agent. Use a tight cap so the fixture stays small.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_read_file_bounded_rejects_oversize() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1300,6 +1416,7 @@ mod tests {
 
     /// Missing file -> `Ok(None)` so callers can keep the "no file here,
     /// move on" code path that the native fallback uses.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_read_file_bounded_missing_returns_none() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1317,6 +1434,7 @@ mod tests {
     /// Parity between Native and Wasm on the same fixture, mirroring
     /// the frontmatter parity test. Pins the contract so a future
     /// guest change cannot silently disagree with the native fallback.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn native_and_wasm_agree_on_read_file_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1338,6 +1456,7 @@ mod tests {
     /// zip-entry primitive and the parity between the host's `zip` crate
     /// (used to build the fixture) and the sandbox's minimal parser
     /// (used to read it inside wasm).
+    #[cfg(feature = "wasm-sandbox")]
     fn build_session_fixture_zip(path: &std::path::Path, entries: &[(&str, &str)]) {
         let file = std::fs::File::create(path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
@@ -1350,6 +1469,7 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn native_and_wasm_agree_on_read_zip_entry_text() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1377,6 +1497,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_read_zip_entry_missing_returns_none() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1397,6 +1518,7 @@ mod tests {
     /// Happy path: a known fixture tree returns the same match set
     /// via both backends, pinning the contract that the sandbox does
     /// not silently drop or reorder hits.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn native_and_wasm_agree_on_search_file_contents() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1429,6 +1551,7 @@ mod tests {
     /// generic sandbox error. The host's `search_file_contents` tool
     /// converts that into a `RequestError` so the LLM gets a clear
     /// "fix the pattern" message rather than an opaque crash.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_search_file_contents_invalid_regex_is_surfaced() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1449,6 +1572,7 @@ mod tests {
     /// behaviour so a future engine swap that re-introduces
     /// backtracking will surface as a fuel-exhaustion failure here
     /// rather than as a wedged agent in production.
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_search_file_contents_redos_is_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1464,6 +1588,7 @@ mod tests {
         assert!(outcome.matches.is_empty());
     }
 
+    #[cfg(feature = "wasm-sandbox")]
     #[test]
     fn wasm_read_zip_entry_rejects_oversize_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1492,6 +1617,7 @@ mod tests {
     /// any sandbox call has to tolerate that ambient runtime. We
     /// isolate the wasmtime work on a scoped non-tokio thread; this
     /// test pins that invariant so the fix does not regress.
+    #[cfg(feature = "wasm-sandbox")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wasm_round_trip_survives_ambient_tokio_runtime() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1512,6 +1638,7 @@ mod tests {
     /// payload exceeds the host-supplied cap). Verifying this through
     /// a tokio runtime ensures both the runtime escape and the error
     /// propagation paths agree end-to-end.
+    #[cfg(feature = "wasm-sandbox")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wasm_round_trip_propagates_guest_errors_under_tokio() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -5,13 +5,13 @@ Guidance for AI agents working in this repository.
 ## Build & test
 
 ```bash
-cargo build --release          # compiles sandbox crate to wasm32-wasip2 + host binary
+cargo build --release          # default build: compiles sandbox crate to wasm32-wasip2 + host binary
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Prerequisite: `rustup target add wasm32-wasip2` (needed by `build.rs`).
+Prerequisite: `rustup target add wasm32-wasip2` (needed by `build.rs` when the default `wasm-sandbox` feature is enabled).
 
 On Linux, `bubblewrap` (`bwrap`) must be installed for `runShellCommand` OS-level sandboxing.
 

@@ -110,6 +110,72 @@ jobs:
             brokk-anvil-*.zip.sha256
           if-no-files-found: error
 
+  build-android-arm64:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: sdkmanager "ndk;29.0.13113456"
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build release binary
+        env:
+          # Android builds intentionally skip the default `wasm-sandbox`
+          # feature because the nested `wasm32-wasip2` sandbox build is
+          # not part of the supported Android release path.
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
+          CC_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CXX_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
+          AR_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build --release --locked --no-default-features --target aarch64-linux-android
+
+      - name: Package archive
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-anvil-${ref}-aarch64-linux-android"
+          mkdir "$name"
+          cp "target/aarch64-linux-android/release/anvil" "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-linux-android
+          path: |
+            brokk-anvil-*.zip
+            brokk-anvil-*.zip.sha256
+          if-no-files-found: error
+
   build-windows:
     name: Build x86_64-pc-windows-msvc
     runs-on: windows-latest
@@ -220,7 +286,7 @@ jobs:
   release:
     name: Create GitHub Release
     if: github.event_name == 'push'
-    needs: [build-linux, build-linux-arm64, build-windows, build-macos]
+    needs: [build-linux, build-linux-arm64, build-android-arm64, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

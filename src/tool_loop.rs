@@ -1306,6 +1306,9 @@ fn bifrost_classifier_skip_reason(
     _tool_exchanges: &[ToolExchange],
     skip_after_prior_gate: bool,
 ) -> Option<&'static str> {
+    if skip_after_prior_gate {
+        return Some("post_gate_tool_batch");
+    }
     if !encourage_bifrost_enabled() {
         return Some("bifrost_encouragement_disabled");
     }
@@ -1313,9 +1316,6 @@ fn bifrost_classifier_skip_reason(
         return shell_classifier_skip_reason(tool_name, tools, skip_after_prior_gate);
     } else if !is_text_navigation_tool(tool_name) {
         return Some("not_text_navigation_tool");
-    }
-    if skip_after_prior_gate {
-        return Some("post_gate_tool_batch");
     }
     if is_text_navigation_tool(tool_name)
         && should_skip_for_static_text_target(tool_name, parsed_input)
