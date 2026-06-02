@@ -40,6 +40,7 @@ pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
 /// `/models` discovery should fail fast. Chat requests can legitimately
 /// run for minutes; setup refreshes should not inherit that wall-clock.
 const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
+const MODEL_DISCOVERY_TASK_TIMEOUT_SECS: u64 = 20;
 
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
@@ -871,19 +872,54 @@ impl OpenAiClient {
                 "OpenRouter fetch_models_response: building GET {url}"
             ));
         }
-        let mut req = self
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS));
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-        if trace_openrouter {
-            crate::openrouter_auth::append_refresh_log(
-                "OpenRouter fetch_models_response: calling req.send()",
-            );
-        }
-        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let url_for_task = url.clone();
+        let trace_for_task = trace_openrouter;
+        let mut send_task = tokio::spawn(async move {
+            let mut req = http
+                .get(&url_for_task)
+                .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS));
+            if let Some(key) = &api_key {
+                req = req.bearer_auth(key);
+            }
+            if trace_for_task {
+                crate::openrouter_auth::append_refresh_log(
+                    "OpenRouter fetch_models_response: calling req.send()",
+                );
+            }
+            req.send()
+                .await
+                .with_context(|| format!("GET {url_for_task}"))
+        });
+        let resp = tokio::select! {
+            joined = &mut send_task => {
+                match joined {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        if trace_openrouter {
+                            crate::openrouter_auth::append_refresh_log(&format!(
+                                "OpenRouter fetch_models_response: send task join error: {e}"
+                            ));
+                        }
+                        anyhow::bail!("OpenRouter /models send task failed: {e}");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(MODEL_DISCOVERY_TASK_TIMEOUT_SECS)) => {
+                if trace_openrouter {
+                    crate::openrouter_auth::append_refresh_log(
+                        "OpenRouter fetch_models_response: send task timed out; aborting task",
+                    );
+                }
+                send_task.abort();
+                anyhow::bail!(
+                    "GET {url} timed out after {}s waiting for req.send task",
+                    MODEL_DISCOVERY_TASK_TIMEOUT_SECS
+                );
+            }
+        };
         if trace_openrouter {
             crate::openrouter_auth::append_refresh_log(
                 "OpenRouter fetch_models_response: req.send() returned",
