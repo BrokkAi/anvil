@@ -319,6 +319,89 @@ impl Default for BifrostPreservesMaterialConstraints {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RequestedRelationKind {
+    None,
+    ReferencesOrUsages,
+    CallSitesOrCallers,
+    Definitions,
+    ImplementationsOrOverrides,
+    ImportsOrDependencies,
+    MemberAccesses,
+    CallSitesWithArgumentFilter,
+    Unknown,
+}
+
+impl Default for RequestedRelationKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternRole {
+    LexicalTarget,
+    SymbolSelector,
+    SemanticScopeFilter,
+    PostFilterRequired,
+    Unknown,
+}
+
+impl Default for PatternRole {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceFormMateriality {
+    Required,
+    NotRequired,
+    Unclear,
+}
+
+impl Default for SurfaceFormMateriality {
+    fn default() -> Self {
+        Self::Unclear
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BifrostAnswerability {
+    Direct,
+    DirectWithSupportedFilter,
+    RequiresTextPostfilter,
+    NotSupported,
+    Unknown,
+}
+
+impl Default for BifrostAnswerability {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetBinding {
+    ProjectSymbol,
+    ExternalOrLibrarySymbol,
+    MacroOrPreprocessorToken,
+    StringOrTextToken,
+    Unresolved,
+    Unknown,
+}
+
+impl Default for TargetBinding {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BifrostCapabilityNeeded {
     References,
     CallSites,
@@ -509,6 +592,16 @@ pub struct RawGateClassifierOutput {
     pub material_constraints: Vec<MaterialConstraint>,
     #[serde(default)]
     pub bifrost_preserves_material_constraints: BifrostPreservesMaterialConstraints,
+    #[serde(default)]
+    pub requested_relation_kind: RequestedRelationKind,
+    #[serde(default)]
+    pub pattern_role: PatternRole,
+    #[serde(default)]
+    pub surface_form_materiality: SurfaceFormMateriality,
+    #[serde(default)]
+    pub bifrost_answerability: BifrostAnswerability,
+    #[serde(default)]
+    pub target_binding: TargetBinding,
     #[serde(default)]
     pub bifrost_capability_needed: Vec<BifrostCapabilityNeeded>,
     #[serde(default)]
@@ -746,15 +839,7 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     ) {
         return false;
     }
-    let source_relationship = matches!(
-        raw.object_of_search,
-        ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
-    );
-    let strong_source_relationship = source_relationship
-        && raw.exactness_role == ExactnessRole::SourceRelationshipFilter
-        && raw.bifrost_fit == BifrostFit::SameOrMoreDirect
-        && source_relationship_grounded(raw);
-    if strong_source_relationship && !has_hard_text_only_constraint(raw) {
+    if semantic_answerability_gate(raw) {
         return true;
     }
     if schema_consistent_text_allow(raw)
@@ -763,6 +848,10 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     {
         return false;
     }
+    let source_relationship = matches!(
+        raw.object_of_search,
+        ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
+    );
     if !source_relationship {
         return false;
     }
@@ -802,6 +891,62 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
             | TextScopeClass::MultiFileSourceScope
             | TextScopeClass::RepositoryWide
     ) {
+        return false;
+    }
+    raw.bifrost_fit == BifrostFit::SameOrMoreDirect
+}
+
+fn semantic_answerability_gate(raw: &RawGateClassifierOutput) -> bool {
+    if !matches!(
+        raw.confidence,
+        GateConfidence::High | GateConfidence::Medium
+    ) {
+        return false;
+    }
+    if raw.allow_exception != TextAllowException::None {
+        return false;
+    }
+    if raw.prior_bifrost_status == PriorBifrostStatus::ObservedEmpty
+        || raw.prior_bifrost_status == PriorBifrostStatus::ObservedError
+    {
+        return false;
+    }
+    if matches!(
+        raw.exactness_role,
+        ExactnessRole::TargetCharacters | ExactnessRole::PostEditVerification
+    ) || has_hard_text_only_constraint(raw)
+        || schema_consistent_text_allow(raw)
+    {
+        return false;
+    }
+    if !matches!(
+        raw.requested_relation_kind,
+        RequestedRelationKind::ReferencesOrUsages
+            | RequestedRelationKind::CallSitesOrCallers
+            | RequestedRelationKind::Definitions
+            | RequestedRelationKind::ImplementationsOrOverrides
+            | RequestedRelationKind::ImportsOrDependencies
+            | RequestedRelationKind::MemberAccesses
+            | RequestedRelationKind::CallSitesWithArgumentFilter
+    ) {
+        return false;
+    }
+    if !matches!(
+        raw.pattern_role,
+        PatternRole::SymbolSelector | PatternRole::SemanticScopeFilter
+    ) {
+        return false;
+    }
+    if raw.surface_form_materiality != SurfaceFormMateriality::NotRequired {
+        return false;
+    }
+    if !matches!(
+        raw.bifrost_answerability,
+        BifrostAnswerability::Direct | BifrostAnswerability::DirectWithSupportedFilter
+    ) {
+        return false;
+    }
+    if !source_relationship_grounded(raw) {
         return false;
     }
     raw.bifrost_fit == BifrostFit::SameOrMoreDirect
@@ -1304,7 +1449,7 @@ fn build_request_body_with_mode(
     let system = if json_only_retry {
         "Return only a valid JSON object matching the schema. No prose, markdown, hidden commentary, action field, or final decision field. Classify the pending read_file/grep_search call as policy facts from pending_call_features and compact_evidence. The system will compute the executable route from those facts."
     } else {
-        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final route from these facts. Do not include an action or decision field. The first field must be reason. Use pending_call_features and compact_evidence first, prose excerpts second. Always allow list_directory. For read_file, exact file/path/line/range inspection is allowed text; only broad redundant source reading after Bifrost found exact source is a possible symbol-navigation fact. For grep_search, first classify the object of search. Object = source_symbol_relationship when the pattern is being used to find source structure: declarations, definitions, implementations, references, callers/callees, method/function calls, member/static/qualified access, constructor calls, overrides, related tests, or a small set of known project symbols. Object = exact_text_or_regex when the requested characters themselves are the target: post-edit verification, typo/literal spelling checks, serialized/wire/schema/config/DB fields, emitted/log/UI/diagnostic text, fixtures/goldens/snapshots, docs, import/include/package lines, assertion text, or an external API name being checked as literal surface text. Set exactness_role=source_relationship_filter when regex syntax, alternation, punctuation, argument names, or source globs are only filters for finding source relationships; exactness can be verified after Bifrost. Set exactness_role=target_characters or post_edit_verification when the exact characters are the task target. Gate-worthy source relationships need grounding stronger than identifier_shape_only: explicit source-navigation intent, source syntax shape, same-token Bifrost hit, deterministic repair context, or prior exact source context. Bare identifiers are not enough by themselves. Do not use prior Bifrost skips, filters, refresh/protocol errors, or lack of same-token candidates as allow-text reasons when source-relationship shape or explicit source-navigation intent is present. Bifrost bugs are infrastructure issues, not targeted misses. If object_of_search=source_symbol_relationship, bifrost_fit=same_or_more_direct, source_relationship_grounding is strong, and exactness_role is source_relationship_filter or unknown, fill bifrost_candidate when possible; if uncertain about args, still set the policy facts correctly and use the most likely tool: search_symbols for declarations/definitions, scan_usages for calls/references/related tests, get_summaries for broad orientation, get_symbol_sources only when exact repo symbol names are already known. Keep reason concise. Output only JSON matching the schema."
+        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final route from these facts. Do not include an action or decision field. The first field must be reason. Use pending_call_features and compact_evidence first, prose excerpts second. Always allow list_directory. For read_file, exact file/path/line/range inspection is allowed text; only broad redundant source reading after Bifrost found exact source is a possible symbol-navigation fact. For grep_search, classify whether Bifrost can produce the same correct answer without preserving the grep pattern's raw text predicate. Do not classify a grep_search as Bifrost-answerable merely because it searches source code or mentions an API, method, macro, exception, annotation, attribute, assertion, or member-looking token. A search is semantic only when the trace asks for a resolved source relationship such as references, usages, callers, call sites, definitions, implementations, overrides, imports, or member accesses, and a Bifrost tool can answer that relation directly. Set surface_form_materiality=required when exact spelling, regex punctuation, escaped characters, alternation, argument layout, assertion syntax, macro spelling, or raw code shape is part of correctness. Set pattern_role=lexical_target for exact character occurrence searches; set pattern_role=post_filter_required when Bifrost could find a broader semantic set but the grep pattern imposes a textual predicate Bifrost cannot natively express. Set pattern_role=symbol_selector only when the pattern merely names the symbol/relation target and semantically equivalent references should count even if their raw text does not match. Set bifrost_answerability=direct or direct_with_supported_filter only when the recommended Bifrost tool can answer the requested relation without text post-filtering. Object = source_symbol_relationship only for actual semantic source structure, not every token in source text. Gate-worthy source relationships need grounding stronger than identifier_shape_only. Bare identifiers are not enough by themselves. Bifrost bugs are infrastructure issues, not targeted misses. If semantic answerability is direct, surface_form_materiality is not_required, and pattern_role is symbol_selector or semantic_scope_filter, fill bifrost_candidate when possible; if uncertain about args, use the most likely tool: search_symbols for declarations/definitions, scan_usages for calls/references/related tests, get_summaries for broad orientation, get_symbol_sources only when exact repo symbol names are already known. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -1338,6 +1483,11 @@ fn build_request_body_with_mode(
           "text_allow_reason": {{"type":"string","enum":["none","post_edit_verification","exact_literal_surface","artifact_or_output_text","external_api_surface_text","import_include_package_text","insufficient_symbol_grounding","unknown"]}},
           "material_constraints": {{"type":"array","items":{{"type":"string","enum":["exact_argument","qualifier","assignment_operator","event_subscription","generic_signature","same_entity_intersection","macro_preprocessor","class_name_regex","alternation_semantics","co_occurrence","bounded_test_regex","build_config_text","external_api_name","schema_wire_field","post_edit_verification"]}}}},
           "bifrost_preserves_material_constraints": {{"type":"string","enum":["full","lossy_superset","no","unknown"]}},
+          "requested_relation_kind": {{"type":"string","enum":["none","references_or_usages","call_sites_or_callers","definitions","implementations_or_overrides","imports_or_dependencies","member_accesses","call_sites_with_argument_filter","unknown"]}},
+          "pattern_role": {{"type":"string","enum":["lexical_target","symbol_selector","semantic_scope_filter","post_filter_required","unknown"]}},
+          "surface_form_materiality": {{"type":"string","enum":["required","not_required","unclear"]}},
+          "bifrost_answerability": {{"type":"string","enum":["direct","direct_with_supported_filter","requires_text_postfilter","not_supported","unknown"]}},
+          "target_binding": {{"type":"string","enum":["project_symbol","external_or_library_symbol","macro_or_preprocessor_token","string_or_text_token","unresolved","unknown"]}},
           "bifrost_capability_needed": {{"type":"array","items":{{"type":"string","enum":["references","call_sites","write_references","call_arg_filter","macro_definitions","prototypes","external_api_references","related_tests"]}}}},
           "prior_bifrost_status": {{"type":"string","enum":["not_attempted","observed_hit","observed_empty","observed_error","skipped_by_classifier","unavailable","unknown"]}},
           "fallback_exception": {{"type":"string","enum":["none","non_source_text","exact_literal_or_regex","external_api_or_annotation_text","compound_idiom_regex","localized_or_sequential_read","whole_file_or_top_of_file_orientation","test_header_macro_or_entrypoint_context","post_edit_or_build_or_test_verification","same_token_or_path_bifrost_miss","uncertain"]}},
@@ -1369,7 +1519,7 @@ fn build_request_body_with_mode(
           "suggested_args": {{"type":"object"}},
           "confidence": {{"type":"string","enum":["low","medium","high"]}}
         }},
-        "required": ["reason","intent","pattern_class","scope_class","bifrost_fit","object_of_search","relationship_kind","source_relationship_grounding","exactness_role","text_allow_reason","material_constraints","bifrost_preserves_material_constraints","bifrost_capability_needed","prior_bifrost_status","fallback_exception","evidence","bifrost_candidate","suggested_args","confidence"]
+        "required": ["reason","intent","pattern_class","scope_class","bifrost_fit","object_of_search","relationship_kind","source_relationship_grounding","exactness_role","text_allow_reason","material_constraints","bifrost_preserves_material_constraints","requested_relation_kind","pattern_role","surface_form_materiality","bifrost_answerability","target_binding","bifrost_capability_needed","prior_bifrost_status","fallback_exception","evidence","bifrost_candidate","suggested_args","confidence"]
       }}
     }}
   }},
