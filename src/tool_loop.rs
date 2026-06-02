@@ -22,6 +22,7 @@ use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
+use crate::structured_output::StructuredOutputRequest;
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 use crate::trace_logging::append_trace_record;
@@ -392,6 +393,7 @@ pub(crate) async fn run(
     registry: &ToolRegistry,
     model: &str,
     reasoning_effort: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
     mut messages: Vec<ChatMessage>,
     max_turns: usize,
     idle_timeout: Duration,
@@ -497,6 +499,7 @@ pub(crate) async fn run(
                 messages: messages.clone(),
                 tools: request_tools,
                 reasoning_effort: reasoning_effort.map(str::to_string),
+                structured_output: structured_output.cloned(),
                 on_token,
                 on_thought: on_thought_cb,
                 cancel: cancel.clone(),
@@ -770,6 +773,7 @@ pub(crate) async fn run(
                                     registry,
                                     model,
                                     reasoning_effort,
+                                    structured_output,
                                     &parsed_input,
                                     max_turns,
                                     idle_timeout,
@@ -1591,6 +1595,7 @@ async fn execute_subagent(
     registry: &ToolRegistry,
     model: &str,
     reasoning_effort: Option<&str>,
+    _structured_output: Option<&StructuredOutputRequest>,
     args: &Value,
     max_turns: usize,
     idle_timeout: Duration,
@@ -1689,6 +1694,7 @@ async fn execute_subagent(
         registry,
         model,
         reasoning_effort,
+        None,
         messages,
         nested_max_turns,
         idle_timeout,

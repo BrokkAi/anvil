@@ -27,6 +27,10 @@ use crate::session::{
     ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
     SessionSnapshot, SessionStore,
 };
+use crate::structured_output::{
+    StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
+    parse_structured_output_request, validate_response,
+};
 
 /// Stable ids for our `SessionConfigOption` selectors. We expose both
 /// dropdowns via configOptions because the ACP spec says clients SHOULD
@@ -45,6 +49,18 @@ const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
 const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
+
+fn parse_prompt_structured_output_request(
+    req: &PromptRequest,
+) -> Result<Option<StructuredOutputRequest>, String> {
+    parse_structured_output_request(req.meta.as_ref()).map_err(|err| err.to_string())
+}
+
+fn prompt_response_meta(
+    result: Option<&StructuredOutputResult>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    build_structured_output_meta(result)
+}
 
 /// Available session modes exposed to ACP clients.
 fn available_modes() -> Vec<AcpSessionMode> {
@@ -1089,6 +1105,20 @@ pub async fn run_agent(
                     send_message(&cx, &session_id, "Error: empty prompt");
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
+                let structured_output_request = match parse_prompt_structured_output_request(&req) {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(
+                                serde_json::json!({
+                                    "reason": format!(
+                                        "invalid structured output request metadata: {reason}"
+                                    ),
+                                }),
+                            ),
+                        );
+                    }
+                };
 
                 // Get session state (prompt doesn't carry cwd, so use current dir as fallback).
                 // The snapshot clones the conversation history exactly once under the
@@ -1396,6 +1426,7 @@ pub async fn run_agent(
                         &registry,
                         &model_for_loop,
                         reasoning_effort_for_loop.as_deref(),
+                        structured_output_request.as_ref(),
                         messages,
                         max_turns,
                         idle_timeout_for_loop,
@@ -1439,6 +1470,9 @@ pub async fn run_agent(
                         .record_usage(&session_id_for_loop, turn_usage)
                         .await
                         .unwrap_or(turn_usage);
+                    let structured_output_result = structured_output_request
+                        .as_ref()
+                        .map(|request| validate_response(request, &response_text));
 
                     // Persist the conversation turn BEFORE finish_prompt so the
                     // per-session cancel token is held during the rewrite -- this
@@ -1457,6 +1491,7 @@ pub async fn run_agent(
                                 user_prompt: prompt_text_for_turn,
                                 agent_response: response_text,
                                 tool_exchanges,
+                                structured_output: structured_output_result.clone(),
                                 summary: None,
                                 fragment_id: None,
                             },
@@ -1495,6 +1530,8 @@ pub async fn run_agent(
                     .cached_read_tokens(cumulative_usage.cached_read_tokens)
                     .cached_write_tokens(cumulative_usage.cached_write_tokens);
                     let response = PromptResponse::new(StopReason::EndTurn).usage(Some(acp_usage));
+                    let response =
+                        response.meta(prompt_response_meta(structured_output_result.as_ref()));
                     if let Err(e) = responder.respond(response) {
                         tracing::warn!(
                             session_id = %session_id_for_loop,
@@ -4440,6 +4477,29 @@ mod tests {
         assert_eq!(extract_prompt_text(&blocks), "before\nafter");
     }
 
+    #[test]
+    fn prompt_response_meta_includes_structured_output_success() {
+        let result =
+            StructuredOutputResult::Success(crate::structured_output::StructuredOutputSuccess {
+                schema_name: "audit_result".into(),
+                validated_output: serde_json::json!({"answer":"ok"}),
+            });
+        let meta = prompt_response_meta(Some(&result)).expect("meta present");
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["status"],
+            serde_json::Value::String("success".into())
+        );
+        assert_eq!(
+            meta["anvil"]["structuredOutput"]["validated_output"]["answer"],
+            "ok"
+        );
+    }
+
+    #[test]
+    fn prompt_response_meta_is_absent_without_structured_output() {
+        assert!(prompt_response_meta(None).is_none());
+    }
+
     /// All four behavior modes embed the cwd into the system prompt so
     /// the model can resolve relative paths, and each mode picks a
     /// distinct mode-specific paragraph.
@@ -4612,6 +4672,7 @@ mod tests {
                         result: "fn main() {}".into(),
                     },
                 ],
+                structured_output: None,
                 summary: None,
                 fragment_id: None,
             }],
@@ -4734,6 +4795,7 @@ mod tests {
                     arguments: r#"{"pattern":"x"}"#.into(),
                     result: "no matches".into(),
                 }],
+                structured_output: None,
                 summary: None,
                 fragment_id: None,
             }],

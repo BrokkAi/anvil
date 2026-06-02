@@ -130,6 +130,7 @@ impl BedrockClient {
             messages,
             tools,
             reasoning_effort: _,
+            structured_output: _,
             mut on_token,
             on_thought: _,
             cancel,
