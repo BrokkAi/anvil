@@ -1094,7 +1094,8 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         .unwrap_or("");
 
     let real_bifrost_miss =
-        recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges);
+        recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges)
+            && !very_strong_deterministic_symbol_navigation(pattern, glob, path, file_path);
     let lower_snake_text_probe = lower_snake_literal_token_count(pattern) >= 2
         && !identifier_tokens(pattern)
             .iter()
@@ -1705,7 +1706,8 @@ fn deterministic_source_symbol_repair_tool(
                 || recoverable_source_symbols(pattern).len() >= 3))
         || import_include_or_package_text_target(pattern)
         || assertion_or_serialization_text(pattern)
-        || recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges)
+        || (recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges)
+            && !very_strong_deterministic_symbol_navigation(pattern, glob, path, file_path))
     {
         return None;
     }
@@ -1754,6 +1756,17 @@ fn deterministic_source_symbol_repair_tool(
     }
     if broad_nav_scope && uppercase_constant_token_count(pattern) >= 2 {
         return Some((RecommendedTool::SearchSymbols, "constant symbol discovery"));
+    }
+    if broad_nav_scope
+        && symbols.len() == 1
+        && symbols
+            .iter()
+            .any(|symbol| overlaps_recent_bifrost_hit(symbol, &context.tool_exchanges))
+    {
+        return Some((
+            RecommendedTool::GetSymbolSources,
+            "known symbol source lookup",
+        ));
     }
     if broad_nav_scope
         && uppercase_constant_token_count(pattern) == 1
@@ -1970,15 +1983,7 @@ fn external_api_or_annotation_names(pattern: &str) -> bool {
     }
     let tokens = identifier_tokens(pattern);
     if tokens.len() == 1
-        && matches!(
-            tokens[0].as_str(),
-            "InternalsVisibleTo"
-                | "TestFixture"
-                | "TestCase"
-                | "SetUp"
-                | "TearDown"
-                | "PrivateObject"
-        )
+        && external_annotation_or_test_api_token(&tokens[0])
         && !symbol_call_or_member(pattern)
     {
         return true;
@@ -1998,6 +2003,16 @@ fn external_api_or_annotation_names(pattern: &str) -> bool {
                 || token.ends_with("IgnoreProperties")
         })
         && !symbol_call_or_member(pattern)
+}
+
+fn external_annotation_or_test_api_token(token: &str) -> bool {
+    token.ends_with("Attribute")
+        || token.ends_with("Annotation")
+        || token.ends_with("VisibleTo")
+        || (token.starts_with("Test")
+            && ["Case", "Fixture", "Method", "Source"]
+                .iter()
+                .any(|suffix| token.ends_with(suffix)))
 }
 
 fn compound_code_idiom_regex(pattern: &str) -> bool {
@@ -2191,8 +2206,6 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
     }
     if output.decision == ShellClassifierDecision::AllowShell
         && route_prefix(&output.reason) == Some(RoutePrefix::UseBuiltin)
-        && !output.shell_semantics_required
-        && output.builtin_preserves_intent
         && conservative_shell_read_search_inspection(command)
     {
         output.decision = ShellClassifierDecision::UseBuiltinTool;
@@ -3009,6 +3022,7 @@ fn shell_semantics_required(command: &str) -> bool {
         go_doc_like(segment)
             || build_test_git_package_like(segment)
             || environment_probe(segment)
+            || shell_parameter_expansion_probe(segment)
             || process_control_or_inspection(segment)
             || shell_conditional_probe_like(
                 &strip_harmless_shell_prefixes(segment).to_ascii_lowercase(),
@@ -3022,6 +3036,7 @@ fn shell_semantics_required(command: &str) -> bool {
     }) || script_raw_byte_or_format_probe(command)
         || script_mutates_files(command)
         || environment_probe(command)
+        || shell_parameter_expansion_probe(command)
         || command.contains("$(")
 }
 
@@ -3039,6 +3054,31 @@ fn environment_probe(command: &str) -> bool {
         lower.split_whitespace().next().unwrap_or(""),
         "env" | "printenv"
     )
+}
+
+fn shell_parameter_expansion_probe(command: &str) -> bool {
+    let stripped = strip_harmless_shell_prefixes(command);
+    let first = stripped.split_whitespace().next().unwrap_or("");
+    matches!(first, "echo" | "printf") && contains_shell_variable_expansion(&stripped)
+}
+
+fn contains_shell_variable_expansion(command: &str) -> bool {
+    if command.contains("${") || command.contains("$(") {
+        return true;
+    }
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+        if chars
+            .peek()
+            .is_some_and(|next| next.is_ascii_alphabetic() || *next == '_')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn same_path_recent_tool(path: &str, exchanges: &[ToolExchange], tools: &[&str]) -> bool {
@@ -3308,14 +3348,7 @@ fn env_probe_like(lower: &str) -> bool {
 
 fn echo_env_probe_like(lower: &str) -> bool {
     let trimmed = lower.trim();
-    trimmed.starts_with("echo ")
-        && (trimmed.contains("$home")
-            || trimmed.contains("$path")
-            || trimmed.contains("$tmp")
-            || trimmed.contains("$temp")
-            || trimmed.contains("$gopath")
-            || trimmed.contains("$goroot")
-            || trimmed.contains("$java_home"))
+    trimmed.starts_with("echo ") && contains_shell_variable_expansion(trimmed)
 }
 
 fn shell_conditional_probe_like(lower: &str) -> bool {
@@ -3705,21 +3738,32 @@ fn shell_search_has_exact_file_scope(command: &str) -> bool {
 }
 
 fn shell_search_targets_config_or_docs(lower_command: &str) -> bool {
-    [
-        "build.sbt",
-        "pom.xml",
-        "package.json",
-        "composer.json",
-        "readme",
-        ".md",
-        ".txt",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".toml",
-    ]
-    .iter()
-    .any(|needle| lower_command.contains(needle))
+    lower_command
+        .split_whitespace()
+        .map(clean_shell_path_token)
+        .any(|token| shell_path_token_targets_config_or_docs(&token))
+}
+
+fn clean_shell_path_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | ';' | '|' | ')' | '(' | ',' | ':' | '[' | ']'
+            )
+        })
+        .to_string()
+}
+
+fn shell_path_token_targets_config_or_docs(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let file_name = token.rsplit('/').next().unwrap_or(token);
+    file_name == "readme"
+        || file_name.starts_with("readme.")
+        || (file_name.starts_with('.') && file_name.ends_with("opts"))
+        || text_like_extension(file_name)
 }
 
 fn shell_symbol_search_like(command: &str) -> bool {
@@ -5606,6 +5650,68 @@ mod tests {
     }
 
     #[test]
+    fn shell_sbt_config_probe_does_not_repair_builtin_to_bifrost() {
+        let command = "sed -n '1,220p' .sbtopts 2>/dev/null || true; printf '\\n---\\n'; sed -n '1,220p' project/build.properties 2>/dev/null || true; printf '\\n---\\n'; grep -RIn 'CMSClassUnloadingEnabled' . 2>/dev/null | head -20";
+        assert!(shell_search_targets_config_or_docs(
+            &command.to_ascii_lowercase()
+        ));
+        assert_eq!(strong_shell_source_symbol_search(command), None);
+
+        let mut output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because this reads config files and greps an exact JVM flag."
+                .to_string(),
+            intent: ShellIntent::LiteralTextSearch,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: ShellAllowException::None,
+            replacement_class: ShellReplacementClass::UseBifrostSymbol,
+            decision: ShellClassifierDecision::UseBuiltinTool,
+            recommended_tool: RecommendedTool::GrepSearch,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": command}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::UseBuiltinTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::GrepSearch);
+
+        let mut contradictory_output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because this reads config files and greps an exact JVM flag."
+                .to_string(),
+            intent: ShellIntent::BuildTestGitPackageOrProjectCli,
+            shell_semantics_required: true,
+            builtin_preserves_intent: false,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: ShellAllowException::BuildTestGitPackageOrProjectCli,
+            replacement_class: ShellReplacementClass::AllowShellUncertain,
+            decision: ShellClassifierDecision::AllowShell,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+
+        enforce_shell_classifier_policy(&mut contradictory_output, &context);
+
+        assert_eq!(
+            contradictory_output.decision,
+            ShellClassifierDecision::UseBuiltinTool
+        );
+        assert_eq!(
+            contradictory_output.recommended_tool,
+            RecommendedTool::GrepSearch
+        );
+    }
+
+    #[test]
     fn shell_allow_with_builtin_policy_quorum_repairs_to_builtin() {
         let mut output = ShellClassifierOutput {
             reason:
@@ -6042,6 +6148,98 @@ mod tests {
     }
 
     #[test]
+    fn single_camel_symbol_with_recent_bifrost_hit_uses_get_symbol_sources() {
+        let mut output = GateClassifierOutput {
+            reason: "Bifrost can find references for this known symbol.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["ChildWindowStyle".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: true,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["ChildWindowStyle"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::ScanUsages,
+            suggested_args: json!({"symbols":["ChildWindowStyle"]}),
+            confidence: GateConfidence::High,
+        };
+        let mut prior = exchange("search_symbols");
+        prior.arguments = r#"{"patterns":["ChildWindowStyle"]}"#.to_string();
+        prior.result = "ChildWindowStyle found in source/Toolbox/Styles.xaml".to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "**/*",
+                "pattern": "ChildWindowStyle"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![prior],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::GetSymbolSources);
+    }
+
+    #[test]
+    fn broad_callsite_grep_ignores_prior_empty_bifrost_and_uses_scan_usages() {
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because Bifrost already returned empty.".to_string(),
+            intent: TextIntent::SymbolUsageLookup,
+            pattern_class: TextPatternClass::RegexText,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["rawField".to_string(), "rawValue".to_string()],
+                same_token_or_path_bifrost_miss: true,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["rawField", "rawValue"]}),
+            }),
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let mut prior = exchange("scan_usages");
+        prior.arguments = r#"{"symbols":["rawField","rawValue"]}"#.to_string();
+        prior.result = r#"{"usages":[{"symbol":"rawField","total_hits":0},{"symbol":"rawValue","total_hits":0}]}"#.to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "path": ".",
+                "glob": "**/*.scala",
+                "pattern": "rawField\\(|rawValue\\(|raw\\("
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![prior],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
     fn exact_bare_identifier_grep_with_text_evidence_stays_allowed() {
         let mut output = GateClassifierOutput {
             reason: "Bifrost could find the attribute symbol.".to_string(),
@@ -6362,6 +6560,12 @@ mod tests {
         ));
         assert!(matches!(
             static_shell_route(&json!({"command": "printenv JAVA_HOME"})),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(
+                &json!({"command": "printf 'A=%s\\nB=%s\\n' \"${JAVA_TOOL_OPTIONS-}\" \"$SBT_OPTS\""})
+            ),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
