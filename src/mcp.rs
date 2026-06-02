@@ -436,7 +436,9 @@ mod tests {
     /// edit here, not whatever happens to be on a contributor's `$PATH`.
     /// Must stay in sync with `BUNDLED_BIFROST_VERSION` in
     /// `brokk-code/brokk_code/rust_acp_install.py`.
-    const TEST_BIFROST_VERSION: &str = "0.5.1";
+    /// bifrost publishes an `aarch64-linux-android` artifact as of v0.5.3,
+    /// so keep the target allowlist below in sync when bumping.
+    const TEST_BIFROST_VERSION: &str = "0.5.3";
 
     const TEST_BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 
@@ -450,6 +452,8 @@ mod tests {
     const TRIPLE: &str = "x86_64-pc-windows-msvc";
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     const TRIPLE: &str = "aarch64-pc-windows-msvc";
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    const TRIPLE: &str = "aarch64-linux-android";
 
     #[cfg(not(any(
         target_os = "macos",
@@ -457,10 +461,11 @@ mod tests {
         all(target_os = "linux", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "aarch64"),
+        all(target_os = "android", target_arch = "aarch64"),
     )))]
     compile_error!(
         "bifrost releases only ship a universal macOS binary, x86_64/aarch64 Linux, \
-         and x86_64/aarch64 Windows; this test cannot run on other targets"
+         x86_64/aarch64 Windows, and aarch64 Android; this test cannot run on other targets"
     );
 
     #[cfg(target_os = "windows")]

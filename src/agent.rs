@@ -1274,11 +1274,11 @@ pub async fn run_agent(
                 }
 
                 let prompt_text = if let Some((name, args)) = slash_command.as_ref()
-                    && let Some(meta) = snap.skills.get(&name)
+                    && let Some(meta) = snap.skills.get(name)
                 {
                     tracing::info!(skill = %name, "slash-command activating skill");
                     sessions_prompt
-                        .mark_skill_activated(&session_id, &name)
+                        .mark_skill_activated(&session_id, name)
                         .await;
                     let body = build_skill_payload(meta);
                     if args.is_empty() {
