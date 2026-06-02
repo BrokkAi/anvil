@@ -1171,20 +1171,11 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         return;
     }
 
-    if let Some((tool, relation)) = repair_tool {
-        output.decision = GateClassifierDecision::GateToSymbolTool;
-        output.recommended_tool = tool;
-        output.suggested_args = json!({});
-        output.reason = format!(
-            "GATE_TO_SYMBOL_TOOL because broad source/test grep for `{}` is source-symbol {relation} navigation, not exact text/value search.",
-            truncate_to(pattern, 120)
-        );
-        output.confidence = GateConfidence::High;
-        return;
-    }
-
     if same_direct_bifrost_candidate(output)
+        && output.confidence == GateConfidence::High
         && output.allow_exception == TextAllowException::None
+        && bifrost_candidate_matches_intent(output)
+        && !output.evidence.same_path_recent_bifrost_hit
         && !output.evidence.exact_text_or_regex_needed
     {
         output.decision = GateClassifierDecision::GateToSymbolTool;
@@ -1203,6 +1194,18 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         return;
     }
 
+    if let Some((tool, relation)) = repair_tool {
+        output.decision = GateClassifierDecision::GateToSymbolTool;
+        output.recommended_tool = tool;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "GATE_TO_SYMBOL_TOOL because broad source/test grep for `{}` is source-symbol {relation} navigation, not exact text/value search.",
+            truncate_to(pattern, 120)
+        );
+        output.confidence = GateConfidence::High;
+        return;
+    }
+
     if output.decision == GateClassifierDecision::AllowText {
         return;
     }
@@ -1215,6 +1218,14 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         output.recommended_tool = RecommendedTool::None;
         output.suggested_args = json!({});
     }
+}
+
+fn bifrost_candidate_matches_intent(output: &GateClassifierOutput) -> bool {
+    output
+        .bifrost_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.tool.as_ref())
+        .is_some_and(|tool| *tool == bifrost_tool_for_text_intent(&output.intent))
 }
 
 fn same_direct_bifrost_candidate(output: &GateClassifierOutput) -> bool {
@@ -5487,6 +5498,53 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
+    fn high_confidence_same_direct_candidate_preserves_recommended_tool() {
+        let mut output = GateClassifierOutput {
+            reason: "This broad source grep names project symbols directly.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec![
+                    "LOCUnknown".to_string(),
+                    "UnknownTitle".to_string(),
+                    "Unknown".to_string(),
+                ],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["LOCUnknown", "UnknownTitle", "Unknown"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({"patterns":["LOCUnknown", "UnknownTitle", "Unknown"]}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "LOCUnknown|UnknownTitle|Unknown", "path": "source", "glob": "*.cs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
+        assert_eq!(
+            output.suggested_args,
+            json!({"patterns":["LOCUnknown", "UnknownTitle", "Unknown"]})
+        );
     }
 
     #[test]
