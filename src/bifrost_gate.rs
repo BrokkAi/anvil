@@ -237,6 +237,7 @@ pub enum MaterialConstraint {
     AssignmentOperator,
     EventSubscription,
     GenericSignature,
+    SameEntityIntersection,
     MacroPreprocessor,
     ClassNameRegex,
     AlternationSemantics,
@@ -573,13 +574,37 @@ fn normalize_raw_text_classifier_consistency(raw: &mut RawGateClassifierOutput) 
             .as_ref()
             .and_then(|candidate| candidate.tool.as_ref())
             .is_some_and(is_bifrost_recommendation);
+    let source_relationship = matches!(
+        raw.object_of_search,
+        ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
+    );
+    if raw.allow_exception == TextAllowException::NonSourceText
+        && raw.object_of_search == ObjectOfSearch::SourceSymbolRelationship
+    {
+        raw.allow_exception = TextAllowException::None;
+    }
+    if has_same_direct_candidate
+        && raw.evidence.symbol_tokens.len() == 1
+        && raw.evidence.same_path_recent_bifrost_hit
+        && !raw.evidence.exact_text_or_regex_needed
+        && source_relationship
+        && !matches!(
+            raw.pattern_class,
+            TextPatternClass::ExternalApiOrAnnotationNames
+                | TextPatternClass::LiteralExact
+                | TextPatternClass::RegexText
+                | TextPatternClass::PathLike
+                | TextPatternClass::NaturalLanguage
+        )
+    {
+        raw.material_constraints.clear();
+        raw.allow_exception = TextAllowException::None;
+    }
     if has_same_direct_candidate
         && raw.material_constraints.is_empty()
         && raw.allow_exception == TextAllowException::None
-        && matches!(
-            raw.object_of_search,
-            ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
-        )
+        && source_relationship
+        && !raw.evidence.exact_text_or_regex_needed
     {
         raw.bifrost_preserves_material_constraints = BifrostPreservesMaterialConstraints::Full;
     }
@@ -665,9 +690,7 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     ) {
         return false;
     }
-    if raw.bifrost_preserves_material_constraints
-        != BifrostPreservesMaterialConstraints::Full
-    {
+    if raw.bifrost_preserves_material_constraints != BifrostPreservesMaterialConstraints::Full {
         return false;
     }
     if !matches!(
@@ -1083,7 +1106,7 @@ fn build_request_body_with_mode(
     let system = if json_only_retry {
         "Return only a valid JSON object matching the schema. No prose, markdown, hidden commentary, action field, or final decision field. Classify the pending read_file/grep_search call as policy facts from pending_call_features and compact_evidence. The system will compute the executable route from those facts."
     } else {
-        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. Always allow list_directory. For read_file, exact file/path/line/range inspection is allowed text; only broad redundant source reading after Bifrost found exact source is a possible symbol-navigation fact. Before classifying grep_search, determine the object of search. Object = source relationship when the pattern is a textual encoding of source structure: declaration, definition, constructor, call site, member/static/qualified access, reference, caller/callee, implementation, override, or related-test navigation. Set bifrost_fit=same_or_more_direct only when the target is a repo-indexed source-symbol relationship Bifrost can preserve: declaration, definition, implementation source, references, callers, related tests, or broad orientation over known project symbols. Do not set same_or_more_direct merely because tokens are identifier-shaped. Same-path or related-symbol Bifrost hits are weak index-health context only; they do not prove the pending token is a known repo symbol. Only same-token Bifrost hits, explicit source-relationship shape, explicit source-navigation intent, or deterministic repair context can ground a single bare identifier for Bifrost routing. If the target is an external/library/framework API name, annotation or attribute name, toolchain-provided symbol, import/package line, or compound regex/idiom whose exact alternation, qualifier, argument literal, or co-occurrence semantics matter, use literal_or_regex_search or regex_text_search facts, bifrost_fit=less_direct or not_applicable, and no Bifrost candidate. In broad source/test scope, route these to Bifrost even when the grep pattern is exact regex; regex exactness is not an allow-text reason if stripping regex syntax leaves recoverable repo source symbols plus source-relationship shape. For regex-like patterns, normalize semantic intent first: ignore wrappers/escapes such as \\b, ^, $, \\(, \\), \\s*, simple groups, and escaping that only protects code punctuation. Call-site shapes include foo\\(, \\bfoo\\s*\\(, .foo\\(, ->foo\\(, ::foo\\(, receiver.foo\\(, and Foo::bar\\(; these are usage/reference searches and should prefer scan_usages unless the task is explicitly about exact emitted text. Bare call delimiters like foo() or foo\\s*\\( are not exact_argument constraints by themselves; use exact_argument, qualifier, generic_signature, or assignment_operator only when the query materially requires a specific argument value, receiver/namespace, generic type, or operator form beyond ordinary call/reference navigation. Object = exact text when the requested target is the characters themselves: wire/schema field, config key, serialized/emitted output, API payload field, DB column, fixture/golden/snapshot, diagnostic/log/UI text, docs, import/include/package lines, build text, assertion text, external annotation/API names, or localized post-edit verification. Allow grep for these even if the token is identifier-shaped and even if the files are source files. Bare identifier guard: do not route a single identifier, lower_snake token, generic word, or word-boundary regex to Bifrost solely because it looks like code. Bare identifiers require source-navigation context, a same-token known existing repo symbol target, or source-relationship shape; otherwise prefer text grep. Concrete code shape is not, by itself, an allow-text reason. First decide whether concrete syntax is the user's target, or merely a way to name a source symbol or source relationship. Treat concrete syntax as Bifrost symbol navigation when it encodes a declaration, definition, constructor, method call, static/member access, reference, caller/callee query, related-test query, or small set of known project symbols over broad source/test scope. Examples include class Foo, function foo, def foo, new Foo(, Foo::, Foo., foo(, and Foo|Bar|Baz when these are project symbols. Treat concrete syntax as allow-text only when the exact characters, literal value, diagnostic text, config/build text, import/include/package line, operator syntax, assertion text, serialization/snapshot text, external API/annotation names, localized post-edit verification text, or compound idiom regex is the object of the search. A test scope does not make a symbol-looking query allow-text. Do not use exact regex as an allow-text reason when stripping regex wrappers leaves recoverable repo source symbols and the search is over broad source/test scope. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct and preserve the exact intent: search_symbols for declarations/definitions, scan_usages for calls/references/related tests, get_summaries for broad orientation, and get_symbol_sources only when exact repo symbol names are already known. When bifrost_candidate is not null, it must contain both `tool` and `args`; `args` must be a JSON object; `tool` must exactly be one of search_symbols, scan_usages, get_summaries, or get_symbol_sources. Keep reason concise. Output only JSON matching the schema."
+        "You are a policy-fact extractor for routing an AI coding agent's text navigation. You are advising a stronger coding model, not commanding it. Return policy facts only; the system will compute the final routing decision from these facts. Do not include an action field or final decision field. The first field must be reason. The reason should explain the policy facts, not announce an executable route; avoid route labels like GATE_TO_SYMBOL_TOOL or ALLOW_TEXT unless quoting prior context. Use pending_call_features and compact_evidence first, prose excerpts second. Always allow list_directory. For read_file, exact file/path/line/range inspection is allowed text; only broad redundant source reading after Bifrost found exact source is a possible symbol-navigation fact. Before classifying grep_search, determine the object of search. Object = source relationship when the pattern is a textual encoding of source structure: declaration, definition, constructor, call site, member/static/qualified access, reference, caller/callee, implementation, override, or related-test navigation. fallback_exception=non_source_text is invalid when object_of_search=source_symbol_relationship. Set bifrost_fit=same_or_more_direct only when the target is a repo-indexed source-symbol relationship Bifrost can preserve: declaration, definition, implementation source, references, callers, related tests, or broad orientation over known project symbols. Do not set same_or_more_direct merely because tokens are identifier-shaped. Same-path or related-symbol Bifrost hits are weak index-health context only; they do not prove the pending token is a known repo symbol. Only same-token Bifrost hits, explicit source-relationship shape, explicit source-navigation intent, or deterministic repair context can ground a single bare identifier for Bifrost routing. If the target is an external/library/framework API name, annotation or attribute name, toolchain-provided symbol, import/package line, or compound regex/idiom whose exact alternation, qualifier, argument literal, same-entity intersection, or co-occurrence semantics matter, use literal_or_regex_search or regex_text_search facts, bifrost_fit=less_direct or not_applicable, and no Bifrost candidate. In broad source/test scope, route these to Bifrost even when the grep pattern is exact regex; regex exactness is not an allow-text reason if stripping regex syntax leaves recoverable repo source symbols plus source-relationship shape. Material constraints must be explicitly present in the pending pattern or user request and required to satisfy the intent. exact_argument means a specific argument value/literal/named argument; qualifier means a specific receiver, namespace, module, class, or owner; generic_signature means explicit generic/type-parameter syntax; assignment_operator means the assignment/update/operator form itself; same_entity_intersection means two or more independent conditions must hold in the same declaration/body/RHS/statement/nearby region. Do not infer material constraints from arbitrary code-looking tokens. If bifrost_fit=same_or_more_direct and bifrost_candidate is non-null, bifrost_preserves_material_constraints should be full unless a specific named material constraint is not preserved. For regex-like patterns, normalize semantic intent first: ignore wrappers/escapes such as \\b, ^, $, \\(, \\), \\s*, simple groups, and escaping that only protects code punctuation. Call-site shapes include foo\\(, \\bfoo\\s*\\(, .foo\\(, ->foo\\(, ::foo\\(, receiver.foo\\(, and Foo::bar\\(; these are usage/reference searches and should prefer scan_usages unless the task is explicitly about exact emitted text. Bare call delimiters like foo() or foo\\s*\\( are not exact_argument constraints by themselves; use exact_argument, qualifier, generic_signature, assignment_operator, or same_entity_intersection only when the query materially requires a specific argument value, receiver/namespace, generic type, operator form, or same-entity/body co-occurrence beyond ordinary call/reference navigation. Object = exact text when the requested target is the characters themselves: wire/schema field, config key, serialized/emitted output, API payload field, DB column, fixture/golden/snapshot, diagnostic/log/UI text, docs, import/include/package lines, build text, assertion text, external annotation/API names, or localized post-edit verification. Allow grep for these even if the token is identifier-shaped and even if the files are source files. Bare identifier guard: do not route a single identifier, lower_snake token, generic word, or word-boundary regex to Bifrost solely because it looks like code. Bare identifiers require source-navigation context, a same-token known existing repo symbol target, or source-relationship shape; otherwise prefer text grep. Concrete code shape is not, by itself, an allow-text reason. First decide whether concrete syntax is the user's target, or merely a way to name a source symbol or source relationship. Treat concrete syntax as Bifrost symbol navigation when it encodes a declaration, definition, constructor, method call, static/member access, reference, caller/callee query, related-test query, or small set of known project symbols over broad source/test scope. Examples include class Foo, function foo, def foo, new Foo(, Foo::, Foo., foo(, and Foo|Bar|Baz when these are project symbols. Treat concrete syntax as allow-text only when the exact characters, literal value, diagnostic text, config/build text, import/include/package line, operator syntax, assertion text, serialization/snapshot text, external API/annotation names, localized post-edit verification text, or compound same-entity/co-occurrence idiom regex is the object of the search. A test scope does not make a symbol-looking query allow-text. Do not use exact regex as an allow-text reason when stripping regex wrappers leaves recoverable repo source symbols and the search is over broad source/test scope. A previous Bifrost call being skipped, filtered, or marked not_text_navigation_tool is not evidence that Bifrost failed. Bifrost internal/protocol/refresh errors are infrastructure failures to fix, not targeted symbol misses. Fill bifrost_candidate only when a symbol tool would be same-or-more-direct and preserve the exact intent: search_symbols for declarations/definitions, scan_usages for calls/references/related tests, get_summaries for broad orientation, and get_symbol_sources only when exact repo symbol names are already known. When bifrost_candidate is not null, it must contain both `tool` and `args`; `args` must be a JSON object; `tool` must exactly be one of search_symbols, scan_usages, get_summaries, or get_symbol_sources. Keep reason concise. Output only JSON matching the schema."
     };
     let user = render_context(context)?;
     let model_json = serde_json::to_string(model)?;
@@ -1112,7 +1135,7 @@ fn build_request_body_with_mode(
           "bifrost_fit": {{"type":"string","enum":["same_or_more_direct","less_direct","not_applicable","unknown"]}},
           "object_of_search": {{"type":"string","enum":["source_symbol_relationship","exact_text_or_regex","mixed","unknown"]}},
           "relationship_kind": {{"type":"string","enum":["declaration","definition","prototype","call_site","usage","write_assignment","implementation","related_test","broad_symbol_orientation","none","unknown"]}},
-          "material_constraints": {{"type":"array","items":{{"type":"string","enum":["exact_argument","qualifier","assignment_operator","event_subscription","generic_signature","macro_preprocessor","class_name_regex","alternation_semantics","co_occurrence","bounded_test_regex","build_config_text","external_api_name","schema_wire_field","post_edit_verification"]}}}},
+          "material_constraints": {{"type":"array","items":{{"type":"string","enum":["exact_argument","qualifier","assignment_operator","event_subscription","generic_signature","same_entity_intersection","macro_preprocessor","class_name_regex","alternation_semantics","co_occurrence","bounded_test_regex","build_config_text","external_api_name","schema_wire_field","post_edit_verification"]}}}},
           "bifrost_preserves_material_constraints": {{"type":"string","enum":["full","lossy_superset","no","unknown"]}},
           "bifrost_capability_needed": {{"type":"array","items":{{"type":"string","enum":["references","call_sites","write_references","call_arg_filter","macro_definitions","prototypes","external_api_references","related_tests"]}}}},
           "prior_bifrost_status": {{"type":"string","enum":["not_attempted","observed_hit","observed_empty","observed_error","skipped_by_classifier","unavailable","unknown"]}},
@@ -1298,6 +1321,34 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         repair_tool.is_some(),
     );
     normalize_call_site_classifier_consistency(output, pattern);
+    if same_entity_intersection_regex(pattern) {
+        output.decision = GateClassifierDecision::AllowText;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "ALLOW_TEXT because `{}` requires same-entity source predicate matching that Bifrost cannot preserve in one tool call.",
+            truncate_to(pattern, 120)
+        );
+        return;
+    }
+    if declaration_repair_compatible_intent(&output.intent)
+        && declaration_shape_without_material_intersection(pattern)
+        && bifrost_navigation_scope(glob, path, file_path)
+    {
+        let (tool, relation) = repair_tool
+            .as_ref()
+            .map(|(tool, relation)| (tool.clone(), *relation))
+            .unwrap_or((RecommendedTool::SearchSymbols, "declaration"));
+        output.decision = GateClassifierDecision::GateToSymbolTool;
+        output.recommended_tool = tool;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "GATE_TO_SYMBOL_TOOL because broad source/test grep for `{}` is source-symbol {relation} navigation, not exact text/value search.",
+            truncate_to(pattern, 120)
+        );
+        output.confidence = GateConfidence::High;
+        return;
+    }
     if hard_text_negative_facts_veto(output) {
         output.decision = GateClassifierDecision::AllowText;
         output.recommended_tool = RecommendedTool::None;
@@ -1364,8 +1415,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         && output.confidence == GateConfidence::High
         && (bifrost_candidate_matches_intent(output)
             || (bifrost_candidate_has_args(output)
-                && (regex_wrapped_single_identifier(pattern).is_none()
-                    || pattern.contains('|'))))
+                && (regex_wrapped_single_identifier(pattern).is_none() || pattern.contains('|'))))
         && (!output.evidence.same_path_recent_bifrost_hit
             || same_symbol_bifrost_hit
             || regex_wrapped_single_identifier(pattern).is_none())
@@ -1475,10 +1525,12 @@ fn bifrost_candidate_matches_intent(output: &GateClassifierOutput) -> bool {
 }
 
 fn bifrost_candidate_has_args(output: &GateClassifierOutput) -> bool {
-    output
-        .bifrost_candidate
-        .as_ref()
-        .is_some_and(|candidate| candidate.args.as_object().is_some_and(|args| !args.is_empty()))
+    output.bifrost_candidate.as_ref().is_some_and(|candidate| {
+        candidate
+            .args
+            .as_object()
+            .is_some_and(|args| !args.is_empty())
+    })
 }
 
 fn same_direct_bifrost_candidate(output: &GateClassifierOutput) -> bool {
@@ -1490,6 +1542,21 @@ fn same_direct_bifrost_candidate(output: &GateClassifierOutput) -> bool {
             .as_ref()
             .and_then(|candidate| candidate.tool.as_ref())
             .is_some_and(is_bifrost_recommendation)
+}
+
+fn source_navigation_text_intent(intent: &TextIntent) -> bool {
+    matches!(
+        intent,
+        TextIntent::SymbolDefinitionLookup
+            | TextIntent::SymbolReferenceLookup
+            | TextIntent::SymbolUsageLookup
+            | TextIntent::KnownSymbolSource
+            | TextIntent::BroadSemanticOrientation
+    )
+}
+
+fn declaration_repair_compatible_intent(intent: &TextIntent) -> bool {
+    source_navigation_text_intent(intent) || matches!(intent, TextIntent::Unknown)
 }
 
 fn text_negative_facts_veto(output: &GateClassifierOutput) -> bool {
@@ -1523,6 +1590,7 @@ fn very_strong_deterministic_symbol_navigation(
 ) -> bool {
     bifrost_navigation_scope(glob, path, file_path)
         && !compound_code_idiom_regex(pattern)
+        && !same_entity_intersection_regex(pattern)
         && !external_api_or_annotation_names(pattern)
         && (declaration_search_pattern(pattern)
             || constructor_or_static_call_usage_pattern(pattern)
@@ -1553,6 +1621,7 @@ fn must_allow_text_grep(pattern: &str, glob: &str, path: &str, file_path: &str) 
     if filename_or_resource_regex(pattern)
         || inline_regex_flag_text_search(pattern)
         || compound_code_idiom_regex(pattern)
+        || same_entity_intersection_regex(pattern)
         || external_api_or_annotation_names(pattern)
     {
         return true;
@@ -1586,6 +1655,7 @@ fn strong_text_grep_allow_exception(
         || external_api_word_boundary_text_search(pattern)
         || external_api_or_annotation_names(pattern)
         || compound_code_idiom_regex(pattern)
+        || same_entity_intersection_regex(pattern)
         || config_or_build_text_scope(glob, path, file_path)
         || diagnostic_or_status_constant_text(pattern)
     {
@@ -1771,7 +1841,13 @@ fn repair_blocked_text_grep(
         || regex_wildcard_text_probe(pattern)
         || exact_member_or_call_expression_text_probe(pattern)
         || ambiguous_bare_identifier_text_probe(pattern)
-        || recent_naming_variant_text_search(pattern, glob, path, file_path, &context.tool_exchanges)
+        || recent_naming_variant_text_search(
+            pattern,
+            glob,
+            path,
+            file_path,
+            &context.tool_exchanges,
+        )
         || path_or_protocol_construction_text_probe(pattern)
         || boolean_assignment_value_text_probe(pattern)
         || filename_or_resource_regex(pattern)
@@ -2438,6 +2514,64 @@ fn compound_code_idiom_regex(pattern: &str) -> bool {
         .count()
         >= 2;
     has_mixed_terms && has_call_fragment && (has_literal_arg || has_qualified_fragment)
+}
+
+fn same_entity_intersection_regex(pattern: &str) -> bool {
+    if !declaration_search_pattern(pattern) {
+        return false;
+    }
+    let Some(after_boundary) = declaration_body_or_rhs_suffix(pattern) else {
+        return false;
+    };
+    let concrete_suffix_tokens: Vec<_> = identifier_tokens(after_boundary)
+        .into_iter()
+        .filter(|token| same_entity_suffix_token(token))
+        .collect();
+    !concrete_suffix_tokens.is_empty()
+}
+
+fn declaration_shape_without_material_intersection(pattern: &str) -> bool {
+    declaration_search_pattern(pattern) && !same_entity_intersection_regex(pattern)
+}
+
+fn declaration_body_or_rhs_suffix(pattern: &str) -> Option<&str> {
+    for boundary in ["=>", "=", "\\{", "{"] {
+        if let Some((_, suffix)) = pattern.split_once(boundary) {
+            return Some(suffix);
+        }
+    }
+    None
+}
+
+fn same_entity_suffix_token(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "class"
+            | "case"
+            | "def"
+            | "func"
+            | "function"
+            | "object"
+            | "trait"
+            | "interface"
+            | "enum"
+            | "return"
+            | "true"
+            | "false"
+            | "none"
+            | "null"
+            | "nil"
+            | "string"
+            | "int"
+            | "bool"
+            | "boolean"
+            | "number"
+            | "void"
+    )
 }
 
 fn regex_has_literal_call_arg(pattern: &str) -> bool {
@@ -4206,10 +4340,7 @@ fn pipeline_grep_filters_command_output(command: &str) -> bool {
                 .map(|part| shell_segment_executable_name(part))
                 .find(|name| !name.is_empty())
                 .unwrap_or_default();
-            !matches!(
-                upstream.as_str(),
-                "cat" | "head" | "tail" | "sed" | "nl"
-            )
+            !matches!(upstream.as_str(), "cat" | "head" | "tail" | "sed" | "nl")
         })
     })
 }
@@ -5276,7 +5407,7 @@ mod tests {
     fn gate_message_explains_retry_override() {
         let output = GateClassifierOutput {
             reason: "GATE_TO_SYMBOL_TOOL because Foo looks like a declaration.".to_string(),
-            intent: TextIntent::SymbolDefinitionLookup,
+            intent: TextIntent::Unknown,
             pattern_class: TextPatternClass::IdentifierLike,
             scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::SameOrMoreDirect,
@@ -5340,6 +5471,80 @@ mod tests {
         let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
         assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(parsed.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn source_relationship_non_source_text_contradiction_routes_to_bifrost() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": json!({
+                        "reason": "Source declaration regex over source scope should use Bifrost.",
+                        "intent": "symbol_definition_lookup",
+                        "pattern_class": "symbol_glob",
+                        "scope_class": "broad_source_scope",
+                        "bifrost_fit": "same_or_more_direct",
+                        "object_of_search": "source_symbol_relationship",
+                        "relationship_kind": "declaration",
+                        "material_constraints": [],
+                        "bifrost_preserves_material_constraints": "no",
+                        "bifrost_capability_needed": ["references"],
+                        "prior_bifrost_status": "observed_hit",
+                        "fallback_exception": "non_source_text",
+                        "evidence": {
+                            "symbol_tokens": ["case", "class"],
+                            "same_token_or_path_bifrost_miss": false,
+                            "same_path_recent_edit_or_write": false,
+                            "same_path_recent_bifrost_hit": false,
+                            "exact_text_or_regex_needed": false
+                        },
+                        "bifrost_candidate": {"tool": "search_symbols", "args": {"patterns":["case class"]}},
+                        "suggested_args": {},
+                        "confidence": "high"
+                    }).to_string()
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::SearchSymbols);
+    }
+
+    #[test]
+    fn single_source_identifier_with_recent_bifrost_hit_ignores_hallucinated_constraints() {
+        let envelope = json!({
+            "choices": [{
+                "message": {
+                    "content": json!({
+                        "reason": "Known source identifier has same-direct Bifrost candidate.",
+                        "intent": "symbol_usage_lookup",
+                        "pattern_class": "symbol_glob",
+                        "scope_class": "repository_wide",
+                        "bifrost_fit": "same_or_more_direct",
+                        "object_of_search": "source_symbol_relationship",
+                        "relationship_kind": "usage",
+                        "material_constraints": ["exact_argument", "qualifier", "generic_signature", "assignment_operator"],
+                        "bifrost_preserves_material_constraints": "lossy_superset",
+                        "bifrost_capability_needed": ["references"],
+                        "prior_bifrost_status": "observed_hit",
+                        "fallback_exception": "none",
+                        "evidence": {
+                            "symbol_tokens": ["x_mitre_permissions_required"],
+                            "same_token_or_path_bifrost_miss": false,
+                            "same_path_recent_edit_or_write": false,
+                            "same_path_recent_bifrost_hit": true,
+                            "exact_text_or_regex_needed": false
+                        },
+                        "bifrost_candidate": {"tool": "scan_usages", "args": {"pattern":"x_mitre_permissions_required"}},
+                        "suggested_args": {},
+                        "confidence": "high"
+                    }).to_string()
+                }
+            }]
+        });
+        let parsed = parse_openrouter_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(parsed.recommended_tool, RecommendedTool::ScanUsages);
     }
 
     #[test]
@@ -5589,7 +5794,7 @@ mod tests {
     fn broad_symbol_grep_with_invalid_allow_facts_is_not_repaired_to_gate() {
         let mut output = GateClassifierOutput {
             reason: "ALLOW_TEXT because regex can find the identifier.".to_string(),
-            intent: TextIntent::SymbolDefinitionLookup,
+            intent: TextIntent::Unknown,
             pattern_class: TextPatternClass::IdentifierLike,
             scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::Unknown,
@@ -6188,7 +6393,8 @@ mod tests {
     #[test]
     fn recent_naming_variant_grep_stays_text() {
         let mut output = GateClassifierOutput {
-            reason: "GATE_TO_SYMBOL_TOOL because property references are source navigation.".to_string(),
+            reason: "GATE_TO_SYMBOL_TOOL because property references are source navigation."
+                .to_string(),
             intent: TextIntent::SymbolReferenceLookup,
             pattern_class: TextPatternClass::IdentifierLike,
             scope_class: TextScopeClass::BroadSourceScope,
@@ -6240,8 +6446,8 @@ mod tests {
         output.confidence = GateConfidence::High;
         let mut hit = exchange("search_symbols");
         hit.arguments = r#"{"patterns":["mount_info_from_path"]}"#.to_string();
-        hit.result = r#"{"files":[{"functions":[{"signature":"fn mount_info_from_path"}]}]}"#
-            .to_string();
+        hit.result =
+            r#"{"files":[{"functions":[{"signature":"fn mount_info_from_path"}]}]}"#.to_string();
         let context = GateContext {
             tool_name: "grep_search".to_string(),
             args: json!({"pattern": "mount_info_from_path", "path": ".", "glob": "*.rs"}),
@@ -6460,6 +6666,85 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::AllowText);
         assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn same_entity_intersection_declaration_regex_stays_text() {
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "pattern": "def .*: String = .*getOrElse",
+                "glob": "thehive/app/org/thp/thehive/models/*.scala",
+                "path": "."
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+        let mut output = GateClassifierOutput {
+            reason: "GATE_TO_SYMBOL_TOOL because this is declaration-shaped.".to_string(),
+            intent: TextIntent::SymbolDefinitionLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["String".to_string(), "getOrElse".to_string()],
+                ..TextEvidence::default()
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::SearchSymbols),
+                args: json!({"patterns":["def .*: String = .*getOrElse"],"include_tests":false}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn broad_declaration_default_shape_still_routes_to_symbols() {
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "pattern": "case class .*\\(.*= .*\\)",
+                "glob": "thehive/app/org/thp/thehive/models/*.scala",
+                "path": "."
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+        let mut output = GateClassifierOutput {
+            reason: "ALLOW_TEXT because the regex default-value syntax is exact.".to_string(),
+            intent: TextIntent::Unknown,
+            pattern_class: TextPatternClass::RegexText,
+            scope_class: TextScopeClass::DirectoryOrGlob,
+            bifrost_fit: BifrostFit::LessDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["case".to_string(), "class".to_string()],
+                same_path_recent_bifrost_hit: true,
+                exact_text_or_regex_needed: true,
+                ..TextEvidence::default()
+            },
+            bifrost_candidate: None,
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
     }
 
     #[test]
@@ -6687,7 +6972,10 @@ mod tests {
     #[test]
     fn shell_runtime_output_filter_stays_shell() {
         let command = "php -m | grep -i '^imagick$' || true";
-        assert_eq!(shell_search_stream(command), ShellSearchStream::CommandOutput);
+        assert_eq!(
+            shell_search_stream(command),
+            ShellSearchStream::CommandOutput
+        );
         assert!(matches!(
             static_shell_route(&json!({"command": command})),
             Some(ShellStaticRoute::AllowShell(
@@ -6724,7 +7012,8 @@ mod tests {
 
     #[test]
     fn shell_arithmetic_heredoc_builtin_claim_fails_open() {
-        let command = "python - <<'PY'\nname = 20 + 2\nstats = 20 + 2 + 20 + 1\nprint(name + stats)\nPY";
+        let command =
+            "python - <<'PY'\nname = 20 + 2\nstats = 20 + 2 + 20 + 1\nprint(name + stats)\nPY";
         let mut output = ShellClassifierOutput {
             reason: "USE_BUILTIN_TOOL because this is simple arithmetic.".to_string(),
             intent: ShellIntent::PipelineTransformationOrExitBehavior,
@@ -7502,7 +7791,9 @@ mod tests {
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
-            static_shell_route(&json!({"command": "python -m py_compile openhands/cli/tui.py tests/unit/test_cli_tui.py"})),
+            static_shell_route(
+                &json!({"command": "python -m py_compile openhands/cli/tui.py tests/unit/test_cli_tui.py"})
+            ),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
