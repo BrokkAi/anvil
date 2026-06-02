@@ -2546,21 +2546,40 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
         output.confidence = GateConfidence::High;
         return;
     }
-    if shell_search_stream(command) == ShellSearchStream::FilePaths {
-        output.decision = ShellClassifierDecision::AllowShell;
-        output.recommended_tool = RecommendedTool::None;
-        output.suggested_args = json!({});
-        output.reason = format!(
-            "ALLOW_SHELL because `{}` filters file paths, not source contents; Bifrost would not preserve the intent.",
-            truncate_to(command, 160)
-        );
-        output.intent = ShellIntent::DirectoryOrFileDiscovery;
-        output.allow_exception = ShellAllowException::None;
-        output.replacement_class = ShellReplacementClass::AllowShellUncertain;
-        output.bifrost_fit = BifrostFit::NotApplicable;
-        output.builtin_preserves_intent = false;
-        output.confidence = GateConfidence::High;
-        return;
+    match shell_search_stream(command) {
+        ShellSearchStream::FilePaths => {
+            output.decision = ShellClassifierDecision::AllowShell;
+            output.recommended_tool = RecommendedTool::None;
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "ALLOW_SHELL because `{}` filters file paths, not source contents; Bifrost would not preserve the intent.",
+                truncate_to(command, 160)
+            );
+            output.intent = ShellIntent::DirectoryOrFileDiscovery;
+            output.allow_exception = ShellAllowException::None;
+            output.replacement_class = ShellReplacementClass::AllowShellUncertain;
+            output.bifrost_fit = BifrostFit::NotApplicable;
+            output.builtin_preserves_intent = false;
+            output.confidence = GateConfidence::High;
+            return;
+        }
+        ShellSearchStream::CommandOutput => {
+            output.decision = ShellClassifierDecision::AllowShell;
+            output.recommended_tool = RecommendedTool::None;
+            output.suggested_args = json!({});
+            output.reason = format!(
+                "ALLOW_SHELL because `{}` filters command output, not source contents; Bifrost would not preserve the intent.",
+                truncate_to(command, 160)
+            );
+            output.intent = ShellIntent::PipelineTransformationOrExitBehavior;
+            output.allow_exception = ShellAllowException::ShellSemanticsRequired;
+            output.replacement_class = ShellReplacementClass::AllowShellUncertain;
+            output.bifrost_fit = BifrostFit::NotApplicable;
+            output.builtin_preserves_intent = false;
+            output.confidence = GateConfidence::High;
+            return;
+        }
+        ShellSearchStream::FileContents | ShellSearchStream::None => {}
     }
     if output.decision == ShellClassifierDecision::UseBifrostTool
         && shell_search_pattern(command).is_some_and(|pattern| {
@@ -2658,6 +2677,24 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
             return;
         }
     }
+    if output.decision == ShellClassifierDecision::UseBuiltinTool
+        && !shell_builtin_route_preserves_intent(command)
+    {
+        output.decision = ShellClassifierDecision::AllowShell;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "ALLOW_SHELL because `{}` is not file/search/list inspection that an available builtin can preserve.",
+            truncate_to(command, 160)
+        );
+        output.intent = ShellIntent::PipelineTransformationOrExitBehavior;
+        output.allow_exception = ShellAllowException::GeneratedArtifactOrExitBehavior;
+        output.replacement_class = ShellReplacementClass::AllowShellUncertain;
+        output.bifrost_fit = BifrostFit::NotApplicable;
+        output.builtin_preserves_intent = false;
+        output.confidence = GateConfidence::High;
+        return;
+    }
     if output.decision == ShellClassifierDecision::AllowShell
         && (simple_shell_read_like(command)
             || script_exact_file_text_inspection(command)
@@ -2684,6 +2721,13 @@ fn enforce_shell_classifier_policy(output: &mut ShellClassifierOutput, context: 
         output.builtin_preserves_intent = true;
         output.confidence = GateConfidence::High;
     }
+}
+
+fn shell_builtin_route_preserves_intent(command: &str) -> bool {
+    ((simple_shell_read_like(command) || simple_shell_search_like(command))
+        && !shell_semantics_required(command))
+        || script_exact_file_text_inspection(command)
+        || script_bounded_file_text_inspection(command)
 }
 
 fn route_prefix(reason: &str) -> Option<RoutePrefix> {
@@ -3610,8 +3654,16 @@ pub fn static_shell_route(args: &Value) -> Option<ShellStaticRoute> {
     if shell_semantics_required(command) {
         return Some(ShellStaticRoute::AllowShell("static_shell_semantics"));
     }
-    if shell_search_stream(command) == ShellSearchStream::FilePaths {
-        return Some(ShellStaticRoute::AllowShell("static_shell_path_filter"));
+    match shell_search_stream(command) {
+        ShellSearchStream::FilePaths => {
+            return Some(ShellStaticRoute::AllowShell("static_shell_path_filter"));
+        }
+        ShellSearchStream::CommandOutput => {
+            return Some(ShellStaticRoute::AllowShell(
+                "static_shell_command_output_filter",
+            ));
+        }
+        ShellSearchStream::FileContents | ShellSearchStream::None => {}
     }
     if shell_search_pattern(command).is_some() {
         return None;
@@ -4118,6 +4170,9 @@ fn shell_search_stream(command: &str) -> ShellSearchStream {
     if lower.contains("find ") && lower.contains("| grep") {
         return ShellSearchStream::FilePaths;
     }
+    if pipeline_grep_filters_command_output(command) {
+        return ShellSearchStream::CommandOutput;
+    }
     if lower
         .split([';', '\n', '|'])
         .any(|segment| strip_harmless_shell_prefixes(segment).starts_with("grep "))
@@ -4128,6 +4183,35 @@ fn shell_search_stream(command: &str) -> ShellSearchStream {
         return ShellSearchStream::CommandOutput;
     }
     ShellSearchStream::None
+}
+
+fn pipeline_grep_filters_command_output(command: &str) -> bool {
+    command.split([';', '\n']).any(|segment| {
+        let parts = segment
+            .split('|')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() < 2 {
+            return false;
+        }
+        parts.iter().enumerate().skip(1).any(|(index, part)| {
+            let name = shell_segment_executable_name(part);
+            if !matches!(name.as_str(), "grep" | "egrep" | "fgrep" | "rg") {
+                return false;
+            }
+            let upstream = parts[..index]
+                .iter()
+                .rev()
+                .map(|part| shell_segment_executable_name(part))
+                .find(|name| !name.is_empty())
+                .unwrap_or_default();
+            !matches!(
+                upstream.as_str(),
+                "cat" | "head" | "tail" | "sed" | "nl"
+            )
+        })
+    })
 }
 
 fn shell_builtin_inspection_guard(command: &str) -> bool {
@@ -6598,6 +6682,74 @@ mod tests {
             ),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
+    }
+
+    #[test]
+    fn shell_runtime_output_filter_stays_shell() {
+        let command = "php -m | grep -i '^imagick$' || true";
+        assert_eq!(shell_search_stream(command), ShellSearchStream::CommandOutput);
+        assert!(matches!(
+            static_shell_route(&json!({"command": command})),
+            Some(ShellStaticRoute::AllowShell(
+                "static_shell_command_output_filter"
+            ))
+        ));
+
+        let mut output = ShellClassifierOutput {
+            reason: "USE_BIFROST_TOOL because Imagick is a symbol-like identifier.".to_string(),
+            intent: ShellIntent::SymbolDefinitionLookup,
+            shell_semantics_required: false,
+            builtin_preserves_intent: false,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: ShellAllowException::None,
+            replacement_class: ShellReplacementClass::UseBifrostSymbol,
+            decision: ShellClassifierDecision::UseBifrostTool,
+            recommended_tool: RecommendedTool::SearchSymbols,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": command}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::AllowShell);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn shell_arithmetic_heredoc_builtin_claim_fails_open() {
+        let command = "python - <<'PY'\nname = 20 + 2\nstats = 20 + 2 + 20 + 1\nprint(name + stats)\nPY";
+        let mut output = ShellClassifierOutput {
+            reason: "USE_BUILTIN_TOOL because this is simple arithmetic.".to_string(),
+            intent: ShellIntent::PipelineTransformationOrExitBehavior,
+            shell_semantics_required: false,
+            builtin_preserves_intent: true,
+            bifrost_fit: BifrostFit::NotApplicable,
+            allow_exception: ShellAllowException::None,
+            replacement_class: ShellReplacementClass::UseBuiltinInspection,
+            decision: ShellClassifierDecision::UseBuiltinTool,
+            recommended_tool: RecommendedTool::GrepSearch,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "run_shell_command".to_string(),
+            args: json!({"command": command}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_shell_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, ShellClassifierDecision::AllowShell);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
