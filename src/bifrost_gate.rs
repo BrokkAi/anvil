@@ -581,20 +581,17 @@ impl From<RawGateClassifierOutput> for GateClassifierOutput {
     fn from(mut raw: RawGateClassifierOutput) -> Self {
         normalize_raw_text_classifier_consistency(&mut raw);
         let should_gate = text_policy_facts_gate(&raw);
-        let bifrost_fit = if raw.bifrost_fit == BifrostFit::SameOrMoreDirect
+        let bifrost_fit = if !should_gate
+            && raw.bifrost_fit == BifrostFit::SameOrMoreDirect
             && raw.bifrost_preserves_material_constraints
                 != BifrostPreservesMaterialConstraints::Full
         {
             BifrostFit::LessDirect
         } else {
-            raw.bifrost_fit
+            raw.bifrost_fit.clone()
         };
         let recommended_tool = if should_gate {
-            raw.bifrost_candidate
-                .as_ref()
-                .and_then(|candidate| candidate.tool.clone())
-                .filter(is_bifrost_recommendation)
-                .unwrap_or_else(|| bifrost_tool_for_text_intent(&raw.intent))
+            bifrost_tool_for_raw_text_facts(&raw)
         } else {
             RecommendedTool::None
         };
@@ -735,22 +732,7 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     ) {
         return false;
     }
-    if raw.allow_exception != TextAllowException::None
-        || matches!(
-            raw.exactness_role,
-            ExactnessRole::TargetCharacters | ExactnessRole::PostEditVerification
-        )
-        || matches!(
-            raw.text_allow_reason,
-            TextAllowReason::PostEditVerification
-                | TextAllowReason::ExactLiteralSurface
-                | TextAllowReason::ArtifactOrOutputText
-                | TextAllowReason::ExternalApiSurfaceText
-                | TextAllowReason::ImportIncludePackageText
-        )
-        || (raw.evidence.exact_text_or_regex_needed
-            && raw.exactness_role != ExactnessRole::SourceRelationshipFilter)
-    {
+    if raw.allow_exception != TextAllowException::None {
         return false;
     }
     if raw.prior_bifrost_status == PriorBifrostStatus::ObservedEmpty
@@ -758,13 +740,35 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     {
         return false;
     }
-    if !matches!(
-        raw.object_of_search,
-        ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
+    if matches!(
+        raw.exactness_role,
+        ExactnessRole::TargetCharacters | ExactnessRole::PostEditVerification
     ) {
         return false;
     }
-    if raw.bifrost_preserves_material_constraints != BifrostPreservesMaterialConstraints::Full {
+    let source_relationship = matches!(
+        raw.object_of_search,
+        ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
+    );
+    let strong_source_relationship = source_relationship
+        && raw.exactness_role == ExactnessRole::SourceRelationshipFilter
+        && raw.bifrost_fit == BifrostFit::SameOrMoreDirect
+        && source_relationship_grounded(raw);
+    if strong_source_relationship && !has_hard_text_only_constraint(raw) {
+        return true;
+    }
+    if schema_consistent_text_allow(raw)
+        || (raw.evidence.exact_text_or_regex_needed
+            && raw.exactness_role != ExactnessRole::SourceRelationshipFilter)
+    {
+        return false;
+    }
+    if !source_relationship {
+        return false;
+    }
+    if raw.bifrost_preserves_material_constraints != BifrostPreservesMaterialConstraints::Full
+        && has_hard_text_only_constraint(raw)
+    {
         return false;
     }
     if !source_navigation_text_intent(&raw.intent) {
@@ -803,6 +807,45 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     raw.bifrost_fit == BifrostFit::SameOrMoreDirect
 }
 
+fn schema_consistent_text_allow(raw: &RawGateClassifierOutput) -> bool {
+    match raw.text_allow_reason {
+        TextAllowReason::None | TextAllowReason::Unknown => false,
+        TextAllowReason::PostEditVerification => {
+            raw.exactness_role == ExactnessRole::PostEditVerification
+        }
+        TextAllowReason::ExactLiteralSurface => raw.exactness_role == ExactnessRole::TargetCharacters,
+        TextAllowReason::ArtifactOrOutputText
+        | TextAllowReason::ExternalApiSurfaceText
+        | TextAllowReason::ImportIncludePackageText
+        | TextAllowReason::InsufficientSymbolGrounding => !matches!(
+            raw.object_of_search,
+            ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
+        ),
+    }
+}
+
+fn has_hard_text_only_constraint(raw: &RawGateClassifierOutput) -> bool {
+    raw.material_constraints.iter().any(|constraint| match constraint {
+        MaterialConstraint::PostEditVerification => {
+            raw.exactness_role == ExactnessRole::PostEditVerification
+        }
+        MaterialConstraint::ExactArgument => raw.exactness_role == ExactnessRole::TargetCharacters,
+        MaterialConstraint::SameEntityIntersection
+        | MaterialConstraint::CoOccurrence
+        | MaterialConstraint::BuildConfigText
+        | MaterialConstraint::SchemaWireField => true,
+        MaterialConstraint::Qualifier
+        | MaterialConstraint::AssignmentOperator
+        | MaterialConstraint::EventSubscription
+        | MaterialConstraint::GenericSignature
+        | MaterialConstraint::MacroPreprocessor
+        | MaterialConstraint::ClassNameRegex
+        | MaterialConstraint::AlternationSemantics
+        | MaterialConstraint::BoundedTestRegex
+        | MaterialConstraint::ExternalApiName => false,
+    })
+}
+
 fn source_relationship_grounded(raw: &RawGateClassifierOutput) -> bool {
     match raw.source_relationship_grounding {
         SourceRelationshipGrounding::ExplicitTraceIntent
@@ -836,6 +879,49 @@ fn source_relationship_grounded(raw: &RawGateClassifierOutput) -> bool {
             | TextPatternClass::MixedSymbolIdentifiers
             | TextPatternClass::RegexText
     )
+}
+
+fn bifrost_tool_for_raw_text_facts(raw: &RawGateClassifierOutput) -> RecommendedTool {
+    if let Some(candidate) = raw.bifrost_candidate.as_ref() {
+        if candidate.args.as_object().is_some_and(|object| !object.is_empty())
+            && matches!(
+                candidate.tool,
+                Some(RecommendedTool::SearchSymbols | RecommendedTool::GetSymbolSources)
+            )
+            && !matches!(
+                raw.relationship_kind,
+                RelationshipKind::CallSite
+                    | RelationshipKind::Usage
+                    | RelationshipKind::WriteAssignment
+                    | RelationshipKind::RelatedTest
+            )
+        {
+            return candidate.tool.clone().unwrap_or(RecommendedTool::SearchSymbols);
+        }
+    }
+    match raw.intent {
+        TextIntent::SymbolReferenceLookup | TextIntent::SymbolUsageLookup => {
+            return RecommendedTool::ScanUsages;
+        }
+        TextIntent::BroadSemanticOrientation => return RecommendedTool::GetSummaries,
+        TextIntent::KnownSymbolSource => return RecommendedTool::GetSymbolSources,
+        _ => {}
+    }
+    match raw.relationship_kind {
+        RelationshipKind::CallSite
+        | RelationshipKind::Usage
+        | RelationshipKind::WriteAssignment
+        | RelationshipKind::RelatedTest => return RecommendedTool::ScanUsages,
+        RelationshipKind::Declaration | RelationshipKind::Definition | RelationshipKind::Prototype => {
+            return RecommendedTool::SearchSymbols;
+        }
+        _ => {}
+    }
+    raw.bifrost_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.tool.clone())
+        .filter(is_bifrost_recommendation)
+        .unwrap_or_else(|| bifrost_tool_for_text_intent(&raw.intent))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
