@@ -193,6 +193,108 @@ impl Default for TextScopeClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectOfSearch {
+    SourceSymbolRelationship,
+    ExactTextOrRegex,
+    Mixed,
+    Unknown,
+}
+
+impl Default for ObjectOfSearch {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipKind {
+    Declaration,
+    Definition,
+    Prototype,
+    CallSite,
+    Usage,
+    WriteAssignment,
+    Implementation,
+    RelatedTest,
+    BroadSymbolOrientation,
+    None,
+    Unknown,
+}
+
+impl Default for RelationshipKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialConstraint {
+    ExactArgument,
+    Qualifier,
+    AssignmentOperator,
+    EventSubscription,
+    GenericSignature,
+    MacroPreprocessor,
+    ClassNameRegex,
+    AlternationSemantics,
+    CoOccurrence,
+    BoundedTestRegex,
+    BuildConfigText,
+    ExternalApiName,
+    SchemaWireField,
+    PostEditVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BifrostPreservesMaterialConstraints {
+    Full,
+    LossySuperset,
+    No,
+    Unknown,
+}
+
+impl Default for BifrostPreservesMaterialConstraints {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BifrostCapabilityNeeded {
+    References,
+    CallSites,
+    WriteReferences,
+    CallArgFilter,
+    MacroDefinitions,
+    Prototypes,
+    ExternalApiReferences,
+    RelatedTests,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorBifrostStatus {
+    NotAttempted,
+    ObservedHit,
+    ObservedEmpty,
+    ObservedError,
+    SkippedByClassifier,
+    Unavailable,
+    Unknown,
+}
+
+impl Default for PriorBifrostStatus {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BifrostCandidate {
     #[serde(default, deserialize_with = "deserialize_optional_recommended_tool")]
     pub tool: Option<RecommendedTool>,
@@ -339,6 +441,18 @@ pub struct RawGateClassifierOutput {
     pub scope_class: TextScopeClass,
     #[serde(default)]
     pub bifrost_fit: BifrostFit,
+    #[serde(default)]
+    pub object_of_search: ObjectOfSearch,
+    #[serde(default)]
+    pub relationship_kind: RelationshipKind,
+    #[serde(default)]
+    pub material_constraints: Vec<MaterialConstraint>,
+    #[serde(default)]
+    pub bifrost_preserves_material_constraints: BifrostPreservesMaterialConstraints,
+    #[serde(default)]
+    pub bifrost_capability_needed: Vec<BifrostCapabilityNeeded>,
+    #[serde(default)]
+    pub prior_bifrost_status: PriorBifrostStatus,
     #[serde(default, alias = "fallback_exception")]
     pub allow_exception: TextAllowException,
     #[serde(default)]
@@ -406,6 +520,14 @@ pub struct GateContext {
 impl From<RawGateClassifierOutput> for GateClassifierOutput {
     fn from(raw: RawGateClassifierOutput) -> Self {
         let should_gate = text_policy_facts_gate(&raw);
+        let bifrost_fit = if raw.bifrost_fit == BifrostFit::SameOrMoreDirect
+            && raw.bifrost_preserves_material_constraints
+                != BifrostPreservesMaterialConstraints::Full
+        {
+            BifrostFit::LessDirect
+        } else {
+            raw.bifrost_fit
+        };
         let recommended_tool = if should_gate {
             raw.bifrost_candidate
                 .as_ref()
@@ -431,7 +553,7 @@ impl From<RawGateClassifierOutput> for GateClassifierOutput {
             intent: raw.intent,
             pattern_class: raw.pattern_class,
             scope_class: raw.scope_class,
-            bifrost_fit: raw.bifrost_fit,
+            bifrost_fit,
             allow_exception: raw.allow_exception,
             evidence: raw.evidence,
             bifrost_candidate: raw.bifrost_candidate,
@@ -510,6 +632,22 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
         return false;
     }
     if raw.allow_exception != TextAllowException::None || raw.evidence.exact_text_or_regex_needed {
+        return false;
+    }
+    if raw.prior_bifrost_status == PriorBifrostStatus::ObservedEmpty
+        || raw.prior_bifrost_status == PriorBifrostStatus::ObservedError
+    {
+        return false;
+    }
+    if !matches!(
+        raw.object_of_search,
+        ObjectOfSearch::SourceSymbolRelationship | ObjectOfSearch::Mixed
+    ) {
+        return false;
+    }
+    if raw.bifrost_preserves_material_constraints
+        != BifrostPreservesMaterialConstraints::Full
+    {
         return false;
     }
     if !matches!(
@@ -952,6 +1090,12 @@ fn build_request_body_with_mode(
           "pattern_class": {{"type":"string","enum":["identifier_like","symbol_glob","mixed_symbol_identifiers","external_api_or_annotation_names","compound_code_idiom_regex","literal_exact","regex_text","path_like","natural_language","mixed","unknown"]}},
           "scope_class": {{"type":"string","enum":["exact_file","narrowed_file_set","directory_or_glob","broad_source_scope","multi_file_source_scope","repository_wide","unknown"]}},
           "bifrost_fit": {{"type":"string","enum":["same_or_more_direct","less_direct","not_applicable","unknown"]}},
+          "object_of_search": {{"type":"string","enum":["source_symbol_relationship","exact_text_or_regex","mixed","unknown"]}},
+          "relationship_kind": {{"type":"string","enum":["declaration","definition","prototype","call_site","usage","write_assignment","implementation","related_test","broad_symbol_orientation","none","unknown"]}},
+          "material_constraints": {{"type":"array","items":{{"type":"string","enum":["exact_argument","qualifier","assignment_operator","event_subscription","generic_signature","macro_preprocessor","class_name_regex","alternation_semantics","co_occurrence","bounded_test_regex","build_config_text","external_api_name","schema_wire_field","post_edit_verification"]}}}},
+          "bifrost_preserves_material_constraints": {{"type":"string","enum":["full","lossy_superset","no","unknown"]}},
+          "bifrost_capability_needed": {{"type":"array","items":{{"type":"string","enum":["references","call_sites","write_references","call_arg_filter","macro_definitions","prototypes","external_api_references","related_tests"]}}}},
+          "prior_bifrost_status": {{"type":"string","enum":["not_attempted","observed_hit","observed_empty","observed_error","skipped_by_classifier","unavailable","unknown"]}},
           "fallback_exception": {{"type":"string","enum":["none","non_source_text","exact_literal_or_regex","external_api_or_annotation_text","compound_idiom_regex","localized_or_sequential_read","whole_file_or_top_of_file_orientation","test_header_macro_or_entrypoint_context","post_edit_or_build_or_test_verification","same_token_or_path_bifrost_miss","uncertain"]}},
           "evidence": {{
             "type":"object",
@@ -981,7 +1125,7 @@ fn build_request_body_with_mode(
           "suggested_args": {{"type":"object"}},
           "confidence": {{"type":"string","enum":["low","medium","high"]}}
         }},
-        "required": ["reason","intent","pattern_class","scope_class","bifrost_fit","fallback_exception","evidence","bifrost_candidate","suggested_args","confidence"]
+        "required": ["reason","intent","pattern_class","scope_class","bifrost_fit","object_of_search","relationship_kind","material_constraints","bifrost_preserves_material_constraints","bifrost_capability_needed","prior_bifrost_status","fallback_exception","evidence","bifrost_candidate","suggested_args","confidence"]
       }}
     }}
   }},
@@ -1133,6 +1277,21 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         context,
         repair_tool.is_some(),
     );
+    if hard_text_negative_facts_veto(output)
+        && !very_strong_deterministic_symbol_navigation(pattern, glob, path, file_path)
+        && repair_tool.is_none()
+        && !same_direct_bifrost_candidate(output)
+        && !same_symbol_bifrost_hit
+    {
+        output.decision = GateClassifierDecision::AllowText;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "ALLOW_TEXT because `{}` has material exact-text constraints Bifrost cannot preserve.",
+            truncate_to(pattern, 120)
+        );
+        return;
+    }
     if text_negative_facts_veto(output)
         && !very_strong_deterministic_symbol_navigation(pattern, glob, path, file_path)
         && repair_tool.is_none()
@@ -1185,11 +1344,12 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         return;
     }
 
-    if relaxed_same_direct_bifrost_candidate(output)
+    if same_direct_bifrost_candidate(output)
         && output.confidence == GateConfidence::High
         && (bifrost_candidate_matches_intent(output)
             || (bifrost_candidate_has_args(output)
-                && regex_wrapped_single_identifier(pattern).is_none()))
+                && (regex_wrapped_single_identifier(pattern).is_none()
+                    || pattern.contains('|'))))
         && (!output.evidence.same_path_recent_bifrost_hit
             || same_symbol_bifrost_hit
             || regex_wrapped_single_identifier(pattern).is_none())
@@ -1294,16 +1454,6 @@ fn same_direct_bifrost_candidate(output: &GateClassifierOutput) -> bool {
             .is_some_and(is_bifrost_recommendation)
 }
 
-fn relaxed_same_direct_bifrost_candidate(output: &GateClassifierOutput) -> bool {
-    output.bifrost_fit == BifrostFit::SameOrMoreDirect
-        && !output.evidence.exact_text_or_regex_needed
-        && output
-            .bifrost_candidate
-            .as_ref()
-            .and_then(|candidate| candidate.tool.as_ref())
-            .is_some_and(is_bifrost_recommendation)
-}
-
 fn text_negative_facts_veto(output: &GateClassifierOutput) -> bool {
     output.allow_exception != TextAllowException::None
         || output.evidence.exact_text_or_regex_needed
@@ -1318,6 +1468,13 @@ fn text_negative_facts_veto(output: &GateClassifierOutput) -> bool {
                 | TextPatternClass::LiteralExact
                 | TextPatternClass::RegexText
         )
+}
+
+fn hard_text_negative_facts_veto(output: &GateClassifierOutput) -> bool {
+    matches!(
+        output.bifrost_fit,
+        BifrostFit::LessDirect | BifrostFit::NotApplicable
+    )
 }
 
 fn very_strong_deterministic_symbol_navigation(
@@ -4827,6 +4984,12 @@ mod tests {
             "pattern_class": if gate { "identifier_like" } else { "literal_exact" },
             "scope_class": if gate { "broad_source_scope" } else { "narrowed_file_set" },
             "bifrost_fit": fit,
+            "object_of_search": if gate { "source_symbol_relationship" } else { "exact_text_or_regex" },
+            "relationship_kind": if gate { "declaration" } else { "none" },
+            "material_constraints": [],
+            "bifrost_preserves_material_constraints": if gate { "full" } else { "no" },
+            "bifrost_capability_needed": if gate { json!(["references"]) } else { json!([]) },
+            "prior_bifrost_status": "not_attempted",
             "fallback_exception": exception,
             "evidence": {
                 "symbol_tokens": ["Foo"],
@@ -5049,6 +5212,12 @@ mod tests {
                         "pattern_class": "identifier_like",
                         "scope_class": "broad_source_scope",
                         "bifrost_fit": "same_or_more_direct",
+                        "object_of_search": "source_symbol_relationship",
+                        "relationship_kind": "declaration",
+                        "material_constraints": [],
+                        "bifrost_preserves_material_constraints": "full",
+                        "bifrost_capability_needed": ["references"],
+                        "prior_bifrost_status": "not_attempted",
                         "fallback_exception": "none",
                         "evidence": {
                             "symbol_tokens": ["Foo"],
@@ -5080,6 +5249,12 @@ mod tests {
                         "pattern_class": "identifier_like",
                         "scope_class": "broad_source_scope",
                         "bifrost_fit": "same_or_more_direct",
+                        "object_of_search": "source_symbol_relationship",
+                        "relationship_kind": "declaration",
+                        "material_constraints": [],
+                        "bifrost_preserves_material_constraints": "full",
+                        "bifrost_capability_needed": ["references"],
+                        "prior_bifrost_status": "not_attempted",
                         "fallback_exception": "none",
                         "evidence": {
                             "symbol_tokens": ["Foo"],
@@ -5277,7 +5452,7 @@ mod tests {
             pattern_class: TextPatternClass::IdentifierLike,
             scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::Unknown,
-            allow_exception: TextAllowException::ExactLiteralOrRegex,
+            allow_exception: TextAllowException::None,
             evidence: TextEvidence {
                 symbol_tokens: vec!["RichEditBoxDefaultLineEnding".to_string()],
                 same_token_or_path_bifrost_miss: false,
@@ -5625,7 +5800,7 @@ mod tests {
             pattern_class: TextPatternClass::SymbolGlob,
             scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::SameOrMoreDirect,
-            allow_exception: TextAllowException::ExactLiteralOrRegex,
+            allow_exception: TextAllowException::None,
             evidence: TextEvidence {
                 symbol_tokens: vec![
                     "LOCUnknown".to_string(),
