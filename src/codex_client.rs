@@ -36,7 +36,10 @@ use tokio_util::sync::CancellationToken;
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    OpenAiClient, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+};
+use crate::structured_output::{
+    NativeResponseFormat, StructuredOutputRequest, native_response_format,
 };
 
 // Codex CLI's `chatgpt_base_url` default is
@@ -138,13 +141,16 @@ impl CodexClient {
             ver = env!("CARGO_PKG_VERSION"),
             os = std::env::consts::OS,
         );
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .cookie_store(true)
-            .user_agent(user_agent)
-            .build()
-            .expect("failed to build HTTP client");
+        let http = OpenAiClient::apply_runtime_tls_workarounds(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600))
+                .cookie_store(true)
+                .user_agent(user_agent),
+            CHATGPT_RESPONSES_URL,
+        )
+        .build()
+        .expect("failed to build HTTP client");
         Self {
             http,
             refresh_lock: Arc::new(Mutex::new(())),
@@ -222,6 +228,7 @@ impl CodexClient {
             messages,
             tools,
             reasoning_effort,
+            structured_output,
             on_token,
             on_thought,
             cancel,
@@ -233,6 +240,7 @@ impl CodexClient {
             &messages,
             tools.as_deref(),
             reasoning_effort.as_deref(),
+            structured_output.as_ref(),
         );
         // Keep the caller's sinks behind a mutex so a retry can build
         // fresh FnMut wrappers without losing the live callbacks.
@@ -633,11 +641,28 @@ pub(crate) struct ResponsesRequest {
     /// honor the level the user asked for in the picker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) text: Option<ResponsesTextConfig>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ReasoningConfig {
     pub(crate) effort: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponsesTextConfig {
+    pub(crate) format: ResponsesTextFormat,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponsesTextFormat {
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        strict: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -688,6 +713,7 @@ pub(crate) fn build_responses_request(
     messages: &[ChatMessage],
     tools: Option<&[ToolDefinition]>,
     reasoning_effort: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
 ) -> ResponsesRequest {
     let mut instructions_parts: Vec<String> = Vec::new();
     let mut input: Vec<ResponsesInputItem> = Vec::new();
@@ -794,6 +820,15 @@ pub(crate) fn build_responses_request(
     let reasoning = reasoning_effort.map(|effort| ReasoningConfig {
         effort: effort.to_string(),
     });
+    let text = structured_output
+        .map(native_response_format)
+        .map(|format: NativeResponseFormat| ResponsesTextConfig {
+            format: ResponsesTextFormat::JsonSchema {
+                name: format.name,
+                schema: format.schema,
+                strict: format.strict,
+            },
+        });
 
     ResponsesRequest {
         model: model.to_string(),
@@ -805,6 +840,7 @@ pub(crate) fn build_responses_request(
         stream: true,
         store: false,
         reasoning,
+        text,
     }
 }
 
@@ -1172,6 +1208,7 @@ where
 mod tests {
     use super::*;
     use crate::llm_client::{ChatMessage, FunctionCall, FunctionDef, ToolCall, ToolDefinition};
+    use crate::structured_output::StructuredOutputRequest;
     use serde_json::json;
 
     fn sink_collecting(
@@ -1199,7 +1236,7 @@ mod tests {
             ChatMessage::system("also be brief"),
             ChatMessage::user("hi"),
         ];
-        let req = build_responses_request("gpt-5-codex", &messages, None, None);
+        let req = build_responses_request("gpt-5-codex", &messages, None, None, None);
         assert_eq!(
             req.instructions.as_deref(),
             Some("be helpful\n\nalso be brief")
@@ -1236,7 +1273,7 @@ mod tests {
             }]),
             ChatMessage::tool_result("fc_abc", "search", "no results"),
         ];
-        let req = build_responses_request("gpt-5-codex", &messages, None, None);
+        let req = build_responses_request("gpt-5-codex", &messages, None, None, None);
         assert_eq!(req.input.len(), 3);
         match &req.input[1] {
             ResponsesInputItem::FunctionCall {
@@ -1269,7 +1306,13 @@ mod tests {
                 parameters: json!({"type": "object", "properties": {}}),
             },
         }];
-        let req = build_responses_request("gpt-5", &[ChatMessage::user("hi")], Some(&tools), None);
+        let req = build_responses_request(
+            "gpt-5",
+            &[ChatMessage::user("hi")],
+            Some(&tools),
+            None,
+            None,
+        );
         let serialized = serde_json::to_value(&req).unwrap();
         let tools = serialized.get("tools").unwrap().as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1302,12 +1345,37 @@ mod tests {
             tool_call_id: None,
             name: None,
         }];
-        let req = build_responses_request("gpt-5", &messages, None, None);
+        let req = build_responses_request("gpt-5", &messages, None, None, None);
         assert_eq!(req.input.len(), 1);
         assert!(matches!(
             req.input[0],
             ResponsesInputItem::FunctionCall { .. }
         ));
+    }
+
+    #[test]
+    fn build_request_serializes_structured_output_format() {
+        let request = StructuredOutputRequest {
+            schema_name: "audit_result".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"]
+            }),
+            allow_coercion: false,
+        };
+        let req = build_responses_request(
+            "gpt-5",
+            &[ChatMessage::user("hi")],
+            None,
+            None,
+            Some(&request),
+        );
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(serialized["text"]["format"]["type"], "json_schema");
+        assert_eq!(serialized["text"]["format"]["name"], "audit_result");
+        assert_eq!(serialized["text"]["format"]["schema"]["type"], "object");
+        assert_eq!(serialized["text"]["format"]["strict"], true);
     }
 
     #[test]
@@ -1317,8 +1385,13 @@ mod tests {
         // to either the model's `default_reasoning_level` or None
         // before reaching here, so an explicit Some(_) here is direct
         // user intent and must appear on the wire.
-        let req =
-            build_responses_request("gpt-5.5", &[ChatMessage::user("hi")], None, Some("xhigh"));
+        let req = build_responses_request(
+            "gpt-5.5",
+            &[ChatMessage::user("hi")],
+            None,
+            Some("xhigh"),
+            None,
+        );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(
             serialized.get("reasoning"),
@@ -1332,7 +1405,7 @@ mod tests {
         // skip_serializing_if=Option::is_none so it must not appear at
         // all (vs. being present with a null/empty value, which the
         // server would reject as an invalid effort).
-        let req = build_responses_request("gpt-5.5", &[ChatMessage::user("hi")], None, None);
+        let req = build_responses_request("gpt-5.5", &[ChatMessage::user("hi")], None, None, None);
         let serialized = serde_json::to_value(&req).unwrap();
         assert!(
             serialized.get("reasoning").is_none(),

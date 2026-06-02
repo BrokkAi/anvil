@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    OpenAiClient, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::trace_logging::append_trace_record;
 
@@ -103,11 +103,14 @@ impl std::fmt::Debug for BedrockClient {
 
 impl BedrockClient {
     pub fn new(bearer_token: String, region: String, default_model: String) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .build()
-            .expect("failed to build Bedrock HTTP client");
+        let http = OpenAiClient::apply_runtime_tls_workarounds(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600)),
+            "https://bedrock-runtime.amazonaws.com",
+        )
+        .build()
+        .expect("failed to build Bedrock HTTP client");
         Self {
             bearer_token,
             region,
@@ -130,6 +133,7 @@ impl BedrockClient {
             messages,
             tools,
             reasoning_effort: _,
+            structured_output: _,
             mut on_token,
             on_thought: _,
             cancel,

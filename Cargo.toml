@@ -15,6 +15,10 @@ repository = "https://github.com/BrokkAi/anvil"
 homepage = "https://github.com/BrokkAi/anvil"
 readme = "README.md"
 
+[features]
+default = ["wasm-sandbox"]
+wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
 [[bin]]
 name = "anvil"
 path = "src/main.rs"
@@ -29,8 +33,8 @@ brokk-acp-sandbox = "0.1.0"
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.
-wasmtime = { version = "44", default-features = false, features = ["cranelift", "cache", "parallel-compilation", "component-model", "runtime"] }
-wasmtime-wasi = "44"
+wasmtime = { version = "44", optional = true, default-features = false, features = ["cranelift", "cache", "parallel-compilation", "component-model", "runtime"] }
+wasmtime-wasi = { version = "44", optional = true }
 zip = "8"
 futures = "0.3"
 regex = "1"
@@ -38,12 +42,14 @@ reqwest = { version = "0.13", features = ["stream", "json", "cookies", "form"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jsonschema = "0.18"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+rustls-native-certs = "0.8"
 # Codex login. We deliberately avoid single-maintainer credential crates:
 # `oauth2` is the de-facto Rust OAuth2 implementation (~32M downloads,
 # depended on by Servo etc.) and gives us PKCE + refresh. The RFC 8693
@@ -75,7 +81,6 @@ tiktoken-rs = "0.7"
 # applied to `runShellCommand`. See `tools/shell.rs::apply_rlimits`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
 [dev-dependencies]
 # `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
 # used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.

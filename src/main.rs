@@ -23,6 +23,7 @@ mod sandbox_backend;
 mod session;
 mod setup_state;
 mod skills;
+mod structured_output;
 mod tokens;
 mod tool_loop;
 mod tools;
@@ -386,6 +387,13 @@ async fn main() -> Result<()> {
     match &strategy {
         crate::sandbox_backend::SandboxBackend::OsNative if os_available => {
             tracing::info!("sandbox strategy: OsNative (OS sandbox + native parsing)");
+        }
+        crate::sandbox_backend::SandboxBackend::OsNative
+            if !crate::sandbox_backend::wasm_sandbox_compiled() =>
+        {
+            tracing::info!(
+                "sandbox strategy: OsNative (no OS sandbox available, wasm sandbox support not compiled into this build)"
+            );
         }
         crate::sandbox_backend::SandboxBackend::OsNative => {
             tracing::info!(

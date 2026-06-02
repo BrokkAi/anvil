@@ -17,15 +17,19 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::discovery::{
     DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discover_ollama_model_metadata,
     discovery_http_client, split_wire_id,
 };
 use crate::llm_client::{LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest};
+
+const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// LLM backend that routes by `<source>::<id>` prefix. Any inner backend
 /// may be absent (e.g. no `auth.json`, no `OPENROUTER_API_KEY`, or no
@@ -121,6 +125,133 @@ impl MultiBackend {
         self.openrouter.read().unwrap().clone()
     }
 
+    async fn list_model_metadata_inner(
+        &self,
+        progress: Option<UnboundedSender<String>>,
+    ) -> Result<Vec<ModelMetadata>> {
+        if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log("Snapshotting configured backends...");
+            let _ = tx.send("Snapshotting configured backends...\n".to_string());
+        }
+        let bedrock = self.bedrock.clone();
+        let codex = self.codex_snapshot();
+        let openrouter = self.openrouter_snapshot();
+        if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log("Building discovery HTTP client...");
+            let _ = tx.send("Building discovery HTTP client...\n".to_string());
+        }
+        let http = discovery_http_client();
+        if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log("Launching provider checks...");
+            let _ = tx.send("Launching provider checks...\n".to_string());
+        }
+
+        let (bedrock_metadata, codex_metadata, openrouter_metadata, ollama_metadata) = tokio::join!(
+            discover_backend_metadata("Bedrock", bedrock, progress.clone()),
+            discover_backend_metadata("Codex", codex, progress.clone()),
+            discover_backend_metadata("OpenRouter", openrouter, progress.clone()),
+            discover_ollama_metadata(&http, progress.clone()),
+        );
+        if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log(
+                "Provider checks finished. Merging catalogs...",
+            );
+            let _ = tx.send("Provider checks finished. Merging catalogs...\n".to_string());
+        }
+
+        let bedrock_by_id: HashMap<String, ModelMetadata> = bedrock_metadata
+            .iter()
+            .map(|m| (m.id.clone(), m.clone()))
+            .collect();
+        let bedrock_ids: Vec<String> = bedrock_metadata.iter().map(|m| m.id.clone()).collect();
+        let bedrock_lookup = || async move { Ok::<_, anyhow::Error>(bedrock_ids) };
+
+        let codex_by_id: HashMap<String, ModelMetadata> = codex_metadata
+            .iter()
+            .map(|m| (m.id.clone(), m.clone()))
+            .collect();
+        let codex_ids: Vec<String> = codex_metadata.iter().map(|m| m.id.clone()).collect();
+        let codex_lookup = || async move { Ok::<_, anyhow::Error>(codex_ids) };
+
+        let openrouter_by_id: HashMap<String, ModelMetadata> = openrouter_metadata
+            .iter()
+            .map(|m| (m.id.clone(), m.clone()))
+            .collect();
+        let openrouter_ids: Vec<String> =
+            openrouter_metadata.iter().map(|m| m.id.clone()).collect();
+        let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
+
+        let discovered: Vec<DiscoveredModel> = discover_all(
+            &http,
+            OLLAMA_DEFAULT_URL,
+            bedrock_lookup,
+            codex_lookup,
+            openrouter_lookup,
+        )
+        .await;
+        if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "Merged discovery results: {} model(s).",
+                discovered.len()
+            ));
+            let _ = tx.send(format!(
+                "Merged discovery results: {} model(s).\n",
+                discovered.len()
+            ));
+        }
+        Ok(discovered
+            .into_iter()
+            .map(|m| {
+                let wire = m.wire_id();
+                match m.source {
+                    ModelSource::Bedrock => bedrock_by_id
+                        .get(&m.id)
+                        .map(|meta| ModelMetadata {
+                            id: wire.clone(),
+                            default_reasoning_level: meta.default_reasoning_level.clone(),
+                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            context_length: meta.context_length,
+                        })
+                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
+                    ModelSource::Codex => codex_by_id
+                        .get(&m.id)
+                        .map(|meta| ModelMetadata {
+                            id: wire.clone(),
+                            default_reasoning_level: meta.default_reasoning_level.clone(),
+                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            context_length: meta.context_length,
+                        })
+                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
+                    ModelSource::Ollama => ollama_metadata
+                        .get(&m.id)
+                        .map(|meta| ModelMetadata {
+                            id: wire.clone(),
+                            default_reasoning_level: meta.default_reasoning_level.clone(),
+                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            context_length: meta.context_length,
+                        })
+                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
+                    ModelSource::OpenRouter => openrouter_by_id
+                        .get(&m.id)
+                        .map(|meta| ModelMetadata {
+                            id: wire.clone(),
+                            default_reasoning_level: meta.default_reasoning_level.clone(),
+                            supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            context_length: meta.context_length,
+                        })
+                        .unwrap_or_else(|| ModelMetadata::id_only(wire)),
+                }
+            })
+            .collect())
+    }
+
+    pub async fn list_model_metadata_with_progress(
+        &self,
+        progress: Option<UnboundedSender<String>>,
+    ) -> Result<Vec<ModelMetadata>> {
+        self.list_model_metadata_inner(progress).await
+    }
+
     fn pick(&self, source: ModelSource) -> Option<Arc<dyn LlmBackend>> {
         match source {
             ModelSource::Bedrock => self.bedrock.clone(),
@@ -196,108 +327,7 @@ impl LlmBackend for MultiBackend {
     }
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
-        Box::pin(async move {
-            let bedrock_metadata: Vec<ModelMetadata> = match &self.bedrock {
-                Some(b) => b.list_model_metadata().await.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            let bedrock_by_id: HashMap<String, ModelMetadata> = bedrock_metadata
-                .iter()
-                .map(|m| (m.id.clone(), m.clone()))
-                .collect();
-            let bedrock_ids: Vec<String> = bedrock_metadata.iter().map(|m| m.id.clone()).collect();
-            let bedrock_lookup = || async move { Ok::<_, anyhow::Error>(bedrock_ids) };
-
-            // Snapshot the Codex backend once and pull its enriched
-            // catalog (slugs + per-model reasoning presets). Holding
-            // only an `Arc` clone here means a concurrent
-            // `install_codex` doesn't perturb this discovery pass.
-            let codex = self.codex_snapshot();
-            let codex_metadata: Vec<ModelMetadata> = match &codex {
-                Some(c) => c.list_model_metadata().await.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            // Index by bare slug so we can re-attach reasoning data
-            // to the wire-prefixed records returned by discover_all.
-            let codex_by_id: HashMap<String, ModelMetadata> = codex_metadata
-                .iter()
-                .map(|m| (m.id.clone(), m.clone()))
-                .collect();
-            // Hand discover_all the bare slugs we already have so we
-            // don't hit `/models` twice during a single list call.
-            let codex_ids: Vec<String> = codex_metadata.iter().map(|m| m.id.clone()).collect();
-            let codex_lookup = || async move { Ok::<_, anyhow::Error>(codex_ids) };
-
-            // OpenRouter catalog entries now carry reasoning metadata for
-            // reasoning-capable models. We snapshot it once, then hand
-            // discover_all the bare ids so source tagging stays uniform.
-            let openrouter = self.openrouter_snapshot();
-            let openrouter_metadata: Vec<ModelMetadata> = match &openrouter {
-                Some(or) => or.list_model_metadata().await.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            let openrouter_by_id: HashMap<String, ModelMetadata> = openrouter_metadata
-                .iter()
-                .map(|m| (m.id.clone(), m.clone()))
-                .collect();
-            let openrouter_ids: Vec<String> =
-                openrouter_metadata.iter().map(|m| m.id.clone()).collect();
-            let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
-            let http = discovery_http_client();
-            let ollama_metadata = discover_ollama_model_metadata(&http, OLLAMA_DEFAULT_URL).await;
-            let discovered: Vec<DiscoveredModel> = discover_all(
-                &http,
-                OLLAMA_DEFAULT_URL,
-                bedrock_lookup,
-                codex_lookup,
-                openrouter_lookup,
-            )
-            .await;
-            Ok(discovered
-                .into_iter()
-                .map(|m| {
-                    let wire = m.wire_id();
-                    match m.source {
-                        ModelSource::Bedrock => bedrock_by_id
-                            .get(&m.id)
-                            .map(|meta| ModelMetadata {
-                                id: wire.clone(),
-                                default_reasoning_level: meta.default_reasoning_level.clone(),
-                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                                context_length: meta.context_length,
-                            })
-                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                        ModelSource::Codex => codex_by_id
-                            .get(&m.id)
-                            .map(|meta| ModelMetadata {
-                                id: wire.clone(),
-                                default_reasoning_level: meta.default_reasoning_level.clone(),
-                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                                context_length: meta.context_length,
-                            })
-                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                        ModelSource::Ollama => ollama_metadata
-                            .get(&m.id)
-                            .map(|meta| ModelMetadata {
-                                id: wire.clone(),
-                                default_reasoning_level: meta.default_reasoning_level.clone(),
-                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                                context_length: meta.context_length,
-                            })
-                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                        ModelSource::OpenRouter => openrouter_by_id
-                            .get(&m.id)
-                            .map(|meta| ModelMetadata {
-                                id: wire.clone(),
-                                default_reasoning_level: meta.default_reasoning_level.clone(),
-                                supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
-                                context_length: meta.context_length,
-                            })
-                            .unwrap_or_else(|| ModelMetadata::id_only(wire)),
-                    }
-                })
-                .collect())
-        })
+        Box::pin(self.list_model_metadata_inner(None))
     }
 
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
@@ -308,6 +338,82 @@ impl LlmBackend for MultiBackend {
             request.model = bare;
             backend.stream_chat(request).await
         })
+    }
+}
+
+async fn discover_backend_metadata(
+    label: &'static str,
+    backend: Option<Arc<dyn LlmBackend>>,
+    progress: Option<UnboundedSender<String>>,
+) -> Vec<ModelMetadata> {
+    let Some(backend) = backend else {
+        if let Some(tx) = &progress {
+            let _ = tx.send(format!("{label}: not configured.\n"));
+        }
+        return Vec::new();
+    };
+
+    if let Some(tx) = &progress {
+        let _ = tx.send(format!("{label}: checking...\n"));
+    }
+
+    match tokio::time::timeout(PROVIDER_DISCOVERY_TIMEOUT, backend.list_model_metadata()).await {
+        Ok(Ok(metadata)) => {
+            if let Some(tx) = &progress {
+                let _ = tx.send(format!("{label}: {} model(s).\n", metadata.len()));
+            }
+            metadata
+        }
+        Ok(Err(e)) => {
+            tracing::info!("{label} model discovery skipped: {e:#}");
+            if let Some(tx) = &progress {
+                let _ = tx.send(format!("{label}: unavailable.\n"));
+            }
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{label} model discovery timed out after {:?}",
+                PROVIDER_DISCOVERY_TIMEOUT
+            );
+            if let Some(tx) = &progress {
+                let _ = tx.send(format!("{label}: timed out.\n"));
+            }
+            Vec::new()
+        }
+    }
+}
+
+async fn discover_ollama_metadata(
+    http: &reqwest::Client,
+    progress: Option<UnboundedSender<String>>,
+) -> HashMap<String, ModelMetadata> {
+    if let Some(tx) = &progress {
+        let _ = tx.send("Local models: checking...\n".to_string());
+    }
+
+    match tokio::time::timeout(
+        PROVIDER_DISCOVERY_TIMEOUT,
+        discover_ollama_model_metadata(http, OLLAMA_DEFAULT_URL),
+    )
+    .await
+    {
+        Ok(metadata) => {
+            if let Some(tx) = &progress {
+                let _ = tx.send(format!("Local models: {} model(s).\n", metadata.len()));
+            }
+            metadata
+        }
+        Err(_) => {
+            tracing::warn!(
+                "ollama model metadata discovery timed out after {:?}",
+                PROVIDER_DISCOVERY_TIMEOUT
+            );
+            if let Some(tx) = &progress {
+                let _ = tx.send("Local models: timed out.\n".to_string());
+            }
+            HashMap::new()
+        }
     }
 }
 
@@ -323,6 +429,7 @@ mod tests {
             messages: vec![],
             tools: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
+            structured_output: None,
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -380,6 +487,22 @@ mod tests {
                 last_reasoning_effort,
             },
         )
+    }
+
+    struct HangingBackend;
+
+    impl LlmBackend for HangingBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            futures::future::pending().boxed()
+        }
+
+        fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
+            futures::future::pending().boxed()
+        }
+
+        fn stream_chat(&self, _request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            async move { anyhow::bail!("stream_chat should not be called in this test") }.boxed()
+        }
     }
 
     /// Wire ids tagged `codex::` route to the Codex backend with the bare
@@ -720,6 +843,19 @@ mod tests {
                 .as_deref(),
             Some("xhigh"),
             "reasoning_effort must arrive at the inner backend unchanged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_models_times_out_stuck_provider_and_keeps_healthy_ones() {
+        let hanging: Arc<dyn LlmBackend> = Arc::new(HangingBackend);
+        let (openrouter_backend, _openrouter_handles) = recording("openrouter");
+        let multi = MultiBackend::new(None, Some(hanging), Some(openrouter_backend), None);
+
+        let models = multi.list_models().await.expect("discovery must succeed");
+        assert!(
+            models.iter().any(|m| m == "openrouter::openrouter-stub"),
+            "healthy provider should still contribute models: got {models:?}"
         );
     }
 }

@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::structured_output::StructuredOutputRequest;
+
 /// Default value for the `--llm-idle-timeout-secs` CLI flag (and the
 /// env var `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS`). The actual value used
 /// per request is a required parameter on `LlmBackend::stream_chat` --
@@ -34,6 +36,11 @@ pub const MIN_IDLE_CHUNK_TIMEOUT_SECS: u64 = 1;
 /// LLM prompt processing on consumer hardware and stops a typo'd huge
 /// number from effectively disabling the stall detector.
 pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
+
+/// `/models` discovery should fail fast. Chat requests can legitimately
+/// run for minutes; setup refreshes should not inherit that wall-clock.
+const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
+const MODEL_DISCOVERY_TASK_TIMEOUT_SECS: u64 = 20;
 
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
@@ -147,6 +154,7 @@ pub struct StreamChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub reasoning_effort: Option<String>,
+    pub structured_output: Option<StructuredOutputRequest>,
     pub on_token: TokenSink,
     pub on_thought: TokenSink,
     pub cancel: CancellationToken,
@@ -482,6 +490,8 @@ struct ChatCompletionRequest {
     /// Serialized as OpenRouter/Ollama's unified `reasoning` object.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ChatCompletionResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -492,6 +502,19 @@ struct StreamOptions {
 #[derive(Debug, Serialize)]
 struct ReasoningConfig {
     effort: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionResponseFormat {
+    r#type: &'static str,
+    json_schema: NativeJsonSchemaFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeJsonSchemaFormat {
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,6 +771,7 @@ pub struct OpenAiClient {
     /// Enabled for OpenRouter and Ollama models that declare reasoning
     /// support.
     supports_reasoning_effort: bool,
+    supports_native_structured_output: bool,
 }
 
 impl std::fmt::Debug for OpenAiClient {
@@ -756,11 +780,67 @@ impl std::fmt::Debug for OpenAiClient {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("supports_reasoning_effort", &self.supports_reasoning_effort)
+            .field(
+                "supports_native_structured_output",
+                &self.supports_native_structured_output,
+            )
             .finish()
     }
 }
 
 impl OpenAiClient {
+    #[cfg(target_os = "android")]
+    pub fn apply_runtime_tls_workarounds(
+        mut builder: reqwest::ClientBuilder,
+        target: &str,
+    ) -> reqwest::ClientBuilder {
+        if target.starts_with("https://") {
+            let native = rustls_native_certs::load_native_certs();
+            tracing::info!(
+                target,
+                certs = native.certs.len(),
+                errors = native.errors.len(),
+                "using native certs with tls_certs_only() for Android HTTPS client"
+            );
+            if target.contains("openrouter.ai") {
+                crate::openrouter_auth::append_refresh_log(&format!(
+                    "Android HTTPS workaround for {target}: {} cert(s), {} error(s)",
+                    native.certs.len(),
+                    native.errors.len()
+                ));
+            }
+            let certs = native
+                .certs
+                .into_iter()
+                .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
+                    Ok(cert) => Some(cert),
+                    Err(e) => {
+                        tracing::warn!(
+                            target,
+                            "skipping native cert during reqwest conversion: {e}"
+                        );
+                        if target.contains("openrouter.ai") {
+                            crate::openrouter_auth::append_refresh_log(&format!(
+                                "OpenRouter native cert conversion skipped one cert: {e}"
+                            ));
+                        }
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            builder = builder.tls_certs_only(certs);
+        }
+        builder
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn apply_runtime_tls_workarounds(
+        builder: reqwest::ClientBuilder,
+        _target: &str,
+    ) -> reqwest::ClientBuilder {
+        builder
+    }
+
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
         Self::with_default_headers(base_url, api_key, reqwest::header::HeaderMap::new())
     }
@@ -775,18 +855,32 @@ impl OpenAiClient {
         api_key: Option<String>,
         default_headers: reqwest::header::HeaderMap,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .default_headers(default_headers)
-            .build()
-            .expect("failed to build HTTP client");
         let base_url = base_url.trim_end_matches('/').to_string();
+        let openrouter_mode = base_url.contains("openrouter.ai");
+        let supports_native_structured_output = supports_native_structured_output(&base_url);
+        let mut builder = Self::apply_runtime_tls_workarounds(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(600))
+                .default_headers(default_headers),
+            &base_url,
+        );
+        if openrouter_mode {
+            crate::openrouter_auth::append_refresh_log(
+                "Configuring OpenRouter reqwest client: native certs + tls_certs_only + http1_only + connection_verbose + no idle pool",
+            );
+            builder = builder
+                .http1_only()
+                .connection_verbose(true)
+                .pool_max_idle_per_host(0);
+        }
+        let http = builder.build().expect("failed to build HTTP client");
         Self {
             base_url,
             api_key,
             http,
             supports_reasoning_effort: false,
+            supports_native_structured_output,
         }
     }
 
@@ -836,27 +930,99 @@ impl LlmBackend for OpenAiClient {
 impl OpenAiClient {
     async fn fetch_models_response(&self) -> Result<ModelsResponse> {
         let url = self.api_url("/models");
-
-        let resp = crate::http_retry::send_with_retries(
-            "fetching models",
-            || {
-                let mut req = self.http.get(&url);
-                if let Some(key) = &self.api_key {
-                    req = req.bearer_auth(key);
+        let trace_openrouter = self.base_url.contains("openrouter.ai");
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: building GET {url}"
+            ));
+        }
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let url_for_task = url.clone();
+        let trace_for_task = trace_openrouter;
+        let mut send_task = tokio::spawn(async move {
+            let mut req = http
+                .get(&url_for_task)
+                .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS));
+            if let Some(key) = &api_key {
+                req = req.bearer_auth(key);
+            }
+            if trace_for_task {
+                crate::openrouter_auth::append_refresh_log(
+                    "OpenRouter fetch_models_response: calling req.send()",
+                );
+            }
+            req.send()
+                .await
+                .with_context(|| format!("GET {url_for_task}"))
+        });
+        let resp = tokio::select! {
+            joined = &mut send_task => {
+                match joined {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        if trace_openrouter {
+                            crate::openrouter_auth::append_refresh_log(&format!(
+                                "OpenRouter fetch_models_response: send task join error: {e}"
+                            ));
+                        }
+                        anyhow::bail!("OpenRouter /models send task failed: {e}");
+                    }
                 }
-                req
-            },
-            None,
-        )
-        .await?;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(MODEL_DISCOVERY_TASK_TIMEOUT_SECS)) => {
+                if trace_openrouter {
+                    crate::openrouter_auth::append_refresh_log(
+                        "OpenRouter fetch_models_response: send task timed out; aborting task",
+                    );
+                }
+                send_task.abort();
+                anyhow::bail!(
+                    "GET {url} timed out after {}s waiting for req.send task",
+                    MODEL_DISCOVERY_TASK_TIMEOUT_SECS
+                );
+            }
+        };
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: req.send() returned",
+            );
+        }
         let status = resp.status();
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: HTTP {status}"
+            ));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            if trace_openrouter {
+                crate::openrouter_auth::append_refresh_log(&format!(
+                    "OpenRouter fetch_models_response: error body length {}",
+                    body.len()
+                ));
+            }
             tracing::warn!("model discovery failed (HTTP {status}): {body}");
             anyhow::bail!("model discovery failed (HTTP {status})");
         }
 
-        resp.json().await.context("failed to parse models response")
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter fetch_models_response: parsing JSON body",
+            );
+        }
+        let parsed: ModelsResponse = resp
+            .json()
+            .await
+            .context("failed to parse models response")?;
+        if trace_openrouter {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter fetch_models_response: parsed {} model entries",
+                parsed.data.len()
+            ));
+        }
+        Ok(parsed)
     }
 
     async fn list_models_impl(&self) -> Result<Vec<String>> {
@@ -865,7 +1031,17 @@ impl OpenAiClient {
     }
 
     async fn list_model_metadata_impl(&self) -> Result<Vec<ModelMetadata>> {
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter list_model_metadata_impl: start",
+            );
+        }
         let models = self.fetch_models_response().await?;
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(
+                "OpenRouter list_model_metadata_impl: fetched models response",
+            );
+        }
         if !self.supports_reasoning_effort {
             return Ok(models
                 .data
@@ -878,11 +1054,18 @@ impl OpenAiClient {
                 })
                 .collect());
         }
-        Ok(models
+        let metadata = models
             .data
             .into_iter()
             .map(|model| model.to_model_metadata())
-            .collect())
+            .collect::<Vec<_>>();
+        if self.base_url.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter list_model_metadata_impl: built {} metadata entries",
+                metadata.len()
+            ));
+        }
+        Ok(metadata)
     }
 
     async fn stream_chat_impl(&self, request: StreamChatRequest) -> Result<LlmResponse> {
@@ -891,6 +1074,7 @@ impl OpenAiClient {
             messages,
             tools,
             reasoning_effort,
+            structured_output,
             on_token,
             on_thought: _on_thought,
             cancel,
@@ -901,6 +1085,21 @@ impl OpenAiClient {
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
         let reasoning = reasoning_effort.map(|effort| ReasoningConfig { effort });
+        let response_format = if self.supports_native_structured_output {
+            structured_output
+                .as_ref()
+                .map(crate::structured_output::native_response_format)
+                .map(|format| ChatCompletionResponseFormat {
+                    r#type: "json_schema",
+                    json_schema: NativeJsonSchemaFormat {
+                        name: format.name,
+                        schema: format.schema,
+                        strict: format.strict,
+                    },
+                })
+        } else {
+            None
+        };
 
         let body = ChatCompletionRequest {
             model,
@@ -914,6 +1113,7 @@ impl OpenAiClient {
             tools,
             tool_choice,
             reasoning,
+            response_format,
         };
 
         let resp = crate::http_retry::send_with_retries(
@@ -940,6 +1140,10 @@ impl OpenAiClient {
 
         drive_sse_stream(stream, on_token, cancel, idle_timeout).await
     }
+}
+
+fn supports_native_structured_output(base_url: &str) -> bool {
+    base_url.contains("api.openai.com") || base_url.contains("openrouter.ai")
 }
 
 /// Drive an SSE byte stream until the LLM emits `[DONE]`, the stream
@@ -1081,6 +1285,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structured_output::StructuredOutputRequest;
     use futures::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1138,6 +1343,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hello")],
                 tools: None,
                 reasoning_effort: None,
+                structured_output: None,
                 on_token,
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
@@ -1548,6 +1754,51 @@ mod tests {
             debug.contains("[REDACTED]"),
             "api_key must be redacted from Debug output: {debug}"
         );
+    }
+
+    #[test]
+    fn chat_completion_request_serializes_response_format_when_present() {
+        let format = crate::structured_output::native_response_format(&StructuredOutputRequest {
+            schema_name: "audit_result".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"]
+            }),
+            allow_coercion: false,
+        });
+        let body = ChatCompletionRequest {
+            model: "gpt-4.1".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: Some(ChatCompletionResponseFormat {
+                r#type: "json_schema",
+                json_schema: NativeJsonSchemaFormat {
+                    name: format.name,
+                    schema: format.schema,
+                    strict: format.strict,
+                },
+            }),
+        };
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert_eq!(serialized["response_format"]["type"], "json_schema");
+        assert_eq!(
+            serialized["response_format"]["json_schema"]["name"],
+            "audit_result"
+        );
+        assert_eq!(
+            serialized["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+        assert_eq!(serialized["response_format"]["json_schema"]["strict"], true);
     }
 
     /// OpenRouter's `/v1/models` response carries strictly more fields

@@ -26,6 +26,8 @@ use chrono::{DateTime, Utc};
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::{Deserialize, Serialize};
 
+use crate::llm_client::OpenAiClient;
+
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -205,10 +207,12 @@ pub(crate) fn urlencode(s: &str) -> String {
 }
 
 fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building reqwest client")
+    OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        TOKEN_URL,
+    )
+    .build()
+    .context("building reqwest client")
 }
 
 async fn exchange_code_for_tokens(

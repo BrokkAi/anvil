@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::ModelMetadata;
+use crate::structured_output::StructuredOutputResult;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
@@ -337,6 +338,9 @@ pub struct ConversationTurn {
     /// answer and may repeat searches/reads/writes it already performed
     /// in the prior turn (#3409).
     pub tool_exchanges: Vec<ToolExchange>,
+    /// Structured-output validation result for this turn's final
+    /// assistant response, when requested through ACP `_meta`.
+    pub structured_output: Option<StructuredOutputResult>,
     /// LLM-produced summary of this turn, when one has been generated
     /// by the compression engine. When set, `build_prompt_messages`
     /// substitutes the summary for this turn's verbatim
@@ -846,6 +850,11 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                 .and_then(|fragment_id| summary_content_ids.get(fragment_id))
                 .and_then(|sid| content_map.get(sid))
                 .cloned();
+            let structured_output = task
+                .get("structuredOutputContentId")
+                .and_then(|v| v.as_str())
+                .and_then(|sid| content_map.get(sid))
+                .and_then(|raw| serde_json::from_str::<StructuredOutputResult>(raw).ok());
 
             // Try markdownContentId first (newer format: pre-rendered markdown)
             if let Some(content_id) = task.get("markdownContentId").and_then(|v| v.as_str())
@@ -867,6 +876,7 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                     user_prompt,
                     agent_response: text.clone(),
                     tool_exchanges: exchanges,
+                    structured_output,
                     summary,
                     fragment_id,
                 });
@@ -900,6 +910,7 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                         user_prompt: user_text,
                         agent_response: assistant_text,
                         tool_exchanges: exchanges,
+                        structured_output: structured_output.clone(),
                         summary: summary.clone(),
                         fragment_id: fragment_id.clone(),
                     });
@@ -1361,6 +1372,10 @@ fn append_turn_to_zip(
         .summary
         .as_ref()
         .map(|_| uuid::Uuid::new_v4().to_string());
+    let structured_output_content_id: Option<String> = turn
+        .structured_output
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
 
     // Build the messages array: user message, then tool_call/tool_result
     // pairs (one of each per exchange) interleaved per the OpenAI wire
@@ -1408,6 +1423,7 @@ fn append_turn_to_zip(
                 "messages": messages_json,
                 "taskDescription": null,
                 "markdownContentId": response_content_id,
+                "structuredOutputContentId": structured_output_content_id,
                 "escapeHtml": false
             }),
         );
@@ -1485,6 +1501,13 @@ fn append_turn_to_zip(
         {
             writer.start_file(format!("content/{sid}.txt"), options)?;
             writer.write_all(summary_text.as_bytes())?;
+        }
+        if let (Some(sid), Some(structured_output)) = (
+            structured_output_content_id.as_ref(),
+            turn.structured_output.as_ref(),
+        ) {
+            writer.start_file(format!("content/{sid}.txt"), options)?;
+            writer.write_all(serde_json::to_string(structured_output)?.as_bytes())?;
         }
 
         Ok(())
@@ -4526,6 +4549,7 @@ done
                             arguments: format!(r#"{{"i":{i}}}"#),
                             result: format!("r-{i}"),
                         }],
+                        structured_output: None,
                         summary: None,
                         fragment_id: None,
                     },
@@ -4595,6 +4619,7 @@ done
                     user_prompt: "explore the repo".into(),
                     agent_response: "found one file".into(),
                     tool_exchanges: exchanges.clone(),
+                    structured_output: None,
                     summary: None,
                     fragment_id: None,
                 },
@@ -4626,6 +4651,62 @@ done
         assert_eq!(xyz.tool_name, "grep_search");
         assert_eq!(xyz.arguments, r#"{"pattern":"TODO"}"#);
         assert_eq!(xyz.result, "no matches");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn add_turn_round_trips_structured_output_through_zip() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-structured-output-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+
+        store
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "emit json".into(),
+                    agent_response: r#"{"answer":"ok"}"#.into(),
+                    tool_exchanges: Vec::new(),
+                    structured_output: Some(StructuredOutputResult::CoercedSuccess(
+                        crate::structured_output::StructuredOutputCoercedSuccess {
+                            schema_name: "audit_result".into(),
+                            validated_output: serde_json::json!({"answer":"one\ntwo"}),
+                            coercions: vec!["response.answer array -> string".into()],
+                            coercion_requested: true,
+                        },
+                    )),
+                    summary: None,
+                    fragment_id: None,
+                },
+            )
+            .await
+            .expect("persist must succeed");
+
+        let on_disk = read_history_from_zip(&session_zip_path(&cwd, &s.id));
+        assert_eq!(on_disk.len(), 1);
+        match on_disk[0]
+            .structured_output
+            .as_ref()
+            .expect("structured output present")
+        {
+            StructuredOutputResult::CoercedSuccess(success) => {
+                assert_eq!(success.schema_name, "audit_result");
+                assert_eq!(success.validated_output["answer"], "one\ntwo");
+                assert_eq!(success.coercions, vec!["response.answer array -> string"]);
+                assert!(success.coercion_requested);
+            }
+            other => panic!("expected coerced success, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

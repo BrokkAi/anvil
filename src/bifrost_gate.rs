@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::discovery::{OPENROUTER_API_KEY_ENV, OPENROUTER_BASE_URL};
-use crate::llm_client::{ChatMessage, ToolDefinition};
+use crate::llm_client::{ChatMessage, OpenAiClient, ToolDefinition};
 use crate::openrouter_auth;
 use crate::session::ToolExchange;
 
@@ -948,11 +948,14 @@ pub async fn classify_text_tool_call(
     let model = classifier_model();
     let body = build_request_body(&model, &context)?;
     let retry_body = build_request_retry_body(&model, &context)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(CLASSIFIER_TIMEOUT)
-        .build()
-        .context("building OpenRouter classifier client")?;
+    let client = OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(CLASSIFIER_TIMEOUT),
+        OPENROUTER_BASE_URL,
+    )
+    .build()
+    .context("building OpenRouter classifier client")?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..2 {
@@ -994,11 +997,14 @@ pub async fn classify_shell_tool_call(
     let model = classifier_model();
     let body = build_shell_request_body(&model, &context)?;
     let retry_body = build_shell_request_retry_body(&model, &context)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(CLASSIFIER_TIMEOUT)
-        .build()
-        .context("building OpenRouter shell classifier client")?;
+    let client = OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(CLASSIFIER_TIMEOUT),
+        OPENROUTER_BASE_URL,
+    )
+    .build()
+    .context("building OpenRouter shell classifier client")?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..2 {

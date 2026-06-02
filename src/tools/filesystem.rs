@@ -1036,13 +1036,26 @@ mod tests {
             100,
             Some(crate::sandbox_backend::SandboxMode::Wasm),
         );
-        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
-        assert!(r.output.contains("hit+one.txt:1: needle"));
-        assert!(
-            !r.output.contains("miss.txt"),
-            "wasm single-file search must stay scoped to the requested file, got: {}",
-            r.output
-        );
+        if crate::sandbox_backend::wasm_sandbox_compiled() {
+            assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+            assert!(r.output.contains("hit+one.txt:1: needle"));
+            assert!(
+                !r.output.contains("miss.txt"),
+                "wasm single-file search must stay scoped to the requested file, got: {}",
+                r.output
+            );
+        } else {
+            assert!(
+                matches!(r.status, ToolStatus::InternalError),
+                "{}",
+                r.output
+            );
+            assert!(
+                r.output.contains("not compiled into this build"),
+                "{}",
+                r.output
+            );
+        }
         std::fs::remove_dir_all(&cwd).ok();
     }
 
