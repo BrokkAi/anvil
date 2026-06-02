@@ -697,6 +697,8 @@ fn source_count(catalog: &[ModelMetadata], source: ModelSource) -> usize {
         .count()
 }
 
+const MODEL_REFRESH_LOCK_WAIT: Duration = Duration::from_secs(2);
+
 fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
     [
         ModelSource::Bedrock,
@@ -2828,7 +2830,15 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             handle_setup_choose(ctx.cx, ctx.sessions, session_id, ctx.llm, ctx.refresh_lock).await
         }
         "refresh" | "try-again" => {
-            match refresh_model_catalog_now(ctx.llm, ctx.sessions, ctx.refresh_lock).await {
+            match refresh_model_catalog_now(
+                Some(ctx.cx),
+                Some(session_id),
+                ctx.llm,
+                ctx.sessions,
+                ctx.refresh_lock,
+            )
+            .await
+            {
                 Ok(_) => render_current_setup(ctx.sessions, session_id).await,
                 Err(e) => format!(
                     "Setup could not refresh models yet: {e}\n\n{}",
@@ -2860,7 +2870,15 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             .await
         }
         "openrouter" => {
-            handle_setup_openrouter(rest, ctx.llm, ctx.login_sessions, ctx.refresh_lock).await
+            handle_setup_openrouter(
+                ctx.cx,
+                session_id,
+                rest,
+                ctx.llm,
+                ctx.login_sessions,
+                ctx.refresh_lock,
+            )
+            .await
         }
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
@@ -2925,15 +2943,40 @@ async fn render_current_setup(sessions: &SessionStore, session_id: &str) -> Stri
 }
 
 async fn refresh_model_catalog_now(
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<Vec<ModelMetadata>, String> {
-    let _guard = refresh_lock.lock().await;
+    let _guard = tokio::time::timeout(MODEL_REFRESH_LOCK_WAIT, refresh_lock.lock())
+        .await
+        .map_err(|_| {
+            "another model refresh is already running; if it is wedged, wait a moment and try again"
+                .to_string()
+        })?;
+
+    let progress = cx.zip(session_id).map(|(cx, session_id)| {
+        send_message(cx, session_id, "Refreshing model catalog...\n");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let cx = cx.clone();
+        let session_id = session_id.to_string();
+        let relay = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                send_message(&cx, &session_id, &chunk);
+            }
+        });
+        (tx, relay)
+    });
+
     let models = llm
-        .list_model_metadata()
+        .list_model_metadata_with_progress(progress.as_ref().map(|(tx, _)| tx.clone()))
         .await
         .map_err(|e| format!("{e:#}"))?;
+    if let Some((tx, relay)) = progress {
+        drop(tx);
+        let _ = relay.await;
+    }
     if let Some(model) = preferred_model(&models) {
         sessions.set_default_model(model).await;
     }
@@ -2948,15 +2991,18 @@ async fn handle_setup_choose(
     llm: &Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> String {
-    let catalog = match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
-        Ok(models) => models,
-        Err(e) => {
-            return format!(
-                "Anvil could not find a working model yet: {e}\n\n\
+    let catalog =
+        match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock)
+            .await
+        {
+            Ok(models) => models,
+            Err(e) => {
+                return format!(
+                    "Anvil could not find a working model yet: {e}\n\n\
                  Try `/setup codex` if you use Codex, or `/setup local` for free local models."
-            );
-        }
-    };
+                );
+            }
+        };
     let Some(model) = preferred_model(&catalog) else {
         return format!(
             "Anvil could not find a working model yet.\n\n{}",
@@ -2991,7 +3037,9 @@ async fn handle_setup_local(
                 .to_string()
         }
         "refresh" | "try-again" => {
-            match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
+            match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock)
+                .await
+            {
                 Ok(catalog) => {
                     let local_count = source_count(&catalog, ModelSource::Ollama);
                     if local_count > 0 {
@@ -3022,6 +3070,8 @@ fn render_local_setup_help() -> String {
 }
 
 async fn handle_setup_openrouter(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
     rest: &str,
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
@@ -3032,7 +3082,15 @@ async fn handle_setup_openrouter(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        return match refresh_model_catalog_now(llm, sessions, refresh_lock).await {
+        return match refresh_model_catalog_now(
+            Some(cx),
+            Some(session_id),
+            llm,
+            sessions,
+            refresh_lock,
+        )
+        .await
+        {
             Ok(catalog) => {
                 let count = source_count(&catalog, ModelSource::OpenRouter);
                 if count > 0 {
