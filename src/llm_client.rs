@@ -35,6 +35,10 @@ pub const MIN_IDLE_CHUNK_TIMEOUT_SECS: u64 = 1;
 /// number from effectively disabling the stall detector.
 pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
 
+/// `/models` discovery should fail fast. Chat requests can legitimately
+/// run for minutes; setup refreshes should not inherit that wall-clock.
+const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
+
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
 
@@ -836,19 +840,14 @@ impl LlmBackend for OpenAiClient {
 impl OpenAiClient {
     async fn fetch_models_response(&self) -> Result<ModelsResponse> {
         let url = self.api_url("/models");
-
-        let resp = crate::http_retry::send_with_retries(
-            "fetching models",
-            || {
-                let mut req = self.http.get(&url);
-                if let Some(key) = &self.api_key {
-                    req = req.bearer_auth(key);
-                }
-                req
-            },
-            None,
-        )
-        .await?;
+        let mut req = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(MODEL_DISCOVERY_TIMEOUT_SECS));
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await.with_context(|| format!("GET {url}"))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
