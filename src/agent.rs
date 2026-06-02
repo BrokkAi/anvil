@@ -1214,6 +1214,7 @@ pub async fn run_agent(
                 // correctly. Built-ins are checked first so a skill
                 // that happens to name itself e.g. `context` or
                 // `setup` can never shadow them.
+                let slash_command = parse_slash_command(&raw_prompt_text);
                 let title_seed = snap
                     .history
                     .first()
@@ -1225,32 +1226,34 @@ pub async fn run_agent(
                 // work starts. The title depends only on the user's text, not
                 // on the model response, so there is no reason to defer it
                 // past the spawn below.
-                match sessions_prompt
-                    .maybe_rename_from_prompt(&session_id, &title_seed)
-                    .await
-                {
-                    Ok(renamed_title) => {
-                        if renamed_title.is_some()
-                            && let Some(metadata) =
-                                sessions_prompt.session_metadata(&session_id).await
-                        {
-                            send_session_info_update(
-                                &cx,
-                                &session_id,
-                                renamed_title,
-                                metadata.updated_at,
+                if should_auto_rename_session_from_prompt(&raw_prompt_text) {
+                    match sessions_prompt
+                        .maybe_rename_from_prompt(&session_id, &title_seed)
+                        .await
+                    {
+                        Ok(renamed_title) => {
+                            if renamed_title.is_some()
+                                && let Some(metadata) =
+                                    sessions_prompt.session_metadata(&session_id).await
+                            {
+                                send_session_info_update(
+                                    &cx,
+                                    &session_id,
+                                    renamed_title,
+                                    metadata.updated_at,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                "failed to update session title: {e:#}"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            "failed to update session title: {e:#}"
-                        );
-                    }
                 }
 
-                let prompt_text = if let Some((name, args)) = parse_slash_command(&raw_prompt_text)
+                let prompt_text = if let Some((name, args)) = slash_command.as_ref()
                     && let Some(meta) = snap.skills.get(&name)
                 {
                     tracing::info!(skill = %name, "slash-command activating skill");
@@ -2148,6 +2151,13 @@ fn parse_slash_command(prompt_text: &str) -> Option<(String, String)> {
         return None;
     }
     Some((head.to_ascii_lowercase(), tail.to_string()))
+}
+
+/// Only plain prompts should auto-title the session. Any slash command,
+/// including skill activations, is an operational turn rather than a
+/// good title seed and should leave the placeholder title alone.
+fn should_auto_rename_session_from_prompt(prompt_text: &str) -> bool {
+    parse_slash_command(prompt_text).is_none()
 }
 
 /// Build the `<available_skills>` tier-1 disclosure block for the system
@@ -5242,6 +5252,22 @@ mod tests {
         assert_eq!(parse_slash_command("hello"), None);
         assert_eq!(parse_slash_command("/"), None);
         assert_eq!(parse_slash_command(""), None);
+    }
+
+    #[test]
+    fn slash_commands_do_not_auto_rename_sessions() {
+        assert!(should_auto_rename_session_from_prompt(
+            "Investigate session names"
+        ));
+        assert!(should_auto_rename_session_from_prompt(
+            "  Explain the diff  "
+        ));
+        assert!(!should_auto_rename_session_from_prompt(
+            "/setup openrouter refresh"
+        ));
+        assert!(!should_auto_rename_session_from_prompt(
+            "  /my-skill with args  "
+        ));
     }
 
     /// Build a `SessionStore` with one session for the apply/render tests
