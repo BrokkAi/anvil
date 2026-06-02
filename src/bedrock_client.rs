@@ -2,13 +2,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    OpenAiClient, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    ModelsResponse, OpenAiClient, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
+use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
 use crate::trace_logging::append_trace_record;
 
 /// Returns true when the model supports Anthropic-style prompt caching
@@ -79,6 +80,7 @@ pub const BEDROCK_REGION_ENV: &str = "BEDROCK_REGION";
 pub const BEDROCK_MODEL_ENV: &str = "ANVIL_BEDROCK_MODEL";
 pub const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
 pub const BEDROCK_DEFAULT_MODEL: &str = "us.anthropic.claude-sonnet-4-6";
+const BEDROCK_RUNTIME_BASE_URL: &str = "https://bedrock-runtime";
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_TOKENS: u32 = 8192;
@@ -89,6 +91,8 @@ pub struct BedrockClient {
     region: String,
     default_model: String,
     http: reqwest::Client,
+    runtime_base_url: String,
+    mantle_base_url: String,
 }
 
 impl std::fmt::Debug for BedrockClient {
@@ -107,27 +111,69 @@ impl BedrockClient {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(600)),
-            "https://bedrock-runtime.amazonaws.com",
+            BEDROCK_RUNTIME_BASE_URL,
         )
         .build()
         .expect("failed to build Bedrock HTTP client");
         Self {
             bearer_token,
+            region: region.clone(),
+            default_model,
+            http,
+            runtime_base_url: BEDROCK_RUNTIME_BASE_URL.to_string(),
+            mantle_base_url: mantle_base_url(&region),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_base_urls(
+        bearer_token: String,
+        region: String,
+        default_model: String,
+        runtime_base_url: String,
+        mantle_base_url: String,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(600))
+            .build()
+            .expect("failed to build test Bedrock HTTP client");
+        Self {
+            bearer_token,
             region,
             default_model,
             http,
+            runtime_base_url,
+            mantle_base_url,
         }
     }
 
     fn invoke_url(&self, model: &str) -> String {
         let encoded = percent_encode_path_segment(model);
+        if self.runtime_base_url.starts_with("http://") || self.runtime_base_url.starts_with("https://")
+        {
+            if self.runtime_base_url.contains("amazonaws.com") {
+                return format!(
+                    "{}.{}.amazonaws.com/model/{encoded}/invoke",
+                    self.runtime_base_url.trim_end_matches('.'),
+                    self.region,
+                );
+            }
+            return format!(
+                "{}/model/{encoded}/invoke",
+                self.runtime_base_url.trim_end_matches('/')
+            );
+        }
         format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{encoded}/invoke",
-            self.region
+            "{}.{}.amazonaws.com/model/{encoded}/invoke",
+            self.runtime_base_url, self.region
         )
     }
 
     async fn invoke_model(&self, request: StreamChatRequest) -> Result<LlmResponse> {
+        if uses_responses_api(&request.model) {
+            return self.invoke_responses_model(request).await;
+        }
         let StreamChatRequest {
             model,
             messages,
@@ -209,29 +255,123 @@ impl BedrockClient {
             Ok(LlmResponse::ToolCalls { text, calls, usage })
         }
     }
+
+    async fn invoke_responses_model(&self, request: StreamChatRequest) -> Result<LlmResponse> {
+        let StreamChatRequest {
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            structured_output,
+            on_token,
+            on_thought,
+            cancel,
+            idle_timeout,
+        } = request;
+        let body = build_responses_request(
+            &model,
+            &messages,
+            tools.as_deref(),
+            reasoning_effort.as_deref(),
+            structured_output.as_ref(),
+        );
+        let url = format!("{}/responses", self.mantle_base_url.trim_end_matches('/'));
+        let resp = crate::http_retry::send_with_retries(
+            "posting Bedrock Responses API request",
+            || {
+                self.http
+                    .post(&url)
+                    .header("Accept", "text/event-stream")
+                    .bearer_auth(&self.bearer_token)
+                    .json(&body)
+            },
+            Some(&cancel),
+        )
+        .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Bedrock Responses API failed (HTTP {status}): {body_text}");
+        }
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
+        drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeout).await
+    }
+
+    async fn list_mantle_model_metadata(&self) -> Result<Vec<ModelMetadata>> {
+        let url = format!("{}/models", self.mantle_base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Bedrock Mantle /models failed (HTTP {status}): {body}");
+        }
+        let parsed: ModelsResponse = resp.json().await.context("parsing Bedrock Mantle /models")?;
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|model| model.to_model_metadata())
+            .collect())
+    }
 }
 
 impl LlmBackend for BedrockClient {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
-        let model = self.default_model.clone();
-        Box::pin(async move { Ok(vec![model]) })
+        Box::pin(async move {
+            Ok(self
+                .list_model_metadata()
+                .await?
+                .into_iter()
+                .map(|m| m.id)
+                .collect())
+        })
     }
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
-        let model = self.default_model.clone();
         Box::pin(async move {
-            Ok(vec![ModelMetadata {
-                id: model,
-                default_reasoning_level: None,
-                supported_reasoning_levels: Vec::new(),
-                context_length: Some(200_000),
-            }])
+            match self.list_mantle_model_metadata().await {
+                Ok(mut models) => {
+                    if !models.iter().any(|m| m.id == self.default_model) {
+                        models.push(ModelMetadata {
+                            id: self.default_model.clone(),
+                            default_reasoning_level: None,
+                            supported_reasoning_levels: Vec::new(),
+                            context_length: Some(200_000),
+                        });
+                    }
+                    Ok(models)
+                }
+                Err(err) => {
+                    tracing::info!("Bedrock Mantle model discovery skipped: {err:#}");
+                    Ok(vec![ModelMetadata {
+                        id: self.default_model.clone(),
+                        default_reasoning_level: None,
+                        supported_reasoning_levels: Vec::new(),
+                        context_length: Some(200_000),
+                    }])
+                }
+            }
         })
     }
 
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
         Box::pin(self.invoke_model(request))
     }
+}
+
+fn uses_responses_api(model: &str) -> bool {
+    model.starts_with("openai.")
+}
+
+fn mantle_base_url(region: &str) -> String {
+    format!("https://bedrock-mantle.{region}.api.aws/v1")
 }
 
 pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
@@ -593,8 +733,12 @@ fn percent_encode_path_segment(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::llm_client::{ChatContentPart, FunctionDef};
+    use std::time::Duration;
 
     use super::*;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn percent_encode_model_id() {
@@ -760,5 +904,156 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn openai_models_use_responses_api_path() {
+        assert!(uses_responses_api("openai.gpt-5.4"));
+        assert!(!uses_responses_api("us.anthropic.claude-sonnet-4-6"));
+    }
+
+    #[tokio::test]
+    async fn responses_models_route_to_mantle_responses() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "openai.gpt-5.4".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("responses request should succeed");
+        match response {
+            LlmResponse::Text { text, usage } => {
+                assert_eq!(text, "ok");
+                assert_eq!(usage.input_tokens, 3);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_models_still_use_native_invoke() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/model/.+/invoke$"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "native ok"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-4-6".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("native request should succeed");
+        match response {
+            LlmResponse::Text { text, usage } => {
+                assert_eq!(text, "native ok");
+                assert_eq!(usage.input_tokens, 2);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mantle_models_are_discovered_and_default_is_preserved() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "openai.gpt-5.4",
+                        "supported_parameters": ["reasoning"],
+                        "default_parameters": {"reasoning": {"effort": "medium"}},
+                        "context_length": 400000
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+        );
+        let models = client
+            .list_model_metadata()
+            .await
+            .expect("discovery should succeed");
+        assert!(models.iter().any(|m| m.id == "openai.gpt-5.4"));
+        assert!(models.iter().any(|m| m.id == "us.anthropic.claude-sonnet-4-6"));
+    }
+
+    #[tokio::test]
+    async fn mantle_discovery_failure_falls_back_to_default_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+        );
+        let models = client
+            .list_model_metadata()
+            .await
+            .expect("fallback should still succeed");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
     }
 }

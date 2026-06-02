@@ -19,6 +19,7 @@ mod llm_client;
 mod mcp;
 mod multi_backend;
 mod openrouter_auth;
+mod responses_api;
 mod sandbox_backend;
 mod session;
 mod setup_state;

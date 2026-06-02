@@ -576,7 +576,7 @@ fn reasoning_effort_from_default_parameters(
 }
 
 impl ModelEntry {
-    fn supports_reasoning(&self) -> bool {
+    pub(crate) fn supports_reasoning(&self) -> bool {
         self.supported_parameters
             .iter()
             .any(|param| param == "reasoning" || param == "include_reasoning")
@@ -587,7 +587,7 @@ impl ModelEntry {
                 .is_some()
     }
 
-    fn to_model_metadata(&self) -> ModelMetadata {
+    pub(crate) fn to_model_metadata(&self) -> ModelMetadata {
         if !self.supports_reasoning() {
             return ModelMetadata {
                 id: self.id.clone(),
