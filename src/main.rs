@@ -23,6 +23,7 @@ mod sandbox_backend;
 mod session;
 mod setup_state;
 mod skills;
+mod structured_output;
 mod tokens;
 mod tool_loop;
 mod tools;

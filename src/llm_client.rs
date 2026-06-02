@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::structured_output::StructuredOutputRequest;
+
 /// Default value for the `--llm-idle-timeout-secs` CLI flag (and the
 /// env var `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS`). The actual value used
 /// per request is a required parameter on `LlmBackend::stream_chat` --
@@ -151,6 +153,7 @@ pub struct StreamChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub reasoning_effort: Option<String>,
+    pub structured_output: Option<StructuredOutputRequest>,
     pub on_token: TokenSink,
     pub on_thought: TokenSink,
     pub cancel: CancellationToken,
@@ -486,6 +489,8 @@ struct ChatCompletionRequest {
     /// Serialized as OpenRouter/Ollama's unified `reasoning` object.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ChatCompletionResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -496,6 +501,19 @@ struct StreamOptions {
 #[derive(Debug, Serialize)]
 struct ReasoningConfig {
     effort: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionResponseFormat {
+    r#type: &'static str,
+    json_schema: NativeJsonSchemaFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeJsonSchemaFormat {
+    name: String,
+    schema: serde_json::Value,
+    strict: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -752,6 +770,7 @@ pub struct OpenAiClient {
     /// Enabled for OpenRouter and Ollama models that declare reasoning
     /// support.
     supports_reasoning_effort: bool,
+    supports_native_structured_output: bool,
 }
 
 impl std::fmt::Debug for OpenAiClient {
@@ -760,6 +779,10 @@ impl std::fmt::Debug for OpenAiClient {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("supports_reasoning_effort", &self.supports_reasoning_effort)
+            .field(
+                "supports_native_structured_output",
+                &self.supports_native_structured_output,
+            )
             .finish()
     }
 }
@@ -786,11 +809,13 @@ impl OpenAiClient {
             .build()
             .expect("failed to build HTTP client");
         let base_url = base_url.trim_end_matches('/').to_string();
+        let supports_native_structured_output = supports_native_structured_output(&base_url);
         Self {
             base_url,
             api_key,
             http,
             supports_reasoning_effort: false,
+            supports_native_structured_output,
         }
     }
 
@@ -890,6 +915,7 @@ impl OpenAiClient {
             messages,
             tools,
             reasoning_effort,
+            structured_output,
             on_token,
             on_thought: _on_thought,
             cancel,
@@ -900,6 +926,21 @@ impl OpenAiClient {
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
         let reasoning = reasoning_effort.map(|effort| ReasoningConfig { effort });
+        let response_format = if self.supports_native_structured_output {
+            structured_output
+                .as_ref()
+                .map(crate::structured_output::native_response_format)
+                .map(|format| ChatCompletionResponseFormat {
+                    r#type: "json_schema",
+                    json_schema: NativeJsonSchemaFormat {
+                        name: format.name,
+                        schema: format.schema,
+                        strict: format.strict,
+                    },
+                })
+        } else {
+            None
+        };
 
         let body = ChatCompletionRequest {
             model,
@@ -913,6 +954,7 @@ impl OpenAiClient {
             tools,
             tool_choice,
             reasoning,
+            response_format,
         };
 
         let resp = crate::http_retry::send_with_retries(
@@ -939,6 +981,10 @@ impl OpenAiClient {
 
         drive_sse_stream(stream, on_token, cancel, idle_timeout).await
     }
+}
+
+fn supports_native_structured_output(base_url: &str) -> bool {
+    base_url.contains("api.openai.com") || base_url.contains("openrouter.ai")
 }
 
 /// Drive an SSE byte stream until the LLM emits `[DONE]`, the stream
@@ -1080,6 +1126,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structured_output::StructuredOutputRequest;
     use futures::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1137,6 +1184,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hello")],
                 tools: None,
                 reasoning_effort: None,
+                structured_output: None,
                 on_token,
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
@@ -1547,6 +1595,50 @@ mod tests {
             debug.contains("[REDACTED]"),
             "api_key must be redacted from Debug output: {debug}"
         );
+    }
+
+    #[test]
+    fn chat_completion_request_serializes_response_format_when_present() {
+        let format = crate::structured_output::native_response_format(&StructuredOutputRequest {
+            schema_name: "audit_result".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"]
+            }),
+        });
+        let body = ChatCompletionRequest {
+            model: "gpt-4.1".into(),
+            messages: vec![ChatMessage::user("hi")],
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            response_format: Some(ChatCompletionResponseFormat {
+                r#type: "json_schema",
+                json_schema: NativeJsonSchemaFormat {
+                    name: format.name,
+                    schema: format.schema,
+                    strict: format.strict,
+                },
+            }),
+        };
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert_eq!(serialized["response_format"]["type"], "json_schema");
+        assert_eq!(
+            serialized["response_format"]["json_schema"]["name"],
+            "audit_result"
+        );
+        assert_eq!(
+            serialized["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+        assert_eq!(serialized["response_format"]["json_schema"]["strict"], true);
     }
 
     /// OpenRouter's `/v1/models` response carries strictly more fields

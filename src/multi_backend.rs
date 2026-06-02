@@ -401,6 +401,7 @@ mod tests {
             messages: vec![],
             tools: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
+            structured_output: None,
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: tokio_util::sync::CancellationToken::new(),

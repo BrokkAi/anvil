@@ -265,6 +265,7 @@ async fn run_summarization_request(
             // reasoning -- "low" keeps cost down on reasoning-capable
             // models that bill thinking tokens.
             reasoning_effort: Some("low".to_string()),
+            structured_output: None,
             on_token,
             on_thought,
             cancel,
@@ -616,6 +617,7 @@ mod tests {
             user_prompt: user.to_string(),
             agent_response: agent.to_string(),
             tool_exchanges: Vec::new(),
+            structured_output: None,
             summary: None,
             fragment_id: None,
         }
@@ -637,6 +639,7 @@ mod tests {
                 arguments: args.to_string(),
                 result: result.to_string(),
             }],
+            structured_output: None,
             summary: None,
             fragment_id: None,
         }
