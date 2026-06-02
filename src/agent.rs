@@ -1831,6 +1831,10 @@ fn send_message(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     }
 }
 
+fn trace_openrouter_refresh(line: &str) {
+    crate::openrouter_auth::append_refresh_log(line);
+}
+
 /// Send a user_message_chunk session update to the client (used when replaying history).
 fn send_user_message(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
@@ -3053,7 +3057,9 @@ async fn refresh_model_catalog_now(
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<Vec<ModelMetadata>, String> {
     if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh("OpenRouter refresh requested.");
         send_message(cx, session_id, "OpenRouter refresh requested.\n");
+        trace_openrouter_refresh("Waiting for model refresh lock...");
         send_message(cx, session_id, "Waiting for model refresh lock...\n");
     }
 
@@ -3065,8 +3071,11 @@ async fn refresh_model_catalog_now(
         })?;
 
     let models = if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh("Refresh lock acquired.");
         send_message(cx, session_id, "Refresh lock acquired.\n");
+        trace_openrouter_refresh("Refreshing model catalog...");
         send_message(cx, session_id, "Refreshing model catalog...\n");
+        trace_openrouter_refresh("Preparing provider discovery...");
         send_message(cx, session_id, "Preparing provider discovery...\n");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let list_future = llm.list_model_metadata_with_progress(Some(tx));
@@ -3076,6 +3085,7 @@ async fn refresh_model_catalog_now(
             tokio::select! {
                 maybe_chunk = rx.recv() => {
                     if let Some(chunk) = maybe_chunk {
+                        trace_openrouter_refresh(chunk.trim_end());
                         send_message(cx, session_id, &chunk);
                     }
                 }
@@ -3086,6 +3096,7 @@ async fn refresh_model_catalog_now(
         };
 
         while let Ok(chunk) = rx.try_recv() {
+            trace_openrouter_refresh(chunk.trim_end());
             send_message(cx, session_id, &chunk);
         }
         models
@@ -3099,6 +3110,10 @@ async fn refresh_model_catalog_now(
     }
     sessions.set_available_models(models.clone()).await;
     if let Some((cx, session_id)) = cx.zip(session_id) {
+        trace_openrouter_refresh(&format!(
+            "Catalog refresh complete: {} model(s) total.",
+            models.len()
+        ));
         send_message(
             cx,
             session_id,

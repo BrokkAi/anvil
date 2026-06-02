@@ -99,6 +99,43 @@ pub fn auth_path() -> Result<PathBuf> {
     Ok(base.join("brokk").join("openrouter.json"))
 }
 
+/// Resolve a best-effort debug log path beside `openrouter.json` so
+/// refresh instrumentation can be inspected even when transcript
+/// notifications are dropped by the client.
+pub fn refresh_log_path() -> Result<PathBuf> {
+    let auth = auth_path()?;
+    let parent = auth
+        .parent()
+        .ok_or_else(|| anyhow!("openrouter auth path has no parent directory"))?;
+    Ok(parent.join("openrouter-refresh.log"))
+}
+
+/// Append one line to the refresh trace file. Best effort: callers use
+/// this for debugging, so failures are intentionally swallowed after a
+/// warning rather than disrupting the main flow.
+pub fn append_refresh_log(line: &str) {
+    if let Err(e) = append_refresh_log_inner(line) {
+        tracing::warn!("failed to append OpenRouter refresh log: {e:#}");
+    }
+}
+
+fn append_refresh_log_inner(line: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let path = refresh_log_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 pub fn read() -> Result<Option<OpenRouterAuth>> {
     let path = auth_path()?;
     if !path.exists() {

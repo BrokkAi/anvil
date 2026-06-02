@@ -130,16 +130,19 @@ impl MultiBackend {
         progress: Option<UnboundedSender<String>>,
     ) -> Result<Vec<ModelMetadata>> {
         if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log("Snapshotting configured backends...");
             let _ = tx.send("Snapshotting configured backends...\n".to_string());
         }
         let bedrock = self.bedrock.clone();
         let codex = self.codex_snapshot();
         let openrouter = self.openrouter_snapshot();
         if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log("Building discovery HTTP client...");
             let _ = tx.send("Building discovery HTTP client...\n".to_string());
         }
         let http = discovery_http_client();
         if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log("Launching provider checks...");
             let _ = tx.send("Launching provider checks...\n".to_string());
         }
 
@@ -150,6 +153,9 @@ impl MultiBackend {
             discover_ollama_metadata(&http, progress.clone()),
         );
         if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log(
+                "Provider checks finished. Merging catalogs...",
+            );
             let _ = tx.send("Provider checks finished. Merging catalogs...\n".to_string());
         }
 
@@ -184,6 +190,10 @@ impl MultiBackend {
         )
         .await;
         if let Some(tx) = &progress {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "Merged discovery results: {} model(s).",
+                discovered.len()
+            ));
             let _ = tx.send(format!(
                 "Merged discovery results: {} model(s).\n",
                 discovered.len()
