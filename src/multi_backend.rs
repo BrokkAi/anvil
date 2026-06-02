@@ -129,10 +129,19 @@ impl MultiBackend {
         &self,
         progress: Option<UnboundedSender<String>>,
     ) -> Result<Vec<ModelMetadata>> {
+        if let Some(tx) = &progress {
+            let _ = tx.send("Snapshotting configured backends...\n".to_string());
+        }
         let bedrock = self.bedrock.clone();
         let codex = self.codex_snapshot();
         let openrouter = self.openrouter_snapshot();
+        if let Some(tx) = &progress {
+            let _ = tx.send("Building discovery HTTP client...\n".to_string());
+        }
         let http = discovery_http_client();
+        if let Some(tx) = &progress {
+            let _ = tx.send("Launching provider checks...\n".to_string());
+        }
 
         let (bedrock_metadata, codex_metadata, openrouter_metadata, ollama_metadata) = tokio::join!(
             discover_backend_metadata("Bedrock", bedrock, progress.clone()),
@@ -140,6 +149,9 @@ impl MultiBackend {
             discover_backend_metadata("OpenRouter", openrouter, progress.clone()),
             discover_ollama_metadata(&http, progress.clone()),
         );
+        if let Some(tx) = &progress {
+            let _ = tx.send("Provider checks finished. Merging catalogs...\n".to_string());
+        }
 
         let bedrock_by_id: HashMap<String, ModelMetadata> = bedrock_metadata
             .iter()
@@ -171,6 +183,12 @@ impl MultiBackend {
             openrouter_lookup,
         )
         .await;
+        if let Some(tx) = &progress {
+            let _ = tx.send(format!(
+                "Merged discovery results: {} model(s).\n",
+                discovered.len()
+            ));
+        }
         Ok(discovered
             .into_iter()
             .map(|m| {

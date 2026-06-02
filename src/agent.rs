@@ -3052,6 +3052,11 @@ async fn refresh_model_catalog_now(
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<Vec<ModelMetadata>, String> {
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        send_message(cx, session_id, "OpenRouter refresh requested.\n");
+        send_message(cx, session_id, "Waiting for model refresh lock...\n");
+    }
+
     let _guard = tokio::time::timeout(MODEL_REFRESH_LOCK_WAIT, refresh_lock.lock())
         .await
         .map_err(|_| {
@@ -3060,7 +3065,9 @@ async fn refresh_model_catalog_now(
         })?;
 
     let models = if let Some((cx, session_id)) = cx.zip(session_id) {
+        send_message(cx, session_id, "Refresh lock acquired.\n");
         send_message(cx, session_id, "Refreshing model catalog...\n");
+        send_message(cx, session_id, "Preparing provider discovery...\n");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let list_future = llm.list_model_metadata_with_progress(Some(tx));
         tokio::pin!(list_future);
@@ -3091,6 +3098,16 @@ async fn refresh_model_catalog_now(
         sessions.set_default_model(model).await;
     }
     sessions.set_available_models(models.clone()).await;
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        send_message(
+            cx,
+            session_id,
+            &format!(
+                "Catalog refresh complete: {} model(s) total.\n",
+                models.len()
+            ),
+        );
+    }
     Ok(models)
 }
 
