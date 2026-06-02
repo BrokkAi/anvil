@@ -1333,6 +1333,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
     }
     if declaration_repair_compatible_intent(&output.intent)
         && declaration_shape_without_material_intersection(pattern)
+        && regex_wrapped_single_identifier(pattern).is_none()
         && bifrost_navigation_scope(glob, path, file_path)
     {
         let (tool, relation) = repair_tool
@@ -1401,23 +1402,32 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         return;
     }
 
-    if known_source_candidate_tool(pattern, output, same_symbol_bifrost_hit).is_some() {
-        output.decision = GateClassifierDecision::GateToSymbolTool;
-        output.recommended_tool = RecommendedTool::GetSymbolSources;
-        output.suggested_args = output
-            .bifrost_candidate
-            .as_ref()
-            .map(|candidate| candidate.args.clone())
-            .unwrap_or_else(|| json!({}));
-        return;
-    }
-
     if exact_argument_literal_probe(pattern) || member_prefix_text_probe(pattern) {
         output.decision = GateClassifierDecision::AllowText;
         output.recommended_tool = RecommendedTool::None;
         output.suggested_args = json!({});
         output.reason = format!(
             "ALLOW_TEXT because `{}` is exact argument/member-prefix text lookup, not broad symbol navigation.",
+            truncate_to(pattern, 120)
+        );
+        return;
+    }
+    if bare_get_symbol_sources_text_probe(pattern, output) {
+        output.decision = GateClassifierDecision::AllowText;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "ALLOW_TEXT because `{}` is a bare value/status token despite a same-named symbol source candidate.",
+            truncate_to(pattern, 120)
+        );
+        return;
+    }
+    if exact_empty_arg_anchored_call_text_probe(pattern) {
+        output.decision = GateClassifierDecision::AllowText;
+        output.recommended_tool = RecommendedTool::None;
+        output.suggested_args = json!({});
+        output.reason = format!(
+            "ALLOW_TEXT because `{}` is exact empty-argument/end-of-line call-shape matching.",
             truncate_to(pattern, 120)
         );
         return;
@@ -1479,14 +1489,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         && output.confidence == GateConfidence::High
         && (bifrost_candidate_matches_intent(output)
             || (bifrost_candidate_has_args(output)
-                && (regex_wrapped_single_identifier(pattern).is_none() || pattern.contains('|')))
-            || (output
-                .bifrost_candidate
-                .as_ref()
-                .and_then(|candidate| candidate.tool.as_ref())
-                .is_some_and(|tool| *tool == RecommendedTool::GetSymbolSources)
-                && regex_wrapped_single_identifier(pattern).is_some()
-                && same_symbol_bifrost_hit))
+                && (regex_wrapped_single_identifier(pattern).is_none() || pattern.contains('|'))))
         && (!output.evidence.same_path_recent_bifrost_hit
             || same_symbol_bifrost_hit
             || regex_wrapped_single_identifier(pattern).is_none())
@@ -1782,6 +1785,21 @@ fn member_prefix_text_probe(pattern: &str) -> bool {
     trimmed.ends_with("\\.") || trimmed.ends_with('.') || trimmed.ends_with("->") || trimmed.ends_with("::")
 }
 
+fn exact_empty_arg_anchored_call_text_probe(pattern: &str) -> bool {
+    let normalized = pattern.replace("\\(", "(").replace("\\)", ")");
+    normalized.contains("()")
+        && (normalized.trim_end().ends_with('$') || normalized.contains(")\\s*$"))
+}
+
+fn bare_get_symbol_sources_text_probe(pattern: &str, output: &GateClassifierOutput) -> bool {
+    regex_wrapped_single_identifier(pattern).is_some()
+        && output
+            .bifrost_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.tool.as_ref())
+            .is_some_and(|tool| *tool == RecommendedTool::GetSymbolSources)
+}
+
 fn single_concrete_call_text_probe(
     pattern: &str,
     output: &GateClassifierOutput,
@@ -1860,24 +1878,6 @@ fn external_acronym_alternation_text_probe(
                 .iter()
                 .any(|token| token.as_str() != acronym.as_str() && token.contains(acronym.as_str()))
         })
-}
-
-fn known_source_candidate_tool(
-    pattern: &str,
-    output: &GateClassifierOutput,
-    same_symbol_bifrost_hit: bool,
-) -> Option<RecommendedTool> {
-    if regex_wrapped_single_identifier(pattern).is_none() || !same_direct_bifrost_candidate(output) {
-        return None;
-    }
-    let candidate_tool = output
-        .bifrost_candidate
-        .as_ref()
-        .and_then(|candidate| candidate.tool.as_ref())?;
-    if *candidate_tool == RecommendedTool::GetSymbolSources && same_symbol_bifrost_hit {
-        return Some(RecommendedTool::GetSymbolSources);
-    }
-    None
 }
 
 fn must_allow_text_grep(pattern: &str, glob: &str, path: &str, file_path: &str) -> bool {
@@ -5747,6 +5747,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_arg_anchored_call_stays_text() {
+        let context = empty_gate_context(
+            "grep_search",
+            json!({"pattern": "remove\\(\\)\\s*$", "path": ".", "glob": "*.scala"}),
+        );
+        let mut output = GateClassifierOutput {
+            reason: "GATE_TO_SYMBOL_TOOL because classifier treated this as usage navigation.".to_string(),
+            intent: TextIntent::SymbolUsageLookup,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::RepositoryWide,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence::default(),
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["remove"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::ScanUsages,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
     fn python_filesystem_probe_routes_to_list_directory() {
         let command = "python - <<'PY'\nimport os\nprint('exists', os.path.exists('ScalliGraph'))\nprint('isdir', os.path.isdir('ScalliGraph'))\nprint('list', os.listdir('ScalliGraph'))\nPY";
         assert!(script_filesystem_listing_probe(command));
@@ -7873,39 +7903,39 @@ mod tests {
     }
 
     #[test]
-    fn single_camel_symbol_with_recent_bifrost_hit_uses_get_symbol_sources() {
+    fn bare_single_symbol_with_recent_bifrost_hit_stays_text() {
         let mut output = GateClassifierOutput {
-            reason: "Bifrost can find references for this known symbol.".to_string(),
+            reason: "Bifrost can find a symbol with this same name.".to_string(),
             intent: TextIntent::SymbolDefinitionLookup,
             pattern_class: TextPatternClass::SymbolGlob,
             scope_class: TextScopeClass::BroadSourceScope,
             bifrost_fit: BifrostFit::SameOrMoreDirect,
             allow_exception: TextAllowException::None,
             evidence: TextEvidence {
-                symbol_tokens: vec!["ChildWindowStyle".to_string()],
+                symbol_tokens: vec!["Deleted".to_string()],
                 same_token_or_path_bifrost_miss: false,
                 same_path_recent_edit_or_write: false,
                 same_path_recent_bifrost_hit: true,
                 exact_text_or_regex_needed: false,
             },
             bifrost_candidate: Some(BifrostCandidate {
-                tool: Some(RecommendedTool::ScanUsages),
-                args: json!({"symbols":["ChildWindowStyle"]}),
+                tool: Some(RecommendedTool::GetSymbolSources),
+                args: json!({"symbols":["org.thp.thehive.models.CaseStatus$.Deleted"]}),
             }),
-            decision: GateClassifierDecision::GateToSymbolTool,
-            recommended_tool: RecommendedTool::ScanUsages,
-            suggested_args: json!({"symbols":["ChildWindowStyle"]}),
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
             confidence: GateConfidence::High,
         };
         let mut prior = exchange("search_symbols");
-        prior.arguments = r#"{"patterns":["ChildWindowStyle"]}"#.to_string();
-        prior.result = "ChildWindowStyle found in source/Toolbox/Styles.xaml".to_string();
+        prior.arguments = r#"{"patterns":["Deleted"]}"#.to_string();
+        prior.result = "CaseStatus$.Deleted found in source".to_string();
         let context = GateContext {
             tool_name: "grep_search".to_string(),
             args: json!({
                 "path": ".",
-                "glob": "**/*",
-                "pattern": "ChildWindowStyle"
+                "glob": "*.scala",
+                "pattern": "Deleted"
             }),
             messages: Vec::new(),
             tools: Vec::new(),
@@ -7914,8 +7944,8 @@ mod tests {
 
         enforce_text_classifier_policy(&mut output, &context);
 
-        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
-        assert_eq!(output.recommended_tool, RecommendedTool::GetSymbolSources);
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
