@@ -686,6 +686,52 @@ fn spawn_delayed_setup_notice(
     });
 }
 
+fn spawn_openrouter_refresh(
+    cx: ConnectionTo<Client>,
+    session_id: String,
+    llm: Arc<MultiBackend>,
+    sessions: SessionStore,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    tokio::spawn(async move {
+        // Let the slash-command response land first so subsequent chunks show
+        // up as progress rather than being coalesced into the command reply.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match refresh_model_catalog_now(
+            Some(&cx),
+            Some(&session_id),
+            &llm,
+            &sessions,
+            &refresh_lock,
+        )
+        .await
+        {
+            Ok(catalog) => {
+                let count = source_count(&catalog, ModelSource::OpenRouter);
+                let message = if count > 0 {
+                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
+                } else {
+                    format!(
+                        "OpenRouter is not showing models yet.\n\n{}",
+                        render_openrouter_setup_help()
+                    )
+                };
+                send_message(&cx, &session_id, &message);
+            }
+            Err(e) => {
+                send_message(
+                    &cx,
+                    &session_id,
+                    &format!(
+                        "Could not check OpenRouter yet: {e}\n\n{}",
+                        render_openrouter_setup_help()
+                    ),
+                );
+            }
+        }
+    });
+}
+
 fn render_session_start_setup_notice(
     session: &Session,
     catalog: &[ModelMetadata],
@@ -3119,31 +3165,14 @@ async fn handle_setup_openrouter(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        return match refresh_model_catalog_now(
-            Some(cx),
-            Some(session_id),
-            llm,
-            sessions,
-            refresh_lock,
-        )
-        .await
-        {
-            Ok(catalog) => {
-                let count = source_count(&catalog, ModelSource::OpenRouter);
-                if count > 0 {
-                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
-                } else {
-                    format!(
-                        "OpenRouter is not showing models yet.\n\n{}",
-                        render_openrouter_setup_help()
-                    )
-                }
-            }
-            Err(e) => format!(
-                "Could not check OpenRouter yet: {e}\n\n{}",
-                render_openrouter_setup_help()
-            ),
-        };
+        spawn_openrouter_refresh(
+            cx.clone(),
+            session_id.to_string(),
+            llm.clone(),
+            sessions.clone(),
+            refresh_lock.clone(),
+        );
+        return "Started OpenRouter model refresh. Progress will appear here.".to_string();
     }
 
     let prompt = match rest.split_once(char::is_whitespace) {
