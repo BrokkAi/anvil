@@ -803,14 +803,23 @@ impl OpenAiClient {
         api_key: Option<String>,
         default_headers: reqwest::header::HeaderMap,
     ) -> Self {
-        let http = reqwest::Client::builder()
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let openrouter_mode = base_url.contains("openrouter.ai");
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(600))
-            .default_headers(default_headers)
-            .build()
-            .expect("failed to build HTTP client");
-        let base_url = base_url.trim_end_matches('/').to_string();
+            .default_headers(default_headers);
         let supports_native_structured_output = supports_native_structured_output(&base_url);
+        if openrouter_mode {
+            crate::openrouter_auth::append_refresh_log(
+                "Configuring OpenRouter reqwest client: http1_only + connection_verbose + no idle pool",
+            );
+            builder = builder
+                .http1_only()
+                .connection_verbose(true)
+                .pool_max_idle_per_host(0);
+        }
+        let http = builder.build().expect("failed to build HTTP client");
         Self {
             base_url,
             api_key,
