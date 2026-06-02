@@ -367,11 +367,11 @@ fn coerce_output_string(
         return value.clone();
     }
 
-    if let Some(array) = value.as_array() {
-        if let Some(joined) = array_to_string(array) {
-            changes.push(format!("{path} array -> string"));
-            return Value::String(joined);
-        }
+    if let Some(array) = value.as_array()
+        && let Some(joined) = array_to_string(array)
+    {
+        changes.push(format!("{path} array -> string"));
+        return Value::String(joined);
     }
 
     if value.is_number() || value.is_boolean() {
