@@ -509,6 +509,9 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     ) {
         return false;
     }
+    if raw.allow_exception != TextAllowException::None || raw.evidence.exact_text_or_regex_needed {
+        return false;
+    }
     if !matches!(
         raw.intent,
         TextIntent::SymbolDefinitionLookup
@@ -1216,6 +1219,8 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
 
 fn same_direct_bifrost_candidate(output: &GateClassifierOutput) -> bool {
     output.bifrost_fit == BifrostFit::SameOrMoreDirect
+        && output.allow_exception == TextAllowException::None
+        && !output.evidence.exact_text_or_regex_needed
         && output
             .bifrost_candidate
             .as_ref()
@@ -1753,9 +1758,10 @@ fn identifier_before_call_delimiter(pattern: &str) -> Option<String> {
         .replace("\\s*", "")
         .replace("\\(", "(")
         .replace("\\)", ")")
+        .replace("\\{", "{")
         .replace("\\.", ".")
         .replace("\\-", "-");
-    let call_pos = normalized.find('(')?;
+    let call_pos = normalized.find('(').or_else(|| normalized.find('{'))?;
     let before = &normalized[..call_pos];
     let token: String = before
         .chars()
@@ -3401,8 +3407,10 @@ fn build_test_git_package_like(command: &str) -> bool {
         "phpcs",
         "vendor/bin/phpcs",
         "php -l",
+        "python -m py_compile",
         "python -m pytest",
         "uv run pytest",
+        "uv run python -m py_compile",
         "uv run python -m pytest",
         "dotnet build",
         "dotnet test",
@@ -5224,6 +5232,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scala_block_call_grep_repairs_to_scan_usages() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "effectAsync\\s*\\{", "path": ".", "glob": "*.scala"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
     fn low_confidence_allow_output(intent: TextIntent) -> GateClassifierOutput {
         GateClassifierOutput {
             reason: "ALLOW_TEXT because classifier was uncertain.".to_string(),
@@ -5462,6 +5487,45 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
         assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
+    fn same_direct_candidate_with_allow_exception_stays_text() {
+        let mut output = GateClassifierOutput {
+            reason: "Bare variant probe has an explicit allow exception.".to_string(),
+            intent: TextIntent::BroadSemanticOrientation,
+            pattern_class: TextPatternClass::SymbolGlob,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::NonSourceText,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["effectAsyncM".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["effectAsyncM"]}),
+            }),
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "effectAsyncM", "path": ".", "glob": "*.scala"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
     }
 
     #[test]
@@ -6750,6 +6814,10 @@ mod tests {
         ));
         assert!(matches!(
             static_shell_route(&json!({"command": "vendor/bin/phpunit tests/FooTest.php"})),
+            Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
+        ));
+        assert!(matches!(
+            static_shell_route(&json!({"command": "python -m py_compile openhands/cli/tui.py tests/unit/test_cli_tui.py"})),
             Some(ShellStaticRoute::AllowShell("static_shell_semantics"))
         ));
         assert!(matches!(
