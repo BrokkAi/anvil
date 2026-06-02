@@ -686,52 +686,6 @@ fn spawn_delayed_setup_notice(
     });
 }
 
-fn spawn_openrouter_refresh(
-    cx: ConnectionTo<Client>,
-    session_id: String,
-    llm: Arc<MultiBackend>,
-    sessions: SessionStore,
-    refresh_lock: Arc<tokio::sync::Mutex<()>>,
-) {
-    tokio::spawn(async move {
-        // Let the slash-command response land first so subsequent chunks show
-        // up as progress rather than being coalesced into the command reply.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        match refresh_model_catalog_now(
-            Some(&cx),
-            Some(&session_id),
-            &llm,
-            &sessions,
-            &refresh_lock,
-        )
-        .await
-        {
-            Ok(catalog) => {
-                let count = source_count(&catalog, ModelSource::OpenRouter);
-                let message = if count > 0 {
-                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
-                } else {
-                    format!(
-                        "OpenRouter is not showing models yet.\n\n{}",
-                        render_openrouter_setup_help()
-                    )
-                };
-                send_message(&cx, &session_id, &message);
-            }
-            Err(e) => {
-                send_message(
-                    &cx,
-                    &session_id,
-                    &format!(
-                        "Could not check OpenRouter yet: {e}\n\n{}",
-                        render_openrouter_setup_help()
-                    ),
-                );
-            }
-        }
-    });
-}
-
 fn render_session_start_setup_notice(
     session: &Session,
     catalog: &[ModelMetadata],
@@ -1195,7 +1149,10 @@ pub async fn run_agent(
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
 
-                if is_slash_command(&raw_prompt_text, "setup") {
+                let stream_setup_openrouter_refresh =
+                    is_streamed_setup_openrouter_refresh(&raw_prompt_text);
+
+                if is_slash_command(&raw_prompt_text, "setup") && !stream_setup_openrouter_refresh {
                     let setup_ctx = SetupContext {
                         cx: &cx,
                         sessions: &sessions_prompt,
@@ -1316,7 +1273,7 @@ pub async fn run_agent(
                 };
 
                 // Validate model is configured
-                if snap.model.is_empty() {
+                if snap.model.is_empty() && !stream_setup_openrouter_refresh {
                     let catalog = sessions_prompt.available_model_metadata().await;
                     send_message(
                         &cx,
@@ -1391,6 +1348,59 @@ pub async fn run_agent(
                     send_message(&cx, &session_id, &report);
                     sessions_prompt.finish_prompt(&session_id).await;
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+
+                if stream_setup_openrouter_refresh {
+                    let llm_for_refresh = llm_login.clone();
+                    let sessions_for_refresh = sessions_prompt.clone();
+                    let cx_for_refresh = cx.clone();
+                    let session_id_for_refresh = session_id.clone();
+                    let refresh_lock_for_refresh = refresh_lock_login.clone();
+
+                    let spawn_result = cx.spawn(async move {
+                        let report = match refresh_model_catalog_now(
+                            Some(&cx_for_refresh),
+                            Some(&session_id_for_refresh),
+                            &llm_for_refresh,
+                            &sessions_for_refresh,
+                            &refresh_lock_for_refresh,
+                        )
+                        .await
+                        {
+                            Ok(catalog) => {
+                                let count = source_count(&catalog, ModelSource::OpenRouter);
+                                if count > 0 {
+                                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
+                                } else {
+                                    format!(
+                                        "OpenRouter is not showing models yet.\n\n{}",
+                                        render_openrouter_setup_help()
+                                    )
+                                }
+                            }
+                            Err(e) => format!(
+                                "Could not check OpenRouter yet: {e}\n\n{}",
+                                render_openrouter_setup_help()
+                            ),
+                        };
+                        send_message(&cx_for_refresh, &session_id_for_refresh, &report);
+                        sessions_for_refresh.finish_prompt(&session_id_for_refresh).await;
+                        if let Err(e) = responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        {
+                            tracing::warn!(
+                                session_id = %session_id_for_refresh,
+                                "failed to deliver PromptResponse: {e}"
+                            );
+                        }
+                        Ok(())
+                    });
+
+                    if let Err(e) = spawn_result {
+                        sessions_prompt.finish_prompt(&session_id).await;
+                        return Err(e);
+                    }
+
+                    return Ok(());
                 }
 
                 let messages = build_prompt_messages_with_compression(
@@ -3016,6 +3026,16 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
     }
 }
 
+fn is_streamed_setup_openrouter_refresh(prompt_text: &str) -> bool {
+    if !is_slash_command(prompt_text, "setup") {
+        return false;
+    }
+    let trimmed = slash_command_args(prompt_text);
+    let (action, rest) = split_setup_action(&trimmed);
+    action.eq_ignore_ascii_case("openrouter")
+        && matches!(rest.to_ascii_lowercase().as_str(), "refresh" | "try-again")
+}
+
 async fn render_current_setup(sessions: &SessionStore, session_id: &str) -> String {
     let fallback_cwd = std::env::current_dir().unwrap_or_default();
     let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
@@ -3165,14 +3185,31 @@ async fn handle_setup_openrouter(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        spawn_openrouter_refresh(
-            cx.clone(),
-            session_id.to_string(),
-            llm.clone(),
-            sessions.clone(),
-            refresh_lock.clone(),
-        );
-        return "Started OpenRouter model refresh. Progress will appear here.".to_string();
+        return match refresh_model_catalog_now(
+            Some(cx),
+            Some(session_id),
+            llm,
+            sessions,
+            refresh_lock,
+        )
+        .await
+        {
+            Ok(catalog) => {
+                let count = source_count(&catalog, ModelSource::OpenRouter);
+                if count > 0 {
+                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
+                } else {
+                    format!(
+                        "OpenRouter is not showing models yet.\n\n{}",
+                        render_openrouter_setup_help()
+                    )
+                }
+            }
+            Err(e) => format!(
+                "Could not check OpenRouter yet: {e}\n\n{}",
+                render_openrouter_setup_help()
+            ),
+        };
     }
 
     let prompt = match rest.split_once(char::is_whitespace) {
