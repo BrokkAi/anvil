@@ -4677,10 +4677,12 @@ done
                     user_prompt: "emit json".into(),
                     agent_response: r#"{"answer":"ok"}"#.into(),
                     tool_exchanges: Vec::new(),
-                    structured_output: Some(StructuredOutputResult::Success(
-                        crate::structured_output::StructuredOutputSuccess {
+                    structured_output: Some(StructuredOutputResult::CoercedSuccess(
+                        crate::structured_output::StructuredOutputCoercedSuccess {
                             schema_name: "audit_result".into(),
-                            validated_output: serde_json::json!({"answer":"ok"}),
+                            validated_output: serde_json::json!({"answer":"one\ntwo"}),
+                            coercions: vec!["response.answer array -> string".into()],
+                            coercion_requested: true,
                         },
                     )),
                     summary: None,
@@ -4697,11 +4699,13 @@ done
             .as_ref()
             .expect("structured output present")
         {
-            StructuredOutputResult::Success(success) => {
+            StructuredOutputResult::CoercedSuccess(success) => {
                 assert_eq!(success.schema_name, "audit_result");
-                assert_eq!(success.validated_output["answer"], "ok");
+                assert_eq!(success.validated_output["answer"], "one\ntwo");
+                assert_eq!(success.coercions, vec!["response.answer array -> string"]);
+                assert!(success.coercion_requested);
             }
-            other => panic!("expected success, got {other:?}"),
+            other => panic!("expected coerced success, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&cwd);
