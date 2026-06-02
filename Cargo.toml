@@ -49,6 +49,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+rustls-native-certs = "0.8"
 # Codex login. We deliberately avoid single-maintainer credential crates:
 # `oauth2` is the de-facto Rust OAuth2 implementation (~32M downloads,
 # depended on by Servo etc.) and gives us PKCE + refresh. The RFC 8693
@@ -80,7 +81,6 @@ tiktoken-rs = "0.7"
 # applied to `runShellCommand`. See `tools/shell.rs::apply_rlimits`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
 [dev-dependencies]
 # `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
 # used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.

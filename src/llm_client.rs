@@ -812,9 +812,29 @@ impl OpenAiClient {
         let supports_native_structured_output = supports_native_structured_output(&base_url);
         if openrouter_mode {
             crate::openrouter_auth::append_refresh_log(
-                "Configuring OpenRouter reqwest client: http1_only + connection_verbose + no idle pool",
+                "Configuring OpenRouter reqwest client: native certs + tls_certs_only + http1_only + connection_verbose + no idle pool",
             );
+            let native = rustls_native_certs::load_native_certs();
+            let cert_count = native.certs.len();
+            let error_count = native.errors.len();
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "OpenRouter native cert load: {cert_count} cert(s), {error_count} error(s)"
+            ));
+            let certs = native
+                .certs
+                .into_iter()
+                .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
+                    Ok(cert) => Some(cert),
+                    Err(e) => {
+                        crate::openrouter_auth::append_refresh_log(&format!(
+                            "OpenRouter native cert conversion skipped one cert: {e}"
+                        ));
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             builder = builder
+                .tls_certs_only(certs)
                 .http1_only()
                 .connection_verbose(true)
                 .pool_max_idle_per_host(0);
