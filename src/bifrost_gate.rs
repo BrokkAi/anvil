@@ -519,12 +519,21 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
     ) {
         return false;
     }
+    let same_direct_candidate = raw.bifrost_fit == BifrostFit::SameOrMoreDirect
+        && raw.allow_exception == TextAllowException::None
+        && !raw.evidence.exact_text_or_regex_needed
+        && raw
+            .bifrost_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.tool.as_ref())
+            .is_some_and(is_bifrost_recommendation);
     if !matches!(
         raw.pattern_class,
         TextPatternClass::IdentifierLike
             | TextPatternClass::SymbolGlob
             | TextPatternClass::MixedSymbolIdentifiers
-    ) {
+    ) && !(raw.pattern_class == TextPatternClass::RegexText && same_direct_candidate)
+    {
         return false;
     }
     if !matches!(
@@ -1096,6 +1105,8 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
     let real_bifrost_miss =
         recent_bifrost_miss_for_grep(pattern, glob, path, file_path, &context.tool_exchanges)
             && !very_strong_deterministic_symbol_navigation(pattern, glob, path, file_path);
+    let same_symbol_bifrost_hit =
+        same_symbol_bifrost_hit_for_grep(pattern, &context.tool_exchanges);
     let lower_snake_text_probe = lower_snake_literal_token_count(pattern) >= 2
         && !identifier_tokens(pattern)
             .iter()
@@ -1103,7 +1114,8 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         && !declaration_search_pattern(pattern)
         && !symbol_call_or_member(pattern)
         && !source_static_or_member_access(pattern)
-        && !source_call_navigation_pattern(pattern);
+        && !source_call_navigation_pattern(pattern)
+        && !same_symbol_bifrost_hit;
     let repair_tool =
         deterministic_source_symbol_repair_tool(pattern, glob, path, file_path, context);
     if text_negative_facts_veto(output)
@@ -1120,7 +1132,9 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         );
         return;
     }
-    if repair_blocked_text_grep(pattern, glob, path, file_path, context)
+    if (repair_tool.is_none()
+        && repair_blocked_text_grep(pattern, glob, path, file_path, context)
+        && !same_symbol_bifrost_hit)
         || ((output.allow_exception == TextAllowException::NonSourceText
             || (matches!(output.intent, TextIntent::ExactTextOrLocalizedRead)
                 && output.bifrost_fit == BifrostFit::NotApplicable
@@ -1131,6 +1145,7 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
             ))
         || lower_snake_text_probe
         || (repair_tool.is_none()
+            && !same_direct_bifrost_candidate(output)
             && strong_text_grep_allow_exception(
                 pattern,
                 glob,
@@ -1162,6 +1177,26 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
             truncate_to(pattern, 120)
         );
         output.confidence = GateConfidence::High;
+        return;
+    }
+
+    if same_direct_bifrost_candidate(output)
+        && output.allow_exception == TextAllowException::None
+        && !output.evidence.exact_text_or_regex_needed
+    {
+        output.decision = GateClassifierDecision::GateToSymbolTool;
+        if let Some(tool) = output
+            .bifrost_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.tool.clone())
+        {
+            output.recommended_tool = tool;
+        }
+        output.suggested_args = output
+            .bifrost_candidate
+            .as_ref()
+            .map(|candidate| candidate.args.clone())
+            .unwrap_or_else(|| json!({}));
         return;
     }
 
@@ -1222,6 +1257,9 @@ fn very_strong_deterministic_symbol_navigation(
 }
 
 fn source_symbol_family_navigation(pattern: &str) -> bool {
+    if natural_language_or_path_literal(pattern) {
+        return false;
+    }
     let symbols = recoverable_source_symbols(pattern);
     if symbols.len() == 1 {
         return high_confidence_source_symbol(&symbols[0]);
@@ -1407,6 +1445,12 @@ fn recent_bifrost_miss_for_grep(
     token_misses > 0 && token_hits == 0
 }
 
+fn same_symbol_bifrost_hit_for_grep(pattern: &str, exchanges: &[ToolExchange]) -> bool {
+    recoverable_source_symbols(pattern)
+        .iter()
+        .any(|symbol| overlaps_recent_bifrost_hit(symbol, exchanges))
+}
+
 fn hard_text_grep_allow_before_force(
     pattern: &str,
     glob: &str,
@@ -1451,6 +1495,7 @@ fn repair_blocked_text_grep(
         || regex_wildcard_text_probe(pattern)
         || exact_member_or_call_expression_text_probe(pattern)
         || ambiguous_bare_identifier_text_probe(pattern)
+        || recent_naming_variant_text_search(pattern, glob, path, file_path, &context.tool_exchanges)
         || path_or_protocol_construction_text_probe(pattern)
         || boolean_assignment_value_text_probe(pattern)
         || filename_or_resource_regex(pattern)
@@ -1601,6 +1646,54 @@ fn regex_wrapped_single_identifier(pattern: &str) -> Option<String> {
     }
 }
 
+fn recent_naming_variant_text_search(
+    pattern: &str,
+    glob: &str,
+    path: &str,
+    file_path: &str,
+    exchanges: &[ToolExchange],
+) -> bool {
+    let current_keys = naming_variant_keys(pattern);
+    if current_keys.is_empty() {
+        return false;
+    }
+    let scope = normalized_grep_scope(glob, path, file_path);
+    let mut variants = std::collections::HashSet::new();
+    for exchange in exchanges.iter().rev().take(10) {
+        if exchange.tool_name != "grep_search" {
+            continue;
+        }
+        if !scope.is_empty() && !exchange.arguments.contains(&scope) {
+            continue;
+        }
+        for key in current_keys.iter() {
+            for token in identifier_tokens(&exchange.arguments) {
+                let token_key = naming_variant_key(&token);
+                if token_key.as_deref() == Some(key.as_str()) {
+                    variants.insert(token);
+                }
+            }
+        }
+    }
+    variants.len() >= 2
+}
+
+fn naming_variant_keys(input: &str) -> std::collections::HashSet<String> {
+    identifier_tokens(input)
+        .into_iter()
+        .filter_map(|token| naming_variant_key(&token))
+        .collect()
+}
+
+fn naming_variant_key(token: &str) -> Option<String> {
+    let key: String = token
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    (key.len() >= 3).then_some(key)
+}
+
 fn path_or_protocol_construction_text_probe(pattern: &str) -> bool {
     let lower = pattern.to_ascii_lowercase();
     (pattern.contains("\\.") || pattern.contains('.'))
@@ -1692,12 +1785,22 @@ fn deterministic_source_symbol_repair_tool(
     context: &GateContext,
 ) -> Option<(RecommendedTool, &'static str)> {
     let source_call_site = source_relationship_call_site_pattern(pattern);
-    if repair_blocked_text_grep(pattern, glob, path, file_path, context)
+    let same_symbol_bifrost_hit =
+        same_symbol_bifrost_hit_for_grep(pattern, &context.tool_exchanges);
+    if (repair_blocked_text_grep(pattern, glob, path, file_path, context)
+        && !same_symbol_bifrost_hit)
         || classify_path_or_glob(&normalized_grep_scope(glob, path, file_path))
             == StaticTextTarget::TextLike
         || exact_error_constant_search(pattern, path, file_path)
         || diagnostic_or_status_constant_text(pattern)
+        || (natural_language_or_path_literal(pattern)
+            && !declaration_search_pattern(pattern)
+            && !constructor_or_static_call_usage_pattern(pattern)
+            && !source_static_or_member_access(pattern)
+            && !source_call_navigation_pattern(pattern)
+            && !source_call_site)
         || (literal_value_text_target(pattern)
+            && !same_symbol_bifrost_hit
             && !(declaration_search_pattern(pattern)
                 || constructor_or_static_call_usage_pattern(pattern)
                 || source_static_or_member_access(pattern)
@@ -1756,6 +1859,15 @@ fn deterministic_source_symbol_repair_tool(
     }
     if broad_nav_scope && uppercase_constant_token_count(pattern) >= 2 {
         return Some((RecommendedTool::SearchSymbols, "constant symbol discovery"));
+    }
+    if broad_nav_scope
+        && same_symbol_bifrost_hit
+        && symbols.len() == 1
+        && symbols
+            .iter()
+            .any(|symbol| symbol.contains('_') && !uppercase_constant_like(symbol))
+    {
+        return Some((RecommendedTool::SearchSymbols, "known symbol discovery"));
     }
     if broad_nav_scope
         && symbols.len() == 1
@@ -5290,6 +5402,69 @@ mod tests {
     }
 
     #[test]
+    fn mixed_phrase_and_symbol_grep_stays_text() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
+        let mut hit = exchange("search_symbols");
+        hit.arguments = r#"{"patterns":["checkWordOccurrence"]}"#.to_string();
+        hit.result = "checkWordOccurrence src/words.js".to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "pattern": "word occurrence|checkWordOccurrence|CheckWordOccurrence|occurrence",
+                "path": ".",
+                "glob": "**/*.{js,ts}"
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![hit],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn same_direct_regex_candidate_routes_to_bifrost() {
+        let mut output = GateClassifierOutput {
+            reason: "Source call-site regex has a same-direct Bifrost candidate.".to_string(),
+            intent: TextIntent::SymbolUsageLookup,
+            pattern_class: TextPatternClass::RegexText,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence {
+                symbol_tokens: vec!["effectAsync".to_string()],
+                same_token_or_path_bifrost_miss: false,
+                same_path_recent_edit_or_write: false,
+                same_path_recent_bifrost_hit: false,
+                exact_text_or_regex_needed: false,
+            },
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["effectAsync"]}),
+            }),
+            decision: GateClassifierDecision::AllowText,
+            recommended_tool: RecommendedTool::None,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "effectAsync\\s*\\{", "path": ".", "glob": "*.scala"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: Vec::new(),
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::ScanUsages);
+    }
+
+    #[test]
     fn low_confidence_post_edit_verification_grep_stays_allowed() {
         let mut output = low_confidence_allow_output(TextIntent::SymbolUsageLookup);
         let mut edit = exchange("edit");
@@ -5327,6 +5502,77 @@ mod tests {
 
         assert_eq!(output.decision, GateClassifierDecision::AllowText);
         assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn recent_naming_variant_grep_stays_text() {
+        let mut output = GateClassifierOutput {
+            reason: "GATE_TO_SYMBOL_TOOL because property references are source navigation.".to_string(),
+            intent: TextIntent::SymbolReferenceLookup,
+            pattern_class: TextPatternClass::IdentifierLike,
+            scope_class: TextScopeClass::BroadSourceScope,
+            bifrost_fit: BifrostFit::SameOrMoreDirect,
+            allow_exception: TextAllowException::None,
+            evidence: TextEvidence::default(),
+            bifrost_candidate: Some(BifrostCandidate {
+                tool: Some(RecommendedTool::ScanUsages),
+                args: json!({"symbols":["callID"]}),
+            }),
+            decision: GateClassifierDecision::GateToSymbolTool,
+            recommended_tool: RecommendedTool::ScanUsages,
+            suggested_args: json!({}),
+            confidence: GateConfidence::High,
+        };
+        let mut first = exchange("grep_search");
+        first.arguments =
+            r#"{"pattern":"call(ID|Id|_id)","glob":"src/tools/delegate-task/**/*.ts","path":"."}"#
+                .to_string();
+        let mut second = exchange("grep_search");
+        second.arguments =
+            r#"{"pattern":"callId","glob":"src/tools/delegate-task/**/*.ts","path":"."}"#
+                .to_string();
+        let mut third = exchange("grep_search");
+        third.arguments =
+            r#"{"pattern":"callID","glob":"src/tools/delegate-task/**/*.ts","path":"."}"#
+                .to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({
+                "pattern": "callID\\W",
+                "glob": "src/tools/delegate-task/**/*.ts",
+                "path": "."
+            }),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![first, second, third],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::AllowText);
+        assert_eq!(output.recommended_tool, RecommendedTool::None);
+    }
+
+    #[test]
+    fn lower_snake_same_symbol_hit_repairs_to_bifrost() {
+        let mut output = low_confidence_allow_output(TextIntent::SymbolDefinitionLookup);
+        output.confidence = GateConfidence::High;
+        let mut hit = exchange("search_symbols");
+        hit.arguments = r#"{"patterns":["mount_info_from_path"]}"#.to_string();
+        hit.result = r#"{"files":[{"functions":[{"signature":"fn mount_info_from_path"}]}]}"#
+            .to_string();
+        let context = GateContext {
+            tool_name: "grep_search".to_string(),
+            args: json!({"pattern": "mount_info_from_path", "path": ".", "glob": "*.rs"}),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_exchanges: vec![hit],
+        };
+
+        enforce_text_classifier_policy(&mut output, &context);
+
+        assert_eq!(output.decision, GateClassifierDecision::GateToSymbolTool);
+        assert_eq!(output.recommended_tool, RecommendedTool::SearchSymbols);
     }
 
     #[test]
