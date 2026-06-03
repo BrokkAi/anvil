@@ -55,10 +55,10 @@ const MAX_CONCURRENT_CHUNK_REQUESTS: usize = 2;
 /// per-turn-summarization trigger threshold.
 const BUDGET_FRACTION: f64 = 0.75;
 
-/// Conservative fallback when the backend doesn't publish a context
-/// length (Codex, Ollama). Undershooting just costs us extra
-/// summarization rounds; overshooting silently drops the user's
-/// prompt mid-stream, which is much worse.
+/// Conservative fallback used only for internal compression budgeting
+/// when a backend does not publish a reliable context length. This is
+/// not a provider-reported maximum and must not be presented to users
+/// as the model's context window.
 pub const FALLBACK_CONTEXT_LENGTH: u32 = 128_000;
 
 /// Per-call input budget for the *summarizer*. Smaller than

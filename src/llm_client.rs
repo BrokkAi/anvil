@@ -526,6 +526,14 @@ pub(crate) struct ModelEntry {
     pub(crate) default_parameters: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) context_length: Option<u32>,
+    #[serde(default)]
+    pub(crate) top_provider: Option<ModelTopProvider>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelTopProvider {
+    #[serde(default)]
+    pub(crate) context_length: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,13 +595,21 @@ impl ModelEntry {
                 .is_some()
     }
 
+    fn context_length(&self) -> Option<u32> {
+        self.context_length.or_else(|| {
+            self.top_provider
+                .as_ref()
+                .and_then(|provider| provider.context_length)
+        })
+    }
+
     fn to_model_metadata(&self) -> ModelMetadata {
         if !self.supports_reasoning() {
             return ModelMetadata {
                 id: self.id.clone(),
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
-                context_length: self.context_length,
+                context_length: self.context_length(),
             };
         }
 
@@ -604,7 +620,7 @@ impl ModelEntry {
             )
             .or_else(|| Some("medium".to_string())),
             supported_reasoning_levels: openrouter_reasoning_presets(),
-            context_length: self.context_length,
+            context_length: self.context_length(),
         }
     }
 }
@@ -1047,10 +1063,10 @@ impl OpenAiClient {
                 .data
                 .into_iter()
                 .map(|model| ModelMetadata {
-                    id: model.id,
+                    id: model.id.clone(),
                     default_reasoning_level: None,
                     supported_reasoning_levels: Vec::new(),
-                    context_length: model.context_length,
+                    context_length: model.context_length(),
                 })
                 .collect());
         }
@@ -1816,13 +1832,16 @@ mod tests {
         let raw = r#"{
             "data": [
                 {
-                    "id": "anthropic/claude-3.5-sonnet",
-                    "name": "Anthropic: Claude 3.5 Sonnet",
-                    "canonical_slug": "anthropic/claude-3.5-sonnet",
-                    "context_length": 200000,
-                    "pricing": {"prompt": "0.000003", "completion": "0.000015"},
-                    "architecture": {"input_modalities": ["text", "image"]},
-                    "top_provider": {"context_length": 200000}
+                    "id": "minimax/minimax-m3",
+                    "name": "MiniMax: MiniMax M3",
+                    "context_length": 1048576,
+                    "top_provider": {
+                        "context_length": 524288,
+                        "max_completion_tokens": 512000,
+                        "is_moderated": false
+                    },
+                    "pricing": {"prompt": "0.0000003", "completion": "0.0000012"},
+                    "architecture": {"input_modalities": ["text", "image", "video"]}
                 },
                 {
                     "id": "openai/gpt-4o",
@@ -1836,12 +1855,12 @@ mod tests {
         let entries: Vec<(String, Option<u32>)> = parsed
             .data
             .iter()
-            .map(|m| (m.id.clone(), m.context_length))
+            .map(|m| (m.id.clone(), m.context_length()))
             .collect();
         assert_eq!(
             entries,
             vec![
-                ("anthropic/claude-3.5-sonnet".to_string(), Some(200_000)),
+                ("minimax/minimax-m3".to_string(), Some(1_048_576)),
                 ("openai/gpt-4o".to_string(), Some(128_000)),
             ]
         );
@@ -1861,6 +1880,27 @@ mod tests {
         let entry: ModelEntry = serde_json::from_str(raw).expect("entry parses");
         assert!(entry.context_length.is_none());
         assert!(entry.to_model_metadata().context_length.is_none());
+    }
+
+    #[test]
+    fn openrouter_top_provider_context_length_is_fallback_only() {
+        // Live OpenRouter `/api/v1/models` publishes both a model-level
+        // `context_length` and a nested `top_provider.context_length`.
+        // The API reference documents `context_length` as the model's
+        // context length; `top_provider` describes the currently preferred
+        // provider and may be smaller. Use the top-provider value only
+        // when the model-level field is absent.
+        let raw = r#"{
+            "id": "provider/only-nested",
+            "top_provider": {
+                "context_length": 65536,
+                "max_completion_tokens": 8192,
+                "is_moderated": false
+            }
+        }"#;
+        let entry: ModelEntry = serde_json::from_str(raw).expect("entry parses");
+        assert_eq!(entry.context_length(), Some(65_536));
+        assert_eq!(entry.to_model_metadata().context_length, Some(65_536));
     }
 
     /// OpenRouter reasoning-capable models should surface a default

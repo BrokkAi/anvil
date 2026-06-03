@@ -247,8 +247,12 @@ pub async fn discover_ollama_model_metadata(
                         id: model_id,
                         default_reasoning_level: None,
                         supported_reasoning_levels: ollama_thinking_presets(),
-                        // Ollama's catalog doesn't publish a context window;
-                        // the compression layer falls back to a default.
+                        // Ollama's effective context window is controlled
+                        // by runtime/server configuration (`num_ctx` in
+                        // request options or the Modelfile), not by the
+                        // OpenAI-compatible `/v1/models` catalog. Leave it
+                        // unknown so UI surfaces do not present a guessed
+                        // maximum as fact.
                         context_length: None,
                     },
                 ));

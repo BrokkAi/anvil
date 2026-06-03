@@ -597,7 +597,7 @@ fn send_session_info_update(
 fn session_usage_update(
     snap: &SessionSnapshot,
     available_models: &[crate::llm_client::ModelMetadata],
-) -> UsageUpdate {
+) -> Option<UsageUpdate> {
     let used = crate::tokens::approximate_tokens_messages(&build_prompt_messages_with_parts(
         snap,
         "",
@@ -606,9 +606,8 @@ fn session_usage_update(
     let size = available_models
         .iter()
         .find(|m| m.id == snap.model)
-        .and_then(|m| m.context_length)
-        .unwrap_or(crate::context_manager::FALLBACK_CONTEXT_LENGTH) as u64;
-    UsageUpdate::new(used, size)
+        .and_then(|m| m.context_length)? as u64;
+    Some(UsageUpdate::new(used, size))
 }
 
 async fn send_session_usage_update(
@@ -620,7 +619,15 @@ async fn send_session_usage_update(
     let Some(snap) = sessions.snapshot(session_id, fallback_cwd).await else {
         return;
     };
-    let update = session_usage_update(&snap, &sessions.available_model_metadata().await);
+    let Some(update) = session_usage_update(&snap, &sessions.available_model_metadata().await)
+    else {
+        tracing::debug!(
+            session_id = %session_id,
+            model = %snap.model,
+            "skipping session usage update because model context window is unknown"
+        );
+        return;
+    };
     let notification =
         SessionNotification::new(session_id.to_string(), SessionUpdate::UsageUpdate(update));
     if let Err(e) = cx.send_notification(notification) {
@@ -4961,7 +4968,7 @@ mod tests {
             context_length: Some(200_000),
         }];
 
-        let update = session_usage_update(&snap, &catalog);
+        let update = session_usage_update(&snap, &catalog).expect("known context window");
         let expected_used = crate::tokens::approximate_tokens_messages(
             &build_prompt_messages_with_parts(&snap, "", &[]),
         ) as u64;
@@ -4971,7 +4978,7 @@ mod tests {
     }
 
     #[test]
-    fn session_usage_update_falls_back_when_model_window_unknown() {
+    fn session_usage_update_is_absent_when_model_window_unknown() {
         use crate::llm_client::ModelMetadata;
         use crate::session::SessionSnapshot;
 
@@ -4994,10 +5001,7 @@ mod tests {
 
         let update = session_usage_update(&snap, &catalog);
 
-        assert_eq!(
-            update.size,
-            crate::context_manager::FALLBACK_CONTEXT_LENGTH as u64
-        );
+        assert!(update.is_none());
     }
 
     /// `session/list` should expose the persisted title and updatedAt

@@ -75,6 +75,12 @@ const ORIGINATOR: &str = "codex_cli_rs";
 /// `/config` prompt and the server forwards it verbatim.
 const FALLBACK_CHATGPT_MODEL: &str = "gpt-5-codex";
 
+/// Last-resort fallback context window used by upstream Codex for
+/// unknown/missing model metadata. See openai/codex
+/// `models-manager/src/model_info.rs::model_info_from_slug`, which sets
+/// both `context_window` and `max_context_window` to 272_000.
+const FALLBACK_CHATGPT_CONTEXT_LENGTH: u32 = 272_000;
+
 /// `client_version` we report to the ChatGPT backend. The server uses
 /// it to gate per-model rollout via each `ModelInfo.minimal_client_version`:
 /// any model whose minimum exceeds the value we send is filtered out
@@ -328,7 +334,7 @@ impl CodexClient {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("skipping ChatGPT model discovery (credentials not ready): {e:#}");
-                return Ok(vec![ModelMetadata::id_only(FALLBACK_CHATGPT_MODEL)]);
+                return Ok(vec![fallback_chatgpt_model_metadata()]);
             }
         };
         match fetch_chatgpt_models(&self.http, &creds).await {
@@ -337,19 +343,27 @@ impl CodexClient {
                 tracing::warn!(
                     "ChatGPT /models endpoint returned no slugs; falling back to {FALLBACK_CHATGPT_MODEL}"
                 );
-                Ok(vec![ModelMetadata::id_only(FALLBACK_CHATGPT_MODEL)])
+                Ok(vec![fallback_chatgpt_model_metadata()])
             }
             Err(e) => {
                 tracing::warn!(
                     "ChatGPT model discovery failed ({CHATGPT_MODELS_URL}): {e:#}; falling back to {FALLBACK_CHATGPT_MODEL}"
                 );
-                Ok(vec![ModelMetadata::id_only(FALLBACK_CHATGPT_MODEL)])
+                Ok(vec![fallback_chatgpt_model_metadata()])
             }
         }
     }
 }
 
-/// GET `chatgpt.com/backend-api/codex/models?client_version=...` and
+fn fallback_chatgpt_model_metadata() -> ModelMetadata {
+    ModelMetadata {
+        id: FALLBACK_CHATGPT_MODEL.to_string(),
+        default_reasoning_level: None,
+        supported_reasoning_levels: Vec::new(),
+        context_length: Some(FALLBACK_CHATGPT_CONTEXT_LENGTH),
+    }
+}
+
 /// return the slugs. Sorted by the server-supplied `priority`
 /// (descending) so the most recommended model surfaces first in the
 /// picker -- matches Codex CLI's ordering.
@@ -443,9 +457,15 @@ async fn fetch_chatgpt_models(
                 .into_iter()
                 .map(ReasoningLevelPreset::from)
                 .collect(),
-            // ChatGPT's `/models` endpoint doesn't expose a context window;
-            // the compression layer falls back to a per-backend default.
-            context_length: None,
+            // Mirrors Codex's ModelInfo fields. Prefer the effective
+            // `context_window`; fall back to `max_context_window`, then to
+            // Codex's own unknown-slug fallback from
+            // models-manager/src/model_info.rs.
+            context_length: Some(
+                m.context_window
+                    .or(m.max_context_window)
+                    .unwrap_or(FALLBACK_CHATGPT_CONTEXT_LENGTH),
+            ),
         })
         .collect())
 }
@@ -489,6 +509,18 @@ struct ChatGptModelEntry {
     /// pick.
     #[serde(default)]
     default_reasoning_level: Option<String>,
+    /// Effective context window in tokens. This is part of upstream
+    /// Codex's `ModelInfo` payload (`context_window`) and is what its
+    /// context manager uses when deciding when to compact.
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// Maximum supported context window in tokens. Upstream Codex lets
+    /// config clamp `context_window` to `max_context_window`; when the
+    /// effective value is absent we still use the max as authoritative
+    /// catalog metadata rather than falling back to Anvil's generic
+    /// default.
+    #[serde(default)]
+    max_context_window: Option<u32>,
     /// Distinct reasoning-effort presets the model accepts. Each entry
     /// carries the wire `effort` token (low/medium/high/xhigh) and a
     /// server-written description we surface in the ACP picker so users
@@ -1679,6 +1711,8 @@ mod tests {
                     "apply_patch_tool_type": null,
                     "truncation_policy": {"type": "auto"},
                     "supports_parallel_tool_calls": true,
+                    "context_window": 272000,
+                    "max_context_window": 400000,
                     "experimental_supported_tools": [],
                     "availability_nux": null,
                     "upgrade": null
@@ -1688,6 +1722,75 @@ mod tests {
         let parsed: ChatGptModelsResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.models.len(), 1);
         assert_eq!(parsed.models[0].slug, "gpt-future");
+        assert_eq!(parsed.models[0].context_window, Some(272_000));
+        assert_eq!(parsed.models[0].max_context_window, Some(400_000));
+    }
+
+    #[test]
+    fn parses_models_response_with_context_windows() {
+        // Upstream Codex `ModelInfo` includes both `context_window` and
+        // `max_context_window` (see openai/codex `protocol/src/openai_models.rs`
+        // and `models-manager/models.json`). We must propagate those
+        // values instead of falling through to Anvil's generic 128k
+        // fallback, otherwise `/context` and compression thresholds are
+        // wrong for the ChatGPT/Codex subscription backend.
+        let raw = r#"{
+            "models": [
+                {
+                    "slug": "gpt-5.5",
+                    "priority": 10,
+                    "visibility": "list",
+                    "context_window": 272000,
+                    "max_context_window": 272000
+                },
+                {
+                    "slug": "future-only-max",
+                    "priority": 5,
+                    "visibility": "list",
+                    "max_context_window": 400000
+                },
+                {
+                    "slug": "missing-context",
+                    "priority": 1,
+                    "visibility": "list"
+                }
+            ]
+        }"#;
+        let parsed: ChatGptModelsResponse = serde_json::from_str(raw).unwrap();
+        let mut models = parsed.models;
+        models.retain(|m| m.visibility.as_deref() == Some("list"));
+        models.sort_by_key(|m| std::cmp::Reverse(m.priority));
+        let metadata: Vec<ModelMetadata> = models
+            .into_iter()
+            .map(|m| ModelMetadata {
+                id: m.slug,
+                default_reasoning_level: m.default_reasoning_level,
+                supported_reasoning_levels: m
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(ReasoningLevelPreset::from)
+                    .collect(),
+                context_length: Some(
+                    m.context_window
+                        .or(m.max_context_window)
+                        .unwrap_or(FALLBACK_CHATGPT_CONTEXT_LENGTH),
+                ),
+            })
+            .collect();
+
+        assert_eq!(metadata[0].context_length, Some(272_000));
+        assert_eq!(metadata[1].context_length, Some(400_000));
+        assert_eq!(
+            metadata[2].context_length,
+            Some(FALLBACK_CHATGPT_CONTEXT_LENGTH)
+        );
+    }
+
+    #[test]
+    fn fallback_chatgpt_metadata_uses_codex_context_window() {
+        let metadata = fallback_chatgpt_model_metadata();
+        assert_eq!(metadata.id, FALLBACK_CHATGPT_MODEL);
+        assert_eq!(metadata.context_length, Some(272_000));
     }
 
     #[test]
