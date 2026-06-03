@@ -24,7 +24,7 @@ name = "anvil"
 path = "src/main.rs"
 
 [dependencies]
-agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"] }
+agent-client-protocol = { version = "0.13.1", features = ["unstable_session_usage"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
