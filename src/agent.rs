@@ -12,7 +12,7 @@ use agent_client_protocol::schema::{
     SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, Usage as AcpUsage,
+    TextContent, Usage as AcpUsage, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
@@ -586,6 +586,40 @@ fn send_session_info_update(
     }
 }
 
+fn session_usage_update(
+    snap: &SessionSnapshot,
+    available_models: &[crate::llm_client::ModelMetadata],
+) -> UsageUpdate {
+    let used = crate::tokens::approximate_tokens_messages(&build_prompt_messages_with_parts(
+        snap,
+        "",
+        &[],
+    )) as u64;
+    let size = available_models
+        .iter()
+        .find(|m| m.id == snap.model)
+        .and_then(|m| m.context_length)
+        .unwrap_or(crate::context_manager::FALLBACK_CONTEXT_LENGTH) as u64;
+    UsageUpdate::new(used, size)
+}
+
+async fn send_session_usage_update(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+) {
+    let Some(snap) = sessions.snapshot(session_id, fallback_cwd).await else {
+        return;
+    };
+    let update = session_usage_update(&snap, &sessions.available_model_metadata().await);
+    let notification =
+        SessionNotification::new(session_id.to_string(), SessionUpdate::UsageUpdate(update));
+    if let Err(e) = cx.send_notification(notification) {
+        tracing::warn!("failed to send usage_update: {e}");
+    }
+}
+
 /// Defer the `available_commands_update` notification so the client has
 /// time to register the freshly-issued session id before the
 /// notification references it.
@@ -628,6 +662,18 @@ fn spawn_delayed_available_commands_update(
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         send_available_commands_update(&cx, &session_id, &skills);
+    });
+}
+
+fn spawn_delayed_session_usage_update(
+    cx: ConnectionTo<Client>,
+    sessions: SessionStore,
+    session_id: String,
+    fallback_cwd: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_session_usage_update(&cx, &sessions, &session_id, &fallback_cwd).await;
     });
 }
 
@@ -962,6 +1008,12 @@ pub async fn run_agent(
                     session.id.clone(),
                     session.skills.clone(),
                 );
+                spawn_delayed_session_usage_update(
+                    cx.clone(),
+                    sessions_new.clone(),
+                    session.id.clone(),
+                    session.cwd.clone(),
+                );
                 spawn_delayed_setup_notice(
                     cx.clone(),
                     setup_session,
@@ -1026,6 +1078,12 @@ pub async fn run_agent(
                     session_id.clone(),
                     session.skills.clone(),
                 );
+                spawn_delayed_session_usage_update(
+                    cx.clone(),
+                    sessions_load.clone(),
+                    session_id.clone(),
+                    session.cwd.clone(),
+                );
                 spawn_delayed_setup_notice(
                     cx.clone(),
                     setup_session,
@@ -1069,6 +1127,12 @@ pub async fn run_agent(
                             cx.clone(),
                             session_id.clone(),
                             session.skills.clone(),
+                        );
+                        spawn_delayed_session_usage_update(
+                            cx.clone(),
+                            sessions_resume.clone(),
+                            session_id.clone(),
+                            session.cwd.clone(),
                         );
                         spawn_delayed_setup_notice(
                             cx.clone(),
@@ -1369,6 +1433,7 @@ pub async fn run_agent(
                     )
                     .await;
                     send_message(&cx, &session_id, &report);
+                    send_session_usage_update(&cx, &sessions_prompt, &session_id, &snap.cwd).await;
                     sessions_prompt.finish_prompt(&session_id).await;
                     return responder.respond(PromptResponse::new(StopReason::EndTurn));
                 }
@@ -1457,6 +1522,7 @@ pub async fn run_agent(
                 let sessions_for_loop = sessions_prompt.clone();
                 let cx_for_loop = cx.clone();
                 let session_id_for_loop = session_id.clone();
+                let fallback_cwd_for_loop = fallback_cwd.clone();
                 let prompt_text_for_turn = prompt_text;
                 let model_for_loop = snap.model;
                 let reasoning_effort_for_loop = snap.reasoning_effort;
@@ -1587,6 +1653,14 @@ pub async fn run_agent(
                             ),
                         );
                     }
+
+                    send_session_usage_update(
+                        &cx_for_loop,
+                        &sessions_for_loop,
+                        &session_id_for_loop,
+                        &fallback_cwd_for_loop,
+                    )
+                    .await;
 
                     // Clean up cancellation token even on panic / persistence failure.
                     sessions_for_loop.finish_prompt(&session_id_for_loop).await;
@@ -1769,6 +1843,8 @@ pub async fn run_agent(
                 if let Err(e) = cx.send_notification(notification) {
                     tracing::warn!("failed to send config_option_update: {e}");
                 }
+                let fallback_cwd = std::env::current_dir().unwrap_or_default();
+                send_session_usage_update(&cx, &sessions_perm, &session_id, &fallback_cwd).await;
 
                 responder.respond(SetSessionConfigOptionResponse::new(outcome.updated_options))
             },
@@ -3675,6 +3751,8 @@ async fn apply_setup_config(
             if let Err(e) = cx.send_notification(notification) {
                 tracing::warn!("failed to send config_option_update from slash command: {e}");
             }
+            let fallback_cwd = std::env::current_dir().unwrap_or_default();
+            send_session_usage_update(cx, sessions, session_id, &fallback_cwd).await;
             let mut msg = match key {
                 MODEL_CONFIG_ID => "Model setup updated.".to_string(),
                 PERMISSION_CONFIG_ID => "Permission mode updated.".to_string(),
@@ -4847,6 +4925,71 @@ mod tests {
         // No catalog entry for the (empty) model id -> falls back to
         // the "model max unknown" line rather than crashing.
         assert!(report.contains("model max unknown"));
+    }
+
+    #[test]
+    fn session_usage_update_reports_replayed_prompt_tokens() {
+        use crate::llm_client::ModelMetadata;
+        use crate::session::{ConversationTurn, SessionSnapshot};
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "gpt-99".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "investigate context accounting".into(),
+                agent_response: "count the replayed prompt, not cumulative billing".into(),
+                ..Default::default()
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: "Use the local style.".into(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let catalog = vec![ModelMetadata {
+            id: "gpt-99".into(),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            context_length: Some(200_000),
+        }];
+
+        let update = session_usage_update(&snap, &catalog);
+        let expected_used = crate::tokens::approximate_tokens_messages(
+            &build_prompt_messages_with_parts(&snap, "", &[]),
+        ) as u64;
+
+        assert_eq!(update.used, expected_used);
+        assert_eq!(update.size, 200_000);
+    }
+
+    #[test]
+    fn session_usage_update_falls_back_when_model_window_unknown() {
+        use crate::llm_client::ModelMetadata;
+        use crate::session::SessionSnapshot;
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Ask,
+            model: "codex::gpt-5-codex".into(),
+            history: vec![],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let catalog = vec![ModelMetadata {
+            id: "codex::gpt-5-codex".into(),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            context_length: None,
+        }];
+
+        let update = session_usage_update(&snap, &catalog);
+
+        assert_eq!(
+            update.size,
+            crate::context_manager::FALLBACK_CONTEXT_LENGTH as u64
+        );
     }
 
     /// `session/list` should expose the persisted title and updatedAt
