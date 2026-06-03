@@ -608,8 +608,8 @@ fn current_context_usage_update(
         project_instructions: snap.project_instructions.clone(),
         skills: snap.skills.clone(),
     };
-    let used = crate::tokens::approximate_tokens_messages(&build_prompt_messages(&context_snap, ""))
-        as u64;
+    let used =
+        crate::tokens::approximate_tokens_messages(&build_replay_messages(&context_snap)) as u64;
     Some(AcpUsageUpdate::new(used, size))
 }
 
@@ -1945,12 +1945,8 @@ fn build_prompt_messages(snap: &SessionSnapshot, new_prompt: &str) -> Vec<ChatMe
     build_prompt_messages_with_parts(snap, new_prompt, &[ChatContentPart::text(new_prompt)])
 }
 
-fn build_prompt_messages_with_parts(
-    snap: &SessionSnapshot,
-    new_prompt_text: &str,
-    new_prompt_parts: &[ChatContentPart],
-) -> Vec<ChatMessage> {
-    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
+fn build_replay_messages(snap: &SessionSnapshot) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 3);
     messages.push(ChatMessage::system(build_system_prompt(
         &snap.mode, &snap.cwd,
     )));
@@ -2039,6 +2035,15 @@ fn build_prompt_messages_with_parts(
             messages.push(ChatMessage::assistant(turn.agent_response.clone()));
         }
     }
+    messages
+}
+
+fn build_prompt_messages_with_parts(
+    snap: &SessionSnapshot,
+    new_prompt_text: &str,
+    new_prompt_parts: &[ChatContentPart],
+) -> Vec<ChatMessage> {
+    let mut messages = build_replay_messages(snap);
     if new_prompt_parts.is_empty() {
         messages.push(ChatMessage::user(new_prompt_text.to_string()));
     } else {
