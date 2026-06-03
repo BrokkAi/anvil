@@ -23,6 +23,9 @@ use crate::llm_client::{
 };
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::structured_output::StructuredOutputRequest;
+use crate::terminal_notifications::{
+    TerminalNotificationEvent, emit as emit_terminal_notification,
+};
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 use crate::trace_logging::append_trace_record;
@@ -1071,6 +1074,7 @@ async fn request_user_permission(
     let options = permission_options(tool_name, shell_sandboxed);
 
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
+    emit_terminal_notification(TerminalNotificationEvent::Prompt);
 
     // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
     // on `run` above. We deliberately do not apply a local timeout here: ACP
