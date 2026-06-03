@@ -118,6 +118,43 @@ impl SandboxPolicy {
     }
 }
 
+/// Returns `true` when the current session really has a sandbox boundary the
+/// permission prompt may advertise.
+///
+/// This uses the session's effective mode plus the backend that can actually
+/// be obtained for that mode. It intentionally does not trust the stored mode
+/// by itself:
+/// - `os` counts only when the OS sandbox exists on this host.
+/// - `wasm` counts only when this session really resolves to a wasm backend.
+/// - `off` never counts.
+pub fn shell_command_will_run_sandboxed(
+    permission_mode: PermissionMode,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+) -> bool {
+    shell_command_will_run_sandboxed_with_default(
+        permission_mode,
+        crate::sandbox_backend::resolve_mode(sandbox_mode),
+        is_os_sandbox_available(),
+        matches!(
+            crate::sandbox_backend::backend_for_mode(sandbox_mode),
+            Ok(crate::sandbox_backend::SandboxBackend::WasmFallback(_))
+        ),
+    )
+}
+
+fn shell_command_will_run_sandboxed_with_default(
+    _permission_mode: PermissionMode,
+    effective_mode: crate::sandbox_backend::SandboxMode,
+    os_sandbox_available: bool,
+    wasm_sandbox_active: bool,
+) -> bool {
+    match effective_mode {
+        crate::sandbox_backend::SandboxMode::Os => os_sandbox_available,
+        crate::sandbox_backend::SandboxMode::Wasm => wasm_sandbox_active,
+        crate::sandbox_backend::SandboxMode::Off => false,
+    }
+}
+
 /// Owns a temp-file path and removes it on Drop. Bound into `WrappedCommand`
 /// so the policy file outlives the spawned child process.
 #[derive(Debug)]
@@ -921,6 +958,96 @@ mod tests {
                 SandboxMode::Wasm
             ),
             SandboxPolicy::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn shell_prompt_treats_missing_os_sandbox_as_unsandboxed_even_if_default_is_os() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(
+            !shell_command_will_run_sandboxed_with_default(
+                PermissionMode::Default,
+                SandboxMode::Os,
+                false,
+                true
+            ),
+            "missing OS sandbox must suppress sandbox-specific prompt language"
+        );
+    }
+
+    #[test]
+    fn shell_prompt_treats_missing_os_sandbox_as_unsandboxed_even_with_os_override() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(
+            !shell_command_will_run_sandboxed_with_default(
+                PermissionMode::Default,
+                SandboxMode::Os,
+                false,
+                false
+            ),
+            "an explicit os override must stay unsandboxed even if the process default uses wasm"
+        );
+    }
+
+    #[test]
+    fn shell_prompt_treats_wasm_default_as_sandboxed() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(
+            shell_command_will_run_sandboxed_with_default(
+                PermissionMode::Default,
+                SandboxMode::Wasm,
+                false,
+                true
+            ),
+            "the wasm fallback counts as a real sandbox for permission UX"
+        );
+    }
+
+    #[test]
+    fn shell_prompt_treats_explicit_wasm_override_as_sandboxed() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(
+            shell_command_will_run_sandboxed_with_default(
+                PermissionMode::Default,
+                SandboxMode::Wasm,
+                false,
+                true
+            ),
+            "an explicit wasm sandbox mode should keep sandbox wording in prompts"
+        );
+    }
+
+    #[test]
+    fn shell_prompt_treats_unavailable_wasm_default_as_unsandboxed() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(
+            !shell_command_will_run_sandboxed_with_default(
+                PermissionMode::Default,
+                SandboxMode::Wasm,
+                false,
+                false
+            ),
+            "a missing wasm runtime must suppress sandbox wording even if wasm is the default"
+        );
+    }
+
+    #[test]
+    fn shell_prompt_treats_unavailable_explicit_wasm_as_unsandboxed() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(
+            !shell_command_will_run_sandboxed_with_default(
+                PermissionMode::Default,
+                SandboxMode::Wasm,
+                true,
+                false
+            ),
+            "an explicit wasm override must not look sandboxed when wasm is unavailable"
         );
     }
 
