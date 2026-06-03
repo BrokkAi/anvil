@@ -32,6 +32,10 @@ one reusable ACP subprocess and put a small client in front of it.
 - **Designed for unattended and attended flows.** Clients can run read-only,
   ask before edits, auto-accept edits, or trust all tool calls. Permission
   prompts are protocol messages, not hardcoded UI.
+- **Terminal attention hooks for interactive runs.** When `stderr` is a real
+  terminal, Anvil rings the terminal bell when it opens a permission prompt and
+  when a turn finishes. Set `BROKK_TERMINAL_NOTIFICATIONS=off` to disable it,
+  or choose events with `prompt`, `turn-ended`, or `prompt,turn-ended`.
 - **Persistent working memory.** Sessions are stored on disk, can be loaded or
   resumed, and support context reports plus automatic or manual compression.
 

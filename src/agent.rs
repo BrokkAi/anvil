@@ -31,6 +31,9 @@ use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
     parse_structured_output_request, validate_response,
 };
+use crate::terminal_notifications::{
+    TerminalNotificationEvent, emit as emit_terminal_notification,
+};
 
 /// Stable ids for our `SessionConfigOption` selectors. We expose both
 /// dropdowns via configOptions because the ACP spec says clients SHOULD
@@ -60,6 +63,11 @@ fn prompt_response_meta(
     result: Option<&StructuredOutputResult>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     build_structured_output_meta(result)
+}
+
+fn prompt_end_turn_response() -> PromptResponse {
+    emit_terminal_notification(TerminalNotificationEvent::TurnEnded);
+    PromptResponse::new(StopReason::EndTurn)
 }
 
 /// Available session modes exposed to ACP clients.
@@ -1187,7 +1195,7 @@ pub async fn run_agent(
                 let raw_prompt_parts = extract_prompt_parts(&req.prompt);
                 if raw_prompt_parts.is_empty() {
                     send_message(&cx, &session_id, "Error: empty prompt");
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
                 let structured_output_request = match parse_prompt_structured_output_request(&req) {
                     Ok(request) => request,
@@ -1213,7 +1221,7 @@ pub async fn run_agent(
                     Some(s) => s,
                     None => {
                         send_message(&cx, &session_id, "Error: unknown session");
-                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        return responder.respond(prompt_end_turn_response());
                     }
                 };
 
@@ -1230,7 +1238,7 @@ pub async fn run_agent(
                     let available_models = sessions_prompt.available_model_metadata().await;
                     let report = render_context_report(&snap, permission_mode, &available_models);
                     send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 let stream_setup_openrouter_refresh =
@@ -1248,7 +1256,7 @@ pub async fn run_agent(
                     };
                     let report = handle_setup(&setup_ctx, &raw_prompt_text, &session_id).await;
                     send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 if is_slash_command(&raw_prompt_text, "permissions") {
@@ -1256,13 +1264,13 @@ pub async fn run_agent(
                         handle_permissions(&cx, &sessions_prompt, &session_id, &raw_prompt_text)
                             .await;
                     send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 if is_slash_command(&raw_prompt_text, "mcp") {
                     let report = handle_mcp(&raw_prompt_text, &sessions_prompt, &session_id).await;
                     send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 if is_slash_command(&raw_prompt_text, "pr-create") {
@@ -1287,7 +1295,7 @@ pub async fn run_agent(
                     )
                     .await;
                     send_message(&cx, &session_id, &report);
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 // User-explicit skill activation. Unlike the built-in
@@ -1367,7 +1375,7 @@ pub async fn run_agent(
                         &session_id,
                         &render_setup_home_from_snapshot(&snap, &catalog),
                     );
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 // Create a cancellation token for this prompt. Reject a
@@ -1435,7 +1443,7 @@ pub async fn run_agent(
                     send_message(&cx, &session_id, &report);
                     send_session_usage_update(&cx, &sessions_prompt, &session_id, &snap.cwd).await;
                     sessions_prompt.finish_prompt(&session_id).await;
-                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 if stream_setup_openrouter_refresh {
@@ -1473,7 +1481,7 @@ pub async fn run_agent(
                         };
                         send_message(&cx_for_refresh, &session_id_for_refresh, &report);
                         sessions_for_refresh.finish_prompt(&session_id_for_refresh).await;
-                        if let Err(e) = responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        if let Err(e) = responder.respond(prompt_end_turn_response())
                         {
                             tracing::warn!(
                                 session_id = %session_id_for_refresh,
@@ -1682,7 +1690,7 @@ pub async fn run_agent(
                     .thought_tokens(cumulative_usage.thought_tokens)
                     .cached_read_tokens(cumulative_usage.cached_read_tokens)
                     .cached_write_tokens(cumulative_usage.cached_write_tokens);
-                    let response = PromptResponse::new(StopReason::EndTurn).usage(Some(acp_usage));
+                    let response = prompt_end_turn_response().usage(Some(acp_usage));
                     let response =
                         response.meta(prompt_response_meta(structured_output_result.as_ref()));
                     if let Err(e) = responder.respond(response) {
