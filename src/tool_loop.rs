@@ -324,10 +324,7 @@ fn shell_command_will_run_sandboxed(
     permission_mode: PermissionMode,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
 ) -> bool {
-    !matches!(
-        SandboxPolicy::resolve(permission_mode, sandbox_mode),
-        SandboxPolicy::None
-    )
+    crate::tools::sandbox::shell_command_will_run_sandboxed(permission_mode, sandbox_mode)
 }
 
 fn always_allow_key(
