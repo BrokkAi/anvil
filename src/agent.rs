@@ -12,7 +12,7 @@ use agent_client_protocol::schema::{
     SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, Usage as AcpUsage,
+    TextContent, Usage as AcpUsage, UsageUpdate as AcpUsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
@@ -583,6 +583,41 @@ fn send_session_info_update(
     );
     if let Err(e) = cx.send_notification(notification) {
         tracing::warn!("failed to send session_info_update: {e}");
+    }
+}
+
+fn current_context_usage_update(
+    snap: &SessionSnapshot,
+    completed_turn: &ConversationTurn,
+    context_length: Option<u32>,
+) -> Option<AcpUsageUpdate> {
+    let size = u64::from(context_length?);
+    if size == 0 {
+        return None;
+    }
+
+    let mut history = snap.history.clone();
+    history.push(completed_turn.clone());
+    let context_snap = SessionSnapshot {
+        cwd: snap.cwd.clone(),
+        mode: snap.mode,
+        model: snap.model.clone(),
+        history,
+        reasoning_effort: snap.reasoning_effort.clone(),
+        idle_timeout_secs: snap.idle_timeout_secs,
+        project_instructions: snap.project_instructions.clone(),
+        skills: snap.skills.clone(),
+    };
+    let used = crate::tokens::approximate_tokens_messages(&build_prompt_messages(&context_snap, ""))
+        as u64;
+    Some(AcpUsageUpdate::new(used, size))
+}
+
+fn send_usage_update(cx: &ConnectionTo<Client>, session_id: &str, update: AcpUsageUpdate) {
+    let notification =
+        SessionNotification::new(session_id.to_string(), SessionUpdate::UsageUpdate(update));
+    if let Err(e) = cx.send_notification(notification) {
+        tracing::warn!("failed to send usage_update: {e}");
     }
 }
 
@@ -1441,7 +1476,7 @@ pub async fn run_agent(
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
                 let registry = sessions_prompt
-                    .get_or_create_registry(&session_id, snap.cwd)
+                    .get_or_create_registry(&session_id, snap.cwd.clone())
                     .await;
 
                 // Capture everything the spawned task needs before we move into it.
@@ -1458,8 +1493,8 @@ pub async fn run_agent(
                 let cx_for_loop = cx.clone();
                 let session_id_for_loop = session_id.clone();
                 let prompt_text_for_turn = prompt_text;
-                let model_for_loop = snap.model;
-                let reasoning_effort_for_loop = snap.reasoning_effort;
+                let model_for_loop = snap.model.clone();
+                let reasoning_effort_for_loop = snap.reasoning_effort.clone();
                 // Resolve per-turn idle timeout: the session override wins,
                 // otherwise fall back to the binary-wide default from
                 // `--llm-idle-timeout-secs` / `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS`.
@@ -1468,6 +1503,7 @@ pub async fn run_agent(
                         .unwrap_or(default_idle_timeout_secs)
                         .max(1),
                 );
+                let context_snap_for_loop = snap;
 
                 let spawn_result = cx.spawn(async move {
                     use futures::FutureExt;
@@ -1563,18 +1599,16 @@ pub async fn run_agent(
                     // Tool exchanges are persisted alongside the turn so a
                     // session/load can re-feed the LLM the same tool context
                     // it had when it produced response_text (#3409).
+                    let completed_turn = ConversationTurn {
+                        user_prompt: prompt_text_for_turn,
+                        agent_response: response_text,
+                        tool_exchanges,
+                        structured_output: structured_output_result.clone(),
+                        summary: None,
+                        fragment_id: None,
+                    };
                     let persist_result = sessions_for_loop
-                        .add_turn(
-                            &session_id_for_loop,
-                            ConversationTurn {
-                                user_prompt: prompt_text_for_turn,
-                                agent_response: response_text,
-                                tool_exchanges,
-                                structured_output: structured_output_result.clone(),
-                                summary: None,
-                                fragment_id: None,
-                            },
-                        )
+                        .add_turn(&session_id_for_loop, completed_turn.clone())
                         .await;
 
                     if let Err(e) = persist_result {
@@ -1586,6 +1620,12 @@ pub async fn run_agent(
                                  it will not survive a session reload: {e}\n"
                             ),
                         );
+                    } else if let Some(update) = current_context_usage_update(
+                        &context_snap_for_loop,
+                        &completed_turn,
+                        context_length,
+                    ) {
+                        send_usage_update(&cx_for_loop, &session_id_for_loop, update);
                     }
 
                     // Clean up cancellation token even on panic / persistence failure.
@@ -4847,6 +4887,87 @@ mod tests {
         // No catalog entry for the (empty) model id -> falls back to
         // the "model max unknown" line rather than crashing.
         assert!(report.contains("model max unknown"));
+    }
+
+    #[test]
+    fn current_context_usage_update_counts_full_replayable_context() {
+        use crate::session::{ConversationTurn, SessionSnapshot, ToolExchange};
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "gpt-99".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "Inspect src/lib.rs".into(),
+                agent_response: "I found the relevant module.".into(),
+                tool_exchanges: vec![ToolExchange {
+                    call_id: "call_1".into(),
+                    tool_name: "read_file".into(),
+                    arguments: "{\"path\":\"src/lib.rs\"}".into(),
+                    result: "pub fn helper() {}".into(),
+                }],
+                ..Default::default()
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: "Always keep tests green.".into(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let completed_turn = ConversationTurn {
+            user_prompt: "Add a regression test.".into(),
+            agent_response: "Added the regression test and updated the assertion.".into(),
+            tool_exchanges: vec![ToolExchange {
+                call_id: "call_2".into(),
+                tool_name: "write_file".into(),
+                arguments: "{\"path\":\"tests/regression.rs\"}".into(),
+                result: "ok".into(),
+            }],
+            ..Default::default()
+        };
+
+        let update =
+            current_context_usage_update(&snap, &completed_turn, Some(200_000)).expect("update");
+
+        let mut history = snap.history.clone();
+        history.push(completed_turn.clone());
+        let expected_snap = SessionSnapshot {
+            cwd: snap.cwd.clone(),
+            mode: snap.mode,
+            model: snap.model.clone(),
+            history,
+            reasoning_effort: snap.reasoning_effort.clone(),
+            idle_timeout_secs: snap.idle_timeout_secs,
+            project_instructions: snap.project_instructions.clone(),
+            skills: snap.skills.clone(),
+        };
+        let expected_used =
+            crate::tokens::approximate_tokens_messages(&build_prompt_messages(&expected_snap, ""))
+                as u64;
+
+        assert_eq!(update.used, expected_used);
+        assert_eq!(update.size, 200_000);
+        assert!(
+            update.used > crate::tokens::approximate_tokens(&completed_turn.agent_response) as u64,
+            "context usage should include more than the latest assistant output",
+        );
+    }
+
+    #[test]
+    fn current_context_usage_update_skips_unknown_context_window() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Ask,
+            model: "gpt-99".into(),
+            history: Vec::new(),
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        assert!(current_context_usage_update(&snap, &ConversationTurn::default(), None).is_none());
     }
 
     /// `session/list` should expose the persisted title and updatedAt
