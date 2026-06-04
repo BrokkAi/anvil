@@ -876,11 +876,12 @@ fn text_policy_facts_gate(raw: &RawGateClassifierOutput) -> bool {
             .is_some_and(is_bifrost_recommendation);
     if raw.source_relationship_grounding == SourceRelationshipGrounding::Unknown
         && !matches!(
-        raw.pattern_class,
-        TextPatternClass::IdentifierLike
-            | TextPatternClass::SymbolGlob
-            | TextPatternClass::MixedSymbolIdentifiers
-    ) && !(raw.pattern_class == TextPatternClass::RegexText && same_direct_candidate)
+            raw.pattern_class,
+            TextPatternClass::IdentifierLike
+                | TextPatternClass::SymbolGlob
+                | TextPatternClass::MixedSymbolIdentifiers
+        )
+        && !(raw.pattern_class == TextPatternClass::RegexText && same_direct_candidate)
     {
         return false;
     }
@@ -958,7 +959,9 @@ fn schema_consistent_text_allow(raw: &RawGateClassifierOutput) -> bool {
         TextAllowReason::PostEditVerification => {
             raw.exactness_role == ExactnessRole::PostEditVerification
         }
-        TextAllowReason::ExactLiteralSurface => raw.exactness_role == ExactnessRole::TargetCharacters,
+        TextAllowReason::ExactLiteralSurface => {
+            raw.exactness_role == ExactnessRole::TargetCharacters
+        }
         TextAllowReason::ArtifactOrOutputText
         | TextAllowReason::ExternalApiSurfaceText
         | TextAllowReason::ImportIncludePackageText
@@ -970,25 +973,29 @@ fn schema_consistent_text_allow(raw: &RawGateClassifierOutput) -> bool {
 }
 
 fn has_hard_text_only_constraint(raw: &RawGateClassifierOutput) -> bool {
-    raw.material_constraints.iter().any(|constraint| match constraint {
-        MaterialConstraint::PostEditVerification => {
-            raw.exactness_role == ExactnessRole::PostEditVerification
-        }
-        MaterialConstraint::ExactArgument => raw.exactness_role == ExactnessRole::TargetCharacters,
-        MaterialConstraint::SameEntityIntersection
-        | MaterialConstraint::CoOccurrence
-        | MaterialConstraint::BuildConfigText
-        | MaterialConstraint::SchemaWireField => true,
-        MaterialConstraint::Qualifier
-        | MaterialConstraint::AssignmentOperator
-        | MaterialConstraint::EventSubscription
-        | MaterialConstraint::GenericSignature
-        | MaterialConstraint::MacroPreprocessor
-        | MaterialConstraint::ClassNameRegex
-        | MaterialConstraint::AlternationSemantics
-        | MaterialConstraint::BoundedTestRegex
-        | MaterialConstraint::ExternalApiName => false,
-    })
+    raw.material_constraints
+        .iter()
+        .any(|constraint| match constraint {
+            MaterialConstraint::PostEditVerification => {
+                raw.exactness_role == ExactnessRole::PostEditVerification
+            }
+            MaterialConstraint::ExactArgument => {
+                raw.exactness_role == ExactnessRole::TargetCharacters
+            }
+            MaterialConstraint::SameEntityIntersection
+            | MaterialConstraint::CoOccurrence
+            | MaterialConstraint::BuildConfigText
+            | MaterialConstraint::SchemaWireField => true,
+            MaterialConstraint::Qualifier
+            | MaterialConstraint::AssignmentOperator
+            | MaterialConstraint::EventSubscription
+            | MaterialConstraint::GenericSignature
+            | MaterialConstraint::MacroPreprocessor
+            | MaterialConstraint::ClassNameRegex
+            | MaterialConstraint::AlternationSemantics
+            | MaterialConstraint::BoundedTestRegex
+            | MaterialConstraint::ExternalApiName => false,
+        })
 }
 
 fn source_relationship_grounded(raw: &RawGateClassifierOutput) -> bool {
@@ -1028,7 +1035,10 @@ fn source_relationship_grounded(raw: &RawGateClassifierOutput) -> bool {
 
 fn bifrost_tool_for_raw_text_facts(raw: &RawGateClassifierOutput) -> RecommendedTool {
     if let Some(candidate) = raw.bifrost_candidate.as_ref() {
-        if candidate.args.as_object().is_some_and(|object| !object.is_empty())
+        if candidate
+            .args
+            .as_object()
+            .is_some_and(|object| !object.is_empty())
             && matches!(
                 candidate.tool,
                 Some(RecommendedTool::SearchSymbols | RecommendedTool::GetSymbolSources)
@@ -1041,7 +1051,10 @@ fn bifrost_tool_for_raw_text_facts(raw: &RawGateClassifierOutput) -> Recommended
                     | RelationshipKind::RelatedTest
             )
         {
-            return candidate.tool.clone().unwrap_or(RecommendedTool::SearchSymbols);
+            return candidate
+                .tool
+                .clone()
+                .unwrap_or(RecommendedTool::SearchSymbols);
         }
     }
     match raw.intent {
@@ -1057,7 +1070,9 @@ fn bifrost_tool_for_raw_text_facts(raw: &RawGateClassifierOutput) -> Recommended
         | RelationshipKind::Usage
         | RelationshipKind::WriteAssignment
         | RelationshipKind::RelatedTest => return RecommendedTool::ScanUsages,
-        RelationshipKind::Declaration | RelationshipKind::Definition | RelationshipKind::Prototype => {
+        RelationshipKind::Declaration
+        | RelationshipKind::Definition
+        | RelationshipKind::Prototype => {
             return RecommendedTool::SearchSymbols;
         }
         _ => {}
@@ -1815,16 +1830,13 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         return;
     }
 
-    if let Some((tool, relation)) = repair_tool
-        .clone()
-        .filter(|_| {
-            regex_wrapped_single_identifier(pattern).is_some()
-                && output.evidence.same_path_recent_bifrost_hit
-                && identifier_tokens(pattern)
-                    .first()
-                    .is_some_and(|token| high_confidence_source_symbol(token))
-        })
-    {
+    if let Some((tool, relation)) = repair_tool.clone().filter(|_| {
+        regex_wrapped_single_identifier(pattern).is_some()
+            && output.evidence.same_path_recent_bifrost_hit
+            && identifier_tokens(pattern)
+                .first()
+                .is_some_and(|token| high_confidence_source_symbol(token))
+    }) {
         output.decision = GateClassifierDecision::GateToSymbolTool;
         output.recommended_tool = tool;
         output.suggested_args = json!({});
@@ -1861,7 +1873,9 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
             .unwrap_or_else(|| json!({}));
         return;
     }
-    if let Some((tool, relation)) = source_symbol_alternation_tool(pattern, glob, path, file_path, output) {
+    if let Some((tool, relation)) =
+        source_symbol_alternation_tool(pattern, glob, path, file_path, output)
+    {
         output.decision = GateClassifierDecision::GateToSymbolTool;
         output.recommended_tool = tool;
         output.suggested_args = json!({});
@@ -1872,15 +1886,12 @@ fn enforce_text_classifier_policy(output: &mut GateClassifierOutput, context: &G
         output.confidence = GateConfidence::High;
         return;
     }
-    if let Some((tool, relation)) = repair_tool
-        .clone()
-        .filter(|_| {
-            declaration_repair_compatible_intent(&output.intent)
-                || source_static_or_member_access(pattern)
-                || source_call_navigation_pattern(pattern)
-                || source_relationship_call_site_pattern(pattern)
-        })
-    {
+    if let Some((tool, relation)) = repair_tool.clone().filter(|_| {
+        declaration_repair_compatible_intent(&output.intent)
+            || source_static_or_member_access(pattern)
+            || source_call_navigation_pattern(pattern)
+            || source_relationship_call_site_pattern(pattern)
+    }) {
         output.decision = GateClassifierDecision::GateToSymbolTool;
         output.recommended_tool = tool;
         output.suggested_args = json!({});
@@ -2095,7 +2106,9 @@ fn source_symbol_alternation_tool(
         return None;
     }
     let source_intent = source_navigation_text_intent(&output.intent);
-    let symbol_family = symbols.iter().all(|symbol| high_confidence_source_symbol(symbol))
+    let symbol_family = symbols
+        .iter()
+        .all(|symbol| high_confidence_source_symbol(symbol))
         || symbols
             .iter()
             .all(|symbol| short_prefixed_source_symbol_like(symbol));
@@ -2133,7 +2146,10 @@ fn exact_argument_literal_probe(pattern: &str) -> bool {
 
 fn member_prefix_text_probe(pattern: &str) -> bool {
     let trimmed = pattern.trim();
-    trimmed.ends_with("\\.") || trimmed.ends_with('.') || trimmed.ends_with("->") || trimmed.ends_with("::")
+    trimmed.ends_with("\\.")
+        || trimmed.ends_with('.')
+        || trimmed.ends_with("->")
+        || trimmed.ends_with("::")
 }
 
 fn exact_empty_arg_anchored_call_text_probe(pattern: &str) -> bool {
@@ -2184,10 +2200,7 @@ fn single_concrete_call_text_probe(
     if output.evidence.same_path_recent_edit_or_write {
         return true;
     }
-    if pattern.contains("\\s*\\(")
-        || pattern.contains("\\s+\\(")
-        || pattern.contains("\\s?\\(")
-    {
+    if pattern.contains("\\s*\\(") || pattern.contains("\\s+\\(") || pattern.contains("\\s?\\(") {
         return true;
     }
     let trimmed = pattern.trim_start();
@@ -2208,10 +2221,7 @@ fn same_line_cooccurrence_text_probe(pattern: &str) -> bool {
         && (pattern.contains("[^\\n]*") || pattern.contains("[^\\\\n]*") || pattern.contains(".*"))
 }
 
-fn external_acronym_alternation_text_probe(
-    pattern: &str,
-    output: &GateClassifierOutput,
-) -> bool {
+fn external_acronym_alternation_text_probe(pattern: &str, output: &GateClassifierOutput) -> bool {
     if !pattern.contains('|') || output.evidence.same_path_recent_bifrost_hit {
         return false;
     }
@@ -6131,7 +6141,8 @@ mod tests {
             json!({"pattern": "UseJVMCICompiler|JVMCI", "path": ".", "glob": "*"}),
         );
         let mut output = GateClassifierOutput {
-            reason: "GATE_TO_SYMBOL_TOOL because classifier treated the JVM flag as source.".to_string(),
+            reason: "GATE_TO_SYMBOL_TOOL because classifier treated the JVM flag as source."
+                .to_string(),
             intent: TextIntent::SymbolUsageLookup,
             pattern_class: TextPatternClass::CompoundCodeIdiomRegex,
             scope_class: TextScopeClass::BroadSourceScope,
@@ -6161,7 +6172,8 @@ mod tests {
             json!({"pattern": "withFieldComputed\\([^\\n]*getOrElse", "path": ".", "glob": "*.scala"}),
         );
         let mut output = GateClassifierOutput {
-            reason: "GATE_TO_SYMBOL_TOOL because classifier treated this as call navigation.".to_string(),
+            reason: "GATE_TO_SYMBOL_TOOL because classifier treated this as call navigation."
+                .to_string(),
             intent: TextIntent::SymbolUsageLookup,
             pattern_class: TextPatternClass::SymbolGlob,
             scope_class: TextScopeClass::RepositoryWide,
@@ -6191,7 +6203,8 @@ mod tests {
             json!({"pattern": "remove\\(\\)\\s*$", "path": ".", "glob": "*.scala"}),
         );
         let mut output = GateClassifierOutput {
-            reason: "GATE_TO_SYMBOL_TOOL because classifier treated this as usage navigation.".to_string(),
+            reason: "GATE_TO_SYMBOL_TOOL because classifier treated this as usage navigation."
+                .to_string(),
             intent: TextIntent::SymbolUsageLookup,
             pattern_class: TextPatternClass::SymbolGlob,
             scope_class: TextScopeClass::RepositoryWide,
@@ -7976,7 +7989,9 @@ mod tests {
     fn shell_builtin_reason_overrides_contradictory_bifrost_action() {
         let command = "python3 - <<'PY'\nimport pathlib\np = pathlib.Path('src/python/bcc/table.py')\nfor i, line in enumerate(p.read_text().splitlines(), 1):\n    if 1148 <= i <= 1205:\n        print(f'{i}: {line}')\nPY";
         let mut output = ShellClassifierOutput {
-            reason: "USE_BUILTIN_TOOL because the pending call reads a bounded range of a single file.".to_string(),
+            reason:
+                "USE_BUILTIN_TOOL because the pending call reads a bounded range of a single file."
+                    .to_string(),
             intent: ShellIntent::OrdinaryFileRead,
             shell_semantics_required: false,
             builtin_preserves_intent: true,
@@ -8006,7 +8021,8 @@ mod tests {
     fn shell_builtin_reason_does_not_route_archive_reads_to_bifrost() {
         let command = "python - <<'PY'\nimport zipfile\nz=zipfile.ZipFile('.brokk/sessions/session.zip')\nfor n in z.namelist():\n    print(n)\n    print(z.read(n).decode())\nPY";
         let mut output = ShellClassifierOutput {
-            reason: "USE_BUILTIN_TOOL because this command only reads a session zip archive.".to_string(),
+            reason: "USE_BUILTIN_TOOL because this command only reads a session zip archive."
+                .to_string(),
             intent: ShellIntent::OrdinaryFileRead,
             shell_semantics_required: false,
             builtin_preserves_intent: true,

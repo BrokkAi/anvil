@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use futures::StreamExt;
-use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
     ModelsResponse, OpenAiClient, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
 use crate::trace_logging::append_trace_record;
+use anyhow::{Context, Result};
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 
 /// Returns true when the model supports Anthropic-style prompt caching
 /// and needs explicit `cache_control` breakpoints in the request body.
@@ -150,7 +150,8 @@ impl BedrockClient {
 
     fn invoke_url(&self, model: &str) -> String {
         let encoded = percent_encode_path_segment(model);
-        if self.runtime_base_url.starts_with("http://") || self.runtime_base_url.starts_with("https://")
+        if self.runtime_base_url.starts_with("http://")
+            || self.runtime_base_url.starts_with("https://")
         {
             if self.runtime_base_url.contains("amazonaws.com") {
                 return format!(
@@ -313,7 +314,10 @@ impl BedrockClient {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Bedrock Mantle /models failed (HTTP {status}): {body}");
         }
-        let parsed: ModelsResponse = resp.json().await.context("parsing Bedrock Mantle /models")?;
+        let parsed: ModelsResponse = resp
+            .json()
+            .await
+            .context("parsing Bedrock Mantle /models")?;
         Ok(parsed
             .data
             .into_iter()
@@ -1031,7 +1035,11 @@ mod tests {
             .await
             .expect("discovery should succeed");
         assert!(models.iter().any(|m| m.id == "openai.gpt-5.4"));
-        assert!(models.iter().any(|m| m.id == "us.anthropic.claude-sonnet-4-6"));
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "us.anthropic.claude-sonnet-4-6")
+        );
     }
 
     #[tokio::test]
