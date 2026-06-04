@@ -31,6 +31,32 @@ use crate::trace_logging::append_trace_record;
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 
+fn bifrost_first_builtin_tools() -> std::collections::HashSet<String> {
+    ["think", "write_file", "edit", "list_directory"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn bifrost_first_post_edit_builtin_tools() -> std::collections::HashSet<String> {
+    let mut tools = bifrost_first_builtin_tools();
+    tools.insert("run_shell_command".to_string());
+    tools
+}
+
+fn advertised_tool_names(tools: Option<&Vec<ToolDefinition>>) -> std::collections::HashSet<String> {
+    tools
+        .into_iter()
+        .flat_map(|defs| defs.iter().map(|tool| tool.function.name.clone()))
+        .collect()
+}
+
+fn tool_unavailable_message(tool_name: &str) -> String {
+    format!(
+        "Error: tool '{tool_name}' is unavailable in the current tool catalog. Retry using a currently advertised tool."
+    )
+}
+
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
@@ -408,6 +434,9 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
+    registry
+        .set_builtin_tools(bifrost_first_builtin_tools())
+        .await;
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
@@ -487,6 +516,7 @@ pub(crate) async fn run(
         // `--llm-idle-timeout-secs` and the per-session `/idle-timeout`
         // override.
         let request_tools = turn_tools.clone();
+        let advertised_this_request = advertised_tool_names(request_tools.as_ref());
         trace_llm_request(
             turn,
             model,
@@ -536,8 +566,6 @@ pub(crate) async fn run(
                 let skip_bifrost_classifier_for_this_tool_batch =
                     skip_bifrost_classifier_for_next_tool_batch;
                 let mut current_tool_batch_triggered_bifrost_gate = false;
-                let mut bifrost_refreshed_this_tool_batch = false;
-                let mut bifrost_refresh_failure: Option<ToolExecution> = None;
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
@@ -678,6 +706,28 @@ pub(crate) async fn run(
                         )),
                     );
 
+                    if !advertised_this_request.contains(tool_name.as_str()) {
+                        let message = tool_unavailable_message(&tool_name);
+                        maybe_send_session_update(
+                            notifications,
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCallUpdate(announce::update_failed(
+                                &call.id,
+                                &message,
+                                Some(Value::String(message.clone())),
+                            )),
+                        );
+                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
+                        tool_exchanges.push(ToolExchange {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            result: message,
+                        });
+                        continue;
+                    }
+
                     // Consult the gate before announcing or executing the call.
                     let decision = consult_gate(
                         &sessions,
@@ -815,78 +865,15 @@ pub(crate) async fn run(
                                     &parsed_input,
                                     &tool_exchanges,
                                 );
-                                if registry.is_bifrost_tool(&tool_name)
-                                    && !bifrost_refreshed_this_tool_batch
-                                {
-                                    tracing::info!(
-                                        session_id = %session_id,
-                                        tool_name = %tool_name,
-                                        "refreshing bifrost before first bifrost tool in batch"
-                                    );
-                                    append_trace_record(serde_json::json!({
-                                        "type": "bifrost_refresh",
-                                        "tool": tool_name,
-                                        "status": "started",
-                                    }));
-                                    let refresh = registry.refresh_bifrost().await;
-                                    let refresh_status = match refresh.status {
-                                        ToolStatus::Success => "success",
-                                        ToolStatus::RequestError => "request_error",
-                                        ToolStatus::InternalError => "internal_error",
-                                    };
-                                    tracing::info!(
-                                        session_id = %session_id,
-                                        tool_name = %tool_name,
-                                        status = refresh_status,
-                                        "bifrost refresh completed before tool batch"
-                                    );
-                                    append_trace_record(serde_json::json!({
-                                        "type": "bifrost_refresh",
-                                        "tool": tool_name,
-                                        "status": refresh_status,
-                                        "output": refresh.output.clone(),
-                                    }));
-                                    bifrost_refreshed_this_tool_batch = true;
-                                    if !matches!(refresh.status, ToolStatus::Success) {
-                                        let exec = tool_result_to_execution(refresh);
-                                        bifrost_refresh_failure = Some(exec.clone());
-                                        exec
-                                    } else {
-                                        execute_tool(
-                                            registry,
-                                            &tool_name,
-                                            parsed_input.clone(),
-                                            policy,
-                                            outside_sandbox_once,
-                                            sandbox_mode,
-                                        )
-                                        .await
-                                    }
-                                } else if registry.is_bifrost_tool(&tool_name) {
-                                    if let Some(exec) = &bifrost_refresh_failure {
-                                        exec.clone()
-                                    } else {
-                                        execute_tool(
-                                            registry,
-                                            &tool_name,
-                                            parsed_input.clone(),
-                                            policy,
-                                            outside_sandbox_once,
-                                            sandbox_mode,
-                                        )
-                                        .await
-                                    }
-                                } else {
-                                    execute_tool(
-                                        registry,
-                                        &tool_name,
-                                        parsed_input.clone(),
-                                        policy,
-                                        outside_sandbox_once,
-                                        sandbox_mode,
-                                    )
-                                    .await
-                                }
+                                execute_tool(
+                                    registry,
+                                    &tool_name,
+                                    parsed_input.clone(),
+                                    policy,
+                                    outside_sandbox_once,
+                                    sandbox_mode,
+                                )
+                                .await
                             };
 
                             // Build the terminal update -- Completed (with a
@@ -929,6 +916,19 @@ pub(crate) async fn run(
                         arguments: call.function.arguments.clone(),
                         result: output,
                     });
+                }
+                if has_successful_file_change(&tool_exchanges)
+                    && !registry
+                        .is_builtin_tool_advertised("run_shell_command")
+                        .await
+                {
+                    registry
+                        .set_builtin_tools(bifrost_first_post_edit_builtin_tools())
+                        .await;
+                    tools = registry.tool_definitions().await;
+                    if depth >= MAX_SUBAGENT_DEPTH {
+                        tools.retain(|t| t.function.name != "task");
+                    }
                 }
                 skip_bifrost_classifier_for_next_tool_batch =
                     current_tool_batch_triggered_bifrost_gate;
@@ -2111,6 +2111,42 @@ mod tests {
         let names = ordered_names_for_test(&calls, &["search_symbols"]);
 
         assert_eq!(names, vec!["think", "read_file", "run_shell_command"]);
+    }
+
+    #[test]
+    fn advertised_tool_names_match_current_request_catalog() {
+        let tools = vec![tool_def_for_test("think"), tool_def_for_test("edit")];
+        let names = advertised_tool_names(Some(&tools));
+
+        assert!(names.contains("think"));
+        assert!(names.contains("edit"));
+        assert!(!names.contains("run_shell_command"));
+    }
+
+    #[test]
+    fn hidden_tool_calls_are_marked_unavailable() {
+        let message = tool_unavailable_message("run_shell_command");
+
+        assert!(message.contains("run_shell_command"));
+        assert!(message.contains("unavailable in the current tool catalog"));
+    }
+
+    #[test]
+    fn bifrost_first_post_edit_policy_only_adds_shell() {
+        let initial = bifrost_first_builtin_tools();
+        let post_edit = bifrost_first_post_edit_builtin_tools();
+
+        assert!(initial.contains("think"));
+        assert!(initial.contains("edit"));
+        assert!(initial.contains("write_file"));
+        assert!(initial.contains("list_directory"));
+        assert!(!initial.contains("read_file"));
+        assert!(!initial.contains("grep_search"));
+        assert!(!initial.contains("run_shell_command"));
+
+        assert!(post_edit.contains("run_shell_command"));
+        assert!(!post_edit.contains("read_file"));
+        assert!(!post_edit.contains("grep_search"));
     }
 
     #[test]
