@@ -2778,6 +2778,36 @@ mod tests {
     }
 
     #[test]
+    fn should_auto_allow_shell_command_rejects_missing_or_unsupported_commands() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": 7}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": ""}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "touch /tmp/x"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+    }
+
+    #[test]
     fn tokenizer_rejects_untrusted_shell_forms() {
         assert!(tokenize_simple_shell_command("git status").is_some());
         assert!(tokenize_simple_shell_command("grep \"foo bar\" README.md").is_some());
