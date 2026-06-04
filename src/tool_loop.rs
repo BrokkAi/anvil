@@ -277,8 +277,9 @@ enum PureGateDecision {
 fn pure_gate_decision(
     mode: PermissionMode,
     kind: ToolKind,
-    _tool_name: &str,
+    tool_name: &str,
     is_always_allowed: bool,
+    shell_auto_allow: bool,
 ) -> PureGateDecision {
     // bypassPermissions: trust everything. Explicit user opt-out of the gate.
     if matches!(mode, PermissionMode::BypassPermissions) {
@@ -303,10 +304,20 @@ fn pure_gate_decision(
         );
     }
 
-    // Mode-independent auto-allow: pure-info kinds never mutate.
+    // Mode-independent auto-allow: pure-info kinds never mutate. In addition,
+    // sandboxed shell commands that fit a conservative read-only safelist may
+    // run without a prompt in the editable modes; the OS sandbox remains the
+    // hard boundary for filesystem writes.
     let auto_allow = match kind {
         ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch => true,
         ToolKind::Edit if matches!(mode, PermissionMode::AcceptEdits) => true,
+        ToolKind::Execute
+            if tool_name == "run_shell_command"
+                && matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits)
+                && shell_auto_allow =>
+        {
+            true
+        }
         _ => false,
     };
     if auto_allow {
@@ -321,6 +332,176 @@ fn pure_gate_decision(
     }
 
     PureGateDecision::Prompt
+}
+
+fn should_auto_allow_shell_command(
+    raw_input: &Value,
+    mode: PermissionMode,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
+) -> bool {
+    if !matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits) {
+        return false;
+    }
+    if !shell_sandboxed {
+        return false;
+    }
+    if crate::sandbox_backend::resolve_mode(sandbox_mode) != crate::sandbox_backend::SandboxMode::Os
+    {
+        return false;
+    }
+
+    raw_input
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_auto_approvable_sandboxed_shell_command)
+}
+
+fn is_auto_approvable_sandboxed_shell_command(command: &str) -> bool {
+    let Some(tokens) = tokenize_simple_shell_command(command) else {
+        return false;
+    };
+
+    let Some(program) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+
+    match program {
+        "pwd" | "id" | "whoami" | "uname" | "echo" | "ls" | "cat" | "head" | "tail" | "wc"
+        | "cut" | "tr" | "sort" | "uniq" | "nl" | "stat" | "which" | "grep" | "rg" => {
+            !tokens_request_file_write(&tokens)
+        }
+        "find" => is_safe_find_command(&tokens),
+        "sed" => is_safe_sed_command(&tokens),
+        "awk" => is_safe_awk_command(&tokens),
+        "git" => is_safe_git_command(&tokens),
+        _ => false,
+    }
+}
+
+fn tokenize_simple_shell_command(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuoteState {
+        Plain,
+        Single,
+        Double,
+    }
+
+    let mut state = QuoteState::Plain;
+    let mut current = String::new();
+    let mut tokens = Vec::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match state {
+            QuoteState::Plain => match ch {
+                '\n' | '\r' => return None,
+                ch if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                '\'' => state = QuoteState::Single,
+                '"' => state = QuoteState::Double,
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(escaped);
+                }
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?'
+                | '!' | '`' | '$' => return None,
+                ch if ch.is_control() => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Single => match ch {
+                '\'' => state = QuoteState::Plain,
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Double => match ch {
+                '"' => state = QuoteState::Plain,
+                '$' | '`' => return None,
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(escaped);
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if state != QuoteState::Plain {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
+fn tokens_request_file_write(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-i" | "-o" | "-f" | "--in-place" | "--output"
+        ) || token.starts_with("--in-place=")
+            || token.starts_with("--output=")
+    })
+}
+
+fn is_safe_find_command(tokens: &[String]) -> bool {
+    if tokens_request_file_write(tokens) {
+        return false;
+    }
+    !tokens.iter().skip(1).any(|token| {
+        matches!(
+            token.as_str(),
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fls"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-ls"
+                | "-print"
+                | "-print0"
+                | "-printf"
+                | "-prune"
+                | "-quit"
+        )
+    })
+}
+
+fn is_safe_sed_command(tokens: &[String]) -> bool {
+    !tokens_request_file_write(tokens)
+}
+
+fn is_safe_awk_command(tokens: &[String]) -> bool {
+    !tokens_request_file_write(tokens)
+}
+
+fn is_safe_git_command(tokens: &[String]) -> bool {
+    if tokens.len() < 2 || tokens[1].starts_with('-') {
+        return false;
+    }
+
+    matches!(
+        tokens[1].as_str(),
+        "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
+    )
 }
 
 fn shell_command_will_run_sandboxed(
@@ -978,12 +1159,14 @@ async fn consult_gate(
     let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
     let shell_sandboxed =
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
+    let shell_auto_allow = tool_name == "run_shell_command"
+        && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
     let always_allow_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
     let is_always_allowed = sessions
         .is_always_allowed(session_id, &always_allow_key)
         .await;
 
-    match pure_gate_decision(mode, kind, tool_name, is_always_allowed) {
+    match pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow) {
         PureGateDecision::Allow => GateDecision::Allow {
             sandbox_policy_override: None,
             sandbox_mode,
@@ -1877,8 +2060,9 @@ mod tests {
         kind: ToolKind,
         tool_name: &str,
         allowed: bool,
+        shell_auto_allow: bool,
     ) -> PureGateDecision {
-        pure_gate_decision(mode, kind, tool_name, allowed)
+        pure_gate_decision(mode, kind, tool_name, allowed, shell_auto_allow)
     }
 
     #[test]
@@ -2349,7 +2533,13 @@ mod tests {
             ToolKind::Other,
         ] {
             assert_eq!(
-                decide(PermissionMode::BypassPermissions, kind, "anything", false),
+                decide(
+                    PermissionMode::BypassPermissions,
+                    kind,
+                    "anything",
+                    false,
+                    false
+                ),
                 PureGateDecision::Allow,
                 "bypass should allow {:?} regardless of always-allow",
                 kind
@@ -2366,7 +2556,7 @@ mod tests {
             ToolKind::Fetch,
         ] {
             assert_eq!(
-                decide(PermissionMode::ReadOnly, kind, "anything", false),
+                decide(PermissionMode::ReadOnly, kind, "anything", false, false),
                 PureGateDecision::Allow,
                 "read-only should allow info kind {:?}",
                 kind
@@ -2387,7 +2577,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decide(PermissionMode::ReadOnly, kind, "any", true),
+                    decide(PermissionMode::ReadOnly, kind, "any", true, false),
                     PureGateDecision::Reject(_)
                 ),
                 "read-only should reject {:?} even when always-allowed",
@@ -2405,7 +2595,7 @@ mod tests {
             ToolKind::Fetch,
         ] {
             assert_eq!(
-                decide(PermissionMode::Default, kind, "anything", false),
+                decide(PermissionMode::Default, kind, "anything", false, false),
                 PureGateDecision::Allow
             );
         }
@@ -2414,7 +2604,13 @@ mod tests {
     #[test]
     fn default_prompts_for_edit_without_always_allow() {
         assert_eq!(
-            decide(PermissionMode::Default, ToolKind::Edit, "write_file", false),
+            decide(
+                PermissionMode::Default,
+                ToolKind::Edit,
+                "write_file",
+                false,
+                false
+            ),
             PureGateDecision::Prompt
         );
     }
@@ -2422,7 +2618,13 @@ mod tests {
     #[test]
     fn default_uses_always_allow_for_edit() {
         assert_eq!(
-            decide(PermissionMode::Default, ToolKind::Edit, "write_file", true),
+            decide(
+                PermissionMode::Default,
+                ToolKind::Edit,
+                "write_file",
+                true,
+                false
+            ),
             PureGateDecision::Allow
         );
     }
@@ -2434,6 +2636,7 @@ mod tests {
                 PermissionMode::AcceptEdits,
                 ToolKind::Edit,
                 "write_file",
+                false,
                 false
             ),
             PureGateDecision::Allow
@@ -2447,6 +2650,7 @@ mod tests {
                 PermissionMode::AcceptEdits,
                 ToolKind::Execute,
                 "run_shell_command",
+                false,
                 false
             ),
             PureGateDecision::Prompt
@@ -2459,12 +2663,157 @@ mod tests {
         // may trust a positive lookup without granting every shell command.
         for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert_eq!(
-                decide(mode, ToolKind::Execute, "run_shell_command", true),
+                decide(mode, ToolKind::Execute, "run_shell_command", true, false),
                 PureGateDecision::Allow,
                 "run_shell_command should honor scoped approval in {:?}",
                 mode
             );
         }
+    }
+
+    #[test]
+    fn default_auto_allows_conservative_sandboxed_shell_commands() {
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn accept_edits_auto_allows_conservative_sandboxed_shell_commands() {
+        assert_eq!(
+            decide(
+                PermissionMode::AcceptEdits,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn shell_auto_allow_does_not_bypass_read_only_mode() {
+        assert!(matches!(
+            decide(
+                PermissionMode::ReadOnly,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn shell_auto_allow_does_not_bypass_non_shell_execute_tools() {
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                ToolKind::Execute,
+                "task",
+                false,
+                true
+            ),
+            PureGateDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn safe_shell_classifier_accepts_basic_read_only_commands() {
+        assert!(is_auto_approvable_sandboxed_shell_command("pwd"));
+        assert!(is_auto_approvable_sandboxed_shell_command("git status"));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "rg PermissionMode src"
+        ));
+    }
+
+    #[test]
+    fn safe_shell_classifier_rejects_writes_and_shell_metacharacters() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sed -i 's/a/b/' src/main.rs"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "python3 -c 'print(1)'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+    }
+
+    #[test]
+    fn should_auto_allow_shell_command_requires_os_sandboxed_shell() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Wasm),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            false,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::ReadOnly,
+            Some(SandboxMode::Os),
+            true,
+        ));
+    }
+
+    #[test]
+    fn should_auto_allow_shell_command_rejects_missing_or_unsupported_commands() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": 7}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": ""}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "touch /tmp/x"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+    }
+
+    #[test]
+    fn tokenizer_rejects_untrusted_shell_forms() {
+        assert!(tokenize_simple_shell_command("git status").is_some());
+        assert!(tokenize_simple_shell_command("grep \"foo bar\" README.md").is_some());
+        assert!(tokenize_simple_shell_command("pwd && ls").is_none());
+        assert!(tokenize_simple_shell_command("echo $HOME").is_none());
+        assert!(tokenize_simple_shell_command("python3 -c 'print(1)' | cat").is_none());
     }
 
     #[test]
