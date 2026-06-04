@@ -2686,6 +2686,20 @@ mod tests {
     }
 
     #[test]
+    fn accept_edits_auto_allows_conservative_sandboxed_shell_commands() {
+        assert_eq!(
+            decide(
+                PermissionMode::AcceptEdits,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Allow
+        );
+    }
+
+    #[test]
     fn shell_auto_allow_does_not_bypass_read_only_mode() {
         assert!(matches!(
             decide(
