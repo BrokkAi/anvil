@@ -428,12 +428,25 @@ fn normalize_path(path: &Path) -> PathBuf {
 fn find_git_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(p) = cur {
-        if p.join(".git").exists() {
+        if is_git_marker(&p.join(".git")) {
             return Some(p.to_path_buf());
         }
         cur = p.parent();
     }
     None
+}
+
+fn is_git_marker(path: &Path) -> bool {
+    if path.is_dir() {
+        return path.join("HEAD").is_file();
+    }
+    path.is_file()
+        && std::fs::read_to_string(path).is_ok_and(|content| {
+            content
+                .lines()
+                .next()
+                .is_some_and(|line| line.starts_with("gitdir:"))
+        })
 }
 
 fn build_dir_chain(cwd: &Path, git_root: Option<&Path>) -> Vec<PathBuf> {
@@ -533,6 +546,7 @@ mod tests {
 
     fn touch_git(root: &Path) {
         fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
     }
 
     fn skill_at(root: &Path, vendor_dir: &str, name: &str, body: &str) -> PathBuf {
