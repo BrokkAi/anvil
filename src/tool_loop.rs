@@ -839,12 +839,17 @@ pub(crate) async fn run(
                         }
                     };
 
-                    // Refuse outright if the permission card would hide
-                    // input. Oversized titles wrap the approval modal and
-                    // oversized multiline shell content gets truncated, so in
-                    // both cases the user could authorize a call they can't
-                    // fully read. Reject instead of hiding details; the LLM can
-                    // retry with smaller arguments.
+                    // Refuse outright if the permission card would hide input.
+                    // Two separate gates apply:
+                    //   • Non-shell tools: title length capped at
+                    //     MAX_TOOL_TITLE_CHARS (1024 chars).
+                    //   • Shell commands: full command text capped at
+                    //     MAX_INLINE_OUTPUT_BYTES (50 000 bytes). The modal
+                    //     title carries the full command for clients that only
+                    //     render the title, so the content-size bound is the
+                    //     right limit for shell.
+                    // Reject rather than truncating; the LLM can retry with
+                    // smaller arguments.
                     if let Some(reason) = announce::rejection_for_oversized_title(
                         &tool_name,
                         &parsed_input,
@@ -855,7 +860,7 @@ pub(crate) async fn run(
                         tracing::warn!(
                             session_id = %session_id,
                             tool_name = %tool_name,
-                            title_chars = announce::tool_title(&tool_name, &parsed_input)
+                            title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
                                 .chars()
                                 .count(),
                             "rejecting tool call: rendered permission card would hide input",
@@ -1288,15 +1293,23 @@ async fn request_user_permission(
     } = request;
 
     // The permission modal needs to show *what* is being approved, not just
-    // the tool kind. Reuse the same title-builder the standalone tool-call
-    // card uses so e.g. ``Run `cargo test` `` appears in the prompt.
+    // the tool kind. Shell commands use a dedicated builder that includes the
+    // full command text because some clients only surface the modal title.
     //
     // Assumes the caller has already filtered oversized titles via
     // `announce::rejection_for_oversized_title` in `run`; the debug assert
     // catches any future path that reaches the modal without that gate.
-    let title = announce::tool_title(tool_name, raw_input);
+    let title = announce::permission_prompt_title(tool_name, raw_input);
+    // Shell titles carry the full command and are bounded at MAX_INLINE_OUTPUT_BYTES
+    // by rejection_for_oversized_input_content; non-shell titles are bounded at
+    // MAX_TOOL_TITLE_CHARS by rejection_for_oversized_title.
+    let max_title_chars = if tool_name == "run_shell_command" {
+        announce::MAX_INLINE_OUTPUT_BYTES
+    } else {
+        announce::MAX_TOOL_TITLE_CHARS
+    };
     debug_assert!(
-        title.chars().count() <= announce::MAX_TOOL_TITLE_CHARS,
+        title.chars().count() <= max_title_chars,
         "request_user_permission: oversized title bypassed the pre-gate check \
          (tool={tool_name}, chars={})",
         title.chars().count()
