@@ -839,19 +839,14 @@ pub(crate) async fn run(
                         }
                     };
 
-                    // Refuse outright if the permission card would hide
-                    // input. Oversized titles wrap the approval modal and
-                    // oversized multiline shell content gets truncated, so in
-                    // both cases the user could authorize a call they can't
-                    // fully read. Reject instead of hiding details; the LLM can
-                    // retry with smaller arguments.
-                    if let Some(reason) = announce::rejection_for_oversized_title(
-                        &tool_name,
-                        &parsed_input,
-                    )
-                    .or_else(|| {
-                        announce::rejection_for_oversized_input_content(&tool_name, &parsed_input)
-                    }) {
+                    // Refuse outright if the permission card title would be too
+                    // long. An oversized title wraps the approval modal and
+                    // pushes the Approve/Reject buttons off-screen, so the user
+                    // could authorize a call they can't fully read. Reject
+                    // instead; the LLM can retry with smaller arguments.
+                    if let Some(reason) =
+                        announce::rejection_for_oversized_title(&tool_name, &parsed_input)
+                    {
                         tracing::warn!(
                             session_id = %session_id,
                             tool_name = %tool_name,
@@ -1305,7 +1300,7 @@ async fn request_user_permission(
         .kind(kind)
         .status(ToolCallStatus::Pending)
         .title(title)
-        .content(announce::tool_input_content(tool_name, raw_input))
+        .content(announce::permission_prompt_content(tool_name, raw_input))
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 
