@@ -1,6 +1,9 @@
+use anyhow::Context;
+use sha2::{Digest, Sha256};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +13,47 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.5.3";
+const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
+
+#[cfg(target_os = "macos")]
+const BIFROST_TARGET_TRIPLE: &str = "universal-apple-darwin";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const BIFROST_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const BIFROST_TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const BIFROST_TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+const BIFROST_TARGET_TRIPLE: &str = "aarch64-pc-windows-msvc";
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+const BIFROST_TARGET_TRIPLE: &str = "aarch64-linux-android";
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64"),
+    all(target_os = "android", target_arch = "aarch64"),
+)))]
+compile_error!(
+    "bifrost releases only ship a universal macOS binary, x86_64/aarch64 Linux, \
+     x86_64/aarch64 Windows, and aarch64 Android; this build cannot bundle Bifrost on other targets"
+);
+
+#[cfg(target_os = "windows")]
+const BIFROST_ARCHIVE_EXT: &str = "zip";
+#[cfg(not(target_os = "windows"))]
+const BIFROST_ARCHIVE_EXT: &str = "tar.gz";
+
+#[cfg(target_os = "windows")]
+const BIFROST_BINARY_NAME: &str = "bifrost.exe";
+#[cfg(not(target_os = "windows"))]
+const BIFROST_BINARY_NAME: &str = "bifrost";
+
+static PREPARED_BIFROST_PATH: OnceLock<PathBuf> = OnceLock::new();
+static PREPARE_BIFROST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum McpError {
@@ -75,17 +119,185 @@ fn default_enabled() -> bool {
     true
 }
 
+fn default_bifrost_args() -> Vec<String> {
+    vec![
+        "--root".to_string(),
+        "{cwd}".to_string(),
+        "--server".to_string(),
+        "core".to_string(),
+    ]
+}
+
+fn prepare_bifrost_lock() -> &'static Mutex<()> {
+    PREPARE_BIFROST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn managed_bifrost_cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::setup_state::config_home()?
+        .join("bifrost")
+        .join(BUNDLED_BIFROST_VERSION)
+        .join(BIFROST_TARGET_TRIPLE))
+}
+
+fn managed_bifrost_binary_path() -> anyhow::Result<PathBuf> {
+    Ok(managed_bifrost_cache_dir()?.join(BIFROST_BINARY_NAME))
+}
+
+fn managed_bifrost_command() -> String {
+    PREPARED_BIFROST_PATH
+        .get()
+        .cloned()
+        .or_else(|| managed_bifrost_binary_path().ok())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "bifrost".to_string())
+}
+
+fn is_legacy_or_managed_bifrost_command(command: &str) -> bool {
+    command == "bifrost" || command == managed_bifrost_command()
+}
+
+pub fn normalize_preinstalled_bifrost_server(server: &mut McpServerConfig) {
+    if server.name != "bifrost"
+        || server.args != default_bifrost_args()
+        || !is_legacy_or_managed_bifrost_command(&server.command)
+    {
+        return;
+    }
+    let enabled = server.enabled;
+    *server = McpServerConfig::bifrost();
+    server.enabled = enabled;
+}
+
+pub async fn ensure_bundled_bifrost() -> anyhow::Result<PathBuf> {
+    if let Some(path) = PREPARED_BIFROST_PATH.get() {
+        return Ok(path.clone());
+    }
+
+    let _guard = prepare_bifrost_lock().lock().await;
+    if let Some(path) = PREPARED_BIFROST_PATH.get() {
+        return Ok(path.clone());
+    }
+
+    let cache_dir = managed_bifrost_cache_dir()?;
+    let binary = managed_bifrost_binary_path()?;
+    if !binary.is_file() {
+        download_and_extract_bifrost(&cache_dir).await?;
+    }
+    anyhow::ensure!(
+        binary.is_file(),
+        "expected bundled bifrost at {} after preparation",
+        binary.display()
+    );
+    let _ = PREPARED_BIFROST_PATH.set(binary.clone());
+    Ok(binary)
+}
+
+async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("creating bifrost cache dir {}", cache_dir.display()))?;
+
+    let asset =
+        format!("bifrost-v{BUNDLED_BIFROST_VERSION}-{BIFROST_TARGET_TRIPLE}.{BIFROST_ARCHIVE_EXT}");
+    let url = format!("{BIFROST_RELEASE_BASE}/v{BUNDLED_BIFROST_VERSION}/{asset}");
+    let sha256_url = format!("{url}.sha256");
+
+    tracing::info!(%url, version = BUNDLED_BIFROST_VERSION, "downloading bundled bifrost");
+    let bytes = reqwest::get(&url)
+        .await
+        .with_context(|| format!("downloading bundled bifrost archive from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("bundled bifrost archive request failed for {url}"))?
+        .bytes()
+        .await
+        .context("reading bundled bifrost archive bytes")?;
+
+    tracing::info!(
+        %sha256_url,
+        version = BUNDLED_BIFROST_VERSION,
+        "verifying bundled bifrost archive"
+    );
+    let sidecar = reqwest::get(&sha256_url)
+        .await
+        .with_context(|| format!("downloading bundled bifrost checksum from {sha256_url}"))?
+        .error_for_status()
+        .with_context(|| format!("bundled bifrost checksum request failed for {sha256_url}"))?
+        .text()
+        .await
+        .context("reading bundled bifrost checksum text")?;
+    let expected_hex = sidecar
+        .split_whitespace()
+        .next()
+        .context("bundled bifrost checksum sidecar is empty")?
+        .to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual_hex = format!("{:x}", hasher.finalize());
+    anyhow::ensure!(
+        actual_hex == expected_hex,
+        "bundled bifrost sha256 mismatch for {url}: got {actual_hex}, expected {expected_hex}"
+    );
+
+    let archive_path = cache_dir.join(&asset);
+    std::fs::write(&archive_path, &bytes)
+        .with_context(|| format!("writing bundled bifrost archive {}", archive_path.display()))?;
+
+    let status = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(cache_dir)
+        .status()
+        .with_context(|| format!("invoking tar to extract {}", archive_path.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "tar extraction failed for {} with status {status}",
+        archive_path.display()
+    );
+
+    let inner_dir = cache_dir.join(format!(
+        "bifrost-v{BUNDLED_BIFROST_VERSION}-{BIFROST_TARGET_TRIPLE}"
+    ));
+    let inner_binary = inner_dir.join(BIFROST_BINARY_NAME);
+    anyhow::ensure!(
+        inner_binary.is_file(),
+        "expected extracted bifrost binary at {}",
+        inner_binary.display()
+    );
+
+    let target = cache_dir.join(BIFROST_BINARY_NAME);
+    std::fs::rename(&inner_binary, &target)
+        .or_else(|_| std::fs::copy(&inner_binary, &target).map(|_| ()))
+        .with_context(|| {
+            format!(
+                "moving bundled bifrost from {} to {}",
+                inner_binary.display(),
+                target.display()
+            )
+        })?;
+
+    let _ = std::fs::remove_file(&archive_path);
+    let _ = std::fs::remove_dir_all(&inner_dir);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&target)
+            .with_context(|| format!("stat bundled bifrost binary {}", target.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms)
+            .with_context(|| format!("chmod 755 {}", target.display()))?;
+    }
+
+    Ok(())
+}
+
 impl McpServerConfig {
     pub fn bifrost() -> Self {
         Self {
             name: "bifrost".to_string(),
-            command: "bifrost".to_string(),
-            args: vec![
-                "--root".to_string(),
-                "{cwd}".to_string(),
-                "--server".to_string(),
-                "core".to_string(),
-            ],
+            command: managed_bifrost_command(),
+            args: default_bifrost_args(),
             framing: McpFraming::Line,
             enabled: true,
         }
@@ -430,53 +642,7 @@ fn parse_tool_list(result: Value) -> Result<Vec<McpToolDef>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-
-    /// Bifrost release the handshake test pins. Bumping bifrost is a deliberate
-    /// edit here, not whatever happens to be on a contributor's `$PATH`.
-    /// Must stay in sync with `BUNDLED_BIFROST_VERSION` in
-    /// `brokk-code/brokk_code/rust_acp_install.py`.
-    /// bifrost publishes an `aarch64-linux-android` artifact as of v0.5.3,
-    /// so keep the target allowlist below in sync when bumping.
-    const TEST_BIFROST_VERSION: &str = "0.5.3";
-
-    const TEST_BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
-
-    #[cfg(target_os = "macos")]
-    const TRIPLE: &str = "universal-apple-darwin";
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    const TRIPLE: &str = "x86_64-unknown-linux-gnu";
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    const TRIPLE: &str = "aarch64-unknown-linux-gnu";
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    const TRIPLE: &str = "x86_64-pc-windows-msvc";
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    const TRIPLE: &str = "aarch64-pc-windows-msvc";
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
-    const TRIPLE: &str = "aarch64-linux-android";
-
-    #[cfg(not(any(
-        target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "windows", target_arch = "aarch64"),
-        all(target_os = "android", target_arch = "aarch64"),
-    )))]
-    compile_error!(
-        "bifrost releases only ship a universal macOS binary, x86_64/aarch64 Linux, \
-         x86_64/aarch64 Windows, and aarch64 Android; this test cannot run on other targets"
-    );
-
-    #[cfg(target_os = "windows")]
-    const ARCHIVE_EXT: &str = "zip";
-    #[cfg(not(target_os = "windows"))]
-    const ARCHIVE_EXT: &str = "tar.gz";
-
-    #[cfg(target_os = "windows")]
-    const BINARY_NAME: &str = "bifrost.exe";
-    #[cfg(not(target_os = "windows"))]
-    const BINARY_NAME: &str = "bifrost";
+    use std::path::PathBuf;
 
     /// Resolve the bifrost binary used by the handshake test.
     ///
@@ -502,12 +668,14 @@ mod tests {
         }
 
         let cache_dir = test_fixture_cache_dir();
-        let binary = cache_dir.join(BINARY_NAME);
+        let binary = cache_dir.join(BIFROST_BINARY_NAME);
         if binary.is_file() {
             return binary;
         }
 
-        download_and_extract_bifrost(&cache_dir).await;
+        download_and_extract_bifrost(&cache_dir)
+            .await
+            .expect("download bifrost test fixture");
         assert!(
             binary.is_file(),
             "expected bifrost at {binary:?} after download+extract"
@@ -520,100 +688,8 @@ mod tests {
             .join("target")
             .join("test-fixtures")
             .join("bifrost")
-            .join(TEST_BIFROST_VERSION)
-            .join(TRIPLE)
-    }
-
-    async fn download_and_extract_bifrost(cache_dir: &Path) {
-        use sha2::{Digest, Sha256};
-
-        std::fs::create_dir_all(cache_dir).expect("create test-fixtures cache");
-
-        let asset = format!("bifrost-v{TEST_BIFROST_VERSION}-{TRIPLE}.{ARCHIVE_EXT}");
-        let url = format!("{TEST_BIFROST_RELEASE_BASE}/v{TEST_BIFROST_VERSION}/{asset}");
-        let sha256_url = format!("{url}.sha256");
-
-        eprintln!("downloading bifrost test fixture: {url}");
-        let bytes = reqwest::get(&url)
-            .await
-            .expect("bifrost release download failed (network/proxy?)")
-            .error_for_status()
-            .expect("bifrost release returned non-200")
-            .bytes()
-            .await
-            .expect("read bifrost archive bytes");
-
-        // Integrity check: verify against the publisher's `.sha256` sidecar
-        // before extraction. `bifrost --version` is unreliable as a pin
-        // (the v0.1.3 binary still self-reports `0.1.2` due to an upstream
-        // Cargo.toml miss); the sha256 is content-addressable so a
-        // mislabeled or swapped binary is caught here. Mirrors the check
-        // already done by `brokk-code/brokk_code/rust_acp_install.py` on
-        // the production install path.
-        eprintln!("verifying bifrost archive against {sha256_url}");
-        let sidecar = reqwest::get(&sha256_url)
-            .await
-            .expect("bifrost .sha256 sidecar download failed")
-            .error_for_status()
-            .expect("bifrost .sha256 sidecar returned non-200")
-            .text()
-            .await
-            .expect("read .sha256 sidecar text");
-        let expected_hex = sidecar
-            .split_whitespace()
-            .next()
-            .expect("bifrost .sha256 sidecar is empty")
-            .to_lowercase();
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let actual_hex = format!("{:x}", hasher.finalize());
-        assert_eq!(
-            actual_hex, expected_hex,
-            "bifrost archive sha256 mismatch for {url}: got {actual_hex}, expected {expected_hex} (refuse to extract)"
-        );
-
-        let archive_path = cache_dir.join(&asset);
-        std::fs::write(&archive_path, &bytes).expect("write archive to cache");
-
-        // `tar -xf` auto-detects the format and handles both .tar.gz and .zip
-        // on modern macOS, Linux, and Windows 10+ runners.
-        let status = std::process::Command::new("tar")
-            .arg("-xf")
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(cache_dir)
-            .status()
-            .expect("invoke tar to extract bifrost archive");
-        assert!(
-            status.success(),
-            "tar extraction of {archive_path:?} failed"
-        );
-
-        // Archive extracts to `bifrost-v<ver>-<triple>/bifrost(.exe)`.
-        let inner_dir = cache_dir.join(format!("bifrost-v{TEST_BIFROST_VERSION}-{TRIPLE}"));
-        let inner_binary = inner_dir.join(BINARY_NAME);
-        assert!(
-            inner_binary.is_file(),
-            "expected extracted binary at {inner_binary:?}"
-        );
-
-        let target = cache_dir.join(BINARY_NAME);
-        std::fs::rename(&inner_binary, &target)
-            .or_else(|_| std::fs::copy(&inner_binary, &target).map(|_| ()))
-            .expect("place bifrost binary at cache root");
-
-        let _ = std::fs::remove_file(&archive_path);
-        let _ = std::fs::remove_dir_all(&inner_dir);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&target)
-                .expect("stat extracted binary")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&target, perms).expect("chmod 755 on extracted binary");
-        }
+            .join(BUNDLED_BIFROST_VERSION)
+            .join(BIFROST_TARGET_TRIPLE)
     }
 
     /// Smoke test: spawn the real bifrost subprocess (pinned release,

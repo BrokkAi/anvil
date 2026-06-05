@@ -24,8 +24,8 @@ one reusable ACP subprocess and put a small client in front of it.
   `codex::gpt-5-codex`, `ollama::llama3:latest`, and
   `openrouter::anthropic/claude-sonnet-4.5`.
 - **MCP-native extensibility.** Anvil manages stdio MCP servers per session.
-  Bifrost is preinstalled as an MCP server for symbol search, cross-references,
-  and structural analysis.
+  Bifrost is preinstalled as a pinned, Anvil-managed local MCP server for
+  symbol search, cross-references, and structural analysis.
 - **Real agent tooling.** Built-in file reads/writes, grep, directory listing,
   shell execution, explicit `think`, MCP tools, subagents, and skill slash
   commands.
@@ -210,10 +210,11 @@ Anvil reads MCP server configuration from its config file and manages stdio MCP
 subprocesses per session. New servers default to standard `Content-Length` MCP
 stdio framing; use `--framing line` only for NDJSON-speaking servers.
 
-Bifrost is preinstalled as an enabled MCP server:
+Bifrost is preinstalled as an enabled MCP server backed by Anvil's managed
+local binary:
 
 ```text
-bifrost --root {cwd} --server core  # line framing
+<managed-bifrost> --root {cwd} --server core  # line framing
 ```
 
 Use `/mcp` in the editor to list or change MCP servers:
