@@ -324,9 +324,9 @@ fn pure_gate_decision(
         return PureGateDecision::Allow;
     }
 
-    // In-session "Always allow". `consult_gate` chooses the cache key; shell
-    // commands use the exact command plus cwd, while regular tools use the
-    // tool name.
+    // Remembered "Always allow". `consult_gate` chooses the cache key; shell
+    // commands use repo-scoped prefix or exact-command keys, while regular
+    // tools use the tool name.
     if is_always_allowed {
         return PureGateDecision::Allow;
     }
@@ -1244,7 +1244,7 @@ async fn consult_gate(
                             if let Some(rule_key) =
                                 shell_always_allow_rule_key(raw_input, shell_sandboxed)
                             {
-                                sessions.add_repo_always_allow(session_id, &rule_key).await;
+                                sessions.add_always_allow(session_id, &rule_key).await;
                             }
                         } else {
                             sessions.add_always_allow(session_id, tool_name).await;

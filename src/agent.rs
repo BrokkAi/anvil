@@ -3488,7 +3488,7 @@ async fn handle_permissions(
                 - `/permissions auto-edits` - Edit files automatically, ask for commands.\n\
                 - `/permissions read-only` - Do not change files or run commands.\n\
                 - `/permissions trusted` - Allow tool calls without prompting.\n\
-                - `/permissions list` - Show remembered Always allow approvals.\n\
+                - `/permissions list` - Show remembered Always allow approvals for this repo.\n\
                 - `/permissions revoke <number-or-key>` - Forget one remembered approval.\n\
                 - `/permissions clear` - Forget all remembered approvals."
             .to_string();
@@ -3537,7 +3537,7 @@ async fn render_always_allowed_permissions(sessions: &SessionStore, session_id: 
         return "No remembered Always allow approvals.".to_string();
     }
 
-    let mut out = String::from("Remembered Always allow approvals:\n\n");
+    let mut out = String::from("Remembered Always allow approvals for this repo:\n\n");
     for (idx, key) in keys.iter().enumerate() {
         out.push_str(&format!(
             "{}. {}\n",
@@ -5659,7 +5659,7 @@ mod tests {
         })
         .to_string();
         store.add_always_allow(&id, "write_file").await;
-        store.add_repo_always_allow(&id, &repo_key).await;
+        store.add_always_allow(&id, &repo_key).await;
 
         let listed = render_always_allowed_permissions(&store, &id).await;
         assert!(listed.contains("1. tool `write_file`"), "{listed}");

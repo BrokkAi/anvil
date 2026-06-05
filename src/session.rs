@@ -454,21 +454,15 @@ pub struct Session {
     /// to auto-sync from external setup state changes.
     pub sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     sandbox_mode_explicitly_set: bool,
-    /// Approval keys the user has chosen "Always allow" for this install.
+    /// Approval keys the user has chosen "Always allow" for this repo.
     /// Most tools use the tool name; shell commands use a scoped key.
-    /// Hydrated from trusted setup state, not from workspace session zips.
+    /// Hydrated from trusted repo-local permission state, not from workspace
+    /// session zips.
     pub always_allow_tools: HashSet<String>,
     /// Approval keys in the order they were first remembered. This keeps
     /// `/permissions list` and `revoke <number>` stable without
     /// weakening the fast membership check above.
     always_allow_order: Vec<String>,
-    /// Repo-local shell-command approvals remembered by normalized command
-    /// prefix. Hydrated from `<repo>/.brokk/permissions.json`, not from the
-    /// workspace session zip, so approvals stay scoped to the current repo.
-    repo_always_allow_tools: HashSet<String>,
-    /// Repo-local approval keys in first-seen order for stable `/permissions`
-    /// output and numeric revocation.
-    repo_always_allow_order: Vec<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
     /// `None` means "use the active model's `default_reasoning_level`";
     /// `Some(_)` means "honor this exact level, fail if unsupported".
@@ -558,8 +552,6 @@ impl Session {
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
             always_allow_order: Vec::new(),
-            repo_always_allow_tools: HashSet::new(),
-            repo_always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions,
@@ -575,9 +567,9 @@ impl Session {
     /// SECURITY: transient fields that intentionally do NOT come from the
     /// workspace session zip (`permission_mode`, `always_allow_tools`,
     /// `always_allow_order`) are reset here. `SessionStore` rehydrates
-    /// remembered approvals from trusted setup state after construction, so a
-    /// stale or tampered zip still cannot silently auto-allow tool calls on
-    /// launch.
+    /// remembered approvals from trusted repo-local permission state after
+    /// construction, so a stale or tampered zip still cannot silently
+    /// auto-allow tool calls on launch.
     ///
     /// Also rejects a mismatch between `id` (the caller's requested id, used
     /// to locate the zip and to key the in-memory map) and `manifest.id`
@@ -626,8 +618,6 @@ impl Session {
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
             always_allow_order: Vec::new(),
-            repo_always_allow_tools: HashSet::new(),
-            repo_always_allow_order: Vec::new(),
             // Reset reasoning effort on load -- it's a transient
             // per-session preference (per issue scope), so a
             // reloaded zip starts at "use model default" until the
@@ -649,16 +639,6 @@ impl Session {
         for key in keys {
             if !key.is_empty() && self.always_allow_tools.insert(key.clone()) {
                 self.always_allow_order.push(key);
-            }
-        }
-    }
-
-    fn set_repo_always_allow_keys(&mut self, keys: impl IntoIterator<Item = String>) {
-        self.repo_always_allow_tools.clear();
-        self.repo_always_allow_order.clear();
-        for key in keys {
-            if !key.is_empty() && self.repo_always_allow_tools.insert(key.clone()) {
-                self.repo_always_allow_order.push(key);
             }
         }
     }
@@ -735,12 +715,32 @@ fn session_zip_path(cwd: &Path, id: &str) -> PathBuf {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct RepoPermissionState {
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        rename = "alwaysAllowShellPrefixes"
-    )]
-    always_allow_shell_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "alwaysAllow")]
+    always_allow: Vec<String>,
+    #[serde(default, rename = "alwaysAllowShellPrefixes", skip_serializing)]
+    legacy_shell_prefixes: Vec<String>,
+}
+
+impl RepoPermissionState {
+    fn merged_approvals(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for key in self
+            .always_allow
+            .iter()
+            .chain(self.legacy_shell_prefixes.iter())
+        {
+            if !key.is_empty() && seen.insert(key.clone()) {
+                out.push(key.clone());
+            }
+        }
+        out
+    }
+
+    fn migrate_legacy(&mut self) {
+        self.always_allow = self.merged_approvals();
+        self.legacy_shell_prefixes.clear();
+    }
 }
 
 static REPO_PERMISSION_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -798,12 +798,13 @@ fn update_repo_permission_state(
         .lock()
         .expect("repo permission write mutex poisoned");
     let mut state = read_repo_permission_state(scope_root);
+    state.migrate_legacy();
     mutator(&mut state);
     write_repo_permission_state(scope_root, &state)
 }
 
 fn read_repo_always_allow_keys(scope_root: &Path) -> Vec<String> {
-    read_repo_permission_state(scope_root).always_allow_shell_prefixes
+    read_repo_permission_state(scope_root).merged_approvals()
 }
 
 fn remember_repo_always_allow_key(scope_root: &Path, key: &str) -> anyhow::Result<()> {
@@ -811,27 +812,21 @@ fn remember_repo_always_allow_key(scope_root: &Path, key: &str) -> anyhow::Resul
         return Ok(());
     }
     update_repo_permission_state(scope_root, |state| {
-        if !state
-            .always_allow_shell_prefixes
-            .iter()
-            .any(|existing| existing == key)
-        {
-            state.always_allow_shell_prefixes.push(key.to_string());
+        if !state.always_allow.iter().any(|existing| existing == key) {
+            state.always_allow.push(key.to_string());
         }
     })
 }
 
 fn forget_repo_always_allow_key(scope_root: &Path, key: &str) -> anyhow::Result<()> {
     update_repo_permission_state(scope_root, |state| {
-        state
-            .always_allow_shell_prefixes
-            .retain(|existing| existing != key);
+        state.always_allow.retain(|existing| existing != key);
     })
 }
 
 fn clear_repo_always_allow_keys(scope_root: &Path) -> anyhow::Result<()> {
     update_repo_permission_state(scope_root, |state| {
-        state.always_allow_shell_prefixes.clear();
+        state.always_allow.clear();
     })
 }
 
@@ -1954,47 +1949,6 @@ impl SessionStore {
         }
     }
 
-    fn remember_always_allow_key(&self, key: &str) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                let mut state = state.lock().expect("transient setup state mutex poisoned");
-                if !key.is_empty() && !state.always_allow.iter().any(|existing| existing == key) {
-                    state.always_allow.push(key.to_string());
-                }
-                Ok(())
-            }
-            None => crate::setup_state::remember_always_allow_key(key),
-        }
-    }
-
-    fn forget_always_allow_key(&self, key: &str) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                state
-                    .lock()
-                    .expect("transient setup state mutex poisoned")
-                    .always_allow
-                    .retain(|existing| existing != key);
-                Ok(())
-            }
-            None => crate::setup_state::forget_always_allow_key(key),
-        }
-    }
-
-    fn clear_remembered_always_allow_keys(&self) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                state
-                    .lock()
-                    .expect("transient setup state mutex poisoned")
-                    .always_allow
-                    .clear();
-                Ok(())
-            }
-            None => crate::setup_state::clear_always_allow_keys(),
-        }
-    }
-
     /// If `sessions.len()` exceeds `limits.max_sessions`, evict the least
     /// recently used session(s) from memory. Sessions with an in-flight
     /// prompt (cancel token registered via `start_prompt`) are skipped --
@@ -2133,7 +2087,6 @@ impl SessionStore {
         let default_model = self.default_model.read().await.clone();
         let default_reasoning_effort = self.default_reasoning_effort.read().await.clone();
         let catalog = self.available_models.read().await.clone();
-        let remembered_always_allow = prefs.always_allow.clone();
         let model = select_session_model(prefs.last_model, default_model, &catalog);
         let reasoning_effort = select_session_reasoning_effort(
             &model,
@@ -2157,10 +2110,7 @@ impl SessionStore {
             ),
         };
         session.selected_reasoning_effort = reasoning_effort;
-        session.set_always_allow_keys(remembered_always_allow);
-        session.set_repo_always_allow_keys(read_repo_always_allow_keys(
-            &session.permission_scope_root,
-        ));
+        session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
         // Persistence failures are logged but not surfaced: `create_session` returns
@@ -2245,7 +2195,6 @@ impl SessionStore {
         };
 
         let prefs = self.setup_state_snapshot();
-        let remembered_always_allow = prefs.always_allow.clone();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let loaded_session = match sandbox_mode {
             Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
@@ -2273,10 +2222,7 @@ impl SessionStore {
                 return false;
             }
         };
-        session.set_always_allow_keys(remembered_always_allow);
-        session.set_repo_always_allow_keys(read_repo_always_allow_keys(
-            &session.permission_scope_root,
-        ));
+        session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
             let mut sessions = self.sessions.write().await;
             // Race window: another task may have inserted under the same id while
@@ -2453,7 +2399,7 @@ impl SessionStore {
             session.project_instructions = project_instructions;
             session.skills = skills;
             session.agents = agents;
-            session.set_repo_always_allow_keys(repo_always_allow);
+            session.set_always_allow_keys(repo_always_allow);
             // cwd changed -> previously-activated skills may no longer
             // be relevant. Clear so the model can re-activate against
             // the new catalog without stale dedup entries.
@@ -2605,10 +2551,7 @@ impl SessionStore {
             .read()
             .await
             .get(id)
-            .map(|s| {
-                s.always_allow_tools.contains(approval_key)
-                    || s.repo_always_allow_tools.contains(approval_key)
-            })
+            .map(|s| s.always_allow_tools.contains(approval_key))
             .unwrap_or(false)
     }
 
@@ -2619,42 +2562,15 @@ impl SessionStore {
             .await
             .get(id)
             .map(|s| {
-                approval_keys.iter().any(|key| {
-                    s.always_allow_tools.contains(key) || s.repo_always_allow_tools.contains(key)
-                })
+                approval_keys
+                    .iter()
+                    .any(|key| s.always_allow_tools.contains(key))
             })
             .unwrap_or(false)
     }
 
-    /// Add `approval_key` to the install-level always-allow set.
+    /// Add `approval_key` to the current repo's remembered approval set.
     pub async fn add_always_allow(&self, id: &str, approval_key: &str) {
-        if approval_key.is_empty() {
-            return;
-        }
-        let changed = {
-            let mut sessions = self.sessions.write().await;
-            if !sessions.contains_key(id) {
-                return;
-            }
-            let mut changed = false;
-            for session in sessions.values_mut() {
-                if session.always_allow_tools.insert(approval_key.to_string()) {
-                    session.always_allow_order.push(approval_key.to_string());
-                    changed = true;
-                }
-            }
-            changed
-        };
-        if changed && let Err(e) = self.remember_always_allow_key(approval_key) {
-            tracing::warn!(
-                session_id = %id,
-                "failed to persist Always allow approval: {e:#}"
-            );
-        }
-    }
-
-    /// Add `approval_key` to the current repo's remembered shell-command approvals.
-    pub async fn add_repo_always_allow(&self, id: &str, approval_key: &str) {
         if approval_key.is_empty() {
             return;
         }
@@ -2675,13 +2591,9 @@ impl SessionStore {
             let mut changed = false;
             for session in sessions.values_mut() {
                 if session.permission_scope_root == scope_root
-                    && session
-                        .repo_always_allow_tools
-                        .insert(approval_key.to_string())
+                    && session.always_allow_tools.insert(approval_key.to_string())
                 {
-                    session
-                        .repo_always_allow_order
-                        .push(approval_key.to_string());
+                    session.always_allow_order.push(approval_key.to_string());
                     changed = true;
                 }
             }
@@ -2700,46 +2612,31 @@ impl SessionStore {
     pub async fn always_allow_keys(&self, id: &str) -> Option<Vec<String>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(id)?;
-        let mut keys = session.always_allow_order.clone();
-        keys.extend(session.repo_always_allow_order.clone());
-        Some(keys)
+        Some(session.always_allow_order.clone())
     }
 
     /// Remove one remembered always-allow key. Returns `None` if the session is unknown.
     pub async fn remove_always_allow(&self, id: &str, approval_key: &str) -> Option<bool> {
-        let (scope_root, remove_global, remove_repo) = {
+        let (scope_root, remove_repo) = {
             let sessions = self.sessions.read().await;
             let session = sessions.get(id)?;
             (
                 session.permission_scope_root.clone(),
                 session.always_allow_tools.contains(approval_key),
-                session.repo_always_allow_tools.contains(approval_key),
             )
         };
-        if !remove_global && !remove_repo {
+        if !remove_repo {
             return Some(false);
         }
 
         {
             let mut sessions = self.sessions.write().await;
             for session in sessions.values_mut() {
-                if remove_global {
+                if session.permission_scope_root == scope_root {
                     session.always_allow_tools.remove(approval_key);
                     session.always_allow_order.retain(|key| key != approval_key);
                 }
-                if remove_repo && session.permission_scope_root == scope_root {
-                    session.repo_always_allow_tools.remove(approval_key);
-                    session
-                        .repo_always_allow_order
-                        .retain(|key| key != approval_key);
-                }
             }
-        }
-        if remove_global && let Err(e) = self.forget_always_allow_key(approval_key) {
-            tracing::warn!(
-                session_id = %id,
-                "failed to persist Always allow revocation: {e:#}"
-            );
         }
         if remove_repo && let Err(e) = forget_repo_always_allow_key(&scope_root, approval_key) {
             tracing::warn!(
@@ -2753,16 +2650,14 @@ impl SessionStore {
 
     /// Clear all remembered always-allow keys.
     pub async fn clear_always_allow(&self, id: &str) -> Option<usize> {
-        let (scope_root, global_count, repo_count) = {
+        let (scope_root, count) = {
             let sessions = self.sessions.read().await;
             let session = sessions.get(id)?;
             (
                 session.permission_scope_root.clone(),
                 session.always_allow_tools.len(),
-                session.repo_always_allow_tools.len(),
             )
         };
-        let count = global_count + repo_count;
         if count == 0 {
             return Some(0);
         }
@@ -2770,25 +2665,13 @@ impl SessionStore {
         {
             let mut sessions = self.sessions.write().await;
             for session in sessions.values_mut() {
-                session.always_allow_tools.clear();
-                session.always_allow_order.clear();
                 if session.permission_scope_root == scope_root {
-                    session.repo_always_allow_tools.clear();
-                    session.repo_always_allow_order.clear();
+                    session.always_allow_tools.clear();
+                    session.always_allow_order.clear();
                 }
             }
         }
-        if global_count > 0
-            && let Err(e) = self.clear_remembered_always_allow_keys()
-        {
-            tracing::warn!(
-                session_id = %id,
-                "failed to persist Always allow clear: {e:#}"
-            );
-        }
-        if repo_count > 0
-            && let Err(e) = clear_repo_always_allow_keys(&scope_root)
-        {
+        if let Err(e) = clear_repo_always_allow_keys(&scope_root) {
             tracing::warn!(
                 session_id = %id,
                 repo_root = %scope_root.display(),
@@ -4225,17 +4108,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `add_always_allow` is persisted in setup state and survives new sessions.
+    /// Remembered approvals persist per repo and survive new sessions in that repo.
     #[tokio::test]
     async fn always_allow_set_is_persisted_for_new_sessions() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
-        let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-always-allow-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let s = store.create_session(cwd.clone()).await;
+        let repo = tempfile::tempdir().expect("repo");
+        let other_repo = tempfile::tempdir().expect("other repo");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("git dir");
+        std::fs::create_dir_all(other_repo.path().join(".git")).expect("other git dir");
+        let s = store.create_session(repo.path().to_path_buf()).await;
 
         assert!(!store.is_always_allowed(&s.id, "write_file").await);
         store.add_always_allow(&s.id, "write_file").await;
@@ -4245,17 +4128,23 @@ mod tests {
         // Unknown session never reports allowed.
         assert!(!store.is_always_allowed("no-such", "write_file").await);
 
-        let next = store.create_session(cwd.clone()).await;
+        let next = store.create_session(repo.path().to_path_buf()).await;
         assert!(store.is_always_allowed(&next.id, "write_file").await);
         assert_eq!(
             store.always_allow_keys(&next.id).await,
             Some(vec!["write_file".to_string()])
         );
 
-        let state = crate::setup_state::read();
-        assert_eq!(state.always_allow, vec!["write_file".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&cwd);
+        let different_repo = store.create_session(other_repo.path().to_path_buf()).await;
+        assert!(
+            !store
+                .is_always_allowed(&different_repo.id, "write_file")
+                .await
+        );
+        assert_eq!(
+            read_repo_permission_state(repo.path()).always_allow,
+            vec!["write_file".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -4277,7 +4166,7 @@ mod tests {
         .to_string();
 
         let first = store.create_session(repo1.path().to_path_buf()).await;
-        store.add_repo_always_allow(&first.id, &repo_key).await;
+        store.add_always_allow(&first.id, &repo_key).await;
         assert!(store.is_always_allowed(&first.id, &repo_key).await);
 
         let second_same_repo = store.create_session(repo1.path().to_path_buf()).await;
@@ -4291,12 +4180,12 @@ mod tests {
         assert!(!store.is_always_allowed(&other_repo.id, &repo_key).await);
 
         assert_eq!(
-            read_repo_permission_state(repo1.path()).always_allow_shell_prefixes,
+            read_repo_permission_state(repo1.path()).always_allow,
             vec![repo_key]
         );
         assert!(
             read_repo_permission_state(repo2.path())
-                .always_allow_shell_prefixes
+                .always_allow
                 .is_empty()
         );
     }
@@ -4318,7 +4207,7 @@ mod tests {
         .to_string();
 
         store.add_always_allow(&s.id, "write_file").await;
-        store.add_repo_always_allow(&s.id, &repo_key).await;
+        store.add_always_allow(&s.id, &repo_key).await;
         store.add_always_allow(&s.id, "write_file").await;
 
         assert_eq!(
