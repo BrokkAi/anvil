@@ -19,7 +19,10 @@ use crate::tools::ToolRegistry;
 /// Cap for inline text content we put on a Completed/Failed update. Keeps
 /// the wire payload bounded; the LLM-facing `raw_output` is bounded
 /// separately by `tool_loop::MAX_TOOL_RESULT_BYTES`.
-const MAX_INLINE_OUTPUT_BYTES: usize = 50_000;
+///
+/// Also used as the effective size cap for shell-command permission-prompt
+/// titles, which carry the full command text (see `rejection_for_oversized_input_content`).
+pub(super) const MAX_INLINE_OUTPUT_BYTES: usize = 50_000;
 
 /// Cap on the rendered tool-call title's count of Unicode scalars
 /// (`str::chars`). Clients render this title at the top of the permission
@@ -96,7 +99,14 @@ pub(super) fn initial_tool_call(
 /// `MAX_TOOL_TITLE_CHARS`, return the rejection message. `None` means the
 /// prompt title fits and the call can proceed to the normal Pending -> gate
 /// flow.
+///
+/// Shell commands (`run_shell_command`) are excluded: their permission-prompt
+/// title carries the full command text and is bounded separately by
+/// `rejection_for_oversized_input_content` at `MAX_INLINE_OUTPUT_BYTES`.
 pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) -> Option<String> {
+    if tool_name == "run_shell_command" {
+        return None;
+    }
     if permission_prompt_title(tool_name, raw_input)
         .chars()
         .count()
@@ -108,17 +118,26 @@ pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) 
     }
 }
 
-/// If the extra approval content would be truncated, reject before showing the
-/// permission prompt. Multiline shell commands rely on this content because
-/// their title intentionally shows only the first line.
+/// If a shell command is too long to show in the approval modal, reject before
+/// displaying the permission prompt. Both the modal title and the content block
+/// carry the full command text (the title for clients that only render the
+/// title; the content block for others), so this guard applies to all shell
+/// commands — mono- and multi-line alike. The effective cap is
+/// `MAX_INLINE_OUTPUT_BYTES`; the 1024-char title cap is intentionally not
+/// applied to shell (see `rejection_for_oversized_title`).
 pub(super) fn rejection_for_oversized_input_content(
     tool_name: &str,
     raw_input: &Value,
 ) -> Option<String> {
-    multiline_shell_command(tool_name, raw_input)
-        .map(command_input_text)
-        .filter(|content| content.len() > MAX_INLINE_OUTPUT_BYTES)
-        .map(|_| input_content_too_long_reason())
+    if tool_name != "run_shell_command" {
+        return None;
+    }
+    let command = raw_input.get("command").and_then(Value::as_str)?;
+    if command_input_text(command).len() > MAX_INLINE_OUTPUT_BYTES {
+        Some(input_content_too_long_reason())
+    } else {
+        None
+    }
 }
 
 /// Pending card for a call we're about to refuse because its full title
@@ -588,20 +607,84 @@ mod tests {
     }
 
     #[test]
-    fn oversized_title_rejected_for_long_shell_command() {
-        // Single-line shell command long enough to push the rendered
-        // `Run \`<cmd>\`` title past 1024 chars. first_line() only strips
-        // \n, not length, so the long single-line case is what trips the
-        // cap in practice.
+    fn shell_bypasses_title_gate() {
+        // Shell commands are gated by rejection_for_oversized_input_content
+        // (MAX_INLINE_OUTPUT_BYTES), not the 1024-char title gate.
         let cmd = "echo ".to_string() + &"a".repeat(MAX_TOOL_TITLE_CHARS);
-        let reason =
-            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd.clone()}));
-        assert!(reason.is_some(), "title >1024 chars must be rejected");
+        assert!(
+            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd})).is_none(),
+            "title gate must not fire for shell commands regardless of length"
+        );
+    }
 
-        let cmd_short = "echo hello".to_string();
-        let reason_short =
-            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd_short}));
-        assert!(reason_short.is_none(), "short title must pass");
+    #[test]
+    fn shell_command_between_title_cap_and_content_cap_is_allowed() {
+        // ~2000 chars: above the 1024-char title cap, well below the 50_000-byte
+        // content cap — must pass both gates and produce a full-command title.
+        let cmd = "echo ".to_string() + &"a".repeat(2000);
+        assert!(
+            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd.clone()}))
+                .is_none(),
+            "title gate must not fire for shell"
+        );
+        assert!(
+            rejection_for_oversized_input_content(
+                "run_shell_command",
+                &json!({"command": cmd.clone()})
+            )
+            .is_none(),
+            "content gate must not fire for a 2000-char command"
+        );
+        let title = permission_prompt_title("run_shell_command", &json!({"command": cmd.clone()}));
+        assert!(
+            title.starts_with("Run command:\n"),
+            "title must use the full-command format"
+        );
+        assert!(title.contains(&cmd), "title must contain the full command");
+    }
+
+    #[test]
+    fn shell_command_over_content_cap_is_rejected() {
+        // A command whose rendered content exceeds MAX_INLINE_OUTPUT_BYTES must
+        // be rejected, whether it is mono- or multi-line.
+        let cmd_single = "echo ".to_string() + &"a".repeat(MAX_INLINE_OUTPUT_BYTES);
+        let reason = rejection_for_oversized_input_content(
+            "run_shell_command",
+            &json!({"command": cmd_single}),
+        );
+        assert!(
+            reason.is_some(),
+            "single-line command > 50_000 bytes must be rejected"
+        );
+        assert!(
+            reason
+                .unwrap()
+                .contains(&MAX_INLINE_OUTPUT_BYTES.to_string()),
+            "rejection message must quote the content cap"
+        );
+
+        let cmd_multi = format!(
+            "python3 - <<'PY'\n{}\nPY",
+            "a".repeat(MAX_INLINE_OUTPUT_BYTES)
+        );
+        assert!(
+            rejection_for_oversized_input_content(
+                "run_shell_command",
+                &json!({"command": cmd_multi})
+            )
+            .is_some(),
+            "multi-line command > 50_000 bytes must be rejected"
+        );
+    }
+
+    #[test]
+    fn non_shell_oversized_title_is_rejected() {
+        // The 1024-char title gate still applies to non-shell tools.
+        let path = "a".repeat(MAX_TOOL_TITLE_CHARS); // "Read `{path}`" => exceeds cap
+        assert!(
+            rejection_for_oversized_title("read_file", &json!({"file_path": path})).is_some(),
+            "non-shell title > 1024 chars must be rejected"
+        );
     }
 
     #[test]
@@ -626,10 +709,11 @@ mod tests {
     fn rejection_text_quotes_the_actual_cap() {
         // Drift guard: the message handed to the LLM must mention the same
         // number the gate enforces. If MAX_TOOL_TITLE_CHARS changes, the
-        // message has to follow.
-        let cmd = "echo ".to_string() + &"a".repeat(MAX_TOOL_TITLE_CHARS);
+        // message has to follow. Uses a non-shell tool; shell is gated by
+        // rejection_for_oversized_input_content instead.
+        let path = "a".repeat(MAX_TOOL_TITLE_CHARS + 1);
         let reason =
-            rejection_for_oversized_title("run_shell_command", &json!({"command": cmd})).unwrap();
+            rejection_for_oversized_title("read_file", &json!({"file_path": path})).unwrap();
         assert!(
             reason.contains(&MAX_TOOL_TITLE_CHARS.to_string()),
             "rejection message must quote the cap; got: {reason}"
