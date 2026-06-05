@@ -324,9 +324,9 @@ fn pure_gate_decision(
         return PureGateDecision::Allow;
     }
 
-    // In-session "Always allow". `consult_gate` chooses the cache key; shell
-    // commands use the exact command plus cwd, while regular tools use the
-    // tool name.
+    // Remembered "Always allow". `consult_gate` chooses the cache key; shell
+    // commands use repo-scoped prefix or exact-command keys, while regular
+    // tools use the tool name.
     if is_always_allowed {
         return PureGateDecision::Allow;
     }
@@ -530,6 +530,55 @@ fn always_allow_key(
     }
 
     tool_name.to_string()
+}
+
+fn shell_always_allow_rule_key(raw_input: &Value, shell_sandboxed: bool) -> Option<String> {
+    let command = raw_input.get("command").and_then(Value::as_str)?;
+    if let Some(tokens) = tokenize_simple_shell_command(command) {
+        let argv_prefix: Vec<String> = tokens.into_iter().take(3).collect();
+        if !argv_prefix.is_empty() {
+            return Some(
+                serde_json::json!({
+                    "tool": "run_shell_command",
+                    "rule": "prefix",
+                    "argvPrefix": argv_prefix,
+                    "shellSandboxed": shell_sandboxed,
+                })
+                .to_string(),
+            );
+        }
+    }
+
+    Some(
+        serde_json::json!({
+            "tool": "run_shell_command",
+            "rule": "exact",
+            "command": command,
+            "shellSandboxed": shell_sandboxed,
+        })
+        .to_string(),
+    )
+}
+
+fn always_allow_lookup_keys(
+    tool_name: &str,
+    raw_input: &Value,
+    cwd: &Path,
+    shell_sandboxed: bool,
+) -> Vec<String> {
+    if tool_name == "run_shell_command" {
+        let mut keys = Vec::with_capacity(2);
+        if let Some(rule_key) = shell_always_allow_rule_key(raw_input, shell_sandboxed) {
+            keys.push(rule_key);
+        }
+        let legacy_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
+        if !legacy_key.is_empty() {
+            keys.push(legacy_key);
+        }
+        return keys;
+    }
+
+    vec![tool_name.to_string()]
 }
 
 /// Decide which sandbox policy to use for an approved tool call.
@@ -1161,9 +1210,9 @@ async fn consult_gate(
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
     let shell_auto_allow = tool_name == "run_shell_command"
         && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
-    let always_allow_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
+    let always_allow_keys = always_allow_lookup_keys(tool_name, raw_input, cwd, shell_sandboxed);
     let is_always_allowed = sessions
-        .is_always_allowed(session_id, &always_allow_key)
+        .is_any_always_allowed(session_id, &always_allow_keys)
         .await;
 
     match pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow) {
@@ -1191,9 +1240,15 @@ async fn consult_gate(
                     // Awaited inline so the next tool call in the same batch
                     // sees the updated set without re-prompting.
                     if grant.allow_always && grant.sandbox_policy_override.is_none() {
-                        sessions
-                            .add_always_allow(session_id, &always_allow_key)
-                            .await;
+                        if tool_name == "run_shell_command" {
+                            if let Some(rule_key) =
+                                shell_always_allow_rule_key(raw_input, shell_sandboxed)
+                            {
+                                sessions.add_always_allow(session_id, &rule_key).await;
+                            }
+                        } else {
+                            sessions.add_always_allow(session_id, tool_name).await;
+                        }
                     }
                     GateDecision::Allow {
                         sandbox_policy_override: grant.sandbox_policy_override,
@@ -2905,6 +2960,26 @@ mod tests {
         assert_ne!(first, different_command);
         assert_ne!(first, different_cwd);
         assert_ne!(first, different_sandbox_mode);
+    }
+
+    #[test]
+    fn shell_repo_always_allow_rule_uses_first_three_tokens() {
+        let key = shell_always_allow_rule_key(
+            &serde_json::json!({"command": "cargo test --workspace --lib"}),
+            true,
+        )
+        .expect("shell rule key");
+
+        assert_eq!(
+            key,
+            serde_json::json!({
+                "tool": "run_shell_command",
+                "rule": "prefix",
+                "argvPrefix": ["cargo", "test", "--workspace"],
+                "shellSandboxed": true,
+            })
+            .to_string()
+        );
     }
 
     #[test]

@@ -3488,7 +3488,7 @@ async fn handle_permissions(
                 - `/permissions auto-edits` - Edit files automatically, ask for commands.\n\
                 - `/permissions read-only` - Do not change files or run commands.\n\
                 - `/permissions trusted` - Allow tool calls without prompting.\n\
-                - `/permissions list` - Show remembered Always allow approvals.\n\
+                - `/permissions list` - Show remembered Always allow approvals for this repo.\n\
                 - `/permissions revoke <number-or-key>` - Forget one remembered approval.\n\
                 - `/permissions clear` - Forget all remembered approvals."
             .to_string();
@@ -3537,7 +3537,7 @@ async fn render_always_allowed_permissions(sessions: &SessionStore, session_id: 
         return "No remembered Always allow approvals.".to_string();
     }
 
-    let mut out = String::from("Remembered Always allow approvals:\n\n");
+    let mut out = String::from("Remembered Always allow approvals for this repo:\n\n");
     for (idx, key) in keys.iter().enumerate() {
         out.push_str(&format!(
             "{}. {}\n",
@@ -3602,6 +3602,43 @@ fn describe_always_allow_key(key: &str) -> String {
     if let Some(value) = parsed
         && value.get("tool").and_then(serde_json::Value::as_str) == Some("run_shell_command")
     {
+        if value.get("rule").and_then(serde_json::Value::as_str) == Some("prefix") {
+            let prefix = value
+                .get("argvPrefix")
+                .and_then(serde_json::Value::as_array)
+                .map(|argv| {
+                    argv.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|joined| !joined.is_empty())
+                .unwrap_or_else(|| "(unknown prefix)".to_string());
+            let sandbox = match value
+                .get("shellSandboxed")
+                .and_then(serde_json::Value::as_bool)
+            {
+                Some(true) => "sandboxed",
+                Some(false) => "unsandboxed",
+                None => "sandbox unknown",
+            };
+            return format!("run_shell_command prefix `{prefix}` in this repo ({sandbox})");
+        }
+        if value.get("rule").and_then(serde_json::Value::as_str) == Some("exact") {
+            let command = value
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("(unknown command)");
+            let sandbox = match value
+                .get("shellSandboxed")
+                .and_then(serde_json::Value::as_bool)
+            {
+                Some(true) => "sandboxed",
+                Some(false) => "unsandboxed",
+                None => "sandbox unknown",
+            };
+            return format!("run_shell_command `{command}` in this repo ({sandbox})");
+        }
         let command = value
             .get("command")
             .and_then(serde_json::Value::as_str)
@@ -5585,7 +5622,14 @@ mod tests {
 
     #[test]
     fn describe_always_allow_key_formats_shell_keys() {
-        let key = serde_json::json!({
+        let repo_prefix_key = serde_json::json!({
+            "tool": "run_shell_command",
+            "rule": "prefix",
+            "argvPrefix": ["cargo", "test"],
+            "shellSandboxed": true,
+        })
+        .to_string();
+        let legacy_key = serde_json::json!({
             "tool": "run_shell_command",
             "cwd": "/work/repo",
             "command": "cargo test",
@@ -5594,7 +5638,11 @@ mod tests {
         .to_string();
 
         assert_eq!(
-            describe_always_allow_key(&key),
+            describe_always_allow_key(&repo_prefix_key),
+            "run_shell_command prefix `cargo test` in this repo (sandboxed)"
+        );
+        assert_eq!(
+            describe_always_allow_key(&legacy_key),
             "run_shell_command `cargo test` in `/work/repo` (sandboxed)"
         );
         assert_eq!(describe_always_allow_key("write_file"), "tool `write_file`");
@@ -5603,17 +5651,35 @@ mod tests {
     #[tokio::test]
     async fn remembered_permissions_can_be_listed_revoked_and_cleared() {
         let (store, id) = make_store_with_session("m").await;
+        let repo_key = serde_json::json!({
+            "tool": "run_shell_command",
+            "rule": "prefix",
+            "argvPrefix": ["cargo", "test"],
+            "shellSandboxed": true,
+        })
+        .to_string();
         store.add_always_allow(&id, "write_file").await;
-        store.add_always_allow(&id, "run_shell_command").await;
+        store.add_always_allow(&id, &repo_key).await;
 
         let listed = render_always_allowed_permissions(&store, &id).await;
         assert!(listed.contains("1. tool `write_file`"), "{listed}");
-        assert!(listed.contains("2. tool `run_shell_command`"), "{listed}");
+        assert!(
+            listed.contains("2. run_shell_command prefix `cargo test` in this repo (sandboxed)"),
+            "{listed}"
+        );
 
         let revoked = revoke_always_allowed_permission(&store, &id, "1").await;
         assert_eq!(revoked, "Forgot Always allow approval: tool `write_file`");
-        assert!(!store.is_always_allowed(&id, "write_file").await);
-        assert!(store.is_always_allowed(&id, "run_shell_command").await);
+        assert!(
+            !store
+                .is_any_always_allowed(&id, &["write_file".to_string()])
+                .await
+        );
+        assert!(
+            store
+                .is_any_always_allowed(&id, std::slice::from_ref(&repo_key))
+                .await
+        );
 
         let missing = revoke_always_allowed_permission(&store, &id, "99").await;
         assert!(missing.contains("No remembered Always allow approval numbered `99`"));
