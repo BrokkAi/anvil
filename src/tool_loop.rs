@@ -28,10 +28,10 @@ use crate::trace_logging::append_trace_record;
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const LLM_STREAM_MAX_ATTEMPTS: usize = 2;
-const ENCOURAGE_BIFROST_ENV: &str = "BRK_ENCOURAGE_BIFROST";
+const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 
-fn bifrost_first_enabled() -> bool {
-    env::var(ENCOURAGE_BIFROST_ENV).ok().is_some_and(|value| {
+fn train_bifrost_enabled() -> bool {
+    env::var(TRAIN_BIFROST_ENV).ok().is_some_and(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -39,15 +39,15 @@ fn bifrost_first_enabled() -> bool {
     })
 }
 
-fn bifrost_first_builtin_tools() -> std::collections::HashSet<String> {
+fn train_bifrost_initial_builtin_tools() -> std::collections::HashSet<String> {
     ["think", "write_file", "edit", "list_directory"]
         .into_iter()
         .map(str::to_string)
         .collect()
 }
 
-fn bifrost_first_post_edit_builtin_tools() -> std::collections::HashSet<String> {
-    let mut tools = bifrost_first_builtin_tools();
+fn train_bifrost_post_edit_builtin_tools() -> std::collections::HashSet<String> {
+    let mut tools = train_bifrost_initial_builtin_tools();
     tools.insert("run_shell_command".to_string());
     tools
 }
@@ -531,10 +531,10 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
-    let bifrost_first = bifrost_first_enabled();
-    if bifrost_first {
+    let train_bifrost = train_bifrost_enabled();
+    if train_bifrost {
         registry
-            .set_builtin_tools(bifrost_first_builtin_tools())
+            .set_builtin_tools(train_bifrost_initial_builtin_tools())
             .await;
     }
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
@@ -560,12 +560,14 @@ pub(crate) async fn run(
         if cancel.is_cancelled() {
             break;
         }
-        if should_emit_no_edit_progress_nudge(
-            turn,
-            max_turns,
-            &tool_exchanges,
-            no_edit_progress_nudge_count,
-        ) {
+        if train_bifrost
+            && should_emit_no_edit_progress_nudge(
+                turn,
+                max_turns,
+                &tool_exchanges,
+                no_edit_progress_nudge_count,
+            )
+        {
             no_edit_progress_nudge_count += 1;
             append_trace_record(serde_json::json!({
                 "type": "no_edit_progress_nudge",
@@ -626,7 +628,9 @@ pub(crate) async fn run(
             Ok(LlmResponse::Text { text, usage }) => {
                 trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
-                if should_reject_no_edit_final_answer(turn, max_turns, &tool_exchanges) {
+                if train_bifrost
+                    && should_reject_no_edit_final_answer(turn, max_turns, &tool_exchanges)
+                {
                     append_trace_record(serde_json::json!({
                         "type": "no_edit_final_answer_guard",
                         "turn": turn,
@@ -981,14 +985,14 @@ pub(crate) async fn run(
                         result: output,
                     });
                 }
-                if bifrost_first
+                if train_bifrost
                     && has_successful_file_change(&tool_exchanges)
                     && !registry
                         .is_builtin_tool_advertised("run_shell_command")
                         .await
                 {
                     registry
-                        .set_builtin_tools(bifrost_first_post_edit_builtin_tools())
+                        .set_builtin_tools(train_bifrost_post_edit_builtin_tools())
                         .await;
                     tools = registry.tool_definitions().await;
                     if depth >= MAX_SUBAGENT_DEPTH {
@@ -1851,9 +1855,9 @@ mod tests {
     }
 
     #[test]
-    fn bifrost_first_post_edit_policy_only_adds_shell() {
-        let initial = bifrost_first_builtin_tools();
-        let post_edit = bifrost_first_post_edit_builtin_tools();
+    fn train_bifrost_post_edit_policy_only_adds_shell() {
+        let initial = train_bifrost_initial_builtin_tools();
+        let post_edit = train_bifrost_post_edit_builtin_tools();
 
         assert!(initial.contains("think"));
         assert!(initial.contains("edit"));
@@ -1869,21 +1873,20 @@ mod tests {
     }
 
     #[test]
-    fn bifrost_first_policy_is_env_controlled() {
+    fn train_bifrost_policy_is_env_controlled() {
         let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
 
-        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(ENCOURAGE_BIFROST_ENV);
-        assert!(!bifrost_first_enabled());
+        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(TRAIN_BIFROST_ENV);
+        assert!(!train_bifrost_enabled());
+        drop(_scope);
+
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "1");
+        assert!(train_bifrost_enabled());
         drop(_scope);
 
         let _scope =
-            crate::openrouter_auth::test_support::EnvScope::set(ENCOURAGE_BIFROST_ENV, "1");
-        assert!(bifrost_first_enabled());
-        drop(_scope);
-
-        let _scope =
-            crate::openrouter_auth::test_support::EnvScope::set(ENCOURAGE_BIFROST_ENV, "false");
-        assert!(!bifrost_first_enabled());
+            crate::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "false");
+        assert!(!train_bifrost_enabled());
     }
 
     #[tokio::test]
