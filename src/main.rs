@@ -28,6 +28,7 @@ mod tokens;
 mod tool_loop;
 mod tools;
 mod trace_logging;
+mod train_bifrost;
 
 use crate::llm_client::LlmBackend;
 use crate::multi_backend::MultiBackend;

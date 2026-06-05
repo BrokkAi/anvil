@@ -25,6 +25,7 @@ use crate::structured_output::StructuredOutputRequest;
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 use crate::trace_logging::append_trace_record;
+use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const LLM_STREAM_MAX_ATTEMPTS: usize = 2;
@@ -532,6 +533,24 @@ pub(crate) async fn run(
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
     let train_bifrost = train_bifrost_enabled();
+    let training_packet = if train_bifrost {
+        match train_bifrost::load_packet_from_env() {
+            Ok(packet) => Some(packet),
+            Err(error) => {
+                append_trace_record(serde_json::json!({
+                    "type": "train_bifrost_config_error",
+                    "error": format!("{error:#}"),
+                }));
+                return (
+                    format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
+                    Vec::new(),
+                    TokenUsage::default(),
+                );
+            }
+        }
+    } else {
+        None
+    };
     if train_bifrost {
         registry
             .set_builtin_tools(train_bifrost_initial_builtin_tools())
@@ -569,15 +588,37 @@ pub(crate) async fn run(
             )
         {
             no_edit_progress_nudge_count += 1;
-            append_trace_record(serde_json::json!({
-                "type": "no_edit_progress_nudge",
-                "turn": turn,
-                "nudge_count": no_edit_progress_nudge_count,
-                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
-            }));
-            messages.push(ChatMessage::user(
-                "You have already retrieved exact source context and no successful file edit/write has happened yet. Stop broad exploration and repeated code retrieval. In this turn, make the smallest plausible code change that addresses the task. Use edit/write_file before any further validation or additional investigation.",
-            ));
+            match build_train_bifrost_nudge(
+                llm,
+                turn,
+                &messages,
+                &tool_exchanges,
+                training_packet.as_ref(),
+                &cancel,
+                idle_timeout,
+            )
+            .await
+            {
+                Some((nudge, usage)) => {
+                    turn_usage.add(usage);
+                    append_trace_record(serde_json::json!({
+                        "type": "no_edit_progress_nudge",
+                        "turn": turn,
+                        "nudge_count": no_edit_progress_nudge_count,
+                        "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                        "message": nudge,
+                    }));
+                    messages.push(ChatMessage::user(nudge));
+                }
+                None => {
+                    append_trace_record(serde_json::json!({
+                        "type": "no_edit_progress_nudge_skipped",
+                        "turn": turn,
+                        "nudge_count": no_edit_progress_nudge_count,
+                        "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                    }));
+                }
+            }
         }
 
         // For the last turn, normally force a text response. If no file
@@ -631,17 +672,39 @@ pub(crate) async fn run(
                 if train_bifrost
                     && should_reject_no_edit_final_answer(turn, max_turns, &tool_exchanges)
                 {
-                    append_trace_record(serde_json::json!({
-                        "type": "no_edit_final_answer_guard",
-                        "turn": turn,
-                        "executed_tool_counts": executed_tool_counts(&tool_exchanges),
-                        "text": text,
-                    }));
-                    messages.push(ChatMessage::assistant(text));
-                    messages.push(ChatMessage::user(
-                        "The task is not complete: no successful file edit/write has been executed yet. Do not give a final answer. Use the available edit/write tools to implement the required code change, then run focused validation.",
-                    ));
-                    continue;
+                    match build_train_bifrost_nudge(
+                        llm,
+                        turn,
+                        &messages,
+                        &tool_exchanges,
+                        training_packet.as_ref(),
+                        &cancel,
+                        idle_timeout,
+                    )
+                    .await
+                    {
+                        Some((nudge, hint_usage)) => {
+                            turn_usage.add(hint_usage);
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_final_answer_guard",
+                                "turn": turn,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "text": text,
+                                "message": nudge,
+                            }));
+                            messages.push(ChatMessage::assistant(text));
+                            messages.push(ChatMessage::user(nudge));
+                            continue;
+                        }
+                        None => {
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_final_answer_guard_skipped",
+                                "turn": turn,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "text": text,
+                            }));
+                        }
+                    }
                 }
                 full_response.push_str(&text);
                 // Final text response -- we're done
@@ -1294,6 +1357,28 @@ fn should_reject_no_edit_final_answer(
     })
 }
 
+async fn build_train_bifrost_nudge(
+    llm: &Arc<dyn LlmBackend>,
+    turn: usize,
+    messages: &[ChatMessage],
+    tool_exchanges: &[ToolExchange],
+    training_packet: Option<&TrainingPacket>,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Option<(String, TokenUsage)> {
+    let packet = training_packet?;
+    train_bifrost::compose_no_edit_nudge(
+        llm,
+        turn,
+        messages,
+        tool_exchanges,
+        packet,
+        cancel,
+        idle_timeout,
+    )
+    .await
+}
+
 fn should_emit_no_edit_progress_nudge(
     turn: usize,
     max_turns: usize,
@@ -1306,28 +1391,6 @@ fn should_emit_no_edit_progress_nudge(
     let first_nudge_turn = (max_turns / 3).clamp(6, 10);
     let next_nudge_turn = first_nudge_turn + 4 * nudge_count;
     turn >= next_nudge_turn
-        && exact_source_tool_count(tool_exchanges) >= 1
-        && code_context_tool_count(tool_exchanges) >= 5
-}
-
-fn code_context_tool_count(tool_exchanges: &[ToolExchange]) -> usize {
-    tool_exchanges
-        .iter()
-        .filter(|exchange| {
-            matches!(
-                exchange.tool_name.as_str(),
-                "search_symbols"
-                    | "get_symbol_sources"
-                    | "scan_usages"
-                    | "get_summaries"
-                    | "list_symbols"
-                    | "get_symbol_locations"
-                    | "read_file"
-                    | "grep_search"
-                    | "list_directory"
-            )
-        })
-        .count()
 }
 
 fn exact_source_tool_count(tool_exchanges: &[ToolExchange]) -> usize {
@@ -2111,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn no_edit_progress_nudge_waits_for_exact_source() {
+    fn no_edit_progress_nudge_uses_turn_threshold_without_context_gate() {
         let prior = vec![
             exchange_for_test("search_symbols"),
             exchange_for_test("scan_usages"),
@@ -2120,7 +2183,8 @@ mod tests {
             exchange_for_test("read_file"),
         ];
 
-        assert!(!should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(7, 25, &prior, 0));
+        assert!(should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
     }
 
     #[test]
