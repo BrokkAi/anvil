@@ -55,6 +55,14 @@ fn title_too_long_reason() -> String {
     )
 }
 
+fn input_content_too_long_reason() -> String {
+    format!(
+        "Tool use denied: the rendered tool-call content would exceed {MAX_INLINE_OUTPUT_BYTES} \
+         bytes, which would hide part of the command from the approval dialog. Retry with a \
+         shorter command or split it into smaller steps."
+    )
+}
+
 /// Build the initial `Pending` tool call -- the card the client renders
 /// before we run the permission gate.
 ///
@@ -98,6 +106,19 @@ pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) 
     } else {
         None
     }
+}
+
+/// If the extra approval content would be truncated, reject before showing the
+/// permission prompt. Multiline shell commands rely on this content because
+/// their title intentionally shows only the first line.
+pub(super) fn rejection_for_oversized_input_content(
+    tool_name: &str,
+    raw_input: &Value,
+) -> Option<String> {
+    multiline_shell_command(tool_name, raw_input)
+        .map(command_input_text)
+        .filter(|content| content.len() > MAX_INLINE_OUTPUT_BYTES)
+        .map(|_| input_content_too_long_reason())
 }
 
 /// Pending card for a call we're about to refuse because its full title
@@ -195,20 +216,6 @@ pub(super) fn tool_input_content(tool_name: &str, raw_input: &Value) -> Vec<Tool
     }
 }
 
-/// Content block for the permission prompt modal. Shell commands carry their
-/// full text in `permission_prompt_title` already, so this returns an empty
-/// Vec for them. Other tools delegate to `tool_input_content`.
-pub(super) fn permission_prompt_content(
-    tool_name: &str,
-    raw_input: &Value,
-) -> Vec<ToolCallContent> {
-    if tool_name == "run_shell_command" {
-        Vec::new()
-    } else {
-        tool_input_content(tool_name, raw_input)
-    }
-}
-
 /// Human-friendly card title that shows *what* the tool is doing,
 /// not just *which* tool it is. Falls back to the static display name
 /// for tools we don't introspect (Bifrost, unknown).
@@ -269,15 +276,12 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     }
 }
 
-/// Title used specifically inside the permission prompt. Multiline shell
-/// commands embed the full command text here because some clients do not
-/// render the separate content block in the approval modal. Single-line
-/// commands use the compact backtick format from `tool_title` so the modal
-/// title stays on one line.
+/// Title used specifically inside the permission prompt. Shell commands need
+/// the full command text here because some clients do not render the separate
+/// content block in the approval modal.
 pub(super) fn permission_prompt_title(tool_name: &str, raw_input: &Value) -> String {
     if tool_name == "run_shell_command"
         && let Some(command) = raw_input.get("command").and_then(Value::as_str)
-        && command.lines().count() > 1
     {
         return format!("Run command:\n{}", command.trim_end());
     }
@@ -447,12 +451,6 @@ mod tests {
             &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
         );
         assert_eq!(title, "Run command:\npython3 - <<'PY'\nprint('hello')\nPY");
-    }
-
-    #[test]
-    fn permission_prompt_title_single_line_uses_compact_format() {
-        let title = permission_prompt_title("run_shell_command", &json!({"command": "cargo test"}));
-        assert_eq!(title, "Run `cargo test`");
     }
 
     #[test]
@@ -655,6 +653,34 @@ mod tests {
         // raw_input is still attached so the user can inspect what was
         // attempted; it lives in a scrollable region client-side.
         assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn oversized_multiline_shell_input_content_is_rejected() {
+        let command = format!(
+            "python3 - <<'PY'\n{}\nPY",
+            "a".repeat(MAX_INLINE_OUTPUT_BYTES)
+        );
+        let reason = rejection_for_oversized_input_content(
+            "run_shell_command",
+            &json!({"command": command}),
+        )
+        .expect("oversized multiline command content should be rejected");
+
+        assert!(
+            reason.contains(&MAX_INLINE_OUTPUT_BYTES.to_string()),
+            "rejection message must quote the content cap; got: {reason}"
+        );
+    }
+
+    #[test]
+    fn short_multiline_shell_input_content_is_allowed() {
+        let reason = rejection_for_oversized_input_content(
+            "run_shell_command",
+            &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
+        );
+
+        assert!(reason.is_none(), "short multiline command must pass");
     }
 
     #[test]
