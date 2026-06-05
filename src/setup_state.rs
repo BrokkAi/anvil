@@ -3,10 +3,11 @@
 //! This is intentionally not the source of truth for whether models work.
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
-//! setup screen and the last selected model/reasoning effort/sandbox mode so
-//! configured installs get a short hint instead of the full welcome on every
-//! new session. It also stores user-configured MCP servers; when that field is
-//! absent, Anvil seeds the config with its preinstalled servers.
+//! setup screen, remembered permission approvals, and the last selected
+//! model/reasoning effort/sandbox mode so configured installs get a short hint
+//! instead of the full welcome on every new session. It also stores
+//! user-configured MCP servers; when that field is absent, Anvil seeds the
+//! config with its preinstalled servers.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ pub struct SetupState {
     pub last_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "alwaysAllow")]
+    pub always_allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
 }
@@ -103,6 +106,25 @@ pub fn remember_last_reasoning_effort(reasoning_effort: Option<String>) -> Resul
 
 pub fn remember_sandbox_mode(mode: Option<crate::sandbox_backend::SandboxMode>) -> Result<()> {
     update(|state| state.last_sandbox_mode = mode)
+}
+
+pub fn remember_always_allow_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    update(|state| {
+        if !state.always_allow.iter().any(|existing| existing == key) {
+            state.always_allow.push(key.to_string());
+        }
+    })
+}
+
+pub fn forget_always_allow_key(key: &str) -> Result<()> {
+    update(|state| state.always_allow.retain(|existing| existing != key))
+}
+
+pub fn clear_always_allow_keys() -> Result<()> {
+    update(|state| state.always_allow.clear())
 }
 
 pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {

@@ -453,9 +453,9 @@ pub struct Session {
     /// to auto-sync from external setup state changes.
     pub sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     sandbox_mode_explicitly_set: bool,
-    /// Approval keys the user has chosen "Always allow" for this session.
+    /// Approval keys the user has chosen "Always allow" for this install.
     /// Most tools use the tool name; shell commands use a scoped key.
-    /// In-memory only (matches `claude-agent-acp` behavior).
+    /// Hydrated from trusted setup state, not from workspace session zips.
     pub always_allow_tools: HashSet<String>,
     /// Approval keys in the order they were first remembered. This keeps
     /// `/permissions list` and `revoke <number>` stable without
@@ -560,12 +560,12 @@ impl Session {
 
     /// Construct a `Session` from data loaded off disk.
     ///
-    /// SECURITY: transient fields that intentionally do NOT survive a reload
-    /// (`permission_mode`, `always_allow_tools`, `always_allow_order`) are
-    /// reset here, mirroring `claude-agent-acp`. Going through this
-    /// constructor guarantees a stale or tampered manifest cannot silently
-    /// auto-allow tool calls on launch, and that any future "reset on reload"
-    /// field is added in one place.
+    /// SECURITY: transient fields that intentionally do NOT come from the
+    /// workspace session zip (`permission_mode`, `always_allow_tools`,
+    /// `always_allow_order`) are reset here. `SessionStore` rehydrates
+    /// remembered approvals from trusted setup state after construction, so a
+    /// stale or tampered zip still cannot silently auto-allow tool calls on
+    /// launch.
     ///
     /// Also rejects a mismatch between `id` (the caller's requested id, used
     /// to locate the zip and to key the in-memory map) and `manifest.id`
@@ -625,6 +625,16 @@ impl Session {
             activated_skills: HashSet::new(),
             usage: crate::llm_client::TokenUsage::default(),
         })
+    }
+
+    fn set_always_allow_keys(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.always_allow_tools.clear();
+        self.always_allow_order.clear();
+        for key in keys {
+            if !key.is_empty() && self.always_allow_tools.insert(key.clone()) {
+                self.always_allow_order.push(key);
+            }
+        }
     }
 }
 
@@ -1816,6 +1826,47 @@ impl SessionStore {
         }
     }
 
+    fn remember_always_allow_key(&self, key: &str) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                let mut state = state.lock().expect("transient setup state mutex poisoned");
+                if !key.is_empty() && !state.always_allow.iter().any(|existing| existing == key) {
+                    state.always_allow.push(key.to_string());
+                }
+                Ok(())
+            }
+            None => crate::setup_state::remember_always_allow_key(key),
+        }
+    }
+
+    fn forget_always_allow_key(&self, key: &str) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .always_allow
+                    .retain(|existing| existing != key);
+                Ok(())
+            }
+            None => crate::setup_state::forget_always_allow_key(key),
+        }
+    }
+
+    fn clear_remembered_always_allow_keys(&self) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .always_allow
+                    .clear();
+                Ok(())
+            }
+            None => crate::setup_state::clear_always_allow_keys(),
+        }
+    }
+
     /// If `sessions.len()` exceeds `limits.max_sessions`, evict the least
     /// recently used session(s) from memory. Sessions with an in-flight
     /// prompt (cancel token registered via `start_prompt`) are skipped --
@@ -1954,6 +2005,7 @@ impl SessionStore {
         let default_model = self.default_model.read().await.clone();
         let default_reasoning_effort = self.default_reasoning_effort.read().await.clone();
         let catalog = self.available_models.read().await.clone();
+        let remembered_always_allow = prefs.always_allow.clone();
         let model = select_session_model(prefs.last_model, default_model, &catalog);
         let reasoning_effort = select_session_reasoning_effort(
             &model,
@@ -1977,6 +2029,7 @@ impl SessionStore {
             ),
         };
         session.selected_reasoning_effort = reasoning_effort;
+        session.set_always_allow_keys(remembered_always_allow);
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
         // Persistence failures are logged but not surfaced: `create_session` returns
@@ -2060,8 +2113,9 @@ impl SessionStore {
             _ => self.default_model.read().await.clone(),
         };
 
-        let sandbox_mode =
-            usable_sandbox_mode_preference(self.setup_state_snapshot().last_sandbox_mode);
+        let prefs = self.setup_state_snapshot();
+        let remembered_always_allow = prefs.always_allow.clone();
+        let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let loaded_session = match sandbox_mode {
             Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
                 id.to_string(),
@@ -2081,13 +2135,14 @@ impl SessionStore {
                 manifest,
             ),
         };
-        let session = match loaded_session {
+        let mut session = match loaded_session {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "rejecting persisted session");
                 return false;
             }
         };
+        session.set_always_allow_keys(remembered_always_allow);
         let inserted = {
             let mut sessions = self.sessions.write().await;
             // Race window: another task may have inserted under the same id while
@@ -2416,40 +2471,84 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
-    /// Add `approval_key` to the session's in-memory always-allow set.
+    /// Add `approval_key` to the install-level always-allow set.
     pub async fn add_always_allow(&self, id: &str, approval_key: &str) {
-        if let Some(session) = self.sessions.write().await.get_mut(id)
-            && session.always_allow_tools.insert(approval_key.to_string())
-        {
-            session.always_allow_order.push(approval_key.to_string());
+        if approval_key.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut sessions = self.sessions.write().await;
+            if !sessions.contains_key(id) {
+                return;
+            }
+            let mut changed = false;
+            for session in sessions.values_mut() {
+                if session.always_allow_tools.insert(approval_key.to_string()) {
+                    session.always_allow_order.push(approval_key.to_string());
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed && let Err(e) = self.remember_always_allow_key(approval_key) {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist Always allow approval: {e:#}"
+            );
         }
     }
 
-    /// Return the session's in-memory always-allow keys in approval order.
+    /// Return remembered always-allow keys in approval order.
     pub async fn always_allow_keys(&self, id: &str) -> Option<Vec<String>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(id)?;
         Some(session.always_allow_order.clone())
     }
 
-    /// Remove one in-memory always-allow key. Returns `None` if the session is unknown.
+    /// Remove one remembered always-allow key. Returns `None` if the session is unknown.
     pub async fn remove_always_allow(&self, id: &str, approval_key: &str) -> Option<bool> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(id)?;
-        let removed = session.always_allow_tools.remove(approval_key);
-        if removed {
-            session.always_allow_order.retain(|key| key != approval_key);
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get(id)?;
+            if !session.always_allow_tools.contains(approval_key) {
+                return Some(false);
+            }
+            for session in sessions.values_mut() {
+                session.always_allow_tools.remove(approval_key);
+                session.always_allow_order.retain(|key| key != approval_key);
+            }
+            true
+        };
+        if removed && let Err(e) = self.forget_always_allow_key(approval_key) {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist Always allow revocation: {e:#}"
+            );
         }
         Some(removed)
     }
 
-    /// Clear all in-memory always-allow keys for a session.
+    /// Clear all remembered always-allow keys.
     pub async fn clear_always_allow(&self, id: &str) -> Option<usize> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(id)?;
-        let count = session.always_allow_tools.len();
-        session.always_allow_tools.clear();
-        session.always_allow_order.clear();
+        let count = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get(id)?;
+            let count = session.always_allow_tools.len();
+            if count == 0 {
+                return Some(0);
+            }
+            for session in sessions.values_mut() {
+                session.always_allow_tools.clear();
+                session.always_allow_order.clear();
+            }
+            count
+        };
+        if let Err(e) = self.clear_remembered_always_allow_keys() {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist Always allow clear: {e:#}"
+            );
+        }
         Some(count)
     }
 
@@ -3880,10 +3979,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `add_always_allow` is in-memory only and survives across queries
-    /// for the same session id.
+    /// `add_always_allow` is persisted in setup state and survives new sessions.
     #[tokio::test]
-    async fn always_allow_set_is_session_scoped() {
+    async fn always_allow_set_is_persisted_for_new_sessions() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
         let cwd = std::env::temp_dir().join(format!(
             "brokk-acp-rust-always-allow-{}",
@@ -3899,11 +3999,23 @@ mod tests {
         // Unknown session never reports allowed.
         assert!(!store.is_always_allowed("no-such", "write_file").await);
 
+        let next = store.create_session(cwd.clone()).await;
+        assert!(store.is_always_allowed(&next.id, "write_file").await);
+        assert_eq!(
+            store.always_allow_keys(&next.id).await,
+            Some(vec!["write_file".to_string()])
+        );
+
+        let state = crate::setup_state::read();
+        assert_eq!(state.always_allow, vec!["write_file".to_string()]);
+
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[tokio::test]
     async fn always_allow_keys_can_be_listed_removed_and_cleared() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
         let cwd = std::env::temp_dir().join(format!(
             "brokk-acp-rust-always-allow-manage-{}",

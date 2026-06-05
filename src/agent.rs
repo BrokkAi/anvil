@@ -3490,7 +3490,7 @@ async fn handle_permissions(
                 - `/permissions trusted` - Allow tool calls without prompting.\n\
                 - `/permissions list` - Show remembered Always allow approvals.\n\
                 - `/permissions revoke <number-or-key>` - Forget one remembered approval.\n\
-                - `/permissions clear` - Forget all remembered approvals for this session."
+                - `/permissions clear` - Forget all remembered approvals."
             .to_string();
     }
     let (action, arg) = split_setup_action(&rest);
@@ -3534,10 +3534,10 @@ async fn render_always_allowed_permissions(sessions: &SessionStore, session_id: 
         return "Error: unknown session.".to_string();
     };
     if keys.is_empty() {
-        return "No remembered Always allow approvals for this session.".to_string();
+        return "No remembered Always allow approvals.".to_string();
     }
 
-    let mut out = String::from("Remembered Always allow approvals for this session:\n\n");
+    let mut out = String::from("Remembered Always allow approvals:\n\n");
     for (idx, key) in keys.iter().enumerate() {
         out.push_str(&format!(
             "{}. {}\n",
@@ -5622,7 +5622,7 @@ mod tests {
         assert_eq!(cleared, "Forgot 1 remembered Always allow approval.");
         assert_eq!(
             render_always_allowed_permissions(&store, &id).await,
-            "No remembered Always allow approvals for this session."
+            "No remembered Always allow approvals."
         );
     }
 

@@ -253,8 +253,8 @@ Use:
 /permissions trusted
 ```
 
-Approvals remembered through an **Always allow** prompt are session-scoped and
-can be inspected or revoked with:
+Approvals remembered through an **Always allow** prompt are stored in Anvil's
+setup state on disk and can be inspected or revoked with:
 
 ```text
 /permissions list
