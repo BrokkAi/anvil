@@ -92,11 +92,16 @@ pub(super) fn initial_tool_call(
         .locations(tool_locations(tool_name, raw_input))
 }
 
-/// If the title we'd render for this call exceeds `MAX_TOOL_TITLE_CHARS`,
-/// return the rejection message. `None` means the call's title fits and
-/// it can proceed to the normal Pending → gate flow.
+/// If the title we'd render for the permission prompt exceeds
+/// `MAX_TOOL_TITLE_CHARS`, return the rejection message. `None` means the
+/// prompt title fits and the call can proceed to the normal Pending -> gate
+/// flow.
 pub(super) fn rejection_for_oversized_title(tool_name: &str, raw_input: &Value) -> Option<String> {
-    if tool_title(tool_name, raw_input).chars().count() > MAX_TOOL_TITLE_CHARS {
+    if permission_prompt_title(tool_name, raw_input)
+        .chars()
+        .count()
+        > MAX_TOOL_TITLE_CHARS
+    {
         Some(title_too_long_reason())
     } else {
         None
@@ -271,6 +276,19 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     }
 }
 
+/// Title used specifically inside the permission prompt. Shell commands need
+/// the full command text here because some clients do not render the separate
+/// content block in the approval modal.
+pub(super) fn permission_prompt_title(tool_name: &str, raw_input: &Value) -> String {
+    if tool_name == "run_shell_command"
+        && let Some(command) = raw_input.get("command").and_then(Value::as_str)
+    {
+        return format!("Run command:\n{}", command.trim_end());
+    }
+
+    tool_title(tool_name, raw_input)
+}
+
 /// File locations affected by this call, used by clients for follow-along.
 /// v1: only the obvious `path` arg on filesystem tools. Bifrost JSON
 /// outputs may carry locations, but parsing them is out of scope here.
@@ -424,6 +442,15 @@ mod tests {
             &json!({"command": "cargo test\n# extra junk"}),
         );
         assert_eq!(title, "Run `cargo test`");
+    }
+
+    #[test]
+    fn permission_prompt_title_shows_full_multiline_shell_command() {
+        let title = permission_prompt_title(
+            "run_shell_command",
+            &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
+        );
+        assert_eq!(title, "Run command:\npython3 - <<'PY'\nprint('hello')\nPY");
     }
 
     #[test]
