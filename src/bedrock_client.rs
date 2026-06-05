@@ -153,11 +153,19 @@ impl BedrockClient {
         if self.runtime_base_url.starts_with("http://")
             || self.runtime_base_url.starts_with("https://")
         {
-            if self.runtime_base_url.contains("amazonaws.com") {
+            if self.runtime_base_url == "https://bedrock-runtime"
+                || self.runtime_base_url == "http://bedrock-runtime"
+            {
                 return format!(
                     "{}.{}.amazonaws.com/model/{encoded}/invoke",
                     self.runtime_base_url.trim_end_matches('.'),
                     self.region,
+                );
+            }
+            if self.runtime_base_url.contains("amazonaws.com") {
+                return format!(
+                    "{}/model/{encoded}/invoke",
+                    self.runtime_base_url.trim_end_matches('/')
                 );
             }
             return format!(
@@ -751,6 +759,36 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6"
         );
         assert_eq!(percent_encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn default_bedrock_runtime_url_includes_region_and_aws_host() {
+        let client = BedrockClient::new(
+            "token".to_string(),
+            "us-east-1".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+        );
+
+        assert_eq!(
+            client.invoke_url("us.anthropic.claude-sonnet-4-6"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-6/invoke"
+        );
+    }
+
+    #[test]
+    fn full_bedrock_runtime_url_is_not_region_expanded_twice() {
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-1".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            "https://bedrock-mantle.us-east-1.api.aws/v1".to_string(),
+        );
+
+        assert_eq!(
+            client.invoke_url("a/b c"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/a%2Fb%20c/invoke"
+        );
     }
 
     #[test]
