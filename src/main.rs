@@ -9,7 +9,6 @@ mod agent;
 mod agents;
 mod agents_md;
 mod bedrock_client;
-mod bifrost_gate;
 mod codex_auth;
 mod codex_client;
 mod context_manager;

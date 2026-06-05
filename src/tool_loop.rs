@@ -1,7 +1,11 @@
 mod announce;
 
+use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
@@ -13,13 +17,6 @@ use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::bifrost_gate::{
-    GateClassifierDecision, GateConfidence, GateContext, RecommendedTool, ShellClassifierDecision,
-    ShellStaticRoute, TextStaticRoute, classifier_trace_context, classify_shell_tool_call,
-    classify_text_tool_call, encourage_bifrost_enabled, gate_message, shell_gate_message,
-    should_skip_for_static_text_target, static_shell_route, static_shell_route_output,
-    static_text_route,
-};
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
@@ -30,6 +27,17 @@ use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 use crate::trace_logging::append_trace_record;
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
+const LLM_STREAM_MAX_ATTEMPTS: usize = 2;
+const ENCOURAGE_BIFROST_ENV: &str = "BRK_ENCOURAGE_BIFROST";
+
+fn bifrost_first_enabled() -> bool {
+    env::var(ENCOURAGE_BIFROST_ENV).ok().is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 fn bifrost_first_builtin_tools() -> std::collections::HashSet<String> {
     ["think", "write_file", "edit", "list_directory"]
@@ -55,6 +63,95 @@ fn tool_unavailable_message(tool_name: &str) -> String {
     format!(
         "Error: tool '{tool_name}' is unavailable in the current tool catalog. Retry using a currently advertised tool."
     )
+}
+
+fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}");
+    error.contains("stream read error")
+        || error.contains("stream made no meaningful progress")
+        || error.contains("server_is_overloaded")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_chat_with_transient_retry(
+    llm: &Arc<dyn LlmBackend>,
+    turn: usize,
+    model: &str,
+    messages: &[ChatMessage],
+    tools: Option<Vec<ToolDefinition>>,
+    reasoning_effort: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    on_text: &TextSink,
+    on_thought: &TextSink,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> anyhow::Result<LlmResponse> {
+    let mut attempt = 1usize;
+    loop {
+        let emitted_output = Arc::new(AtomicBool::new(false));
+
+        let token_sink = on_text.clone();
+        let token_emitted = emitted_output.clone();
+        let on_token: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
+            if !token.is_empty() {
+                token_emitted.store(true, Ordering::SeqCst);
+            }
+            if let Ok(mut cb) = token_sink.lock() {
+                cb(token);
+            }
+        });
+
+        let thought_sink = on_thought.clone();
+        let thought_emitted = emitted_output.clone();
+        let on_thought_cb: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
+            if !token.is_empty() {
+                thought_emitted.store(true, Ordering::SeqCst);
+            }
+            if let Ok(mut cb) = thought_sink.lock() {
+                cb(token);
+            }
+        });
+
+        let response = llm
+            .stream_chat(StreamChatRequest {
+                model: model.to_string(),
+                messages: messages.to_vec(),
+                tools: tools.clone(),
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                structured_output: structured_output.cloned(),
+                on_token,
+                on_thought: on_thought_cb,
+                cancel: cancel.clone(),
+                idle_timeout,
+            })
+            .await;
+
+        match response {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if attempt < LLM_STREAM_MAX_ATTEMPTS
+                    && !cancel.is_cancelled()
+                    && !emitted_output.load(Ordering::SeqCst)
+                    && is_retryable_llm_error(&error) =>
+            {
+                append_trace_record(serde_json::json!({
+                    "type": "llm_retry",
+                    "turn": turn,
+                    "attempt": attempt,
+                    "max_attempts": LLM_STREAM_MAX_ATTEMPTS,
+                    "reason": format!("{error:#}"),
+                }));
+                tracing::warn!(
+                    turn,
+                    attempt,
+                    max_attempts = LLM_STREAM_MAX_ATTEMPTS,
+                    "retrying transient LLM stream failure before any output was emitted"
+                );
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Result of approving a permission request.
@@ -434,9 +531,12 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
-    registry
-        .set_builtin_tools(bifrost_first_builtin_tools())
-        .await;
+    let bifrost_first = bifrost_first_enabled();
+    if bifrost_first {
+        registry
+            .set_builtin_tools(bifrost_first_builtin_tools())
+            .await;
+    }
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
@@ -455,7 +555,6 @@ pub(crate) async fn run(
     // calls as it dispatches tools). The caller adds this to the
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
-    let mut skip_bifrost_classifier_for_next_tool_batch = false;
     let mut no_edit_progress_nudge_count = 0usize;
     'outer: for turn in 0..max_turns {
         if cancel.is_cancelled() {
@@ -472,7 +571,7 @@ pub(crate) async fn run(
                 "type": "no_edit_progress_nudge",
                 "turn": turn,
                 "nudge_count": no_edit_progress_nudge_count,
-                "tool_counts": bifrost_gate_tool_counts(&tool_exchanges),
+                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
             }));
             messages.push(ChatMessage::user(
                 "You have already retrieved exact source context and no successful file edit/write has happened yet. Stop broad exploration and repeated code retrieval. In this turn, make the smallest plausible code change that addresses the task. Use edit/write_file before any further validation or additional investigation.",
@@ -491,23 +590,6 @@ pub(crate) async fn run(
             None
         };
 
-        // Forward tokens straight through to the caller; no buffering.
-        let text_clone = on_text.clone();
-        let on_token: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if let Ok(mut cb) = text_clone.lock() {
-                cb(token);
-            }
-        });
-        // Reasoning deltas route to a parallel sink so the agent layer
-        // can emit them as ACP AgentThoughtChunk events; backends that
-        // don't surface reasoning simply never invoke this closure.
-        let thought_clone = on_thought.clone();
-        let on_thought_cb: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if let Ok(mut cb) = thought_clone.lock() {
-                cb(token);
-            }
-        });
-
         // Wall-clock bound on this stream is enforced by the reqwest client's
         // own `.timeout(...)` (see `OpenAiClient::new`). Per-chunk idle
         // inactivity (the case in #3366 / #3453: streams that drip
@@ -525,19 +607,20 @@ pub(crate) async fn run(
             request_tools.as_ref(),
         );
 
-        let response = llm
-            .stream_chat(StreamChatRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                tools: request_tools,
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                structured_output: structured_output.cloned(),
-                on_token,
-                on_thought: on_thought_cb,
-                cancel: cancel.clone(),
-                idle_timeout,
-            })
-            .await;
+        let response = stream_chat_with_transient_retry(
+            llm,
+            turn,
+            model,
+            &messages,
+            request_tools,
+            reasoning_effort,
+            structured_output,
+            &on_text,
+            &on_thought,
+            &cancel,
+            idle_timeout,
+        )
+        .await;
 
         match response {
             Ok(LlmResponse::Text { text, usage }) => {
@@ -547,7 +630,7 @@ pub(crate) async fn run(
                     append_trace_record(serde_json::json!({
                         "type": "no_edit_final_answer_guard",
                         "turn": turn,
-                        "tool_counts": bifrost_gate_tool_counts(&tool_exchanges),
+                        "executed_tool_counts": executed_tool_counts(&tool_exchanges),
                         "text": text,
                     }));
                     messages.push(ChatMessage::assistant(text));
@@ -563,9 +646,6 @@ pub(crate) async fn run(
             Ok(LlmResponse::ToolCalls { text, calls, usage }) => {
                 trace_llm_tool_response(turn, &text, &calls, usage);
                 turn_usage.add(usage);
-                let skip_bifrost_classifier_for_this_tool_batch =
-                    skip_bifrost_classifier_for_next_tool_batch;
-                let mut current_tool_batch_triggered_bifrost_gate = false;
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
@@ -843,22 +923,6 @@ pub(crate) async fn run(
                                 // turn, not just the parent's own calls.
                                 turn_usage.add(nested_usage);
                                 exec
-                            } else if let Some(message) = maybe_bifrost_classifier_gate(
-                                &tool_name,
-                                &parsed_input,
-                                &messages,
-                                &tools,
-                                &tool_exchanges,
-                                skip_bifrost_classifier_for_this_tool_batch,
-                                &cancel,
-                            )
-                            .await
-                            {
-                                current_tool_batch_triggered_bifrost_gate = true;
-                                ToolExecution {
-                                    output: message,
-                                    failed: false,
-                                }
                             } else {
                                 trace_bifrost_context_shadow(
                                     &tool_name,
@@ -917,7 +981,8 @@ pub(crate) async fn run(
                         result: output,
                     });
                 }
-                if has_successful_file_change(&tool_exchanges)
+                if bifrost_first
+                    && has_successful_file_change(&tool_exchanges)
                     && !registry
                         .is_builtin_tool_advertised("run_shell_command")
                         .await
@@ -930,8 +995,6 @@ pub(crate) async fn run(
                         tools.retain(|t| t.function.name != "task");
                     }
                 }
-                skip_bifrost_classifier_for_next_tool_batch =
-                    current_tool_batch_triggered_bifrost_gate;
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
@@ -1125,404 +1188,17 @@ struct ToolExecution {
     failed: bool,
 }
 
+#[cfg(test)]
 fn has_tool(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.function.name == name)
 }
 
+#[cfg(test)]
 fn is_text_navigation_tool(name: &str) -> bool {
     matches!(name, "read_file" | "grep_search" | "list_directory")
 }
 
-async fn maybe_bifrost_classifier_gate(
-    tool_name: &str,
-    parsed_input: &Value,
-    messages: &[ChatMessage],
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    skip_after_prior_gate: bool,
-    cancel: &CancellationToken,
-) -> Option<String> {
-    if let Some(reason) = bifrost_classifier_skip_reason(
-        tool_name,
-        parsed_input,
-        tools,
-        tool_exchanges,
-        skip_after_prior_gate,
-    ) {
-        let trace_type = if tool_name == "run_shell_command" {
-            "shell_gate_classifier_skipped"
-        } else {
-            "bifrost_gate_classifier_skipped"
-        };
-        append_trace_record(serde_json::json!({
-            "type": trace_type,
-            "tool": tool_name,
-            "args": parsed_input,
-            "reason": reason,
-            "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-        }));
-        return None;
-    }
-
-    let context = GateContext {
-        tool_name: tool_name.to_string(),
-        args: parsed_input.clone(),
-        messages: messages.to_vec(),
-        tools: tools.to_vec(),
-        tool_exchanges: tool_exchanges.to_vec(),
-    };
-    let trace_context = classifier_trace_context(&context);
-    if tool_name == "run_shell_command" {
-        return maybe_shell_classifier_gate(parsed_input, tools, tool_exchanges, context, cancel)
-            .await;
-    }
-
-    if let Some(route) = static_text_route(tool_name, parsed_input, tool_exchanges) {
-        match route {
-            TextStaticRoute::AllowText(reason) => {
-                append_trace_record(serde_json::json!({
-                    "type": "bifrost_gate_static_route",
-                    "tool": tool_name,
-                    "args": parsed_input,
-                    "route": "allow_text",
-                    "reason": reason,
-                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-                }));
-                return None;
-            }
-        }
-    }
-
-    append_trace_record(serde_json::json!({
-        "type": "bifrost_gate_classifier_call",
-        "tool": tool_name,
-        "args": parsed_input,
-        "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-        "classifier_context": trace_context,
-    }));
-
-    match classify_text_tool_call(context, cancel).await {
-        Ok(output)
-            if output.decision == GateClassifierDecision::GateToSymbolTool
-                && output.confidence == GateConfidence::High
-                && matches!(
-                    output.recommended_tool,
-                    RecommendedTool::SearchSymbols
-                        | RecommendedTool::ScanUsages
-                        | RecommendedTool::GetSummaries
-                        | RecommendedTool::GetSymbolSources
-                ) =>
-        {
-            let message = gate_message(&output, tools);
-            append_trace_record(serde_json::json!({
-                "type": "bifrost_gate_classifier",
-                "tool": tool_name,
-                "args": parsed_input,
-                "decision": output,
-                "gated": true,
-            }));
-            Some(message)
-        }
-        Ok(mut output) => {
-            let normalized_recommended_tool = output.decision == GateClassifierDecision::AllowText
-                && output.recommended_tool != RecommendedTool::None;
-            if normalized_recommended_tool {
-                output.recommended_tool = RecommendedTool::None;
-                output.suggested_args = serde_json::json!({});
-            }
-            append_trace_record(serde_json::json!({
-                "type": "bifrost_gate_classifier",
-                "tool": tool_name,
-                "args": parsed_input,
-                "decision": output,
-                "gated": false,
-                "normalized_recommended_tool": normalized_recommended_tool,
-            }));
-            None
-        }
-        Err(err) => {
-            let error = format!("{err:#}");
-            tracing::warn!(tool_name, "Bifrost gate classifier failed open: {error}");
-            append_trace_record(serde_json::json!({
-                "type": "bifrost_gate_classifier_error",
-                "tool": tool_name,
-                "args": parsed_input,
-                "category": classifier_error_category(&error),
-                "error": error,
-            }));
-            None
-        }
-    }
-}
-
-async fn maybe_shell_classifier_gate(
-    parsed_input: &Value,
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    context: GateContext,
-    cancel: &CancellationToken,
-) -> Option<String> {
-    if let Some(route) = static_shell_route(parsed_input) {
-        match route {
-            ShellStaticRoute::AllowShell(reason) => {
-                append_trace_record(serde_json::json!({
-                    "type": "shell_gate_static_route",
-                    "tool": "run_shell_command",
-                    "args": parsed_input,
-                    "route": "allow_shell",
-                    "reason": reason,
-                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-                }));
-                return None;
-            }
-            ShellStaticRoute::UseBuiltin(reason, recommended_tool) => {
-                let output = static_shell_route_output(
-                    reason,
-                    ShellClassifierDecision::UseBuiltinTool,
-                    recommended_tool,
-                );
-                let message = shell_gate_message(&output, tools);
-                append_trace_record(serde_json::json!({
-                    "type": "shell_gate_static_route",
-                    "tool": "run_shell_command",
-                    "args": parsed_input,
-                    "route": "use_builtin_tool",
-                    "reason": reason,
-                    "decision": output,
-                    "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-                }));
-                return Some(message);
-            }
-        }
-    }
-
-    append_trace_record(serde_json::json!({
-        "type": "shell_gate_classifier_call",
-        "tool": "run_shell_command",
-        "args": parsed_input,
-        "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-        "classifier_context": classifier_trace_context(&context),
-    }));
-
-    match classify_shell_tool_call(context, cancel).await {
-        Ok(output)
-            if matches!(
-                output.decision,
-                ShellClassifierDecision::UseBuiltinTool | ShellClassifierDecision::UseBifrostTool
-            ) && output.confidence == GateConfidence::High =>
-        {
-            let message = shell_gate_message(&output, tools);
-            append_trace_record(serde_json::json!({
-                "type": "shell_gate_classifier",
-                "tool": "run_shell_command",
-                "args": parsed_input,
-                "decision": output,
-                "gated": true,
-            }));
-            Some(message)
-        }
-        Ok(mut output) => {
-            let normalized_recommended_tool = output.decision
-                == ShellClassifierDecision::AllowShell
-                && output.recommended_tool != RecommendedTool::None;
-            if normalized_recommended_tool {
-                output.recommended_tool = RecommendedTool::None;
-                output.suggested_args = serde_json::json!({});
-            }
-            append_trace_record(serde_json::json!({
-                "type": "shell_gate_classifier",
-                "tool": "run_shell_command",
-                "args": parsed_input,
-                "decision": output,
-                "gated": false,
-                "normalized_recommended_tool": normalized_recommended_tool,
-            }));
-            None
-        }
-        Err(err) => {
-            let error = format!("{err:#}");
-            tracing::warn!("Shell routing classifier failed open: {error}");
-            append_trace_record(serde_json::json!({
-                "type": "shell_gate_classifier_error",
-                "tool": "run_shell_command",
-                "args": parsed_input,
-                "category": classifier_error_category(&error),
-                "error": error,
-            }));
-            None
-        }
-    }
-}
-
-fn classifier_error_category(error: &str) -> &'static str {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("http") {
-        "http"
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        "timeout"
-    } else if lower.contains("missing choices") || lower.contains("missing content") {
-        "missing_content"
-    } else if lower.contains("parsing") || lower.contains("json") || lower.contains("schema") {
-        "parse_or_schema"
-    } else if lower.contains("cancelled") {
-        "cancelled"
-    } else if lower.contains("credential") || lower.contains("api key") {
-        "auth"
-    } else if lower.contains("sending classifier request")
-        || lower.contains("dns")
-        || lower.contains("connect")
-    {
-        "transport"
-    } else {
-        "other"
-    }
-}
-
-#[cfg(test)]
-fn should_consult_bifrost_classifier(
-    tool_name: &str,
-    parsed_input: &Value,
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    skip_after_prior_gate: bool,
-) -> bool {
-    bifrost_classifier_skip_reason(
-        tool_name,
-        parsed_input,
-        tools,
-        tool_exchanges,
-        skip_after_prior_gate,
-    )
-    .is_none()
-}
-
-fn bifrost_classifier_skip_reason(
-    tool_name: &str,
-    parsed_input: &Value,
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    skip_after_prior_gate: bool,
-) -> Option<&'static str> {
-    if skip_after_prior_gate {
-        return Some("post_gate_tool_batch");
-    }
-    if !encourage_bifrost_enabled() {
-        return Some("bifrost_encouragement_disabled");
-    }
-    if tool_name == "run_shell_command" {
-        return shell_classifier_skip_reason(tool_name, tools, skip_after_prior_gate);
-    } else if !is_text_navigation_tool(tool_name) {
-        return Some("not_text_navigation_tool");
-    }
-    if tool_name == "list_directory" {
-        return Some("list_directory_default_allow");
-    }
-    if is_text_navigation_tool(tool_name)
-        && should_skip_for_static_text_target(tool_name, parsed_input)
-    {
-        return Some("static_text_target");
-    }
-    if tool_name == "read_file" && has_targeted_recent_bifrost_miss(parsed_input, tool_exchanges) {
-        return Some("targeted_bifrost_miss_fallback");
-    }
-    if tool_name == "grep_search"
-        && has_targeted_recent_bifrost_miss_for_grep(parsed_input, tool_exchanges)
-    {
-        return Some("targeted_bifrost_miss_fallback");
-    }
-    if !has_tool(tools, "search_symbols")
-        || !has_tool(tools, "scan_usages")
-        || !has_tool(tools, "get_summaries")
-    {
-        return Some("missing_required_bifrost_tools");
-    }
-    None
-}
-
-fn has_targeted_recent_bifrost_miss(parsed_input: &Value, tool_exchanges: &[ToolExchange]) -> bool {
-    let Some(path) = parsed_input.get("file_path").and_then(Value::as_str) else {
-        return false;
-    };
-    if path.len() < 3 {
-        return false;
-    }
-    tool_exchanges.iter().rev().take(8).any(|exchange| {
-        matches!(
-            exchange.tool_name.as_str(),
-            "search_symbols" | "scan_usages" | "get_summaries" | "get_symbol_sources"
-        ) && tool_result_looks_like_bifrost_miss(&exchange.result)
-            && (exchange.arguments.contains(path) || exchange.result.contains(path))
-    })
-}
-
-fn has_targeted_recent_bifrost_miss_for_grep(
-    parsed_input: &Value,
-    tool_exchanges: &[ToolExchange],
-) -> bool {
-    let Some(pattern) = parsed_input.get("pattern").and_then(Value::as_str) else {
-        return false;
-    };
-    let tokens = identifier_terms(pattern);
-    if tokens.is_empty() {
-        return false;
-    }
-    tool_exchanges.iter().rev().take(8).any(|exchange| {
-        matches!(
-            exchange.tool_name.as_str(),
-            "search_symbols" | "scan_usages" | "get_summaries" | "get_symbol_sources"
-        ) && tool_result_looks_like_bifrost_miss(&exchange.result)
-            && tokens
-                .iter()
-                .any(|token| exchange.arguments.contains(token) || exchange.result.contains(token))
-    })
-}
-
-fn identifier_terms(pattern: &str) -> Vec<String> {
-    pattern
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .filter(|token| token.len() >= 3)
-        .take(12)
-        .map(str::to_string)
-        .collect()
-}
-
-fn tool_result_looks_like_bifrost_miss(result: &str) -> bool {
-    let trimmed = result.trim();
-    if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    [
-        "not_found",
-        "not found",
-        "no match",
-        "no matches",
-        "no symbol",
-        "no symbols",
-        "no usages",
-        "no references",
-        "empty result",
-        "returned empty",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn shell_classifier_skip_reason(
-    tool_name: &str,
-    _tools: &[ToolDefinition],
-    skip_after_prior_gate: bool,
-) -> Option<&'static str> {
-    if tool_name != "run_shell_command" {
-        return Some("not_shell_tool");
-    }
-    if skip_after_prior_gate {
-        return Some("post_gate_tool_batch");
-    }
-    None
-}
-
-fn bifrost_gate_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
+fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
     serde_json::json!({
         "read_file": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "read_file").count(),
         "grep_search": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "grep_search").count(),
@@ -1588,7 +1264,7 @@ fn trace_bifrost_context_shadow(
         "prior_exact_args_count": prior_exact_args_count,
         "has_successful_file_change": has_successful_file_change(tool_exchanges),
         "exact_source_count": exact_source_tool_count(tool_exchanges),
-        "tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+        "executed_tool_counts": executed_tool_counts(tool_exchanges),
     }));
 }
 
@@ -2005,6 +1681,8 @@ fn ordered_tool_call_indices(
 mod tests {
     use super::*;
     use crate::llm_client::{FunctionCall, FunctionDef};
+    use futures::future::{BoxFuture, FutureExt};
+    use std::sync::atomic::AtomicUsize;
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -2042,6 +1720,47 @@ mod tests {
             .into_iter()
             .map(|index| calls[index].function.name.clone())
             .collect()
+    }
+
+    struct RetryBackend {
+        attempts: Arc<AtomicUsize>,
+        emit_before_error: bool,
+        first_error: &'static str,
+    }
+
+    impl LlmBackend for RetryBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            mut request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            let emit_before_error = self.emit_before_error;
+            let first_error = self.first_error;
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    if emit_before_error {
+                        (request.on_token)("partial");
+                    }
+                    anyhow::bail!(first_error);
+                }
+                Ok(LlmResponse::Text {
+                    text: "ok".to_string(),
+                    usage: TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
+    fn text_sink_for_test(buffer: Arc<Mutex<String>>) -> TextSink {
+        Arc::new(Mutex::new(move |text: &str| {
+            buffer.lock().unwrap().push_str(text);
+        }))
     }
 
     fn decide(
@@ -2150,6 +1869,120 @@ mod tests {
     }
 
     #[test]
+    fn bifrost_first_policy_is_env_controlled() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+
+        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(ENCOURAGE_BIFROST_ENV);
+        assert!(!bifrost_first_enabled());
+        drop(_scope);
+
+        let _scope =
+            crate::openrouter_auth::test_support::EnvScope::set(ENCOURAGE_BIFROST_ENV, "1");
+        assert!(bifrost_first_enabled());
+        drop(_scope);
+
+        let _scope =
+            crate::openrouter_auth::test_support::EnvScope::set(ENCOURAGE_BIFROST_ENV, "false");
+        assert!(!bifrost_first_enabled());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_transient_stream_error_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Codex stream read error: simulated disconnect",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("retry should recover");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_after_partial_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: true,
+            first_error: "Codex stream read error: simulated disconnect",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let error = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("partial output makes retry unsafe");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("Codex stream read error"));
+        assert_eq!(output.lock().unwrap().as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_server_overloaded_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Codex Responses stream failed: server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("overload should be retried before output");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[test]
     fn text_navigation_gate_triggers_on_fourth_text_navigation_call() {
         let tools = vec![
             tool_def_for_test("read_file"),
@@ -2233,183 +2066,6 @@ mod tests {
     }
 
     #[test]
-    fn bifrost_classifier_is_skipped_immediately_after_gate_prompt() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        let should_consult = should_consult_bifrost_classifier(
-            "read_file",
-            &serde_json::json!({"file_path": "src/lib.rs"}),
-            &tools,
-            &[],
-            true,
-        );
-
-        assert!(!should_consult);
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[],
-                true,
-            ),
-            Some("post_gate_tool_batch")
-        );
-    }
-
-    #[test]
-    fn bifrost_classifier_is_disabled_by_default_without_env_var() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("bifrost_encouragement_disabled")
-        );
-        assert!(!should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test -q"}),
-            &tools,
-            &[],
-            false,
-        ));
-    }
-
-    #[test]
-    fn bifrost_classifier_can_be_enabled_with_env_var() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert!(should_consult_bifrost_classifier(
-            "read_file",
-            &serde_json::json!({"file_path": "src/lib.rs"}),
-            &tools,
-            &[],
-            false,
-        ));
-    }
-
-    #[test]
-    fn list_directory_always_skips_bifrost_classifier() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("list_directory"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "list_directory",
-                &serde_json::json!({"path": "src"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("list_directory_default_allow")
-        );
-    }
-
-    #[test]
-    fn read_file_allows_targeted_bifrost_miss_fallback() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-        let mut miss = exchange_for_test("search_symbols");
-        miss.arguments = "{\"patterns\":[\"src/lib.rs\"]}".to_string();
-        miss.result = "No symbols found for src/lib.rs".to_string();
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[miss],
-                false,
-            ),
-            Some("targeted_bifrost_miss_fallback")
-        );
-    }
-
-    #[test]
-    fn grep_search_allows_targeted_bifrost_miss_fallback() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-        let mut miss = exchange_for_test("search_symbols");
-        miss.arguments = "{\"patterns\":[\"RenameFileAsync\"]}".to_string();
-        miss.result = "No symbols found for RenameFileAsync".to_string();
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "grep_search",
-                &serde_json::json!({"glob": "**/*.cs", "pattern": "RenameFileAsync"}),
-                &tools,
-                &[miss],
-                false,
-            ),
-            Some("targeted_bifrost_miss_fallback")
-        );
-    }
-
-    #[test]
     fn no_edit_final_guard_rejects_navigation_only_final_before_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
 
@@ -2483,156 +2139,6 @@ mod tests {
         ];
 
         assert!(!should_emit_no_edit_progress_nudge(12, 25, &prior, 0));
-    }
-
-    #[test]
-    fn bifrost_classifier_runs_when_not_in_post_gate_batch() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        let should_consult = should_consult_bifrost_classifier(
-            "read_file",
-            &serde_json::json!({"file_path": "src/lib.rs"}),
-            &tools,
-            &[],
-            false,
-        );
-
-        assert!(should_consult);
-    }
-
-    #[test]
-    fn shell_classifier_runs_for_all_shell_commands() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("run_shell_command"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "nl -ba src/main.rs | sed -n '1,80p'"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test -q"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/Foo.php').write_text('x')\nPY"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "sed -i 's/a/b/' src/Foo.php"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(!should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test -q"}),
-            &tools,
-            &[],
-            true,
-        ));
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "run_shell_command",
-                &serde_json::json!({"command": "cargo test -q"}),
-                &tools,
-                &[],
-                true,
-            ),
-            Some("post_gate_tool_batch")
-        );
-    }
-
-    #[test]
-    fn bifrost_classifier_skip_reasons_are_specific() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "edit",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("not_text_navigation_tool")
-        );
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": ".harness/build.sh"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("static_text_target")
-        );
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[
-                    exchange_for_test("search_symbols"),
-                    exchange_for_test("scan_usages"),
-                    exchange_for_test("get_summaries"),
-                ],
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &[tool_def_for_test("read_file")],
-                &[],
-                false,
-            ),
-            Some("missing_required_bifrost_tools")
-        );
     }
 
     #[test]
