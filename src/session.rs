@@ -2545,16 +2545,6 @@ impl SessionStore {
         self.sync_sandbox_mode_from_setup_state(id).await
     }
 
-    /// True if the session has previously chosen "Always allow" for `approval_key`.
-    pub async fn is_always_allowed(&self, id: &str, approval_key: &str) -> bool {
-        self.sessions
-            .read()
-            .await
-            .get(id)
-            .map(|s| s.always_allow_tools.contains(approval_key))
-            .unwrap_or(false)
-    }
-
     /// True if any of the candidate approval keys is remembered for this session.
     pub async fn is_any_always_allowed(&self, id: &str, approval_keys: &[String]) -> bool {
         self.sessions
@@ -2585,7 +2575,16 @@ impl SessionStore {
 
         let changed = {
             let mut sessions = self.sessions.write().await;
-            if !sessions.contains_key(id) {
+            // Re-validate: the originating session must still exist with the
+            // same scope_root read before acquiring the write lock.  Without
+            // this check a session that is closed and replaced by a new one in
+            // a different repo between the two locks could receive an approval
+            // that was scoped to the original repo.
+            let scope_matches = sessions
+                .get(id)
+                .map(|s| s.permission_scope_root == scope_root)
+                .unwrap_or(false);
+            if !scope_matches {
                 return;
             }
             let mut changed = false;
@@ -4120,16 +4119,36 @@ mod tests {
         std::fs::create_dir_all(other_repo.path().join(".git")).expect("other git dir");
         let s = store.create_session(repo.path().to_path_buf()).await;
 
-        assert!(!store.is_always_allowed(&s.id, "write_file").await);
+        assert!(
+            !store
+                .is_any_always_allowed(&s.id, &["write_file".to_string()])
+                .await
+        );
         store.add_always_allow(&s.id, "write_file").await;
-        assert!(store.is_always_allowed(&s.id, "write_file").await);
+        assert!(
+            store
+                .is_any_always_allowed(&s.id, &["write_file".to_string()])
+                .await
+        );
         // Different tool name, same session: still false.
-        assert!(!store.is_always_allowed(&s.id, "run_shell_command").await);
+        assert!(
+            !store
+                .is_any_always_allowed(&s.id, &["run_shell_command".to_string()])
+                .await
+        );
         // Unknown session never reports allowed.
-        assert!(!store.is_always_allowed("no-such", "write_file").await);
+        assert!(
+            !store
+                .is_any_always_allowed("no-such", &["write_file".to_string()])
+                .await
+        );
 
         let next = store.create_session(repo.path().to_path_buf()).await;
-        assert!(store.is_always_allowed(&next.id, "write_file").await);
+        assert!(
+            store
+                .is_any_always_allowed(&next.id, &["write_file".to_string()])
+                .await
+        );
         assert_eq!(
             store.always_allow_keys(&next.id).await,
             Some(vec!["write_file".to_string()])
@@ -4138,7 +4157,7 @@ mod tests {
         let different_repo = store.create_session(other_repo.path().to_path_buf()).await;
         assert!(
             !store
-                .is_always_allowed(&different_repo.id, "write_file")
+                .is_any_always_allowed(&different_repo.id, &["write_file".to_string()])
                 .await
         );
         assert_eq!(
@@ -4167,17 +4186,25 @@ mod tests {
 
         let first = store.create_session(repo1.path().to_path_buf()).await;
         store.add_always_allow(&first.id, &repo_key).await;
-        assert!(store.is_always_allowed(&first.id, &repo_key).await);
+        assert!(
+            store
+                .is_any_always_allowed(&first.id, std::slice::from_ref(&repo_key))
+                .await
+        );
 
         let second_same_repo = store.create_session(repo1.path().to_path_buf()).await;
         assert!(
             store
-                .is_always_allowed(&second_same_repo.id, &repo_key)
+                .is_any_always_allowed(&second_same_repo.id, std::slice::from_ref(&repo_key))
                 .await
         );
 
         let other_repo = store.create_session(repo2.path().to_path_buf()).await;
-        assert!(!store.is_always_allowed(&other_repo.id, &repo_key).await);
+        assert!(
+            !store
+                .is_any_always_allowed(&other_repo.id, std::slice::from_ref(&repo_key))
+                .await
+        );
 
         assert_eq!(
             read_repo_permission_state(repo1.path()).always_allow,

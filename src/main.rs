@@ -433,6 +433,18 @@ async fn main() -> Result<()> {
         );
     }
 
+    {
+        let legacy = crate::setup_state::read();
+        if !legacy.always_allow.is_empty() {
+            tracing::warn!(
+                count = legacy.always_allow.len(),
+                "setup.json contains install-wide Always allow approvals that are no longer \
+                 used. Per-repo approvals are now stored in .brokk/permissions.json inside \
+                 each repository. Re-approve the tools you want in each repository.",
+            );
+        }
+    }
+
     match crate::mcp::ensure_bundled_bifrost().await {
         Ok(path) => tracing::info!(
             bifrost = %path.display(),

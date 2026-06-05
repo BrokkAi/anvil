@@ -5670,8 +5670,16 @@ mod tests {
 
         let revoked = revoke_always_allowed_permission(&store, &id, "1").await;
         assert_eq!(revoked, "Forgot Always allow approval: tool `write_file`");
-        assert!(!store.is_always_allowed(&id, "write_file").await);
-        assert!(store.is_always_allowed(&id, &repo_key).await);
+        assert!(
+            !store
+                .is_any_always_allowed(&id, &["write_file".to_string()])
+                .await
+        );
+        assert!(
+            store
+                .is_any_always_allowed(&id, std::slice::from_ref(&repo_key))
+                .await
+        );
 
         let missing = revoke_always_allowed_permission(&store, &id, "99").await;
         assert!(missing.contains("No remembered Always allow approval numbered `99`"));
