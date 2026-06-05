@@ -53,7 +53,7 @@ const BIFROST_BINARY_NAME: &str = "bifrost.exe";
 const BIFROST_BINARY_NAME: &str = "bifrost";
 
 static PREPARED_BIFROST_PATH: OnceLock<PathBuf> = OnceLock::new();
-static PREPARE_BIFROST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PREPARE_BIFROST_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug)]
 pub enum McpError {
@@ -128,10 +128,6 @@ fn default_bifrost_args() -> Vec<String> {
     ]
 }
 
-fn prepare_bifrost_lock() -> &'static Mutex<()> {
-    PREPARE_BIFROST_LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn managed_bifrost_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::setup_state::config_home()?
         .join("bifrost")
@@ -143,6 +139,11 @@ fn managed_bifrost_binary_path() -> anyhow::Result<PathBuf> {
     Ok(managed_bifrost_cache_dir()?.join(BIFROST_BINARY_NAME))
 }
 
+// Not cached: config_home() can return different values depending on the
+// environment (test thread-local vs. env-var override vs. OS default), so a
+// process-wide OnceLock here would break test isolation.  The call is cheap
+// (env-var lookup or OS config-dir resolution) and is made only during session
+// startup, not on any hot path.
 fn managed_bifrost_command() -> String {
     PREPARED_BIFROST_PATH
         .get()
@@ -156,6 +157,15 @@ fn is_legacy_or_managed_bifrost_command(command: &str) -> bool {
     command == "bifrost" || command == managed_bifrost_command()
 }
 
+/// Normalises a stored Bifrost server entry so it always uses Anvil's managed
+/// local binary with the correct line framing.
+///
+/// The function matches on name, default args, and a legacy (`"bifrost"`) or
+/// managed-path command.  When all three match the **entire** `McpServerConfig`
+/// is replaced by [`McpServerConfig::bifrost()`]; only `enabled` is preserved.
+/// Any other customisation (e.g. a manually-set framing override) is
+/// intentionally discarded — Bifrost's wire protocol requires line framing and
+/// the command must point to the pinned managed binary.
 pub fn normalize_preinstalled_bifrost_server(server: &mut McpServerConfig) {
     if server.name != "bifrost"
         || server.args != default_bifrost_args()
@@ -173,7 +183,7 @@ pub async fn ensure_bundled_bifrost() -> anyhow::Result<PathBuf> {
         return Ok(path.clone());
     }
 
-    let _guard = prepare_bifrost_lock().lock().await;
+    let _guard = PREPARE_BIFROST_LOCK.lock().await;
     if let Some(path) = PREPARED_BIFROST_PATH.get() {
         return Ok(path.clone());
     }
@@ -193,7 +203,8 @@ pub async fn ensure_bundled_bifrost() -> anyhow::Result<PathBuf> {
 }
 
 async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(cache_dir)
+    tokio::fs::create_dir_all(cache_dir)
+        .await
         .with_context(|| format!("creating bifrost cache dir {}", cache_dir.display()))?;
 
     let asset =
@@ -201,8 +212,17 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
     let url = format!("{BIFROST_RELEASE_BASE}/v{BUNDLED_BIFROST_VERSION}/{asset}");
     let sha256_url = format!("{url}.sha256");
 
+    // A single client with an explicit timeout shared across both requests so a
+    // slow or dropped CDN connection does not stall startup indefinitely.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("building reqwest client for bifrost download")?;
+
     tracing::info!(%url, version = BUNDLED_BIFROST_VERSION, "downloading bundled bifrost");
-    let bytes = reqwest::get(&url)
+    let bytes = client
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("downloading bundled bifrost archive from {url}"))?
         .error_for_status()
@@ -216,7 +236,9 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         version = BUNDLED_BIFROST_VERSION,
         "verifying bundled bifrost archive"
     );
-    let sidecar = reqwest::get(&sha256_url)
+    let sidecar = client
+        .get(&sha256_url)
+        .send()
         .await
         .with_context(|| format!("downloading bundled bifrost checksum from {sha256_url}"))?
         .error_for_status()
@@ -238,15 +260,20 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
     );
 
     let archive_path = cache_dir.join(&asset);
-    std::fs::write(&archive_path, &bytes)
+    tokio::fs::write(&archive_path, &bytes)
+        .await
         .with_context(|| format!("writing bundled bifrost archive {}", archive_path.display()))?;
 
-    let status = std::process::Command::new("tar")
+    // `tar -xf` auto-detects the format; on Windows 10+ (build 17063) the
+    // inbox BSD tar handles both `.tar.gz` and `.zip`, so a single invocation
+    // covers all supported targets without an extra dependency.
+    let status = Command::new("tar")
         .arg("-xf")
         .arg(&archive_path)
         .arg("-C")
         .arg(cache_dir)
         .status()
+        .await
         .with_context(|| format!("invoking tar to extract {}", archive_path.display()))?;
     anyhow::ensure!(
         status.success(),
@@ -265,27 +292,31 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
     );
 
     let target = cache_dir.join(BIFROST_BINARY_NAME);
-    std::fs::rename(&inner_binary, &target)
-        .or_else(|_| std::fs::copy(&inner_binary, &target).map(|_| ()))
-        .with_context(|| {
-            format!(
-                "moving bundled bifrost from {} to {}",
-                inner_binary.display(),
-                target.display()
-            )
-        })?;
+    if tokio::fs::rename(&inner_binary, &target).await.is_err() {
+        tokio::fs::copy(&inner_binary, &target)
+            .await
+            .with_context(|| {
+                format!(
+                    "moving bundled bifrost from {} to {}",
+                    inner_binary.display(),
+                    target.display()
+                )
+            })?;
+    }
 
-    let _ = std::fs::remove_file(&archive_path);
-    let _ = std::fs::remove_dir_all(&inner_dir);
+    let _ = tokio::fs::remove_file(&archive_path).await;
+    let _ = tokio::fs::remove_dir_all(&inner_dir).await;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&target)
+        let mut perms = tokio::fs::metadata(&target)
+            .await
             .with_context(|| format!("stat bundled bifrost binary {}", target.display()))?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&target, perms)
+        tokio::fs::set_permissions(&target, perms)
+            .await
             .with_context(|| format!("chmod 755 {}", target.display()))?;
     }
 

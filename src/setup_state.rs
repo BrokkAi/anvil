@@ -211,7 +211,14 @@ mod tests {
             bifrost.command,
             crate::mcp::McpServerConfig::bifrost().command
         );
-        assert_ne!(bifrost.command, "bifrost");
+        assert!(
+            bifrost
+                .command
+                .contains(crate::mcp::BUNDLED_BIFROST_VERSION),
+            "expected managed bifrost command to contain pinned version '{}', got: '{}'",
+            crate::mcp::BUNDLED_BIFROST_VERSION,
+            bifrost.command,
+        );
         assert_eq!(bifrost.framing, crate::mcp::McpFraming::Line);
     }
 
