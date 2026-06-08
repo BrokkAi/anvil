@@ -1384,6 +1384,19 @@ pub async fn run_agent(
                     vec![ChatContentPart::text(prompt_text.clone())]
                 };
 
+                if let Some(spec) = loop_spec.as_ref()
+                    && snap.model.is_empty()
+                    && !loop_target_runs_without_model(&spec.target)
+                {
+                    let catalog = sessions_prompt.available_model_metadata().await;
+                    send_message(
+                        &cx,
+                        &session_id,
+                        &render_setup_home_from_snapshot(&snap, &catalog),
+                    );
+                    return responder.respond(prompt_end_turn_response());
+                }
+
                 // Validate model is configured
                 if snap.model.is_empty()
                     && !stream_setup_openrouter_refresh
@@ -1475,73 +1488,133 @@ pub async fn run_agent(
                     let session_id_for_loop = session_id.clone();
                     let fallback_cwd_for_loop = fallback_cwd.clone();
                     let refresh_lock_for_loop = refresh_lock_login.clone();
+                    let structured_output_request_for_loop = structured_output_request.clone();
 
                     let spawn_result = cx.spawn(async move {
-                        send_message(
-                            &cx_for_loop,
-                            &session_id_for_loop,
-                            &format!(
-                                "Starting `/loop`: every {}s run `{}`.\n\
-                                 Cancel the session to stop.\n",
-                                loop_spec.interval_secs, loop_spec.target
-                            ),
-                        );
+                        use futures::FutureExt;
+                        use std::panic::AssertUnwindSafe;
 
-                        let mut iteration = 0u64;
-                        loop {
-                            if cancel.is_cancelled() {
-                                send_message(&cx_for_loop, &session_id_for_loop, "Cancelled.\n");
-                                break;
-                            }
-
-                            iteration += 1;
+                        let loop_result = AssertUnwindSafe(async {
                             send_message(
                                 &cx_for_loop,
                                 &session_id_for_loop,
                                 &format!(
-                                    "\n[loop iteration {iteration} | every {}s]\n",
-                                    loop_spec.interval_secs
+                                    "Starting `/loop`: every {}s run this target:\n{}\n\
+                                     Cancel the session to stop.\n",
+                                    loop_spec.interval_secs, loop_spec.target
                                 ),
                             );
-                            send_user_message(
-                                &cx_for_loop,
-                                &session_id_for_loop,
-                                &loop_spec.target,
-                            );
 
-                            if let Err(err) = run_loop_iteration(
-                                &cx_for_loop,
-                                &sessions_for_loop,
-                                &session_id_for_loop,
-                                &fallback_cwd_for_loop,
-                                llm_for_loop_turns.clone(),
-                                llm_for_setup.clone(),
-                                &refresh_lock_for_loop,
-                                &loop_spec.target,
-                                default_idle_timeout_secs,
-                                max_turns,
-                                cancel.clone(),
-                            )
-                            .await
-                            {
+                            let mut iteration = 0u64;
+                            let mut last_structured_output_result = None;
+                            let mut last_cumulative_usage = None;
+
+                            loop {
+                                if cancel.is_cancelled() {
+                                    send_message(
+                                        &cx_for_loop,
+                                        &session_id_for_loop,
+                                        "Cancelled.\n",
+                                    );
+                                    break;
+                                }
+
+                                iteration += 1;
+                                send_thought(
+                                    &cx_for_loop,
+                                    &session_id_for_loop,
+                                    &format!(
+                                        "\n[loop iteration {iteration} | every {}s]\n",
+                                        loop_spec.interval_secs
+                                    ),
+                                );
+                                send_user_message(
+                                    &cx_for_loop,
+                                    &session_id_for_loop,
+                                    &loop_spec.target,
+                                );
+
+                                match run_loop_iteration(
+                                    &cx_for_loop,
+                                    &sessions_for_loop,
+                                    &session_id_for_loop,
+                                    &fallback_cwd_for_loop,
+                                    llm_for_loop_turns.clone(),
+                                    llm_for_setup.clone(),
+                                    &refresh_lock_for_loop,
+                                    &loop_spec.target,
+                                    structured_output_request_for_loop.as_ref(),
+                                    default_idle_timeout_secs,
+                                    max_turns,
+                                    cancel.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => {
+                                        last_structured_output_result =
+                                            outcome.structured_output_result;
+                                        last_cumulative_usage = Some(outcome.cumulative_usage);
+                                    }
+                                    Err(LoopIterationError::Terminal(err)) => {
+                                        send_message(
+                                            &cx_for_loop,
+                                            &session_id_for_loop,
+                                            &format!(
+                                                "Loop iteration {iteration} stopped: {err}\n"
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                }
+
+                                tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        send_message(&cx_for_loop, &session_id_for_loop, "Cancelled.\n");
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(loop_spec.interval_secs)) => {}
+                                }
+                            }
+
+                            (last_structured_output_result, last_cumulative_usage)
+                        })
+                        .catch_unwind()
+                        .await;
+
+                        let (structured_output_result, cumulative_usage) = match loop_result {
+                            Ok(state) => state,
+                            Err(panic) => {
+                                tracing::error!(
+                                    session_id = %session_id_for_loop,
+                                    "loop dispatcher panicked: {:?}",
+                                    panic
+                                );
                                 send_message(
                                     &cx_for_loop,
                                     &session_id_for_loop,
-                                    &format!("Loop iteration {iteration} failed: {err}\n"),
+                                    "Error: loop dispatcher panicked. See server logs.\n",
                                 );
+                                (None, None)
                             }
-
-                            tokio::select! {
-                                _ = cancel.cancelled() => {
-                                    send_message(&cx_for_loop, &session_id_for_loop, "Cancelled.\n");
-                                    break;
-                                }
-                                _ = tokio::time::sleep(loop_spec.interval) => {}
-                            }
-                        }
+                        };
 
                         sessions_for_loop.finish_prompt(&session_id_for_loop).await;
-                        if let Err(e) = responder.respond(prompt_end_turn_response()) {
+                        let response = if let Some(cumulative_usage) = cumulative_usage {
+                            let acp_usage = AcpUsage::new(
+                                cumulative_usage.total_tokens(),
+                                cumulative_usage.input_tokens,
+                                cumulative_usage.output_tokens,
+                            )
+                            .thought_tokens(cumulative_usage.thought_tokens)
+                            .cached_read_tokens(cumulative_usage.cached_read_tokens)
+                            .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                            prompt_end_turn_response().usage(Some(acp_usage))
+                        } else {
+                            prompt_end_turn_response()
+                        };
+                        let response =
+                            response.meta(prompt_response_meta(structured_output_result.as_ref()));
+                        if let Err(e) = responder.respond(response) {
                             tracing::warn!(
                                 session_id = %session_id_for_loop,
                                 "failed to deliver PromptResponse: {e}"
@@ -1970,6 +2043,25 @@ fn send_thought(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     }
 }
 
+#[derive(Debug)]
+enum LoopIterationError {
+    Terminal(String),
+}
+
+struct LoopIterationOutcome {
+    structured_output_result: Option<StructuredOutputResult>,
+    cumulative_usage: crate::llm_client::TokenUsage,
+}
+
+impl LoopIterationOutcome {
+    fn without_usage() -> Self {
+        Self {
+            structured_output_result: None,
+            cumulative_usage: crate::llm_client::TokenUsage::default(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_iteration(
     cx: &ConnectionTo<Client>,
@@ -1980,18 +2072,15 @@ async fn run_loop_iteration(
     llm_setup: Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     target: &str,
+    structured_output_request: Option<&StructuredOutputRequest>,
     default_idle_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<(), String> {
+) -> Result<LoopIterationOutcome, LoopIterationError> {
     let mut snap = sessions
         .snapshot(session_id, fallback_cwd)
         .await
-        .ok_or_else(|| "unknown session".to_string())?;
-
-    if is_slash_command(target, "loop") {
-        return Err("nested `/loop` is not supported".to_string());
-    }
+        .ok_or_else(|| LoopIterationError::Terminal("unknown session".to_string()))?;
 
     if is_slash_command(target, "context") {
         let permission_mode = sessions
@@ -2004,7 +2093,7 @@ async fn run_loop_iteration(
             session_id,
             &render_context_report(&snap, permission_mode, &available_models),
         );
-        return Ok(());
+        return Ok(LoopIterationOutcome::without_usage());
     }
 
     if is_slash_command(target, "setup") {
@@ -2022,7 +2111,7 @@ async fn run_loop_iteration(
             session_id,
             &handle_setup(&setup_ctx, target, session_id).await,
         );
-        return Ok(());
+        return Ok(LoopIterationOutcome::without_usage());
     }
 
     if is_slash_command(target, "permissions") {
@@ -2031,7 +2120,7 @@ async fn run_loop_iteration(
             session_id,
             &handle_permissions(cx, sessions, session_id, target).await,
         );
-        return Ok(());
+        return Ok(LoopIterationOutcome::without_usage());
     }
 
     if is_slash_command(target, "mcp") {
@@ -2040,7 +2129,7 @@ async fn run_loop_iteration(
             session_id,
             &handle_mcp(target, sessions, session_id).await,
         );
-        return Ok(());
+        return Ok(LoopIterationOutcome::without_usage());
     }
 
     if is_slash_command(target, "pr-create") {
@@ -2057,7 +2146,7 @@ async fn run_loop_iteration(
             session_id,
             &handle_pr_create(target, &registry, permission_mode, sandbox_mode).await,
         );
-        return Ok(());
+        return Ok(LoopIterationOutcome::without_usage());
     }
 
     if is_slash_command(target, "compress") {
@@ -2084,7 +2173,7 @@ async fn run_loop_iteration(
         )
         .await;
         send_message(cx, session_id, &report);
-        return Ok(());
+        return Ok(LoopIterationOutcome::without_usage());
     }
 
     let raw_prompt_text = target.to_string();
@@ -2094,6 +2183,8 @@ async fn run_loop_iteration(
         && let Some(meta) = snap.skills.get(name)
     {
         tracing::info!(skill = %name, "loop activating skill");
+        // `mark_skill_activated` writes into the session's HashSet of
+        // activated skills, so repeated loop iterations are idempotent.
         sessions.mark_skill_activated(session_id, name).await;
         let body = build_skill_payload(meta);
         if args.is_empty() {
@@ -2111,13 +2202,9 @@ async fn run_loop_iteration(
     };
 
     if snap.model.is_empty() {
-        let catalog = sessions.available_model_metadata().await;
-        send_message(
-            cx,
-            session_id,
-            &render_setup_home_from_snapshot(&snap, &catalog),
-        );
-        return Ok(());
+        return Err(LoopIterationError::Terminal(
+            "model not configured".to_string(),
+        ));
     }
 
     let context_length = sessions
@@ -2152,7 +2239,7 @@ async fn run_loop_iteration(
             .max(1),
     );
 
-    let _ = run_model_turn_in_spawn(
+    let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
         cx,
         sessions,
         session_id,
@@ -2161,7 +2248,7 @@ async fn run_loop_iteration(
         &registry,
         &snap.model,
         snap.reasoning_effort.as_deref(),
-        None,
+        structured_output_request,
         messages,
         max_turns,
         idle_timeout,
@@ -2169,7 +2256,10 @@ async fn run_loop_iteration(
         prompt_text,
     )
     .await;
-    Ok(())
+    Ok(LoopIterationOutcome {
+        structured_output_result,
+        cumulative_usage,
+    })
 }
 
 /// Build the `Vec<ChatMessage>` to send to the LLM for a fresh prompt.
@@ -4296,9 +4386,16 @@ fn slash_command_args(prompt_text: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoopSpec {
-    interval: Duration,
     interval_secs: u64,
     target: String,
+}
+
+fn loop_target_runs_without_model(target: &str) -> bool {
+    is_slash_command(target, "context")
+        || is_slash_command(target, "setup")
+        || is_slash_command(target, "permissions")
+        || is_slash_command(target, "mcp")
+        || is_slash_command(target, "pr-create")
 }
 
 fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
@@ -4319,6 +4416,9 @@ fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
              Missing command or prompt after the interval."
             .to_string());
     }
+    if is_slash_command(target, "loop") {
+        return Err("Nested `/loop` is not supported.".to_string());
+    }
 
     let interval_secs = match raw_secs.parse::<u64>() {
         Ok(secs) if (1..=86_400).contains(&secs) => secs,
@@ -4335,7 +4435,6 @@ fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
     };
 
     Ok(LoopSpec {
-        interval: Duration::from_secs(interval_secs),
         interval_secs,
         target: target.to_string(),
     })
@@ -5030,7 +5129,6 @@ mod tests {
         assert_eq!(
             parse_loop_command("/loop 30 /context"),
             Ok(LoopSpec {
-                interval: Duration::from_secs(30),
                 interval_secs: 30,
                 target: "/context".to_string(),
             })
@@ -5047,6 +5145,21 @@ mod tests {
     fn parse_loop_command_rejects_invalid_interval() {
         let err = parse_loop_command("/loop soon /context").expect_err("junk interval must reject");
         assert!(err.contains("Invalid interval"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_loop_command_rejects_out_of_range() {
+        let err = parse_loop_command("/loop 0 /context").expect_err("zero must reject");
+        assert!(err.contains("out of range"), "got: {err}");
+
+        let err = parse_loop_command("/loop 86401 /context").expect_err("too large must reject");
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_loop_command_rejects_nested_loop() {
+        let err = parse_loop_command("/loop 30 /loop 60 hi").expect_err("nested loop must reject");
+        assert!(err.contains("Nested `/loop`"), "got: {err}");
     }
 
     /// `plan_compress` returns the indexes of every turn whose
