@@ -193,11 +193,21 @@ pub struct WrappedCommand {
 impl WrappedCommand {
     fn unwrapped(command: &str) -> Self {
         Self {
-            argv: vec!["sh".into(), "-c".into(), command.into()],
+            argv: unwrapped_shell_argv(command),
             sandboxed: false,
             _policy_file: None,
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn unwrapped_shell_argv(command: &str) -> Vec<String> {
+    vec!["cmd".into(), "/C".into(), command.into()]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unwrapped_shell_argv(command: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), command.into()]
 }
 
 /// Wrap a shell command in the appropriate platform sandbox.
@@ -1084,6 +1094,9 @@ mod tests {
     #[test]
     fn none_returns_unwrapped_argv_with_no_temp_file_and_sandboxed_false() {
         let wrapped = wrap_command(SandboxPolicy::None, Path::new("/tmp"), "echo hi").unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(wrapped.argv, vec!["cmd", "/C", "echo hi"]);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(wrapped.argv, vec!["sh", "-c", "echo hi"]);
         assert!(wrapped._policy_file.is_none());
         assert!(!wrapped.sandboxed);

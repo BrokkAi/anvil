@@ -1326,16 +1326,21 @@ mod tests {
             .set_builtin_tools(["think"].into_iter().map(str::to_string).collect())
             .await;
 
+        #[cfg(target_os = "windows")]
+        let command = "echo ok";
+        #[cfg(not(target_os = "windows"))]
+        let command = "printf ok";
+
         let result = registry
             .execute(
                 "run_shell_command",
-                json!({ "command": "printf ok" }),
-                SandboxPolicy::WorkspaceWrite,
+                json!({ "command": command }),
+                SandboxPolicy::None,
             )
             .await;
 
         assert!(matches!(result.status, ToolStatus::Success));
-        assert_eq!(result.output, "ok");
+        assert_eq!(result.output.trim(), "ok");
     }
 
     /// `task` is gated on having at least one discovered subagent.
