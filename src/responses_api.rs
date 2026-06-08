@@ -105,26 +105,22 @@ pub(crate) fn build_responses_request(
                     instructions_parts.push(text);
                 }
             }
-            "user" => {
-                if !msg.content.is_empty() {
-                    input.push(ResponsesInputItem::Message {
-                        role: "user".to_string(),
-                        content: msg
-                            .content
-                            .iter()
-                            .map(|part| match part {
-                                ChatContentPart::Text { text } => {
-                                    ResponsesContent::InputText { text: text.clone() }
-                                }
-                                ChatContentPart::Image { image_url } => {
-                                    ResponsesContent::InputImage {
-                                        image_url: image_url.clone(),
-                                    }
-                                }
-                            })
-                            .collect(),
-                    });
-                }
+            "user" if !msg.content.is_empty() => {
+                input.push(ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: msg
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            ChatContentPart::Text { text } => {
+                                ResponsesContent::InputText { text: text.clone() }
+                            }
+                            ChatContentPart::Image { image_url } => ResponsesContent::InputImage {
+                                image_url: image_url.clone(),
+                            },
+                        })
+                        .collect(),
+                });
             }
             "assistant" => {
                 if let Some(calls) = &msg.tool_calls {
