@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::llm_client::{
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Returns true when the model supports Anthropic-style prompt caching
 /// and needs explicit `cache_control` breakpoints in the request body.
@@ -77,6 +79,69 @@ fn thinking_budget_for_effort(effort: &str) -> Option<u32> {
 /// top of the reasoning budget.
 fn thinking_max_tokens(budget_tokens: u32) -> u32 {
     budget_tokens.saturating_add(MAX_TOKENS)
+}
+
+/// Build a native Anthropic request, attaching the reasoning controls for
+/// the given wire `shape` when an `effort` is present. `effort` is assumed
+/// already validated (`thinking_budget_for_effort` returns `Some`).
+fn build_anthropic_request(
+    anthropic_version: &'static str,
+    system: Option<Vec<BedrockTextBlock>>,
+    messages: Vec<BedrockMessage>,
+    tools: Option<Vec<BedrockTool>>,
+    effort: Option<&str>,
+    shape: ThinkingShape,
+) -> BedrockAnthropicRequest {
+    let mut request = BedrockAnthropicRequest {
+        anthropic_version,
+        system,
+        messages,
+        tools,
+        max_tokens: MAX_TOKENS,
+        temperature: None,
+        thinking: None,
+        output_config: None,
+    };
+    let Some(effort) = effort else {
+        return request;
+    };
+    match shape {
+        ThinkingShape::Enabled => {
+            if let Some(budget_tokens) = thinking_budget_for_effort(effort) {
+                request.max_tokens = thinking_max_tokens(budget_tokens);
+                request.thinking = Some(BedrockThinking::Enabled { budget_tokens });
+            }
+        }
+        ThinkingShape::Adaptive => {
+            request.thinking = Some(BedrockThinking::Adaptive);
+            request.output_config = Some(BedrockOutputConfig {
+                effort: effort.to_string(),
+            });
+        }
+    }
+    request
+}
+
+/// True when a failed native invoke is the documented "this model does not
+/// support `thinking.type.enabled`; use `thinking.type.adaptive` and
+/// `output_config.effort`" rejection. Detection is on the API's own error
+/// contract (authoritative) rather than a model-id version allowlist.
+fn error_requires_adaptive_thinking(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("thinking.type.enabled")
+        && (msg.contains("adaptive") || msg.contains("output_config"))
+}
+
+/// Attach reasoning presets to every thinking-capable Anthropic model in
+/// the merged catalog that doesn't already advertise them. Keyed on the
+/// final (post-normalization) invocable id, so it's independent of which
+/// discovery source produced the entry or how merge dedup ordered them.
+fn attach_anthropic_reasoning_presets(models: &mut [ModelMetadata]) {
+    for model in models.iter_mut() {
+        if model.supported_reasoning_levels.is_empty() && supports_extended_thinking(&model.id) {
+            model.supported_reasoning_levels = anthropic_thinking_presets();
+        }
+    }
 }
 
 const CACHE_CONTROL: CacheControl = CacheControl {
@@ -154,6 +219,23 @@ pub struct BedrockClient {
     runtime_base_url: String,
     mantle_base_url: String,
     control_base_url: String,
+    /// Per-resolved-model record of which Anthropic thinking wire shape the
+    /// model actually accepts. The Bedrock catalog publishes no capability
+    /// signal for this, so the first reasoning request probes with the
+    /// legacy `enabled` shape and, on the documented "use adaptive" 400,
+    /// learns `Adaptive` for subsequent calls. Avoids a brittle
+    /// model-id-version allowlist and re-probing on every request.
+    thinking_shape_cache: Arc<RwLock<HashMap<String, ThinkingShape>>>,
+}
+
+/// Which Anthropic extended-thinking request shape a Bedrock model accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingShape {
+    /// Legacy extended thinking: `thinking: {type: "enabled", budget_tokens}`.
+    Enabled,
+    /// Newer effort-based control: `thinking: {type: "adaptive"}` plus
+    /// `output_config: {effort}`.
+    Adaptive,
 }
 
 impl std::fmt::Debug for BedrockClient {
@@ -184,6 +266,7 @@ impl BedrockClient {
             runtime_base_url: BEDROCK_RUNTIME_BASE_URL.to_string(),
             mantle_base_url: mantle_base_url(&region),
             control_base_url: BEDROCK_CONTROL_BASE_URL.to_string(),
+            thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -209,6 +292,7 @@ impl BedrockClient {
             runtime_base_url,
             mantle_base_url,
             control_base_url,
+            thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -313,36 +397,74 @@ impl BedrockClient {
         } else {
             Some(system_blocks)
         };
-        // Map the resolved reasoning effort to an Anthropic extended-thinking
-        // block, but only for models that actually support it. When thinking
-        // is enabled `temperature` must be unset and `max_tokens` must exceed
-        // the reasoning budget.
-        let thinking = reasoning_effort
+        let tools = tools.map(|t| convert_tools(t, enable_cache));
+
+        // Decide whether to request reasoning at all. The Bedrock catalog
+        // publishes no per-model reasoning capability, so this gate is the
+        // one unavoidable id-based check; the *wire shape* below is detected
+        // at runtime instead of guessed from the id.
+        let effort = reasoning_effort
             .as_deref()
             .filter(|_| supports_extended_thinking(&resolved_model))
-            .and_then(thinking_budget_for_effort)
-            .map(|budget_tokens| BedrockThinking {
-                thinking_type: "enabled",
-                budget_tokens,
-            });
-        let max_tokens = thinking
-            .as_ref()
-            .map(|t| thinking_max_tokens(t.budget_tokens))
-            .unwrap_or(MAX_TOKENS);
-        let body = BedrockAnthropicRequest {
-            anthropic_version: ANTHROPIC_VERSION,
-            system,
-            messages,
-            tools: tools.map(|t| convert_tools(t, enable_cache)),
-            max_tokens,
-            temperature: None,
-            thinking,
+            .filter(|e| thinking_budget_for_effort(e).is_some())
+            .map(str::to_string);
+
+        // Start from the shape we last learned worked for this model
+        // (defaulting to the legacy `enabled` form, whose rejection error is
+        // well-defined so we can detect and fall back to `adaptive`).
+        let mut shape = match &effort {
+            Some(_) => self
+                .thinking_shape_cache
+                .read()
+                .await
+                .get(&resolved_model)
+                .copied()
+                .unwrap_or(ThinkingShape::Enabled),
+            None => ThinkingShape::Enabled,
         };
+
         let url = self.invoke_url(&resolved_model);
-        trace_bedrock_request(&body);
-        let body_text = self
-            .invoke_native_anthropic_with_fallback(&resolved_model, &url, &body, &cancel)
-            .await?;
+        let body_text = loop {
+            let body = build_anthropic_request(
+                ANTHROPIC_VERSION,
+                system.clone(),
+                messages.clone(),
+                tools.clone(),
+                effort.as_deref(),
+                shape,
+            );
+            trace_bedrock_request(&body);
+            match self
+                .invoke_native_anthropic_with_fallback(&resolved_model, &url, &body, &cancel)
+                .await
+            {
+                Ok(text) => {
+                    if effort.is_some() {
+                        self.thinking_shape_cache
+                            .write()
+                            .await
+                            .insert(resolved_model.clone(), shape);
+                    }
+                    break text;
+                }
+                // The model rejected the legacy `enabled` shape and told us to
+                // use `adaptive` + `output_config.effort`. Switch shape once
+                // and retry; the cache (set on success above) prevents this
+                // probe from recurring on later turns.
+                Err(err)
+                    if shape == ThinkingShape::Enabled
+                        && effort.is_some()
+                        && error_requires_adaptive_thinking(&err) =>
+                {
+                    tracing::info!(
+                        "Bedrock model {} rejected enabled-thinking; retrying with adaptive effort control",
+                        resolved_model
+                    );
+                    shape = ThinkingShape::Adaptive;
+                }
+                Err(err) => return Err(err),
+            }
+        };
         if body_text.is_empty() && cancel.is_cancelled() {
             return Ok(LlmResponse::Text {
                 text: String::new(),
@@ -619,6 +741,16 @@ impl LlmBackend for BedrockClient {
             );
             models = normalize_bedrock_model_ids(models, &inference_profiles, &self.region);
 
+            // Enrich AFTER merge + normalization: the two discovery sources
+            // (Mantle `/models` and foundation models) can both yield the
+            // same Anthropic id, and dedup keeps whichever was inserted
+            // first -- often the Mantle entry, which advertises no reasoning
+            // presets. Attaching presets here, keyed on the final invocable
+            // id, is source-agnostic and immune to merge ordering. It only
+            // matches native-invoke Anthropic ids (never `openai.*`), which
+            // is exactly the path that sends the `thinking` block.
+            attach_anthropic_reasoning_presets(&mut models);
+
             if !models.iter().any(|m| m.id == default_model) {
                 let supported_reasoning_levels = if supports_extended_thinking(&default_model) {
                     anthropic_thinking_presets()
@@ -852,15 +984,30 @@ struct BedrockAnthropicRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<BedrockThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<BedrockOutputConfig>,
 }
 
-/// Anthropic extended-thinking control block. When present, `temperature`
-/// must be unset and `max_tokens` must exceed `budget_tokens`.
+/// Anthropic extended-thinking control block. Two wire shapes exist:
+///
+/// - `Enabled { budget_tokens }` — legacy extended thinking. Requires
+///   `temperature` unset and `max_tokens > budget_tokens`.
+/// - `Adaptive` — newer effort-based control, paired with
+///   `output_config: { effort }` on the request.
 #[derive(Debug, Serialize)]
-struct BedrockThinking {
-    #[serde(rename = "type")]
-    thinking_type: &'static str,
-    budget_tokens: u32,
+#[serde(tag = "type")]
+enum BedrockThinking {
+    #[serde(rename = "enabled")]
+    Enabled { budget_tokens: u32 },
+    #[serde(rename = "adaptive")]
+    Adaptive,
+}
+
+/// `output_config.effort` companion for the adaptive thinking shape. Carries
+/// the user's chosen effort verbatim (`low`/`medium`/`high`).
+#[derive(Debug, Serialize)]
+struct BedrockOutputConfig {
+    effort: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -868,7 +1015,7 @@ struct CacheControl {
     r#type: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct BedrockTextBlock {
     #[serde(rename = "type")]
     block_type: &'static str,
@@ -877,13 +1024,13 @@ struct BedrockTextBlock {
     cache_control: Option<CacheControl>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct BedrockMessage {
     role: String,
     content: Vec<BedrockContentOut>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type")]
 enum BedrockContentOut {
     #[serde(rename = "text")]
@@ -907,7 +1054,7 @@ enum BedrockContentOut {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct BedrockImageSource {
     #[serde(rename = "type")]
     source_type: &'static str,
@@ -915,7 +1062,7 @@ struct BedrockImageSource {
     data: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct BedrockTool {
     name: String,
     description: String,
@@ -1358,6 +1505,68 @@ mod tests {
     }
 
     #[test]
+    fn enrichment_attaches_presets_regardless_of_source() {
+        // Simulates the merge result where a Mantle-sourced Anthropic entry
+        // (no presets) wins dedup over the foundation entry. The post-merge
+        // enrichment must still surface the reasoning presets.
+        let mut models = vec![
+            ModelMetadata {
+                id: "us.anthropic.claude-sonnet-4-6".to_string(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                supports_images: Some(true),
+                context_length: Some(200_000),
+            },
+            ModelMetadata {
+                id: "us.anthropic.claude-3-5-sonnet".to_string(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                supports_images: Some(true),
+                context_length: Some(200_000),
+            },
+            ModelMetadata {
+                id: "openai.gpt-5.4".to_string(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                supports_images: Some(true),
+                context_length: Some(200_000),
+            },
+        ];
+        attach_anthropic_reasoning_presets(&mut models);
+
+        let sonnet4 = &models[0];
+        assert_eq!(
+            sonnet4
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        // Claude 3.5 and openai.* must remain preset-free.
+        assert!(models[1].supported_reasoning_levels.is_empty());
+        assert!(models[2].supported_reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn enrichment_preserves_existing_presets() {
+        let mut models = vec![ModelMetadata {
+            id: "us.anthropic.claude-sonnet-4-6".to_string(),
+            default_reasoning_level: Some("high".to_string()),
+            supported_reasoning_levels: vec![ReasoningLevelPreset {
+                effort: "high".to_string(),
+                description: "preset".to_string(),
+            }],
+            supports_images: Some(true),
+            context_length: Some(200_000),
+        }];
+        attach_anthropic_reasoning_presets(&mut models);
+        // Existing presets are not clobbered.
+        assert_eq!(models[0].supported_reasoning_levels.len(), 1);
+        assert_eq!(models[0].default_reasoning_level.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn default_bedrock_runtime_url_includes_region_and_aws_host() {
         let client = BedrockClient::new(
             "token".to_string(),
@@ -1662,6 +1871,114 @@ mod tests {
             LlmResponse::Text { text, .. } => assert_eq!(text, "plain"),
             other => panic!("expected text response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_falls_back_to_adaptive_shape_on_400() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::body_partial_json;
+        use wiremock::{Match, Request};
+
+        // First attempt: legacy `enabled` shape -> model rejects it with the
+        // documented "use adaptive + output_config.effort" 400.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-opus-4-8/invoke"))
+            .and(body_partial_json(serde_json::json!({
+                "thinking": {"type": "enabled"}
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message": "\"thinking.type.enabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."
+            })))
+            .mount(&server)
+            .await;
+
+        // Count adaptive-shaped requests so we can prove the cache prevents a
+        // second probe on the follow-up turn.
+        let adaptive_hits = Arc::new(AtomicUsize::new(0));
+        struct AdaptiveShape(Arc<AtomicUsize>);
+        impl Match for AdaptiveShape {
+            fn matches(&self, request: &Request) -> bool {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                let ok = v
+                    .get("thinking")
+                    .and_then(|t| t.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("adaptive")
+                    && v.get("output_config")
+                        .and_then(|o| o.get("effort"))
+                        .and_then(|e| e.as_str())
+                        == Some("high");
+                if ok {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                ok
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-opus-4-8/invoke"))
+            .and(AdaptiveShape(adaptive_hits.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [
+                    {"type": "thinking", "thinking": "weighing"},
+                    {"type": "text", "text": "adaptive ok"}
+                ],
+                "usage": {"input_tokens": 6, "output_tokens": 4}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-opus-4-8".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+
+        let make_request = || {
+            let thoughts = Arc::new(Mutex::new(String::new()));
+            let captured = thoughts.clone();
+            (
+                StreamChatRequest {
+                    model: "us.anthropic.claude-opus-4-8".to_string(),
+                    messages: vec![ChatMessage::user("hi")],
+                    tools: None,
+                    reasoning_effort: Some("high".to_string()),
+                    structured_output: None,
+                    on_token: Box::new(|_| {}),
+                    on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
+                    cancel: CancellationToken::new(),
+                    idle_timeout: Duration::from_secs(5),
+                },
+                thoughts,
+            )
+        };
+
+        let (req, thoughts) = make_request();
+        let response = client
+            .stream_chat(req)
+            .await
+            .expect("should recover by switching to adaptive shape");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "adaptive ok"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(thoughts.lock().unwrap().as_str(), "weighing");
+        assert_eq!(adaptive_hits.load(Ordering::SeqCst), 1);
+
+        // Second turn: the learned shape is cached, so it goes straight to
+        // adaptive (no enabled probe) -- adaptive hit count rises to 2.
+        let (req2, _) = make_request();
+        client
+            .stream_chat(req2)
+            .await
+            .expect("cached adaptive shape should succeed directly");
+        assert_eq!(adaptive_hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -192,7 +192,12 @@ Anvil is zero-config by default:
   Anvil normalizes it to the matching profile automatically. Claude 3.7 and the
   Claude 4 family (Sonnet/Opus) expose extended-thinking reasoning presets
   (`low`/`medium`/`high`) in the effort picker; reasoning is opt-in, so the
-  `thinking` block is sent only when an effort is explicitly selected. Other
+  `thinking` block is sent only when an effort is explicitly selected. The
+  Bedrock catalog publishes no per-model reasoning capability, so the wire
+  shape is detected at runtime: Anvil sends the legacy
+  `thinking.type=enabled` form first and, if the model responds that it
+  requires `thinking.type=adaptive` + `output_config.effort`, retries with
+  that shape and remembers the model's shape for later turns. Other
   Bedrock-hosted Anthropic models (e.g. Claude 3.5) advertise no presets.
 
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
