@@ -214,10 +214,12 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
 
     // A single client with an explicit timeout shared across both requests so a
     // slow or dropped CDN connection does not stall startup indefinitely.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .context("building reqwest client for bifrost download")?;
+    let client = crate::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)),
+        &url,
+    )
+    .build()
+    .context("building reqwest client for bifrost download")?;
 
     tracing::info!(%url, version = BUNDLED_BIFROST_VERSION, "downloading bundled bifrost");
     let bytes = client

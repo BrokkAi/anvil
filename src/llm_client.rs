@@ -794,42 +794,40 @@ impl OpenAiClient {
         mut builder: reqwest::ClientBuilder,
         target: &str,
     ) -> reqwest::ClientBuilder {
-        if target.starts_with("https://") {
-            let native = rustls_native_certs::load_native_certs();
-            tracing::info!(
-                target,
-                certs = native.certs.len(),
-                errors = native.errors.len(),
-                "using native certs with tls_certs_only() for Android HTTPS client"
-            );
-            if target.contains("openrouter.ai") {
-                crate::openrouter_auth::append_refresh_log(&format!(
-                    "Android HTTPS workaround for {target}: {} cert(s), {} error(s)",
-                    native.certs.len(),
-                    native.errors.len()
-                ));
-            }
-            let certs = native
-                .certs
-                .into_iter()
-                .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
-                    Ok(cert) => Some(cert),
-                    Err(e) => {
-                        tracing::warn!(
-                            target,
-                            "skipping native cert during reqwest conversion: {e}"
-                        );
-                        if target.contains("openrouter.ai") {
-                            crate::openrouter_auth::append_refresh_log(&format!(
-                                "OpenRouter native cert conversion skipped one cert: {e}"
-                            ));
-                        }
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            builder = builder.tls_certs_only(certs);
+        let native = rustls_native_certs::load_native_certs();
+        tracing::info!(
+            target,
+            certs = native.certs.len(),
+            errors = native.errors.len(),
+            "using native certs with tls_certs_only() for Android HTTP(S) client"
+        );
+        if target.contains("openrouter.ai") {
+            crate::openrouter_auth::append_refresh_log(&format!(
+                "Android HTTPS workaround for {target}: {} cert(s), {} error(s)",
+                native.certs.len(),
+                native.errors.len()
+            ));
         }
+        let certs = native
+            .certs
+            .into_iter()
+            .filter_map(|cert| match reqwest::Certificate::from_der(cert.as_ref()) {
+                Ok(cert) => Some(cert),
+                Err(e) => {
+                    tracing::warn!(
+                        target,
+                        "skipping native cert during reqwest conversion: {e}"
+                    );
+                    if target.contains("openrouter.ai") {
+                        crate::openrouter_auth::append_refresh_log(&format!(
+                            "OpenRouter native cert conversion skipped one cert: {e}"
+                        ));
+                    }
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        builder = builder.tls_certs_only(certs);
         builder
     }
 
