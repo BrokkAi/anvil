@@ -953,14 +953,16 @@ pub(crate) async fn run(
                     // Consult the gate before announcing or executing the call.
                     let decision = consult_gate(
                         &sessions,
-                        &session_id,
                         &spawned_cx,
                         &cancel,
-                        &tool_name,
-                        kind,
-                        &call.id,
-                        &parsed_input,
-                        registry.cwd(),
+                        GateCheck {
+                            session_id: &session_id,
+                            tool_name: &tool_name,
+                            kind,
+                            tool_call_id: &call.id,
+                            raw_input: &parsed_input,
+                            cwd: registry.cwd(),
+                        },
                     )
                     .await;
 
@@ -1308,23 +1310,25 @@ async fn deterministic_gate_rejection(
 
 /// Apply the per-call permission policy. Returns `Allow` if the tool should
 /// execute, or `Reject(msg)` to feed the LLM a denial message instead.
-#[allow(clippy::too_many_arguments)]
 async fn consult_gate(
     sessions: &SessionStore,
-    session_id: &str,
     spawned_cx: &SpawnedCx<'_>,
     cancel: &CancellationToken,
-    tool_name: &str,
-    kind: ToolKind,
-    tool_call_id: &str,
-    raw_input: &Value,
-    cwd: &Path,
+    request: GateCheck<'_>,
 ) -> GateDecision {
-    let evaluation =
-        match evaluate_pure_gate(sessions, session_id, tool_name, kind, raw_input, cwd).await {
-            Ok(evaluation) => evaluation,
-            Err(reason) => return GateDecision::Reject(reason),
-        };
+    let evaluation = match evaluate_pure_gate(
+        sessions,
+        request.session_id,
+        request.tool_name,
+        request.kind,
+        request.raw_input,
+        request.cwd,
+    )
+    .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(reason) => return GateDecision::Reject(reason),
+    };
 
     match evaluation.decision {
         PureGateDecision::Allow => GateDecision::Allow {
@@ -1337,11 +1341,11 @@ async fn consult_gate(
                 spawned_cx,
                 cancel,
                 PermissionRequest {
-                    session_id,
-                    tool_name,
-                    kind,
-                    tool_call_id,
-                    raw_input,
+                    session_id: request.session_id,
+                    tool_name: request.tool_name,
+                    kind: request.kind,
+                    tool_call_id: request.tool_call_id,
+                    raw_input: request.raw_input,
                     shell_sandboxed: evaluation.shell_sandboxed,
                 },
             )
@@ -1351,14 +1355,19 @@ async fn consult_gate(
                     // Awaited inline so the next tool call in the same batch
                     // sees the updated set without re-prompting.
                     if grant.allow_always && grant.sandbox_policy_override.is_none() {
-                        if tool_name == "run_shell_command" {
-                            if let Some(rule_key) =
-                                shell_always_allow_rule_key(raw_input, evaluation.shell_sandboxed)
-                            {
-                                sessions.add_always_allow(session_id, &rule_key).await;
+                        if request.tool_name == "run_shell_command" {
+                            if let Some(rule_key) = shell_always_allow_rule_key(
+                                request.raw_input,
+                                evaluation.shell_sandboxed,
+                            ) {
+                                sessions
+                                    .add_always_allow(request.session_id, &rule_key)
+                                    .await;
                             }
                         } else {
-                            sessions.add_always_allow(session_id, tool_name).await;
+                            sessions
+                                .add_always_allow(request.session_id, request.tool_name)
+                                .await;
                         }
                     }
                     GateDecision::Allow {
@@ -1375,6 +1384,15 @@ async fn consult_gate(
 /// Send `session/request_permission` to the client and await the outcome.
 /// Returns `Ok(grant)` if the user approved (with or without remembering),
 /// or `Err(reason)` describing the rejection or transport failure.
+struct GateCheck<'a> {
+    session_id: &'a str,
+    tool_name: &'a str,
+    kind: ToolKind,
+    tool_call_id: &'a str,
+    raw_input: &'a Value,
+    cwd: &'a Path,
+}
+
 struct PermissionRequest<'a> {
     session_id: &'a str,
     tool_name: &'a str,
