@@ -202,7 +202,10 @@ impl WrappedCommand {
 
 #[cfg(target_os = "windows")]
 fn unwrapped_shell_argv(command: &str) -> Vec<String> {
-    vec!["cmd".into(), "/C".into(), command.into()]
+    let comspec = std::env::var("ComSpec")
+        .or_else(|_| std::env::var("COMSPEC"))
+        .unwrap_or_else(|_| String::from(r"C:\Windows\System32\cmd.exe"));
+    vec![comspec, "/C".into(), command.into()]
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -550,6 +553,11 @@ pub const ENV_WHITELIST: &[&str] = &[
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
+    "ComSpec",
+    "COMSPEC",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
     // Terminal width hints (ripgrep, fd, ls --color, less, ...)
     "COLUMNS",
     "LINES",
@@ -1095,7 +1103,16 @@ mod tests {
     fn none_returns_unwrapped_argv_with_no_temp_file_and_sandboxed_false() {
         let wrapped = wrap_command(SandboxPolicy::None, Path::new("/tmp"), "echo hi").unwrap();
         #[cfg(target_os = "windows")]
-        assert_eq!(wrapped.argv, vec!["cmd", "/C", "echo hi"]);
+        assert_eq!(
+            wrapped.argv,
+            vec![
+                std::env::var("ComSpec")
+                    .or_else(|_| std::env::var("COMSPEC"))
+                    .unwrap_or_else(|_| String::from(r"C:\Windows\System32\cmd.exe")),
+                String::from("/C"),
+                String::from("echo hi"),
+            ]
+        );
         #[cfg(not(target_os = "windows"))]
         assert_eq!(wrapped.argv, vec!["sh", "-c", "echo hi"]);
         assert!(wrapped._policy_file.is_none());
