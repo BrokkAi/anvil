@@ -5881,6 +5881,7 @@ mod tests {
             names,
             vec![
                 "context",
+                "loop",
                 "setup",
                 "permissions",
                 "compress",
