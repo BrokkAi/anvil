@@ -485,6 +485,10 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "pr-create",
             "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
         ),
+        AvailableCommand::new(
+            "commit",
+            "Commit session changes with an LLM-generated message (e.g. `/commit`, `/commit session`, `/commit all`)",
+        ),
     ]
 }
 
@@ -501,6 +505,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
         "compress",
         "mcp",
         "pr-create",
+        "commit",
     ]
     .into_iter()
     .collect()
@@ -1309,6 +1314,42 @@ pub async fn run_agent(
                         &registry,
                         permission_mode,
                         sandbox_mode,
+                    )
+                    .await;
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(prompt_end_turn_response());
+                }
+
+                if is_slash_command(&raw_prompt_text, "commit") {
+                    let permission_mode = sessions_prompt
+                        .permission_mode(&session_id)
+                        .await
+                        .unwrap_or(PermissionMode::Default);
+                    let sandbox_mode = sessions_prompt.sandbox_mode(&session_id).await.flatten();
+                    let registry = sessions_prompt
+                        .get_or_create_registry(&session_id, snap.cwd.clone())
+                        .await;
+                    let session = match sessions_prompt.get_session(&session_id, &snap.cwd).await {
+                        Some(session) => session,
+                        None => {
+                            send_message(&cx, &session_id, "Error: unknown session");
+                            return responder.respond(prompt_end_turn_response());
+                        }
+                    };
+                    let idle_timeout = Duration::from_secs(
+                        snap.idle_timeout_secs
+                            .unwrap_or(default_idle_timeout_secs)
+                            .max(1),
+                    );
+                    let report = handle_commit(
+                        &raw_prompt_text,
+                        &session,
+                        &registry,
+                        llm.as_ref(),
+                        permission_mode,
+                        sandbox_mode,
+                        &snap.model,
+                        idle_timeout,
                     )
                     .await;
                     send_message(&cx, &session_id, &report);
@@ -2145,6 +2186,41 @@ async fn run_loop_iteration(
             cx,
             session_id,
             &handle_pr_create(target, &registry, permission_mode, sandbox_mode).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "commit") {
+        let permission_mode = sessions
+            .permission_mode(session_id)
+            .await
+            .unwrap_or(PermissionMode::Default);
+        let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
+        let registry = sessions
+            .get_or_create_registry(session_id, snap.cwd.clone())
+            .await;
+        let Some(session) = sessions.get_session(session_id, &snap.cwd).await else {
+            return Err(LoopIterationError::Terminal("unknown session".to_string()));
+        };
+        let idle_timeout = Duration::from_secs(
+            snap.idle_timeout_secs
+                .unwrap_or(default_idle_timeout_secs)
+                .max(1),
+        );
+        send_message(
+            cx,
+            session_id,
+            &handle_commit(
+                target,
+                &session,
+                &registry,
+                llm.as_ref(),
+                permission_mode,
+                sandbox_mode,
+                &snap.model,
+                idle_timeout,
+            )
+            .await,
         );
         return Ok(LoopIterationOutcome::without_usage());
     }
@@ -4452,6 +4528,87 @@ fn parse_pr_create_arg(prompt_text: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitScope {
+    Auto,
+    Session,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitPlan {
+    session_paths: Vec<String>,
+    outside_paths: Vec<String>,
+    commit_paths: Vec<String>,
+}
+
+fn parse_commit_scope(prompt_text: &str) -> Result<CommitScope, String> {
+    let trimmed = slash_command_args(prompt_text);
+    if trimmed.is_empty() {
+        return Ok(CommitScope::Auto);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "session" | "own" => Ok(CommitScope::Session),
+        "all" => Ok(CommitScope::All),
+        other => Err(format!(
+            "Unknown `/commit` mode `{other}`.\n\nUsage:\n- `/commit`\n- `/commit session`\n- `/commit all`"
+        )),
+    }
+}
+
+fn plan_commit(
+    session: &Session,
+    current_dirty: &std::collections::BTreeSet<String>,
+    scope: CommitScope,
+) -> CommitPlan {
+    let initial_dirty = session.initial_dirty_paths();
+    let session_owned = session.session_edited_paths();
+    let session_paths: Vec<String> = current_dirty
+        .iter()
+        .filter(|path| session_owned.contains(*path) && !initial_dirty.contains(path.as_str()))
+        .cloned()
+        .collect();
+    let outside_paths: Vec<String> = current_dirty
+        .iter()
+        .filter(|path| !session_owned.contains(*path) || initial_dirty.contains(path.as_str()))
+        .cloned()
+        .collect();
+    let commit_paths = match scope {
+        CommitScope::All => current_dirty.iter().cloned().collect(),
+        CommitScope::Auto | CommitScope::Session => session_paths.clone(),
+    };
+    CommitPlan {
+        session_paths,
+        outside_paths,
+        commit_paths,
+    }
+}
+
+fn render_commit_scope_guidance(plan: &CommitPlan) -> String {
+    let mut lines = vec![
+        "Working tree contains changes that were not exclusively provided by this session."
+            .to_string(),
+    ];
+    if !plan.session_paths.is_empty() {
+        lines.push(String::new());
+        lines.push("Session-owned dirty paths:".to_string());
+        lines.extend(plan.session_paths.iter().map(|path| format!("- `{path}`")));
+    }
+    if !plan.outside_paths.is_empty() {
+        lines.push(String::new());
+        lines.push("Other dirty paths:".to_string());
+        lines.extend(plan.outside_paths.iter().map(|path| format!("- `{path}`")));
+    }
+    lines.push(String::new());
+    lines.push("Choose one:".to_string());
+    if !plan.session_paths.is_empty() {
+        lines.push("- `/commit session` to commit only the session-owned paths.".to_string());
+    }
+    lines.push("- `/commit all` to commit every dirty path currently in the tree.".to_string());
+    lines.push("- Or clean/stash the other paths first, then run `/commit` again.".to_string());
+    lines.join("\n")
+}
+
 /// Quote a string for `sh -c` by wrapping in single quotes and
 /// escaping any embedded single quote via the standard `'\''` trick.
 /// `run_shell_command` invokes `sh -c` with a single argv element, so
@@ -4487,6 +4644,179 @@ async fn run_or_report(
         Ok(result.output)
     } else {
         Err(format!("Error: `{label}` failed.\n\n{}", result.output))
+    }
+}
+
+async fn generate_commit_message(
+    llm: &dyn crate::llm_client::LlmBackend,
+    model: &str,
+    diff: &str,
+    idle_timeout: Duration,
+) -> Result<String, String> {
+    const SYSTEM_PROMPT: &str = "Write a git commit subject line for the supplied staged diff.\n\
+\n\
+Requirements:\n\
+- Output exactly one line.\n\
+- Use imperative mood.\n\
+- Keep it concise and specific.\n\
+- Do not wrap it in quotes or backticks.\n\
+- Do not add a trailing period.";
+    let response = llm
+        .stream_chat(crate::llm_client::StreamChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage::system(SYSTEM_PROMPT),
+                ChatMessage::user(format!("Staged diff to summarize:\n\n{diff}")),
+            ],
+            tools: None,
+            reasoning_effort: Some("low".to_string()),
+            structured_output: None,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            idle_timeout,
+        })
+        .await
+        .map_err(|e| format!("Error: failed to generate commit message.\n\n{e:#}"))?;
+    let text = match response {
+        crate::llm_client::LlmResponse::Text { text, .. }
+        | crate::llm_client::LlmResponse::ToolCalls { text, .. } => text,
+    };
+    let message = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim_end_matches('.')
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        Err("Error: the model returned an empty commit message.".to_string())
+    } else {
+        Ok(message)
+    }
+}
+
+async fn handle_commit(
+    prompt_text: &str,
+    session: &Session,
+    registry: &crate::tools::ToolRegistry,
+    llm: &dyn crate::llm_client::LlmBackend,
+    permission_mode: PermissionMode,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    model: &str,
+    idle_timeout: Duration,
+) -> String {
+    if matches!(permission_mode, PermissionMode::ReadOnly) {
+        return "Error: `/commit` is disabled in read-only permission mode. \
+                Switch to `default`, `acceptEdits`, or `bypassPermissions` to \
+                create commits."
+            .to_string();
+    }
+    let scope = match parse_commit_scope(prompt_text) {
+        Ok(scope) => scope,
+        Err(report) => return report,
+    };
+    let policy = crate::tools::sandbox::SandboxPolicy::resolve(permission_mode, sandbox_mode);
+    let dirty_output = match run_or_report(
+        registry,
+        "git diff --name-only -z && git diff --name-only --cached -z && git ls-files --others --exclude-standard -z",
+        "git dirty check",
+        policy,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => return e,
+    };
+    let current_dirty: std::collections::BTreeSet<String> = dirty_output
+        .split('\0')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| path.replace('\\', "/"))
+        .map(|path| path.trim_start_matches("./").to_string())
+        .collect();
+    if current_dirty.is_empty() {
+        return "Nothing to commit: the working tree is clean.".to_string();
+    }
+
+    let plan = plan_commit(session, &current_dirty, scope);
+    if matches!(scope, CommitScope::Auto) && !plan.outside_paths.is_empty() {
+        return render_commit_scope_guidance(&plan);
+    }
+    if matches!(scope, CommitScope::Session | CommitScope::Auto) && plan.commit_paths.is_empty() {
+        if plan.session_paths.is_empty() && !plan.outside_paths.is_empty() {
+            return format!(
+                "This session has no exclusive dirty paths to commit.\n\n{}",
+                render_commit_scope_guidance(&plan)
+            );
+        }
+        return "Nothing to commit for this session.".to_string();
+    }
+
+    let pathspec = if matches!(scope, CommitScope::All) {
+        String::new()
+    } else {
+        let joined = plan
+            .commit_paths
+            .iter()
+            .map(|path| shell_single_quote(path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(" -- {joined}")
+    };
+    let add_cmd = if matches!(scope, CommitScope::All) {
+        "git add -A".to_string()
+    } else {
+        format!("git add{pathspec}")
+    };
+    if let Err(e) = run_or_report(registry, &add_cmd, "git add", policy).await {
+        return e;
+    }
+
+    let diff_cmd = if matches!(scope, CommitScope::All) {
+        "git diff --cached --stat && printf '\\n' && git diff --cached".to_string()
+    } else {
+        format!("git diff --cached --stat{pathspec} && printf '\\n' && git diff --cached{pathspec}")
+    };
+    let staged_diff = match run_or_report(registry, &diff_cmd, "git diff --cached", policy).await {
+        Ok(diff) => diff,
+        Err(e) => return e,
+    };
+    if staged_diff.trim().is_empty() {
+        return "Nothing to commit after staging the selected paths.".to_string();
+    }
+
+    let message = match generate_commit_message(llm, model, &staged_diff, idle_timeout).await {
+        Ok(message) => message,
+        Err(e) => return e,
+    };
+    let commit_cmd = if matches!(scope, CommitScope::All) {
+        format!("git commit -m {}", shell_single_quote(&message))
+    } else {
+        format!(
+            "git commit --only -m {}{}",
+            shell_single_quote(&message),
+            pathspec
+        )
+    };
+    match run_or_report(registry, &commit_cmd, "git commit", policy).await {
+        Ok(output) => {
+            let mut report = format!("Committed with message `{message}`.");
+            if !matches!(scope, CommitScope::All) {
+                report.push_str(&format!(
+                    "\n\nCommitted {} path(s) from this session.",
+                    plan.commit_paths.len()
+                ));
+            }
+            let summary = output.trim();
+            if !summary.is_empty() {
+                report.push_str(&format!("\n\n{summary}"));
+            }
+            report
+        }
+        Err(e) => e,
     }
 }
 
@@ -5034,6 +5364,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_commit_scope_defaults_to_auto() {
+        assert_eq!(parse_commit_scope("/commit"), Ok(CommitScope::Auto));
+        assert_eq!(parse_commit_scope("  /commit   "), Ok(CommitScope::Auto));
+    }
+
+    #[test]
+    fn parse_commit_scope_accepts_session_and_all() {
+        assert_eq!(
+            parse_commit_scope("/commit session"),
+            Ok(CommitScope::Session)
+        );
+        assert_eq!(parse_commit_scope("/commit own"), Ok(CommitScope::Session));
+        assert_eq!(parse_commit_scope("/commit all"), Ok(CommitScope::All));
+    }
+
+    #[test]
+    fn parse_commit_scope_rejects_unknown_mode() {
+        let err = parse_commit_scope("/commit weird").expect_err("unknown scope must reject");
+        assert!(err.contains("Unknown `/commit` mode"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_commit_separates_session_and_outside_paths() {
+        let mut session = Session::new(
+            "session-1".into(),
+            PathBuf::from("/repo"),
+            "test-model".into(),
+            "test".into(),
+        );
+        session.set_initial_dirty_paths(["preexisting.txt".to_string()].into_iter().collect());
+        session.history.push(ConversationTurn {
+            user_prompt: "edit".into(),
+            agent_response: "done".into(),
+            tool_exchanges: vec![crate::session::ToolExchange {
+                call_id: "call-1".into(),
+                tool_name: "write_file".into(),
+                arguments: r#"{"file_path":"src/lib.rs","content":"x"}"#.into(),
+                result: "OK".into(),
+            }],
+            ..Default::default()
+        });
+        session.record_edited_paths(["src/lib.rs".to_string()]);
+        let current_dirty = ["preexisting.txt", "src/lib.rs", "manual.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let plan = plan_commit(&session, &current_dirty, CommitScope::Auto);
+
+        assert_eq!(plan.session_paths, vec!["src/lib.rs"]);
+        assert_eq!(plan.outside_paths, vec!["manual.txt", "preexisting.txt"]);
+        assert_eq!(plan.commit_paths, vec!["src/lib.rs"]);
+    }
+
+    #[test]
     fn is_slash_command_matches_pr_create_variants() {
         assert!(is_slash_command("/pr-create", "pr-create"));
         assert!(is_slash_command("  /pr-create  ", "pr-create"));
@@ -5046,9 +5431,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_commands_include_setup_permissions_and_pr_create() {
+    fn builtin_commands_include_setup_permissions_pr_create_and_commit() {
         // `/setup` owns model/provider configuration, `/permissions` owns
-        // approval controls, and `/pr-create` remains an explicit workflow command.
+        // approval controls, and workflow commands remain explicit.
         let cmds = builtin_commands();
         assert!(
             cmds.iter().any(|c| c.name == "setup"),
@@ -5066,6 +5451,11 @@ mod tests {
             cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
         assert!(
+            cmds.iter().any(|c| c.name == "commit"),
+            "builtin_commands() missing commit; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
             builtin_command_names().contains("setup"),
             "builtin_command_names() missing setup"
         );
@@ -5076,6 +5466,10 @@ mod tests {
         assert!(
             builtin_command_names().contains("pr-create"),
             "builtin_command_names() missing pr-create"
+        );
+        assert!(
+            builtin_command_names().contains("commit"),
+            "builtin_command_names() missing commit"
         );
         assert!(!builtin_command_names().contains("configure"));
     }
@@ -5562,6 +5956,8 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            initial_dirty_paths: Vec::new(),
+            session_edited_paths: Vec::new(),
         };
         let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
 
@@ -5887,6 +6283,7 @@ mod tests {
                 "compress",
                 "mcp",
                 "pr-create",
+                "commit",
                 "apple",
                 "zebra"
             ]

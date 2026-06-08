@@ -201,6 +201,9 @@ Built-in commands:
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
+- `/commit`, `/commit session`, `/commit all`: commit changes with an
+  LLM-generated message, pausing when the tree also contains changes not owned
+  by the current session.
 
 Skill slash commands are discovered from `SKILL.md` files. If a skill name
 collides with a built-in command, the built-in command wins and the skill slash

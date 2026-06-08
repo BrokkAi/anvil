@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::convert::TryFrom;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,6 +103,91 @@ fn current_timestamp_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn collect_nul_delimited_paths(
+    cwd: &Path,
+    args: &[&str],
+    paths: &mut HashSet<String>,
+) -> std::io::Result<()> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+    if !output.status.success() {
+        return Ok(());
+    }
+    for raw in output.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(raw).trim().replace('\\', "/");
+        let path = path.trim_start_matches("./").to_string();
+        if !path.is_empty() {
+            paths.insert(path);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_repo_relative_path(cwd: &Path, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(cwd).ok()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    let normalized = normalized.trim_start_matches("./").to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn git_dirty_paths(cwd: &Path) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for args in [
+        &["diff", "--name-only", "-z"][..],
+        &["diff", "--name-only", "--cached", "-z"][..],
+        &["ls-files", "--others", "--exclude-standard", "-z"][..],
+    ] {
+        if let Err(e) = collect_nul_delimited_paths(cwd, args, &mut paths) {
+            tracing::debug!(cwd = %cwd.display(), args = ?args, "failed to inspect git dirty paths: {e}");
+        }
+    }
+    paths
+}
+
+fn tool_exchange_succeeded(result: &str) -> bool {
+    !result.starts_with("Error:") && !result.starts_with("Internal error:")
+}
+
+fn edited_paths_from_turn(cwd: &Path, turn: &ConversationTurn) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for exchange in &turn.tool_exchanges {
+        if !matches!(exchange.tool_name.as_str(), "edit" | "write_file")
+            || !tool_exchange_succeeded(&exchange.result)
+        {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(&exchange.arguments) else {
+            continue;
+        };
+        let Some(raw_path) = args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(path) = normalize_repo_relative_path(cwd, raw_path) {
+            paths.insert(path);
+        }
+    }
+    paths
 }
 
 fn normalize_session_title(name: &str) -> Option<String> {
@@ -406,6 +492,24 @@ pub struct SessionManifest {
         rename = "brokkModel"
     )]
     pub model: Option<String>,
+    /// Dirty paths present when this session was created. Persisted so a
+    /// later `/commit` can keep distinguishing pre-existing local changes
+    /// from edits made by the session itself after a reload.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "brokkInitialDirtyPaths"
+    )]
+    pub initial_dirty_paths: Vec<String>,
+    /// Repo-relative paths successfully edited by this session. Persisted so
+    /// slash workflows such as `/commit` do not lose provenance when older
+    /// turns are evicted from the in-memory history window.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "brokkSessionEditedPaths"
+    )]
+    pub session_edited_paths: Vec<String>,
 }
 
 impl SessionManifest {
@@ -433,6 +537,8 @@ pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
     permission_scope_root: PathBuf,
+    initial_dirty_paths: HashSet<String>,
+    session_edited_paths: HashSet<String>,
     pub mode: SessionMode,
     pub model: String,
     pub history: Vec<ConversationTurn>,
@@ -536,6 +642,8 @@ impl Session {
             } else {
                 Some(model.clone())
             },
+            initial_dirty_paths: Vec::new(),
+            session_edited_paths: Vec::new(),
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
@@ -543,6 +651,8 @@ impl Session {
             id,
             cwd,
             permission_scope_root,
+            initial_dirty_paths: HashSet::new(),
+            session_edited_paths: HashSet::new(),
             mode,
             model,
             history: Vec::new(),
@@ -603,12 +713,23 @@ impl Session {
                 loaded: manifest.id,
             });
         }
+        let session_edited_paths = if manifest.session_edited_paths.is_empty() {
+            let mut derived = HashSet::new();
+            for turn in &history {
+                derived.extend(edited_paths_from_turn(&cwd, turn));
+            }
+            derived
+        } else {
+            manifest.session_edited_paths.iter().cloned().collect()
+        };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
         Ok(Self {
             id,
             cwd,
             permission_scope_root,
+            initial_dirty_paths: manifest.initial_dirty_paths.iter().cloned().collect(),
+            session_edited_paths,
             mode,
             model,
             history,
@@ -641,6 +762,30 @@ impl Session {
                 self.always_allow_order.push(key);
             }
         }
+    }
+
+    pub fn set_initial_dirty_paths(&mut self, paths: HashSet<String>) {
+        let mut sorted: Vec<String> = paths.iter().cloned().collect();
+        sorted.sort();
+        self.initial_dirty_paths = paths;
+        self.manifest.initial_dirty_paths = sorted;
+    }
+
+    pub fn initial_dirty_paths(&self) -> &HashSet<String> {
+        &self.initial_dirty_paths
+    }
+
+    pub fn record_edited_paths(&mut self, paths: impl IntoIterator<Item = String>) {
+        for path in paths {
+            self.session_edited_paths.insert(path);
+        }
+        let mut sorted: Vec<String> = self.session_edited_paths.iter().cloned().collect();
+        sorted.sort();
+        self.manifest.session_edited_paths = sorted;
+    }
+
+    pub fn session_edited_paths(&self) -> &HashSet<String> {
+        &self.session_edited_paths
     }
 }
 
@@ -2111,6 +2256,7 @@ impl SessionStore {
         };
         session.selected_reasoning_effort = reasoning_effort;
         session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
+        session.set_initial_dirty_paths(git_dirty_paths(&cwd));
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
         // Persistence failures are logged but not surfaced: `create_session` returns
@@ -2990,19 +3136,33 @@ impl SessionStore {
             match sessions.get_mut(id) {
                 Some(session) => {
                     let prev_modified = session.manifest.modified;
+                    let prev_session_edited_paths = session.session_edited_paths.clone();
+                    let prev_manifest_session_edited_paths =
+                        session.manifest.session_edited_paths.clone();
+                    let edited_paths = edited_paths_from_turn(&session.cwd, &turn);
                     session.history.push(turn.clone());
+                    session.record_edited_paths(edited_paths);
                     let now = current_timestamp_millis();
                     session.manifest.modified = now;
                     Some((
                         session_zip_path(&session.cwd, &session.id),
                         session.manifest.clone(),
                         prev_modified,
+                        prev_session_edited_paths,
+                        prev_manifest_session_edited_paths,
                     ))
                 }
                 None => None,
             }
         };
-        let Some((zip_path, manifest, prev_modified)) = snapshot else {
+        let Some((
+            zip_path,
+            manifest,
+            prev_modified,
+            prev_session_edited_paths,
+            prev_manifest_session_edited_paths,
+        )) = snapshot
+        else {
             // Session is unknown -- no in-memory state to roll back, nothing
             // to persist. Treat as a no-op success.
             return Ok(());
@@ -3031,6 +3191,8 @@ impl SessionStore {
                 if let Some(session) = self.sessions.write().await.get_mut(id) {
                     session.history.pop();
                     session.manifest.modified = prev_modified;
+                    session.session_edited_paths = prev_session_edited_paths;
+                    session.manifest.session_edited_paths = prev_manifest_session_edited_paths;
                 }
                 return Err(e);
             }
@@ -3225,6 +3387,8 @@ mod tests {
             version: "4.0".into(),
             mode: Some("CODE".into()),
             model: Some("m".into()),
+            initial_dirty_paths: Vec::new(),
+            session_edited_paths: Vec::new(),
         };
         let history = vec![ConversationTurn {
             user_prompt: "u".into(),
@@ -3452,6 +3616,8 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            initial_dirty_paths: Vec::new(),
+            session_edited_paths: Vec::new(),
         };
 
         let err = Session::from_persisted(
@@ -3582,6 +3748,7 @@ mod tests {
         assert_eq!(manifest.id, session.id);
         assert_eq!(manifest.mode.as_deref(), Some("LUTZ"));
         assert_eq!(manifest.model.as_deref(), Some("initial-model"));
+        assert!(manifest.initial_dirty_paths.is_empty());
         assert!(manifest.title().is_none(), "new sessions start untitled");
         assert!(
             manifest.updated_at().is_some(),
