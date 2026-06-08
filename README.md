@@ -196,6 +196,8 @@ Built-in commands:
 - `/permissions`: change edit/command approvals and remembered Always allow
   entries.
 - `/context`: show the current session context snapshot and token estimate.
+- `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or
+  prompt on an interval until the session is cancelled.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
