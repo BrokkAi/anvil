@@ -443,6 +443,7 @@ async fn fetch_chatgpt_models(
                 .into_iter()
                 .map(ReasoningLevelPreset::from)
                 .collect(),
+            supports_images: None,
             // ChatGPT's `/models` endpoint doesn't expose a context window;
             // the compression layer falls back to a per-backend default.
             context_length: None,

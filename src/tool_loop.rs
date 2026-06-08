@@ -20,6 +20,7 @@ use crate::bifrost_gate::{
 };
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    messages_include_images, rewrite_image_prompt_provider_error,
 };
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::structured_output::StructuredOutputRequest;
@@ -1219,7 +1220,14 @@ pub(crate) async fn run(
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
-                let err_msg = format!("\n**Error:** LLM request failed: {e}\n");
+                let friendly = messages_include_images(&messages)
+                    .then(|| rewrite_image_prompt_provider_error(&e.to_string()))
+                    .flatten();
+                let err_msg = if let Some(message) = friendly {
+                    format!("\n**Error:** {message}\n")
+                } else {
+                    format!("\n**Error:** LLM request failed: {e}\n")
+                };
                 if let Ok(mut cb) = on_text.lock() {
                     cb(&err_msg);
                 }

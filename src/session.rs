@@ -3738,6 +3738,7 @@ mod tests {
                         effort: "medium".to_string(),
                         description: "".to_string(),
                     }],
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata {
@@ -3757,6 +3758,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    supports_images: None,
                     context_length: None,
                 },
             ])
@@ -3806,6 +3808,7 @@ mod tests {
                         description: "".to_string(),
                     },
                 ],
+                supports_images: None,
                 context_length: None,
             }])
             .await;
@@ -3845,6 +3848,7 @@ mod tests {
                         effort: "medium".to_string(),
                         description: "".to_string(),
                     }],
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata {
@@ -3864,6 +3868,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    supports_images: None,
                     context_length: None,
                 },
             ])
@@ -4061,6 +4066,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata {
@@ -4070,6 +4076,7 @@ mod tests {
                         effort: "high".to_string(),
                         description: "".to_string(),
                     }],
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata::id_only("persisted-model"),
@@ -4442,6 +4449,7 @@ mod tests {
                         description: "".to_string(),
                     },
                 ],
+                supports_images: None,
                 context_length: None,
             }])
             .await;
@@ -4509,6 +4517,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata {
@@ -4528,6 +4537,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    supports_images: None,
                     context_length: None,
                 },
             ])
@@ -4587,12 +4597,14 @@ mod tests {
                     id: "gpt-a".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: supported.clone(),
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata {
                     id: "gpt-b".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: supported,
+                    supports_images: None,
                     context_length: None,
                 },
             ])

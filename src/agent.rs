@@ -1414,6 +1414,14 @@ pub async fn run_agent(
                     return responder.respond(prompt_end_turn_response());
                 }
 
+                let available_models = sessions_prompt.available_model_metadata().await;
+                if let Some(message) =
+                    image_prompt_rejection(&snap.model, &prompt_parts, &available_models)
+                {
+                    send_message(&cx, &session_id, &format!("Error: {message}\n"));
+                    return responder.respond(prompt_end_turn_response());
+                }
+
                 // Create a cancellation token for this prompt. Reject a
                 // second in-flight prompt for the same session before we
                 // spawn any background work.
@@ -1439,9 +1447,7 @@ pub async fn run_agent(
                 // the compression budget calc has it. Codex/Ollama models
                 // typically don't publish one and fall through to the
                 // per-backend default inside `context_budget`.
-                let context_length = sessions_prompt
-                    .available_model_metadata()
-                    .await
+                let context_length = available_models
                     .iter()
                     .find(|m| m.id == snap.model)
                     .and_then(|m| m.context_length);
@@ -1991,6 +1997,29 @@ fn extract_prompt_parts(blocks: &[ContentBlock]) -> Vec<ChatContentPart> {
         .collect()
 }
 
+fn prompt_parts_include_images(parts: &[ChatContentPart]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, ChatContentPart::Image { .. }))
+}
+
+fn image_prompt_rejection(
+    model: &str,
+    prompt_parts: &[ChatContentPart],
+    catalog: &[ModelMetadata],
+) -> Option<String> {
+    if !prompt_parts_include_images(prompt_parts) {
+        return None;
+    }
+    let supports_images = catalog
+        .iter()
+        .find(|meta| meta.id == model)
+        .and_then(|meta| meta.supports_images);
+    (supports_images == Some(false)).then_some(
+        "The selected model does not advertise image input support. Choose a vision-capable model to use image prompts.".to_string(),
+    )
+}
+
 fn prompt_text_for_title(text: &str, parts: &[ChatContentPart]) -> String {
     if !text.trim().is_empty() {
         return text.to_string();
@@ -2210,9 +2239,13 @@ async fn run_loop_iteration(
         ));
     }
 
-    let context_length = sessions
-        .available_model_metadata()
-        .await
+    let available_models = sessions.available_model_metadata().await;
+    if let Some(message) = image_prompt_rejection(&snap.model, &prompt_parts, &available_models) {
+        send_message(cx, session_id, &format!("Error: {message}\n"));
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    let context_length = available_models
         .iter()
         .find(|m| m.id == snap.model)
         .and_then(|m| m.context_length);
@@ -5321,6 +5354,29 @@ mod tests {
     }
 
     #[test]
+    fn image_prompt_rejection_blocks_known_text_only_models() {
+        let prompt_parts = vec![ChatContentPart::image_url("https://example.com/cat.png")];
+        let catalog = vec![ModelMetadata {
+            id: "text-only".into(),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            supports_images: Some(false),
+            context_length: None,
+        }];
+
+        let message =
+            image_prompt_rejection("text-only", &prompt_parts, &catalog).expect("must reject");
+        assert!(message.contains("does not advertise image input support"));
+    }
+
+    #[test]
+    fn image_prompt_rejection_allows_unknown_support_models() {
+        let prompt_parts = vec![ChatContentPart::image_url("https://example.com/cat.png")];
+        let catalog = vec![ModelMetadata::id_only("unknown")];
+        assert!(image_prompt_rejection("unknown", &prompt_parts, &catalog).is_none());
+    }
+
+    #[test]
     fn prompt_response_meta_includes_structured_output_success() {
         let result =
             StructuredOutputResult::Success(crate::structured_output::StructuredOutputSuccess {
@@ -5448,6 +5504,7 @@ mod tests {
             id: "gpt-99".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            supports_images: None,
             context_length: Some(200_000),
         }];
         let report = render_context_report(&snap, PermissionMode::AcceptEdits, &catalog);
@@ -5510,6 +5567,7 @@ mod tests {
             id: "gpt-99".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            supports_images: None,
             context_length: Some(200_000),
         }];
 
@@ -5541,6 +5599,7 @@ mod tests {
             id: "codex::gpt-5-codex".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            supports_images: None,
             context_length: None,
         }];
 
@@ -6288,6 +6347,7 @@ mod tests {
                         effort: "high".into(),
                         description: "High".into(),
                     }],
+                    supports_images: None,
                     context_length: None,
                 },
                 ModelMetadata::id_only("model-b"),

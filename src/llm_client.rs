@@ -266,6 +266,36 @@ impl ChatMessage {
     }
 }
 
+pub fn messages_include_images(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|part| matches!(part, ChatContentPart::Image { .. }))
+    })
+}
+
+pub fn rewrite_image_prompt_provider_error(error: &str) -> Option<&'static str> {
+    let normalized = error.to_ascii_lowercase();
+    let image_like = normalized.contains("image")
+        || normalized.contains("vision")
+        || normalized.contains("multimodal")
+        || normalized.contains("modality");
+    let unsupported_like = normalized.contains("not support")
+        || normalized.contains("unsupported")
+        || normalized.contains("invalid input type")
+        || normalized.contains("input modality")
+        || normalized.contains("only text")
+        || normalized.contains("text-only");
+    if image_like && unsupported_like {
+        Some(
+            "The selected model does not accept image prompts. Choose a vision-capable model and try again.",
+        )
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatContentPart {
@@ -346,6 +376,9 @@ pub struct ModelMetadata {
     pub id: String,
     pub default_reasoning_level: Option<String>,
     pub supported_reasoning_levels: Vec<ReasoningLevelPreset>,
+    /// Tri-state image-input support as published by the provider.
+    /// `None` means the backend does not expose reliable modality info.
+    pub supports_images: Option<bool>,
     /// Maximum context window in tokens, as published by the provider.
     /// `None` when the backend doesn't expose it (Codex, Ollama); the
     /// compression layer falls back to a per-backend default in that
@@ -363,6 +396,7 @@ impl ModelMetadata {
             id: id.into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            supports_images: None,
             context_length: None,
         }
     }
@@ -525,7 +559,15 @@ pub(crate) struct ModelEntry {
     #[serde(default)]
     pub(crate) default_parameters: Option<serde_json::Value>,
     #[serde(default)]
+    pub(crate) architecture: Option<ModelArchitecture>,
+    #[serde(default)]
     pub(crate) context_length: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelArchitecture {
+    #[serde(default)]
+    pub(crate) input_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -576,6 +618,15 @@ fn reasoning_effort_from_default_parameters(
 }
 
 impl ModelEntry {
+    fn supports_images(&self) -> Option<bool> {
+        let modalities = self.architecture.as_ref()?.input_modalities.as_ref()?;
+        Some(
+            modalities
+                .iter()
+                .any(|modality| modality.eq_ignore_ascii_case("image")),
+        )
+    }
+
     fn supports_reasoning(&self) -> bool {
         self.supported_parameters
             .iter()
@@ -593,6 +644,7 @@ impl ModelEntry {
                 id: self.id.clone(),
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
+                supports_images: self.supports_images(),
                 context_length: self.context_length,
             };
         }
@@ -604,6 +656,7 @@ impl ModelEntry {
             )
             .or_else(|| Some("medium".to_string())),
             supported_reasoning_levels: openrouter_reasoning_presets(),
+            supports_images: self.supports_images(),
             context_length: self.context_length,
         }
     }
@@ -1044,12 +1097,7 @@ impl OpenAiClient {
             return Ok(models
                 .data
                 .into_iter()
-                .map(|model| ModelMetadata {
-                    id: model.id,
-                    default_reasoning_level: None,
-                    supported_reasoning_levels: Vec::new(),
-                    context_length: model.context_length,
-                })
+                .map(|model| model.to_model_metadata())
                 .collect());
         }
         let metadata = models
@@ -1848,6 +1896,11 @@ mod tests {
         // it for the threshold regardless of reasoning support).
         let plain = parsed.data[1].to_model_metadata();
         assert_eq!(plain.context_length, Some(128_000));
+        assert_eq!(
+            parsed.data[0].to_model_metadata().supports_images,
+            Some(true)
+        );
+        assert_eq!(plain.supports_images, None);
     }
 
     /// Missing `context_length` (some OpenRouter providers omit it, and
@@ -1859,6 +1912,24 @@ mod tests {
         let entry: ModelEntry = serde_json::from_str(raw).expect("entry parses");
         assert!(entry.context_length.is_none());
         assert!(entry.to_model_metadata().context_length.is_none());
+        assert!(entry.to_model_metadata().supports_images.is_none());
+    }
+
+    #[test]
+    fn openrouter_text_only_model_surfaces_supports_images_false() {
+        let raw = r#"{
+            "id": "openai/gpt-4.1-mini",
+            "architecture": {"input_modalities": ["text"]}
+        }"#;
+        let entry: ModelEntry = serde_json::from_str(raw).expect("entry parses");
+        assert_eq!(entry.to_model_metadata().supports_images, Some(false));
+    }
+
+    #[test]
+    fn image_prompt_provider_errors_are_rewritten() {
+        let err = "chat completion failed (HTTP 400): model is text-only and does not support image input";
+        assert!(rewrite_image_prompt_provider_error(err).is_some());
+        assert!(rewrite_image_prompt_provider_error("timeout waiting for stream").is_none());
     }
 
     /// OpenRouter reasoning-capable models should surface a default

@@ -224,6 +224,7 @@ impl LlmBackend for BedrockClient {
                 id: model,
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
+                supports_images: None,
                 context_length: Some(200_000),
             }])
         })
