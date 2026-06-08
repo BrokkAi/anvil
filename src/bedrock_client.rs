@@ -383,7 +383,7 @@ fn uses_responses_api(model: &str) -> bool {
 }
 
 fn mantle_base_url(region: &str) -> String {
-    format!("https://bedrock-mantle.{region}.api.aws/v1")
+    format!("https://bedrock-mantle.{region}.api.aws/openai/v1")
 }
 
 pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
@@ -958,7 +958,7 @@ mod tests {
     async fn responses_models_route_to_mantle_responses() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/responses"))
+            .and(path("/openai/v1/responses"))
             .and(header("authorization", "Bearer token"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -976,7 +976,7 @@ mod tests {
             "us-east-2".to_string(),
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
-            format!("{}/v1", server.uri()),
+            format!("{}/openai/v1", server.uri()),
         );
         let response = client
             .stream_chat(StreamChatRequest {
@@ -1048,7 +1048,7 @@ mod tests {
     async fn mantle_models_are_discovered_and_default_is_preserved() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/models"))
+            .and(path("/openai/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [
                     {
@@ -1066,7 +1066,7 @@ mod tests {
             "us-east-2".to_string(),
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
-            format!("{}/v1", server.uri()),
+            format!("{}/openai/v1", server.uri()),
         );
         let models = client
             .list_model_metadata()
@@ -1084,7 +1084,7 @@ mod tests {
     async fn mantle_discovery_failure_falls_back_to_default_model() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/models"))
+            .and(path("/openai/v1/models"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -1093,7 +1093,7 @@ mod tests {
             "us-east-2".to_string(),
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
-            format!("{}/v1", server.uri()),
+            format!("{}/openai/v1", server.uri()),
         );
         let models = client
             .list_model_metadata()
