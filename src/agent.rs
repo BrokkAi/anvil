@@ -25,7 +25,7 @@ use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
-    SessionSnapshot, SessionStore,
+    SessionSnapshot, SessionStore, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -954,7 +954,10 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let cwd = req.cwd.clone();
                 tracing::info!("ACP session/new, cwd={}", cwd.display());
-                let session = sessions_new.create_session(cwd).await;
+                let session_mcp_servers = acp_mcp_servers_to_configs(req.mcp_servers);
+                let session = sessions_new
+                    .create_session_with_mcp_servers(cwd, Some(session_mcp_servers))
+                    .await;
 
                 // Use the cached catalog populated at init; fall back to a
                 // single-entry catalog from the session's own model so the
@@ -3270,6 +3273,7 @@ async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str
                 name: name.to_string(),
                 command: server_command.to_string(),
                 args: words[idx + 2..].to_vec(),
+                env: Vec::new(),
                 framing,
                 enabled: true,
             };
@@ -5562,6 +5566,7 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            brokk_mcp_servers: None,
         };
         let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
 

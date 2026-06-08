@@ -202,6 +202,7 @@ mod tests {
             name: "bifrost".to_string(),
             command: "bifrost".to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
             framing: crate::mcp::McpFraming::ContentLength,
             enabled: true,
         }])
@@ -236,6 +237,7 @@ mod tests {
             name: "bifrost".to_string(),
             command: "/tmp/custom-bifrost".to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
             framing: crate::mcp::McpFraming::Line,
             enabled: true,
         }])
