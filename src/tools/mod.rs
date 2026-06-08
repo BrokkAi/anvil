@@ -1254,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_tools_have_metadata_and_are_advertised() {
         let registry = ToolRegistry {
-            cwd: PathBuf::from("/tmp"),
+            cwd: std::env::temp_dir(),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1341,7 +1341,11 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result.status, ToolStatus::Success));
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "hidden builtins should still execute for non-LLM callers; output={}",
+            result.output
+        );
         assert_eq!(result.output.trim(), "ok");
     }
 
