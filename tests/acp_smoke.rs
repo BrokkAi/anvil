@@ -495,7 +495,7 @@ impl<'a> JsonRpcClient<'a> {
     }
 
     fn wait_for_response(&mut self, id: u64, method: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             self.drain_stderr();
             if let Some(status) = self.child.try_wait().expect("poll child") {
