@@ -190,6 +190,14 @@ fn edited_paths_from_turn(cwd: &Path, turn: &ConversationTurn) -> HashSet<String
     paths
 }
 
+fn derive_session_edited_paths(cwd: &Path, history: &[ConversationTurn]) -> HashSet<String> {
+    let mut derived = HashSet::new();
+    for turn in history {
+        derived.extend(edited_paths_from_turn(cwd, turn));
+    }
+    derived
+}
+
 fn normalize_session_title(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed == DEFAULT_SESSION_NAME {
@@ -714,11 +722,7 @@ impl Session {
             });
         }
         let session_edited_paths = if manifest.session_edited_paths.is_empty() {
-            let mut derived = HashSet::new();
-            for turn in &history {
-                derived.extend(edited_paths_from_turn(&cwd, turn));
-            }
-            derived
+            derive_session_edited_paths(&cwd, &history)
         } else {
             manifest.session_edited_paths.iter().cloned().collect()
         };
@@ -781,6 +785,13 @@ impl Session {
         }
         let mut sorted: Vec<String> = self.session_edited_paths.iter().cloned().collect();
         sorted.sort();
+        self.manifest.session_edited_paths = sorted;
+    }
+
+    pub fn set_session_edited_paths(&mut self, paths: HashSet<String>) {
+        let mut sorted: Vec<String> = paths.iter().cloned().collect();
+        sorted.sort();
+        self.session_edited_paths = paths;
         self.manifest.session_edited_paths = sorted;
     }
 
@@ -2323,6 +2334,10 @@ impl SessionStore {
         let Some((manifest, mut history)) = loaded else {
             return false;
         };
+        let derived_session_edited_paths = manifest
+            .session_edited_paths
+            .is_empty()
+            .then(|| derive_session_edited_paths(cwd, &history));
 
         // Apply the in-memory sliding window before constructing the session,
         // so `Session.history.len()` never exceeds `max_history_turns`.
@@ -2368,6 +2383,9 @@ impl SessionStore {
                 return false;
             }
         };
+        if let Some(paths) = derived_session_edited_paths {
+            session.set_session_edited_paths(paths);
+        }
         session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
             let mut sessions = self.sessions.write().await;
@@ -2539,12 +2557,15 @@ impl SessionStore {
         ));
         let permission_scope_root = permission_scope_root(&cwd);
         let repo_always_allow = read_repo_always_allow_keys(&permission_scope_root);
+        let initial_dirty_paths = git_dirty_paths(&cwd);
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
             session.permission_scope_root = permission_scope_root;
             session.project_instructions = project_instructions;
             session.skills = skills;
             session.agents = agents;
+            session.set_initial_dirty_paths(initial_dirty_paths);
+            session.set_session_edited_paths(HashSet::new());
             session.set_always_allow_keys(repo_always_allow);
             // cwd changed -> previously-activated skills may no longer
             // be relevant. Clear so the model can re-activate against
@@ -3416,6 +3437,59 @@ mod tests {
         assert_eq!(session.model, "m");
         assert_eq!(session.history.len(), 1);
         assert_eq!(session.manifest.id, manifest.id);
+    }
+
+    #[tokio::test]
+    async fn load_into_memory_derives_session_edited_paths_before_trimming_history() {
+        let store = SessionStore::with_limits(
+            "test-model".to_string(),
+            SessionLimits {
+                max_sessions: 50,
+                max_history_turns: 1,
+            },
+        );
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir_all(cwd.path().join(".git")).expect("touch git");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        for idx in 0..3 {
+            store
+                .add_turn(
+                    &session.id,
+                    ConversationTurn {
+                        user_prompt: format!("u{idx}"),
+                        agent_response: format!("a{idx}"),
+                        tool_exchanges: vec![ToolExchange {
+                            call_id: format!("call-{idx}"),
+                            tool_name: "write_file".into(),
+                            arguments: format!(r#"{{"file_path":"file-{idx}.txt","content":"x"}}"#),
+                            result: "OK".into(),
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("turn should persist");
+        }
+
+        let zip_path = session_zip_path(cwd.path(), &session.id);
+        let mut manifest = read_manifest_from_zip(&zip_path).expect("manifest");
+        manifest.session_edited_paths.clear();
+        rewrite_manifest_in_zip(&zip_path, &manifest).expect("rewrite manifest");
+
+        store.sessions.write().await.remove(&session.id);
+
+        let loaded = store
+            .get_session(&session.id, cwd.path())
+            .await
+            .expect("session should reload");
+        assert_eq!(
+            loaded.history.len(),
+            1,
+            "history should still be trimmed in memory"
+        );
+        assert!(loaded.session_edited_paths().contains("file-0.txt"));
+        assert!(loaded.session_edited_paths().contains("file-1.txt"));
+        assert!(loaded.session_edited_paths().contains("file-2.txt"));
     }
 
     /// `trim_history` is a sliding window: when the cap is exceeded, the
@@ -4779,6 +4853,37 @@ mod tests {
         assert_eq!(after.cwd, cwd2);
 
         let _ = std::fs::remove_dir_all(&cwd1);
+    }
+
+    #[tokio::test]
+    async fn update_cwd_resets_commit_tracking_state() {
+        let store = SessionStore::new("m".to_string());
+        let cwd1 = tempfile::tempdir().expect("cwd1");
+        std::fs::create_dir_all(cwd1.path().join(".git")).expect("touch git1");
+        let session = store.create_session(cwd1.path().to_path_buf()).await;
+        {
+            let mut sessions = store.sessions.write().await;
+            let current = sessions.get_mut(&session.id).expect("session");
+            current.set_initial_dirty_paths(["old-dirty.txt".to_string()].into_iter().collect());
+            current.record_edited_paths(["old-edit.txt".to_string()]);
+        }
+
+        let cwd2 = tempfile::tempdir().expect("cwd2");
+        std::fs::create_dir_all(cwd2.path().join(".git")).expect("touch git2");
+        store
+            .update_cwd(&session.id, cwd2.path().to_path_buf())
+            .await;
+
+        let after = store
+            .sessions
+            .read()
+            .await
+            .get(&session.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(after.cwd, cwd2.path());
+        assert!(after.initial_dirty_paths().is_empty());
+        assert!(after.session_edited_paths().is_empty());
     }
 
     /// `update_cwd` must also re-discover subagents so the `task` tool's

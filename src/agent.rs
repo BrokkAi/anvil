@@ -4609,6 +4609,22 @@ fn render_commit_scope_guidance(plan: &CommitPlan) -> String {
     lines.join("\n")
 }
 
+fn build_commit_preview_cmd(scope: CommitScope, pathspec: &str) -> String {
+    let add_cmd = if matches!(scope, CommitScope::All) {
+        "GIT_INDEX_FILE=\"$tmp\" git add -A".to_string()
+    } else {
+        format!("GIT_INDEX_FILE=\"$tmp\" git add{pathspec}")
+    };
+    let diff_cmd = if matches!(scope, CommitScope::All) {
+        "GIT_INDEX_FILE=\"$tmp\" git diff --cached --stat && printf '\\n' && GIT_INDEX_FILE=\"$tmp\" git diff --cached".to_string()
+    } else {
+        format!(
+            "GIT_INDEX_FILE=\"$tmp\" git diff --cached --stat{pathspec} && printf '\\n' && GIT_INDEX_FILE=\"$tmp\" git diff --cached{pathspec}"
+        )
+    };
+    format!("tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT && {add_cmd} && {diff_cmd}")
+}
+
 /// Quote a string for `sh -c` by wrapping in single quotes and
 /// escaping any embedded single quote via the standard `'\''` trick.
 /// `run_shell_command` invokes `sh -c` with a single argv element, so
@@ -4766,21 +4782,9 @@ async fn handle_commit(
             .join(" ");
         format!(" -- {joined}")
     };
-    let add_cmd = if matches!(scope, CommitScope::All) {
-        "git add -A".to_string()
-    } else {
-        format!("git add{pathspec}")
-    };
-    if let Err(e) = run_or_report(registry, &add_cmd, "git add", policy).await {
-        return e;
-    }
-
-    let diff_cmd = if matches!(scope, CommitScope::All) {
-        "git diff --cached --stat && printf '\\n' && git diff --cached".to_string()
-    } else {
-        format!("git diff --cached --stat{pathspec} && printf '\\n' && git diff --cached{pathspec}")
-    };
-    let staged_diff = match run_or_report(registry, &diff_cmd, "git diff --cached", policy).await {
+    let preview_cmd = build_commit_preview_cmd(scope, &pathspec);
+    let staged_diff = match run_or_report(registry, &preview_cmd, "git diff --cached", policy).await
+    {
         Ok(diff) => diff,
         Err(e) => return e,
     };
@@ -4792,6 +4796,14 @@ async fn handle_commit(
         Ok(message) => message,
         Err(e) => return e,
     };
+    let add_cmd = if matches!(scope, CommitScope::All) {
+        "git add -A".to_string()
+    } else {
+        format!("git add{pathspec}")
+    };
+    if let Err(e) = run_or_report(registry, &add_cmd, "git add", policy).await {
+        return e;
+    }
     let commit_cmd = if matches!(scope, CommitScope::All) {
         format!("git commit -m {}", shell_single_quote(&message))
     } else {
@@ -5416,6 +5428,20 @@ mod tests {
         assert_eq!(plan.session_paths, vec!["src/lib.rs"]);
         assert_eq!(plan.outside_paths, vec!["manual.txt", "preexisting.txt"]);
         assert_eq!(plan.commit_paths, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn build_commit_preview_cmd_uses_temporary_index() {
+        let scoped = build_commit_preview_cmd(CommitScope::Session, " -- 'src/lib.rs'");
+        assert!(scoped.contains("tmp=$(mktemp)"));
+        assert!(scoped.contains("GIT_INDEX_FILE=\"$tmp\" git add -- 'src/lib.rs'"));
+        assert!(
+            scoped.contains("GIT_INDEX_FILE=\"$tmp\" git diff --cached --stat -- 'src/lib.rs'")
+        );
+
+        let all = build_commit_preview_cmd(CommitScope::All, "");
+        assert!(all.contains("GIT_INDEX_FILE=\"$tmp\" git add -A"));
+        assert!(all.contains("GIT_INDEX_FILE=\"$tmp\" git diff --cached --stat"));
     }
 
     #[test]
