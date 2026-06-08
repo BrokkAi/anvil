@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.10.1"
+version = "0.10.3"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"
@@ -24,7 +24,7 @@ name = "anvil"
 path = "src/main.rs"
 
 [dependencies]
-agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"] }
+agent-client-protocol = { version = "0.13.1", features = ["unstable_session_usage"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
@@ -50,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 rustls-native-certs = "0.8"
+sha2 = "0.10"
 # Codex login. We deliberately avoid single-maintainer credential crates:
 # `oauth2` is the de-facto Rust OAuth2 implementation (~32M downloads,
 # depended on by Servo etc.) and gives us PKCE + refresh. The RFC 8693
@@ -85,11 +86,6 @@ libc = "0.2"
 # `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
 # used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
-# Used by the bifrost test fixture (`mcp::tests`) to verify
-# the downloaded release archive against its `.sha256` sidecar before
-# extraction, mirroring what `brokk-code/brokk_code/rust_acp_install.py`
-# already does for the production install path.
-sha2 = "0.10"
 # Used by `agents_md` tests to build throwaway project trees (`.git`
 # marker + AGENTS.md/CLAUDE.md fixtures) without polluting the working
 # directory.

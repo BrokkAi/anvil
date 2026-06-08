@@ -24,6 +24,7 @@ mod session;
 mod setup_state;
 mod skills;
 mod structured_output;
+mod terminal_notifications;
 mod tokens;
 mod tool_loop;
 mod tools;
@@ -73,8 +74,8 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     max_history_turns: usize,
 
-    /// DEPRECATED. MCP servers are configured with `/mcp`; Bifrost is preinstalled
-    /// there as `bifrost --root {cwd} --server core`.
+    /// DEPRECATED. MCP servers are configured with `/mcp`; Anvil now manages
+    /// its own pinned local Bifrost binary for the built-in MCP server.
     #[arg(long, env = "BROKK_BIFROST_BINARY", hide = true)]
     bifrost_binary: Option<PathBuf>,
 
@@ -428,9 +429,34 @@ async fn main() -> Result<()> {
     }
     if args.bifrost_binary.is_some() {
         tracing::warn!(
-            "--bifrost-binary is deprecated and ignored. Bifrost is now the preinstalled \
-             MCP server; use `/mcp` to view or change MCP server configuration."
+            "--bifrost-binary is deprecated and ignored. Anvil now manages a pinned local \
+             Bifrost MCP server; use `/mcp` to view or change MCP server configuration."
         );
+    }
+
+    {
+        let legacy = crate::setup_state::read();
+        if !legacy.always_allow.is_empty() {
+            tracing::warn!(
+                count = legacy.always_allow.len(),
+                "setup.json contains install-wide Always allow approvals that are no longer \
+                 used. Per-repo approvals are now stored in .brokk/permissions.json inside \
+                 each repository. Re-approve the tools you want in each repository.",
+            );
+        }
+    }
+
+    match crate::mcp::ensure_bundled_bifrost().await {
+        Ok(path) => tracing::info!(
+            bifrost = %path.display(),
+            version = crate::mcp::BUNDLED_BIFROST_VERSION,
+            "bundled bifrost ready"
+        ),
+        Err(e) => tracing::warn!(
+            version = crate::mcp::BUNDLED_BIFROST_VERSION,
+            error = %e,
+            "failed to prepare bundled bifrost; built-in Bifrost MCP tools may be unavailable"
+        ),
     }
 
     let bedrock_backend = build_bedrock_backend();

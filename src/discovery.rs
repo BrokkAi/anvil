@@ -111,11 +111,14 @@ pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 /// Build a short-timeout HTTP client tuned for discovery. Ollama is local;
 /// if it's not running we want to fail fast, not block startup for 30s.
 pub fn discovery_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("failed to build discovery HTTP client")
+    crate::llm_client::OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5)),
+        OLLAMA_DEFAULT_URL,
+    )
+    .build()
+    .expect("failed to build discovery HTTP client")
 }
 
 /// Query Ollama's OpenAI-compatible `/v1/models` endpoint. Recent Ollama

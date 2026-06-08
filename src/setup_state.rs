@@ -3,10 +3,11 @@
 //! This is intentionally not the source of truth for whether models work.
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
-//! setup screen and the last selected model/reasoning effort/sandbox mode so
-//! configured installs get a short hint instead of the full welcome on every
-//! new session. It also stores user-configured MCP servers; when that field is
-//! absent, Anvil seeds the config with its preinstalled servers.
+//! setup screen and the last selected
+//! model/reasoning effort/sandbox mode so configured installs get a short hint
+//! instead of the full welcome on every new session. It also stores
+//! user-configured MCP servers; when that field is absent, Anvil seeds the
+//! config with its preinstalled servers.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,11 @@ pub struct SetupState {
     pub last_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    /// Legacy install-wide approvals from older builds. Current builds use
+    /// repo-local `.brokk/permissions.json` instead, but we still deserialize
+    /// this field for backward compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "alwaysAllow")]
+    pub always_allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
 }
@@ -55,11 +61,11 @@ impl Drop for TestConfigHomeScope {
     }
 }
 
-pub fn path() -> Result<PathBuf> {
+pub(crate) fn config_home() -> Result<PathBuf> {
     #[cfg(test)]
     {
         if let Some(custom) = TEST_CONFIG_HOME.with(|slot| slot.borrow().clone()) {
-            Ok(custom.join("setup.json"))
+            Ok(custom)
         } else {
             Err(anyhow::anyhow!(
                 "test setup state path is unset; use TestConfigHomeScope"
@@ -71,14 +77,18 @@ pub fn path() -> Result<PathBuf> {
         if let Ok(custom) = std::env::var("BROKK_CONFIG_HOME")
             && !custom.trim().is_empty()
         {
-            Ok(PathBuf::from(custom).join("setup.json"))
+            Ok(PathBuf::from(custom))
         } else {
             let base = dirs::config_dir().ok_or_else(|| {
                 anyhow::anyhow!("could not resolve OS config directory for setup state")
             })?;
-            Ok(base.join("brokk").join("setup.json"))
+            Ok(base.join("brokk"))
         }
     }
+}
+
+pub fn path() -> Result<PathBuf> {
+    Ok(config_home()?.join("setup.json"))
 }
 
 pub fn read() -> SetupState {
@@ -113,15 +123,8 @@ pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
     let mut servers = read()
         .mcp_servers
         .unwrap_or_else(crate::mcp::default_servers);
-    let bifrost = crate::mcp::McpServerConfig::bifrost();
     for server in &mut servers {
-        if server.name == bifrost.name
-            && server.command == bifrost.command
-            && server.args == bifrost.args
-            && server.framing == crate::mcp::McpFraming::ContentLength
-        {
-            server.framing = bifrost.framing;
-        }
+        crate::mcp::normalize_preinstalled_bifrost_server(server);
     }
     servers
 }
@@ -185,4 +188,67 @@ fn write_inner(state: &SetupState) -> Result<()> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_mcp_servers_migrates_legacy_bifrost_command_to_managed_binary() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: "bifrost".to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::ContentLength,
+            enabled: true,
+        }])
+        .expect("remember mcp servers");
+
+        let servers = read_mcp_servers();
+        let bifrost = servers
+            .into_iter()
+            .find(|server| server.name == "bifrost")
+            .expect("bifrost server");
+
+        assert_eq!(
+            bifrost.command,
+            crate::mcp::McpServerConfig::bifrost().command
+        );
+        assert!(
+            bifrost
+                .command
+                .contains(crate::mcp::BUNDLED_BIFROST_VERSION),
+            "expected managed bifrost command to contain pinned version '{}', got: '{}'",
+            crate::mcp::BUNDLED_BIFROST_VERSION,
+            bifrost.command,
+        );
+        assert_eq!(bifrost.framing, crate::mcp::McpFraming::Line);
+    }
+
+    #[test]
+    fn read_mcp_servers_preserves_custom_bifrost_command() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: "/tmp/custom-bifrost".to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp servers");
+
+        let servers = read_mcp_servers();
+        let bifrost = servers
+            .into_iter()
+            .find(|server| server.name == "bifrost")
+            .expect("bifrost server");
+
+        assert_eq!(bifrost.command, "/tmp/custom-bifrost");
+    }
 }

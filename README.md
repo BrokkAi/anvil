@@ -24,14 +24,18 @@ one reusable ACP subprocess and put a small client in front of it.
   `codex::gpt-5-codex`, `ollama::llama3:latest`, and
   `openrouter::anthropic/claude-sonnet-4.5`.
 - **MCP-native extensibility.** Anvil manages stdio MCP servers per session.
-  Bifrost is preinstalled as an MCP server for symbol search, cross-references,
-  and structural analysis.
+  Bifrost is preinstalled as a pinned, Anvil-managed local MCP server for
+  symbol search, cross-references, and structural analysis.
 - **Real agent tooling.** Built-in file reads/writes, grep, directory listing,
   shell execution, explicit `think`, MCP tools, subagents, and skill slash
   commands.
 - **Designed for unattended and attended flows.** Clients can run read-only,
   ask before edits, auto-accept edits, or trust all tool calls. Permission
   prompts are protocol messages, not hardcoded UI.
+- **Terminal attention hooks for interactive runs.** When `stderr` is a real
+  terminal, Anvil rings the terminal bell when it opens a permission prompt and
+  when a turn finishes. Set `BROKK_TERMINAL_NOTIFICATIONS=off` to disable it,
+  or choose events with `prompt`, `turn-ended`, or `prompt,turn-ended`.
 - **Persistent working memory.** Sessions are stored on disk, can be loaded or
   resumed, and support context reports plus automatic or manual compression.
 
@@ -198,6 +202,8 @@ Built-in commands:
 - `/permissions`: change edit/command approvals and remembered Always allow
   entries.
 - `/context`: show the current session context snapshot and token estimate.
+- `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or
+  prompt on an interval until the session is cancelled.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
@@ -212,10 +218,11 @@ Anvil reads MCP server configuration from its config file and manages stdio MCP
 subprocesses per session. New servers default to standard `Content-Length` MCP
 stdio framing; use `--framing line` only for NDJSON-speaking servers.
 
-Bifrost is preinstalled as an enabled MCP server:
+Bifrost is preinstalled as an enabled MCP server backed by Anvil's managed
+local binary:
 
 ```text
-bifrost --root {cwd} --server core  # line framing
+<managed-bifrost> --root {cwd} --server core  # line framing
 ```
 
 Use `/mcp` in the editor to list or change MCP servers:
@@ -241,8 +248,8 @@ Bifrost provides structural code-intelligence tools such as:
 
 Permission mode controls whether Anvil asks before tool calls:
 
-- `default`: ask before edits and shell commands.
-- `acceptEdits`: allow file edits, ask before shell commands.
+- `default`: ask before edits, and before shell commands except for a conservative auto-approved subset of sandboxed read-only commands.
+- `acceptEdits`: allow file edits, and ask before shell commands except for a conservative auto-approved subset of sandboxed read-only commands.
 - `readOnly`: block edits and shell commands.
 - `bypassPermissions`: allow tool calls without prompting.
 
@@ -255,8 +262,8 @@ Use:
 /permissions trusted
 ```
 
-Approvals remembered through an **Always allow** prompt are session-scoped and
-can be inspected or revoked with:
+Approvals remembered through an **Always allow** prompt are stored in Anvil's
+setup state on disk and can be inspected or revoked with:
 
 ```text
 /permissions list

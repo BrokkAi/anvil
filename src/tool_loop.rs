@@ -22,6 +22,9 @@ use crate::llm_client::{
 };
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::structured_output::StructuredOutputRequest;
+use crate::terminal_notifications::{
+    TerminalNotificationEvent, emit as emit_terminal_notification,
+};
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 use crate::trace_logging::append_trace_record;
@@ -400,8 +403,9 @@ enum PureGateDecision {
 fn pure_gate_decision(
     mode: PermissionMode,
     kind: ToolKind,
-    _tool_name: &str,
+    tool_name: &str,
     is_always_allowed: bool,
+    shell_auto_allow: bool,
 ) -> PureGateDecision {
     // bypassPermissions: trust everything. Explicit user opt-out of the gate.
     if matches!(mode, PermissionMode::BypassPermissions) {
@@ -426,19 +430,29 @@ fn pure_gate_decision(
         );
     }
 
-    // Mode-independent auto-allow: pure-info kinds never mutate.
+    // Mode-independent auto-allow: pure-info kinds never mutate. In addition,
+    // sandboxed shell commands that fit a conservative read-only safelist may
+    // run without a prompt in the editable modes; the OS sandbox remains the
+    // hard boundary for filesystem writes.
     let auto_allow = match kind {
         ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch => true,
         ToolKind::Edit if matches!(mode, PermissionMode::AcceptEdits) => true,
+        ToolKind::Execute
+            if tool_name == "run_shell_command"
+                && matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits)
+                && shell_auto_allow =>
+        {
+            true
+        }
         _ => false,
     };
     if auto_allow {
         return PureGateDecision::Allow;
     }
 
-    // In-session "Always allow". `consult_gate` chooses the cache key; shell
-    // commands use the exact command plus cwd, while regular tools use the
-    // tool name.
+    // Remembered "Always allow". `consult_gate` chooses the cache key; shell
+    // commands use repo-scoped prefix or exact-command keys, while regular
+    // tools use the tool name.
     if is_always_allowed {
         return PureGateDecision::Allow;
     }
@@ -446,14 +460,181 @@ fn pure_gate_decision(
     PureGateDecision::Prompt
 }
 
+fn should_auto_allow_shell_command(
+    raw_input: &Value,
+    mode: PermissionMode,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
+) -> bool {
+    if !matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits) {
+        return false;
+    }
+    if !shell_sandboxed {
+        return false;
+    }
+    if crate::sandbox_backend::resolve_mode(sandbox_mode) != crate::sandbox_backend::SandboxMode::Os
+    {
+        return false;
+    }
+
+    raw_input
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_auto_approvable_sandboxed_shell_command)
+}
+
+fn is_auto_approvable_sandboxed_shell_command(command: &str) -> bool {
+    let Some(tokens) = tokenize_simple_shell_command(command) else {
+        return false;
+    };
+
+    let Some(program) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+
+    match program {
+        "pwd" | "id" | "whoami" | "uname" | "echo" | "ls" | "cat" | "head" | "tail" | "wc"
+        | "cut" | "tr" | "sort" | "uniq" | "nl" | "stat" | "which" | "grep" | "rg" => {
+            !tokens_request_file_write(&tokens)
+        }
+        "find" => is_safe_find_command(&tokens),
+        "sed" => is_safe_sed_command(&tokens),
+        "awk" => is_safe_awk_command(&tokens),
+        "git" => is_safe_git_command(&tokens),
+        _ => false,
+    }
+}
+
+fn tokenize_simple_shell_command(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuoteState {
+        Plain,
+        Single,
+        Double,
+    }
+
+    let mut state = QuoteState::Plain;
+    let mut current = String::new();
+    let mut tokens = Vec::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match state {
+            QuoteState::Plain => match ch {
+                '\n' | '\r' => return None,
+                ch if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                '\'' => state = QuoteState::Single,
+                '"' => state = QuoteState::Double,
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(escaped);
+                }
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?'
+                | '!' | '`' | '$' => return None,
+                ch if ch.is_control() => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Single => match ch {
+                '\'' => state = QuoteState::Plain,
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Double => match ch {
+                '"' => state = QuoteState::Plain,
+                '$' | '`' => return None,
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(escaped);
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if state != QuoteState::Plain {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
+fn tokens_request_file_write(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-i" | "-o" | "-f" | "--in-place" | "--output"
+        ) || token.starts_with("--in-place=")
+            || token.starts_with("--output=")
+    })
+}
+
+fn is_safe_find_command(tokens: &[String]) -> bool {
+    if tokens_request_file_write(tokens) {
+        return false;
+    }
+    !tokens.iter().skip(1).any(|token| {
+        matches!(
+            token.as_str(),
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fls"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-ls"
+                | "-print"
+                | "-print0"
+                | "-printf"
+                | "-prune"
+                | "-quit"
+        )
+    })
+}
+
+fn is_safe_sed_command(tokens: &[String]) -> bool {
+    !tokens_request_file_write(tokens)
+}
+
+fn is_safe_awk_command(tokens: &[String]) -> bool {
+    !tokens_request_file_write(tokens)
+}
+
+fn is_safe_git_command(tokens: &[String]) -> bool {
+    if tokens.len() < 2 || tokens[1].starts_with('-') {
+        return false;
+    }
+
+    matches!(
+        tokens[1].as_str(),
+        "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
+    )
+}
+
 fn shell_command_will_run_sandboxed(
     permission_mode: PermissionMode,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
 ) -> bool {
-    !matches!(
-        SandboxPolicy::resolve(permission_mode, sandbox_mode),
-        SandboxPolicy::None
-    )
+    crate::tools::sandbox::shell_command_will_run_sandboxed(permission_mode, sandbox_mode)
 }
 
 fn always_allow_key(
@@ -475,6 +656,55 @@ fn always_allow_key(
     }
 
     tool_name.to_string()
+}
+
+fn shell_always_allow_rule_key(raw_input: &Value, shell_sandboxed: bool) -> Option<String> {
+    let command = raw_input.get("command").and_then(Value::as_str)?;
+    if let Some(tokens) = tokenize_simple_shell_command(command) {
+        let argv_prefix: Vec<String> = tokens.into_iter().take(3).collect();
+        if !argv_prefix.is_empty() {
+            return Some(
+                serde_json::json!({
+                    "tool": "run_shell_command",
+                    "rule": "prefix",
+                    "argvPrefix": argv_prefix,
+                    "shellSandboxed": shell_sandboxed,
+                })
+                .to_string(),
+            );
+        }
+    }
+
+    Some(
+        serde_json::json!({
+            "tool": "run_shell_command",
+            "rule": "exact",
+            "command": command,
+            "shellSandboxed": shell_sandboxed,
+        })
+        .to_string(),
+    )
+}
+
+fn always_allow_lookup_keys(
+    tool_name: &str,
+    raw_input: &Value,
+    cwd: &Path,
+    shell_sandboxed: bool,
+) -> Vec<String> {
+    if tool_name == "run_shell_command" {
+        let mut keys = Vec::with_capacity(2);
+        if let Some(rule_key) = shell_always_allow_rule_key(raw_input, shell_sandboxed) {
+            keys.push(rule_key);
+        }
+        let legacy_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
+        if !legacy_key.is_empty() {
+            keys.push(legacy_key);
+        }
+        return keys;
+    }
+
+    vec![tool_name.to_string()]
 }
 
 /// Decide which sandbox policy to use for an approved tool call.
@@ -579,8 +809,13 @@ pub(crate) async fn run(
         if cancel.is_cancelled() {
             break;
         }
+        let permission_mode = sessions
+            .permission_mode(&session_id)
+            .await
+            .unwrap_or(PermissionMode::ReadOnly);
         if train_bifrost
             && should_emit_no_edit_progress_nudge(
+                permission_mode,
                 turn,
                 max_turns,
                 &tool_exchanges,
@@ -670,7 +905,12 @@ pub(crate) async fn run(
                 trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
                 if train_bifrost
-                    && should_reject_no_edit_final_answer(turn, max_turns, &tool_exchanges)
+                    && should_reject_no_edit_final_answer(
+                        permission_mode,
+                        turn,
+                        max_turns,
+                        &tool_exchanges,
+                    )
                 {
                     match build_train_bifrost_nudge(
                         llm,
@@ -786,12 +1026,17 @@ pub(crate) async fn run(
                         }
                     };
 
-                    // Refuse outright if the permission card would hide
-                    // input. Oversized titles wrap the approval modal and
-                    // oversized multiline shell content gets truncated, so in
-                    // both cases the user could authorize a call they can't
-                    // fully read. Reject instead of hiding details; the LLM can
-                    // retry with smaller arguments.
+                    // Refuse outright if the permission card would hide input.
+                    // Two separate gates apply:
+                    //   • Non-shell tools: title length capped at
+                    //     MAX_TOOL_TITLE_CHARS (1024 chars).
+                    //   • Shell commands: full command text capped at
+                    //     MAX_INLINE_OUTPUT_BYTES (50 000 bytes). The modal
+                    //     title carries the full command for clients that only
+                    //     render the title, so the content-size bound is the
+                    //     right limit for shell.
+                    // Reject rather than truncating; the LLM can retry with
+                    // smaller arguments.
                     if let Some(reason) = announce::rejection_for_oversized_title(
                         &tool_name,
                         &parsed_input,
@@ -802,7 +1047,7 @@ pub(crate) async fn run(
                         tracing::warn!(
                             session_id = %session_id,
                             tool_name = %tool_name,
-                            title_chars = announce::tool_title(&tool_name, &parsed_input)
+                            title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
                                 .chars()
                                 .count(),
                             "rejecting tool call: rendered permission card would hide input",
@@ -834,6 +1079,45 @@ pub(crate) async fn run(
                             tool_name: tool_name.clone(),
                             arguments: call.function.arguments.clone(),
                             result: reason,
+                        });
+                        continue;
+                    }
+
+                    if let Some(message) = deterministic_gate_rejection(
+                        &sessions,
+                        &session_id,
+                        &tool_name,
+                        kind,
+                        &parsed_input,
+                        registry.cwd(),
+                    )
+                    .await
+                    {
+                        let (blocked_call, failed_update) = blocked_tool_call_updates(
+                            &call.id,
+                            &tool_name,
+                            kind,
+                            &parsed_input,
+                            &message,
+                        );
+                        maybe_send_session_update(
+                            notifications,
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCall(blocked_call),
+                        );
+                        maybe_send_session_update(
+                            notifications,
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCallUpdate(failed_update),
+                        );
+                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
+                        tool_exchanges.push(ToolExchange {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            result: message,
                         });
                         continue;
                     }
@@ -878,14 +1162,16 @@ pub(crate) async fn run(
                     // Consult the gate before announcing or executing the call.
                     let decision = consult_gate(
                         &sessions,
-                        &session_id,
                         &spawned_cx,
                         &cancel,
-                        &tool_name,
-                        kind,
-                        &call.id,
-                        &parsed_input,
-                        registry.cwd(),
+                        GateCheck {
+                            session_id: &session_id,
+                            tool_name: &tool_name,
+                            kind,
+                            tool_call_id: &call.id,
+                            raw_input: &parsed_input,
+                            cwd: registry.cwd(),
+                        },
                     )
                     .await;
 
@@ -1078,20 +1364,37 @@ pub(crate) async fn run(
     (full_response, tool_exchanges, turn_usage)
 }
 
-/// Apply the per-call permission policy. Returns `Allow` if the tool should
-/// execute, or `Reject(msg)` to feed the LLM a denial message instead.
-#[allow(clippy::too_many_arguments)]
-async fn consult_gate(
-    sessions: &SessionStore,
-    session_id: &str,
-    spawned_cx: &SpawnedCx<'_>,
-    cancel: &CancellationToken,
+fn blocked_tool_call_updates(
+    tool_call_id: &str,
     tool_name: &str,
     kind: ToolKind,
-    tool_call_id: &str,
+    raw_input: &Value,
+    reason: &str,
+) -> (agent_client_protocol::schema::ToolCall, ToolCallUpdate) {
+    (
+        announce::blocked_tool_call(tool_call_id, tool_name, kind, raw_input, reason),
+        announce::update_failed(
+            tool_call_id,
+            reason,
+            Some(Value::String(reason.to_string())),
+        ),
+    )
+}
+
+struct PureGateEvaluation {
+    decision: PureGateDecision,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
+}
+
+async fn evaluate_pure_gate(
+    sessions: &SessionStore,
+    session_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
     raw_input: &Value,
     cwd: &Path,
-) -> GateDecision {
+) -> Result<PureGateEvaluation, String> {
     let mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
         None => {
@@ -1100,25 +1403,79 @@ async fn consult_gate(
                 tool_name,
                 "permission gate: session not found; refusing tool"
             );
-            return GateDecision::Reject(
-                "Tool use denied: session is no longer registered. \
+            return Err("Tool use denied: session is no longer registered. \
                  Start a new prompt to continue."
-                    .to_string(),
-            );
+                .to_string());
         }
     };
     let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
     let shell_sandboxed =
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
-    let always_allow_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
+    let shell_auto_allow = tool_name == "run_shell_command"
+        && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
+    let always_allow_keys = always_allow_lookup_keys(tool_name, raw_input, cwd, shell_sandboxed);
     let is_always_allowed = sessions
-        .is_always_allowed(session_id, &always_allow_key)
+        .is_any_always_allowed(session_id, &always_allow_keys)
         .await;
+    let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
 
-    match pure_gate_decision(mode, kind, tool_name, is_always_allowed) {
+    Ok(PureGateEvaluation {
+        decision,
+        sandbox_mode,
+        shell_sandboxed,
+    })
+}
+
+/// Return a deterministic permission denial, if one exists before any user
+/// prompt is needed. Promptable calls still go through `consult_gate` after
+/// the pending card is emitted so the permission modal has a matching card id.
+async fn deterministic_gate_rejection(
+    sessions: &SessionStore,
+    session_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+    cwd: &Path,
+) -> Option<String> {
+    match evaluate_pure_gate(sessions, session_id, tool_name, kind, raw_input, cwd).await {
+        Err(msg) => Some(msg),
+        Ok(PureGateEvaluation {
+            decision: PureGateDecision::Reject(msg),
+            ..
+        }) => Some(msg),
+        Ok(PureGateEvaluation {
+            decision: PureGateDecision::Allow | PureGateDecision::Prompt,
+            ..
+        }) => None,
+    }
+}
+
+/// Apply the per-call permission policy. Returns `Allow` if the tool should
+/// execute, or `Reject(msg)` to feed the LLM a denial message instead.
+async fn consult_gate(
+    sessions: &SessionStore,
+    spawned_cx: &SpawnedCx<'_>,
+    cancel: &CancellationToken,
+    request: GateCheck<'_>,
+) -> GateDecision {
+    let evaluation = match evaluate_pure_gate(
+        sessions,
+        request.session_id,
+        request.tool_name,
+        request.kind,
+        request.raw_input,
+        request.cwd,
+    )
+    .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(reason) => return GateDecision::Reject(reason),
+    };
+
+    match evaluation.decision {
         PureGateDecision::Allow => GateDecision::Allow {
             sandbox_policy_override: None,
-            sandbox_mode,
+            sandbox_mode: evaluation.sandbox_mode,
         },
         PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
         PureGateDecision::Prompt => {
@@ -1126,12 +1483,12 @@ async fn consult_gate(
                 spawned_cx,
                 cancel,
                 PermissionRequest {
-                    session_id,
-                    tool_name,
-                    kind,
-                    tool_call_id,
-                    raw_input,
-                    shell_sandboxed,
+                    session_id: request.session_id,
+                    tool_name: request.tool_name,
+                    kind: request.kind,
+                    tool_call_id: request.tool_call_id,
+                    raw_input: request.raw_input,
+                    shell_sandboxed: evaluation.shell_sandboxed,
                 },
             )
             .await
@@ -1140,13 +1497,24 @@ async fn consult_gate(
                     // Awaited inline so the next tool call in the same batch
                     // sees the updated set without re-prompting.
                     if grant.allow_always && grant.sandbox_policy_override.is_none() {
-                        sessions
-                            .add_always_allow(session_id, &always_allow_key)
-                            .await;
+                        if request.tool_name == "run_shell_command" {
+                            if let Some(rule_key) = shell_always_allow_rule_key(
+                                request.raw_input,
+                                evaluation.shell_sandboxed,
+                            ) {
+                                sessions
+                                    .add_always_allow(request.session_id, &rule_key)
+                                    .await;
+                            }
+                        } else {
+                            sessions
+                                .add_always_allow(request.session_id, request.tool_name)
+                                .await;
+                        }
                     }
                     GateDecision::Allow {
                         sandbox_policy_override: grant.sandbox_policy_override,
-                        sandbox_mode,
+                        sandbox_mode: evaluation.sandbox_mode,
                     }
                 }
                 Err(reason) => GateDecision::Reject(reason),
@@ -1158,6 +1526,15 @@ async fn consult_gate(
 /// Send `session/request_permission` to the client and await the outcome.
 /// Returns `Ok(grant)` if the user approved (with or without remembering),
 /// or `Err(reason)` describing the rejection or transport failure.
+struct GateCheck<'a> {
+    session_id: &'a str,
+    tool_name: &'a str,
+    kind: ToolKind,
+    tool_call_id: &'a str,
+    raw_input: &'a Value,
+    cwd: &'a Path,
+}
+
 struct PermissionRequest<'a> {
     session_id: &'a str,
     tool_name: &'a str,
@@ -1182,15 +1559,23 @@ async fn request_user_permission(
     } = request;
 
     // The permission modal needs to show *what* is being approved, not just
-    // the tool kind. Reuse the same title-builder the standalone tool-call
-    // card uses so e.g. ``Run `cargo test` `` appears in the prompt.
+    // the tool kind. Shell commands use a dedicated builder that includes the
+    // full command text because some clients only surface the modal title.
     //
     // Assumes the caller has already filtered oversized titles via
     // `announce::rejection_for_oversized_title` in `run`; the debug assert
     // catches any future path that reaches the modal without that gate.
-    let title = announce::tool_title(tool_name, raw_input);
+    let title = announce::permission_prompt_title(tool_name, raw_input);
+    // Shell titles carry the full command and are bounded at MAX_INLINE_OUTPUT_BYTES
+    // by rejection_for_oversized_input_content; non-shell titles are bounded at
+    // MAX_TOOL_TITLE_CHARS by rejection_for_oversized_title.
+    let max_title_chars = if tool_name == "run_shell_command" {
+        announce::MAX_INLINE_OUTPUT_BYTES
+    } else {
+        announce::MAX_TOOL_TITLE_CHARS
+    };
     debug_assert!(
-        title.chars().count() <= announce::MAX_TOOL_TITLE_CHARS,
+        title.chars().count() <= max_title_chars,
         "request_user_permission: oversized title bypassed the pre-gate check \
          (tool={tool_name}, chars={})",
         title.chars().count()
@@ -1206,6 +1591,7 @@ async fn request_user_permission(
     let options = permission_options(tool_name, shell_sandboxed);
 
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
+    emit_terminal_notification(TerminalNotificationEvent::Prompt);
 
     // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
     // on `run` above. We deliberately do not apply a local timeout here: ACP
@@ -1336,10 +1722,14 @@ fn trace_bifrost_context_shadow(
 }
 
 fn should_reject_no_edit_final_answer(
+    permission_mode: PermissionMode,
     turn: usize,
     max_turns: usize,
     tool_exchanges: &[ToolExchange],
 ) -> bool {
+    if matches!(permission_mode, PermissionMode::ReadOnly) {
+        return false;
+    }
     if turn >= max_turns - 1 || has_successful_file_change(tool_exchanges) {
         return false;
     }
@@ -1380,11 +1770,15 @@ async fn build_train_bifrost_nudge(
 }
 
 fn should_emit_no_edit_progress_nudge(
+    permission_mode: PermissionMode,
     turn: usize,
     max_turns: usize,
     tool_exchanges: &[ToolExchange],
     nudge_count: usize,
 ) -> bool {
+    if matches!(permission_mode, PermissionMode::ReadOnly) {
+        return false;
+    }
     if nudge_count >= 2 || has_successful_file_change(tool_exchanges) {
         return false;
     }
@@ -1835,8 +2229,9 @@ mod tests {
         kind: ToolKind,
         tool_name: &str,
         allowed: bool,
+        shell_auto_allow: bool,
     ) -> PureGateDecision {
-        pure_gate_decision(mode, kind, tool_name, allowed)
+        pure_gate_decision(mode, kind, tool_name, allowed, shell_auto_allow)
     }
 
     #[test]
@@ -2135,7 +2530,18 @@ mod tests {
     fn no_edit_final_guard_rejects_navigation_only_final_before_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
 
-        assert!(should_reject_no_edit_final_answer(3, 10, &prior));
+        assert!(should_reject_no_edit_final_answer(
+            PermissionMode::Default,
+            3,
+            10,
+            &prior
+        ));
+        assert!(!should_reject_no_edit_final_answer(
+            PermissionMode::ReadOnly,
+            3,
+            10,
+            &prior
+        ));
     }
 
     #[test]
@@ -2147,7 +2553,12 @@ mod tests {
             result: "Edited 'src/lib.rs' (1 replacement)".to_string(),
         }];
 
-        assert!(!should_reject_no_edit_final_answer(3, 10, &prior));
+        assert!(!should_reject_no_edit_final_answer(
+            PermissionMode::Default,
+            3,
+            10,
+            &prior
+        ));
         assert!(has_successful_file_change(&prior));
     }
 
@@ -2155,7 +2566,12 @@ mod tests {
     fn no_edit_final_guard_does_not_reject_on_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
 
-        assert!(!should_reject_no_edit_final_answer(9, 10, &prior));
+        assert!(!should_reject_no_edit_final_answer(
+            PermissionMode::Default,
+            9,
+            10,
+            &prior
+        ));
     }
 
     #[test]
@@ -2168,9 +2584,34 @@ mod tests {
             exchange_for_test("read_file"),
         ];
 
-        assert!(should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
-        assert!(!should_emit_no_edit_progress_nudge(7, 25, &prior, 0));
-        assert!(!should_emit_no_edit_progress_nudge(8, 25, &prior, 2));
+        assert!(should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            8,
+            25,
+            &prior,
+            0
+        ));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::ReadOnly,
+            8,
+            25,
+            &prior,
+            0
+        ));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            7,
+            25,
+            &prior,
+            0
+        ));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            8,
+            25,
+            &prior,
+            2
+        ));
     }
 
     #[test]
@@ -2183,8 +2624,20 @@ mod tests {
             exchange_for_test("read_file"),
         ];
 
-        assert!(!should_emit_no_edit_progress_nudge(7, 25, &prior, 0));
-        assert!(should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            7,
+            25,
+            &prior,
+            0
+        ));
+        assert!(should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            8,
+            25,
+            &prior,
+            0
+        ));
     }
 
     #[test]
@@ -2205,7 +2658,13 @@ mod tests {
             },
         ];
 
-        assert!(!should_emit_no_edit_progress_nudge(12, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            12,
+            25,
+            &prior,
+            0
+        ));
     }
 
     #[test]
@@ -2219,7 +2678,13 @@ mod tests {
             ToolKind::Other,
         ] {
             assert_eq!(
-                decide(PermissionMode::BypassPermissions, kind, "anything", false),
+                decide(
+                    PermissionMode::BypassPermissions,
+                    kind,
+                    "anything",
+                    false,
+                    false
+                ),
                 PureGateDecision::Allow,
                 "bypass should allow {:?} regardless of always-allow",
                 kind
@@ -2236,7 +2701,7 @@ mod tests {
             ToolKind::Fetch,
         ] {
             assert_eq!(
-                decide(PermissionMode::ReadOnly, kind, "anything", false),
+                decide(PermissionMode::ReadOnly, kind, "anything", false, false),
                 PureGateDecision::Allow,
                 "read-only should allow info kind {:?}",
                 kind
@@ -2257,13 +2722,126 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decide(PermissionMode::ReadOnly, kind, "any", true),
+                    decide(PermissionMode::ReadOnly, kind, "any", true, false),
                     PureGateDecision::Reject(_)
                 ),
                 "read-only should reject {:?} even when always-allowed",
                 kind
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_preflight_rejects_mutation_tools_before_execution() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+
+        let cases = [
+            (
+                "write_file",
+                ToolRegistry::tool_kind("write_file"),
+                serde_json::json!({"file_path": "app.js", "content": "x"}),
+            ),
+            (
+                "edit",
+                ToolRegistry::tool_kind("edit"),
+                serde_json::json!({"file_path": "app.js", "old_string": "x", "new_string": "y"}),
+            ),
+            (
+                "run_shell_command",
+                ToolRegistry::tool_kind("run_shell_command"),
+                serde_json::json!({"command": "touch app.js"}),
+            ),
+            (
+                "task",
+                ToolRegistry::tool_kind("task"),
+                serde_json::json!({"subagent_type": "reviewer", "prompt": "edit app.js"}),
+            ),
+        ];
+
+        for (tool_name, kind, input) in cases {
+            let rejection = deterministic_gate_rejection(
+                &store,
+                &session.id,
+                tool_name,
+                kind,
+                &input,
+                cwd.path(),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{tool_name} should be rejected before execution"));
+
+            assert!(
+                rejection.contains("read-only mode forbids"),
+                "unexpected rejection for {tool_name}: {rejection}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_does_not_block_promptable_or_read_only_safe_tools() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        let default_edit = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "write_file",
+            ToolRegistry::tool_kind("write_file"),
+            &serde_json::json!({"file_path": "app.js", "content": "x"}),
+            cwd.path(),
+        )
+        .await;
+        assert!(
+            default_edit.is_none(),
+            "default edit should proceed to the permission prompt"
+        );
+
+        assert!(
+            store
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+        let read = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "read_file",
+            ToolRegistry::tool_kind("read_file"),
+            &serde_json::json!({"file_path": "app.js"}),
+            cwd.path(),
+        )
+        .await;
+        assert!(read.is_none(), "read-only should allow read tools");
+    }
+
+    #[test]
+    fn blocked_tool_call_sequence_has_failed_card_and_terminal_update() {
+        let reason = "Tool use denied: read-only mode forbids edits";
+        let (card, update) = blocked_tool_call_updates(
+            "call-write",
+            "write_file",
+            ToolRegistry::tool_kind("write_file"),
+            &serde_json::json!({"file_path": "app.js", "content": "x"}),
+            reason,
+        );
+
+        assert_eq!(card.tool_call_id.0.as_ref(), "call-write");
+        assert_eq!(card.title, "Blocked Writing file");
+        assert_eq!(card.status, ToolCallStatus::Failed);
+        assert_eq!(update.tool_call_id.0.as_ref(), "call-write");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        assert!(card.raw_input.is_some());
+        assert_eq!(
+            update.fields.raw_output,
+            Some(Value::String(reason.to_string()))
+        );
     }
 
     #[test]
@@ -2275,7 +2853,7 @@ mod tests {
             ToolKind::Fetch,
         ] {
             assert_eq!(
-                decide(PermissionMode::Default, kind, "anything", false),
+                decide(PermissionMode::Default, kind, "anything", false, false),
                 PureGateDecision::Allow
             );
         }
@@ -2284,7 +2862,13 @@ mod tests {
     #[test]
     fn default_prompts_for_edit_without_always_allow() {
         assert_eq!(
-            decide(PermissionMode::Default, ToolKind::Edit, "write_file", false),
+            decide(
+                PermissionMode::Default,
+                ToolKind::Edit,
+                "write_file",
+                false,
+                false
+            ),
             PureGateDecision::Prompt
         );
     }
@@ -2292,7 +2876,13 @@ mod tests {
     #[test]
     fn default_uses_always_allow_for_edit() {
         assert_eq!(
-            decide(PermissionMode::Default, ToolKind::Edit, "write_file", true),
+            decide(
+                PermissionMode::Default,
+                ToolKind::Edit,
+                "write_file",
+                true,
+                false
+            ),
             PureGateDecision::Allow
         );
     }
@@ -2304,6 +2894,7 @@ mod tests {
                 PermissionMode::AcceptEdits,
                 ToolKind::Edit,
                 "write_file",
+                false,
                 false
             ),
             PureGateDecision::Allow
@@ -2317,6 +2908,7 @@ mod tests {
                 PermissionMode::AcceptEdits,
                 ToolKind::Execute,
                 "run_shell_command",
+                false,
                 false
             ),
             PureGateDecision::Prompt
@@ -2329,12 +2921,157 @@ mod tests {
         // may trust a positive lookup without granting every shell command.
         for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert_eq!(
-                decide(mode, ToolKind::Execute, "run_shell_command", true),
+                decide(mode, ToolKind::Execute, "run_shell_command", true, false),
                 PureGateDecision::Allow,
                 "run_shell_command should honor scoped approval in {:?}",
                 mode
             );
         }
+    }
+
+    #[test]
+    fn default_auto_allows_conservative_sandboxed_shell_commands() {
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn accept_edits_auto_allows_conservative_sandboxed_shell_commands() {
+        assert_eq!(
+            decide(
+                PermissionMode::AcceptEdits,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn shell_auto_allow_does_not_bypass_read_only_mode() {
+        assert!(matches!(
+            decide(
+                PermissionMode::ReadOnly,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn shell_auto_allow_does_not_bypass_non_shell_execute_tools() {
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                ToolKind::Execute,
+                "task",
+                false,
+                true
+            ),
+            PureGateDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn safe_shell_classifier_accepts_basic_read_only_commands() {
+        assert!(is_auto_approvable_sandboxed_shell_command("pwd"));
+        assert!(is_auto_approvable_sandboxed_shell_command("git status"));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "rg PermissionMode src"
+        ));
+    }
+
+    #[test]
+    fn safe_shell_classifier_rejects_writes_and_shell_metacharacters() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sed -i 's/a/b/' src/main.rs"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "python3 -c 'print(1)'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+    }
+
+    #[test]
+    fn should_auto_allow_shell_command_requires_os_sandboxed_shell() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Wasm),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            false,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "pwd"}),
+            PermissionMode::ReadOnly,
+            Some(SandboxMode::Os),
+            true,
+        ));
+    }
+
+    #[test]
+    fn should_auto_allow_shell_command_rejects_missing_or_unsupported_commands() {
+        use crate::sandbox_backend::SandboxMode;
+
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": 7}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": ""}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+        assert!(!should_auto_allow_shell_command(
+            &serde_json::json!({"command": "touch /tmp/x"}),
+            PermissionMode::Default,
+            Some(SandboxMode::Os),
+            true,
+        ));
+    }
+
+    #[test]
+    fn tokenizer_rejects_untrusted_shell_forms() {
+        assert!(tokenize_simple_shell_command("git status").is_some());
+        assert!(tokenize_simple_shell_command("grep \"foo bar\" README.md").is_some());
+        assert!(tokenize_simple_shell_command("pwd && ls").is_none());
+        assert!(tokenize_simple_shell_command("echo $HOME").is_none());
+        assert!(tokenize_simple_shell_command("python3 -c 'print(1)' | cat").is_none());
     }
 
     #[test]
@@ -2426,6 +3163,26 @@ mod tests {
         assert_ne!(first, different_command);
         assert_ne!(first, different_cwd);
         assert_ne!(first, different_sandbox_mode);
+    }
+
+    #[test]
+    fn shell_repo_always_allow_rule_uses_first_three_tokens() {
+        let key = shell_always_allow_rule_key(
+            &serde_json::json!({"command": "cargo test --workspace --lib"}),
+            true,
+        )
+        .expect("shell rule key");
+
+        assert_eq!(
+            key,
+            serde_json::json!({
+                "tool": "run_shell_command",
+                "rule": "prefix",
+                "argvPrefix": ["cargo", "test", "--workspace"],
+                "shellSandboxed": true,
+            })
+            .to_string()
+        );
     }
 
     #[test]

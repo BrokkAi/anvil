@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::ModelMetadata;
+use crate::mcp::{McpEnvVar, McpFraming, McpServerConfig};
 use crate::structured_output::StructuredOutputResult;
 use crate::tools::ToolRegistry;
 
@@ -248,6 +249,53 @@ fn discover_session_context(
     }
 }
 
+pub(crate) fn acp_mcp_servers_to_configs(
+    servers: Vec<agent_client_protocol::schema::McpServer>,
+) -> Vec<McpServerConfig> {
+    servers
+        .into_iter()
+        .filter_map(|server| match server {
+            agent_client_protocol::schema::McpServer::Stdio(stdio) => {
+                Some(McpServerConfig {
+                    name: stdio.name,
+                    command: stdio.command.display().to_string(),
+                    args: stdio.args,
+                    env: stdio
+                        .env
+                        .into_iter()
+                        .map(|var| McpEnvVar {
+                            name: var.name,
+                            value: var.value,
+                        })
+                        .collect(),
+                    framing: McpFraming::ContentLength,
+                    enabled: true,
+                })
+            }
+            agent_client_protocol::schema::McpServer::Http(http) => {
+                tracing::warn!(
+                    server = %http.name,
+                    "ACP HTTP MCP server skipped; Anvil only supports stdio MCP subprocesses"
+                );
+                None
+            }
+            agent_client_protocol::schema::McpServer::Sse(sse) => {
+                tracing::warn!(
+                    server = %sse.name,
+                    "ACP SSE MCP server skipped; Anvil only supports stdio MCP subprocesses"
+                );
+                None
+            }
+            _ => {
+                tracing::warn!(
+                    "unsupported ACP MCP server transport skipped; Anvil only supports stdio MCP subprocesses"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Session modes
 // ---------------------------------------------------------------------------
@@ -406,6 +454,15 @@ pub struct SessionManifest {
         rename = "brokkModel"
     )]
     pub model: Option<String>,
+    /// Brokk ACP-specific: effective MCP server configuration for this
+    /// session. `None` means the session uses install-level `/mcp` config;
+    /// `Some(vec![])` means ACP explicitly requested no MCP servers.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "brokkMcpServers"
+    )]
+    pub brokk_mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 impl SessionManifest {
@@ -432,6 +489,7 @@ fn default_version() -> String {
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
+    permission_scope_root: PathBuf,
     pub mode: SessionMode,
     pub model: String,
     pub history: Vec<ConversationTurn>,
@@ -453,9 +511,10 @@ pub struct Session {
     /// to auto-sync from external setup state changes.
     pub sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     sandbox_mode_explicitly_set: bool,
-    /// Approval keys the user has chosen "Always allow" for this session.
+    /// Approval keys the user has chosen "Always allow" for this repo.
     /// Most tools use the tool name; shell commands use a scoped key.
-    /// In-memory only (matches `claude-agent-acp` behavior).
+    /// Hydrated from trusted repo-local permission state, not from workspace
+    /// session zips.
     pub always_allow_tools: HashSet<String>,
     /// Approval keys in the order they were first remembered. This keeps
     /// `/permissions list` and `revoke <number>` stable without
@@ -473,6 +532,11 @@ pub struct Session {
     /// Set via `/idle-timeout <secs>`, cleared via `/idle-timeout default`.
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
+    /// Per-session MCP server configuration supplied by ACP `session/new`.
+    /// `None` means use Anvil's install-level `/mcp` configuration. `Some`,
+    /// including `Some(vec![])`, is authoritative for this session and must
+    /// not be supplemented with default/preinstalled servers.
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
     /// Concatenated AGENTS.md / CLAUDE.md content discovered under `cwd`
     /// (and the user's global config slot) at session creation or on the
     /// most recent `update_cwd`. Empty string means none found. Not
@@ -534,11 +598,14 @@ impl Session {
             } else {
                 Some(model.clone())
             },
+            brokk_mcp_servers: None,
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
+        let permission_scope_root = permission_scope_root(&cwd);
         Self {
             id,
             cwd,
+            permission_scope_root,
             mode,
             model,
             history: Vec::new(),
@@ -550,6 +617,7 @@ impl Session {
             always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
+            mcp_servers: None,
             project_instructions,
             skills,
             agents,
@@ -560,12 +628,12 @@ impl Session {
 
     /// Construct a `Session` from data loaded off disk.
     ///
-    /// SECURITY: transient fields that intentionally do NOT survive a reload
-    /// (`permission_mode`, `always_allow_tools`, `always_allow_order`) are
-    /// reset here, mirroring `claude-agent-acp`. Going through this
-    /// constructor guarantees a stale or tampered manifest cannot silently
-    /// auto-allow tool calls on launch, and that any future "reset on reload"
-    /// field is added in one place.
+    /// SECURITY: transient fields that intentionally do NOT come from the
+    /// workspace session zip (`permission_mode`, `always_allow_tools`,
+    /// `always_allow_order`) are reset here. `SessionStore` rehydrates
+    /// remembered approvals from trusted repo-local permission state after
+    /// construction, so a stale or tampered zip still cannot silently
+    /// auto-allow tool calls on launch.
     ///
     /// Also rejects a mismatch between `id` (the caller's requested id, used
     /// to locate the zip and to key the in-memory map) and `manifest.id`
@@ -600,9 +668,12 @@ impl Session {
             });
         }
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
+        let permission_scope_root = permission_scope_root(&cwd);
+        let mcp_servers = manifest.brokk_mcp_servers.clone();
         Ok(Self {
             id,
             cwd,
+            permission_scope_root,
             mode,
             model,
             history,
@@ -619,12 +690,23 @@ impl Session {
             selected_reasoning_effort: None,
             // Same rationale: idle timeout override is in-memory only.
             idle_timeout_secs: None,
+            mcp_servers,
             project_instructions,
             skills,
             agents,
             activated_skills: HashSet::new(),
             usage: crate::llm_client::TokenUsage::default(),
         })
+    }
+
+    fn set_always_allow_keys(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.always_allow_tools.clear();
+        self.always_allow_order.clear();
+        for key in keys {
+            if !key.is_empty() && self.always_allow_tools.insert(key.clone()) {
+                self.always_allow_order.push(key);
+            }
+        }
     }
 }
 
@@ -695,6 +777,123 @@ fn sessions_dir(cwd: &Path) -> PathBuf {
 
 fn session_zip_path(cwd: &Path, id: &str) -> PathBuf {
     sessions_dir(cwd).join(format!("{id}.zip"))
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct RepoPermissionState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "alwaysAllow")]
+    always_allow: Vec<String>,
+    #[serde(default, rename = "alwaysAllowShellPrefixes", skip_serializing)]
+    legacy_shell_prefixes: Vec<String>,
+}
+
+impl RepoPermissionState {
+    fn merged_approvals(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for key in self
+            .always_allow
+            .iter()
+            .chain(self.legacy_shell_prefixes.iter())
+        {
+            if !key.is_empty() && seen.insert(key.clone()) {
+                out.push(key.clone());
+            }
+        }
+        out
+    }
+
+    fn migrate_legacy(&mut self) {
+        self.always_allow = self.merged_approvals();
+        self.legacy_shell_prefixes.clear();
+    }
+}
+
+static REPO_PERMISSION_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn permission_scope_root(cwd: &Path) -> PathBuf {
+    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    for ancestor in start.ancestors() {
+        if ancestor.join(".git").exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    start
+}
+
+fn repo_permission_path(scope_root: &Path) -> PathBuf {
+    scope_root.join(".brokk").join("permissions.json")
+}
+
+fn read_repo_permission_state(scope_root: &Path) -> RepoPermissionState {
+    let path = repo_permission_path(scope_root);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return RepoPermissionState::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn write_repo_permission_state(
+    scope_root: &Path,
+    state: &RepoPermissionState,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let path = repo_permission_path(scope_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating repo permission dir {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("permissions.json");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(state).context("serializing repo permission state")?;
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn update_repo_permission_state(
+    scope_root: &Path,
+    mutator: impl FnOnce(&mut RepoPermissionState),
+) -> anyhow::Result<()> {
+    let _guard = REPO_PERMISSION_WRITE_LOCK
+        .lock()
+        .expect("repo permission write mutex poisoned");
+    let mut state = read_repo_permission_state(scope_root);
+    state.migrate_legacy();
+    mutator(&mut state);
+    write_repo_permission_state(scope_root, &state)
+}
+
+fn read_repo_always_allow_keys(scope_root: &Path) -> Vec<String> {
+    read_repo_permission_state(scope_root).merged_approvals()
+}
+
+fn remember_repo_always_allow_key(scope_root: &Path, key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    update_repo_permission_state(scope_root, |state| {
+        if !state.always_allow.iter().any(|existing| existing == key) {
+            state.always_allow.push(key.to_string());
+        }
+    })
+}
+
+fn forget_repo_always_allow_key(scope_root: &Path, key: &str) -> anyhow::Result<()> {
+    update_repo_permission_state(scope_root, |state| {
+        state.always_allow.retain(|existing| existing != key);
+    })
+}
+
+fn clear_repo_always_allow_keys(scope_root: &Path) -> anyhow::Result<()> {
+    update_repo_permission_state(scope_root, |state| {
+        state.always_allow.clear();
+    })
 }
 
 /// Read manifest.json from a session zip. Returns None if the zip or manifest is unreadable.
@@ -1908,7 +2107,13 @@ impl SessionStore {
             existing.set_agents(agents).await;
             return existing;
         }
-        let mcp_servers = crate::setup_state::read_mcp_servers();
+        let mcp_servers = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .and_then(|session| session.mcp_servers.clone())
+                .unwrap_or_else(crate::setup_state::read_mcp_servers)
+        };
         let registry =
             Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
         self.registries
@@ -1947,8 +2152,17 @@ impl SessionStore {
         self.available_models.read().await.clone()
     }
 
-    /// Create a new session and write it to disk as a zip.
+    #[cfg(test)]
     pub async fn create_session(&self, cwd: PathBuf) -> Session {
+        self.create_session_with_mcp_servers(cwd, None).await
+    }
+
+    /// Create a new session and write it to disk as a zip.
+    pub async fn create_session_with_mcp_servers(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Option<Vec<McpServerConfig>>,
+    ) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
         let prefs = self.setup_state_snapshot();
         let default_model = self.default_model.read().await.clone();
@@ -1976,7 +2190,10 @@ impl SessionStore {
                 DEFAULT_SESSION_NAME.to_string(),
             ),
         };
+        session.mcp_servers = mcp_servers.clone();
+        session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
+        session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
         // Persistence failures are logged but not surfaced: `create_session` returns
@@ -2060,8 +2277,8 @@ impl SessionStore {
             _ => self.default_model.read().await.clone(),
         };
 
-        let sandbox_mode =
-            usable_sandbox_mode_preference(self.setup_state_snapshot().last_sandbox_mode);
+        let prefs = self.setup_state_snapshot();
+        let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let loaded_session = match sandbox_mode {
             Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
                 id.to_string(),
@@ -2081,13 +2298,14 @@ impl SessionStore {
                 manifest,
             ),
         };
-        let session = match loaded_session {
+        let mut session = match loaded_session {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "rejecting persisted session");
                 return false;
             }
         };
+        session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
             let mut sessions = self.sessions.write().await;
             // Race window: another task may have inserted under the same id while
@@ -2256,11 +2474,15 @@ impl SessionStore {
             &cwd,
             sandbox_mode,
         ));
+        let permission_scope_root = permission_scope_root(&cwd);
+        let repo_always_allow = read_repo_always_allow_keys(&permission_scope_root);
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
+            session.permission_scope_root = permission_scope_root;
             session.project_instructions = project_instructions;
             session.skills = skills;
             session.agents = agents;
+            session.set_always_allow_keys(repo_always_allow);
             // cwd changed -> previously-activated skills may no longer
             // be relevant. Clear so the model can re-activate against
             // the new catalog without stale dedup entries.
@@ -2406,50 +2628,138 @@ impl SessionStore {
         self.sync_sandbox_mode_from_setup_state(id).await
     }
 
-    /// True if the session has previously chosen "Always allow" for `approval_key`.
-    pub async fn is_always_allowed(&self, id: &str, approval_key: &str) -> bool {
+    /// True if any of the candidate approval keys is remembered for this session.
+    pub async fn is_any_always_allowed(&self, id: &str, approval_keys: &[String]) -> bool {
         self.sessions
             .read()
             .await
             .get(id)
-            .map(|s| s.always_allow_tools.contains(approval_key))
+            .map(|s| {
+                approval_keys
+                    .iter()
+                    .any(|key| s.always_allow_tools.contains(key))
+            })
             .unwrap_or(false)
     }
 
-    /// Add `approval_key` to the session's in-memory always-allow set.
+    /// Add `approval_key` to the current repo's remembered approval set.
     pub async fn add_always_allow(&self, id: &str, approval_key: &str) {
-        if let Some(session) = self.sessions.write().await.get_mut(id)
-            && session.always_allow_tools.insert(approval_key.to_string())
-        {
-            session.always_allow_order.push(approval_key.to_string());
+        if approval_key.is_empty() {
+            return;
+        }
+        let Some(scope_root) = ({
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(id)
+                .map(|session| session.permission_scope_root.clone())
+        }) else {
+            return;
+        };
+
+        let changed = {
+            let mut sessions = self.sessions.write().await;
+            // Re-validate: the originating session must still exist with the
+            // same scope_root read before acquiring the write lock.  Without
+            // this check a session that is closed and replaced by a new one in
+            // a different repo between the two locks could receive an approval
+            // that was scoped to the original repo.
+            let scope_matches = sessions
+                .get(id)
+                .map(|s| s.permission_scope_root == scope_root)
+                .unwrap_or(false);
+            if !scope_matches {
+                return;
+            }
+            let mut changed = false;
+            for session in sessions.values_mut() {
+                if session.permission_scope_root == scope_root
+                    && session.always_allow_tools.insert(approval_key.to_string())
+                {
+                    session.always_allow_order.push(approval_key.to_string());
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed && let Err(e) = remember_repo_always_allow_key(&scope_root, approval_key) {
+            tracing::warn!(
+                session_id = %id,
+                repo_root = %scope_root.display(),
+                "failed to persist repo Always allow approval: {e:#}"
+            );
         }
     }
 
-    /// Return the session's in-memory always-allow keys in approval order.
+    /// Return remembered always-allow keys in approval order.
     pub async fn always_allow_keys(&self, id: &str) -> Option<Vec<String>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(id)?;
         Some(session.always_allow_order.clone())
     }
 
-    /// Remove one in-memory always-allow key. Returns `None` if the session is unknown.
+    /// Remove one remembered always-allow key. Returns `None` if the session is unknown.
     pub async fn remove_always_allow(&self, id: &str, approval_key: &str) -> Option<bool> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(id)?;
-        let removed = session.always_allow_tools.remove(approval_key);
-        if removed {
-            session.always_allow_order.retain(|key| key != approval_key);
+        let (scope_root, remove_repo) = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(id)?;
+            (
+                session.permission_scope_root.clone(),
+                session.always_allow_tools.contains(approval_key),
+            )
+        };
+        if !remove_repo {
+            return Some(false);
         }
-        Some(removed)
+
+        {
+            let mut sessions = self.sessions.write().await;
+            for session in sessions.values_mut() {
+                if session.permission_scope_root == scope_root {
+                    session.always_allow_tools.remove(approval_key);
+                    session.always_allow_order.retain(|key| key != approval_key);
+                }
+            }
+        }
+        if remove_repo && let Err(e) = forget_repo_always_allow_key(&scope_root, approval_key) {
+            tracing::warn!(
+                session_id = %id,
+                repo_root = %scope_root.display(),
+                "failed to persist repo Always allow revocation: {e:#}"
+            );
+        }
+        Some(true)
     }
 
-    /// Clear all in-memory always-allow keys for a session.
+    /// Clear all remembered always-allow keys.
     pub async fn clear_always_allow(&self, id: &str) -> Option<usize> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(id)?;
-        let count = session.always_allow_tools.len();
-        session.always_allow_tools.clear();
-        session.always_allow_order.clear();
+        let (scope_root, count) = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(id)?;
+            (
+                session.permission_scope_root.clone(),
+                session.always_allow_tools.len(),
+            )
+        };
+        if count == 0 {
+            return Some(0);
+        }
+
+        {
+            let mut sessions = self.sessions.write().await;
+            for session in sessions.values_mut() {
+                if session.permission_scope_root == scope_root {
+                    session.always_allow_tools.clear();
+                    session.always_allow_order.clear();
+                }
+            }
+        }
+        if let Err(e) = clear_repo_always_allow_keys(&scope_root) {
+            tracing::warn!(
+                session_id = %id,
+                repo_root = %scope_root.display(),
+                "failed to persist repo Always allow clear: {e:#}"
+            );
+        }
         Some(count)
     }
 
@@ -2998,6 +3308,7 @@ mod tests {
             version: "4.0".into(),
             mode: Some("CODE".into()),
             model: Some("m".into()),
+            brokk_mcp_servers: None,
         };
         let history = vec![ConversationTurn {
             user_prompt: "u".into(),
@@ -3225,6 +3536,7 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            brokk_mcp_servers: None,
         };
 
         let err = Session::from_persisted(
@@ -3880,47 +4192,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `add_always_allow` is in-memory only and survives across queries
-    /// for the same session id.
+    /// Remembered approvals persist per repo and survive new sessions in that repo.
     #[tokio::test]
-    async fn always_allow_set_is_session_scoped() {
+    async fn always_allow_set_is_persisted_for_new_sessions() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
-        let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-always-allow-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let s = store.create_session(cwd.clone()).await;
+        let repo = tempfile::tempdir().expect("repo");
+        let other_repo = tempfile::tempdir().expect("other repo");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("git dir");
+        std::fs::create_dir_all(other_repo.path().join(".git")).expect("other git dir");
+        let s = store.create_session(repo.path().to_path_buf()).await;
 
-        assert!(!store.is_always_allowed(&s.id, "write_file").await);
+        assert!(
+            !store
+                .is_any_always_allowed(&s.id, &["write_file".to_string()])
+                .await
+        );
         store.add_always_allow(&s.id, "write_file").await;
-        assert!(store.is_always_allowed(&s.id, "write_file").await);
+        assert!(
+            store
+                .is_any_always_allowed(&s.id, &["write_file".to_string()])
+                .await
+        );
         // Different tool name, same session: still false.
-        assert!(!store.is_always_allowed(&s.id, "run_shell_command").await);
+        assert!(
+            !store
+                .is_any_always_allowed(&s.id, &["run_shell_command".to_string()])
+                .await
+        );
         // Unknown session never reports allowed.
-        assert!(!store.is_always_allowed("no-such", "write_file").await);
+        assert!(
+            !store
+                .is_any_always_allowed("no-such", &["write_file".to_string()])
+                .await
+        );
 
-        let _ = std::fs::remove_dir_all(&cwd);
+        let next = store.create_session(repo.path().to_path_buf()).await;
+        assert!(
+            store
+                .is_any_always_allowed(&next.id, &["write_file".to_string()])
+                .await
+        );
+        assert_eq!(
+            store.always_allow_keys(&next.id).await,
+            Some(vec!["write_file".to_string()])
+        );
+
+        let different_repo = store.create_session(other_repo.path().to_path_buf()).await;
+        assert!(
+            !store
+                .is_any_always_allowed(&different_repo.id, &["write_file".to_string()])
+                .await
+        );
+        assert_eq!(
+            read_repo_permission_state(repo.path()).always_allow,
+            vec!["write_file".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_shell_permissions_are_persisted_per_repo() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+        let repo1 = tempfile::tempdir().expect("repo1");
+        let repo2 = tempfile::tempdir().expect("repo2");
+        std::fs::create_dir_all(repo1.path().join(".git")).expect("git dir 1");
+        std::fs::create_dir_all(repo2.path().join(".git")).expect("git dir 2");
+
+        let repo_key = serde_json::json!({
+            "tool": "run_shell_command",
+            "rule": "prefix",
+            "argvPrefix": ["cargo", "test"],
+            "shellSandboxed": true,
+        })
+        .to_string();
+
+        let first = store.create_session(repo1.path().to_path_buf()).await;
+        store.add_always_allow(&first.id, &repo_key).await;
+        assert!(
+            store
+                .is_any_always_allowed(&first.id, std::slice::from_ref(&repo_key))
+                .await
+        );
+
+        let second_same_repo = store.create_session(repo1.path().to_path_buf()).await;
+        assert!(
+            store
+                .is_any_always_allowed(&second_same_repo.id, std::slice::from_ref(&repo_key))
+                .await
+        );
+
+        let other_repo = store.create_session(repo2.path().to_path_buf()).await;
+        assert!(
+            !store
+                .is_any_always_allowed(&other_repo.id, std::slice::from_ref(&repo_key))
+                .await
+        );
+
+        assert_eq!(
+            read_repo_permission_state(repo1.path()).always_allow,
+            vec![repo_key]
+        );
+        assert!(
+            read_repo_permission_state(repo2.path())
+                .always_allow
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn always_allow_keys_can_be_listed_removed_and_cleared() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
-        let cwd = std::env::temp_dir().join(format!(
-            "brokk-acp-rust-always-allow-manage-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let s = store.create_session(cwd.clone()).await;
+        let cwd = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(cwd.path().join(".git")).expect("git dir");
+        let s = store.create_session(cwd.path().to_path_buf()).await;
+        let repo_key = serde_json::json!({
+            "tool": "run_shell_command",
+            "rule": "prefix",
+            "argvPrefix": ["cargo", "test"],
+            "shellSandboxed": true,
+        })
+        .to_string();
 
         store.add_always_allow(&s.id, "write_file").await;
-        store.add_always_allow(&s.id, "run_shell_command").await;
+        store.add_always_allow(&s.id, &repo_key).await;
         store.add_always_allow(&s.id, "write_file").await;
 
         assert_eq!(
             store.always_allow_keys(&s.id).await,
-            Some(vec![
-                "write_file".to_string(),
-                "run_shell_command".to_string()
-            ])
+            Some(vec!["write_file".to_string(), repo_key.clone()])
         );
         assert_eq!(
             store.remove_always_allow(&s.id, "write_file").await,
@@ -3936,8 +4340,6 @@ mod tests {
         assert_eq!(store.always_allow_keys("no-such").await, None);
         assert_eq!(store.remove_always_allow("no-such", "x").await, None);
         assert_eq!(store.clear_always_allow("no-such").await, None);
-
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// `start_prompt` registers a token, `cancel_prompt` flips it,
@@ -4409,6 +4811,115 @@ done
             .collect()
     }
 
+    #[test]
+    fn acp_stdio_mcp_servers_convert_to_anvil_configs() {
+        let configs =
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Stdio(
+                agent_client_protocol::schema::McpServerStdio::new("local", "/usr/bin/mcp")
+                    .args(vec!["--flag".to_string(), "value".to_string()])
+                    .env(vec![agent_client_protocol::schema::EnvVariable::new(
+                        "TOKEN", "secret",
+                    )]),
+            )]);
+
+        assert_eq!(
+            configs,
+            vec![crate::mcp::McpServerConfig {
+                name: "local".to_string(),
+                command: "/usr/bin/mcp".to_string(),
+                args: vec!["--flag".to_string(), "value".to_string()],
+                env: vec![crate::mcp::McpEnvVar {
+                    name: "TOKEN".to_string(),
+                    value: "secret".to_string(),
+                }],
+                framing: crate::mcp::McpFraming::ContentLength,
+                enabled: true,
+            }]
+        );
+    }
+
+    /// An explicit ACP `mcpServers: []` is authoritative for that session
+    /// and must not be filled with Anvil's persisted/preinstalled defaults.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_empty_acp_mcp_servers_do_not_spawn_default_bifrost() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
+        let session = store
+            .create_session_with_mcp_servers(cwd.path().to_path_buf(), Some(Vec::new()))
+            .await;
+
+        let registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await;
+
+        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
+        assert!(
+            !bifrost_log.exists(),
+            "explicit empty ACP MCP list should not spawn persisted default bifrost"
+        );
+    }
+
+    /// The ACP MCP override is persisted in the session manifest so an LRU
+    /// eviction, `session/load`, or server restart cannot reintroduce
+    /// install-level default MCP servers for a session created with
+    /// `mcpServers: []`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_empty_acp_mcp_servers_survive_cold_reload() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
+        let session = store
+            .create_session_with_mcp_servers(cwd.path().to_path_buf(), Some(Vec::new()))
+            .await;
+        store.sessions.write().await.remove(&session.id);
+        store.registries.write().await.remove(&session.id);
+
+        let reloaded = store
+            .get_session(&session.id, cwd.path())
+            .await
+            .expect("session should cold-load from zip");
+        assert_eq!(reloaded.mcp_servers, Some(Vec::new()));
+
+        let registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await;
+
+        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
+        assert!(
+            !bifrost_log.exists(),
+            "cold-loaded ACP empty MCP list should not spawn persisted default bifrost"
+        );
+    }
+
     /// A cwd change must invalidate the cached registry so the next
     /// prompt runs against the new workspace and respawns Bifrost with the
     /// updated root.
@@ -4427,6 +4938,7 @@ done
             name: "bifrost".to_string(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
             framing: crate::mcp::McpFraming::Line,
             enabled: true,
         }])
