@@ -1116,8 +1116,9 @@ mod tests {
         for meta in skills {
             reg.insert_for_test(meta);
         }
+        let cwd = std::env::temp_dir();
         ToolRegistry {
-            cwd: PathBuf::from("/tmp"),
+            cwd,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1136,8 +1137,9 @@ mod tests {
         for meta in agents {
             reg.insert_for_test(meta);
         }
+        let cwd = std::env::temp_dir();
         ToolRegistry {
-            cwd: PathBuf::from("/tmp"),
+            cwd,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
