@@ -145,6 +145,21 @@ pub(crate) fn rfc3339_from_millis(millis: u64) -> Option<String> {
     DateTime::<Utc>::from_timestamp_millis(millis).map(|ts| ts.to_rfc3339())
 }
 
+fn effective_mcp_servers(extra_servers: Option<Vec<McpServerConfig>>) -> Vec<McpServerConfig> {
+    let mut servers = crate::setup_state::read_mcp_servers();
+    for server in extra_servers.into_iter().flatten() {
+        if server.name == "bifrost" {
+            tracing::warn!(
+                command = %server.command,
+                "ignoring additive ACP bifrost MCP server; use /mcp setup for canonical bifrost config"
+            );
+            continue;
+        }
+        servers.push(server);
+    }
+    servers
+}
+
 /// Error returned when a session already has a prompt in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptStartError {
@@ -454,9 +469,11 @@ pub struct SessionManifest {
         rename = "brokkModel"
     )]
     pub model: Option<String>,
-    /// Brokk ACP-specific: effective MCP server configuration for this
-    /// session. `None` means the session uses install-level `/mcp` config;
-    /// `Some(vec![])` means ACP explicitly requested no MCP servers.
+    /// Brokk ACP-specific: additional MCP server configuration for this
+    /// session, supplied by ACP `session/new`.
+    ///
+    /// These servers are additive to Anvil's canonical Bifrost setup from
+    /// install-level `/mcp` config or the built-in default.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -532,10 +549,9 @@ pub struct Session {
     /// Set via `/idle-timeout <secs>`, cleared via `/idle-timeout default`.
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
-    /// Per-session MCP server configuration supplied by ACP `session/new`.
-    /// `None` means use Anvil's install-level `/mcp` configuration. `Some`,
-    /// including `Some(vec![])`, is authoritative for this session and must
-    /// not be supplemented with default/preinstalled servers.
+    /// Additional per-session MCP servers supplied by ACP `session/new`.
+    /// These are additive to Anvil's canonical Bifrost setup from the
+    /// install-level `/mcp` configuration or the built-in default.
     pub mcp_servers: Option<Vec<McpServerConfig>>,
     /// Concatenated AGENTS.md / CLAUDE.md content discovered under `cwd`
     /// (and the user's global config slot) at session creation or on the
@@ -2109,10 +2125,10 @@ impl SessionStore {
         }
         let mcp_servers = {
             let sessions = self.sessions.read().await;
-            sessions
+            let extra_servers = sessions
                 .get(session_id)
-                .and_then(|session| session.mcp_servers.clone())
-                .unwrap_or_else(crate::setup_state::read_mcp_servers)
+                .and_then(|session| session.mcp_servers.clone());
+            effective_mcp_servers(extra_servers)
         };
         let registry =
             Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
@@ -4838,11 +4854,11 @@ done
         );
     }
 
-    /// An explicit ACP `mcpServers: []` is authoritative for that session
-    /// and must not be filled with Anvil's persisted/preinstalled defaults.
+    /// An explicit ACP `mcpServers: []` means "no extra MCP servers";
+    /// canonical Bifrost should still spawn from setup/default config.
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_empty_acp_mcp_servers_do_not_spawn_default_bifrost() {
+    async fn explicit_empty_acp_mcp_servers_still_spawn_default_bifrost() {
         let store = SessionStore::new("m".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let config_dir = tempfile::tempdir().expect("config dir");
@@ -4869,18 +4885,18 @@ done
 
         assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
         assert!(
-            !bifrost_log.exists(),
-            "explicit empty ACP MCP list should not spawn persisted default bifrost"
+            bifrost_log.exists(),
+            "explicit empty ACP MCP list should still spawn persisted default bifrost"
         );
+        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
     }
 
-    /// The ACP MCP override is persisted in the session manifest so an LRU
-    /// eviction, `session/load`, or server restart cannot reintroduce
-    /// install-level default MCP servers for a session created with
-    /// `mcpServers: []`.
+    /// The ACP extra MCP list is persisted in the session manifest, but
+    /// canonical Bifrost is still reconstructed from setup/default config
+    /// after reload.
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_empty_acp_mcp_servers_survive_cold_reload() {
+    async fn explicit_empty_acp_mcp_servers_survive_cold_reload_with_default_bifrost() {
         let store = SessionStore::new("m".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let config_dir = tempfile::tempdir().expect("config dir");
@@ -4915,8 +4931,114 @@ done
 
         assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
         assert!(
-            !bifrost_log.exists(),
-            "cold-loaded ACP empty MCP list should not spawn persisted default bifrost"
+            bifrost_log.exists(),
+            "cold-loaded ACP empty MCP list should still spawn persisted default bifrost"
+        );
+        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
+    }
+
+    /// ACP-provided MCP servers are additive to canonical Bifrost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_extra_mcp_servers_spawn_alongside_default_bifrost() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
+        let extra_mcp_dir = tempfile::tempdir().expect("extra mcp dir");
+        let extra_log = extra_mcp_dir.path().join("extra-mcp-argv.log");
+        let extra_mcp = make_fake_bifrost_binary(extra_mcp_dir.path(), &extra_log);
+        let session = store
+            .create_session_with_mcp_servers(
+                cwd.path().to_path_buf(),
+                Some(vec![crate::mcp::McpServerConfig {
+                    name: "local".to_string(),
+                    command: extra_mcp.display().to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    framing: crate::mcp::McpFraming::Line,
+                    enabled: true,
+                }]),
+            )
+            .await;
+
+        let registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await;
+
+        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
+        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
+        assert!(extra_log.exists(), "extra ACP MCP server should also spawn");
+        assert!(
+            !read_log_lines(&extra_log).is_empty(),
+            "extra ACP MCP server should receive its startup argv"
+        );
+    }
+
+    /// ACP must not be able to add a duplicate Bifrost server on top of the
+    /// canonical setup/default instance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn additive_acp_bifrost_server_is_ignored() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
+        let extra_bifrost_dir = tempfile::tempdir().expect("extra bifrost dir");
+        let extra_log = extra_bifrost_dir.path().join("extra-bifrost-argv.log");
+        let extra_bifrost = make_fake_bifrost_binary(extra_bifrost_dir.path(), &extra_log);
+        let session = store
+            .create_session_with_mcp_servers(
+                cwd.path().to_path_buf(),
+                Some(vec![crate::mcp::McpServerConfig {
+                    name: "bifrost".to_string(),
+                    command: extra_bifrost.display().to_string(),
+                    args: vec![
+                        "--root".to_string(),
+                        "{cwd}".to_string(),
+                        "--server".to_string(),
+                        "symbol".to_string(),
+                    ],
+                    env: Vec::new(),
+                    framing: crate::mcp::McpFraming::Line,
+                    enabled: true,
+                }]),
+            )
+            .await;
+
+        let registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await;
+
+        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
+        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
+        assert!(
+            !extra_log.exists(),
+            "duplicate ACP bifrost server should be ignored"
         );
     }
 
