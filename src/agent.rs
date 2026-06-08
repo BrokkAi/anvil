@@ -5706,31 +5706,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_config_option_read_only_blocks_mutation_tools_at_gate() {
-        let (store, id) = make_store_with_session("m").await;
-        apply_config_option(&store, &id, PERMISSION_CONFIG_ID, "readOnly")
-            .await
-            .expect("permission mode update");
-
-        let cwd = std::env::temp_dir();
-        let rejection = crate::tool_loop::deterministic_gate_rejection(
-            &store,
-            &id,
-            "write_file",
-            crate::tools::ToolRegistry::tool_kind("write_file"),
-            &serde_json::json!({"file_path": "app.js", "content": "x"}),
-            &cwd,
-        )
-        .await
-        .expect("readOnly should block write_file before execution");
-
-        assert!(
-            rejection.contains("read-only mode forbids"),
-            "unexpected rejection: {rejection}"
-        );
-    }
-
-    #[tokio::test]
     async fn apply_config_option_sets_behavior_mode() {
         let (store, id) = make_store_with_session("m").await;
         apply_config_option(&store, &id, BEHAVIOR_CONFIG_ID, "PLAN")

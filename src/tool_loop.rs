@@ -1237,30 +1237,31 @@ fn blocked_tool_call_updates(
     )
 }
 
-/// Return a deterministic permission denial, if one exists before any user
-/// prompt is needed. Promptable calls still go through `consult_gate` after
-/// the pending card is emitted so the permission modal has a matching card id.
-pub(crate) async fn deterministic_gate_rejection(
+struct PureGateEvaluation {
+    decision: PureGateDecision,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
+}
+
+async fn evaluate_pure_gate(
     sessions: &SessionStore,
     session_id: &str,
     tool_name: &str,
     kind: ToolKind,
     raw_input: &Value,
     cwd: &Path,
-) -> Option<String> {
+) -> Result<PureGateEvaluation, String> {
     let mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
         None => {
             tracing::warn!(
                 session_id,
                 tool_name,
-                "permission gate: session not found; refusing tool before pending card"
+                "permission gate: session not found; refusing tool"
             );
-            return Some(
-                "Tool use denied: session is no longer registered. \
+            return Err("Tool use denied: session is no longer registered. \
                  Start a new prompt to continue."
-                    .to_string(),
-            );
+                .to_string());
         }
     };
     let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
@@ -1272,10 +1273,36 @@ pub(crate) async fn deterministic_gate_rejection(
     let is_always_allowed = sessions
         .is_any_always_allowed(session_id, &always_allow_keys)
         .await;
+    let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
 
-    match pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow) {
-        PureGateDecision::Reject(msg) => Some(msg),
-        PureGateDecision::Allow | PureGateDecision::Prompt => None,
+    Ok(PureGateEvaluation {
+        decision,
+        sandbox_mode,
+        shell_sandboxed,
+    })
+}
+
+/// Return a deterministic permission denial, if one exists before any user
+/// prompt is needed. Promptable calls still go through `consult_gate` after
+/// the pending card is emitted so the permission modal has a matching card id.
+async fn deterministic_gate_rejection(
+    sessions: &SessionStore,
+    session_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+    cwd: &Path,
+) -> Option<String> {
+    match evaluate_pure_gate(sessions, session_id, tool_name, kind, raw_input, cwd).await {
+        Err(msg) => Some(msg),
+        Ok(PureGateEvaluation {
+            decision: PureGateDecision::Reject(msg),
+            ..
+        }) => Some(msg),
+        Ok(PureGateEvaluation {
+            decision: PureGateDecision::Allow | PureGateDecision::Prompt,
+            ..
+        }) => None,
     }
 }
 
@@ -1293,35 +1320,16 @@ async fn consult_gate(
     raw_input: &Value,
     cwd: &Path,
 ) -> GateDecision {
-    let mode = match sessions.permission_mode(session_id).await {
-        Some(m) => m,
-        None => {
-            tracing::warn!(
-                session_id,
-                tool_name,
-                "permission gate: session not found; refusing tool"
-            );
-            return GateDecision::Reject(
-                "Tool use denied: session is no longer registered. \
-                 Start a new prompt to continue."
-                    .to_string(),
-            );
-        }
-    };
-    let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
-    let shell_sandboxed =
-        tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
-    let shell_auto_allow = tool_name == "run_shell_command"
-        && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
-    let always_allow_keys = always_allow_lookup_keys(tool_name, raw_input, cwd, shell_sandboxed);
-    let is_always_allowed = sessions
-        .is_any_always_allowed(session_id, &always_allow_keys)
-        .await;
+    let evaluation =
+        match evaluate_pure_gate(sessions, session_id, tool_name, kind, raw_input, cwd).await {
+            Ok(evaluation) => evaluation,
+            Err(reason) => return GateDecision::Reject(reason),
+        };
 
-    match pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow) {
+    match evaluation.decision {
         PureGateDecision::Allow => GateDecision::Allow {
             sandbox_policy_override: None,
-            sandbox_mode,
+            sandbox_mode: evaluation.sandbox_mode,
         },
         PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
         PureGateDecision::Prompt => {
@@ -1334,7 +1342,7 @@ async fn consult_gate(
                     kind,
                     tool_call_id,
                     raw_input,
-                    shell_sandboxed,
+                    shell_sandboxed: evaluation.shell_sandboxed,
                 },
             )
             .await
@@ -1345,7 +1353,7 @@ async fn consult_gate(
                     if grant.allow_always && grant.sandbox_policy_override.is_none() {
                         if tool_name == "run_shell_command" {
                             if let Some(rule_key) =
-                                shell_always_allow_rule_key(raw_input, shell_sandboxed)
+                                shell_always_allow_rule_key(raw_input, evaluation.shell_sandboxed)
                             {
                                 sessions.add_always_allow(session_id, &rule_key).await;
                             }
@@ -1355,7 +1363,7 @@ async fn consult_gate(
                     }
                     GateDecision::Allow {
                         sandbox_policy_override: grant.sandbox_policy_override,
-                        sandbox_mode,
+                        sandbox_mode: evaluation.sandbox_mode,
                     }
                 }
                 Err(reason) => GateDecision::Reject(reason),
@@ -2854,7 +2862,7 @@ mod tests {
         );
 
         assert_eq!(card.tool_call_id.0.as_ref(), "call-write");
-        assert_eq!(card.title, "Blocked write_file");
+        assert_eq!(card.title, "Blocked Writing file");
         assert_eq!(card.status, ToolCallStatus::Failed);
         assert_eq!(update.tool_call_id.0.as_ref(), "call-write");
         assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));

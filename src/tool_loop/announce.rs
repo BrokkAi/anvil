@@ -175,7 +175,7 @@ pub(super) fn blocked_tool_call(
 ) -> ToolCall {
     ToolCall::new(
         ToolCallId::new(tool_call_id.to_string()),
-        format!("Blocked {tool_name}"),
+        format!("Blocked {}", ToolRegistry::display_name(tool_name)),
     )
     .kind(kind)
     .status(ToolCallStatus::Failed)
@@ -771,7 +771,7 @@ mod tests {
             "read-only",
         );
 
-        assert_eq!(card.title, "Blocked write_file");
+        assert_eq!(card.title, "Blocked Writing file");
         assert_eq!(card.status, ToolCallStatus::Failed);
         assert_ne!(card.title, "Write `app.js`");
         assert!(card.raw_input.is_some());
@@ -787,9 +787,25 @@ mod tests {
             "read-only",
         );
 
-        assert_eq!(card.title, "Blocked edit");
+        assert_eq!(card.title, "Blocked Editing file");
         assert_eq!(card.status, ToolCallStatus::Failed);
         assert_ne!(card.title, "Edit `app.js`");
+        assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn blocked_unknown_tool_uses_static_bounded_title() {
+        let huge = "x".repeat(MAX_TOOL_TITLE_CHARS * 2);
+        let card = blocked_tool_call(
+            "tc1",
+            &huge,
+            ToolKind::Other,
+            &json!({"anything": "goes"}),
+            "read-only",
+        );
+
+        assert_eq!(card.title, "Blocked Executing tool");
+        assert!(card.title.chars().count() <= MAX_TOOL_TITLE_CHARS);
         assert!(card.raw_input.is_some());
     }
 
