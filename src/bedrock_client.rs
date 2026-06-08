@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -81,6 +82,7 @@ pub const BEDROCK_MODEL_ENV: &str = "ANVIL_BEDROCK_MODEL";
 pub const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
 pub const BEDROCK_DEFAULT_MODEL: &str = "us.anthropic.claude-sonnet-4-6";
 const BEDROCK_RUNTIME_BASE_URL: &str = "https://bedrock-runtime";
+const BEDROCK_CONTROL_BASE_URL: &str = "https://bedrock";
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_TOKENS: u32 = 8192;
@@ -93,6 +95,7 @@ pub struct BedrockClient {
     http: reqwest::Client,
     runtime_base_url: String,
     mantle_base_url: String,
+    control_base_url: String,
 }
 
 impl std::fmt::Debug for BedrockClient {
@@ -122,6 +125,7 @@ impl BedrockClient {
             http,
             runtime_base_url: BEDROCK_RUNTIME_BASE_URL.to_string(),
             mantle_base_url: mantle_base_url(&region),
+            control_base_url: BEDROCK_CONTROL_BASE_URL.to_string(),
         }
     }
 
@@ -132,6 +136,7 @@ impl BedrockClient {
         default_model: String,
         runtime_base_url: String,
         mantle_base_url: String,
+        control_base_url: String,
     ) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -145,6 +150,7 @@ impl BedrockClient {
             http,
             runtime_base_url,
             mantle_base_url,
+            control_base_url,
         }
     }
 
@@ -197,6 +203,25 @@ impl BedrockClient {
         )
     }
 
+    fn inference_profiles_url(&self) -> String {
+        if (self.control_base_url.starts_with("http://")
+            || self.control_base_url.starts_with("https://"))
+            && self.control_base_url != "https://bedrock"
+            && self.control_base_url != "http://bedrock"
+            && !self.control_base_url.contains("amazonaws.com")
+        {
+            return format!(
+                "{}/inference-profiles?typeEquals=SYSTEM_DEFINED",
+                self.control_base_url.trim_end_matches('/')
+            );
+        }
+        format!(
+            "{}.{}.amazonaws.com/inference-profiles?typeEquals=SYSTEM_DEFINED",
+            self.control_base_url.trim_end_matches('.'),
+            self.region
+        )
+    }
+
     async fn discover_model_metadata(&self) -> Result<Vec<ModelMetadata>> {
         discover_model_metadata_with_http(
             &self.http,
@@ -239,29 +264,15 @@ impl BedrockClient {
         };
         let url = self.invoke_url(&model);
         trace_bedrock_request(&body);
-        let send = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.bearer_token)
-            .json(&body)
-            .send();
-
-        let resp = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Ok(LlmResponse::Text {
-                    text: String::new(),
-                    usage: TokenUsage::default(),
-                });
-            }
-            resp = send => resp.context("failed to send Bedrock request")?,
-        };
-
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!("Bedrock request failed (HTTP {status}): {body_text}");
+        let body_text = self
+            .invoke_native_anthropic_with_fallback(&model, &url, &body, &cancel)
+            .await?;
+        if body_text.is_empty() && cancel.is_cancelled() {
+            return Ok(LlmResponse::Text {
+                text: String::new(),
+                usage: TokenUsage::default(),
+            });
         }
-
         let parsed: BedrockAnthropicResponse =
             serde_json::from_str(&body_text).context("parse Bedrock response")?;
         let mut text = String::new();
@@ -360,6 +371,112 @@ impl BedrockClient {
             .map(|model| model.to_model_metadata())
             .collect())
     }
+
+    async fn invoke_native_anthropic_with_fallback(
+        &self,
+        model: &str,
+        url: &str,
+        body: &BedrockAnthropicRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<String> {
+        let Some((status, body_text)) = self.post_native_invoke(url, body, cancel).await? else {
+            return Ok(String::new());
+        };
+        if status.is_success() {
+            return Ok(body_text);
+        }
+
+        if !needs_inference_profile_retry(status, &body_text)
+            || looks_like_inference_profile_identifier(model)
+        {
+            anyhow::bail!("Bedrock request failed (HTTP {status}): {body_text}");
+        }
+
+        let mut last_retry_error = None;
+        for profile_id in self.inference_profile_candidates_for_model(model).await {
+            tracing::info!(
+                "retrying Bedrock invoke for model {} with inference profile {}",
+                model,
+                profile_id
+            );
+            let retry_url = self.invoke_url(&profile_id);
+            let Some((retry_status, retry_body)) =
+                self.post_native_invoke(&retry_url, body, cancel).await?
+            else {
+                return Ok(String::new());
+            };
+            if retry_status.is_success() {
+                return Ok(retry_body);
+            }
+            last_retry_error = Some((profile_id, retry_status, retry_body));
+        }
+
+        if let Some((profile_id, retry_status, retry_body)) = last_retry_error {
+            anyhow::bail!(
+                "Bedrock request failed (HTTP {status}): {body_text}; retry with inference profile {} also failed (HTTP {retry_status}): {retry_body}",
+                profile_id
+            );
+        }
+
+        anyhow::bail!("Bedrock request failed (HTTP {status}): {body_text}");
+    }
+
+    async fn post_native_invoke(
+        &self,
+        url: &str,
+        body: &BedrockAnthropicRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<(reqwest::StatusCode, String)>> {
+        let send = self
+            .http
+            .post(url)
+            .bearer_auth(&self.bearer_token)
+            .json(body)
+            .send();
+
+        let resp = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Ok(None);
+            }
+            resp = send => resp.context("failed to send Bedrock request")?,
+        };
+
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        Ok(Some((status, body_text)))
+    }
+
+    async fn inference_profile_candidates_for_model(&self, model: &str) -> Vec<String> {
+        let mut candidates = self
+            .list_inference_profiles()
+            .await
+            .map(|profiles| match_inference_profiles_to_model(model, &profiles, &self.region))
+            .unwrap_or_else(|err| {
+                tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
+                Vec::new()
+            });
+        candidates.extend(guessed_inference_profile_candidates(model, &self.region));
+        dedup_preserve_order(candidates)
+    }
+
+    async fn list_inference_profiles(&self) -> Result<Vec<BedrockInferenceProfileSummary>> {
+        let url = self.inference_profiles_url();
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.bearer_token)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Bedrock inference profile discovery failed (HTTP {status}): {body}");
+        }
+        let parsed: BedrockListInferenceProfilesResponse =
+            serde_json::from_str(&body).context("parse Bedrock inference profile response")?;
+        Ok(parsed.inference_profile_summaries)
+    }
 }
 
 impl LlmBackend for BedrockClient {
@@ -389,9 +506,23 @@ impl LlmBackend for BedrockClient {
                     tracing::info!("Bedrock foundation-model discovery skipped: {err:#}");
                 }
             }
-            if !models.iter().any(|m| m.id == self.default_model) {
+            let inference_profiles = match self.list_inference_profiles().await {
+                Ok(profiles) => profiles,
+                Err(err) => {
+                    tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
+                    Vec::new()
+                }
+            };
+            let default_model = normalize_default_bedrock_model(
+                &self.default_model,
+                &inference_profiles,
+                &self.region,
+            );
+            models = normalize_bedrock_model_ids(models, &inference_profiles, &self.region);
+
+            if !models.iter().any(|m| m.id == default_model) {
                 models.push(ModelMetadata {
-                    id: self.default_model.clone(),
+                    id: default_model.clone(),
                     default_reasoning_level: None,
                     supported_reasoning_levels: Vec::new(),
                     supports_images: None,
@@ -399,8 +530,8 @@ impl LlmBackend for BedrockClient {
                 });
             }
             models.sort_by(|a, b| {
-                let a_default = a.id == self.default_model;
-                let b_default = b.id == self.default_model;
+                let a_default = a.id == default_model;
+                let b_default = b.id == default_model;
                 b_default.cmp(&a_default).then_with(|| a.id.cmp(&b.id))
             });
             models.dedup_by(|a, b| a.id == b.id);
@@ -453,6 +584,138 @@ pub fn model_from_env() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string())
+}
+
+fn needs_inference_profile_retry(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && body.contains("on-demand throughput isn")
+        && body.contains("inference profile")
+}
+
+fn looks_like_inference_profile_identifier(model: &str) -> bool {
+    model.starts_with("global.")
+        || model.starts_with("us.")
+        || model.starts_with("eu.")
+        || model.starts_with("jp.")
+        || model.starts_with("au.")
+        || model.contains(":inference-profile/")
+}
+
+fn guessed_inference_profile_candidates(model: &str, region: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(prefix) = preferred_geo_prefix(region) {
+        candidates.push(format!("{prefix}{model}"));
+    }
+    candidates.push(format!("global.{model}"));
+    candidates
+}
+
+fn normalize_default_bedrock_model(
+    model: &str,
+    profiles: &[BedrockInferenceProfileSummary],
+    region: &str,
+) -> String {
+    preferred_invocable_bedrock_model_id(model, profiles, region)
+        .unwrap_or_else(|| model.to_string())
+}
+
+fn normalize_bedrock_model_ids(
+    models: Vec<ModelMetadata>,
+    profiles: &[BedrockInferenceProfileSummary],
+    region: &str,
+) -> Vec<ModelMetadata> {
+    let mut by_id = HashMap::new();
+    for mut model in models {
+        if let Some(invocable_id) =
+            preferred_invocable_bedrock_model_id(&model.id, profiles, region)
+        {
+            model.id = invocable_id;
+        }
+        by_id.entry(model.id.clone()).or_insert(model);
+    }
+    let mut normalized: Vec<ModelMetadata> = by_id.into_values().collect();
+    normalized.sort_by(|a, b| a.id.cmp(&b.id));
+    normalized
+}
+
+fn preferred_invocable_bedrock_model_id(
+    model: &str,
+    profiles: &[BedrockInferenceProfileSummary],
+    region: &str,
+) -> Option<String> {
+    if looks_like_inference_profile_identifier(model) || uses_responses_api(model) {
+        return None;
+    }
+    match_inference_profiles_to_model(model, profiles, region)
+        .into_iter()
+        .next()
+}
+
+fn preferred_geo_prefix(region: &str) -> Option<&'static str> {
+    if region.starts_with("us-")
+        || region.starts_with("ca-")
+        || region.starts_with("sa-")
+        || region.starts_with("mx-")
+    {
+        Some("us.")
+    } else if region.starts_with("eu-") {
+        Some("eu.")
+    } else if matches!(region, "ap-northeast-1" | "ap-northeast-3") {
+        Some("jp.")
+    } else if matches!(region, "ap-southeast-2" | "ap-southeast-4") {
+        Some("au.")
+    } else {
+        None
+    }
+}
+
+fn match_inference_profiles_to_model(
+    model: &str,
+    profiles: &[BedrockInferenceProfileSummary],
+    region: &str,
+) -> Vec<String> {
+    let mut exact_geo = Vec::new();
+    let mut global = Vec::new();
+    let mut other = Vec::new();
+    let preferred_geo = preferred_geo_prefix(region);
+
+    for profile in profiles {
+        if !profile_matches_model(&profile, model) {
+            continue;
+        }
+        if let Some(prefix) = preferred_geo
+            && profile.inference_profile_id.starts_with(prefix)
+        {
+            exact_geo.push(profile.inference_profile_id.clone());
+        } else if profile.inference_profile_id.starts_with("global.") {
+            global.push(profile.inference_profile_id.clone());
+        } else {
+            other.push(profile.inference_profile_id.clone());
+        }
+    }
+
+    exact_geo.extend(global);
+    exact_geo.extend(other);
+    exact_geo
+}
+
+fn profile_matches_model(profile: &BedrockInferenceProfileSummary, model: &str) -> bool {
+    profile
+        .models
+        .iter()
+        .filter_map(|entry| entry.model_arn.rsplit('/').next())
+        .any(|model_id| model_id == model)
+}
+
+fn dedup_preserve_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
 }
 
 fn read_secret_file(name: &str) -> Result<Option<String>> {
@@ -856,6 +1119,26 @@ struct BedrockFoundationModelSummary {
     response_streaming_supported: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct BedrockListInferenceProfilesResponse {
+    #[serde(rename = "inferenceProfileSummaries", default)]
+    inference_profile_summaries: Vec<BedrockInferenceProfileSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BedrockInferenceProfileSummary {
+    #[serde(rename = "inferenceProfileId")]
+    inference_profile_id: String,
+    #[serde(default)]
+    models: Vec<BedrockInferenceProfileModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BedrockInferenceProfileModel {
+    #[serde(rename = "modelArn")]
+    model_arn: String,
+}
+
 impl BedrockFoundationModelSummary {
     fn into_model_metadata(self) -> ModelMetadata {
         let supports_images = self
@@ -913,6 +1196,7 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6".to_string(),
             "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             "https://bedrock-mantle.us-east-1.api.aws/v1".to_string(),
+            "https://bedrock".to_string(),
         );
 
         assert_eq!(
@@ -1107,6 +1391,7 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
             format!("{}/v1", server.uri()),
+            server.uri(),
         );
         let response = client
             .stream_chat(StreamChatRequest {
@@ -1150,6 +1435,7 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
             format!("{}/v1", server.uri()),
+            server.uri(),
         );
         let response = client
             .stream_chat(StreamChatRequest {
@@ -1169,6 +1455,72 @@ mod tests {
             LlmResponse::Text { text, usage } => {
                 assert_eq!(text, "native ok");
                 assert_eq!(usage.input_tokens, 2);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_demand_throughput_errors_retry_with_inference_profile() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-profiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "inferenceProfileSummaries": [
+                    {
+                        "inferenceProfileId": "global.anthropic.claude-opus-4-8",
+                        "models": [
+                            {
+                                "modelArn": "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-4-8"
+                            }
+                        ]
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/model/anthropic.claude-opus-4-8/invoke"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message": "Invocation of model ID anthropic.claude-opus-4-8 with on-demand throughput isn’t supported. Retry your request with the ID or ARN of an inference profile that contains this model."
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/model/global.anthropic.claude-opus-4-8/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "profile ok"}],
+                "usage": {"input_tokens": 4, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "anthropic.claude-opus-4-8".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("request should retry with inference profile");
+        match response {
+            LlmResponse::Text { text, usage } => {
+                assert_eq!(text, "profile ok");
+                assert_eq!(usage.input_tokens, 4);
             }
             other => panic!("expected text response, got {other:?}"),
         }
@@ -1217,6 +1569,7 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
             format!("{}/v1", server.uri()),
+            server.uri(),
         );
         let models = client
             .list_model_metadata()
@@ -1234,6 +1587,91 @@ mod tests {
                 .find(|m| m.id == "anthropic.claude-sonnet-4-20250514-v1:0")
                 .and_then(|m| m.supports_images),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn foundation_models_are_rewritten_to_invocable_profile_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "modelSummaries": [
+                            {
+                                "modelId": "anthropic.claude-opus-4-8",
+                                "inputModalities": ["TEXT", "IMAGE"],
+                                "outputModalities": ["TEXT"],
+                                "responseStreamingSupported": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-profiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "inferenceProfileSummaries": [
+                    {
+                        "inferenceProfileId": "global.anthropic.claude-opus-4-8",
+                        "models": [
+                            {
+                                "modelArn": "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-4-8"
+                            }
+                        ]
+                    },
+                    {
+                        "inferenceProfileId": "us.anthropic.claude-opus-4-8",
+                        "models": [
+                            {
+                                "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-8"
+                            }
+                        ]
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "anthropic.claude-opus-4-8".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let models = client
+            .list_model_metadata()
+            .await
+            .expect("discovery should succeed");
+
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "us.anthropic.claude-opus-4-8")
+        );
+        assert!(!models.iter().any(|m| m.id == "anthropic.claude-opus-4-8"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "us.anthropic.claude-opus-4-8")
+                .and_then(|m| m.supports_images),
+            Some(true)
+        );
+        assert_eq!(
+            models.first().map(|m| m.id.as_str()),
+            Some("us.anthropic.claude-opus-4-8")
         );
     }
 
@@ -1271,6 +1709,7 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
             format!("{}/v1", server.uri()),
+            server.uri(),
         );
         let models = client
             .list_model_metadata()
@@ -1393,5 +1832,62 @@ mod tests {
         .expect("fallback should succeed");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn inference_profile_matching_prefers_geo_then_global() {
+        let profiles = vec![
+            BedrockInferenceProfileSummary {
+                inference_profile_id: "global.anthropic.claude-opus-4-8".to_string(),
+                models: vec![BedrockInferenceProfileModel {
+                    model_arn:
+                        "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-4-8"
+                            .to_string(),
+                }],
+            },
+            BedrockInferenceProfileSummary {
+                inference_profile_id: "us.anthropic.claude-opus-4-8".to_string(),
+                models: vec![BedrockInferenceProfileModel {
+                    model_arn:
+                        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-8"
+                            .to_string(),
+                }],
+            },
+            BedrockInferenceProfileSummary {
+                inference_profile_id: "eu.anthropic.claude-opus-4-8".to_string(),
+                models: vec![BedrockInferenceProfileModel {
+                    model_arn:
+                        "arn:aws:bedrock:eu-west-1::foundation-model/anthropic.claude-opus-4-8"
+                            .to_string(),
+                }],
+            },
+        ];
+        let matched =
+            match_inference_profiles_to_model("anthropic.claude-opus-4-8", &profiles, "us-east-2");
+
+        assert_eq!(
+            matched,
+            vec![
+                "us.anthropic.claude-opus-4-8".to_string(),
+                "global.anthropic.claude-opus-4-8".to_string(),
+                "eu.anthropic.claude-opus-4-8".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_model_is_normalized_to_invocable_profile_id() {
+        let profiles = vec![BedrockInferenceProfileSummary {
+            inference_profile_id: "global.anthropic.claude-opus-4-8".to_string(),
+            models: vec![BedrockInferenceProfileModel {
+                model_arn: "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-4-8"
+                    .to_string(),
+            }],
+        }];
+
+        assert_eq!(
+            normalize_default_bedrock_model("anthropic.claude-opus-4-8", &profiles, "us-east-2",),
+            "global.anthropic.claude-opus-4-8"
+        );
     }
 }

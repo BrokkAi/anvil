@@ -185,7 +185,11 @@ Anvil is zero-config by default:
   `bedrock::us.anthropic.claude-sonnet-4-6`. Bedrock-hosted `openai.*` models
   route through the OpenAI-compatible `Responses` API at
   `https://bedrock-mantle.<region>.api.aws/v1` when the selected model supports
-  that API on Bedrock.
+  that API on Bedrock. On startup and refresh, Anvil discovers Bedrock
+  inference profiles for the current region and publishes invocable model ids
+  in the picker. `ANVIL_BEDROCK_MODEL` may be either a foundation model id or
+  an inference profile id/ARN; when a base model requires an inference profile,
+  Anvil normalizes it to the matching profile automatically.
 
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.
