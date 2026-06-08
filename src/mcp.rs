@@ -84,10 +84,18 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<McpEnvVar>,
     #[serde(default)]
     pub framing: McpFraming,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpEnvVar {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +339,7 @@ impl McpServerConfig {
             name: "bifrost".to_string(),
             command: managed_bifrost_command(),
             args: default_bifrost_args(),
+            env: Vec::new(),
             framing: McpFraming::Line,
             enabled: true,
         }
@@ -383,6 +392,7 @@ impl McpClient {
         let rendered_args = config.rendered_args(cwd);
         let mut child = Command::new(&config.command)
             .args(&rendered_args)
+            .envs(config.env.iter().map(|var| (&var.name, &var.value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -744,6 +754,7 @@ mod tests {
             name: "bifrost".to_string(),
             command: binary.display().to_string(),
             args: McpServerConfig::bifrost().args,
+            env: Vec::new(),
             framing: McpFraming::Line,
             enabled: true,
         };
@@ -806,6 +817,59 @@ mod tests {
         eprintln!(
             "list_symbols result: {}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_passes_configured_env_vars() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let env_log = tmp.path().join("env.log");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$ANVIL_MCP_TEST_TOKEN" > "{}"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'* )
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{}}}}}}'
+      ;;
+    *'"method":"tools/list"'* )
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
+      exit 0
+      ;;
+  esac
+done
+"#,
+            env_log.display()
+        );
+        std::fs::write(&script_path, script).expect("write fake MCP script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake MCP script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake MCP script");
+
+        let config = McpServerConfig {
+            name: "fake".to_string(),
+            command: script_path.display().to_string(),
+            args: Vec::new(),
+            env: vec![McpEnvVar {
+                name: "ANVIL_MCP_TEST_TOKEN".to_string(),
+                value: "expected-token".to_string(),
+            }],
+            framing: McpFraming::Line,
+            enabled: true,
+        };
+
+        let _client = McpClient::spawn(&config, tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        assert_eq!(
+            std::fs::read_to_string(&env_log).expect("read env log"),
+            "expected-token\n"
         );
     }
 }

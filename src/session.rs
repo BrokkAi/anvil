@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::ModelMetadata;
+use crate::mcp::{McpEnvVar, McpFraming, McpServerConfig};
 use crate::structured_output::StructuredOutputResult;
 use crate::tools::ToolRegistry;
 
@@ -248,6 +249,53 @@ fn discover_session_context(
     }
 }
 
+pub(crate) fn acp_mcp_servers_to_configs(
+    servers: Vec<agent_client_protocol::schema::McpServer>,
+) -> Vec<McpServerConfig> {
+    servers
+        .into_iter()
+        .filter_map(|server| match server {
+            agent_client_protocol::schema::McpServer::Stdio(stdio) => {
+                Some(McpServerConfig {
+                    name: stdio.name,
+                    command: stdio.command.display().to_string(),
+                    args: stdio.args,
+                    env: stdio
+                        .env
+                        .into_iter()
+                        .map(|var| McpEnvVar {
+                            name: var.name,
+                            value: var.value,
+                        })
+                        .collect(),
+                    framing: McpFraming::ContentLength,
+                    enabled: true,
+                })
+            }
+            agent_client_protocol::schema::McpServer::Http(http) => {
+                tracing::warn!(
+                    server = %http.name,
+                    "ACP HTTP MCP server skipped; Anvil only supports stdio MCP subprocesses"
+                );
+                None
+            }
+            agent_client_protocol::schema::McpServer::Sse(sse) => {
+                tracing::warn!(
+                    server = %sse.name,
+                    "ACP SSE MCP server skipped; Anvil only supports stdio MCP subprocesses"
+                );
+                None
+            }
+            _ => {
+                tracing::warn!(
+                    "unsupported ACP MCP server transport skipped; Anvil only supports stdio MCP subprocesses"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Session modes
 // ---------------------------------------------------------------------------
@@ -406,6 +454,15 @@ pub struct SessionManifest {
         rename = "brokkModel"
     )]
     pub model: Option<String>,
+    /// Brokk ACP-specific: effective MCP server configuration for this
+    /// session. `None` means the session uses install-level `/mcp` config;
+    /// `Some(vec![])` means ACP explicitly requested no MCP servers.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "brokkMcpServers"
+    )]
+    pub brokk_mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 impl SessionManifest {
@@ -475,6 +532,11 @@ pub struct Session {
     /// Set via `/idle-timeout <secs>`, cleared via `/idle-timeout default`.
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
+    /// Per-session MCP server configuration supplied by ACP `session/new`.
+    /// `None` means use Anvil's install-level `/mcp` configuration. `Some`,
+    /// including `Some(vec![])`, is authoritative for this session and must
+    /// not be supplemented with default/preinstalled servers.
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
     /// Concatenated AGENTS.md / CLAUDE.md content discovered under `cwd`
     /// (and the user's global config slot) at session creation or on the
     /// most recent `update_cwd`. Empty string means none found. Not
@@ -536,6 +598,7 @@ impl Session {
             } else {
                 Some(model.clone())
             },
+            brokk_mcp_servers: None,
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
@@ -554,6 +617,7 @@ impl Session {
             always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
+            mcp_servers: None,
             project_instructions,
             skills,
             agents,
@@ -605,6 +669,7 @@ impl Session {
         }
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
+        let mcp_servers = manifest.brokk_mcp_servers.clone();
         Ok(Self {
             id,
             cwd,
@@ -625,6 +690,7 @@ impl Session {
             selected_reasoning_effort: None,
             // Same rationale: idle timeout override is in-memory only.
             idle_timeout_secs: None,
+            mcp_servers,
             project_instructions,
             skills,
             agents,
@@ -2041,7 +2107,13 @@ impl SessionStore {
             existing.set_agents(agents).await;
             return existing;
         }
-        let mcp_servers = crate::setup_state::read_mcp_servers();
+        let mcp_servers = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .and_then(|session| session.mcp_servers.clone())
+                .unwrap_or_else(crate::setup_state::read_mcp_servers)
+        };
         let registry =
             Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
         self.registries
@@ -2080,8 +2152,17 @@ impl SessionStore {
         self.available_models.read().await.clone()
     }
 
-    /// Create a new session and write it to disk as a zip.
+    #[cfg(test)]
     pub async fn create_session(&self, cwd: PathBuf) -> Session {
+        self.create_session_with_mcp_servers(cwd, None).await
+    }
+
+    /// Create a new session and write it to disk as a zip.
+    pub async fn create_session_with_mcp_servers(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Option<Vec<McpServerConfig>>,
+    ) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
         let prefs = self.setup_state_snapshot();
         let default_model = self.default_model.read().await.clone();
@@ -2109,6 +2190,8 @@ impl SessionStore {
                 DEFAULT_SESSION_NAME.to_string(),
             ),
         };
+        session.mcp_servers = mcp_servers.clone();
+        session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
         session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
 
@@ -3225,6 +3308,7 @@ mod tests {
             version: "4.0".into(),
             mode: Some("CODE".into()),
             model: Some("m".into()),
+            brokk_mcp_servers: None,
         };
         let history = vec![ConversationTurn {
             user_prompt: "u".into(),
@@ -3452,6 +3536,7 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            brokk_mcp_servers: None,
         };
 
         let err = Session::from_persisted(
@@ -4726,6 +4811,115 @@ done
             .collect()
     }
 
+    #[test]
+    fn acp_stdio_mcp_servers_convert_to_anvil_configs() {
+        let configs =
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Stdio(
+                agent_client_protocol::schema::McpServerStdio::new("local", "/usr/bin/mcp")
+                    .args(vec!["--flag".to_string(), "value".to_string()])
+                    .env(vec![agent_client_protocol::schema::EnvVariable::new(
+                        "TOKEN", "secret",
+                    )]),
+            )]);
+
+        assert_eq!(
+            configs,
+            vec![crate::mcp::McpServerConfig {
+                name: "local".to_string(),
+                command: "/usr/bin/mcp".to_string(),
+                args: vec!["--flag".to_string(), "value".to_string()],
+                env: vec![crate::mcp::McpEnvVar {
+                    name: "TOKEN".to_string(),
+                    value: "secret".to_string(),
+                }],
+                framing: crate::mcp::McpFraming::ContentLength,
+                enabled: true,
+            }]
+        );
+    }
+
+    /// An explicit ACP `mcpServers: []` is authoritative for that session
+    /// and must not be filled with Anvil's persisted/preinstalled defaults.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_empty_acp_mcp_servers_do_not_spawn_default_bifrost() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
+        let session = store
+            .create_session_with_mcp_servers(cwd.path().to_path_buf(), Some(Vec::new()))
+            .await;
+
+        let registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await;
+
+        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
+        assert!(
+            !bifrost_log.exists(),
+            "explicit empty ACP MCP list should not spawn persisted default bifrost"
+        );
+    }
+
+    /// The ACP MCP override is persisted in the session manifest so an LRU
+    /// eviction, `session/load`, or server restart cannot reintroduce
+    /// install-level default MCP servers for a session created with
+    /// `mcpServers: []`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_empty_acp_mcp_servers_survive_cold_reload() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let fake_bifrost_dir = tempfile::tempdir().expect("fake bifrost dir");
+        let bifrost_log = fake_bifrost_dir.path().join("bifrost-argv.log");
+        let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
+        crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
+            name: "bifrost".to_string(),
+            command: fake_bifrost.display().to_string(),
+            args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
+            framing: crate::mcp::McpFraming::Line,
+            enabled: true,
+        }])
+        .expect("remember mcp config");
+        let session = store
+            .create_session_with_mcp_servers(cwd.path().to_path_buf(), Some(Vec::new()))
+            .await;
+        store.sessions.write().await.remove(&session.id);
+        store.registries.write().await.remove(&session.id);
+
+        let reloaded = store
+            .get_session(&session.id, cwd.path())
+            .await
+            .expect("session should cold-load from zip");
+        assert_eq!(reloaded.mcp_servers, Some(Vec::new()));
+
+        let registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await;
+
+        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
+        assert!(
+            !bifrost_log.exists(),
+            "cold-loaded ACP empty MCP list should not spawn persisted default bifrost"
+        );
+    }
+
     /// A cwd change must invalidate the cached registry so the next
     /// prompt runs against the new workspace and respawns Bifrost with the
     /// updated root.
@@ -4744,6 +4938,7 @@ done
             name: "bifrost".to_string(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
+            env: Vec::new(),
             framing: crate::mcp::McpFraming::Line,
             enabled: true,
         }])
