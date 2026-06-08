@@ -660,7 +660,12 @@ pub(crate) async fn run(
         if cancel.is_cancelled() {
             break;
         }
+        let permission_mode = sessions
+            .permission_mode(&session_id)
+            .await
+            .unwrap_or(PermissionMode::ReadOnly);
         if should_emit_no_edit_progress_nudge(
+            permission_mode,
             turn,
             max_turns,
             &tool_exchanges,
@@ -741,7 +746,12 @@ pub(crate) async fn run(
             Ok(LlmResponse::Text { text, usage }) => {
                 trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
-                if should_reject_no_edit_final_answer(turn, max_turns, &tool_exchanges) {
+                if should_reject_no_edit_final_answer(
+                    permission_mode,
+                    turn,
+                    max_turns,
+                    &tool_exchanges,
+                ) {
                     append_trace_record(serde_json::json!({
                         "type": "no_edit_final_answer_guard",
                         "turn": turn,
@@ -1796,10 +1806,14 @@ fn trace_bifrost_context_shadow(
 }
 
 fn should_reject_no_edit_final_answer(
+    permission_mode: PermissionMode,
     turn: usize,
     max_turns: usize,
     tool_exchanges: &[ToolExchange],
 ) -> bool {
+    if matches!(permission_mode, PermissionMode::ReadOnly) {
+        return false;
+    }
     if turn >= max_turns - 1 || has_successful_file_change(tool_exchanges) {
         return false;
     }
@@ -1818,11 +1832,15 @@ fn should_reject_no_edit_final_answer(
 }
 
 fn should_emit_no_edit_progress_nudge(
+    permission_mode: PermissionMode,
     turn: usize,
     max_turns: usize,
     tool_exchanges: &[ToolExchange],
     nudge_count: usize,
 ) -> bool {
+    if matches!(permission_mode, PermissionMode::ReadOnly) {
+        return false;
+    }
     if nudge_count >= 2 || has_successful_file_change(tool_exchanges) {
         return false;
     }
@@ -2492,7 +2510,18 @@ mod tests {
     fn no_edit_final_guard_rejects_navigation_only_final_before_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
 
-        assert!(should_reject_no_edit_final_answer(3, 10, &prior));
+        assert!(should_reject_no_edit_final_answer(
+            PermissionMode::Default,
+            3,
+            10,
+            &prior
+        ));
+        assert!(!should_reject_no_edit_final_answer(
+            PermissionMode::ReadOnly,
+            3,
+            10,
+            &prior
+        ));
     }
 
     #[test]
@@ -2504,7 +2533,12 @@ mod tests {
             result: "Edited 'src/lib.rs' (1 replacement)".to_string(),
         }];
 
-        assert!(!should_reject_no_edit_final_answer(3, 10, &prior));
+        assert!(!should_reject_no_edit_final_answer(
+            PermissionMode::Default,
+            3,
+            10,
+            &prior
+        ));
         assert!(has_successful_file_change(&prior));
     }
 
@@ -2512,7 +2546,12 @@ mod tests {
     fn no_edit_final_guard_does_not_reject_on_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
 
-        assert!(!should_reject_no_edit_final_answer(9, 10, &prior));
+        assert!(!should_reject_no_edit_final_answer(
+            PermissionMode::Default,
+            9,
+            10,
+            &prior
+        ));
     }
 
     #[test]
@@ -2525,9 +2564,34 @@ mod tests {
             exchange_for_test("read_file"),
         ];
 
-        assert!(should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
-        assert!(!should_emit_no_edit_progress_nudge(7, 25, &prior, 0));
-        assert!(!should_emit_no_edit_progress_nudge(8, 25, &prior, 2));
+        assert!(should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            8,
+            25,
+            &prior,
+            0
+        ));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::ReadOnly,
+            8,
+            25,
+            &prior,
+            0
+        ));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            7,
+            25,
+            &prior,
+            0
+        ));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            8,
+            25,
+            &prior,
+            2
+        ));
     }
 
     #[test]
@@ -2540,7 +2604,13 @@ mod tests {
             exchange_for_test("read_file"),
         ];
 
-        assert!(!should_emit_no_edit_progress_nudge(8, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            8,
+            25,
+            &prior,
+            0
+        ));
     }
 
     #[test]
@@ -2561,7 +2631,13 @@ mod tests {
             },
         ];
 
-        assert!(!should_emit_no_edit_progress_nudge(12, 25, &prior, 0));
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            12,
+            25,
+            &prior,
+            0
+        ));
     }
 
     #[test]
