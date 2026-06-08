@@ -77,6 +77,12 @@ pub enum SkillScope {
     Project,
 }
 
+#[derive(Debug)]
+struct SkillCandidate {
+    path: PathBuf,
+    scope: SkillScope,
+}
+
 /// In-memory registry. Keyed by `name`; last-wins on insert. Diagnostics
 /// (collision warnings, parse errors, name/dir mismatches) are stashed
 /// so `/context` can surface them without spamming the LLM catalog.
@@ -133,14 +139,18 @@ impl SkillRegistry {
                 prev.location.display(),
                 meta.location.display(),
             );
-            tracing::warn!("{msg}");
-            self.diagnostics.push(msg);
+            self.push_shadow_diagnostic(msg);
         }
         self.by_name.insert(meta.name.clone(), meta);
     }
 
     fn push_diagnostic(&mut self, msg: String) {
         tracing::warn!("{msg}");
+        self.diagnostics.push(msg);
+    }
+
+    fn push_shadow_diagnostic(&mut self, msg: String) {
+        tracing::debug!("{msg}");
         self.diagnostics.push(msg);
     }
 }
@@ -180,7 +190,15 @@ fn discover_with_backend(
     backend: &crate::sandbox_backend::SandboxBackend,
 ) -> SkillRegistry {
     let cwd = normalize_path(cwd);
+    crate::trace_checkpoint!(
+        "skills_discovery_begin",
+        serde_json::json!({
+            "cwd": cwd.display().to_string(),
+            "home": home.map(|h| h.display().to_string()),
+        }),
+    );
     let mut reg = SkillRegistry::default();
+    let mut candidates = Vec::new();
 
     // 1+2. User scope: `~/.claude/skills/` then `~/.agents/skills/`.
     //      `.agents/` is scanned last so it wins under last-wins.
@@ -188,14 +206,14 @@ fn discover_with_backend(
         scan_root(
             &h.join(CLAUDE_DIR).join(SKILLS_SUBDIR),
             SkillScope::User,
+            &mut candidates,
             &mut reg,
-            backend,
         );
         scan_root(
             &h.join(AGENTS_DIR).join(SKILLS_SUBDIR),
             SkillScope::User,
+            &mut candidates,
             &mut reg,
-            backend,
         );
     }
 
@@ -207,29 +225,52 @@ fn discover_with_backend(
         scan_root(
             &dir.join(CLAUDE_DIR).join(SKILLS_SUBDIR),
             SkillScope::Project,
+            &mut candidates,
             &mut reg,
-            backend,
         );
         scan_root(
             &dir.join(AGENTS_DIR).join(SKILLS_SUBDIR),
             SkillScope::Project,
+            &mut candidates,
             &mut reg,
-            backend,
         );
+    }
+
+    let candidate_count = candidates.len();
+    let candidates = dedupe_candidates(candidates, &mut reg);
+    crate::trace_checkpoint!(
+        "skills_discovery_candidates_deduped",
+        serde_json::json!({
+            "candidate_count": candidate_count,
+            "winner_count": candidates.len(),
+            "diagnostic_count": reg.diagnostics.len(),
+        }),
+    );
+
+    for candidate in candidates {
+        load_skill(&candidate.path, candidate.scope, &mut reg, backend);
     }
 
     if !reg.is_empty() {
         let names: Vec<&str> = reg.by_name.keys().map(|s| s.as_str()).collect();
         tracing::info!(skills = ?names, "SKILL.md discovery");
     }
+    crate::trace_checkpoint!(
+        "skills_discovery_end",
+        serde_json::json!({
+            "skill_count": reg.by_name.len(),
+            "diagnostic_count": reg.diagnostics.len(),
+            "skills": reg.by_name.keys().cloned().collect::<Vec<_>>(),
+        }),
+    );
     reg
 }
 
 fn scan_root(
     root: &Path,
     scope: SkillScope,
+    candidates: &mut Vec<SkillCandidate>,
     reg: &mut SkillRegistry,
-    backend: &crate::sandbox_backend::SandboxBackend,
 ) {
     // Empty/missing root is the common case (no `.agents/skills/`
     // anywhere). Distinguish from real errors so we don't spam warnings.
@@ -277,8 +318,48 @@ fn scan_root(
         if entry.file_name() != OsStr::new(SKILL_FILE) {
             continue;
         }
-        load_skill(entry.path(), scope, reg, backend);
+        candidates.push(SkillCandidate {
+            path: entry.path().to_path_buf(),
+            scope,
+        });
     }
+}
+
+fn dedupe_candidates(
+    candidates: Vec<SkillCandidate>,
+    reg: &mut SkillRegistry,
+) -> Vec<SkillCandidate> {
+    let mut winner_by_dir_name: HashMap<String, usize> = HashMap::new();
+    let mut keep = vec![true; candidates.len()];
+
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let Some(dir_name) = candidate
+            .path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+
+        if let Some(prev_idx) = winner_by_dir_name.insert(dir_name.clone(), idx) {
+            keep[prev_idx] = false;
+            reg.push_shadow_diagnostic(format!(
+                "duplicate skill '{}': '{}' shadowed by '{}'",
+                dir_name,
+                candidates[prev_idx].path.display(),
+                candidate.path.display()
+            ));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| keep[idx].then_some(candidate))
+        .collect()
 }
 
 /// Skip `.git/`, `node_modules/`, and any other hidden directory that
@@ -740,6 +821,41 @@ mod tests {
         assert_eq!(meta.description, "agents user");
         assert_eq!(canonical(&meta.location), canonical(&agents_path));
         assert_eq!(meta.scope, SkillScope::User);
+    }
+
+    #[test]
+    fn shadowed_duplicate_is_not_parsed() {
+        let home = TempDir::new().unwrap();
+        skill_at(
+            home.path(),
+            CLAUDE_DIR,
+            "dup",
+            "---\nname: dup\ndescription: [unterminated\n---\nBody",
+        );
+        let agents_path = skill_at(
+            home.path(),
+            AGENTS_DIR,
+            "dup",
+            &minimal("dup", "agents user"),
+        );
+
+        let project = TempDir::new().unwrap();
+        let reg = discover_inner(project.path(), Some(home.path()));
+        let meta = reg.get("dup").unwrap();
+        assert_eq!(meta.description, "agents user");
+        assert_eq!(canonical(&meta.location), canonical(&agents_path));
+        assert!(
+            reg.diagnostics()
+                .iter()
+                .any(|d| d.contains("duplicate skill 'dup'")),
+            "expected duplicate diagnostic; got: {:?}",
+            reg.diagnostics()
+        );
+        assert!(
+            !reg.diagnostics().iter().any(|d| d.contains("invalid YAML")),
+            "shadowed lower-priority duplicate should not be parsed; diagnostics: {:?}",
+            reg.diagnostics()
+        );
     }
 
     #[test]

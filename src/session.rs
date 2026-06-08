@@ -250,18 +250,47 @@ fn discover_session_context(
     Arc<crate::skills::SkillRegistry>,
     Arc<crate::agents::AgentRegistry>,
 ) {
-    match sandbox_mode {
-        Some(mode) => (
-            crate::agents_md::discover_with_sandbox_mode(cwd, Some(mode)),
-            Arc::new(crate::skills::discover_with_sandbox_mode(cwd, Some(mode))),
-            Arc::new(crate::agents::discover_with_sandbox_mode(cwd, Some(mode))),
-        ),
-        None => (
-            crate::agents_md::discover(cwd),
-            Arc::new(crate::skills::discover(cwd)),
-            Arc::new(crate::agents::discover(cwd)),
-        ),
-    }
+    crate::trace_checkpoint!(
+        "session_context_discovery_begin",
+        serde_json::json!({
+            "cwd": cwd.display().to_string(),
+            "sandbox_mode": sandbox_mode.map(|mode| mode.as_str()),
+        }),
+    );
+    crate::trace_checkpoint!(
+        "agents_md_discovery_begin",
+        serde_json::json!({
+            "cwd": cwd.display().to_string(),
+        }),
+    );
+    let project_instructions = match sandbox_mode {
+        Some(mode) => crate::agents_md::discover_with_sandbox_mode(cwd, Some(mode)),
+        None => crate::agents_md::discover(cwd),
+    };
+    crate::trace_checkpoint!(
+        "agents_md_discovery_end",
+        serde_json::json!({
+            "bytes": project_instructions.len(),
+        }),
+    );
+
+    let skills = Arc::new(match sandbox_mode {
+        Some(mode) => crate::skills::discover_with_sandbox_mode(cwd, Some(mode)),
+        None => crate::skills::discover(cwd),
+    });
+    let agents = Arc::new(match sandbox_mode {
+        Some(mode) => crate::agents::discover_with_sandbox_mode(cwd, Some(mode)),
+        None => crate::agents::discover(cwd),
+    });
+    crate::trace_checkpoint!(
+        "session_context_discovery_end",
+        serde_json::json!({
+            "project_instruction_bytes": project_instructions.len(),
+            "has_skills": !skills.is_empty(),
+            "has_subagents": !agents.is_empty(),
+        }),
+    );
+    (project_instructions, skills, agents)
 }
 
 pub(crate) fn acp_mcp_servers_to_configs(
@@ -2105,6 +2134,13 @@ impl SessionStore {
         cwd: PathBuf,
     ) -> Arc<ToolRegistry> {
         let normalized_cwd = normalize_cwd(&cwd);
+        crate::trace_checkpoint!(
+            "tool_registry_lookup_begin",
+            serde_json::json!({
+                "session_id": session_id,
+                "cwd": normalized_cwd.display().to_string(),
+            }),
+        );
         let (skills, agents) = {
             let sessions = self.sessions.read().await;
             match sessions.get(session_id) {
@@ -2121,6 +2157,13 @@ impl SessionStore {
         {
             existing.set_skills(skills).await;
             existing.set_agents(agents).await;
+            crate::trace_checkpoint!(
+                "tool_registry_lookup_reused",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": normalized_cwd.display().to_string(),
+                }),
+            );
             return existing;
         }
         let mcp_servers = {
@@ -2130,12 +2173,35 @@ impl SessionStore {
                 .and_then(|session| session.mcp_servers.clone());
             effective_mcp_servers(extra_servers)
         };
+        crate::trace_checkpoint!(
+            "mcp_server_resolution_end",
+            serde_json::json!({
+                "session_id": session_id,
+                "server_count": mcp_servers.len(),
+                "servers": mcp_servers.iter().map(|server| server.name.clone()).collect::<Vec<_>>(),
+            }),
+        );
+        crate::trace_checkpoint!(
+            "tool_registry_construction_begin",
+            serde_json::json!({
+                "session_id": session_id,
+                "cwd": normalized_cwd.display().to_string(),
+                "mcp_server_count": mcp_servers.len(),
+            }),
+        );
         let registry =
             Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
         self.registries
             .write()
             .await
             .insert(session_id.to_string(), registry.clone());
+        crate::trace_checkpoint!(
+            "tool_registry_construction_end",
+            serde_json::json!({
+                "session_id": session_id,
+                "cwd": registry.cwd().display().to_string(),
+            }),
+        );
         registry
     }
 

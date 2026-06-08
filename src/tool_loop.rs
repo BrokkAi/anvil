@@ -899,6 +899,17 @@ pub(crate) async fn run(
             &messages,
             request_tools.as_ref(),
         );
+        crate::trace_checkpoint!(
+            "turn_provider_dispatch_begin",
+            serde_json::json!({
+                "session_id": session_id,
+                "turn": turn,
+                "model": model,
+                "message_count": messages.len(),
+                "tool_definition_count": request_tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
+                "has_structured_output": structured_output.is_some(),
+            }),
+        );
 
         let response = stream_chat_with_transient_retry(
             llm,
@@ -914,6 +925,18 @@ pub(crate) async fn run(
             idle_timeout,
         )
         .await;
+        crate::trace_checkpoint!(
+            "turn_provider_dispatch_end",
+            serde_json::json!({
+                "session_id": session_id,
+                "turn": turn,
+                "result": match &response {
+                    Ok(LlmResponse::Text { .. }) => "text",
+                    Ok(LlmResponse::ToolCalls { .. }) => "tool_calls",
+                    Err(_) => "error",
+                },
+            }),
+        );
 
         match response {
             Ok(LlmResponse::Text { text, usage }) => {
