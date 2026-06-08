@@ -162,6 +162,28 @@ pub(super) fn rejected_initial_tool_call(
     .locations(tool_locations(tool_name, raw_input))
 }
 
+/// Failed card for a tool call rejected before it can become an ordinary
+/// pending operation. The title is intentionally neutral so read-only
+/// clients never have to interpret `Write foo` / `Edit foo` as "attempted
+/// but blocked" versus "actually running".
+pub(super) fn blocked_tool_call(
+    tool_call_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+    reason: &str,
+) -> ToolCall {
+    ToolCall::new(
+        ToolCallId::new(tool_call_id.to_string()),
+        format!("Blocked {}", ToolRegistry::display_name(tool_name)),
+    )
+    .kind(kind)
+    .status(ToolCallStatus::Failed)
+    .content(vec![text_content(reason)])
+    .raw_input(raw_input.clone())
+    .locations(tool_locations(tool_name, raw_input))
+}
+
 /// Mark the tool as actively running. Sent once the gate clears.
 pub(super) fn update_in_progress(tool_call_id: &str) -> ToolCallUpdate {
     let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
@@ -736,6 +758,54 @@ mod tests {
         assert_eq!(card.title, "Running shell command");
         // raw_input is still attached so the user can inspect what was
         // attempted; it lives in a scrollable region client-side.
+        assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn blocked_write_card_uses_neutral_failed_title() {
+        let card = blocked_tool_call(
+            "tc1",
+            "write_file",
+            ToolKind::Edit,
+            &json!({"file_path": "app.js", "content": "x"}),
+            "read-only",
+        );
+
+        assert_eq!(card.title, "Blocked Writing file");
+        assert_eq!(card.status, ToolCallStatus::Failed);
+        assert_ne!(card.title, "Write `app.js`");
+        assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn blocked_edit_card_uses_neutral_failed_title() {
+        let card = blocked_tool_call(
+            "tc1",
+            "edit",
+            ToolKind::Edit,
+            &json!({"file_path": "app.js", "old_string": "x", "new_string": "y"}),
+            "read-only",
+        );
+
+        assert_eq!(card.title, "Blocked Editing file");
+        assert_eq!(card.status, ToolCallStatus::Failed);
+        assert_ne!(card.title, "Edit `app.js`");
+        assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn blocked_unknown_tool_uses_static_bounded_title() {
+        let huge = "x".repeat(MAX_TOOL_TITLE_CHARS * 2);
+        let card = blocked_tool_call(
+            "tc1",
+            &huge,
+            ToolKind::Other,
+            &json!({"anything": "goes"}),
+            "read-only",
+        );
+
+        assert_eq!(card.title, "Blocked Executing tool");
+        assert!(card.title.chars().count() <= MAX_TOOL_TITLE_CHARS);
         assert!(card.raw_input.is_some());
     }
 
