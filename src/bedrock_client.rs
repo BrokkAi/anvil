@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    ModelsResponse, OpenAiClient, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    ModelsResponse, OpenAiClient, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
 use crate::trace_logging::append_trace_record;
@@ -19,6 +20,63 @@ use serde::{Deserialize, Serialize};
 /// (e.g. `us.anthropic.claude-sonnet-4-6`).
 fn requires_explicit_caching(model: &str) -> bool {
     model.contains("anthropic")
+}
+
+/// Returns true when the Bedrock-hosted Anthropic model supports the
+/// extended-thinking ("reasoning") feature. Claude 3.7 Sonnet and the
+/// Claude 4 family (Sonnet/Opus) expose a `thinking` request block; older
+/// Claude 3.x models (3.5 and earlier) do not.
+fn supports_extended_thinking(model: &str) -> bool {
+    if !model.contains("anthropic") {
+        return false;
+    }
+    // Claude 4 family ids look like `...claude-sonnet-4-*`, `...claude-opus-4-*`.
+    let claude_4 = model.contains("claude-sonnet-4")
+        || model.contains("claude-opus-4")
+        || model.contains("claude-haiku-4");
+    // Claude 3.7 Sonnet introduced extended thinking on the 3.x line.
+    let claude_3_7 = model.contains("claude-3-7");
+    claude_4 || claude_3_7
+}
+
+/// Reasoning-effort presets surfaced for Bedrock Anthropic models that
+/// support extended thinking. `default_reasoning_level` is left `None` so
+/// the feature stays opt-in: with no explicit pick the session omits the
+/// effort and the request carries no `thinking` block (current behavior).
+fn anthropic_thinking_presets() -> Vec<ReasoningLevelPreset> {
+    [
+        ("low", "Light reasoning for shorter problems."),
+        ("medium", "Balanced reasoning for moderate complexity."),
+        ("high", "Deep reasoning for harder problems."),
+    ]
+    .into_iter()
+    .map(|(effort, description)| ReasoningLevelPreset {
+        effort: effort.to_string(),
+        description: description.to_string(),
+    })
+    .collect()
+}
+
+/// Map a reasoning-effort preset to an Anthropic extended-thinking
+/// `budget_tokens` value. Returns `None` for unknown/empty efforts so the
+/// caller omits the `thinking` block entirely.
+///
+/// Budgets must be >= 1024 and strictly less than the request's
+/// `max_tokens`; `thinking_max_tokens` keeps that invariant.
+fn thinking_budget_for_effort(effort: &str) -> Option<u32> {
+    match effort.trim() {
+        "low" => Some(2_048),
+        "medium" => Some(4_096),
+        "high" => Some(8_192),
+        _ => None,
+    }
+}
+
+/// Output cap to send alongside a `thinking` budget. Anthropic requires
+/// `max_tokens > budget_tokens`; we add headroom for the visible answer on
+/// top of the reasoning budget.
+fn thinking_max_tokens(budget_tokens: u32) -> u32 {
+    budget_tokens.saturating_add(MAX_TOKENS)
 }
 
 const CACHE_CONTROL: CacheControl = CacheControl {
@@ -240,32 +298,50 @@ impl BedrockClient {
             model,
             messages,
             tools,
-            reasoning_effort: _,
+            reasoning_effort,
             structured_output: _,
             mut on_token,
-            on_thought: _,
+            mut on_thought,
             cancel,
             idle_timeout: _,
         } = request;
-        let enable_cache = requires_explicit_caching(&model);
+        let resolved_model = self.resolve_invocable_model_id(&model).await?;
+        let enable_cache = requires_explicit_caching(&resolved_model);
         let (system_blocks, messages) = convert_messages(messages, enable_cache)?;
         let system = if system_blocks.is_empty() {
             None
         } else {
             Some(system_blocks)
         };
+        // Map the resolved reasoning effort to an Anthropic extended-thinking
+        // block, but only for models that actually support it. When thinking
+        // is enabled `temperature` must be unset and `max_tokens` must exceed
+        // the reasoning budget.
+        let thinking = reasoning_effort
+            .as_deref()
+            .filter(|_| supports_extended_thinking(&resolved_model))
+            .and_then(thinking_budget_for_effort)
+            .map(|budget_tokens| BedrockThinking {
+                thinking_type: "enabled",
+                budget_tokens,
+            });
+        let max_tokens = thinking
+            .as_ref()
+            .map(|t| thinking_max_tokens(t.budget_tokens))
+            .unwrap_or(MAX_TOKENS);
         let body = BedrockAnthropicRequest {
             anthropic_version: ANTHROPIC_VERSION,
             system,
             messages,
             tools: tools.map(|t| convert_tools(t, enable_cache)),
-            max_tokens: MAX_TOKENS,
+            max_tokens,
             temperature: None,
+            thinking,
         };
-        let url = self.invoke_url(&model);
+        let url = self.invoke_url(&resolved_model);
         trace_bedrock_request(&body);
         let body_text = self
-            .invoke_native_anthropic_with_fallback(&model, &url, &body, &cancel)
+            .invoke_native_anthropic_with_fallback(&resolved_model, &url, &body, &cancel)
             .await?;
         if body_text.is_empty() && cancel.is_cancelled() {
             return Ok(LlmResponse::Text {
@@ -276,10 +352,12 @@ impl BedrockClient {
         let parsed: BedrockAnthropicResponse =
             serde_json::from_str(&body_text).context("parse Bedrock response")?;
         let mut text = String::new();
+        let mut thoughts = String::new();
         let mut calls = Vec::new();
         for block in parsed.content {
             match block {
                 BedrockContentBlock::Text { text: part } => text.push_str(&part),
+                BedrockContentBlock::Thinking { thinking: part } => thoughts.push_str(&part),
                 BedrockContentBlock::ToolUse { id, name, input } => {
                     calls.push(ToolCall {
                         id,
@@ -292,6 +370,9 @@ impl BedrockClient {
                 }
                 BedrockContentBlock::Other => {}
             }
+        }
+        if !thoughts.is_empty() {
+            on_thought(&thoughts);
         }
         if !text.is_empty() {
             on_token(&text);
@@ -459,6 +540,24 @@ impl BedrockClient {
         dedup_preserve_order(candidates)
     }
 
+    async fn resolve_invocable_model_id(&self, model: &str) -> Result<String> {
+        if looks_like_inference_profile_identifier(model) || uses_responses_api(model) {
+            return Ok(model.to_string());
+        }
+
+        let profiles = self.list_inference_profiles().await.unwrap_or_else(|err| {
+            tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
+            Vec::new()
+        });
+        if let Some(invocable_id) =
+            preferred_invocable_bedrock_model_id(model, &profiles, &self.region)
+        {
+            return Ok(invocable_id);
+        }
+
+        Ok(model.to_string())
+    }
+
     async fn list_inference_profiles(&self) -> Result<Vec<BedrockInferenceProfileSummary>> {
         let url = self.inference_profiles_url();
         let resp = self
@@ -521,10 +620,15 @@ impl LlmBackend for BedrockClient {
             models = normalize_bedrock_model_ids(models, &inference_profiles, &self.region);
 
             if !models.iter().any(|m| m.id == default_model) {
+                let supported_reasoning_levels = if supports_extended_thinking(&default_model) {
+                    anthropic_thinking_presets()
+                } else {
+                    Vec::new()
+                };
                 models.push(ModelMetadata {
                     id: default_model.clone(),
                     default_reasoning_level: None,
-                    supported_reasoning_levels: Vec::new(),
+                    supported_reasoning_levels,
                     supports_images: None,
                     context_length: Some(200_000),
                 });
@@ -680,7 +784,7 @@ fn match_inference_profiles_to_model(
     let preferred_geo = preferred_geo_prefix(region);
 
     for profile in profiles {
-        if !profile_matches_model(&profile, model) {
+        if !profile_matches_model(profile, model) {
             continue;
         }
         if let Some(prefix) = preferred_geo
@@ -746,6 +850,17 @@ struct BedrockAnthropicRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<BedrockThinking>,
+}
+
+/// Anthropic extended-thinking control block. When present, `temperature`
+/// must be unset and `max_tokens` must exceed `budget_tokens`.
+#[derive(Debug, Serialize)]
+struct BedrockThinking {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -822,6 +937,8 @@ struct BedrockAnthropicResponse {
 enum BedrockContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -1145,10 +1262,17 @@ impl BedrockFoundationModelSummary {
             .input_modalities
             .iter()
             .any(|modality| modality == "IMAGE");
+        let supported_reasoning_levels = if supports_extended_thinking(&self.model_id) {
+            anthropic_thinking_presets()
+        } else {
+            Vec::new()
+        };
         ModelMetadata {
             id: self.model_id,
+            // Opt-in: leave the default unset so reasoning is only sent when
+            // the user explicitly picks an effort from the dropdown.
             default_reasoning_level: None,
-            supported_reasoning_levels: Vec::new(),
+            supported_reasoning_levels,
             supports_images: Some(supports_images),
             context_length: None,
         }
@@ -1172,6 +1296,65 @@ mod tests {
             "us.anthropic.claude-sonnet-4-6"
         );
         assert_eq!(percent_encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn extended_thinking_support_is_scoped_to_claude_37_and_4() {
+        assert!(supports_extended_thinking("us.anthropic.claude-sonnet-4-6"));
+        assert!(supports_extended_thinking(
+            "global.anthropic.claude-opus-4-8"
+        ));
+        assert!(supports_extended_thinking("anthropic.claude-3-7-sonnet"));
+        assert!(!supports_extended_thinking(
+            "us.anthropic.claude-3-5-sonnet"
+        ));
+        assert!(!supports_extended_thinking("openai.gpt-5.4"));
+        assert!(!supports_extended_thinking("amazon.titan-text"));
+    }
+
+    #[test]
+    fn thinking_budget_maps_known_efforts_only() {
+        assert_eq!(thinking_budget_for_effort("low"), Some(2_048));
+        assert_eq!(thinking_budget_for_effort("medium"), Some(4_096));
+        assert_eq!(thinking_budget_for_effort("high"), Some(8_192));
+        assert_eq!(thinking_budget_for_effort(" high "), Some(8_192));
+        assert_eq!(thinking_budget_for_effort("none"), None);
+        assert_eq!(thinking_budget_for_effort(""), None);
+    }
+
+    #[test]
+    fn thinking_max_tokens_exceeds_budget() {
+        for effort in ["low", "medium", "high"] {
+            let budget = thinking_budget_for_effort(effort).expect("known effort");
+            assert!(thinking_max_tokens(budget) > budget);
+        }
+    }
+
+    #[test]
+    fn anthropic_models_advertise_reasoning_presets() {
+        let summary = BedrockFoundationModelSummary {
+            model_id: "anthropic.claude-sonnet-4-6".to_string(),
+            input_modalities: vec!["TEXT".to_string()],
+            output_modalities: vec!["TEXT".to_string()],
+            response_streaming_supported: true,
+        };
+        let meta = summary.into_model_metadata();
+        assert!(meta.default_reasoning_level.is_none());
+        let efforts: Vec<_> = meta
+            .supported_reasoning_levels
+            .iter()
+            .map(|p| p.effort.as_str())
+            .collect();
+        assert_eq!(efforts, ["low", "medium", "high"]);
+
+        let plain = BedrockFoundationModelSummary {
+            model_id: "amazon.titan-text".to_string(),
+            input_modalities: vec!["TEXT".to_string()],
+            output_modalities: vec!["TEXT".to_string()],
+            response_streaming_supported: true,
+        };
+        let plain_meta = plain.into_model_metadata();
+        assert!(plain_meta.supported_reasoning_levels.is_empty());
     }
 
     #[test]
@@ -1369,6 +1552,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_effort_adds_thinking_block_and_surfaces_thoughts() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        // Match only when the thinking block is present with the expected
+        // medium budget and the bumped max_tokens. If the field were dropped
+        // (the old behavior) this mock would not match and the request would
+        // 404, failing the test.
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-sonnet-4-6/invoke"))
+            .and(body_partial_json(serde_json::json!({
+                "max_tokens": 12_288,
+                "thinking": {"type": "enabled", "budget_tokens": 4_096}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [
+                    {"type": "thinking", "thinking": "let me reason"},
+                    {"type": "text", "text": "done"}
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let thoughts = Arc::new(Mutex::new(String::new()));
+        let captured = thoughts.clone();
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-4-6".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("medium".to_string()),
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("native request with thinking should succeed");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "done"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(thoughts.lock().unwrap().as_str(), "let me reason");
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_ignored_for_models_without_thinking() {
+        use wiremock::{Match, Request};
+
+        // Custom matcher asserting the request body carries NO `thinking`
+        // field, since Claude 3.5 does not support extended thinking and the
+        // effort must be dropped rather than forwarded.
+        struct NoThinkingField;
+        impl Match for NoThinkingField {
+            fn matches(&self, request: &Request) -> bool {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|v| v.get("thinking").cloned())
+                    .is_none()
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-3-5-sonnet/invoke"))
+            .and(NoThinkingField)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "plain"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-3-5-sonnet".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-3-5-sonnet".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("high".to_string()),
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("native request without thinking should succeed");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "plain"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn responses_models_route_to_mantle_responses() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1521,6 +1817,65 @@ mod tests {
             LlmResponse::Text { text, usage } => {
                 assert_eq!(text, "profile ok");
                 assert_eq!(usage.input_tokens, 4);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_resolves_prefixed_profile_before_first_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-profiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "inferenceProfileSummaries": [
+                    {
+                        "inferenceProfileId": "us.anthropic.claude-opus-4-8",
+                        "models": [
+                            {
+                                "modelArn": "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-opus-4-8"
+                            }
+                        ]
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-opus-4-8/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "resolved first"}],
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "anthropic.claude-opus-4-8".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("request should resolve directly to prefixed profile");
+        match response {
+            LlmResponse::Text { text, usage } => {
+                assert_eq!(text, "resolved first");
+                assert_eq!(usage.input_tokens, 3);
             }
             other => panic!("expected text response, got {other:?}"),
         }
