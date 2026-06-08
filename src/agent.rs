@@ -465,6 +465,10 @@ fn builtin_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::new("context", "Show current session context snapshot"),
         AvailableCommand::new(
+            "loop",
+            "Repeat a slash command or prompt on an interval until cancelled",
+        ),
+        AvailableCommand::new(
             "setup",
             "Set up models, login, behavior, sandboxing, and advanced options",
         ),
@@ -491,6 +495,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
 fn builtin_command_names() -> std::collections::HashSet<&'static str> {
     [
         "context",
+        "loop",
         "setup",
         "permissions",
         "compress",
@@ -1241,6 +1246,18 @@ pub async fn run_agent(
                     return responder.respond(prompt_end_turn_response());
                 }
 
+                let loop_spec = if is_slash_command(&raw_prompt_text, "loop") {
+                    match parse_loop_command(&raw_prompt_text) {
+                        Ok(spec) => Some(spec),
+                        Err(report) => {
+                            send_message(&cx, &session_id, &report);
+                            return responder.respond(prompt_end_turn_response());
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let stream_setup_openrouter_refresh =
                     is_streamed_setup_openrouter_refresh(&raw_prompt_text);
 
@@ -1367,8 +1384,24 @@ pub async fn run_agent(
                     vec![ChatContentPart::text(prompt_text.clone())]
                 };
 
+                if let Some(spec) = loop_spec.as_ref()
+                    && snap.model.is_empty()
+                    && !loop_target_runs_without_model(&spec.target)
+                {
+                    let catalog = sessions_prompt.available_model_metadata().await;
+                    send_message(
+                        &cx,
+                        &session_id,
+                        &render_setup_home_from_snapshot(&snap, &catalog),
+                    );
+                    return responder.respond(prompt_end_turn_response());
+                }
+
                 // Validate model is configured
-                if snap.model.is_empty() && !stream_setup_openrouter_refresh {
+                if snap.model.is_empty()
+                    && !stream_setup_openrouter_refresh
+                    && loop_spec.is_none()
+                {
                     let catalog = sessions_prompt.available_model_metadata().await;
                     send_message(
                         &cx,
@@ -1444,6 +1477,158 @@ pub async fn run_agent(
                     send_session_usage_update(&cx, &sessions_prompt, &session_id, &snap.cwd).await;
                     sessions_prompt.finish_prompt(&session_id).await;
                     return responder.respond(prompt_end_turn_response());
+                }
+
+                if let Some(loop_spec) = loop_spec {
+                    let llm_for_loop_turns: Arc<dyn crate::llm_client::LlmBackend> =
+                        llm_prompt.clone();
+                    let llm_for_setup = llm_login.clone();
+                    let sessions_for_loop = sessions_prompt.clone();
+                    let cx_for_loop = cx.clone();
+                    let session_id_for_loop = session_id.clone();
+                    let fallback_cwd_for_loop = fallback_cwd.clone();
+                    let refresh_lock_for_loop = refresh_lock_login.clone();
+                    let structured_output_request_for_loop = structured_output_request.clone();
+
+                    let spawn_result = cx.spawn(async move {
+                        use futures::FutureExt;
+                        use std::panic::AssertUnwindSafe;
+
+                        let loop_result = AssertUnwindSafe(async {
+                            send_message(
+                                &cx_for_loop,
+                                &session_id_for_loop,
+                                &format!(
+                                    "Starting `/loop`: every {}s run this target:\n{}\n\
+                                     Cancel the session to stop.\n",
+                                    loop_spec.interval_secs, loop_spec.target
+                                ),
+                            );
+
+                            let mut iteration = 0u64;
+                            let mut last_structured_output_result = None;
+                            let mut last_cumulative_usage = None;
+
+                            loop {
+                                if cancel.is_cancelled() {
+                                    send_message(
+                                        &cx_for_loop,
+                                        &session_id_for_loop,
+                                        "Cancelled.\n",
+                                    );
+                                    break;
+                                }
+
+                                iteration += 1;
+                                send_thought(
+                                    &cx_for_loop,
+                                    &session_id_for_loop,
+                                    &format!(
+                                        "\n[loop iteration {iteration} | every {}s]\n",
+                                        loop_spec.interval_secs
+                                    ),
+                                );
+                                send_user_message(
+                                    &cx_for_loop,
+                                    &session_id_for_loop,
+                                    &loop_spec.target,
+                                );
+
+                                match run_loop_iteration(
+                                    &cx_for_loop,
+                                    &sessions_for_loop,
+                                    &session_id_for_loop,
+                                    &fallback_cwd_for_loop,
+                                    llm_for_loop_turns.clone(),
+                                    llm_for_setup.clone(),
+                                    &refresh_lock_for_loop,
+                                    &loop_spec.target,
+                                    structured_output_request_for_loop.as_ref(),
+                                    default_idle_timeout_secs,
+                                    max_turns,
+                                    cancel.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(outcome) => {
+                                        last_structured_output_result =
+                                            outcome.structured_output_result;
+                                        last_cumulative_usage = Some(outcome.cumulative_usage);
+                                    }
+                                    Err(LoopIterationError::Terminal(err)) => {
+                                        send_message(
+                                            &cx_for_loop,
+                                            &session_id_for_loop,
+                                            &format!(
+                                                "Loop iteration {iteration} stopped: {err}\n"
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                }
+
+                                tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        send_message(&cx_for_loop, &session_id_for_loop, "Cancelled.\n");
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(loop_spec.interval_secs)) => {}
+                                }
+                            }
+
+                            (last_structured_output_result, last_cumulative_usage)
+                        })
+                        .catch_unwind()
+                        .await;
+
+                        let (structured_output_result, cumulative_usage) = match loop_result {
+                            Ok(state) => state,
+                            Err(panic) => {
+                                tracing::error!(
+                                    session_id = %session_id_for_loop,
+                                    "loop dispatcher panicked: {:?}",
+                                    panic
+                                );
+                                send_message(
+                                    &cx_for_loop,
+                                    &session_id_for_loop,
+                                    "Error: loop dispatcher panicked. See server logs.\n",
+                                );
+                                (None, None)
+                            }
+                        };
+
+                        sessions_for_loop.finish_prompt(&session_id_for_loop).await;
+                        let response = if let Some(cumulative_usage) = cumulative_usage {
+                            let acp_usage = AcpUsage::new(
+                                cumulative_usage.total_tokens(),
+                                cumulative_usage.input_tokens,
+                                cumulative_usage.output_tokens,
+                            )
+                            .thought_tokens(cumulative_usage.thought_tokens)
+                            .cached_read_tokens(cumulative_usage.cached_read_tokens)
+                            .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                            prompt_end_turn_response().usage(Some(acp_usage))
+                        } else {
+                            prompt_end_turn_response()
+                        };
+                        let response =
+                            response.meta(prompt_response_meta(structured_output_result.as_ref()));
+                        if let Err(e) = responder.respond(response) {
+                            tracing::warn!(
+                                session_id = %session_id_for_loop,
+                                "failed to deliver PromptResponse: {e}"
+                            );
+                        }
+                        Ok(())
+                    });
+
+                    if let Err(e) = spawn_result {
+                        sessions_prompt.finish_prompt(&session_id).await;
+                        return Err(e);
+                    }
+
+                    return Ok(());
                 }
 
                 if stream_setup_openrouter_refresh {
@@ -1544,37 +1729,11 @@ pub async fn run_agent(
                 );
 
                 let spawn_result = cx.spawn(async move {
-                    use futures::FutureExt;
-                    use std::panic::AssertUnwindSafe;
-
-                    let cx_text = cx_for_loop.clone();
-                    let sid_text = session_id_for_loop.clone();
-                    let cx_thought = cx_for_loop.clone();
-                    let sid_thought = session_id_for_loop.clone();
-
-                    // Text tokens stream to the client in real time via this shared sink.
-                    let text_sink: crate::tool_loop::TextSink =
-                        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
-                            send_message(&cx_text, &sid_text, token);
-                        }));
-                    // Reasoning deltas stream into the dedicated ACP
-                    // thought channel so the client can render them as
-                    // a collapsible block separate from the final answer.
-                    let thought_sink: crate::tool_loop::TextSink =
-                        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
-                            send_thought(&cx_thought, &sid_thought, token);
-                        }));
-
-                    // Catch panics so cleanup (finish_prompt, respond) always runs.
-                    // Without this, a panic inside the tool loop would leak the cancel
-                    // token in `cancel_tokens` and leave the dispatcher waiting on a
-                    // PromptResponse that never arrives.
-                    //
-                    // SpawnedCx is constructed here, inside the cx.spawn body -- the
-                    // tool loop's `block_task` calls require this proof of context.
-                    let cx_for_gate = cx_for_loop.clone();
-                    let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
-                    let loop_result = AssertUnwindSafe(crate::tool_loop::run(
+                    let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
+                        &cx_for_loop,
+                        &sessions_for_loop,
+                        &session_id_for_loop,
+                        &fallback_cwd_for_loop,
                         &llm_for_loop,
                         &registry,
                         &model_for_loop,
@@ -1584,89 +1743,7 @@ pub async fn run_agent(
                         max_turns,
                         idle_timeout_for_loop,
                         cancel,
-                        text_sink,
-                        thought_sink,
-                        spawned_cx,
-                        session_id_for_loop.clone(),
-                        sessions_for_loop.clone(),
-                        crate::tool_loop::NotificationMode::Live,
-                        0,
-                    ))
-                    .catch_unwind()
-                    .await;
-
-                    let (response_text, tool_exchanges, turn_usage) = match loop_result {
-                        Ok((text, exchanges, usage)) => (text, exchanges, usage),
-                        Err(panic) => {
-                            tracing::error!(
-                                session_id = %session_id_for_loop,
-                                "tool loop panicked: {:?}",
-                                panic
-                            );
-                            (
-                                "Error: agent loop panicked. See server logs.".to_string(),
-                                Vec::new(),
-                                crate::llm_client::TokenUsage::default(),
-                            )
-                        }
-                    };
-
-                    // Roll this turn's provider-reported usage into the
-                    // session-wide running total. The cumulative figure
-                    // is what the ACP `session/usage` RFD asks for on
-                    // `PromptResponse.usage` ("Total input tokens across
-                    // all turns", etc.). If the session is gone by now
-                    // (raced delete), fall back to this turn alone so
-                    // we still report something rather than silently
-                    // dropping the numbers.
-                    let cumulative_usage = sessions_for_loop
-                        .record_usage(&session_id_for_loop, turn_usage)
-                        .await
-                        .unwrap_or(turn_usage);
-                    let structured_output_result = structured_output_request
-                        .as_ref()
-                        .map(|request| validate_response(request, &response_text));
-
-                    // Persist the conversation turn BEFORE finish_prompt so the
-                    // per-session cancel token is held during the rewrite -- this
-                    // is the locking that makes `add_turn`'s rollback safe (see
-                    // the concurrency note on `SessionStore::add_turn`). On
-                    // failure, surface the error to the client so the user
-                    // knows their last turn isn't on disk.
-                    //
-                    // Tool exchanges are persisted alongside the turn so a
-                    // session/load can re-feed the LLM the same tool context
-                    // it had when it produced response_text (#3409).
-                    let persist_result = sessions_for_loop
-                        .add_turn(
-                            &session_id_for_loop,
-                            ConversationTurn {
-                                user_prompt: prompt_text_for_turn,
-                                agent_response: response_text,
-                                tool_exchanges,
-                                structured_output: structured_output_result.clone(),
-                                summary: None,
-                                fragment_id: None,
-                            },
-                        )
-                        .await;
-
-                    if let Err(e) = persist_result {
-                        send_message(
-                            &cx_for_loop,
-                            &session_id_for_loop,
-                            &format!(
-                                "\n**Warning:** failed to save this conversation turn to disk; \
-                                 it will not survive a session reload: {e}\n"
-                            ),
-                        );
-                    }
-
-                    send_session_usage_update(
-                        &cx_for_loop,
-                        &sessions_for_loop,
-                        &session_id_for_loop,
-                        &fallback_cwd_for_loop,
+                        prompt_text_for_turn,
                     )
                     .await;
 
@@ -1966,6 +2043,225 @@ fn send_thought(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     }
 }
 
+#[derive(Debug)]
+enum LoopIterationError {
+    Terminal(String),
+}
+
+struct LoopIterationOutcome {
+    structured_output_result: Option<StructuredOutputResult>,
+    cumulative_usage: crate::llm_client::TokenUsage,
+}
+
+impl LoopIterationOutcome {
+    fn without_usage() -> Self {
+        Self {
+            structured_output_result: None,
+            cumulative_usage: crate::llm_client::TokenUsage::default(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_iteration(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+    llm: Arc<dyn crate::llm_client::LlmBackend>,
+    llm_setup: Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    target: &str,
+    structured_output_request: Option<&StructuredOutputRequest>,
+    default_idle_timeout_secs: u64,
+    max_turns: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<LoopIterationOutcome, LoopIterationError> {
+    let mut snap = sessions
+        .snapshot(session_id, fallback_cwd)
+        .await
+        .ok_or_else(|| LoopIterationError::Terminal("unknown session".to_string()))?;
+
+    if is_slash_command(target, "context") {
+        let permission_mode = sessions
+            .permission_mode(session_id)
+            .await
+            .unwrap_or(PermissionMode::Default);
+        let available_models = sessions.available_model_metadata().await;
+        send_message(
+            cx,
+            session_id,
+            &render_context_report(&snap, permission_mode, &available_models),
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "setup") {
+        let setup_ctx = SetupContext {
+            cx,
+            sessions,
+            llm: &llm_setup,
+            login_sessions: sessions,
+            refresh_lock,
+            default_idle_timeout_secs,
+            current_session_idle_timeout: snap.idle_timeout_secs,
+        };
+        send_message(
+            cx,
+            session_id,
+            &handle_setup(&setup_ctx, target, session_id).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "permissions") {
+        send_message(
+            cx,
+            session_id,
+            &handle_permissions(cx, sessions, session_id, target).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "mcp") {
+        send_message(
+            cx,
+            session_id,
+            &handle_mcp(target, sessions, session_id).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "pr-create") {
+        let permission_mode = sessions
+            .permission_mode(session_id)
+            .await
+            .unwrap_or(PermissionMode::Default);
+        let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
+        let registry = sessions
+            .get_or_create_registry(session_id, snap.cwd.clone())
+            .await;
+        send_message(
+            cx,
+            session_id,
+            &handle_pr_create(target, &registry, permission_mode, sandbox_mode).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "compress") {
+        let context_length = sessions
+            .available_model_metadata()
+            .await
+            .iter()
+            .find(|m| m.id == snap.model)
+            .and_then(|m| m.context_length);
+        let idle_timeout = Duration::from_secs(
+            snap.idle_timeout_secs
+                .unwrap_or(default_idle_timeout_secs)
+                .max(1),
+        );
+        let report = handle_compress(
+            &snap,
+            llm.as_ref(),
+            sessions,
+            session_id,
+            cancel,
+            idle_timeout,
+            context_length,
+            cx,
+        )
+        .await;
+        send_message(cx, session_id, &report);
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    let raw_prompt_text = target.to_string();
+    let raw_prompt_parts = vec![ChatContentPart::text(raw_prompt_text.clone())];
+    let slash_command = parse_slash_command(&raw_prompt_text);
+    let prompt_text = if let Some((name, args)) = slash_command.as_ref()
+        && let Some(meta) = snap.skills.get(name)
+    {
+        tracing::info!(skill = %name, "loop activating skill");
+        // `mark_skill_activated` writes into the session's HashSet of
+        // activated skills, so repeated loop iterations are idempotent.
+        sessions.mark_skill_activated(session_id, name).await;
+        let body = build_skill_payload(meta);
+        if args.is_empty() {
+            body
+        } else {
+            format!("{body}\n\nUser input: {args}")
+        }
+    } else {
+        raw_prompt_text.clone()
+    };
+    let prompt_parts = if prompt_text == raw_prompt_text {
+        raw_prompt_parts
+    } else {
+        vec![ChatContentPart::text(prompt_text.clone())]
+    };
+
+    if snap.model.is_empty() {
+        return Err(LoopIterationError::Terminal(
+            "model not configured".to_string(),
+        ));
+    }
+
+    let context_length = sessions
+        .available_model_metadata()
+        .await
+        .iter()
+        .find(|m| m.id == snap.model)
+        .and_then(|m| m.context_length);
+    let compression_idle_timeout = Duration::from_secs(
+        snap.idle_timeout_secs
+            .unwrap_or(default_idle_timeout_secs)
+            .max(1),
+    );
+    let messages = build_prompt_messages_with_compression(
+        &mut snap,
+        &prompt_text,
+        &prompt_parts,
+        llm.as_ref(),
+        sessions,
+        session_id,
+        cancel.clone(),
+        compression_idle_timeout,
+        context_length,
+    )
+    .await;
+    let registry = sessions
+        .get_or_create_registry(session_id, snap.cwd.clone())
+        .await;
+    let idle_timeout = Duration::from_secs(
+        snap.idle_timeout_secs
+            .unwrap_or(default_idle_timeout_secs)
+            .max(1),
+    );
+
+    let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
+        cx,
+        sessions,
+        session_id,
+        fallback_cwd,
+        &llm,
+        &registry,
+        &snap.model,
+        snap.reasoning_effort.as_deref(),
+        structured_output_request,
+        messages,
+        max_turns,
+        idle_timeout,
+        cancel,
+        prompt_text,
+    )
+    .await;
+    Ok(LoopIterationOutcome {
+        structured_output_result,
+        cumulative_usage,
+    })
+}
+
 /// Build the `Vec<ChatMessage>` to send to the LLM for a fresh prompt.
 ///
 /// Layout:
@@ -2189,6 +2485,113 @@ async fn build_prompt_messages_with_compression(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_model_turn_in_spawn(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    registry: &Arc<crate::tools::ToolRegistry>,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    structured_output_request: Option<&StructuredOutputRequest>,
+    messages: Vec<ChatMessage>,
+    max_turns: usize,
+    idle_timeout: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+    prompt_text_for_turn: String,
+) -> (
+    Option<StructuredOutputResult>,
+    crate::llm_client::TokenUsage,
+) {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let cx_text = cx.clone();
+    let sid_text = session_id.to_string();
+    let cx_thought = cx.clone();
+    let sid_thought = session_id.to_string();
+
+    let text_sink: crate::tool_loop::TextSink =
+        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
+            send_message(&cx_text, &sid_text, token);
+        }));
+    let thought_sink: crate::tool_loop::TextSink =
+        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
+            send_thought(&cx_thought, &sid_thought, token);
+        }));
+
+    let cx_for_gate = cx.clone();
+    let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
+    let loop_result = AssertUnwindSafe(crate::tool_loop::run(
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        structured_output_request,
+        messages,
+        max_turns,
+        idle_timeout,
+        cancel,
+        text_sink,
+        thought_sink,
+        spawned_cx,
+        session_id.to_string(),
+        sessions.clone(),
+        crate::tool_loop::NotificationMode::Live,
+        0,
+    ))
+    .catch_unwind()
+    .await;
+
+    let (response_text, tool_exchanges, turn_usage) = match loop_result {
+        Ok((text, exchanges, usage)) => (text, exchanges, usage),
+        Err(panic) => {
+            tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
+            (
+                "Error: agent loop panicked. See server logs.".to_string(),
+                Vec::new(),
+                crate::llm_client::TokenUsage::default(),
+            )
+        }
+    };
+
+    let cumulative_usage = sessions
+        .record_usage(session_id, turn_usage)
+        .await
+        .unwrap_or(turn_usage);
+    let structured_output_result =
+        structured_output_request.map(|request| validate_response(request, &response_text));
+
+    if let Err(e) = sessions
+        .add_turn(
+            session_id,
+            ConversationTurn {
+                user_prompt: prompt_text_for_turn,
+                agent_response: response_text,
+                tool_exchanges,
+                structured_output: structured_output_result.clone(),
+                summary: None,
+                fragment_id: None,
+            },
+        )
+        .await
+    {
+        send_message(
+            cx,
+            session_id,
+            &format!(
+                "\n**Warning:** failed to save this conversation turn to disk; \
+                 it will not survive a session reload: {e}\n"
+            ),
+        );
+    }
+
+    send_session_usage_update(cx, sessions, session_id, fallback_cwd).await;
+    (structured_output_result, cumulative_usage)
 }
 
 fn build_system_prompt(mode: &SessionMode, cwd: &Path) -> String {
@@ -3981,6 +4384,62 @@ fn slash_command_args(prompt_text: &str) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopSpec {
+    interval_secs: u64,
+    target: String,
+}
+
+fn loop_target_runs_without_model(target: &str) -> bool {
+    is_slash_command(target, "context")
+        || is_slash_command(target, "setup")
+        || is_slash_command(target, "permissions")
+        || is_slash_command(target, "mcp")
+        || is_slash_command(target, "pr-create")
+}
+
+fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
+    let trimmed = slash_command_args(prompt_text);
+    if trimmed.is_empty() {
+        return Err("Usage: `/loop <seconds> <slash-command-or-prompt>`\n\
+             Example: `/loop 30 /context`\n\
+             Example: `/loop 300 check CI status`\n\n\
+             The loop runs until you cancel the session."
+            .to_string());
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let raw_secs = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("").trim();
+    if target.is_empty() {
+        return Err("Usage: `/loop <seconds> <slash-command-or-prompt>`\n\
+             Missing command or prompt after the interval."
+            .to_string());
+    }
+    if is_slash_command(target, "loop") {
+        return Err("Nested `/loop` is not supported.".to_string());
+    }
+
+    let interval_secs = match raw_secs.parse::<u64>() {
+        Ok(secs) if (1..=86_400).contains(&secs) => secs,
+        Ok(other) => {
+            return Err(format!(
+                "Interval `{other}` is out of range. Pick a value between 1 and 86400 seconds."
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "Invalid interval `{raw_secs}`. Usage: `/loop <seconds> <slash-command-or-prompt>`"
+            ));
+        }
+    };
+
+    Ok(LoopSpec {
+        interval_secs,
+        target: target.to_string(),
+    })
+}
+
 /// Parse the optional title from `/pr-create [title]`. Whitespace-only
 /// arguments collapse to `None` so `gh pr create --fill` derives the title
 /// from commit messages instead.
@@ -4638,6 +5097,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builtin_commands_include_loop() {
+        let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "loop"),
+            "builtin_commands() missing loop; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            builtin_command_names().contains("loop"),
+            "builtin_command_names() missing loop"
+        );
+    }
+
     /// `/compress` parses via the same slash-command dispatcher used
     /// by `/context` and `/setup`, including case-insensitive and
     /// args-tolerant forms.
@@ -4649,6 +5122,44 @@ mod tests {
         assert!(is_slash_command("/COMPRESS", "compress"));
         // The dispatcher must not confuse `/compress` with `/context`.
         assert!(!is_slash_command("/context", "compress"));
+    }
+
+    #[test]
+    fn parse_loop_command_parses_interval_and_target() {
+        assert_eq!(
+            parse_loop_command("/loop 30 /context"),
+            Ok(LoopSpec {
+                interval_secs: 30,
+                target: "/context".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_loop_command_rejects_missing_target() {
+        let err = parse_loop_command("/loop 30").expect_err("missing target must reject");
+        assert!(err.contains("Missing command or prompt"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_loop_command_rejects_invalid_interval() {
+        let err = parse_loop_command("/loop soon /context").expect_err("junk interval must reject");
+        assert!(err.contains("Invalid interval"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_loop_command_rejects_out_of_range() {
+        let err = parse_loop_command("/loop 0 /context").expect_err("zero must reject");
+        assert!(err.contains("out of range"), "got: {err}");
+
+        let err = parse_loop_command("/loop 86401 /context").expect_err("too large must reject");
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_loop_command_rejects_nested_loop() {
+        let err = parse_loop_command("/loop 30 /loop 60 hi").expect_err("nested loop must reject");
+        assert!(err.contains("Nested `/loop`"), "got: {err}");
     }
 
     /// `plan_compress` returns the indexes of every turn whose
@@ -5370,6 +5881,7 @@ mod tests {
             names,
             vec![
                 "context",
+                "loop",
                 "setup",
                 "permissions",
                 "compress",
