@@ -896,6 +896,45 @@ pub(crate) async fn run(
                         continue;
                     }
 
+                    if let Some(message) = deterministic_gate_rejection(
+                        &sessions,
+                        &session_id,
+                        &tool_name,
+                        kind,
+                        &parsed_input,
+                        registry.cwd(),
+                    )
+                    .await
+                    {
+                        let (blocked_call, failed_update) = blocked_tool_call_updates(
+                            &call.id,
+                            &tool_name,
+                            kind,
+                            &parsed_input,
+                            &message,
+                        );
+                        maybe_send_session_update(
+                            notifications,
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCall(blocked_call),
+                        );
+                        maybe_send_session_update(
+                            notifications,
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCallUpdate(failed_update),
+                        );
+                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
+                        tool_exchanges.push(ToolExchange {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            result: message,
+                        });
+                        continue;
+                    }
+
                     // Pending -- emit the card before the gate runs so the
                     // permission modal (which reuses this id) renders against
                     // a card that already shows path / command / etc.
@@ -1179,6 +1218,65 @@ pub(crate) async fn run(
     }
 
     (full_response, tool_exchanges, turn_usage)
+}
+
+fn blocked_tool_call_updates(
+    tool_call_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+    reason: &str,
+) -> (agent_client_protocol::schema::ToolCall, ToolCallUpdate) {
+    (
+        announce::blocked_tool_call(tool_call_id, tool_name, kind, raw_input, reason),
+        announce::update_failed(
+            tool_call_id,
+            reason,
+            Some(Value::String(reason.to_string())),
+        ),
+    )
+}
+
+/// Return a deterministic permission denial, if one exists before any user
+/// prompt is needed. Promptable calls still go through `consult_gate` after
+/// the pending card is emitted so the permission modal has a matching card id.
+pub(crate) async fn deterministic_gate_rejection(
+    sessions: &SessionStore,
+    session_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+    cwd: &Path,
+) -> Option<String> {
+    let mode = match sessions.permission_mode(session_id).await {
+        Some(m) => m,
+        None => {
+            tracing::warn!(
+                session_id,
+                tool_name,
+                "permission gate: session not found; refusing tool before pending card"
+            );
+            return Some(
+                "Tool use denied: session is no longer registered. \
+                 Start a new prompt to continue."
+                    .to_string(),
+            );
+        }
+    };
+    let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
+    let shell_sandboxed =
+        tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
+    let shell_auto_allow = tool_name == "run_shell_command"
+        && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
+    let always_allow_keys = always_allow_lookup_keys(tool_name, raw_input, cwd, shell_sandboxed);
+    let is_always_allowed = sessions
+        .is_any_always_allowed(session_id, &always_allow_keys)
+        .await;
+
+    match pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow) {
+        PureGateDecision::Reject(msg) => Some(msg),
+        PureGateDecision::Allow | PureGateDecision::Prompt => None,
+    }
 }
 
 /// Apply the per-call permission policy. Returns `Allow` if the tool should
@@ -2652,6 +2750,119 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_preflight_rejects_mutation_tools_before_execution() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+
+        let cases = [
+            (
+                "write_file",
+                ToolRegistry::tool_kind("write_file"),
+                serde_json::json!({"file_path": "app.js", "content": "x"}),
+            ),
+            (
+                "edit",
+                ToolRegistry::tool_kind("edit"),
+                serde_json::json!({"file_path": "app.js", "old_string": "x", "new_string": "y"}),
+            ),
+            (
+                "run_shell_command",
+                ToolRegistry::tool_kind("run_shell_command"),
+                serde_json::json!({"command": "touch app.js"}),
+            ),
+            (
+                "task",
+                ToolRegistry::tool_kind("task"),
+                serde_json::json!({"subagent_type": "reviewer", "prompt": "edit app.js"}),
+            ),
+        ];
+
+        for (tool_name, kind, input) in cases {
+            let rejection = deterministic_gate_rejection(
+                &store,
+                &session.id,
+                tool_name,
+                kind,
+                &input,
+                cwd.path(),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{tool_name} should be rejected before execution"));
+
+            assert!(
+                rejection.contains("read-only mode forbids"),
+                "unexpected rejection for {tool_name}: {rejection}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_does_not_block_promptable_or_read_only_safe_tools() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        let default_edit = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "write_file",
+            ToolRegistry::tool_kind("write_file"),
+            &serde_json::json!({"file_path": "app.js", "content": "x"}),
+            cwd.path(),
+        )
+        .await;
+        assert!(
+            default_edit.is_none(),
+            "default edit should proceed to the permission prompt"
+        );
+
+        assert!(
+            store
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+        let read = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "read_file",
+            ToolRegistry::tool_kind("read_file"),
+            &serde_json::json!({"file_path": "app.js"}),
+            cwd.path(),
+        )
+        .await;
+        assert!(read.is_none(), "read-only should allow read tools");
+    }
+
+    #[test]
+    fn blocked_tool_call_sequence_has_failed_card_and_terminal_update() {
+        let reason = "Tool use denied: read-only mode forbids edits";
+        let (card, update) = blocked_tool_call_updates(
+            "call-write",
+            "write_file",
+            ToolRegistry::tool_kind("write_file"),
+            &serde_json::json!({"file_path": "app.js", "content": "x"}),
+            reason,
+        );
+
+        assert_eq!(card.tool_call_id.0.as_ref(), "call-write");
+        assert_eq!(card.title, "Blocked write_file");
+        assert_eq!(card.status, ToolCallStatus::Failed);
+        assert_eq!(update.tool_call_id.0.as_ref(), "call-write");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        assert!(card.raw_input.is_some());
+        assert_eq!(
+            update.fields.raw_output,
+            Some(Value::String(reason.to_string()))
+        );
     }
 
     #[test]
