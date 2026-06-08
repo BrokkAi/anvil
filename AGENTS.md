@@ -7,7 +7,7 @@ Guidance for AI agents working in this repository.
 ```bash
 cargo build --release          # default build: compiles sandbox crate to wasm32-wasip2 + host binary
 cargo test
-cargo fmt --check
+cargo fmt
 cargo clippy --all-targets -- -D warnings
 ```
 

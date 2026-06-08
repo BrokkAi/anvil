@@ -273,6 +273,7 @@ pub struct ToolRegistry {
     cwd: PathBuf,
     mcp_clients: Vec<Arc<McpClient>>,
     mcp_tool_servers: HashMap<String, Arc<McpClient>>,
+    advertised_builtin_tools: RwLock<HashSet<String>>,
     skills: RwLock<Arc<SkillRegistry>>,
     agents: RwLock<Arc<AgentRegistry>>,
 }
@@ -294,6 +295,23 @@ impl ToolRegistry {
     /// next prompt's tool catalog reflects it.
     pub async fn set_agents(&self, agents: Arc<AgentRegistry>) {
         *self.agents.write().await = agents;
+    }
+
+    /// Replace the set of built-in tools advertised to the model. This does
+    /// not affect the underlying builtin dispatch; it only changes which
+    /// builtin schemas appear in subsequent `tool_definitions()` snapshots.
+    pub async fn set_builtin_tools(&self, tools: HashSet<String>) {
+        *self.advertised_builtin_tools.write().await = tools;
+    }
+
+    /// Snapshot the current built-in tool names advertised to the model.
+    pub async fn active_builtin_tools(&self) -> HashSet<String> {
+        self.advertised_builtin_tools.read().await.clone()
+    }
+
+    /// Whether the built-in `name` is currently advertised to the model.
+    pub async fn is_builtin_tool_advertised(&self, name: &str) -> bool {
+        self.advertised_builtin_tools.read().await.contains(name)
     }
 
     /// Snapshot the current AgentRegistry. Used by `tool_loop::run` to
@@ -365,6 +383,12 @@ impl ToolRegistry {
             cwd,
             mcp_clients,
             mcp_tool_servers,
+            advertised_builtin_tools: RwLock::new(
+                BUILTIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
             skills: RwLock::new(skills),
             agents: RwLock::new(agents),
         }
@@ -372,8 +396,10 @@ impl ToolRegistry {
 
     /// All tool definitions for the OpenAI tools parameter.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs = vec![
-            tool_def(
+        let builtin_tools = self.active_builtin_tools().await;
+        let mut defs = Vec::new();
+        if builtin_tools.contains("think") {
+            defs.push(tool_def(
                 "think",
                 "Use this tool to think through a problem step by step before acting. The input is not used for anything -- it is just a scratchpad for your thoughts.",
                 json!({
@@ -386,8 +412,10 @@ impl ToolRegistry {
                     },
                     "required": ["thought"]
                 }),
-            ),
-            tool_def(
+            ));
+        }
+        if builtin_tools.contains("read_file") {
+            defs.push(tool_def(
                 "read_file",
                 "Reads and returns the content of a specified text file. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
                 json!({
@@ -408,8 +436,10 @@ impl ToolRegistry {
                     },
                     "required": ["file_path"]
                 }),
-            ),
-            tool_def(
+            ));
+        }
+        if builtin_tools.contains("write_file") {
+            defs.push(tool_def(
                 "write_file",
                 "Writes content to a specified file in the local filesystem. Paths may be relative to the working directory or absolute paths inside it.",
                 json!({
@@ -426,8 +456,10 @@ impl ToolRegistry {
                     },
                     "required": ["file_path", "content"]
                 }),
-            ),
-            tool_def(
+            ));
+        }
+        if builtin_tools.contains("edit") {
+            defs.push(tool_def(
                 "edit",
                 "Replaces exact literal text within a file. By default, replaces a single occurrence. Set `replace_all` to true to replace every matching occurrence.",
                 json!({
@@ -452,8 +484,10 @@ impl ToolRegistry {
                     },
                     "required": ["file_path", "old_string", "new_string"]
                 }),
-            ),
-            tool_def(
+            ));
+        }
+        if builtin_tools.contains("list_directory") {
+            defs.push(tool_def(
                 "list_directory",
                 "Lists the names of files and subdirectories directly within a specified directory path. Paths may be relative to the working directory or absolute paths inside it.",
                 json!({
@@ -466,8 +500,10 @@ impl ToolRegistry {
                     },
                     "required": ["path"]
                 }),
-            ),
-            tool_def(
+            ));
+        }
+        if builtin_tools.contains("grep_search") {
+            defs.push(tool_def(
                 "grep_search",
                 "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages.",
                 json!({
@@ -492,8 +528,10 @@ impl ToolRegistry {
                     },
                     "required": ["pattern"]
                 }),
-            ),
-            tool_def(
+            ));
+        }
+        if builtin_tools.contains("run_shell_command") {
+            defs.push(tool_def(
                 "run_shell_command",
                 "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection.",
                 json!({
@@ -518,8 +556,8 @@ impl ToolRegistry {
                     },
                     "required": ["command"]
                 }),
-            ),
-        ];
+            ));
+        }
         let mut advertised_names: HashSet<String> =
             defs.iter().map(|def| def.function.name.clone()).collect();
         for client in &self.mcp_clients {
@@ -621,31 +659,6 @@ impl ToolRegistry {
         self.mcp_tool_servers
             .get(name)
             .is_some_and(|client| client.name() == "bifrost")
-    }
-
-    pub(crate) async fn refresh_bifrost(&self) -> ToolResult {
-        let Some(client) = self
-            .mcp_clients
-            .iter()
-            .find(|client| client.name() == "bifrost")
-            .cloned()
-        else {
-            return ToolResult {
-                status: ToolStatus::RequestError,
-                output: "Bifrost refresh failed: no configured bifrost MCP server.".to_string(),
-            };
-        };
-
-        match client.call_tool("refresh", json!({})).await {
-            Ok(_) => ToolResult {
-                status: ToolStatus::Success,
-                output: "Bifrost analyzer index refreshed.".to_string(),
-            },
-            Err(err) => ToolResult {
-                status: ToolStatus::InternalError,
-                output: format!("Bifrost refresh failed: {err}"),
-            },
-        }
     }
 
     /// Execute a tool by name with JSON arguments.
@@ -1107,6 +1120,12 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
+            advertised_builtin_tools: RwLock::new(
+                BUILTIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
             skills: RwLock::new(Arc::new(reg)),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
         }
@@ -1121,6 +1140,12 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
+            advertised_builtin_tools: RwLock::new(
+                BUILTIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(reg)),
         }
@@ -1230,6 +1255,12 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
+            advertised_builtin_tools: RwLock::new(
+                BUILTIN_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
         };
@@ -1259,6 +1290,52 @@ mod tests {
                 "tool_definitions() advertises '{advertised_name}' but it is missing from the TOOLS metadata table"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_respect_filtered_builtin_set() {
+        let registry = registry_with_skills(vec![]);
+        registry
+            .set_builtin_tools(
+                ["think", "edit", "write_file", "list_directory"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )
+            .await;
+        let advertised: Vec<String> = registry
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|d| d.function.name)
+            .collect();
+
+        assert!(advertised.iter().any(|name| name == "think"));
+        assert!(advertised.iter().any(|name| name == "edit"));
+        assert!(advertised.iter().any(|name| name == "write_file"));
+        assert!(advertised.iter().any(|name| name == "list_directory"));
+        assert!(!advertised.iter().any(|name| name == "read_file"));
+        assert!(!advertised.iter().any(|name| name == "grep_search"));
+        assert!(!advertised.iter().any(|name| name == "run_shell_command"));
+    }
+
+    #[tokio::test]
+    async fn hidden_builtins_still_execute_for_non_llm_callers() {
+        let registry = registry_with_skills(vec![]);
+        registry
+            .set_builtin_tools(["think"].into_iter().map(str::to_string).collect())
+            .await;
+
+        let result = registry
+            .execute(
+                "run_shell_command",
+                json!({ "command": "printf ok" }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+
+        assert!(matches!(result.status, ToolStatus::Success));
+        assert_eq!(result.output, "ok");
     }
 
     /// `task` is gated on having at least one discovered subagent.

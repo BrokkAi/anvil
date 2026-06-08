@@ -180,6 +180,12 @@ Anvil is zero-config by default:
   default port, then use `/setup local refresh`.
 - **OpenRouter**: uses `OPENROUTER_API_KEY` or credentials saved through
   `/setup openrouter key <key>`.
+- **Bedrock**: uses `AWS_BEARER_TOKEN_BEDROCK` or `~/.secrets/bedrock_api_key`.
+  Native Bedrock invoke remains in place for Anthropic-style model ids such as
+  `bedrock::us.anthropic.claude-sonnet-4-6`. Bedrock-hosted `openai.*` models
+  route through the OpenAI-compatible `Responses` API at
+  `https://bedrock-mantle.<region>.api.aws/v1` when the selected model supports
+  that API on Bedrock.
 
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.

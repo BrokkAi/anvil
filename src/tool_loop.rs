@@ -1,7 +1,11 @@
 mod announce;
 
+use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
@@ -13,11 +17,6 @@ use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::bifrost_gate::{
-    GateClassifierDecision, GateContext, RecommendedTool, ShellClassifierDecision,
-    classify_shell_tool_call, classify_text_tool_call, encourage_bifrost_enabled, gate_message,
-    shell_gate_message, should_skip_for_static_text_target,
-};
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
     messages_include_images, rewrite_image_prompt_provider_error,
@@ -30,8 +29,135 @@ use crate::terminal_notifications::{
 use crate::tools::sandbox::SandboxPolicy;
 use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
 use crate::trace_logging::append_trace_record;
+use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
+const LLM_STREAM_MAX_ATTEMPTS: usize = 2;
+const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
+
+fn train_bifrost_enabled() -> bool {
+    env::var(TRAIN_BIFROST_ENV).ok().is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn train_bifrost_initial_builtin_tools() -> std::collections::HashSet<String> {
+    ["think", "write_file", "edit", "list_directory"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn train_bifrost_post_edit_builtin_tools() -> std::collections::HashSet<String> {
+    let mut tools = train_bifrost_initial_builtin_tools();
+    tools.insert("run_shell_command".to_string());
+    tools
+}
+
+fn advertised_tool_names(tools: Option<&Vec<ToolDefinition>>) -> std::collections::HashSet<String> {
+    tools
+        .into_iter()
+        .flat_map(|defs| defs.iter().map(|tool| tool.function.name.clone()))
+        .collect()
+}
+
+fn tool_unavailable_message(tool_name: &str) -> String {
+    format!(
+        "Error: tool '{tool_name}' is unavailable in the current tool catalog. Retry using a currently advertised tool."
+    )
+}
+
+fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}");
+    error.contains("stream read error")
+        || error.contains("stream made no meaningful progress")
+        || error.contains("server_is_overloaded")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_chat_with_transient_retry(
+    llm: &Arc<dyn LlmBackend>,
+    turn: usize,
+    model: &str,
+    messages: &[ChatMessage],
+    tools: Option<Vec<ToolDefinition>>,
+    reasoning_effort: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    on_text: &TextSink,
+    on_thought: &TextSink,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> anyhow::Result<LlmResponse> {
+    let mut attempt = 1usize;
+    loop {
+        let emitted_output = Arc::new(AtomicBool::new(false));
+
+        let token_sink = on_text.clone();
+        let token_emitted = emitted_output.clone();
+        let on_token: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
+            if !token.is_empty() {
+                token_emitted.store(true, Ordering::SeqCst);
+            }
+            if let Ok(mut cb) = token_sink.lock() {
+                cb(token);
+            }
+        });
+
+        let thought_sink = on_thought.clone();
+        let thought_emitted = emitted_output.clone();
+        let on_thought_cb: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
+            if !token.is_empty() {
+                thought_emitted.store(true, Ordering::SeqCst);
+            }
+            if let Ok(mut cb) = thought_sink.lock() {
+                cb(token);
+            }
+        });
+
+        let response = llm
+            .stream_chat(StreamChatRequest {
+                model: model.to_string(),
+                messages: messages.to_vec(),
+                tools: tools.clone(),
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                structured_output: structured_output.cloned(),
+                on_token,
+                on_thought: on_thought_cb,
+                cancel: cancel.clone(),
+                idle_timeout,
+            })
+            .await;
+
+        match response {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if attempt < LLM_STREAM_MAX_ATTEMPTS
+                    && !cancel.is_cancelled()
+                    && !emitted_output.load(Ordering::SeqCst)
+                    && is_retryable_llm_error(&error) =>
+            {
+                append_trace_record(serde_json::json!({
+                    "type": "llm_retry",
+                    "turn": turn,
+                    "attempt": attempt,
+                    "max_attempts": LLM_STREAM_MAX_ATTEMPTS,
+                    "reason": format!("{error:#}"),
+                }));
+                tracing::warn!(
+                    turn,
+                    attempt,
+                    max_attempts = LLM_STREAM_MAX_ATTEMPTS,
+                    "retrying transient LLM stream failure before any output was emitted"
+                );
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Result of approving a permission request.
 ///
@@ -637,6 +763,30 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
+    let train_bifrost = train_bifrost_enabled();
+    let training_packet = if train_bifrost {
+        match train_bifrost::load_packet_from_env() {
+            Ok(packet) => Some(packet),
+            Err(error) => {
+                append_trace_record(serde_json::json!({
+                    "type": "train_bifrost_config_error",
+                    "error": format!("{error:#}"),
+                }));
+                return (
+                    format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
+                    Vec::new(),
+                    TokenUsage::default(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    if train_bifrost {
+        registry
+            .set_builtin_tools(train_bifrost_initial_builtin_tools())
+            .await;
+    }
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
@@ -655,7 +805,6 @@ pub(crate) async fn run(
     // calls as it dispatches tools). The caller adds this to the
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
-    let mut skip_bifrost_classifier_for_next_tool_batch = false;
     let mut no_edit_progress_nudge_count = 0usize;
     'outer: for turn in 0..max_turns {
         if cancel.is_cancelled() {
@@ -665,23 +814,47 @@ pub(crate) async fn run(
             .permission_mode(&session_id)
             .await
             .unwrap_or(PermissionMode::ReadOnly);
-        if should_emit_no_edit_progress_nudge(
-            permission_mode,
-            turn,
-            max_turns,
-            &tool_exchanges,
-            no_edit_progress_nudge_count,
-        ) {
+        if train_bifrost
+            && should_emit_no_edit_progress_nudge(
+                permission_mode,
+                turn,
+                max_turns,
+                &tool_exchanges,
+                no_edit_progress_nudge_count,
+            )
+        {
             no_edit_progress_nudge_count += 1;
-            append_trace_record(serde_json::json!({
-                "type": "no_edit_progress_nudge",
-                "turn": turn,
-                "nudge_count": no_edit_progress_nudge_count,
-                "tool_counts": bifrost_gate_tool_counts(&tool_exchanges),
-            }));
-            messages.push(ChatMessage::user(
-                "You have already retrieved exact source context and no successful file edit/write has happened yet. Stop broad exploration and repeated code retrieval. In this turn, make the smallest plausible code change that addresses the task. Use edit/write_file before any further validation or additional investigation.",
-            ));
+            match build_train_bifrost_nudge(
+                llm,
+                turn,
+                &messages,
+                &tool_exchanges,
+                training_packet.as_ref(),
+                &cancel,
+                idle_timeout,
+            )
+            .await
+            {
+                Some((nudge, usage)) => {
+                    turn_usage.add(usage);
+                    append_trace_record(serde_json::json!({
+                        "type": "no_edit_progress_nudge",
+                        "turn": turn,
+                        "nudge_count": no_edit_progress_nudge_count,
+                        "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                        "message": nudge,
+                    }));
+                    messages.push(ChatMessage::user(nudge));
+                }
+                None => {
+                    append_trace_record(serde_json::json!({
+                        "type": "no_edit_progress_nudge_skipped",
+                        "turn": turn,
+                        "nudge_count": no_edit_progress_nudge_count,
+                        "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                    }));
+                }
+            }
         }
 
         // For the last turn, normally force a text response. If no file
@@ -696,23 +869,6 @@ pub(crate) async fn run(
             None
         };
 
-        // Forward tokens straight through to the caller; no buffering.
-        let text_clone = on_text.clone();
-        let on_token: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if let Ok(mut cb) = text_clone.lock() {
-                cb(token);
-            }
-        });
-        // Reasoning deltas route to a parallel sink so the agent layer
-        // can emit them as ACP AgentThoughtChunk events; backends that
-        // don't surface reasoning simply never invoke this closure.
-        let thought_clone = on_thought.clone();
-        let on_thought_cb: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if let Ok(mut cb) = thought_clone.lock() {
-                cb(token);
-            }
-        });
-
         // Wall-clock bound on this stream is enforced by the reqwest client's
         // own `.timeout(...)` (see `OpenAiClient::new`). Per-chunk idle
         // inactivity (the case in #3366 / #3453: streams that drip
@@ -721,6 +877,7 @@ pub(crate) async fn run(
         // `--llm-idle-timeout-secs` and the per-session `/idle-timeout`
         // override.
         let request_tools = turn_tools.clone();
+        let advertised_this_request = advertised_tool_names(request_tools.as_ref());
         trace_llm_request(
             turn,
             model,
@@ -729,41 +886,66 @@ pub(crate) async fn run(
             request_tools.as_ref(),
         );
 
-        let response = llm
-            .stream_chat(StreamChatRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                tools: request_tools,
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                structured_output: structured_output.cloned(),
-                on_token,
-                on_thought: on_thought_cb,
-                cancel: cancel.clone(),
-                idle_timeout,
-            })
-            .await;
+        let response = stream_chat_with_transient_retry(
+            llm,
+            turn,
+            model,
+            &messages,
+            request_tools,
+            reasoning_effort,
+            structured_output,
+            &on_text,
+            &on_thought,
+            &cancel,
+            idle_timeout,
+        )
+        .await;
 
         match response {
             Ok(LlmResponse::Text { text, usage }) => {
                 trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
-                if should_reject_no_edit_final_answer(
-                    permission_mode,
-                    turn,
-                    max_turns,
-                    &tool_exchanges,
-                ) {
-                    append_trace_record(serde_json::json!({
-                        "type": "no_edit_final_answer_guard",
-                        "turn": turn,
-                        "tool_counts": bifrost_gate_tool_counts(&tool_exchanges),
-                        "text": text,
-                    }));
-                    messages.push(ChatMessage::assistant(text));
-                    messages.push(ChatMessage::user(
-                        "The task is not complete: no successful file edit/write has been executed yet. Do not give a final answer. Use the available edit/write tools to implement the required code change, then run focused validation.",
-                    ));
-                    continue;
+                if train_bifrost
+                    && should_reject_no_edit_final_answer(
+                        permission_mode,
+                        turn,
+                        max_turns,
+                        &tool_exchanges,
+                    )
+                {
+                    match build_train_bifrost_nudge(
+                        llm,
+                        turn,
+                        &messages,
+                        &tool_exchanges,
+                        training_packet.as_ref(),
+                        &cancel,
+                        idle_timeout,
+                    )
+                    .await
+                    {
+                        Some((nudge, hint_usage)) => {
+                            turn_usage.add(hint_usage);
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_final_answer_guard",
+                                "turn": turn,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "text": text,
+                                "message": nudge,
+                            }));
+                            messages.push(ChatMessage::assistant(text));
+                            messages.push(ChatMessage::user(nudge));
+                            continue;
+                        }
+                        None => {
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_final_answer_guard_skipped",
+                                "turn": turn,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "text": text,
+                            }));
+                        }
+                    }
                 }
                 full_response.push_str(&text);
                 // Final text response -- we're done
@@ -772,11 +954,6 @@ pub(crate) async fn run(
             Ok(LlmResponse::ToolCalls { text, calls, usage }) => {
                 trace_llm_tool_response(turn, &text, &calls, usage);
                 turn_usage.add(usage);
-                let skip_bifrost_classifier_for_this_tool_batch =
-                    skip_bifrost_classifier_for_next_tool_batch;
-                let mut current_tool_batch_triggered_bifrost_gate = false;
-                let mut bifrost_refreshed_this_tool_batch = false;
-                let mut bifrost_refresh_failure: Option<ToolExecution> = None;
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
@@ -961,6 +1138,28 @@ pub(crate) async fn run(
                         )),
                     );
 
+                    if !advertised_this_request.contains(tool_name.as_str()) {
+                        let message = tool_unavailable_message(&tool_name);
+                        maybe_send_session_update(
+                            notifications,
+                            spawned_cx.cx(),
+                            &session_id,
+                            SessionUpdate::ToolCallUpdate(announce::update_failed(
+                                &call.id,
+                                &message,
+                                Some(Value::String(message.clone())),
+                            )),
+                        );
+                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
+                        tool_exchanges.push(ToolExchange {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            result: message,
+                        });
+                        continue;
+                    }
+
                     // Consult the gate before announcing or executing the call.
                     let decision = consult_gate(
                         &sessions,
@@ -1078,100 +1277,21 @@ pub(crate) async fn run(
                                 // turn, not just the parent's own calls.
                                 turn_usage.add(nested_usage);
                                 exec
-                            } else if let Some(message) = maybe_bifrost_classifier_gate(
-                                &tool_name,
-                                &parsed_input,
-                                &messages,
-                                &tools,
-                                &tool_exchanges,
-                                skip_bifrost_classifier_for_this_tool_batch,
-                                &cancel,
-                            )
-                            .await
-                            {
-                                current_tool_batch_triggered_bifrost_gate = true;
-                                ToolExecution {
-                                    output: message,
-                                    failed: false,
-                                }
                             } else {
                                 trace_bifrost_context_shadow(
                                     &tool_name,
                                     &parsed_input,
                                     &tool_exchanges,
                                 );
-                                if registry.is_bifrost_tool(&tool_name)
-                                    && !bifrost_refreshed_this_tool_batch
-                                {
-                                    tracing::info!(
-                                        session_id = %session_id,
-                                        tool_name = %tool_name,
-                                        "refreshing bifrost before first bifrost tool in batch"
-                                    );
-                                    append_trace_record(serde_json::json!({
-                                        "type": "bifrost_refresh",
-                                        "tool": tool_name,
-                                        "status": "started",
-                                    }));
-                                    let refresh = registry.refresh_bifrost().await;
-                                    let refresh_status = match refresh.status {
-                                        ToolStatus::Success => "success",
-                                        ToolStatus::RequestError => "request_error",
-                                        ToolStatus::InternalError => "internal_error",
-                                    };
-                                    tracing::info!(
-                                        session_id = %session_id,
-                                        tool_name = %tool_name,
-                                        status = refresh_status,
-                                        "bifrost refresh completed before tool batch"
-                                    );
-                                    append_trace_record(serde_json::json!({
-                                        "type": "bifrost_refresh",
-                                        "tool": tool_name,
-                                        "status": refresh_status,
-                                        "output": refresh.output.clone(),
-                                    }));
-                                    bifrost_refreshed_this_tool_batch = true;
-                                    if !matches!(refresh.status, ToolStatus::Success) {
-                                        let exec = tool_result_to_execution(refresh);
-                                        bifrost_refresh_failure = Some(exec.clone());
-                                        exec
-                                    } else {
-                                        execute_tool(
-                                            registry,
-                                            &tool_name,
-                                            parsed_input.clone(),
-                                            policy,
-                                            outside_sandbox_once,
-                                            sandbox_mode,
-                                        )
-                                        .await
-                                    }
-                                } else if registry.is_bifrost_tool(&tool_name) {
-                                    if let Some(exec) = &bifrost_refresh_failure {
-                                        exec.clone()
-                                    } else {
-                                        execute_tool(
-                                            registry,
-                                            &tool_name,
-                                            parsed_input.clone(),
-                                            policy,
-                                            outside_sandbox_once,
-                                            sandbox_mode,
-                                        )
-                                        .await
-                                    }
-                                } else {
-                                    execute_tool(
-                                        registry,
-                                        &tool_name,
-                                        parsed_input.clone(),
-                                        policy,
-                                        outside_sandbox_once,
-                                        sandbox_mode,
-                                    )
-                                    .await
-                                }
+                                execute_tool(
+                                    registry,
+                                    &tool_name,
+                                    parsed_input.clone(),
+                                    policy,
+                                    outside_sandbox_once,
+                                    sandbox_mode,
+                                )
+                                .await
                             };
 
                             // Build the terminal update -- Completed (with a
@@ -1215,8 +1335,20 @@ pub(crate) async fn run(
                         result: output,
                     });
                 }
-                skip_bifrost_classifier_for_next_tool_batch =
-                    current_tool_batch_triggered_bifrost_gate;
+                if train_bifrost
+                    && has_successful_file_change(&tool_exchanges)
+                    && !registry
+                        .is_builtin_tool_advertised("run_shell_command")
+                        .await
+                {
+                    registry
+                        .set_builtin_tools(train_bifrost_post_edit_builtin_tools())
+                        .await;
+                    tools = registry.tool_definitions().await;
+                    if depth >= MAX_SUBAGENT_DEPTH {
+                        tools.retain(|t| t.function.name != "task");
+                    }
+                }
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
@@ -1517,233 +1649,17 @@ struct ToolExecution {
     failed: bool,
 }
 
+#[cfg(test)]
 fn has_tool(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.function.name == name)
 }
 
+#[cfg(test)]
 fn is_text_navigation_tool(name: &str) -> bool {
     matches!(name, "read_file" | "grep_search" | "list_directory")
 }
 
-async fn maybe_bifrost_classifier_gate(
-    tool_name: &str,
-    parsed_input: &Value,
-    messages: &[ChatMessage],
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    skip_after_prior_gate: bool,
-    cancel: &CancellationToken,
-) -> Option<String> {
-    if let Some(reason) = bifrost_classifier_skip_reason(
-        tool_name,
-        parsed_input,
-        tools,
-        tool_exchanges,
-        skip_after_prior_gate,
-    ) {
-        let trace_type = if tool_name == "run_shell_command" {
-            "shell_gate_classifier_skipped"
-        } else {
-            "bifrost_gate_classifier_skipped"
-        };
-        append_trace_record(serde_json::json!({
-            "type": trace_type,
-            "tool": tool_name,
-            "args": parsed_input,
-            "reason": reason,
-            "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-        }));
-        return None;
-    }
-
-    let context = GateContext {
-        tool_name: tool_name.to_string(),
-        args: parsed_input.clone(),
-        messages: messages.to_vec(),
-        tools: tools.to_vec(),
-        tool_exchanges: tool_exchanges.to_vec(),
-    };
-    if tool_name == "run_shell_command" {
-        return maybe_shell_classifier_gate(parsed_input, tools, tool_exchanges, context, cancel)
-            .await;
-    }
-
-    append_trace_record(serde_json::json!({
-        "type": "bifrost_gate_classifier_call",
-        "tool": tool_name,
-        "args": parsed_input,
-        "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-    }));
-
-    match classify_text_tool_call(context, cancel).await {
-        Ok(output) if output.decision == GateClassifierDecision::GateToSymbolTool => {
-            let message = gate_message(&output, tools);
-            append_trace_record(serde_json::json!({
-                "type": "bifrost_gate_classifier",
-                "tool": tool_name,
-                "args": parsed_input,
-                "decision": output,
-                "gated": true,
-            }));
-            Some(message)
-        }
-        Ok(mut output) => {
-            let normalized_recommended_tool = output.decision == GateClassifierDecision::AllowText
-                && output.recommended_tool != RecommendedTool::None;
-            if normalized_recommended_tool {
-                output.recommended_tool = RecommendedTool::None;
-                output.suggested_args = serde_json::json!({});
-            }
-            append_trace_record(serde_json::json!({
-                "type": "bifrost_gate_classifier",
-                "tool": tool_name,
-                "args": parsed_input,
-                "decision": output,
-                "gated": false,
-                "normalized_recommended_tool": normalized_recommended_tool,
-            }));
-            None
-        }
-        Err(err) => {
-            tracing::warn!(tool_name, "Bifrost gate classifier failed open: {err:#}");
-            append_trace_record(serde_json::json!({
-                "type": "bifrost_gate_classifier_error",
-                "tool": tool_name,
-                "args": parsed_input,
-                "error": err.to_string(),
-            }));
-            None
-        }
-    }
-}
-
-async fn maybe_shell_classifier_gate(
-    parsed_input: &Value,
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    context: GateContext,
-    cancel: &CancellationToken,
-) -> Option<String> {
-    append_trace_record(serde_json::json!({
-        "type": "shell_gate_classifier_call",
-        "tool": "run_shell_command",
-        "args": parsed_input,
-        "prior_tool_counts": bifrost_gate_tool_counts(tool_exchanges),
-    }));
-
-    match classify_shell_tool_call(context, cancel).await {
-        Ok(output)
-            if matches!(
-                output.decision,
-                ShellClassifierDecision::UseBuiltinTool | ShellClassifierDecision::UseBifrostTool
-            ) =>
-        {
-            let message = shell_gate_message(&output, tools);
-            append_trace_record(serde_json::json!({
-                "type": "shell_gate_classifier",
-                "tool": "run_shell_command",
-                "args": parsed_input,
-                "decision": output,
-                "gated": true,
-            }));
-            Some(message)
-        }
-        Ok(mut output) => {
-            let normalized_recommended_tool = output.decision
-                == ShellClassifierDecision::AllowShell
-                && output.recommended_tool != RecommendedTool::None;
-            if normalized_recommended_tool {
-                output.recommended_tool = RecommendedTool::None;
-                output.suggested_args = serde_json::json!({});
-            }
-            append_trace_record(serde_json::json!({
-                "type": "shell_gate_classifier",
-                "tool": "run_shell_command",
-                "args": parsed_input,
-                "decision": output,
-                "gated": false,
-                "normalized_recommended_tool": normalized_recommended_tool,
-            }));
-            None
-        }
-        Err(err) => {
-            tracing::warn!("Shell routing classifier failed open: {err:#}");
-            append_trace_record(serde_json::json!({
-                "type": "shell_gate_classifier_error",
-                "tool": "run_shell_command",
-                "args": parsed_input,
-                "error": err.to_string(),
-            }));
-            None
-        }
-    }
-}
-
-#[cfg(test)]
-fn should_consult_bifrost_classifier(
-    tool_name: &str,
-    parsed_input: &Value,
-    tools: &[ToolDefinition],
-    tool_exchanges: &[ToolExchange],
-    skip_after_prior_gate: bool,
-) -> bool {
-    bifrost_classifier_skip_reason(
-        tool_name,
-        parsed_input,
-        tools,
-        tool_exchanges,
-        skip_after_prior_gate,
-    )
-    .is_none()
-}
-
-fn bifrost_classifier_skip_reason(
-    tool_name: &str,
-    parsed_input: &Value,
-    tools: &[ToolDefinition],
-    _tool_exchanges: &[ToolExchange],
-    skip_after_prior_gate: bool,
-) -> Option<&'static str> {
-    if skip_after_prior_gate {
-        return Some("post_gate_tool_batch");
-    }
-    if !encourage_bifrost_enabled() {
-        return Some("bifrost_encouragement_disabled");
-    }
-    if tool_name == "run_shell_command" {
-        return shell_classifier_skip_reason(tool_name, tools, skip_after_prior_gate);
-    } else if !is_text_navigation_tool(tool_name) {
-        return Some("not_text_navigation_tool");
-    }
-    if is_text_navigation_tool(tool_name)
-        && should_skip_for_static_text_target(tool_name, parsed_input)
-    {
-        return Some("static_text_target");
-    }
-    if !has_tool(tools, "search_symbols")
-        || !has_tool(tools, "scan_usages")
-        || !has_tool(tools, "get_summaries")
-    {
-        return Some("missing_required_bifrost_tools");
-    }
-    None
-}
-
-fn shell_classifier_skip_reason(
-    tool_name: &str,
-    _tools: &[ToolDefinition],
-    skip_after_prior_gate: bool,
-) -> Option<&'static str> {
-    if tool_name != "run_shell_command" {
-        return Some("not_shell_tool");
-    }
-    if skip_after_prior_gate {
-        return Some("post_gate_tool_batch");
-    }
-    None
-}
-
-fn bifrost_gate_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
+fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
     serde_json::json!({
         "read_file": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "read_file").count(),
         "grep_search": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "grep_search").count(),
@@ -1809,7 +1725,7 @@ fn trace_bifrost_context_shadow(
         "prior_exact_args_count": prior_exact_args_count,
         "has_successful_file_change": has_successful_file_change(tool_exchanges),
         "exact_source_count": exact_source_tool_count(tool_exchanges),
-        "tool_counts": bifrost_gate_tool_counts(tool_exchanges),
+        "executed_tool_counts": executed_tool_counts(tool_exchanges),
     }));
 }
 
@@ -1839,6 +1755,28 @@ fn should_reject_no_edit_final_answer(
     })
 }
 
+async fn build_train_bifrost_nudge(
+    llm: &Arc<dyn LlmBackend>,
+    turn: usize,
+    messages: &[ChatMessage],
+    tool_exchanges: &[ToolExchange],
+    training_packet: Option<&TrainingPacket>,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Option<(String, TokenUsage)> {
+    let packet = training_packet?;
+    train_bifrost::compose_no_edit_nudge(
+        llm,
+        turn,
+        messages,
+        tool_exchanges,
+        packet,
+        cancel,
+        idle_timeout,
+    )
+    .await
+}
+
 fn should_emit_no_edit_progress_nudge(
     permission_mode: PermissionMode,
     turn: usize,
@@ -1855,28 +1793,6 @@ fn should_emit_no_edit_progress_nudge(
     let first_nudge_turn = (max_turns / 3).clamp(6, 10);
     let next_nudge_turn = first_nudge_turn + 4 * nudge_count;
     turn >= next_nudge_turn
-        && exact_source_tool_count(tool_exchanges) >= 1
-        && code_context_tool_count(tool_exchanges) >= 5
-}
-
-fn code_context_tool_count(tool_exchanges: &[ToolExchange]) -> usize {
-    tool_exchanges
-        .iter()
-        .filter(|exchange| {
-            matches!(
-                exchange.tool_name.as_str(),
-                "search_symbols"
-                    | "get_symbol_sources"
-                    | "scan_usages"
-                    | "get_summaries"
-                    | "list_symbols"
-                    | "get_symbol_locations"
-                    | "read_file"
-                    | "grep_search"
-                    | "list_directory"
-            )
-        })
-        .count()
 }
 
 fn exact_source_tool_count(tool_exchanges: &[ToolExchange]) -> usize {
@@ -2234,6 +2150,8 @@ fn ordered_tool_call_indices(
 mod tests {
     use super::*;
     use crate::llm_client::{FunctionCall, FunctionDef};
+    use futures::future::{BoxFuture, FutureExt};
+    use std::sync::atomic::AtomicUsize;
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -2271,6 +2189,47 @@ mod tests {
             .into_iter()
             .map(|index| calls[index].function.name.clone())
             .collect()
+    }
+
+    struct RetryBackend {
+        attempts: Arc<AtomicUsize>,
+        emit_before_error: bool,
+        first_error: &'static str,
+    }
+
+    impl LlmBackend for RetryBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            mut request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            let emit_before_error = self.emit_before_error;
+            let first_error = self.first_error;
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    if emit_before_error {
+                        (request.on_token)("partial");
+                    }
+                    anyhow::bail!(first_error);
+                }
+                Ok(LlmResponse::Text {
+                    text: "ok".to_string(),
+                    usage: TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
+    fn text_sink_for_test(buffer: Arc<Mutex<String>>) -> TextSink {
+        Arc::new(Mutex::new(move |text: &str| {
+            buffer.lock().unwrap().push_str(text);
+        }))
     }
 
     fn decide(
@@ -2341,6 +2300,155 @@ mod tests {
         let names = ordered_names_for_test(&calls, &["search_symbols"]);
 
         assert_eq!(names, vec!["think", "read_file", "run_shell_command"]);
+    }
+
+    #[test]
+    fn advertised_tool_names_match_current_request_catalog() {
+        let tools = vec![tool_def_for_test("think"), tool_def_for_test("edit")];
+        let names = advertised_tool_names(Some(&tools));
+
+        assert!(names.contains("think"));
+        assert!(names.contains("edit"));
+        assert!(!names.contains("run_shell_command"));
+    }
+
+    #[test]
+    fn hidden_tool_calls_are_marked_unavailable() {
+        let message = tool_unavailable_message("run_shell_command");
+
+        assert!(message.contains("run_shell_command"));
+        assert!(message.contains("unavailable in the current tool catalog"));
+    }
+
+    #[test]
+    fn train_bifrost_post_edit_policy_only_adds_shell() {
+        let initial = train_bifrost_initial_builtin_tools();
+        let post_edit = train_bifrost_post_edit_builtin_tools();
+
+        assert!(initial.contains("think"));
+        assert!(initial.contains("edit"));
+        assert!(initial.contains("write_file"));
+        assert!(initial.contains("list_directory"));
+        assert!(!initial.contains("read_file"));
+        assert!(!initial.contains("grep_search"));
+        assert!(!initial.contains("run_shell_command"));
+
+        assert!(post_edit.contains("run_shell_command"));
+        assert!(!post_edit.contains("read_file"));
+        assert!(!post_edit.contains("grep_search"));
+    }
+
+    #[test]
+    fn train_bifrost_policy_is_env_controlled() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+
+        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(TRAIN_BIFROST_ENV);
+        assert!(!train_bifrost_enabled());
+        drop(_scope);
+
+        let _scope = crate::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "1");
+        assert!(train_bifrost_enabled());
+        drop(_scope);
+
+        let _scope =
+            crate::openrouter_auth::test_support::EnvScope::set(TRAIN_BIFROST_ENV, "false");
+        assert!(!train_bifrost_enabled());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_transient_stream_error_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Codex stream read error: simulated disconnect",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("retry should recover");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_after_partial_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: true,
+            first_error: "Codex stream read error: simulated disconnect",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let error = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("partial output makes retry unsafe");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(format!("{error:#}").contains("Codex stream read error"));
+        assert_eq!(output.lock().unwrap().as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_server_overloaded_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Codex Responses stream failed: server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("overload should be retried before output");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
     }
 
     #[test]
@@ -2424,94 +2532,6 @@ mod tests {
         let output = maybe_text_navigation_gate("read_file", &prior, &tools, 0);
 
         assert!(output.is_none());
-    }
-
-    #[test]
-    fn bifrost_classifier_is_skipped_immediately_after_gate_prompt() {
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        let should_consult = should_consult_bifrost_classifier(
-            "read_file",
-            &serde_json::json!({"file_path": "src/lib.rs"}),
-            &tools,
-            &[],
-            true,
-        );
-
-        assert!(!should_consult);
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[],
-                true,
-            ),
-            Some("post_gate_tool_batch")
-        );
-    }
-
-    #[test]
-    fn bifrost_classifier_is_disabled_by_default_without_env_var() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::remove(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("bifrost_encouragement_disabled")
-        );
-        assert!(!should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test -q"}),
-            &tools,
-            &[],
-            false,
-        ));
-    }
-
-    #[test]
-    fn bifrost_classifier_can_be_enabled_with_env_var() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert!(should_consult_bifrost_classifier(
-            "read_file",
-            &serde_json::json!({"file_path": "src/lib.rs"}),
-            &tools,
-            &[],
-            false,
-        ));
     }
 
     #[test]
@@ -2603,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn no_edit_progress_nudge_waits_for_exact_source() {
+    fn no_edit_progress_nudge_uses_turn_threshold_without_context_gate() {
         let prior = vec![
             exchange_for_test("search_symbols"),
             exchange_for_test("scan_usages"),
@@ -2613,6 +2633,13 @@ mod tests {
         ];
 
         assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            7,
+            25,
+            &prior,
+            0
+        ));
+        assert!(should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             8,
             25,
@@ -2646,156 +2673,6 @@ mod tests {
             &prior,
             0
         ));
-    }
-
-    #[test]
-    fn bifrost_classifier_runs_when_not_in_post_gate_batch() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        let should_consult = should_consult_bifrost_classifier(
-            "read_file",
-            &serde_json::json!({"file_path": "src/lib.rs"}),
-            &tools,
-            &[],
-            false,
-        );
-
-        assert!(should_consult);
-    }
-
-    #[test]
-    fn shell_classifier_runs_for_all_shell_commands() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("run_shell_command"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "nl -ba src/main.rs | sed -n '1,80p'"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test -q"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/Foo.php').write_text('x')\nPY"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "sed -i 's/a/b/' src/Foo.php"}),
-            &tools,
-            &[],
-            false,
-        ));
-        assert!(!should_consult_bifrost_classifier(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test -q"}),
-            &tools,
-            &[],
-            true,
-        ));
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "run_shell_command",
-                &serde_json::json!({"command": "cargo test -q"}),
-                &tools,
-                &[],
-                true,
-            ),
-            Some("post_gate_tool_batch")
-        );
-    }
-
-    #[test]
-    fn bifrost_classifier_skip_reasons_are_specific() {
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let _scope = crate::openrouter_auth::test_support::EnvScope::set(
-            crate::bifrost_gate::ENCOURAGE_BIFROST_ENV,
-            "1",
-        );
-        let tools = vec![
-            tool_def_for_test("read_file"),
-            tool_def_for_test("grep_search"),
-            tool_def_for_test("search_symbols"),
-            tool_def_for_test("scan_usages"),
-            tool_def_for_test("get_summaries"),
-        ];
-
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "edit",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("not_text_navigation_tool")
-        );
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": ".harness/build.sh"}),
-                &tools,
-                &[],
-                false,
-            ),
-            Some("static_text_target")
-        );
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &tools,
-                &[
-                    exchange_for_test("search_symbols"),
-                    exchange_for_test("scan_usages"),
-                    exchange_for_test("get_summaries"),
-                ],
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            bifrost_classifier_skip_reason(
-                "read_file",
-                &serde_json::json!({"file_path": "src/lib.rs"}),
-                &[tool_def_for_test("read_file")],
-                &[],
-                false,
-            ),
-            Some("missing_required_bifrost_tools")
-        );
     }
 
     #[test]
