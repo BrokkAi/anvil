@@ -250,6 +250,9 @@ pub async fn discover_ollama_model_metadata(
                         id: model_id,
                         default_reasoning_level: None,
                         supported_reasoning_levels: ollama_thinking_presets(),
+                        supports_images: Some(
+                            parsed.capabilities.iter().any(|cap| cap == "vision"),
+                        ),
                         // Ollama's catalog doesn't publish a context window;
                         // the compression layer falls back to a default.
                         context_length: None,
@@ -257,7 +260,18 @@ pub async fn discover_ollama_model_metadata(
                 ));
             }
 
-            Some((model_id.clone(), ModelMetadata::id_only(model_id)))
+            Some((
+                model_id.clone(),
+                ModelMetadata {
+                    id: model_id,
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
+                    supports_images: Some(
+                        parsed.capabilities.iter().any(|cap| cap == "vision"),
+                    ),
+                    context_length: None,
+                },
+            ))
         }
     });
 
@@ -453,6 +467,7 @@ mod tests {
         let metadata = discover_ollama_model_metadata(&http, &server.uri()).await;
         let thinking = metadata.get("gemma4:26b").expect("thinking model metadata");
         assert!(thinking.default_reasoning_level.is_none());
+        assert_eq!(thinking.supports_images, Some(true));
         assert_eq!(
             thinking
                 .supported_reasoning_levels
@@ -465,6 +480,7 @@ mod tests {
         let plain = metadata.get("qwen3.5:4b").expect("plain model metadata");
         assert!(plain.default_reasoning_level.is_none());
         assert!(plain.supported_reasoning_levels.is_empty());
+        assert_eq!(plain.supports_images, Some(false));
     }
 
     /// `wire_id` round-trips through `split_wire_id` for every source,

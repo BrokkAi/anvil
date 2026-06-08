@@ -355,6 +355,7 @@ impl LlmBackend for BedrockClient {
                             id: self.default_model.clone(),
                             default_reasoning_level: None,
                             supported_reasoning_levels: Vec::new(),
+                            supports_images: None,
                             context_length: Some(200_000),
                         });
                     }
@@ -366,6 +367,7 @@ impl LlmBackend for BedrockClient {
                         id: self.default_model.clone(),
                         default_reasoning_level: None,
                         supported_reasoning_levels: Vec::new(),
+                        supports_images: None,
                         context_length: Some(200_000),
                     }])
                 }

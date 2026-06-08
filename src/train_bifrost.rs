@@ -359,11 +359,13 @@ pub(crate) async fn compose_no_edit_nudge(
         match request_hint_with_retries(
             llm,
             turn,
-            messages,
-            tool_exchanges,
-            file,
-            packet,
-            &deterministic_nudges,
+            HintRequestContext {
+                messages,
+                tool_exchanges,
+                file,
+                packet,
+                deterministic_nudges: &deterministic_nudges,
+            },
             cancel,
             idle_timeout,
         )
@@ -410,36 +412,19 @@ pub(crate) async fn compose_no_edit_nudge(
 async fn request_hint_with_retries(
     llm: &Arc<dyn LlmBackend>,
     turn: usize,
-    messages: &[ChatMessage],
-    tool_exchanges: &[ToolExchange],
-    file: &TrainingFile,
-    packet: &TrainingPacket,
-    deterministic_nudges: &[String],
+    context: HintRequestContext<'_>,
     cancel: &CancellationToken,
     idle_timeout: Duration,
 ) -> Result<(String, TokenUsage)> {
     let mut last_error = None;
     for attempt in 1..=HINT_MAX_ATTEMPTS {
-        match request_hint(
-            llm,
-            turn,
-            attempt,
-            messages,
-            tool_exchanges,
-            file,
-            packet,
-            deterministic_nudges,
-            cancel,
-            idle_timeout,
-        )
-        .await
-        {
+        match request_hint(llm, turn, attempt, context, cancel, idle_timeout).await {
             Ok(result) => return Ok(result),
             Err(error) => {
                 append_trace_record(serde_json::json!({
                     "type": "train_bifrost_hint_retry",
                     "turn": turn,
-                    "file": file.path,
+                    "file": context.file.path,
                     "attempt": attempt,
                     "max_attempts": HINT_MAX_ATTEMPTS,
                     "error": format!("{error:#}"),
@@ -455,11 +440,7 @@ async fn request_hint(
     llm: &Arc<dyn LlmBackend>,
     turn: usize,
     attempt: usize,
-    messages: &[ChatMessage],
-    tool_exchanges: &[ToolExchange],
-    file: &TrainingFile,
-    packet: &TrainingPacket,
-    deterministic_nudges: &[String],
+    context: HintRequestContext<'_>,
     cancel: &CancellationToken,
     idle_timeout: Duration,
 ) -> Result<(String, TokenUsage)> {
@@ -467,7 +448,7 @@ async fn request_hint(
         "type": "train_bifrost_hint_request",
         "turn": turn,
         "attempt": attempt,
-        "file": file.path,
+        "file": context.file.path,
         "model": TRAIN_BIFROST_HINT_MODEL,
     }));
 
@@ -475,10 +456,10 @@ async fn request_hint(
         ChatMessage::system(HINT_SYSTEM_PROMPT),
         ChatMessage::user(format!(
             "<conversation>\n{}\n</conversation>\n\n<sidecar_file_summaries>\n{}\n</sidecar_file_summaries>\n\n<deterministic_nudges_already_planned>\n{}\n</deterministic_nudges_already_planned>\n\n<golden_file_diff>\n{}\n</golden_file_diff>\n\nReturn one concise source-discovery hint. It should help the active model decide what to inspect next, not what code to write. Do not repeat any deterministic nudge already planned above.",
-            conversation_for_hint(messages, tool_exchanges),
-            sidecar_summaries_for_hint(packet),
-            deterministic_nudges_for_hint(deterministic_nudges),
-            file.diff
+            conversation_for_hint(context.messages, context.tool_exchanges),
+            sidecar_summaries_for_hint(context.packet),
+            deterministic_nudges_for_hint(context.deterministic_nudges),
+            context.file.diff
         )),
     ];
 
@@ -495,7 +476,7 @@ async fn request_hint(
             idle_timeout,
         })
         .await
-        .with_context(|| format!("hint model request failed for {}", file.path))?;
+        .with_context(|| format!("hint model request failed for {}", context.file.path))?;
 
     let usage = response.usage();
     let text = match response {
@@ -508,10 +489,19 @@ async fn request_hint(
         "type": "train_bifrost_hint_response",
         "turn": turn,
         "attempt": attempt,
-        "file": file.path,
+        "file": context.file.path,
         "hint": parsed.hint,
     }));
     Ok((parsed.hint, usage))
+}
+
+#[derive(Clone, Copy)]
+struct HintRequestContext<'a> {
+    messages: &'a [ChatMessage],
+    tool_exchanges: &'a [ToolExchange],
+    file: &'a TrainingFile,
+    packet: &'a TrainingPacket,
+    deterministic_nudges: &'a [String],
 }
 
 fn conversation_for_hint(messages: &[ChatMessage], tool_exchanges: &[ToolExchange]) -> String {
