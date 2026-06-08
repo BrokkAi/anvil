@@ -375,7 +375,7 @@ pub async fn run_shell_command(
     #[cfg(unix)]
     let sandbox_path = sandbox::discover_sandbox_path();
     #[cfg(not(unix))]
-    let sandbox_path: String = String::from("/usr/local/bin:/usr/bin:/bin");
+    let sandbox_path = std::env::var_os("PATH").unwrap_or_default();
     let mut cmd = Command::new(&wrapped.argv[0]);
     cmd.args(&wrapped.argv[1..])
         .current_dir(cwd)

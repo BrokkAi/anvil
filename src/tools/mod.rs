@@ -1116,8 +1116,9 @@ mod tests {
         for meta in skills {
             reg.insert_for_test(meta);
         }
+        let cwd = std::env::temp_dir();
         ToolRegistry {
-            cwd: PathBuf::from("/tmp"),
+            cwd,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1136,8 +1137,9 @@ mod tests {
         for meta in agents {
             reg.insert_for_test(meta);
         }
+        let cwd = std::env::temp_dir();
         ToolRegistry {
-            cwd: PathBuf::from("/tmp"),
+            cwd,
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1252,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_tools_have_metadata_and_are_advertised() {
         let registry = ToolRegistry {
-            cwd: PathBuf::from("/tmp"),
+            cwd: std::env::temp_dir(),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1326,16 +1328,25 @@ mod tests {
             .set_builtin_tools(["think"].into_iter().map(str::to_string).collect())
             .await;
 
+        #[cfg(target_os = "windows")]
+        let command = "echo ok";
+        #[cfg(not(target_os = "windows"))]
+        let command = "printf ok";
+
         let result = registry
             .execute(
                 "run_shell_command",
-                json!({ "command": "printf ok" }),
-                SandboxPolicy::WorkspaceWrite,
+                json!({ "command": command }),
+                SandboxPolicy::None,
             )
             .await;
 
-        assert!(matches!(result.status, ToolStatus::Success));
-        assert_eq!(result.output, "ok");
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "hidden builtins should still execute for non-LLM callers; output={}",
+            result.output
+        );
+        assert_eq!(result.output.trim(), "ok");
     }
 
     /// `task` is gated on having at least one discovered subagent.

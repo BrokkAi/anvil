@@ -185,7 +185,20 @@ Anvil is zero-config by default:
   `bedrock::us.anthropic.claude-sonnet-4-6`. Bedrock-hosted `openai.*` models
   route through the OpenAI-compatible `Responses` API at
   `https://bedrock-mantle.<region>.api.aws/v1` when the selected model supports
-  that API on Bedrock.
+  that API on Bedrock. On startup and refresh, Anvil discovers Bedrock
+  inference profiles for the current region and publishes invocable model ids
+  in the picker. `ANVIL_BEDROCK_MODEL` may be either a foundation model id or
+  an inference profile id/ARN; when a base model requires an inference profile,
+  Anvil normalizes it to the matching profile automatically. Claude 3.7 and the
+  Claude 4 family (Sonnet/Opus) expose extended-thinking reasoning presets
+  (`low`/`medium`/`high`) in the effort picker; reasoning is opt-in, so the
+  `thinking` block is sent only when an effort is explicitly selected. The
+  Bedrock catalog publishes no per-model reasoning capability, so the wire
+  shape is detected at runtime: Anvil sends the legacy
+  `thinking.type=enabled` form first and, if the model responds that it
+  requires `thinking.type=adaptive` + `output_config.effort`, retries with
+  that shape and remembers the model's shape for later turns. Other
+  Bedrock-hosted Anthropic models (e.g. Claude 3.5) advertise no presets.
 
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.
