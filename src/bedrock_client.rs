@@ -179,6 +179,34 @@ impl BedrockClient {
         )
     }
 
+    fn catalog_url(&self) -> String {
+        if (self.runtime_base_url.starts_with("http://")
+            || self.runtime_base_url.starts_with("https://"))
+            && self.runtime_base_url != "https://bedrock-runtime"
+            && self.runtime_base_url != "http://bedrock-runtime"
+            && !self.runtime_base_url.contains("amazonaws.com")
+        {
+            return format!(
+                "{}/foundation-models",
+                self.runtime_base_url.trim_end_matches('/')
+            );
+        }
+        format!(
+            "https://bedrock.{}.amazonaws.com/foundation-models",
+            self.region
+        )
+    }
+
+    async fn discover_model_metadata(&self) -> Result<Vec<ModelMetadata>> {
+        discover_model_metadata_with_http(
+            &self.http,
+            &self.catalog_url(),
+            &self.bearer_token,
+            &self.default_model,
+        )
+        .await
+    }
+
     async fn invoke_model(&self, request: StreamChatRequest) -> Result<LlmResponse> {
         if uses_responses_api(&request.model) {
             return self.invoke_responses_model(request).await;
@@ -348,30 +376,35 @@ impl LlmBackend for BedrockClient {
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         Box::pin(async move {
-            match self.list_mantle_model_metadata().await {
-                Ok(mut models) => {
-                    if !models.iter().any(|m| m.id == self.default_model) {
-                        models.push(ModelMetadata {
-                            id: self.default_model.clone(),
-                            default_reasoning_level: None,
-                            supported_reasoning_levels: Vec::new(),
-                            supports_images: None,
-                            context_length: Some(200_000),
-                        });
-                    }
-                    Ok(models)
-                }
+            let mut models = match self.list_mantle_model_metadata().await {
+                Ok(models) => models,
                 Err(err) => {
                     tracing::info!("Bedrock Mantle model discovery skipped: {err:#}");
-                    Ok(vec![ModelMetadata {
-                        id: self.default_model.clone(),
-                        default_reasoning_level: None,
-                        supported_reasoning_levels: Vec::new(),
-                        supports_images: None,
-                        context_length: Some(200_000),
-                    }])
+                    Vec::new()
+                }
+            };
+            match self.discover_model_metadata().await {
+                Ok(native_models) => models.extend(native_models),
+                Err(err) => {
+                    tracing::info!("Bedrock foundation-model discovery skipped: {err:#}");
                 }
             }
+            if !models.iter().any(|m| m.id == self.default_model) {
+                models.push(ModelMetadata {
+                    id: self.default_model.clone(),
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
+                    supports_images: None,
+                    context_length: Some(200_000),
+                });
+            }
+            models.sort_by(|a, b| {
+                let a_default = a.id == self.default_model;
+                let b_default = b.id == self.default_model;
+                b_default.cmp(&a_default).then_with(|| a.id.cmp(&b.id))
+            });
+            models.dedup_by(|a, b| a.id == b.id);
+            Ok(models)
         })
     }
 
@@ -731,6 +764,67 @@ fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
     serde_json::from_str(raw).with_context(|| format!("parse tool arguments as JSON: {raw}"))
 }
 
+async fn discover_model_metadata_with_http(
+    http: &reqwest::Client,
+    catalog_url: &str,
+    bearer_token: &str,
+    default_model: &str,
+) -> Result<Vec<ModelMetadata>> {
+    let response = http
+        .get(catalog_url)
+        .bearer_auth(bearer_token)
+        .send()
+        .await
+        .context("failed to send Bedrock model discovery request")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read Bedrock model discovery response body")?;
+    if !status.is_success() {
+        anyhow::bail!("Bedrock model discovery failed (HTTP {status}): {body}");
+    }
+
+    let parsed: BedrockListModelsResponse =
+        serde_json::from_str(&body).context("parse Bedrock model discovery response")?;
+    let mut models: Vec<ModelMetadata> = parsed
+        .model_summaries
+        .into_iter()
+        .filter(is_supported_bedrock_model)
+        .map(BedrockFoundationModelSummary::into_model_metadata)
+        .collect();
+
+    if models.is_empty() {
+        tracing::warn!(
+            "Bedrock model discovery returned no compatible models; falling back to default model {}",
+            default_model
+        );
+        models.push(ModelMetadata::id_only(default_model.to_string()));
+        return Ok(models);
+    }
+
+    models.sort_by(|a, b| {
+        let a_default = a.id == default_model;
+        let b_default = b.id == default_model;
+        b_default.cmp(&a_default).then_with(|| a.id.cmp(&b.id))
+    });
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
+
+fn is_supported_bedrock_model(summary: &BedrockFoundationModelSummary) -> bool {
+    summary.response_streaming_supported
+        && summary.model_id.contains("anthropic")
+        && summary
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "TEXT")
+        && summary
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "TEXT")
+}
+
 fn percent_encode_path_segment(input: &str) -> String {
     let mut out = String::new();
     for b in input.bytes() {
@@ -742,6 +836,40 @@ fn percent_encode_path_segment(input: &str) -> String {
         }
     }
     out
+}
+
+#[derive(Debug, Deserialize)]
+struct BedrockListModelsResponse {
+    #[serde(rename = "modelSummaries")]
+    model_summaries: Vec<BedrockFoundationModelSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BedrockFoundationModelSummary {
+    #[serde(rename = "modelId")]
+    model_id: String,
+    #[serde(rename = "inputModalities")]
+    input_modalities: Vec<String>,
+    #[serde(rename = "outputModalities")]
+    output_modalities: Vec<String>,
+    #[serde(rename = "responseStreamingSupported")]
+    response_streaming_supported: bool,
+}
+
+impl BedrockFoundationModelSummary {
+    fn into_model_metadata(self) -> ModelMetadata {
+        let supports_images = self
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "IMAGE");
+        ModelMetadata {
+            id: self.model_id,
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            supports_images: Some(supports_images),
+            context_length: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1063,6 +1191,26 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "modelSummaries": [
+                            {
+                                "modelId": "anthropic.claude-sonnet-4-20250514-v1:0",
+                                "inputModalities": ["TEXT", "IMAGE"],
+                                "outputModalities": ["TEXT"],
+                                "responseStreamingSupported": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .mount(&server)
+            .await;
         let client = BedrockClient::with_base_urls(
             "token".to_string(),
             "us-east-2".to_string(),
@@ -1078,16 +1226,43 @@ mod tests {
         assert!(
             models
                 .iter()
-                .any(|m| m.id == "us.anthropic.claude-sonnet-4-6")
+                .any(|m| m.id == "anthropic.claude-sonnet-4-20250514-v1:0")
+        );
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "anthropic.claude-sonnet-4-20250514-v1:0")
+                .and_then(|m| m.supports_images),
+            Some(true)
         );
     }
 
     #[tokio::test]
-    async fn mantle_discovery_failure_falls_back_to_default_model() {
+    async fn mantle_discovery_failure_still_returns_discovered_native_models() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "modelSummaries": [
+                            {
+                                "modelId": "anthropic.claude-sonnet-4-20250514-v1:0",
+                                "inputModalities": ["TEXT"],
+                                "outputModalities": ["TEXT"],
+                                "responseStreamingSupported": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
             .mount(&server)
             .await;
         let client = BedrockClient::with_base_urls(
@@ -1100,7 +1275,122 @@ mod tests {
         let models = client
             .list_model_metadata()
             .await
-            .expect("fallback should still succeed");
+            .expect("discovery should still succeed");
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "anthropic.claude-sonnet-4-20250514-v1:0")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "us.anthropic.claude-sonnet-4-6")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_compatible_bedrock_models_and_prioritizes_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "modelSummaries": [
+                            {
+                                "modelId": "amazon.nova-micro-v1:0",
+                                "inputModalities": ["TEXT"],
+                                "outputModalities": ["TEXT"],
+                                "responseStreamingSupported": true
+                            },
+                            {
+                                "modelId": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                                "inputModalities": ["TEXT", "IMAGE"],
+                                "outputModalities": ["TEXT"],
+                                "responseStreamingSupported": true
+                            },
+                            {
+                                "modelId": "anthropic.claude-sonnet-4-20250514-v1:0",
+                                "inputModalities": ["TEXT"],
+                                "outputModalities": ["TEXT"],
+                                "responseStreamingSupported": true
+                            },
+                            {
+                                "modelId": "anthropic.claude-image-v1:0",
+                                "inputModalities": ["IMAGE"],
+                                "outputModalities": ["IMAGE"],
+                                "responseStreamingSupported": false
+                            }
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let models = discover_model_metadata_with_http(
+            &http,
+            &format!("{}/foundation-models", server.uri()),
+            "test-token",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+        )
+        .await
+        .expect("discovery should succeed");
+
+        let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic.claude-sonnet-4-20250514-v1:0",
+                "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            ]
+        );
+        assert_eq!(
+            models
+                .iter()
+                .find(|m| m.id == "anthropic.claude-3-5-sonnet-20240620-v1:0")
+                .and_then(|m| m.supports_images),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_default_model_when_no_compatible_models_exist() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    serde_json::json!({
+                        "modelSummaries": [
+                            {
+                                "modelId": "amazon.nova-canvas-v1:0",
+                                "inputModalities": ["TEXT"],
+                                "outputModalities": ["IMAGE"],
+                                "responseStreamingSupported": false
+                            }
+                        ]
+                    })
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let models = discover_model_metadata_with_http(
+            &http,
+            &format!("{}/foundation-models", server.uri()),
+            "test-token",
+            "us.anthropic.claude-sonnet-4-6",
+        )
+        .await
+        .expect("fallback should succeed");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
     }
