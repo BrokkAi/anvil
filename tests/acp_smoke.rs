@@ -134,10 +134,9 @@ fn run_smoke_case(case: &SmokeCase) {
         case.name
     );
     assert!(
-        !bifrost_log.exists(),
-        "{}: explicit mcpServers: [] spawned persisted default Bifrost; log:\n{}",
+        bifrost_log.exists(),
+        "{}: explicit mcpServers: [] did not spawn persisted default Bifrost",
         case.name,
-        std::fs::read_to_string(&bifrost_log).unwrap_or_default()
     );
 
     assert_eq!(
