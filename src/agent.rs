@@ -4,13 +4,13 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionInfoUpdate,
-    SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
+    SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, Usage as AcpUsage, UsageUpdate,
 };
@@ -602,6 +602,7 @@ fn send_session_info_update(
 fn session_usage_update(
     snap: &SessionSnapshot,
     available_models: &[crate::llm_client::ModelMetadata],
+    cost_usd: Option<f64>,
 ) -> UsageUpdate {
     let used = crate::tokens::approximate_tokens_messages(&build_prompt_messages_with_parts(
         snap,
@@ -613,7 +614,11 @@ fn session_usage_update(
         .find(|m| m.id == snap.model)
         .and_then(|m| m.context_length)
         .unwrap_or(crate::context_manager::FALLBACK_CONTEXT_LENGTH) as u64;
-    UsageUpdate::new(used, size)
+    let mut update = UsageUpdate::new(used, size);
+    if let Some(amount) = cost_usd {
+        update = update.cost(Some(Cost::new(amount, "USD")));
+    }
+    update
 }
 
 async fn send_session_usage_update(
@@ -625,7 +630,8 @@ async fn send_session_usage_update(
     let Some(snap) = sessions.snapshot(session_id, fallback_cwd).await else {
         return;
     };
-    let update = session_usage_update(&snap, &sessions.available_model_metadata().await);
+    let cost_usd = sessions.exact_usage_cost_usd(session_id).await;
+    let update = session_usage_update(&snap, &sessions.available_model_metadata().await, cost_usd);
     let notification =
         SessionNotification::new(session_id.to_string(), SessionUpdate::UsageUpdate(update));
     if let Err(e) = cx.send_notification(notification) {
@@ -1857,7 +1863,12 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.to_string();
                 let config_id = req.config_id.to_string();
-                let value = req.value.to_string();
+                let value = match &req.value {
+                    SessionConfigOptionValue::ValueId { value } => value.to_string(),
+                    SessionConfigOptionValue::Boolean { value } => value.to_string(),
+                    _ => serde_json::to_string(&req.value)
+                        .unwrap_or_else(|_| "<unsupported config value>".to_string()),
+                };
                 tracing::info!(
                     "ACP set_config_option session={session_id} config={config_id} value={value}"
                 );
@@ -2595,8 +2606,14 @@ async fn run_model_turn_in_spawn(
         }
     };
 
+    let cost_delta_usd = sessions
+        .available_model_metadata()
+        .await
+        .iter()
+        .find(|meta| meta.id == model)
+        .and_then(|meta| meta.estimate_cost_usd(turn_usage));
     let cumulative_usage = sessions
-        .record_usage(session_id, turn_usage)
+        .record_usage(session_id, turn_usage, cost_delta_usd)
         .await
         .unwrap_or(turn_usage);
     let structured_output_result =
@@ -5362,6 +5379,7 @@ mod tests {
             supported_reasoning_levels: Vec::new(),
             supports_images: Some(false),
             context_length: None,
+            pricing: None,
         }];
 
         let message =
@@ -5506,6 +5524,7 @@ mod tests {
             supported_reasoning_levels: Vec::new(),
             supports_images: None,
             context_length: Some(200_000),
+            pricing: None,
         }];
         let report = render_context_report(&snap, PermissionMode::AcceptEdits, &catalog);
 
@@ -5569,9 +5588,10 @@ mod tests {
             supported_reasoning_levels: Vec::new(),
             supports_images: None,
             context_length: Some(200_000),
+            pricing: None,
         }];
 
-        let update = session_usage_update(&snap, &catalog);
+        let update = session_usage_update(&snap, &catalog, None);
         let expected_used = crate::tokens::approximate_tokens_messages(
             &build_prompt_messages_with_parts(&snap, "", &[]),
         ) as u64;
@@ -5601,13 +5621,47 @@ mod tests {
             supported_reasoning_levels: Vec::new(),
             supports_images: None,
             context_length: None,
+            pricing: None,
         }];
 
-        let update = session_usage_update(&snap, &catalog);
+        let update = session_usage_update(&snap, &catalog, None);
 
         assert_eq!(
             update.size,
             crate::context_manager::FALLBACK_CONTEXT_LENGTH as u64
+        );
+    }
+
+    #[test]
+    fn session_usage_update_includes_cost_when_available() {
+        use crate::llm_client::ModelMetadata;
+        use crate::session::SessionSnapshot;
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Ask,
+            model: "openrouter::openai/gpt-4o".into(),
+            history: vec![],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+        let catalog = vec![ModelMetadata {
+            id: "openrouter::openai/gpt-4o".into(),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            supports_images: None,
+            context_length: Some(128_000),
+            pricing: None,
+        }];
+
+        let update = session_usage_update(&snap, &catalog, Some(1.25));
+
+        assert_eq!(update.cost.as_ref().map(|cost| cost.amount), Some(1.25));
+        assert_eq!(
+            update.cost.as_ref().map(|cost| cost.currency.as_str()),
+            Some("USD")
         );
     }
 
@@ -6349,6 +6403,7 @@ mod tests {
                     }],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata::id_only("model-b"),
             ])

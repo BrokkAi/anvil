@@ -763,6 +763,7 @@ impl LlmBackend for BedrockClient {
                     supported_reasoning_levels,
                     supports_images: None,
                     context_length: Some(200_000),
+                    pricing: None,
                 });
             }
             models.sort_by(|a, b| {
@@ -1422,6 +1423,7 @@ impl BedrockFoundationModelSummary {
             supported_reasoning_levels,
             supports_images: Some(supports_images),
             context_length: None,
+            pricing: None,
         }
     }
 }
@@ -1516,6 +1518,7 @@ mod tests {
                 supported_reasoning_levels: Vec::new(),
                 supports_images: Some(true),
                 context_length: Some(200_000),
+                pricing: None,
             },
             ModelMetadata {
                 id: "us.anthropic.claude-3-5-sonnet".to_string(),
@@ -1523,6 +1526,7 @@ mod tests {
                 supported_reasoning_levels: Vec::new(),
                 supports_images: Some(true),
                 context_length: Some(200_000),
+                pricing: None,
             },
             ModelMetadata {
                 id: "openai.gpt-5.4".to_string(),
@@ -1530,6 +1534,7 @@ mod tests {
                 supported_reasoning_levels: Vec::new(),
                 supports_images: Some(true),
                 context_length: Some(200_000),
+                pricing: None,
             },
         ];
         attach_anthropic_reasoning_presets(&mut models);
@@ -1559,6 +1564,7 @@ mod tests {
             }],
             supports_images: Some(true),
             context_length: Some(200_000),
+            pricing: None,
         }];
         attach_anthropic_reasoning_presets(&mut models);
         // Existing presets are not clobbered.

@@ -447,6 +447,7 @@ async fn fetch_chatgpt_models(
             // ChatGPT's `/models` endpoint doesn't expose a context window;
             // the compression layer falls back to a per-backend default.
             context_length: None,
+            pricing: None,
         })
         .collect())
 }
