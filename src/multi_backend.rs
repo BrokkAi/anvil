@@ -27,7 +27,9 @@ use crate::discovery::{
     DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discover_ollama_model_metadata,
     discovery_http_client, split_wire_id,
 };
-use crate::llm_client::{LlmBackend, LlmResponse, ModelMetadata, StreamChatRequest};
+use crate::llm_client::{
+    LlmBackend, LlmResponse, ModelMetadata, ResolvedModelInfo, StreamChatRequest,
+};
 
 const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -336,6 +338,28 @@ impl LlmBackend for MultiBackend {
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         Box::pin(self.list_model_metadata_inner(None))
+    }
+
+    fn resolve_model_info(&self, configured_model: &str) -> ResolvedModelInfo {
+        match self.resolve(configured_model) {
+            Ok((_backend, bare)) => {
+                let provider = split_wire_id(configured_model)
+                    .map(|(source, _)| source)
+                    .or_else(|| self.fallback_source())
+                    .map(|source| source.as_str().to_string());
+                ResolvedModelInfo {
+                    configured_model: configured_model.to_string(),
+                    resolved_provider: provider,
+                    resolved_model: bare,
+                }
+            }
+            Err(_) => ResolvedModelInfo {
+                configured_model: configured_model.to_string(),
+                resolved_provider: split_wire_id(configured_model)
+                    .map(|(source, _)| source.as_str().to_string()),
+                resolved_model: configured_model.to_string(),
+            },
+        }
     }
 
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
@@ -779,6 +803,33 @@ mod tests {
             openrouter_handles.last_model.lock().unwrap().as_deref(),
             Some("anthropic/claude-3.5-sonnet")
         );
+    }
+
+    #[test]
+    fn resolve_model_info_reports_wire_provider_and_bare_model() {
+        let (openrouter_backend, _openrouter_handles) = recording("openrouter");
+        let multi = MultiBackend::new(None, None, Some(openrouter_backend), None);
+
+        let info = multi.resolve_model_info("openrouter::google/gemini-3.1-pro-preview");
+
+        assert_eq!(
+            info.configured_model,
+            "openrouter::google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(info.resolved_provider.as_deref(), Some("openrouter"));
+        assert_eq!(info.resolved_model, "google/gemini-3.1-pro-preview");
+    }
+
+    #[test]
+    fn resolve_model_info_reports_bare_model_fallback_provider() {
+        let (openrouter_backend, _openrouter_handles) = recording("openrouter");
+        let multi = MultiBackend::new(None, None, Some(openrouter_backend), None);
+
+        let info = multi.resolve_model_info("gemini-3.1-pro-preview");
+
+        assert_eq!(info.configured_model, "gemini-3.1-pro-preview");
+        assert_eq!(info.resolved_provider.as_deref(), Some("openrouter"));
+        assert_eq!(info.resolved_model, "gemini-3.1-pro-preview");
     }
 
     /// Fallback priority: Codex > Ollama > OpenRouter. With all three
