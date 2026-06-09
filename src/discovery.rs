@@ -256,6 +256,7 @@ pub async fn discover_ollama_model_metadata(
                         // Ollama's catalog doesn't publish a context window;
                         // the compression layer falls back to a default.
                         context_length: None,
+                        pricing: None,
                     },
                 ));
             }
@@ -270,6 +271,7 @@ pub async fn discover_ollama_model_metadata(
                         parsed.capabilities.iter().any(|cap| cap == "vision"),
                     ),
                     context_length: None,
+                    pricing: None,
                 },
             ))
         }

@@ -94,6 +94,15 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Whether every token bucket is zero.
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.thought_tokens == 0
+            && self.cached_read_tokens == 0
+            && self.cached_write_tokens == 0
+    }
+
     /// Sum of all categories. Matches the ACP `total_tokens` semantics:
     /// "Sum of all token types across session." Cached counts are
     /// included because the spec example treats them as additive
@@ -367,6 +376,34 @@ pub struct ReasoningLevelPreset {
     pub description: String,
 }
 
+/// Per-token USD pricing published by a provider's model catalog.
+///
+/// Today this is populated only from OpenRouter's `/models` endpoint,
+/// which publishes `pricing.prompt` and `pricing.completion` values as
+/// decimal USD-per-token strings.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelPricing {
+    pub input_cost_per_token_usd: f64,
+    pub output_cost_per_token_usd: f64,
+}
+
+impl ModelPricing {
+    /// Estimate the provider-billed cost for one call using the token
+    /// accounting shape Anvil already stores.
+    ///
+    /// Input-side cached tokens still occupy the provider's prompt-token
+    /// bucket, so they are billed at the input rate when a backend does
+    /// not publish a separate cache tariff. Thought tokens are part of
+    /// the completion-side total and are billed at the output rate.
+    pub fn estimate_cost_usd(&self, usage: TokenUsage) -> f64 {
+        let billed_input_tokens =
+            usage.input_tokens + usage.cached_read_tokens + usage.cached_write_tokens;
+        let billed_output_tokens = usage.output_tokens + usage.thought_tokens;
+        billed_input_tokens as f64 * self.input_cost_per_token_usd
+            + billed_output_tokens as f64 * self.output_cost_per_token_usd
+    }
+}
+
 /// Richer model descriptor surfaced through `LlmBackend::list_model_metadata`.
 /// The `id` is the wire identifier the backend expects in `stream_chat`;
 /// the optional reasoning fields are populated only for backends whose
@@ -384,6 +421,8 @@ pub struct ModelMetadata {
     /// compression layer falls back to a per-backend default in that
     /// case.
     pub context_length: Option<u32>,
+    /// Provider-published per-token pricing, when available.
+    pub pricing: Option<ModelPricing>,
 }
 
 impl ModelMetadata {
@@ -398,7 +437,13 @@ impl ModelMetadata {
             supported_reasoning_levels: Vec::new(),
             supports_images: None,
             context_length: None,
+            pricing: None,
         }
+    }
+
+    /// Estimate this model's cost for one provider-reported usage sample.
+    pub fn estimate_cost_usd(&self, usage: TokenUsage) -> Option<f64> {
+        self.pricing.map(|pricing| pricing.estimate_cost_usd(usage))
     }
 }
 
@@ -562,6 +607,8 @@ pub(crate) struct ModelEntry {
     pub(crate) architecture: Option<ModelArchitecture>,
     #[serde(default)]
     pub(crate) context_length: Option<u32>,
+    #[serde(default)]
+    pub(crate) pricing: Option<ModelPricingEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -574,6 +621,14 @@ pub(crate) struct ModelArchitecture {
 pub(crate) struct ModelsResponse {
     #[serde(default)]
     pub(crate) data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelPricingEntry {
+    #[serde(default)]
+    pub(crate) prompt: String,
+    #[serde(default)]
+    pub(crate) completion: String,
 }
 
 const OPENROUTER_REASONING_PRESETS: &[(&str, &str)] = &[
@@ -618,6 +673,16 @@ fn reasoning_effort_from_default_parameters(
 }
 
 impl ModelEntry {
+    pub(crate) fn pricing(&self) -> Option<ModelPricing> {
+        let pricing = self.pricing.as_ref()?;
+        let input_cost_per_token_usd = pricing.prompt.parse::<f64>().ok()?;
+        let output_cost_per_token_usd = pricing.completion.parse::<f64>().ok()?;
+        Some(ModelPricing {
+            input_cost_per_token_usd,
+            output_cost_per_token_usd,
+        })
+    }
+
     pub(crate) fn supports_images(&self) -> Option<bool> {
         let modalities = self.architecture.as_ref()?.input_modalities.as_ref()?;
         Some(
@@ -646,6 +711,7 @@ impl ModelEntry {
                 supported_reasoning_levels: Vec::new(),
                 supports_images: self.supports_images(),
                 context_length: self.context_length,
+                pricing: self.pricing(),
             };
         }
 
@@ -658,6 +724,7 @@ impl ModelEntry {
             supported_reasoning_levels: openrouter_reasoning_presets(),
             supports_images: self.supports_images(),
             context_length: self.context_length,
+            pricing: self.pricing(),
         }
     }
 }
@@ -1982,5 +2049,29 @@ mod tests {
         assert_eq!(plain_model.id, "openai/gpt-4o");
         assert!(plain_model.default_reasoning_level.is_none());
         assert!(plain_model.supported_reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn openrouter_pricing_is_preserved_and_estimates_cost() {
+        let raw = r#"{
+            "data": [
+                {
+                    "id": "anthropic/claude-3.5-sonnet",
+                    "pricing": {"prompt": "0.000003", "completion": "0.000015"}
+                }
+            ]
+        }"#;
+        let parsed: ModelsResponse = serde_json::from_str(raw).expect("OpenRouter /models parses");
+        let model = parsed.data[0].to_model_metadata();
+        let cost = model.estimate_cost_usd(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 4,
+            thought_tokens: 1,
+            cached_read_tokens: 2,
+            cached_write_tokens: 0,
+        });
+        assert_eq!(model.id, "anthropic/claude-3.5-sonnet");
+        let cost = cost.expect("pricing must produce a cost");
+        assert!((cost - 0.000111).abs() < 1e-12, "got {cost}");
     }
 }

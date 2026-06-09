@@ -590,6 +590,47 @@ pub struct Session {
     /// starts the counters fresh because we don't persist per-call
     /// usage on disk yet.
     pub usage: crate::llm_client::TokenUsage,
+    /// Cumulative session cost in USD when every token-using turn so far
+    /// had an exact provider pricing source. If any non-zero turn lacks
+    /// pricing metadata, the session cost becomes unavailable rather than
+    /// silently under-reporting.
+    usage_cost: SessionUsageCost,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionUsageCost {
+    amount_usd: f64,
+    unavailable: bool,
+}
+
+impl Default for SessionUsageCost {
+    fn default() -> Self {
+        Self {
+            amount_usd: 0.0,
+            unavailable: false,
+        }
+    }
+}
+
+impl SessionUsageCost {
+    fn record(&mut self, usage: crate::llm_client::TokenUsage, delta_usd: Option<f64>) {
+        if self.unavailable || usage.is_zero() {
+            return;
+        }
+        match delta_usd {
+            Some(delta) => {
+                self.amount_usd += delta;
+            }
+            None => {
+                self.amount_usd = 0.0;
+                self.unavailable = true;
+            }
+        }
+    }
+
+    fn exact_usd(&self) -> Option<f64> {
+        (!self.unavailable).then_some(self.amount_usd)
+    }
 }
 
 impl Session {
@@ -644,6 +685,7 @@ impl Session {
             agents,
             activated_skills: HashSet::new(),
             usage: crate::llm_client::TokenUsage::default(),
+            usage_cost: SessionUsageCost::default(),
         }
     }
 
@@ -717,6 +759,7 @@ impl Session {
             agents,
             activated_skills: HashSet::new(),
             usage: crate::llm_client::TokenUsage::default(),
+            usage_cost: SessionUsageCost::default(),
         })
     }
 
@@ -2793,11 +2836,22 @@ impl SessionStore {
         &self,
         id: &str,
         delta: crate::llm_client::TokenUsage,
+        cost_delta_usd: Option<f64>,
     ) -> Option<crate::llm_client::TokenUsage> {
         let mut sessions = self.sessions.write().await;
         let session = sessions.get_mut(id)?;
         session.usage.add(delta);
+        session.usage_cost.record(delta, cost_delta_usd);
         Some(session.usage)
+    }
+
+    /// Return the exact cumulative USD cost for a live session when every
+    /// token-using turn so far had a known pricing source.
+    pub async fn exact_usage_cost_usd(&self, id: &str) -> Option<f64> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(id)
+            .and_then(|session| session.usage_cost.exact_usd())
     }
 
     /// Update the session's behavior mode and persist the new manifest.
@@ -3761,6 +3815,7 @@ mod tests {
                     }],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata {
                     id: "model-b".to_string(),
@@ -3781,6 +3836,7 @@ mod tests {
                     ],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
             ])
             .await;
@@ -3831,6 +3887,7 @@ mod tests {
                 ],
                 supports_images: None,
                 context_length: None,
+                pricing: None,
             }])
             .await;
         let cwd = tempfile::tempdir().expect("cwd");
@@ -3871,6 +3928,7 @@ mod tests {
                     }],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata {
                     id: "model-b".to_string(),
@@ -3891,6 +3949,7 @@ mod tests {
                     ],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
             ])
             .await;
@@ -4089,6 +4148,7 @@ mod tests {
                     ],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata {
                     id: "runtime-model".to_string(),
@@ -4099,6 +4159,7 @@ mod tests {
                     }],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata::id_only("persisted-model"),
             ])
@@ -4472,6 +4533,7 @@ mod tests {
                 ],
                 supports_images: None,
                 context_length: None,
+                pricing: None,
             }])
             .await;
         store
@@ -4540,6 +4602,7 @@ mod tests {
                     ],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata {
                     id: "gpt-mini".to_string(),
@@ -4560,6 +4623,7 @@ mod tests {
                     ],
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
             ])
             .await;
@@ -4620,6 +4684,7 @@ mod tests {
                     supported_reasoning_levels: supported.clone(),
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
                 ModelMetadata {
                     id: "gpt-b".to_string(),
@@ -4627,6 +4692,7 @@ mod tests {
                     supported_reasoning_levels: supported,
                     supports_images: None,
                     context_length: None,
+                    pricing: None,
                 },
             ])
             .await;
