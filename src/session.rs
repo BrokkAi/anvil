@@ -4822,6 +4822,7 @@ done
 
     #[cfg(unix)]
     fn bifrost_spawn_args(cwd: &Path) -> Vec<String> {
+        let cwd = normalize_cwd(cwd);
         vec![
             "--root".to_string(),
             cwd.display().to_string(),
