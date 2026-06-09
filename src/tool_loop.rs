@@ -32,7 +32,6 @@ use crate::trace_logging::append_trace_record;
 use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
-const LLM_STREAM_MAX_ATTEMPTS: usize = 2;
 const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 
 fn train_bifrost_enabled() -> bool {
@@ -73,8 +72,13 @@ fn tool_unavailable_message(tool_name: &str) -> String {
 fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
     let error = format!("{error:#}");
     error.contains("stream read error")
-        || error.contains("stream made no meaningful progress")
+        || error.contains("no meaningful progress")
+        || error.contains("Responses stream failed: server_error")
+        || error.contains("Responses stream failed: server_is_overloaded")
+        || error.contains("Responses stream failed: rate_limit_exceeded")
         || error.contains("server_is_overloaded")
+        || error.contains("server_error")
+        || error.contains("rate_limit_exceeded")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,7 +95,7 @@ async fn stream_chat_with_transient_retry(
     cancel: &CancellationToken,
     idle_timeout: Duration,
 ) -> anyhow::Result<LlmResponse> {
-    let mut attempt = 1usize;
+    let mut attempt = 1u64;
     loop {
         let emitted_output = Arc::new(AtomicBool::new(false));
 
@@ -134,24 +138,34 @@ async fn stream_chat_with_transient_retry(
         match response {
             Ok(response) => return Ok(response),
             Err(error)
-                if attempt < LLM_STREAM_MAX_ATTEMPTS
+                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
                     && !cancel.is_cancelled()
                     && !emitted_output.load(Ordering::SeqCst)
                     && is_retryable_llm_error(&error) =>
             {
+                let delay = crate::http_retry::retry_backoff(attempt);
                 append_trace_record(serde_json::json!({
                     "type": "llm_retry",
                     "turn": turn,
                     "attempt": attempt,
-                    "max_attempts": LLM_STREAM_MAX_ATTEMPTS,
+                    "max_attempts": crate::http_retry::LLM_MAX_ATTEMPTS,
+                    "phase": "stream",
                     "reason": format!("{error:#}"),
+                    "delay_ms": delay.as_millis(),
                 }));
                 tracing::warn!(
                     turn,
                     attempt,
-                    max_attempts = LLM_STREAM_MAX_ATTEMPTS,
+                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
                     "retrying transient LLM stream failure before any output was emitted"
                 );
+                crate::http_retry::sleep_before_retry(
+                    "streaming LLM response",
+                    attempt,
+                    format!("{error:#}"),
+                    Some(cancel),
+                )
+                .await?;
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -2445,6 +2459,70 @@ mod tests {
         )
         .await
         .expect("overload should be retried before output");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_server_error_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Responses stream failed: server_error: The server had an error while processing your request.",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "bedrock::openai.gpt-5.4",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("server_error should be retried before output");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_rate_limit_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Responses stream failed: rate_limit_exceeded: slow down",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "bedrock::openai.gpt-5.4",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("rate_limit_exceeded should be retried before output");
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
