@@ -3075,6 +3075,12 @@ mod tests {
         assert!(is_auto_approvable_sandboxed_shell_command("pwd"));
         assert!(is_auto_approvable_sandboxed_shell_command("git status"));
         assert!(is_auto_approvable_sandboxed_shell_command(
+            "git diff --stat"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "git show HEAD~1"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
             "rg PermissionMode src"
         ));
     }
@@ -3088,6 +3094,19 @@ mod tests {
             "python3 -c 'print(1)'"
         ));
         assert!(!is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+    }
+
+    #[test]
+    fn safe_git_classifier_rejects_global_flags_and_mutating_subcommands() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git -C /tmp status"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git commit -m nope"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git apply patch.diff"
+        ));
     }
 
     #[test]
