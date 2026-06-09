@@ -53,3 +53,44 @@ jobs:
 
     - name: Run tests
       run: cargo test
+
+  build-android:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        # Android builds still embed the sandbox guest, so the runner needs
+        # both the host cross target and the nested wasm target available.
+        targets: aarch64-linux-android,wasm32-wasip2
+
+    - name: Install Android SDK + NDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install Android NDK
+      shell: bash
+      run: sdkmanager "ndk;29.0.13113456"
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: android-aarch64-cargo-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          android-aarch64-cargo-
+
+    - name: Build Anvil for Android
+      env:
+        ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
+        CC_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        CXX_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
+        AR_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+        CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+      run: cargo build --release --locked --target aarch64-linux-android
