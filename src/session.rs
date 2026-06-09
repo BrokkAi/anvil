@@ -2844,7 +2844,9 @@ impl SessionStore {
     /// token-using turn so far had a known pricing source.
     pub async fn exact_usage_cost_usd(&self, id: &str) -> Option<f64> {
         let sessions = self.sessions.read().await;
-        sessions.get(id).and_then(|session| session.usage_cost.exact_usd())
+        sessions
+            .get(id)
+            .and_then(|session| session.usage_cost.exact_usd())
     }
 
     /// Update the session's behavior mode and persist the new manifest.
