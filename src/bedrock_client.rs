@@ -786,7 +786,7 @@ fn uses_responses_api(model: &str) -> bool {
 }
 
 fn mantle_base_url(region: &str) -> String {
-    format!("https://bedrock-mantle.{region}.api.aws/openai/v1")
+    format!("https://bedrock-mantle.{region}.api.aws/v1")
 }
 
 pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
@@ -1341,7 +1341,7 @@ async fn discover_model_metadata_with_http(
 }
 
 fn is_supported_bedrock_model(summary: &BedrockFoundationModelSummary) -> bool {
-    summary.response_streaming_supported
+    summary.response_streaming_supported.unwrap_or(false)
         && summary.model_id.contains("anthropic")
         && summary
             .output_modalities
@@ -1380,8 +1380,11 @@ struct BedrockFoundationModelSummary {
     input_modalities: Vec<String>,
     #[serde(rename = "outputModalities")]
     output_modalities: Vec<String>,
-    #[serde(rename = "responseStreamingSupported")]
-    response_streaming_supported: bool,
+    // Some newer/preview models return null for this field; treat null as
+    // false (i.e. exclude them from the supported set) so the response
+    // can still be parsed for the models that do report a boolean.
+    #[serde(rename = "responseStreamingSupported", default)]
+    response_streaming_supported: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1485,7 +1488,7 @@ mod tests {
             model_id: "anthropic.claude-sonnet-4-6".to_string(),
             input_modalities: vec!["TEXT".to_string()],
             output_modalities: vec!["TEXT".to_string()],
-            response_streaming_supported: true,
+            response_streaming_supported: Some(true),
         };
         let meta = summary.into_model_metadata();
         assert!(meta.default_reasoning_level.is_none());
@@ -1500,7 +1503,7 @@ mod tests {
             model_id: "amazon.titan-text".to_string(),
             input_modalities: vec!["TEXT".to_string()],
             output_modalities: vec!["TEXT".to_string()],
-            response_streaming_supported: true,
+            response_streaming_supported: Some(true),
         };
         let plain_meta = plain.into_model_metadata();
         assert!(plain_meta.supported_reasoning_levels.is_empty());
@@ -1991,7 +1994,7 @@ mod tests {
     async fn responses_models_route_to_mantle_responses() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/openai/v1/responses"))
+            .and(path("/v1/responses"))
             .and(header("authorization", "Bearer token"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -2009,7 +2012,7 @@ mod tests {
             "us-east-2".to_string(),
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
-            format!("{}/openai/v1", server.uri()),
+            format!("{}/v1", server.uri()),
             server.uri(),
         );
         let response = client
@@ -2208,7 +2211,7 @@ mod tests {
     async fn mantle_models_are_discovered_and_default_is_preserved() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/openai/v1/models"))
+            .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [
                     {
@@ -2246,7 +2249,7 @@ mod tests {
             "us-east-2".to_string(),
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
-            format!("{}/openai/v1", server.uri()),
+            format!("{}/v1", server.uri()),
             server.uri(),
         );
         let models = client
@@ -2272,7 +2275,7 @@ mod tests {
     async fn foundation_models_are_rewritten_to_invocable_profile_ids() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/openai/v1/models"))
+            .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -2386,7 +2389,7 @@ mod tests {
             "us-east-2".to_string(),
             "us.anthropic.claude-sonnet-4-6".to_string(),
             server.uri(),
-            format!("{}/openai/v1", server.uri()),
+            format!("{}/v1", server.uri()),
             server.uri(),
         );
         let models = client

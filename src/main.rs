@@ -506,6 +506,19 @@ async fn main() -> Result<()> {
         ollama_backend,
     ));
 
+    // Kick off model discovery eagerly so any provider errors ("skipped"
+    // log lines with HTTP status codes) appear immediately in the startup
+    // log rather than waiting for the first client session to connect.
+    {
+        let llm = llm.clone();
+        tokio::spawn(async move {
+            match llm.list_model_metadata().await {
+                Ok(models) => tracing::info!("startup discovery: {} model(s) found", models.len()),
+                Err(e) => tracing::warn!("startup discovery failed: {e:#}"),
+            }
+        });
+    }
+
     let limits = session::SessionLimits {
         max_sessions: args.max_sessions,
         max_history_turns: args.max_history_turns,
