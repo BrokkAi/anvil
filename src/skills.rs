@@ -190,13 +190,6 @@ fn discover_with_backend(
     backend: &crate::sandbox_backend::SandboxBackend,
 ) -> SkillRegistry {
     let cwd = normalize_path(cwd);
-    crate::trace_checkpoint!(
-        "skills_discovery_begin",
-        serde_json::json!({
-            "cwd": cwd.display().to_string(),
-            "home": home.map(|h| h.display().to_string()),
-        }),
-    );
     let mut reg = SkillRegistry::default();
     let mut candidates = Vec::new();
 
@@ -238,13 +231,11 @@ fn discover_with_backend(
 
     let candidate_count = candidates.len();
     let candidates = dedupe_candidates(candidates, &mut reg);
-    crate::trace_checkpoint!(
-        "skills_discovery_candidates_deduped",
-        serde_json::json!({
-            "candidate_count": candidate_count,
-            "winner_count": candidates.len(),
-            "diagnostic_count": reg.diagnostics.len(),
-        }),
+    tracing::debug!(
+        candidate_count,
+        winner_count = candidates.len(),
+        diagnostic_count = reg.diagnostics.len(),
+        "SKILL.md candidates deduped"
     );
 
     for candidate in candidates {
@@ -255,14 +246,6 @@ fn discover_with_backend(
         let names: Vec<&str> = reg.by_name.keys().map(|s| s.as_str()).collect();
         tracing::info!(skills = ?names, "SKILL.md discovery");
     }
-    crate::trace_checkpoint!(
-        "skills_discovery_end",
-        serde_json::json!({
-            "skill_count": reg.by_name.len(),
-            "diagnostic_count": reg.diagnostics.len(),
-            "skills": reg.by_name.keys().cloned().collect::<Vec<_>>(),
-        }),
-    );
     reg
 }
 

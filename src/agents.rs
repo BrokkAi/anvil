@@ -155,13 +155,6 @@ fn discover_with_backend(
     backend: &crate::sandbox_backend::SandboxBackend,
 ) -> AgentRegistry {
     let cwd = normalize_path(cwd);
-    crate::trace_checkpoint!(
-        "subagents_discovery_begin",
-        serde_json::json!({
-            "cwd": cwd.display().to_string(),
-            "home": home.map(|h| h.display().to_string()),
-        }),
-    );
     let mut reg = AgentRegistry::default();
 
     // 1+2. User scope.
@@ -201,14 +194,6 @@ fn discover_with_backend(
         let names: Vec<&str> = reg.by_name.keys().map(|s| s.as_str()).collect();
         tracing::info!(subagents = ?names, "subagent discovery");
     }
-    crate::trace_checkpoint!(
-        "subagents_discovery_end",
-        serde_json::json!({
-            "subagent_count": reg.by_name.len(),
-            "diagnostic_count": reg.diagnostics.len(),
-            "subagents": reg.by_name.keys().cloned().collect::<Vec<_>>(),
-        }),
-    );
     reg
 }
 

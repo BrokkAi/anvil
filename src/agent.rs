@@ -512,20 +512,8 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
 /// ambiguous autocomplete -- the skill remains reachable to the model
 /// via the `activate_skill` tool.
 fn available_commands(registry: &crate::skills::SkillRegistry) -> Vec<AvailableCommand> {
-    crate::trace_checkpoint!(
-        "available_commands_construction_begin",
-        serde_json::json!({
-            "skill_count": registry.iter_sorted().count(),
-        }),
-    );
     let mut commands = builtin_commands();
     if registry.is_empty() {
-        crate::trace_checkpoint!(
-            "available_commands_construction_end",
-            serde_json::json!({
-                "command_count": commands.len(),
-            }),
-        );
         return commands;
     }
     let builtins = builtin_command_names();
@@ -543,12 +531,6 @@ fn available_commands(registry: &crate::skills::SkillRegistry) -> Vec<AvailableC
             shorten_for_autocomplete(&meta.description),
         ));
     }
-    crate::trace_checkpoint!(
-        "available_commands_construction_end",
-        serde_json::json!({
-            "command_count": commands.len(),
-        }),
-    );
     commands
 }
 
@@ -621,41 +603,13 @@ fn session_usage_update(
     snap: &SessionSnapshot,
     available_models: &[crate::llm_client::ModelMetadata],
 ) -> UsageUpdate {
-    crate::trace_checkpoint!(
-        "context_sizing_begin",
-        serde_json::json!({
-            "history_turns": snap.history.len(),
-            "model": snap.model,
-        }),
-    );
     let messages = build_prompt_messages_with_parts(snap, "", &[]);
-    crate::trace_checkpoint!(
-        "token_counting_begin",
-        serde_json::json!({
-            "message_count": messages.len(),
-            "source": "session_usage_update",
-        }),
-    );
     let used = crate::tokens::approximate_tokens_messages(&messages) as u64;
-    crate::trace_checkpoint!(
-        "token_counting_end",
-        serde_json::json!({
-            "used_tokens": used,
-            "source": "session_usage_update",
-        }),
-    );
     let size = available_models
         .iter()
         .find(|m| m.id == snap.model)
         .and_then(|m| m.context_length)
         .unwrap_or(crate::context_manager::FALLBACK_CONTEXT_LENGTH) as u64;
-    crate::trace_checkpoint!(
-        "context_sizing_end",
-        serde_json::json!({
-            "used_tokens": used,
-            "context_size": size,
-        }),
-    );
     UsageUpdate::new(used, size)
 }
 
@@ -956,12 +910,6 @@ pub async fn run_agent(
                         responder: Responder<InitializeResponse>,
                         _cx: ConnectionTo<Client>| {
                 tracing::info!("ACP initialize");
-                crate::trace_checkpoint!(
-                    "acp_initialize_begin",
-                    serde_json::json!({
-                        "protocol_version": format!("{:?}", req.protocol_version),
-                    }),
-                );
 
                 // Try to discover models at startup and cache them for session/new.
                 let models = match llm_init.list_model_metadata_with_progress(None).await {
@@ -971,7 +919,6 @@ pub async fn run_agent(
                         vec![]
                     }
                 };
-                let model_count = models.len();
                 let current_default_model = sessions_init.default_model().await;
                 if current_default_model.trim().is_empty()
                     && let Some(first) = models.first()
@@ -991,18 +938,9 @@ pub async fn run_agent(
                             .resume(SessionResumeCapabilities::new()),
                     );
 
-                let result = responder.respond(
+                responder.respond(
                     InitializeResponse::new(req.protocol_version).agent_capabilities(capabilities),
-                );
-                if result.is_ok() {
-                    crate::trace_checkpoint!(
-                        "acp_initialize_end",
-                        serde_json::json!({
-                            "model_count": model_count,
-                        }),
-                    );
-                }
-                result
+                )
             },
             on_receive_request!(),
         )
@@ -1013,38 +951,10 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let cwd = req.cwd.clone();
                 tracing::info!("ACP session/new, cwd={}", cwd.display());
-                crate::trace_checkpoint!(
-                    "acp_session_new_begin",
-                    serde_json::json!({
-                        "cwd": cwd.display().to_string(),
-                        "mcp_server_count": req.mcp_servers.len(),
-                    }),
-                );
-                crate::trace_checkpoint!(
-                    "acp_session_new_mcp_conversion_begin",
-                    serde_json::json!({
-                        "mcp_server_count": req.mcp_servers.len(),
-                    }),
-                );
                 let session_mcp_servers = acp_mcp_servers_to_configs(req.mcp_servers);
-                crate::trace_checkpoint!(
-                    "acp_session_new_mcp_conversion_end",
-                    serde_json::json!({
-                        "mcp_server_count": session_mcp_servers.len(),
-                    }),
-                );
                 let session = sessions_new
                     .create_session_with_mcp_servers(cwd, Some(session_mcp_servers))
                     .await;
-                crate::trace_checkpoint!(
-                    "acp_session_new_session_created",
-                    serde_json::json!({
-                        "session_id": session.id,
-                        "cwd": session.cwd.display().to_string(),
-                        "skill_count": session.skills.iter_sorted().count(),
-                        "subagent_count": session.agents.iter_sorted().count(),
-                    }),
-                );
 
                 // Use the cached catalog populated at init; fall back to a
                 // single-entry catalog from the session's own model so the
@@ -1106,14 +1016,6 @@ pub async fn run_agent(
                 // rationale (FIFO wire order alone is not enough on the
                 // session/new path).
                 let result = responder.respond(response);
-                if result.is_ok() {
-                    crate::trace_checkpoint!(
-                        "acp_session_new_end",
-                        serde_json::json!({
-                            "session_id": session.id,
-                        }),
-                    );
-                }
                 spawn_delayed_available_commands_update(
                     cx.clone(),
                     session.id.clone(),
@@ -1291,48 +1193,18 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.to_string();
                 tracing::info!("ACP session/prompt session={session_id}");
-                crate::trace_checkpoint!(
-                    "acp_session_prompt_begin",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "prompt_block_count": req.prompt.len(),
-                        "has_meta": req.meta.is_some(),
-                    }),
-                );
 
                 // Extract prompt content from ACP blocks. Text drives slash-command
                 // parsing and session titles; images are preserved for the LLM turn.
                 let raw_prompt_text = extract_prompt_text(&req.prompt);
                 let raw_prompt_parts = extract_prompt_parts(&req.prompt);
-                crate::trace_checkpoint!(
-                    "prompt_content_extraction_end",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "text_bytes": raw_prompt_text.len(),
-                        "part_count": raw_prompt_parts.len(),
-                    }),
-                );
                 if raw_prompt_parts.is_empty() {
                     send_message(&cx, &session_id, "Error: empty prompt");
                     return responder.respond(prompt_end_turn_response());
                 }
-                crate::trace_checkpoint!(
-                    "structured_output_metadata_parse_begin",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "has_meta": req.meta.is_some(),
-                    }),
-                );
                 let structured_output_request = match parse_prompt_structured_output_request(&req) {
                     Ok(request) => request,
                     Err(reason) => {
-                        crate::trace_checkpoint!(
-                            "structured_output_metadata_parse_error",
-                            serde_json::json!({
-                                "session_id": session_id,
-                                "reason": reason,
-                            }),
-                        );
                         return responder.respond_with_error(
                             agent_client_protocol::Error::invalid_params().data(
                                 serde_json::json!({
@@ -1344,13 +1216,6 @@ pub async fn run_agent(
                         );
                     }
                 };
-                crate::trace_checkpoint!(
-                    "structured_output_metadata_parse_end",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "has_structured_output": structured_output_request.is_some(),
-                    }),
-                );
 
                 // Get session state (prompt doesn't carry cwd, so use current dir as fallback).
                 // The snapshot clones the conversation history exactly once under the
@@ -1364,15 +1229,6 @@ pub async fn run_agent(
                         return responder.respond(prompt_end_turn_response());
                     }
                 };
-                crate::trace_checkpoint!(
-                    "prompt_session_snapshot_end",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "cwd": snap.cwd.display().to_string(),
-                        "history_turns": snap.history.len(),
-                        "model": snap.model,
-                    }),
-                );
 
                 // Slash commands run locally and short-circuit the LLM round-trip.
                 // They are not persisted as conversation turns -- the response is
@@ -1846,25 +1702,11 @@ pub async fn run_agent(
                     context_length,
                 )
                 .await;
-                crate::trace_checkpoint!(
-                    "prompt_messages_construction_end",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "message_count": messages.len(),
-                    }),
-                );
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
                 let registry = sessions_prompt
                     .get_or_create_registry(&session_id, snap.cwd)
                     .await;
-                crate::trace_checkpoint!(
-                    "prompt_tool_registry_ready",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "cwd": registry.cwd().display().to_string(),
-                    }),
-                );
 
                 // Capture everything the spawned task needs before we move into it.
                 // The tool loop calls `block_task()` to await `session/request_permission`,
@@ -1893,15 +1735,6 @@ pub async fn run_agent(
                 );
 
                 let spawn_result = cx.spawn(async move {
-                    crate::trace_checkpoint!(
-                        "final_llm_request_dispatch_begin",
-                        serde_json::json!({
-                            "session_id": session_id_for_loop,
-                            "model": model_for_loop,
-                            "message_count": messages.len(),
-                            "has_structured_output": structured_output_request.is_some(),
-                        }),
-                    );
                     let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
                         &cx_for_loop,
                         &sessions_for_loop,
@@ -2025,14 +1858,6 @@ pub async fn run_agent(
                 tracing::info!(
                     "ACP set_config_option session={session_id} config={config_id} value={value}"
                 );
-                crate::trace_checkpoint!(
-                    "acp_set_config_option_begin",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "config_id": config_id,
-                        "value": value,
-                    }),
-                );
 
                 let outcome = match apply_config_option(
                     &sessions_perm,
@@ -2083,14 +1908,6 @@ pub async fn run_agent(
                         );
                     }
                 };
-                crate::trace_checkpoint!(
-                    "acp_set_config_option_applied",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "config_id": config_id,
-                        "value": value,
-                    }),
-                );
 
                 // Auto-fallback notice: when changing the model dropped a
                 // now-unsupported reasoning_effort pick, surface a
@@ -2119,14 +1936,6 @@ pub async fn run_agent(
                 }
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
                 send_session_usage_update(&cx, &sessions_perm, &session_id, &fallback_cwd).await;
-                crate::trace_checkpoint!(
-                    "acp_set_config_option_end",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "config_id": config_id,
-                        "value": value,
-                    }),
-                );
 
                 responder.respond(SetSessionConfigOptionResponse::new(outcome.updated_options))
             },
@@ -2514,16 +2323,6 @@ fn build_prompt_messages_with_parts(
     new_prompt_text: &str,
     new_prompt_parts: &[ChatContentPart],
 ) -> Vec<ChatMessage> {
-    crate::trace_checkpoint!(
-        "prompt_message_parts_build_begin",
-        serde_json::json!({
-            "history_turns": snap.history.len(),
-            "project_instruction_bytes": snap.project_instructions.len(),
-            "has_skills": !snap.skills.is_empty(),
-            "new_prompt_text_bytes": new_prompt_text.len(),
-            "new_prompt_part_count": new_prompt_parts.len(),
-        }),
-    );
     let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
     messages.push(ChatMessage::system(build_system_prompt(
         &snap.mode, &snap.cwd,
@@ -2618,12 +2417,6 @@ fn build_prompt_messages_with_parts(
     } else {
         messages.push(ChatMessage::user_parts(new_prompt_parts.to_vec()));
     }
-    crate::trace_checkpoint!(
-        "prompt_message_parts_build_end",
-        serde_json::json!({
-            "message_count": messages.len(),
-        }),
-    );
     messages
 }
 
@@ -2664,37 +2457,7 @@ async fn build_prompt_messages_with_compression(
     let mut messages = build_prompt_messages_with_parts(snap, prompt_text, prompt_parts);
 
     loop {
-        crate::trace_checkpoint!(
-            "context_sizing_begin",
-            serde_json::json!({
-                "source": "prompt_compression",
-                "message_count": messages.len(),
-                "budget": budget,
-            }),
-        );
-        crate::trace_checkpoint!(
-            "token_counting_begin",
-            serde_json::json!({
-                "source": "prompt_compression",
-                "message_count": messages.len(),
-            }),
-        );
         let projected = crate::tokens::approximate_tokens_messages(&messages);
-        crate::trace_checkpoint!(
-            "token_counting_end",
-            serde_json::json!({
-                "source": "prompt_compression",
-                "projected_tokens": projected,
-            }),
-        );
-        crate::trace_checkpoint!(
-            "context_sizing_end",
-            serde_json::json!({
-                "source": "prompt_compression",
-                "projected_tokens": projected,
-                "budget": budget,
-            }),
-        );
         if projected <= budget {
             return messages;
         }
@@ -2818,25 +2581,9 @@ async fn run_model_turn_in_spawn(
     .await;
 
     let (response_text, tool_exchanges, turn_usage) = match loop_result {
-        Ok((text, exchanges, usage)) => {
-            crate::trace_checkpoint!(
-                "final_llm_request_dispatch_end",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "response_bytes": text.len(),
-                    "tool_exchange_count": exchanges.len(),
-                }),
-            );
-            (text, exchanges, usage)
-        }
+        Ok((text, exchanges, usage)) => (text, exchanges, usage),
         Err(panic) => {
             tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
-            crate::trace_checkpoint!(
-                "final_llm_request_dispatch_panic",
-                serde_json::json!({
-                    "session_id": session_id,
-                }),
-            );
             (
                 "Error: agent loop panicked. See server logs.".to_string(),
                 Vec::new(),
@@ -2961,12 +2708,6 @@ fn build_skills_catalog(registry: &crate::skills::SkillRegistry) -> Option<Strin
     if registry.is_empty() {
         return None;
     }
-    crate::trace_checkpoint!(
-        "skill_catalog_construction_begin",
-        serde_json::json!({
-            "skill_count": registry.iter_sorted().count(),
-        }),
-    );
     let mut out = String::from("<available_skills>\n");
     for meta in registry.iter_sorted() {
         out.push_str("  <skill>\n");
@@ -2987,12 +2728,6 @@ fn build_skills_catalog(registry: &crate::skills::SkillRegistry) -> Option<Strin
         When a task matches a skill's description, call the `activate_skill` tool \
         with the skill's name to load its full instructions. Users can also invoke \
         a skill directly by typing `/<skill-name>` as a slash command.",
-    );
-    crate::trace_checkpoint!(
-        "skill_catalog_construction_end",
-        serde_json::json!({
-            "bytes": out.len(),
-        }),
     );
     Some(out)
 }

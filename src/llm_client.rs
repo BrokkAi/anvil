@@ -5,7 +5,6 @@ use futures::future::BoxFuture;
 use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -42,7 +41,6 @@ pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
 /// run for minutes; setup refreshes should not inherit that wall-clock.
 const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
 const MODEL_DISCOVERY_TASK_TIMEOUT_SECS: u64 = 20;
-static NEXT_PROVIDER_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
@@ -1128,22 +1126,7 @@ impl OpenAiClient {
             cancel,
             idle_timeout,
         } = request;
-        let stream_id = NEXT_PROVIDER_STREAM_ID.fetch_add(1, Ordering::Relaxed);
         let url = self.api_url("/chat/completions");
-        if crate::trace_logging::trace_enabled() {
-            crate::trace_logging::trace_checkpoint(
-                "provider_stream_dispatch_begin",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "url": url.clone(),
-                    "model": model.clone(),
-                    "message_count": messages.len(),
-                    "tool_definition_count": tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
-                    "has_structured_output": structured_output.is_some(),
-                    "idle_timeout_secs": idle_timeout.as_secs(),
-                }),
-            );
-        }
 
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
@@ -1178,25 +1161,6 @@ impl OpenAiClient {
             reasoning,
             response_format,
         };
-        if crate::trace_logging::trace_enabled() {
-            crate::trace_logging::trace_checkpoint(
-                "provider_stream_request_body_ready",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "message_count": body.messages.len(),
-                    "tool_definition_count": body.tools.as_ref().map(|tools| tools.len()).unwrap_or(0),
-                    "has_response_format": body.response_format.is_some(),
-                }),
-            );
-            crate::trace_logging::trace_checkpoint(
-                "provider_http_send_begin",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "url": url.clone(),
-                }),
-            );
-        }
-
         let resp = match crate::http_retry::send_with_retries(
             "sending chat completion request",
             || {
@@ -1211,42 +1175,11 @@ impl OpenAiClient {
         .await
         {
             Ok(resp) => resp,
-            Err(e) => {
-                if crate::trace_logging::trace_enabled() {
-                    crate::trace_logging::trace_checkpoint(
-                        "provider_http_send_error",
-                        serde_json::json!({
-                            "stream_id": stream_id,
-                            "error": format!("{e:#}"),
-                        }),
-                    );
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         let status = resp.status();
-        if crate::trace_logging::trace_enabled() {
-            crate::trace_logging::trace_checkpoint(
-                "provider_http_send_end",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "status": status.as_u16(),
-                    "success": status.is_success(),
-                }),
-            );
-        }
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            if crate::trace_logging::trace_enabled() {
-                crate::trace_logging::trace_checkpoint(
-                    "provider_http_error_body_read",
-                    serde_json::json!({
-                        "stream_id": stream_id,
-                        "status": status.as_u16(),
-                        "body_bytes": body_text.len(),
-                    }),
-                );
-            }
             anyhow::bail!("chat completion failed (HTTP {status}): {body_text}");
         }
 
@@ -1254,15 +1187,7 @@ impl OpenAiClient {
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
 
-        if crate::trace_logging::trace_enabled() {
-            crate::trace_logging::trace_checkpoint(
-                "provider_sse_stream_begin",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                }),
-            );
-        }
-        drive_sse_stream(stream, on_token, cancel, idle_timeout, Some(stream_id)).await
+        drive_sse_stream(stream, on_token, cancel, idle_timeout).await
     }
 }
 
@@ -1283,12 +1208,10 @@ async fn drive_sse_stream<S>(
     mut on_token: TokenSink,
     cancel: CancellationToken,
     idle: Duration,
-    trace_stream_id: Option<u64>,
 ) -> Result<LlmResponse>
 where
     S: Stream<Item = Result<Vec<u8>>> + Unpin,
 {
-    let trace = trace_stream_id.filter(|_| crate::trace_logging::trace_enabled());
     let mut full_text = String::new();
     let mut tool_acc = ToolCallAccumulator::default();
     let mut raw_buf: Vec<u8> = Vec::new();
@@ -1303,31 +1226,12 @@ where
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("streaming cancelled by client");
-                if let Some(stream_id) = trace {
-                    crate::trace_logging::trace_checkpoint(
-                        "provider_sse_stream_cancelled",
-                        serde_json::json!({
-                            "stream_id": stream_id,
-                            "text_bytes": full_text.len(),
-                            "has_tool_calls": !tool_acc.is_empty(),
-                        }),
-                    );
-                }
                 break;
             }
             chunk_or_timeout = tokio::time::timeout_at(deadline, stream.next()) => {
                 let chunk_opt = match chunk_or_timeout {
                     Ok(opt) => opt,
                     Err(_elapsed) => {
-                        if let Some(stream_id) = trace {
-                            crate::trace_logging::trace_checkpoint(
-                                "provider_sse_idle_timeout",
-                                serde_json::json!({
-                                    "stream_id": stream_id,
-                                    "idle_timeout_secs": idle.as_secs(),
-                                }),
-                            );
-                        }
                         anyhow::bail!(
                             "LLM stream made no meaningful progress for {}s; aborting (server-side hang or keepalive-only flood)",
                             idle.as_secs()
@@ -1335,28 +1239,9 @@ where
                     }
                 };
                 let Some(chunk) = chunk_opt else {
-                    if let Some(stream_id) = trace {
-                        crate::trace_logging::trace_checkpoint(
-                            "provider_sse_byte_stream_end",
-                            serde_json::json!({
-                                "stream_id": stream_id,
-                                "text_bytes": full_text.len(),
-                                "has_tool_calls": !tool_acc.is_empty(),
-                            }),
-                        );
-                    }
                     break;
                 };
                 let chunk = chunk.context("stream read error")?;
-                if let Some(stream_id) = trace {
-                    crate::trace_logging::trace_checkpoint(
-                        "provider_sse_chunk_received",
-                        serde_json::json!({
-                            "stream_id": stream_id,
-                            "bytes": chunk.len(),
-                        }),
-                    );
-                }
                 raw_buf.extend_from_slice(&chunk);
 
                 let mut made_progress = false;
@@ -1377,27 +1262,7 @@ where
 
                     if data == "[DONE]" {
                         if tool_acc.is_empty() {
-                            if let Some(stream_id) = trace {
-                                crate::trace_logging::trace_checkpoint(
-                                    "provider_sse_done_text",
-                                    serde_json::json!({
-                                        "stream_id": stream_id,
-                                        "text_bytes": full_text.len(),
-                                        "total_tokens": usage.total_tokens(),
-                                    }),
-                                );
-                            }
                             return Ok(LlmResponse::Text { text: full_text, usage });
-                        }
-                        if let Some(stream_id) = trace {
-                            crate::trace_logging::trace_checkpoint(
-                                "provider_sse_done_tool_calls",
-                                serde_json::json!({
-                                    "stream_id": stream_id,
-                                    "text_bytes": full_text.len(),
-                                    "total_tokens": usage.total_tokens(),
-                                }),
-                            );
                         }
                         return Ok(LlmResponse::ToolCalls {
                             text: full_text,
@@ -1414,30 +1279,11 @@ where
                                     made_progress = true;
                                     on_token(content);
                                     full_text.push_str(content);
-                                    if let Some(stream_id) = trace {
-                                        crate::trace_logging::trace_checkpoint(
-                                            "provider_sse_text_delta",
-                                            serde_json::json!({
-                                                "stream_id": stream_id,
-                                                "bytes": content.len(),
-                                                "total_text_bytes": full_text.len(),
-                                            }),
-                                        );
-                                    }
                                 }
                                 // Accumulate tool call fragments
                                 if let Some(tc_chunks) = &choice.delta.tool_calls {
                                     if !tc_chunks.is_empty() {
                                         made_progress = true;
-                                        if let Some(stream_id) = trace {
-                                            crate::trace_logging::trace_checkpoint(
-                                                "provider_sse_tool_delta",
-                                                serde_json::json!({
-                                                    "stream_id": stream_id,
-                                                    "fragment_count": tc_chunks.len(),
-                                                }),
-                                            );
-                                        }
                                     }
                                     for tc in tc_chunks {
                                         tool_acc.push(tc);
@@ -1450,28 +1296,10 @@ where
                             if let Some(u) = chunk.usage {
                                 usage = u.into_usage();
                                 made_progress = true;
-                                if let Some(stream_id) = trace {
-                                    crate::trace_logging::trace_checkpoint(
-                                        "provider_sse_usage",
-                                        serde_json::json!({
-                                            "stream_id": stream_id,
-                                            "total_tokens": usage.total_tokens(),
-                                        }),
-                                    );
-                                }
                             }
                         }
                         Err(e) => {
                             tracing::debug!("skipping unparseable SSE chunk: {e}");
-                            if let Some(stream_id) = trace {
-                                crate::trace_logging::trace_checkpoint(
-                                    "provider_sse_unparseable_data",
-                                    serde_json::json!({
-                                        "stream_id": stream_id,
-                                        "error": e.to_string(),
-                                    }),
-                                );
-                            }
                         }
                     }
                 }
@@ -1487,15 +1315,6 @@ where
     // (arguments JSON truncated mid-stream). Return only the text we've already
     // streamed to the caller to avoid dispatching malformed tool calls.
     if cancel.is_cancelled() {
-        if let Some(stream_id) = trace {
-            crate::trace_logging::trace_checkpoint(
-                "provider_sse_return_cancelled_text",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "text_bytes": full_text.len(),
-                }),
-            );
-        }
         return Ok(LlmResponse::Text {
             text: full_text,
             usage,
@@ -1503,31 +1322,11 @@ where
     }
 
     if tool_acc.is_empty() {
-        if let Some(stream_id) = trace {
-            crate::trace_logging::trace_checkpoint(
-                "provider_sse_return_text_eof",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "text_bytes": full_text.len(),
-                    "total_tokens": usage.total_tokens(),
-                }),
-            );
-        }
         Ok(LlmResponse::Text {
             text: full_text,
             usage,
         })
     } else {
-        if let Some(stream_id) = trace {
-            crate::trace_logging::trace_checkpoint(
-                "provider_sse_return_tool_calls_eof",
-                serde_json::json!({
-                    "stream_id": stream_id,
-                    "text_bytes": full_text.len(),
-                    "total_tokens": usage.total_tokens(),
-                }),
-            );
-        }
         Ok(LlmResponse::ToolCalls {
             text: full_text,
             calls: tool_acc.into_tool_calls(),
@@ -1628,7 +1427,7 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         let err = result.expect_err("keepalive-only stream should bail");
         let msg = err.to_string();
@@ -1653,7 +1452,7 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "hello"),
@@ -1673,7 +1472,7 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "hi"),
@@ -1693,7 +1492,7 @@ mod tests {
         let s = stream::pending::<Result<Vec<u8>>>();
 
         let (on_token, _) = collect_tokens();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete via cancel") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, ""),
@@ -1722,7 +1521,7 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
             LlmResponse::ToolCalls { text, calls, .. } => {
@@ -1750,7 +1549,7 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "ok"),
@@ -1775,7 +1574,7 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text, usage } => {
@@ -1803,7 +1602,7 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90), None).await;
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "partial"),

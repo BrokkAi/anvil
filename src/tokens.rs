@@ -11,67 +11,18 @@
 //! we use it to trigger compression at a configurable threshold, not
 //! to predict billing.
 //!
-//! The encoder is initialized lazily on a dedicated worker thread and
-//! reused for the lifetime of the process. `tiktoken-rs` can use enough
-//! stack during initialization/encoding that running it directly on ACP
-//! handler or Tokio runtime threads risks process-aborting stack overflows;
-//! the worker has an explicit large stack so callers do not need to set
-//! `RUST_MIN_STACK`.
+//! The encoder is initialized lazily and reused for the lifetime of the
+//! process.
 
 use std::sync::OnceLock;
-use std::sync::mpsc;
 
-use tiktoken_rs::o200k_base;
+use tiktoken_rs::{CoreBPE, o200k_base};
 
 use crate::llm_client::ChatMessage;
 
-const TOKENIZER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
-
-struct TokenRequest {
-    text: String,
-    reply: mpsc::Sender<usize>,
-}
-
-fn tokenizer() -> &'static mpsc::Sender<TokenRequest> {
-    static TOKENIZER: OnceLock<mpsc::Sender<TokenRequest>> = OnceLock::new();
-    TOKENIZER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<TokenRequest>();
-        if crate::trace_logging::trace_enabled() {
-            crate::trace_checkpoint!(
-                "tokenizer_worker_spawn_begin",
-                serde_json::json!({
-                    "stack_bytes": TOKENIZER_THREAD_STACK_BYTES,
-                }),
-            );
-        }
-        std::thread::Builder::new()
-            .name("anvil-tokenizer".to_string())
-            .stack_size(TOKENIZER_THREAD_STACK_BYTES)
-            .spawn(move || {
-                if crate::trace_logging::trace_enabled() {
-                    crate::trace_checkpoint!(
-                        "tokenizer_worker_started",
-                        serde_json::json!({
-                            "stack_bytes": TOKENIZER_THREAD_STACK_BYTES,
-                        }),
-                    );
-                }
-                let encoder = o200k_base().expect("o200k_base tokenizer initializes");
-                while let Ok(req) = rx.recv() {
-                    let count = encoder.encode_with_special_tokens(&req.text).len();
-                    let _ = req.reply.send(count);
-                }
-            })
-            .expect("tokenizer worker thread starts");
-        tx
-    })
-}
-
-fn fallback_estimate(text: &str) -> usize {
-    // Keep context accounting usable if the tokenizer worker is gone. This is
-    // intentionally conservative and avoids calling tiktoken on the caller's
-    // stack, which is the failure mode this module is designed to prevent.
-    text.len().div_ceil(4)
+fn tokenizer() -> &'static CoreBPE {
+    static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+    TOKENIZER.get_or_init(|| o200k_base().expect("o200k_base tokenizer initializes"))
 }
 
 /// Approximate token count for a single string. Matches Brokk's
@@ -80,33 +31,7 @@ pub fn approximate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    let trace = crate::trace_logging::trace_enabled();
-    if trace {
-        crate::trace_checkpoint!(
-            "tokenizer_request_begin",
-            serde_json::json!({
-                "bytes": text.len(),
-            }),
-        );
-    }
-    let (reply, rx) = mpsc::channel();
-    let req = TokenRequest {
-        text: text.to_string(),
-        reply,
-    };
-    if tokenizer().send(req).is_err() {
-        return fallback_estimate(text);
-    }
-    let count = rx.recv().unwrap_or_else(|_| fallback_estimate(text));
-    if trace {
-        crate::trace_checkpoint!(
-            "tokenizer_request_end",
-            serde_json::json!({
-                "tokens": count,
-            }),
-        );
-    }
-    count
+    tokenizer().encode_with_special_tokens(text).len()
 }
 
 /// Approximate token count for a full chat message list. Sums the

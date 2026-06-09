@@ -10,41 +10,15 @@ use serde_json::{Value, json};
 
 struct SmokeCase {
     name: &'static str,
-    duplicate_global_skills: bool,
-    read_only: bool,
-    structured_output: bool,
-    tool_follow_up: bool,
     prompt: String,
 }
 
 #[test]
 fn slopcop_shaped_acp_path_does_not_abort() {
-    let cases = [
-        SmokeCase {
-            name: "plain_default_no_skills",
-            duplicate_global_skills: false,
-            read_only: false,
-            structured_output: false,
-            tool_follow_up: false,
-            prompt: "List the files you would inspect first. Do not call tools.".to_string(),
-        },
-        SmokeCase {
-            name: "structured_readonly_duplicate_global_skills",
-            duplicate_global_skills: true,
-            read_only: true,
-            structured_output: true,
-            tool_follow_up: false,
-            prompt: slopcop_sized_prompt(),
-        },
-        SmokeCase {
-            name: "structured_readonly_tool_followup_duplicate_global_skills",
-            duplicate_global_skills: true,
-            read_only: true,
-            structured_output: true,
-            tool_follow_up: true,
-            prompt: slopcop_sized_prompt(),
-        },
-    ];
+    let cases = [SmokeCase {
+        name: "structured_readonly_empty_mcp_tool_followup",
+        prompt: slopcop_sized_prompt(),
+    }];
 
     for case in cases {
         run_smoke_case(&case);
@@ -60,31 +34,20 @@ fn run_smoke_case(case: &SmokeCase) {
 
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
-    if case.duplicate_global_skills {
-        write_skill(
-            &home.join(".claude/skills/use-railway/SKILL.md"),
-            "use-railway",
-            "Shadowed lower-priority test skill",
-        );
-        write_skill(
-            &home.join(".agents/skills/use-railway/SKILL.md"),
-            "use-railway",
-            "Winning higher-priority test skill",
-        );
-    }
 
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
-    std::fs::write(config_home.join("setup.json"), r#"{"mcp_servers":[]}"#).expect("write setup");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
-    let provider = case.tool_follow_up.then(start_openai_smoke_server);
+    let provider = start_openai_smoke_server();
     let mut child = spawn_anvil(
         &home,
         &config_home,
         &trace_path,
-        provider.as_ref().map(|server| server.base_url.as_str()),
-        if case.tool_follow_up { 2 } else { 1 },
+        Some(provider.base_url.as_str()),
+        2,
     );
     let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
     let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
@@ -119,17 +82,15 @@ fn run_smoke_case(case: &SmokeCase) {
         .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
         .to_string();
 
-    if case.read_only {
-        let config = client.request(
-            "session/set_config_option",
-            json!({
-                "sessionId": session_id,
-                "configId": "permission_mode",
-                "value": "readOnly"
-            }),
-        );
-        assert_response_ok(case, "session/set_config_option", &config, &client);
-    }
+    let config = client.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "permission_mode",
+            "value": "readOnly"
+        }),
+    );
+    assert_response_ok(case, "session/set_config_option", &config, &client);
 
     let mut prompt_params = json!({
         "sessionId": session_id,
@@ -140,24 +101,22 @@ fn run_smoke_case(case: &SmokeCase) {
             }
         ]
     });
-    if case.structured_output {
-        prompt_params["_meta"] = json!({
-            "anvil": {
-                "structuredOutput": {
-                    "schemaName": "slopcop_smoke",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "answer": { "type": "string" }
-                        },
-                        "required": ["answer"],
-                        "additionalProperties": false
+    prompt_params["_meta"] = json!({
+        "anvil": {
+            "structuredOutput": {
+                "schemaName": "slopcop_smoke",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": { "type": "string" }
                     },
-                    "allowCoercion": false
-                }
+                    "required": ["answer"],
+                    "additionalProperties": false
+                },
+                "allowCoercion": false
             }
-        });
-    }
+        }
+    });
 
     let prompt = client.request("session/prompt", prompt_params);
     assert_response_ok(case, "session/prompt", &prompt, &client);
@@ -168,94 +127,48 @@ fn run_smoke_case(case: &SmokeCase) {
         client.stderr_text(),
         client.trace_text()
     );
-    let trace = client.trace_text();
-    for checkpoint in [
-        "acp_initialize_end",
-        "acp_session_new_end",
-        "session_context_discovery_end",
-        "skills_discovery_end",
-        "subagents_discovery_end",
-        "mcp_server_resolution_end",
-        "tool_registry_construction_end",
-        "structured_output_metadata_parse_end",
-        "prompt_messages_construction_end",
-        "token_counting_end",
-        "final_llm_request_dispatch_begin",
-        "final_llm_request_dispatch_end",
-    ] {
-        assert!(
-            trace.contains(&format!(r#""checkpoint":"{checkpoint}""#)),
-            "{}: trace missing checkpoint {checkpoint}\ntrace:\n{}\nstderr:\n{}",
-            case.name,
-            trace,
-            client.stderr_text()
-        );
-    }
-    if case.read_only {
-        assert!(
-            trace.contains(r#""checkpoint":"acp_set_config_option_end""#),
-            "{}: trace missing readOnly config checkpoint\ntrace:\n{}\nstderr:\n{}",
-            case.name,
-            trace,
-            client.stderr_text()
-        );
-    }
+    assert_structured_output_success(case, &prompt, &client);
+    assert!(
+        !cwd.join("blocked.txt").exists(),
+        "{}: readOnly session allowed write_file to create blocked.txt",
+        case.name
+    );
+    assert!(
+        !bifrost_log.exists(),
+        "{}: explicit mcpServers: [] spawned persisted default Bifrost; log:\n{}",
+        case.name,
+        std::fs::read_to_string(&bifrost_log).unwrap_or_default()
+    );
 
-    if case.tool_follow_up {
-        let trace = client.trace_text();
-        for checkpoint in [
-            "turn_provider_dispatch_begin",
-            "turn_provider_dispatch_end",
-            "provider_stream_dispatch_begin",
-            "provider_stream_request_body_ready",
-            "provider_http_send_begin",
-            "provider_http_send_end",
-            "provider_sse_stream_begin",
-            "provider_sse_tool_delta",
-            "provider_sse_done_tool_calls",
-            "provider_sse_text_delta",
-            "provider_sse_done_text",
-        ] {
-            assert!(
-                trace.contains(&format!(r#""checkpoint":"{checkpoint}""#)),
-                "{}: trace missing provider/tool-follow-up checkpoint {checkpoint}\ntrace:\n{}\nstderr:\n{}",
-                case.name,
-                trace,
-                client.stderr_text()
-            );
-        }
-        assert!(
-            trace_has_event_for_turn(&trace, "llm_request", 1),
-            "{}: trace missing turn-1 llm_request after tool result\ntrace:\n{}\nstderr:\n{}",
-            case.name,
-            trace,
-            client.stderr_text()
-        );
-        assert!(
-            trace_has_event_for_turn(&trace, "llm_response", 1),
-            "{}: trace missing turn-1 llm_response after tool result\ntrace:\n{}\nstderr:\n{}",
-            case.name,
-            trace,
-            client.stderr_text()
-        );
-        let provider = provider.as_ref().expect("provider server");
-        assert_eq!(
-            provider.request_count(),
-            2,
-            "{}: expected provider to receive turn 0 and turn 1 requests",
-            case.name
-        );
-        assert!(
-            provider
-                .request_bodies()
-                .get(1)
-                .is_some_and(|body| body.contains(r#""role":"tool""#)
-                    && body.contains("README.md")),
-            "{}: turn-1 provider request did not include the tool result body; requests: {:?}",
-            case.name,
-            provider.request_bodies()
-        );
-    }
+    assert_eq!(
+        provider.request_count(),
+        2,
+        "{}: expected provider to receive turn 0 and turn 1 requests",
+        case.name
+    );
+    assert!(
+        provider.request_bodies().get(1).is_some_and(
+            |body| body.contains(r#""role":"tool""#) && body.contains("read-only mode forbids")
+        ),
+        "{}: turn-1 provider request did not include the readOnly blocked tool result; requests: {:?}",
+        case.name,
+        provider.request_bodies()
+    );
+    let trace = client.trace_text();
+    assert!(
+        trace_has_event_for_turn(&trace, "llm_request", 1),
+        "{}: trace missing turn-1 llm_request after blocked tool result\ntrace:\n{}\nstderr:\n{}",
+        case.name,
+        trace,
+        client.stderr_text()
+    );
+    assert!(
+        trace_has_event_for_turn(&trace, "llm_response", 1),
+        "{}: trace missing turn-1 llm_response after blocked tool result\ntrace:\n{}\nstderr:\n{}",
+        case.name,
+        trace,
+        client.stderr_text()
+    );
 
     client.shutdown();
     let _ = stdout_join.join();
@@ -290,7 +203,6 @@ fn spawn_anvil(
         .env("CODEX_HOME", home.join(".codex"))
         .env("BROKK_CONFIG_HOME", config_home)
         .env("ANVIL_TRACE_JSONL", trace_path)
-        .env("RUST_MIN_STACK", "33554432")
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("BEDROCK_API_KEY")
@@ -403,9 +315,10 @@ fn handle_provider_connection(
 }
 
 fn tool_call_sse_body() -> String {
-    let args = serde_json::to_string(r#"{"file_path":"README.md"}"#).expect("encode args");
+    let args = serde_json::to_string(r#"{"file_path":"blocked.txt","content":"blocked"}"#)
+        .expect("encode args");
     format!(
-        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_readme\",\"function\":{{\"name\":\"read_file\",\"arguments\":{args}}}}}]}}}}]}}\n\
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_write\",\"function\":{{\"name\":\"write_file\",\"arguments\":{args}}}}}]}}}}]}}\n\
          \n\
          data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":4}}}}\n\
          \n\
@@ -414,12 +327,63 @@ fn tool_call_sse_body() -> String {
 }
 
 fn text_sse_body() -> String {
-    "data: {\"choices\":[{\"delta\":{\"content\":\"README inspected.\"}}]}\n\
+    "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"answer\\\":\\\"Blocked write observed.\\\"}\"}}]}\n\
      \n\
      data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5}}\n\
      \n\
      data: [DONE]\n\n"
         .to_string()
+}
+
+fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
+    let fake_bifrost = make_fake_bifrost_binary(temp, bifrost_log);
+    let setup = json!({
+        "mcp_servers": [
+            {
+                "name": "bifrost",
+                "command": fake_bifrost,
+                "args": ["--root", "{cwd}", "--server", "core"],
+                "framing": "line",
+                "enabled": true
+            }
+        ]
+    });
+    std::fs::write(config_home.join("setup.json"), setup.to_string()).expect("write setup");
+}
+
+#[cfg(unix)]
+fn make_fake_bifrost_binary(temp: &Path, bifrost_log: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = temp.join("fake-bifrost.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho spawned \"$@\" >> '{}'\n",
+            bifrost_log.display()
+        ),
+    )
+    .expect("write fake bifrost");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat fake bifrost")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod fake bifrost");
+    script.display().to_string()
+}
+
+#[cfg(not(unix))]
+fn make_fake_bifrost_binary(temp: &Path, bifrost_log: &Path) -> String {
+    let script = temp.join("fake-bifrost.cmd");
+    std::fs::write(
+        &script,
+        format!(
+            "@echo off\r\necho spawned %* >> \"{}\"\r\n",
+            bifrost_log.display()
+        ),
+    )
+    .expect("write fake bifrost");
+    script.display().to_string()
 }
 
 fn trace_has_event_for_turn(trace: &str, event_type: &str, turn: u64) -> bool {
@@ -431,6 +395,52 @@ fn trace_has_event_for_turn(trace: &str, event_type: &str, turn: u64) -> bool {
                     && value.get("turn").and_then(Value::as_u64) == Some(turn)
             })
     })
+}
+
+fn assert_structured_output_success(
+    case: &SmokeCase,
+    response: &Value,
+    client: &JsonRpcClient<'_>,
+) {
+    let structured = find_structured_output(response).unwrap_or_else(|| {
+        panic!(
+            "{}: prompt response missing structured-output metadata: {response}\nstderr:\n{}\ntrace:\n{}",
+            case.name,
+            client.stderr_text(),
+            client.trace_text()
+        )
+    });
+    assert_eq!(
+        structured.get("status").and_then(Value::as_str),
+        Some("success"),
+        "{}: structured-output metadata was not successful: {structured}\nstderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    assert_eq!(
+        structured
+            .get("validated_output")
+            .and_then(|value| value.get("answer"))
+            .and_then(Value::as_str),
+        Some("Blocked write observed."),
+        "{}: structured-output metadata did not round-trip validated answer: {structured}",
+        case.name
+    );
+}
+
+fn find_structured_output(value: &Value) -> Option<&Value> {
+    if let Some(found) = value
+        .get("anvil")
+        .and_then(|anvil| anvil.get("structuredOutput"))
+    {
+        return Some(found);
+    }
+    match value {
+        Value::Array(items) => items.iter().find_map(find_structured_output),
+        Value::Object(map) => map.values().find_map(find_structured_output),
+        _ => None,
+    }
 }
 
 fn spawn_line_reader<R>(reader: R) -> (mpsc::Receiver<String>, std::thread::JoinHandle<()>)
@@ -589,15 +599,6 @@ fn assert_response_ok(
         client.stderr_text(),
         client.trace_text()
     );
-}
-
-fn write_skill(path: &Path, name: &str, description: &str) {
-    std::fs::create_dir_all(path.parent().expect("skill parent")).expect("create skill parent");
-    std::fs::write(
-        path,
-        format!("---\nname: {name}\ndescription: {description}\n---\n\nBody"),
-    )
-    .expect("write skill");
 }
 
 fn slopcop_sized_prompt() -> String {
