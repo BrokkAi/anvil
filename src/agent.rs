@@ -21,7 +21,7 @@ use agent_client_protocol::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
-use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata};
+use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
@@ -61,8 +61,43 @@ fn parse_prompt_structured_output_request(
 
 fn prompt_response_meta(
     result: Option<&StructuredOutputResult>,
+    orchestration_model: Option<&ResolvedModelInfo>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    build_structured_output_meta(result)
+    let mut meta = build_structured_output_meta(result).unwrap_or_default();
+    if let Some(model) = orchestration_model {
+        let mut namespace = meta
+            .remove(crate::structured_output::ACP_META_NAMESPACE)
+            .and_then(|value| match value {
+                serde_json::Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+        namespace.insert(
+            "modelSelection".to_string(),
+            serde_json::json!({
+                "orchestration": {
+                    "configured_model": model.configured_model.clone(),
+                    "resolved_provider": model.resolved_provider.clone(),
+                    "resolved_model": model.resolved_model.clone(),
+                    "actual_model": model.resolved_model.clone(),
+                },
+                "internal_specialist": {
+                    "separate_model_selection_supported": false,
+                    "configured_model": null,
+                    "resolved_provider": model.resolved_provider.clone(),
+                    "resolved_model": model.resolved_model.clone(),
+                    "actual_model": model.resolved_model.clone(),
+                    "selection_source": "inherits_orchestration",
+                    "reason": "ACP session/prompt does not support a separate internal specialist model; task subagents inherit the orchestration model.",
+                }
+            }),
+        );
+        meta.insert(
+            crate::structured_output::ACP_META_NAMESPACE.to_string(),
+            serde_json::Value::Object(namespace),
+        );
+    }
+    if meta.is_empty() { None } else { Some(meta) }
 }
 
 fn prompt_end_turn_response() -> PromptResponse {
@@ -1494,6 +1529,8 @@ pub async fn run_agent(
                 if let Some(loop_spec) = loop_spec {
                     let llm_for_loop_turns: Arc<dyn crate::llm_client::LlmBackend> =
                         llm_prompt.clone();
+                    let orchestration_model_for_response =
+                        llm_for_loop_turns.resolve_model_info(&snap.model);
                     let llm_for_setup = llm_login.clone();
                     let sessions_for_loop = sessions_prompt.clone();
                     let cx_for_loop = cx.clone();
@@ -1624,8 +1661,10 @@ pub async fn run_agent(
                         } else {
                             prompt_end_turn_response()
                         };
-                        let response =
-                            response.meta(prompt_response_meta(structured_output_result.as_ref()));
+                        let response = response.meta(prompt_response_meta(
+                            structured_output_result.as_ref(),
+                            Some(&orchestration_model_for_response),
+                        ));
                         if let Err(e) = responder.respond(response) {
                             tracing::warn!(
                                 session_id = %session_id_for_loop,
@@ -1730,6 +1769,8 @@ pub async fn run_agent(
                 let fallback_cwd_for_loop = fallback_cwd.clone();
                 let prompt_text_for_turn = prompt_text;
                 let model_for_loop = snap.model;
+                let orchestration_model_for_response =
+                    llm_for_loop.resolve_model_info(&model_for_loop);
                 let reasoning_effort_for_loop = snap.reasoning_effort;
                 // Resolve per-turn idle timeout: the session override wins,
                 // otherwise fall back to the binary-wide default from
@@ -1780,8 +1821,10 @@ pub async fn run_agent(
                     .cached_read_tokens(cumulative_usage.cached_read_tokens)
                     .cached_write_tokens(cumulative_usage.cached_write_tokens);
                     let response = prompt_end_turn_response().usage(Some(acp_usage));
-                    let response =
-                        response.meta(prompt_response_meta(structured_output_result.as_ref()));
+                    let response = response.meta(prompt_response_meta(
+                        structured_output_result.as_ref(),
+                        Some(&orchestration_model_for_response),
+                    ));
                     if let Err(e) = responder.respond(response) {
                         tracing::warn!(
                             session_id = %session_id_for_loop,
@@ -5399,7 +5442,7 @@ mod tests {
                 validated_output: serde_json::json!({"answer":"ok"}),
                 coercion_requested: false,
             });
-        let meta = prompt_response_meta(Some(&result)).expect("meta present");
+        let meta = prompt_response_meta(Some(&result), None).expect("meta present");
         assert_eq!(
             meta["anvil"]["structuredOutput"]["status"],
             serde_json::Value::String("success".into())
@@ -5424,7 +5467,7 @@ mod tests {
                 coercion_requested: true,
             },
         );
-        let meta = prompt_response_meta(Some(&result)).expect("meta present");
+        let meta = prompt_response_meta(Some(&result), None).expect("meta present");
         assert_eq!(
             meta["anvil"]["structuredOutput"]["status"],
             serde_json::Value::String("coerced_success".into())
@@ -5453,7 +5496,7 @@ mod tests {
                 coercion_requested: true,
             },
         );
-        let meta = prompt_response_meta(Some(&result)).expect("meta present");
+        let meta = prompt_response_meta(Some(&result), None).expect("meta present");
         assert_eq!(
             meta["anvil"]["structuredOutput"]["status"],
             serde_json::Value::String("validation_error".into())
@@ -5466,7 +5509,46 @@ mod tests {
 
     #[test]
     fn prompt_response_meta_is_absent_without_structured_output() {
-        assert!(prompt_response_meta(None).is_none());
+        assert!(prompt_response_meta(None, None).is_none());
+    }
+
+    #[test]
+    fn prompt_response_meta_includes_model_selection_contract() {
+        let model = ResolvedModelInfo {
+            configured_model: "openrouter::google/gemini-3.1-pro-preview".into(),
+            resolved_provider: Some("openrouter".into()),
+            resolved_model: "google/gemini-3.1-pro-preview".into(),
+        };
+        let meta = prompt_response_meta(None, Some(&model)).expect("meta present");
+
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["orchestration"]["configured_model"],
+            "openrouter::google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["orchestration"]["resolved_provider"],
+            "openrouter"
+        );
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["orchestration"]["resolved_model"],
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["orchestration"]["actual_model"],
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["internal_specialist"]["separate_model_selection_supported"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["internal_specialist"]["actual_model"],
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            meta["anvil"]["modelSelection"]["internal_specialist"]["selection_source"],
+            "inherits_orchestration"
+        );
     }
 
     /// All four behavior modes embed the cwd into the system prompt so

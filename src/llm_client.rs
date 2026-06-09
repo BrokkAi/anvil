@@ -425,6 +425,13 @@ pub struct ModelMetadata {
     pub pricing: Option<ModelPricing>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelInfo {
+    pub configured_model: String,
+    pub resolved_provider: Option<String>,
+    pub resolved_model: String,
+}
+
 impl ModelMetadata {
     /// Lift a bare model id to a metadata record with no reasoning data.
     /// Used by backends that don't publish reasoning presets, and by the
@@ -453,6 +460,14 @@ impl ModelMetadata {
 
 pub trait LlmBackend: Send + Sync {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>>;
+
+    fn resolve_model_info(&self, configured_model: &str) -> ResolvedModelInfo {
+        ResolvedModelInfo {
+            configured_model: configured_model.to_string(),
+            resolved_provider: None,
+            resolved_model: configured_model.to_string(),
+        }
+    }
 
     /// Same catalog as `list_models`, but carrying any per-model
     /// reasoning-effort presets the backend's discovery endpoint
