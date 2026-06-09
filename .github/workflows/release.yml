@@ -119,7 +119,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,wasm32-wasip2
 
       - name: Install Android SDK + NDK
         uses: android-actions/setup-android@v3
@@ -146,15 +146,15 @@ jobs:
 
       - name: Build release binary
         env:
-          # Android builds intentionally skip the default `wasm-sandbox`
-          # feature because the nested `wasm32-wasip2` sandbox build is
-          # not part of the supported Android release path.
+          # Android releases embed the same wasm sandbox artifact as other
+          # targets, so the NDK cross-linker and nested wasm target must
+          # both be configured on the runner.
           ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
           CC_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
           CXX_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
           AR_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
-        run: cargo build --release --locked --no-default-features --target aarch64-linux-android
+        run: cargo build --release --locked --target aarch64-linux-android
 
       - name: Package archive
         shell: bash
