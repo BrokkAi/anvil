@@ -820,7 +820,13 @@ pub(crate) async fn run(
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
     let mut no_edit_progress_nudge_count = 0usize;
-    'outer: for turn in 0..max_turns {
+    let mut no_edit_completion_retry_count = 0usize;
+    let turn_limit = if train_bifrost {
+        max_turns.saturating_add(1)
+    } else {
+        max_turns
+    };
+    'outer: for turn in 0..turn_limit {
         if cancel.is_cancelled() {
             break;
         }
@@ -835,6 +841,9 @@ pub(crate) async fn run(
                 max_turns,
                 &tool_exchanges,
                 no_edit_progress_nudge_count,
+                training_packet
+                    .as_ref()
+                    .expect("BRK_TRAIN_BIFROST requires a training packet"),
             )
         {
             no_edit_progress_nudge_count += 1;
@@ -924,6 +933,9 @@ pub(crate) async fn run(
                         turn,
                         max_turns,
                         &tool_exchanges,
+                        training_packet
+                            .as_ref()
+                            .expect("BRK_TRAIN_BIFROST requires a training packet"),
                     )
                 {
                     match build_train_bifrost_nudge(
@@ -954,6 +966,55 @@ pub(crate) async fn run(
                             append_trace_record(serde_json::json!({
                                 "type": "no_edit_final_answer_guard_skipped",
                                 "turn": turn,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "text": text,
+                            }));
+                        }
+                    }
+                }
+                if train_bifrost
+                    && should_retry_no_edit_completion(
+                        permission_mode,
+                        &tool_exchanges,
+                        no_edit_completion_retry_count,
+                        training_packet
+                            .as_ref()
+                            .expect("BRK_TRAIN_BIFROST requires a training packet"),
+                    )
+                {
+                    match build_train_bifrost_nudge(
+                        llm,
+                        turn,
+                        &messages,
+                        &tool_exchanges,
+                        training_packet.as_ref(),
+                        &cancel,
+                        idle_timeout,
+                    )
+                    .await
+                    {
+                        Some((nudge, hint_usage)) => {
+                            no_edit_completion_retry_count += 1;
+                            turn_usage.add(hint_usage);
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_completion_retry",
+                                "reason": "final_text",
+                                "turn": turn,
+                                "retry_count": no_edit_completion_retry_count,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "text": text,
+                                "message": nudge,
+                            }));
+                            messages.push(ChatMessage::assistant(text));
+                            messages.push(ChatMessage::user(nudge));
+                            continue;
+                        }
+                        None => {
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_completion_retry_skipped",
+                                "reason": "final_text",
+                                "turn": turn,
+                                "retry_count": no_edit_completion_retry_count,
                                 "executed_tool_counts": executed_tool_counts(&tool_exchanges),
                                 "text": text,
                             }));
@@ -1362,6 +1423,54 @@ pub(crate) async fn run(
                         tools.retain(|t| t.function.name != "task");
                     }
                 }
+                if train_bifrost
+                    && should_retry_no_edit_turn_limit_completion(
+                        permission_mode,
+                        turn,
+                        max_turns,
+                        &tool_exchanges,
+                        no_edit_completion_retry_count,
+                        training_packet
+                            .as_ref()
+                            .expect("BRK_TRAIN_BIFROST requires a training packet"),
+                    )
+                {
+                    match build_train_bifrost_nudge(
+                        llm,
+                        turn,
+                        &messages,
+                        &tool_exchanges,
+                        training_packet.as_ref(),
+                        &cancel,
+                        idle_timeout,
+                    )
+                    .await
+                    {
+                        Some((nudge, hint_usage)) => {
+                            no_edit_completion_retry_count += 1;
+                            turn_usage.add(hint_usage);
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_completion_retry",
+                                "reason": "turn_limit",
+                                "turn": turn,
+                                "retry_count": no_edit_completion_retry_count,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                                "message": nudge,
+                            }));
+                            messages.push(ChatMessage::user(nudge));
+                            continue;
+                        }
+                        None => {
+                            append_trace_record(serde_json::json!({
+                                "type": "no_edit_completion_retry_skipped",
+                                "reason": "turn_limit",
+                                "turn": turn,
+                                "retry_count": no_edit_completion_retry_count,
+                                "executed_tool_counts": executed_tool_counts(&tool_exchanges),
+                            }));
+                        }
+                    }
+                }
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
@@ -1692,6 +1801,44 @@ fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
     })
 }
 
+fn has_successful_training_file_change(
+    tool_exchanges: &[ToolExchange],
+    packet: &TrainingPacket,
+) -> bool {
+    tool_exchanges.iter().any(|exchange| {
+        if tool_result_failed(&exchange.result) {
+            return false;
+        }
+        let Some(path) = file_change_target_path(exchange) else {
+            return false;
+        };
+        packet.files.iter().any(|file| file.path == path)
+    })
+}
+
+fn file_change_target_path(exchange: &ToolExchange) -> Option<String> {
+    if !matches!(exchange.tool_name.as_str(), "edit" | "write_file") {
+        return None;
+    }
+    let args = serde_json::from_str::<Value>(&exchange.arguments).ok()?;
+    let path = args.get("file_path")?.as_str()?;
+    normalize_tool_path(path)
+}
+
+fn normalize_tool_path(path: &str) -> Option<String> {
+    let path = path.trim().replace('\\', "/");
+    if path.is_empty() || path.starts_with('/') {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path.as_str())
+            .trim_start_matches("./")
+            .to_string(),
+    )
+}
+
 fn tool_result_failed(result: &str) -> bool {
     result.starts_with("Error:") || result.starts_with("Internal error:")
 }
@@ -1747,11 +1894,12 @@ fn should_reject_no_edit_final_answer(
     turn: usize,
     max_turns: usize,
     tool_exchanges: &[ToolExchange],
+    packet: &TrainingPacket,
 ) -> bool {
     if matches!(permission_mode, PermissionMode::ReadOnly) {
         return false;
     }
-    if turn >= max_turns - 1 || has_successful_file_change(tool_exchanges) {
+    if turn >= max_turns - 1 || has_successful_training_file_change(tool_exchanges, packet) {
         return false;
     }
     tool_exchanges.iter().any(|exchange| {
@@ -1766,6 +1914,30 @@ fn should_reject_no_edit_final_answer(
                 | "list_directory"
         )
     })
+}
+
+fn should_retry_no_edit_completion(
+    permission_mode: PermissionMode,
+    tool_exchanges: &[ToolExchange],
+    retry_count: usize,
+    packet: &TrainingPacket,
+) -> bool {
+    if matches!(permission_mode, PermissionMode::ReadOnly) {
+        return false;
+    }
+    retry_count == 0 && !has_successful_training_file_change(tool_exchanges, packet)
+}
+
+fn should_retry_no_edit_turn_limit_completion(
+    permission_mode: PermissionMode,
+    turn: usize,
+    max_turns: usize,
+    tool_exchanges: &[ToolExchange],
+    retry_count: usize,
+    packet: &TrainingPacket,
+) -> bool {
+    turn >= max_turns.saturating_sub(1)
+        && should_retry_no_edit_completion(permission_mode, tool_exchanges, retry_count, packet)
 }
 
 async fn build_train_bifrost_nudge(
@@ -1796,11 +1968,12 @@ fn should_emit_no_edit_progress_nudge(
     max_turns: usize,
     tool_exchanges: &[ToolExchange],
     nudge_count: usize,
+    packet: &TrainingPacket,
 ) -> bool {
     if matches!(permission_mode, PermissionMode::ReadOnly) {
         return false;
     }
-    if nudge_count >= 2 || has_successful_file_change(tool_exchanges) {
+    if nudge_count >= 2 || has_successful_training_file_change(tool_exchanges, packet) {
         return false;
     }
     let first_nudge_turn = (max_turns / 3).clamp(6, 10);
@@ -2194,6 +2367,25 @@ mod tests {
             tool_name: tool_name.to_string(),
             arguments: "{}".to_string(),
             result: String::new(),
+        }
+    }
+
+    fn training_packet_for_test(path: &str) -> TrainingPacket {
+        TrainingPacket {
+            files: vec![train_bifrost::TrainingFile {
+                path: path.to_string(),
+                diff: "diff --git a/src/lib.rs b/src/lib.rs\n".to_string(),
+            }],
+            related_files: Vec::new(),
+        }
+    }
+
+    fn file_exchange_for_test(tool_name: &str, path: &str) -> ToolExchange {
+        ToolExchange {
+            call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.to_string(),
+            arguments: serde_json::json!({ "file_path": path }).to_string(),
+            result: format!("Edited '{path}'"),
         }
     }
 
@@ -2614,48 +2806,159 @@ mod tests {
     #[test]
     fn no_edit_final_guard_rejects_navigation_only_final_before_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
+        let packet = training_packet_for_test("src/lib.rs");
 
         assert!(should_reject_no_edit_final_answer(
             PermissionMode::Default,
             3,
             10,
-            &prior
+            &prior,
+            &packet
         ));
         assert!(!should_reject_no_edit_final_answer(
             PermissionMode::ReadOnly,
             3,
             10,
-            &prior
+            &prior,
+            &packet
         ));
     }
 
     #[test]
-    fn no_edit_final_guard_allows_after_successful_edit() {
-        let prior = vec![ToolExchange {
-            call_id: "edit".to_string(),
-            tool_name: "edit".to_string(),
-            arguments: "{}".to_string(),
-            result: "Edited 'src/lib.rs' (1 replacement)".to_string(),
-        }];
+    fn no_edit_final_guard_allows_after_successful_gold_path_edit() {
+        let prior = vec![file_exchange_for_test("edit", "src/lib.rs")];
+        let packet = training_packet_for_test("src/lib.rs");
 
         assert!(!should_reject_no_edit_final_answer(
             PermissionMode::Default,
             3,
             10,
-            &prior
+            &prior,
+            &packet
         ));
         assert!(has_successful_file_change(&prior));
+        assert!(has_successful_training_file_change(&prior, &packet));
+    }
+
+    #[test]
+    fn no_edit_gate_ignores_successful_scratch_writes() {
+        let prior = vec![file_exchange_for_test("write_file", ".tmp")];
+        let packet = training_packet_for_test("src/lib.rs");
+
+        assert!(has_successful_file_change(&prior));
+        assert!(!has_successful_training_file_change(&prior, &packet));
+        assert!(should_retry_no_edit_completion(
+            PermissionMode::Default,
+            &prior,
+            0,
+            &packet
+        ));
     }
 
     #[test]
     fn no_edit_final_guard_does_not_reject_on_last_turn() {
         let prior = vec![exchange_for_test("search_symbols")];
+        let packet = training_packet_for_test("src/lib.rs");
 
         assert!(!should_reject_no_edit_final_answer(
             PermissionMode::Default,
             9,
             10,
-            &prior
+            &prior,
+            &packet
+        ));
+    }
+
+    #[test]
+    fn no_edit_completion_retry_triggers_without_prior_edit() {
+        let prior = vec![exchange_for_test("search_symbols")];
+        let packet = training_packet_for_test("src/lib.rs");
+
+        assert!(should_retry_no_edit_completion(
+            PermissionMode::Default,
+            &prior,
+            0,
+            &packet
+        ));
+        assert!(!should_retry_no_edit_completion(
+            PermissionMode::ReadOnly,
+            &prior,
+            0,
+            &packet
+        ));
+    }
+
+    #[test]
+    fn no_edit_completion_retry_is_one_shot_and_allows_successful_gold_path_edits() {
+        let edited = vec![file_exchange_for_test("edit", "src/lib.rs")];
+        let searched = vec![exchange_for_test("search_symbols")];
+        let packet = training_packet_for_test("src/lib.rs");
+
+        assert!(!should_retry_no_edit_completion(
+            PermissionMode::Default,
+            &edited,
+            0,
+            &packet
+        ));
+        assert!(!should_retry_no_edit_completion(
+            PermissionMode::Default,
+            &searched,
+            1,
+            &packet
+        ));
+    }
+
+    #[test]
+    fn no_edit_turn_limit_completion_retry_triggers_at_limit_only() {
+        let searched = vec![exchange_for_test("search_symbols")];
+        let packet = training_packet_for_test("src/lib.rs");
+
+        assert!(!should_retry_no_edit_turn_limit_completion(
+            PermissionMode::Default,
+            8,
+            10,
+            &searched,
+            0,
+            &packet
+        ));
+        assert!(should_retry_no_edit_turn_limit_completion(
+            PermissionMode::Default,
+            9,
+            10,
+            &searched,
+            0,
+            &packet
+        ));
+        assert!(!should_retry_no_edit_turn_limit_completion(
+            PermissionMode::Default,
+            9,
+            10,
+            &searched,
+            1,
+            &packet
+        ));
+    }
+
+    #[test]
+    fn no_edit_turn_limit_completion_retry_is_independent_of_progress_nudge_cap() {
+        let searched = vec![exchange_for_test("search_symbols")];
+        let packet = training_packet_for_test("src/lib.rs");
+
+        assert!(!should_emit_no_edit_progress_nudge(
+            PermissionMode::Default,
+            12,
+            25,
+            &searched,
+            2,
+            &packet
+        ));
+        assert!(should_retry_no_edit_turn_limit_completion(
+            PermissionMode::Default,
+            24,
+            25,
+            &searched,
+            0,
+            &packet
         ));
     }
 
@@ -2668,34 +2971,39 @@ mod tests {
             exchange_for_test("get_summaries"),
             exchange_for_test("read_file"),
         ];
+        let packet = training_packet_for_test("src/lib.rs");
 
         assert!(should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             8,
             25,
             &prior,
-            0
+            0,
+            &packet
         ));
         assert!(!should_emit_no_edit_progress_nudge(
             PermissionMode::ReadOnly,
             8,
             25,
             &prior,
-            0
+            0,
+            &packet
         ));
         assert!(!should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             7,
             25,
             &prior,
-            0
+            0,
+            &packet
         ));
         assert!(!should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             8,
             25,
             &prior,
-            2
+            2,
+            &packet
         ));
     }
 
@@ -2708,25 +3016,28 @@ mod tests {
             exchange_for_test("search_symbols"),
             exchange_for_test("read_file"),
         ];
+        let packet = training_packet_for_test("src/lib.rs");
 
         assert!(!should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             7,
             25,
             &prior,
-            0
+            0,
+            &packet
         ));
         assert!(should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             8,
             25,
             &prior,
-            0
+            0,
+            &packet
         ));
     }
 
     #[test]
-    fn no_edit_progress_nudge_allows_after_successful_edit() {
+    fn no_edit_progress_nudge_allows_after_successful_gold_path_edit() {
         let prior = vec![
             exchange_for_test("search_symbols"),
             exchange_for_test("get_symbol_sources"),
@@ -2735,20 +3046,17 @@ mod tests {
             exchange_for_test("search_symbols"),
             exchange_for_test("get_symbol_sources"),
             exchange_for_test("read_file"),
-            ToolExchange {
-                call_id: "edit".to_string(),
-                tool_name: "edit".to_string(),
-                arguments: "{}".to_string(),
-                result: "Edited 'src/lib.rs' (1 replacement)".to_string(),
-            },
+            file_exchange_for_test("edit", "src/lib.rs"),
         ];
+        let packet = training_packet_for_test("src/lib.rs");
 
         assert!(!should_emit_no_edit_progress_nudge(
             PermissionMode::Default,
             12,
             25,
             &prior,
-            0
+            0,
+            &packet
         ));
     }
 
