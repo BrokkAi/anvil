@@ -1,5 +1,4 @@
 use std::io::Write;
-
 const TRACE_JSONL_ENV: &str = "ANVIL_TRACE_JSONL";
 
 pub fn append_trace_record(record: serde_json::Value) {

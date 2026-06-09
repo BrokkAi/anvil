@@ -603,11 +603,8 @@ fn session_usage_update(
     snap: &SessionSnapshot,
     available_models: &[crate::llm_client::ModelMetadata],
 ) -> UsageUpdate {
-    let used = crate::tokens::approximate_tokens_messages(&build_prompt_messages_with_parts(
-        snap,
-        "",
-        &[],
-    )) as u64;
+    let messages = build_prompt_messages_with_parts(snap, "", &[]);
+    let used = crate::tokens::approximate_tokens_messages(&messages) as u64;
     let size = available_models
         .iter()
         .find(|m| m.id == snap.model)

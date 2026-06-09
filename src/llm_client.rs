@@ -1161,8 +1161,7 @@ impl OpenAiClient {
             reasoning,
             response_format,
         };
-
-        let resp = crate::http_retry::send_with_retries(
+        let resp = match crate::http_retry::send_with_retries(
             "sending chat completion request",
             || {
                 let mut req = self.http.post(&url).json(&body);
@@ -1173,7 +1172,11 @@ impl OpenAiClient {
             },
             Some(&cancel),
         )
-        .await?;
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return Err(e),
+        };
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -1228,12 +1231,16 @@ where
             chunk_or_timeout = tokio::time::timeout_at(deadline, stream.next()) => {
                 let chunk_opt = match chunk_or_timeout {
                     Ok(opt) => opt,
-                    Err(_elapsed) => anyhow::bail!(
-                        "LLM stream made no meaningful progress for {}s; aborting (server-side hang or keepalive-only flood)",
-                        idle.as_secs()
-                    ),
+                    Err(_elapsed) => {
+                        anyhow::bail!(
+                            "LLM stream made no meaningful progress for {}s; aborting (server-side hang or keepalive-only flood)",
+                            idle.as_secs()
+                        );
+                    }
                 };
-                let Some(chunk) = chunk_opt else { break; };
+                let Some(chunk) = chunk_opt else {
+                    break;
+                };
                 let chunk = chunk.context("stream read error")?;
                 raw_buf.extend_from_slice(&chunk);
 

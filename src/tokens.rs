@@ -11,21 +11,18 @@
 //! we use it to trigger compression at a configurable threshold, not
 //! to predict billing.
 //!
-//! The encoder is initialized lazily on first use and reused for the
-//! lifetime of the process. `tiktoken-rs::o200k_base` returns a
-//! `CoreBPE` which is `Send + Sync`, so a single global instance is
-//! safe across threads.
+//! The encoder is initialized lazily and reused for the lifetime of the
+//! process.
 
 use std::sync::OnceLock;
 
-use tiktoken_rs::CoreBPE;
-use tiktoken_rs::o200k_base;
+use tiktoken_rs::{CoreBPE, o200k_base};
 
 use crate::llm_client::ChatMessage;
 
-fn encoder() -> &'static CoreBPE {
-    static ENCODER: OnceLock<CoreBPE> = OnceLock::new();
-    ENCODER.get_or_init(|| o200k_base().expect("o200k_base tokenizer initializes"))
+fn tokenizer() -> &'static CoreBPE {
+    static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+    TOKENIZER.get_or_init(|| o200k_base().expect("o200k_base tokenizer initializes"))
 }
 
 /// Approximate token count for a single string. Matches Brokk's
@@ -34,7 +31,7 @@ pub fn approximate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    encoder().encode_with_special_tokens(text).len()
+    tokenizer().encode_with_special_tokens(text).len()
 }
 
 /// Approximate token count for a full chat message list. Sums the

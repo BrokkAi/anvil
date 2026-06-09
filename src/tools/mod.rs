@@ -100,6 +100,11 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Finding symbol locations",
     },
     ToolMeta {
+        name: "get_symbol_ancestors",
+        kind: ToolKind::Search,
+        display_name: "Finding symbol ancestors",
+    },
+    ToolMeta {
         name: "get_symbol_summaries",
         kind: ToolKind::Search,
         display_name: "Getting symbol summaries",

@@ -235,17 +235,30 @@ async fn build_codex_backend() -> Option<Arc<dyn LlmBackend>> {
 /// (handled by `discovery.rs`) hits the OpenAI-compatible `/v1/models`.
 /// Ollama doesn't require an API key for local use.
 fn build_ollama_backend() -> Arc<dyn LlmBackend> {
-    let chat_url = format!("{}/v1", discovery::OLLAMA_DEFAULT_URL);
+    let ollama_base_url =
+        test_ollama_base_url().unwrap_or_else(|| discovery::OLLAMA_DEFAULT_URL.to_string());
+    let ollama_base_url = ollama_base_url.trim_end_matches('/').to_string();
+    let chat_url = format!("{ollama_base_url}/v1");
     tracing::info!(
         "Ollama backend wired at {chat_url} (chat) and {}/v1/models (discovery); \
          models become available if/when the daemon responds",
-        discovery::OLLAMA_DEFAULT_URL
+        ollama_base_url
     );
     Arc::new(llm_client::OpenAiClient::with_reasoning_support(
         chat_url,
         None,
         reqwest::header::HeaderMap::new(),
     ))
+}
+
+fn test_ollama_base_url() -> Option<String> {
+    // Internal test hook for integration smoke tests. There is intentionally
+    // no public CLI flag for this; normal production routing remains the
+    // documented zero-config Ollama default unless this explicit test env is
+    // set by a harness.
+    std::env::var("ANVIL_TEST_OLLAMA_BASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
 }
 
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks

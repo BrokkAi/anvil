@@ -146,6 +146,9 @@ pub(crate) fn rfc3339_from_millis(millis: u64) -> Option<String> {
 }
 
 fn effective_mcp_servers(extra_servers: Option<Vec<McpServerConfig>>) -> Vec<McpServerConfig> {
+    if matches!(extra_servers.as_ref(), Some(servers) if servers.is_empty()) {
+        return Vec::new();
+    }
     let mut servers = crate::setup_state::read_mcp_servers();
     for server in extra_servers.into_iter().flatten() {
         if server.name == "bifrost" {
@@ -250,18 +253,20 @@ fn discover_session_context(
     Arc<crate::skills::SkillRegistry>,
     Arc<crate::agents::AgentRegistry>,
 ) {
-    match sandbox_mode {
-        Some(mode) => (
-            crate::agents_md::discover_with_sandbox_mode(cwd, Some(mode)),
-            Arc::new(crate::skills::discover_with_sandbox_mode(cwd, Some(mode))),
-            Arc::new(crate::agents::discover_with_sandbox_mode(cwd, Some(mode))),
-        ),
-        None => (
-            crate::agents_md::discover(cwd),
-            Arc::new(crate::skills::discover(cwd)),
-            Arc::new(crate::agents::discover(cwd)),
-        ),
-    }
+    let project_instructions = match sandbox_mode {
+        Some(mode) => crate::agents_md::discover_with_sandbox_mode(cwd, Some(mode)),
+        None => crate::agents_md::discover(cwd),
+    };
+
+    let skills = Arc::new(match sandbox_mode {
+        Some(mode) => crate::skills::discover_with_sandbox_mode(cwd, Some(mode)),
+        None => crate::skills::discover(cwd),
+    });
+    let agents = Arc::new(match sandbox_mode {
+        Some(mode) => crate::agents::discover_with_sandbox_mode(cwd, Some(mode)),
+        None => crate::agents::discover(cwd),
+    });
+    (project_instructions, skills, agents)
 }
 
 pub(crate) fn acp_mcp_servers_to_configs(
@@ -4867,11 +4872,12 @@ done
         );
     }
 
-    /// An explicit ACP `mcpServers: []` means "no extra MCP servers";
-    /// canonical Bifrost should still spawn from setup/default config.
+    /// An explicit ACP `mcpServers: []` is authoritative for that
+    /// session and must not reintroduce Anvil's persisted/default
+    /// Bifrost configuration.
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_empty_acp_mcp_servers_still_spawn_default_bifrost() {
+    async fn explicit_empty_acp_mcp_servers_do_not_spawn_default_bifrost() {
         let store = SessionStore::new("m".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let config_dir = tempfile::tempdir().expect("config dir");
@@ -4898,18 +4904,18 @@ done
 
         assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
         assert!(
-            bifrost_log.exists(),
-            "explicit empty ACP MCP list should still spawn persisted default bifrost"
+            !bifrost_log.exists(),
+            "explicit empty ACP MCP list should not spawn persisted default bifrost"
         );
-        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
     }
 
-    /// The ACP extra MCP list is persisted in the session manifest, but
-    /// canonical Bifrost is still reconstructed from setup/default config
-    /// after reload.
+    /// The ACP MCP override is persisted in the session manifest so an
+    /// LRU eviction, `session/load`, or server restart cannot
+    /// reintroduce setup/default Bifrost for a session created with
+    /// `mcpServers: []`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_empty_acp_mcp_servers_survive_cold_reload_with_default_bifrost() {
+    async fn explicit_empty_acp_mcp_servers_survive_cold_reload() {
         let store = SessionStore::new("m".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let config_dir = tempfile::tempdir().expect("config dir");
@@ -4944,10 +4950,9 @@ done
 
         assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
         assert!(
-            bifrost_log.exists(),
-            "cold-loaded ACP empty MCP list should still spawn persisted default bifrost"
+            !bifrost_log.exists(),
+            "cold-loaded ACP empty MCP list should not spawn persisted default bifrost"
         );
-        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
     }
 
     /// ACP-provided MCP servers are additive to canonical Bifrost.
@@ -4991,8 +4996,12 @@ done
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
             .await;
 
-        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
-        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
+        let canonical_cwd = normalize_cwd(cwd.path());
+        assert_eq!(registry.cwd(), canonical_cwd.as_path());
+        assert_eq!(
+            read_log_lines(&bifrost_log),
+            bifrost_spawn_args(&canonical_cwd)
+        );
         assert!(extra_log.exists(), "extra ACP MCP server should also spawn");
         assert!(
             !read_log_lines(&extra_log).is_empty(),
@@ -5047,8 +5056,12 @@ done
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
             .await;
 
-        assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
-        assert_eq!(read_log_lines(&bifrost_log), bifrost_spawn_args(cwd.path()));
+        let canonical_cwd = normalize_cwd(cwd.path());
+        assert_eq!(registry.cwd(), canonical_cwd.as_path());
+        assert_eq!(
+            read_log_lines(&bifrost_log),
+            bifrost_spawn_args(&canonical_cwd)
+        );
         assert!(
             !extra_log.exists(),
             "duplicate ACP bifrost server should be ignored"

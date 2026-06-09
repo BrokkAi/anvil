@@ -356,10 +356,10 @@ pub(crate) async fn compose_no_edit_nudge(
     let mut hints = Vec::new();
     let mut usage = TokenUsage::default();
     for file in unread {
-        match request_hint_with_retries(
+        match request_hint_with_retries(HintRequest {
             llm,
             turn,
-            HintRequestContext {
+            context: HintRequestContext {
                 messages,
                 tool_exchanges,
                 file,
@@ -368,7 +368,7 @@ pub(crate) async fn compose_no_edit_nudge(
             },
             cancel,
             idle_timeout,
-        )
+        })
         .await
         {
             Ok((hint, hint_usage)) => {
@@ -409,22 +409,24 @@ pub(crate) async fn compose_no_edit_nudge(
     Some((nudge, usage))
 }
 
-async fn request_hint_with_retries(
-    llm: &Arc<dyn LlmBackend>,
+struct HintRequest<'a> {
+    llm: &'a Arc<dyn LlmBackend>,
     turn: usize,
-    context: HintRequestContext<'_>,
-    cancel: &CancellationToken,
+    context: HintRequestContext<'a>,
+    cancel: &'a CancellationToken,
     idle_timeout: Duration,
-) -> Result<(String, TokenUsage)> {
+}
+
+async fn request_hint_with_retries(req: HintRequest<'_>) -> Result<(String, TokenUsage)> {
     let mut last_error = None;
     for attempt in 1..=HINT_MAX_ATTEMPTS {
-        match request_hint(llm, turn, attempt, context, cancel, idle_timeout).await {
+        match request_hint(&req, attempt).await {
             Ok(result) => return Ok(result),
             Err(error) => {
                 append_trace_record(serde_json::json!({
                     "type": "train_bifrost_hint_retry",
-                    "turn": turn,
-                    "file": context.file.path,
+                    "turn": req.turn,
+                    "file": req.context.file.path,
                     "attempt": attempt,
                     "max_attempts": HINT_MAX_ATTEMPTS,
                     "error": format!("{error:#}"),
@@ -436,19 +438,12 @@ async fn request_hint_with_retries(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("hint request failed")))
 }
 
-async fn request_hint(
-    llm: &Arc<dyn LlmBackend>,
-    turn: usize,
-    attempt: usize,
-    context: HintRequestContext<'_>,
-    cancel: &CancellationToken,
-    idle_timeout: Duration,
-) -> Result<(String, TokenUsage)> {
+async fn request_hint(req: &HintRequest<'_>, attempt: usize) -> Result<(String, TokenUsage)> {
     append_trace_record(serde_json::json!({
         "type": "train_bifrost_hint_request",
-        "turn": turn,
+        "turn": req.turn,
         "attempt": attempt,
-        "file": context.file.path,
+        "file": req.context.file.path,
         "model": TRAIN_BIFROST_HINT_MODEL,
     }));
 
@@ -456,14 +451,15 @@ async fn request_hint(
         ChatMessage::system(HINT_SYSTEM_PROMPT),
         ChatMessage::user(format!(
             "<conversation>\n{}\n</conversation>\n\n<sidecar_file_summaries>\n{}\n</sidecar_file_summaries>\n\n<deterministic_nudges_already_planned>\n{}\n</deterministic_nudges_already_planned>\n\n<golden_file_diff>\n{}\n</golden_file_diff>\n\nReturn one concise source-discovery hint. It should help the active model decide what to inspect next, not what code to write. Do not repeat any deterministic nudge already planned above.",
-            conversation_for_hint(context.messages, context.tool_exchanges),
-            sidecar_summaries_for_hint(context.packet),
-            deterministic_nudges_for_hint(context.deterministic_nudges),
-            context.file.diff
+            conversation_for_hint(req.context.messages, req.context.tool_exchanges),
+            sidecar_summaries_for_hint(req.context.packet),
+            deterministic_nudges_for_hint(req.context.deterministic_nudges),
+            req.context.file.diff
         )),
     ];
 
-    let response = llm
+    let response = req
+        .llm
         .stream_chat(StreamChatRequest {
             model: TRAIN_BIFROST_HINT_MODEL.to_string(),
             messages: prompt_messages,
@@ -472,11 +468,11 @@ async fn request_hint(
             structured_output: None,
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
-            cancel: cancel.clone(),
-            idle_timeout,
+            cancel: req.cancel.clone(),
+            idle_timeout: req.idle_timeout,
         })
         .await
-        .with_context(|| format!("hint model request failed for {}", context.file.path))?;
+        .with_context(|| format!("hint model request failed for {}", req.context.file.path))?;
 
     let usage = response.usage();
     let text = match response {
@@ -487,9 +483,9 @@ async fn request_hint(
         .with_context(|| format!("hint model returned malformed JSON: {}", text.trim()))?;
     append_trace_record(serde_json::json!({
         "type": "train_bifrost_hint_response",
-        "turn": turn,
+        "turn": req.turn,
         "attempt": attempt,
-        "file": context.file.path,
+        "file": req.context.file.path,
         "hint": parsed.hint,
     }));
     Ok((parsed.hint, usage))

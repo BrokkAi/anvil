@@ -899,7 +899,6 @@ pub(crate) async fn run(
             &messages,
             request_tools.as_ref(),
         );
-
         let response = stream_chat_with_transient_retry(
             llm,
             turn,
