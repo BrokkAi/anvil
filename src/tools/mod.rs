@@ -516,7 +516,7 @@ impl ToolRegistry {
         if builtin_tools.contains("run_shell_command") {
             defs.push(tool_def(
                 "run_shell_command",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. Commands run in the sandbox by default; if a sandboxed attempt fails and you determine the sandbox boundary is likely the cause, retry with `sandbox_permissions: \"require_escalated\"` to ask the user for one-time unsandboxed permission.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -527,6 +527,11 @@ impl ToolRegistry {
                         "timeout": {
                             "type": "number",
                             "description": "Optional timeout in milliseconds."
+                        },
+                        "sandbox_permissions": {
+                            "type": "string",
+                            "enum": ["require_escalated"],
+                            "description": "Set to `require_escalated` only when retrying a command that failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation or writes outside the workspace). This asks the user for permission to run the command outside the OS sandbox once. Do not set it on the first attempt."
                         },
                         "description": {
                             "type": "string",
