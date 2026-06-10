@@ -90,6 +90,7 @@ fn build_anthropic_request(
     messages: Vec<BedrockMessage>,
     tools: Option<Vec<BedrockTool>>,
     effort: Option<&str>,
+    temperature: Option<f64>,
     shape: ThinkingShape,
 ) -> BedrockAnthropicRequest {
     let mut request = BedrockAnthropicRequest {
@@ -98,7 +99,7 @@ fn build_anthropic_request(
         messages,
         tools,
         max_tokens: MAX_TOKENS,
-        temperature: None,
+        temperature,
         thinking: None,
         output_config: None,
     };
@@ -109,10 +110,12 @@ fn build_anthropic_request(
         ThinkingShape::Enabled => {
             if let Some(budget_tokens) = thinking_budget_for_effort(effort) {
                 request.max_tokens = thinking_max_tokens(budget_tokens);
+                request.temperature = None;
                 request.thinking = Some(BedrockThinking::Enabled { budget_tokens });
             }
         }
         ThinkingShape::Adaptive => {
+            request.temperature = None;
             request.thinking = Some(BedrockThinking::Adaptive);
             request.output_config = Some(BedrockOutputConfig {
                 effort: effort.to_string(),
@@ -383,6 +386,7 @@ impl BedrockClient {
             messages,
             tools,
             reasoning_effort,
+            temperature,
             structured_output: _,
             mut on_token,
             mut on_thought,
@@ -431,6 +435,7 @@ impl BedrockClient {
                 messages.clone(),
                 tools.clone(),
                 effort.as_deref(),
+                temperature,
                 shape,
             );
             trace_bedrock_request(&body);
@@ -513,6 +518,7 @@ impl BedrockClient {
             messages,
             tools,
             reasoning_effort,
+            temperature: _temperature,
             structured_output,
             on_token,
             on_thought,
@@ -1811,6 +1817,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: Some("medium".to_string()),
+                temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
@@ -1868,6 +1875,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: Some("high".to_string()),
+                temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
@@ -1958,6 +1966,7 @@ mod tests {
                     messages: vec![ChatMessage::user("hi")],
                     tools: None,
                     reasoning_effort: Some("high".to_string()),
+                    temperature: None,
                     structured_output: None,
                     on_token: Box::new(|_| {}),
                     on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
@@ -2021,6 +2030,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: None,
+                temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
@@ -2065,6 +2075,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: None,
+                temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
@@ -2131,6 +2142,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: None,
+                temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
@@ -2190,6 +2202,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: None,
+                temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),

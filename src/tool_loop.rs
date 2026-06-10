@@ -1,6 +1,5 @@
 mod announce;
 
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -21,6 +20,7 @@ use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
     messages_include_images, rewrite_image_prompt_provider_error,
 };
+use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::structured_output::StructuredOutputRequest;
 use crate::terminal_notifications::{
@@ -35,25 +35,15 @@ const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 
 fn train_bifrost_enabled() -> bool {
-    env::var(TRAIN_BIFROST_ENV).ok().is_some_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    p2t::env_var_truthy(TRAIN_BIFROST_ENV)
 }
 
 fn train_bifrost_initial_builtin_tools() -> std::collections::HashSet<String> {
-    ["write_file", "edit", "list_directory"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    p2t::p2t_initial_builtin_tools()
 }
 
 fn train_bifrost_post_edit_builtin_tools() -> std::collections::HashSet<String> {
-    let mut tools = train_bifrost_initial_builtin_tools();
-    tools.insert("run_shell_command".to_string());
-    tools
+    p2t::p2t_post_edit_builtin_tools()
 }
 
 fn advertised_tool_names(tools: Option<&Vec<ToolDefinition>>) -> std::collections::HashSet<String> {
@@ -67,6 +57,11 @@ fn tool_unavailable_message(tool_name: &str) -> String {
     format!(
         "Error: tool '{tool_name}' is unavailable in the current tool catalog. Retry using a currently advertised tool."
     )
+}
+
+struct ExecutedStepOutcome {
+    results: Vec<p2t::PrefixToolResult>,
+    cancelled: bool,
 }
 
 fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
@@ -89,6 +84,7 @@ async fn stream_chat_with_transient_retry(
     messages: &[ChatMessage],
     tools: Option<Vec<ToolDefinition>>,
     reasoning_effort: Option<&str>,
+    temperature: Option<f64>,
     structured_output: Option<&StructuredOutputRequest>,
     on_text: &TextSink,
     on_thought: &TextSink,
@@ -127,6 +123,7 @@ async fn stream_chat_with_transient_retry(
                 messages: messages.to_vec(),
                 tools: tools.clone(),
                 reasoning_effort: reasoning_effort.map(str::to_string),
+                temperature,
                 structured_output: structured_output.cloned(),
                 on_token,
                 on_thought: on_thought_cb,
@@ -775,6 +772,20 @@ pub(crate) async fn run(
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
     let train_bifrost = train_bifrost_enabled();
+    let p2t_config = match p2t::load_config_from_env(train_bifrost) {
+        Ok(config) => config,
+        Err(error) => {
+            append_trace_record(serde_json::json!({
+                "type": "p2t_config_error",
+                "error": format!("{error:#}"),
+            }));
+            return (
+                format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
+                Vec::new(),
+                TokenUsage::default(),
+            );
+        }
+    };
     let training_packet = if train_bifrost {
         match train_bifrost::load_packet_from_env() {
             Ok(packet) => Some(packet),
@@ -793,10 +804,38 @@ pub(crate) async fn run(
     } else {
         None
     };
+    let prefix_steps = if let Some(config) = p2t_config.as_ref() {
+        match config.prefix_steps.as_deref() {
+            Some(path) => match p2t::load_prefix_steps(path) {
+                Ok(steps) => steps,
+                Err(error) => {
+                    append_trace_record(serde_json::json!({
+                        "type": "p2t_prefix_error",
+                        "error": format!("{error:#}"),
+                    }));
+                    return (
+                        format!("BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"),
+                        Vec::new(),
+                        TokenUsage::default(),
+                    );
+                }
+            },
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     if train_bifrost {
         registry
             .set_builtin_tools(train_bifrost_initial_builtin_tools())
             .await;
+    } else if p2t_config.is_some() {
+        let builtin_tools = if p2t::prefix_unlocks_shell(&prefix_steps) {
+            p2t::p2t_post_edit_builtin_tools()
+        } else {
+            p2t::p2t_initial_builtin_tools()
+        };
+        registry.set_builtin_tools(builtin_tools).await;
     }
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
     // Nested runs (subagents) must not see the `task` tool themselves --
@@ -818,14 +857,108 @@ pub(crate) async fn run(
     let mut turn_usage = TokenUsage::default();
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
-    let turn_limit = if train_bifrost {
+    if let Some(config) = p2t_config.as_ref() {
+        p2t::append_prefix_messages(&mut messages, &prefix_steps);
+        // Self-contained trace contract: record the exact message context
+        // (system prompt, user prompt, injected prefix) and advertised tools
+        // this window starts from, so trajectories can be exported to
+        // training rows without consulting anvil internals.
+        p2t::append_window_start_trace(&config.step_trace_out, &messages, &tools);
+        if let Some(snapshot_dir) = config
+            .snapshot_dir
+            .as_ref()
+            .filter(|_| config.max_steps > 0)
+        {
+            snapshot_p2t_workspace_best_effort(config, registry.cwd(), snapshot_dir, 0);
+        }
+    }
+    let mut p2t_steps_executed = 0usize;
+    let mut p2t_stop_reason: Option<P2tStopReason> = None;
+    let turn_limit = if let Some(config) = p2t_config.as_ref() {
+        config.max_steps
+    } else if train_bifrost {
         max_turns.saturating_add(1)
     } else {
         max_turns
     };
+    if p2t_config
+        .as_ref()
+        .is_some_and(|config| config.max_steps == 0)
+    {
+        p2t_stop_reason = Some(P2tStopReason::WindowEnd);
+    }
     'outer: for turn in 0..turn_limit {
+        if p2t_stop_reason.is_some() {
+            break;
+        }
         if cancel.is_cancelled() {
             break;
+        }
+        if let Some((config, forced_step)) = p2t_config
+            .as_ref()
+            .and_then(|config| config.forced_first_step.as_ref().map(|step| (config, step)))
+            .filter(|_| p2t_steps_executed == 0)
+        {
+            let calls = p2t::forced_step_to_tool_calls(forced_step);
+            let advertised_this_request = advertised_tool_names(Some(&tools));
+            if !forced_step.assistant_text.is_empty() {
+                full_response.push_str(&forced_step.assistant_text);
+            }
+            messages.push(p2t::forced_step_to_message(forced_step));
+
+            let outcome = execute_step_tool_calls(
+                llm,
+                registry,
+                model,
+                reasoning_effort,
+                structured_output,
+                &calls,
+                &advertised_this_request,
+                &mut messages,
+                &mut tool_exchanges,
+                &mut turn_usage,
+                max_turns,
+                idle_timeout,
+                cancel.clone(),
+                &spawned_cx,
+                &session_id,
+                &sessions,
+                notifications,
+                depth,
+            )
+            .await;
+            if outcome.cancelled {
+                break;
+            }
+            maybe_unlock_shell_after_file_change(
+                train_bifrost,
+                p2t_config.is_some(),
+                registry,
+                &tool_exchanges,
+                &mut tools,
+                depth,
+            )
+            .await;
+
+            p2t_steps_executed += 1;
+            record_p2t_step(
+                config,
+                registry.cwd(),
+                StepTraceRecord {
+                    record_type: "step",
+                    step: p2t_steps_executed,
+                    forced: true,
+                    assistant_text: forced_step.assistant_text.clone(),
+                    tool_calls: forced_step.tool_calls.clone(),
+                    results: outcome.results,
+                },
+            );
+            p2t_stop_reason =
+                p2t::stop_reason_after_step(p2t_steps_executed, config.max_steps, calls.len());
+            if p2t_stop_reason.is_some() {
+                break;
+            }
+            continue;
         }
         let permission_mode = sessions
             .permission_mode(&session_id)
@@ -881,8 +1014,9 @@ pub(crate) async fn run(
         // change has succeeded yet, keep tools available so a hard task does
         // not end with a false "I cannot edit" answer solely because the
         // harness withheld edit/write tools on the final turn.
-        let force_text_response =
-            turn >= max_turns - 1 && has_successful_file_change(&tool_exchanges);
+        let force_text_response = p2t_config.is_none()
+            && turn >= max_turns - 1
+            && has_successful_file_change(&tool_exchanges);
         let turn_tools = if !force_text_response {
             Some(tools.clone())
         } else {
@@ -912,6 +1046,7 @@ pub(crate) async fn run(
             &messages,
             request_tools,
             reasoning_effort,
+            p2t_config.as_ref().and_then(|config| config.temperature),
             structured_output,
             &on_text,
             &on_thought,
@@ -924,6 +1059,23 @@ pub(crate) async fn run(
             Ok(LlmResponse::Text { text, usage }) => {
                 trace_llm_text_response(turn, &text, usage);
                 turn_usage.add(usage);
+                if let Some(config) = p2t_config.as_ref() {
+                    p2t_steps_executed += 1;
+                    record_p2t_step(
+                        config,
+                        registry.cwd(),
+                        StepTraceRecord {
+                            record_type: "step",
+                            step: p2t_steps_executed,
+                            forced: false,
+                            assistant_text: text.clone(),
+                            tool_calls: Vec::new(),
+                            results: Vec::new(),
+                        },
+                    );
+                    p2t_stop_reason =
+                        p2t::stop_reason_after_step(p2t_steps_executed, config.max_steps, 0);
+                }
                 if train_bifrost
                     && should_reject_no_edit_final_answer(
                         permission_mode,
@@ -1033,391 +1185,68 @@ pub(crate) async fn run(
                 // Record the assistant message with tool_calls
                 messages.push(ChatMessage::assistant_tool_calls(calls.clone()));
 
-                // Execute each tool call
-                for call_index in
-                    ordered_tool_call_indices(&calls, |name| registry.is_bifrost_tool(name))
-                {
-                    let call = &calls[call_index];
-                    if cancel.is_cancelled() {
-                        // The user cancelled mid-batch; stop issuing more
-                        // permission prompts and tool executions.
-                        break 'outer;
-                    }
-
-                    let tool_name = call.function.name.clone();
-                    let kind = ToolRegistry::tool_kind(&tool_name);
-
-                    // Parse the LLM's serialized arguments up front so the
-                    // tool-call card can pull `path` / `command` / `pattern`
-                    // out for the title, and so an arg-parse failure becomes
-                    // a Failed card rather than a silent fallback.
-                    let parsed_input = match serde_json::from_str::<Value>(&call.function.arguments)
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let reason = format!(
-                                "Error: tool arguments are not valid JSON ({e}). \
-                                 Please retry with a valid JSON object matching the tool schema."
-                            );
-                            // Render the card anyway so the user sees what
-                            // the agent tried to invoke -- raw_input falls
-                            // back to the unparsed string.
-                            maybe_send_session_update(
-                                notifications,
-                                spawned_cx.cx(),
-                                &session_id,
-                                SessionUpdate::ToolCall(announce::initial_tool_call(
-                                    &call.id,
-                                    &tool_name,
-                                    kind,
-                                    &Value::String(call.function.arguments.clone()),
-                                )),
-                            );
-                            maybe_send_session_update(
-                                notifications,
-                                spawned_cx.cx(),
-                                &session_id,
-                                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                                    &call.id,
-                                    &reason,
-                                    Some(Value::String(reason.clone())),
-                                )),
-                            );
-                            messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
-                            // Record the failed exchange so a session/load
-                            // sees that the model attempted this call (with
-                            // unparseable args) and got rejected; without it
-                            // the model might re-emit the same broken call.
-                            tool_exchanges.push(ToolExchange {
-                                call_id: call.id.clone(),
-                                tool_name: tool_name.clone(),
-                                arguments: call.function.arguments.clone(),
-                                result: reason,
-                            });
-                            continue;
-                        }
-                    };
-
-                    // Refuse outright if the permission card would hide input.
-                    // Two separate gates apply:
-                    //   • Non-shell tools: title length capped at
-                    //     MAX_TOOL_TITLE_CHARS (1024 chars).
-                    //   • Shell commands: full command text capped at
-                    //     MAX_INLINE_OUTPUT_BYTES (50 000 bytes). The modal
-                    //     title carries the full command for clients that only
-                    //     render the title, so the content-size bound is the
-                    //     right limit for shell.
-                    // Reject rather than truncating; the LLM can retry with
-                    // smaller arguments.
-                    if let Some(reason) = announce::rejection_for_oversized_title(
-                        &tool_name,
-                        &parsed_input,
-                    )
-                    .or_else(|| {
-                        announce::rejection_for_oversized_input_content(&tool_name, &parsed_input)
-                    }) {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            tool_name = %tool_name,
-                            title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
-                                .chars()
-                                .count(),
-                            "rejecting tool call: rendered permission card would hide input",
-                        );
-                        maybe_send_session_update(
-                            notifications,
-                            spawned_cx.cx(),
-                            &session_id,
-                            SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
-                                &call.id,
-                                &tool_name,
-                                kind,
-                                &parsed_input,
-                            )),
-                        );
-                        maybe_send_session_update(
-                            notifications,
-                            spawned_cx.cx(),
-                            &session_id,
-                            SessionUpdate::ToolCallUpdate(announce::update_failed(
-                                &call.id,
-                                &reason,
-                                Some(Value::String(reason.clone())),
-                            )),
-                        );
-                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
-                        tool_exchanges.push(ToolExchange {
-                            call_id: call.id.clone(),
-                            tool_name: tool_name.clone(),
-                            arguments: call.function.arguments.clone(),
-                            result: reason,
-                        });
-                        continue;
-                    }
-
-                    if let Some(message) = deterministic_gate_rejection(
-                        &sessions,
-                        &session_id,
-                        &tool_name,
-                        kind,
-                        &parsed_input,
-                        registry.cwd(),
-                    )
-                    .await
-                    {
-                        let (blocked_call, failed_update) = blocked_tool_call_updates(
-                            &call.id,
-                            &tool_name,
-                            kind,
-                            &parsed_input,
-                            &message,
-                        );
-                        maybe_send_session_update(
-                            notifications,
-                            spawned_cx.cx(),
-                            &session_id,
-                            SessionUpdate::ToolCall(blocked_call),
-                        );
-                        maybe_send_session_update(
-                            notifications,
-                            spawned_cx.cx(),
-                            &session_id,
-                            SessionUpdate::ToolCallUpdate(failed_update),
-                        );
-                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
-                        tool_exchanges.push(ToolExchange {
-                            call_id: call.id.clone(),
-                            tool_name: tool_name.clone(),
-                            arguments: call.function.arguments.clone(),
-                            result: message,
-                        });
-                        continue;
-                    }
-
-                    // Pending -- emit the card before the gate runs so the
-                    // permission modal (which reuses this id) renders against
-                    // a card that already shows path / command / etc.
-                    maybe_send_session_update(
-                        notifications,
-                        spawned_cx.cx(),
-                        &session_id,
-                        SessionUpdate::ToolCall(announce::initial_tool_call(
-                            &call.id,
-                            &tool_name,
-                            kind,
-                            &parsed_input,
-                        )),
-                    );
-
-                    if !advertised_this_request.contains(tool_name.as_str()) {
-                        let message = tool_unavailable_message(&tool_name);
-                        maybe_send_session_update(
-                            notifications,
-                            spawned_cx.cx(),
-                            &session_id,
-                            SessionUpdate::ToolCallUpdate(announce::update_failed(
-                                &call.id,
-                                &message,
-                                Some(Value::String(message.clone())),
-                            )),
-                        );
-                        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
-                        tool_exchanges.push(ToolExchange {
-                            call_id: call.id.clone(),
-                            tool_name: tool_name.clone(),
-                            arguments: call.function.arguments.clone(),
-                            result: message,
-                        });
-                        continue;
-                    }
-
-                    // Consult the gate before announcing or executing the call.
-                    let decision = consult_gate(
-                        &sessions,
-                        &spawned_cx,
-                        &cancel,
-                        GateCheck {
-                            session_id: &session_id,
-                            tool_name: &tool_name,
-                            kind,
-                            tool_call_id: &call.id,
-                            raw_input: &parsed_input,
-                            cwd: registry.cwd(),
-                        },
-                    )
-                    .await;
-
-                    let output = match decision {
-                        GateDecision::Reject(message) => {
-                            // Failed terminal update so the card reflects the
-                            // denial and doesn't sit at Pending forever.
-                            maybe_send_session_update(
-                                notifications,
-                                spawned_cx.cx(),
-                                &session_id,
-                                SessionUpdate::ToolCallUpdate(announce::update_failed(
-                                    &call.id,
-                                    &message,
-                                    Some(Value::String(message.clone())),
-                                )),
-                            );
-                            message
-                        }
-                        GateDecision::Allow {
-                            sandbox_policy_override,
-                            sandbox_mode,
-                        } => {
-                            maybe_send_session_update(
-                                notifications,
-                                spawned_cx.cx(),
-                                &session_id,
-                                SessionUpdate::ToolCallUpdate(announce::update_in_progress(
-                                    &call.id,
-                                )),
-                            );
-
-                            // Capture pre-write content so write/edit tools get a
-                            // real Diff card. Outer None == not an edit tool,
-                            // or prior content unavailable (binary, missing
-                            // parent dir we can't resolve, etc) -- in either
-                            // case we fall back to text content. Inner None
-                            // (per ACP `Diff.old_text` schema) == new file.
-                            let pre_write: Option<Option<String>> =
-                                if matches!(tool_name.as_str(), "write_file" | "edit") {
-                                    capture_pre_write_text(registry.cwd(), &parsed_input)
-                                } else {
-                                    None
-                                };
-
-                            // Resolve the sandbox tier from the session's permission mode.
-                            // If the session disappeared between gate-accept and exec
-                            // (race), fail safe to ReadOnly: the gate already cleared
-                            // the call but we no longer trust the mode lookup.
-                            let permission_mode = sessions.permission_mode(&session_id).await;
-                            if permission_mode.is_none() {
-                                tracing::warn!(
-                                    session_id,
-                                    tool_name,
-                                    outside_sandbox_once = sandbox_policy_override.is_some(),
-                                    "session vanished between gate-accept and exec; falling back to ReadOnly sandbox"
-                                );
-                            }
-                            let (policy, outside_sandbox_once) = resolve_execution_policy(
-                                permission_mode,
-                                sandbox_mode,
-                                sandbox_policy_override,
-                            );
-
-                            tracing::info!(
-                                "executing tool {} with args: {} (sandbox={:?}, outside_sandbox_once={})",
-                                tool_name,
-                                call.function.arguments,
-                                policy,
-                                outside_sandbox_once
-                            );
-
-                            // `task` short-circuits the registry: it needs
-                            // `llm`/`spawned_cx`/`sessions` to spin up a
-                            // nested `run()` for the subagent, none of
-                            // which the registry sees. The gate has
-                            // already cleared this call (kind=Other =>
-                            // prompted in `default`, refused in
-                            // `readOnly`), so by the time we get here we
-                            // know the user has authorized the dispatch.
-                            let exec = if tool_name == "task" {
-                                let (exec, nested_usage) = execute_subagent(
-                                    llm,
-                                    registry,
-                                    model,
-                                    reasoning_effort,
-                                    structured_output,
-                                    &parsed_input,
-                                    max_turns,
-                                    idle_timeout,
-                                    cancel.clone(),
-                                    &spawned_cx,
-                                    &session_id,
-                                    &sessions,
-                                    depth + 1,
-                                )
-                                .await;
-                                // A subagent burns its own tokens against
-                                // the same upstream account; surface them
-                                // in the parent's `PromptResponse.usage`
-                                // so the client sees the true cost of the
-                                // turn, not just the parent's own calls.
-                                turn_usage.add(nested_usage);
-                                exec
-                            } else {
-                                trace_bifrost_context_shadow(
-                                    &tool_name,
-                                    &parsed_input,
-                                    &tool_exchanges,
-                                );
-                                execute_tool(
-                                    registry,
-                                    &tool_name,
-                                    parsed_input.clone(),
-                                    policy,
-                                    outside_sandbox_once,
-                                    sandbox_mode,
-                                )
-                                .await
-                            };
-
-                            // Build the terminal update -- Completed (with a
-                            // Diff for write/edit tools when we have prior content)
-                            // or Failed (for tool-reported errors).
-                            let update = if exec.failed {
-                                announce::update_failed_with_input(
-                                    &call.id,
-                                    &tool_name,
-                                    &parsed_input,
-                                    &exec.output,
-                                    Some(Value::String(exec.output.clone())),
-                                )
-                            } else {
-                                let diff = pre_write.and_then(|prior| {
-                                    build_editing_diff(&tool_name, &parsed_input, prior)
-                                });
-                                announce::update_completed(
-                                    &call.id,
-                                    &tool_name,
-                                    &parsed_input,
-                                    &exec.output,
-                                    diff,
-                                )
-                            };
-                            maybe_send_session_update(
-                                notifications,
-                                spawned_cx.cx(),
-                                &session_id,
-                                SessionUpdate::ToolCallUpdate(update),
-                            );
-                            exec.output
-                        }
-                    };
-
-                    messages.push(ChatMessage::tool_result(&call.id, &tool_name, &output));
-                    tool_exchanges.push(ToolExchange {
-                        call_id: call.id.clone(),
-                        tool_name: tool_name.clone(),
-                        arguments: call.function.arguments.clone(),
-                        result: output,
-                    });
+                let outcome = execute_step_tool_calls(
+                    llm,
+                    registry,
+                    model,
+                    reasoning_effort,
+                    structured_output,
+                    &calls,
+                    &advertised_this_request,
+                    &mut messages,
+                    &mut tool_exchanges,
+                    &mut turn_usage,
+                    max_turns,
+                    idle_timeout,
+                    cancel.clone(),
+                    &spawned_cx,
+                    &session_id,
+                    &sessions,
+                    notifications,
+                    depth,
+                )
+                .await;
+                if outcome.cancelled {
+                    break 'outer;
                 }
-                if train_bifrost
-                    && has_successful_file_change(&tool_exchanges)
-                    && !registry
-                        .is_builtin_tool_advertised("run_shell_command")
-                        .await
-                {
-                    registry
-                        .set_builtin_tools(train_bifrost_post_edit_builtin_tools())
-                        .await;
-                    tools = registry.tool_definitions().await;
-                    if depth >= MAX_SUBAGENT_DEPTH {
-                        tools.retain(|t| t.function.name != "task");
+                let step_results = outcome.results;
+                maybe_unlock_shell_after_file_change(
+                    train_bifrost,
+                    p2t_config.is_some(),
+                    registry,
+                    &tool_exchanges,
+                    &mut tools,
+                    depth,
+                )
+                .await;
+                if let Some(config) = p2t_config.as_ref() {
+                    p2t_steps_executed += 1;
+                    record_p2t_step(
+                        config,
+                        registry.cwd(),
+                        StepTraceRecord {
+                            record_type: "step",
+                            step: p2t_steps_executed,
+                            forced: false,
+                            assistant_text: text.clone(),
+                            tool_calls: calls
+                                .iter()
+                                .map(|call| p2t::PrefixToolCall {
+                                    id: call.id.clone(),
+                                    name: call.function.name.clone(),
+                                    arguments: call.function.arguments.clone(),
+                                })
+                                .collect(),
+                            results: step_results,
+                        },
+                    );
+                    p2t_stop_reason = p2t::stop_reason_after_step(
+                        p2t_steps_executed,
+                        config.max_steps,
+                        calls.len(),
+                    );
+                    if p2t_stop_reason.is_some() {
+                        break;
                     }
                 }
                 if train_bifrost
@@ -1488,7 +1317,418 @@ pub(crate) async fn run(
         }
     }
 
+    if let Some(config) = p2t_config.as_ref().filter(|_| p2t_stop_reason.is_some()) {
+        p2t::append_window_end_trace(
+            &config.step_trace_out,
+            p2t_stop_reason.expect("checked above"),
+            p2t_steps_executed,
+        );
+    }
+
     (full_response, tool_exchanges, turn_usage)
+}
+
+fn record_p2t_step(config: &p2t::P2tConfig, cwd: &Path, record: StepTraceRecord) {
+    let step = record.step;
+    p2t::append_step_trace(&config.step_trace_out, &record);
+    if let Some(snapshot_dir) = config.snapshot_dir.as_ref() {
+        snapshot_p2t_workspace_best_effort(config, cwd, snapshot_dir, step);
+    }
+}
+
+fn snapshot_p2t_workspace_best_effort(
+    config: &p2t::P2tConfig,
+    cwd: &Path,
+    snapshot_dir: &Path,
+    step: usize,
+) {
+    if let Err(error) = p2t::snapshot_workspace(cwd, snapshot_dir, step) {
+        let rendered = format!("{error:#}");
+        tracing::warn!(
+            step,
+            cwd = %cwd.display(),
+            snapshot_dir = %snapshot_dir.display(),
+            error = %rendered,
+            "failed to capture P2T workspace snapshot"
+        );
+        p2t::append_snapshot_error_trace(&config.step_trace_out, step, &rendered);
+    }
+}
+
+async fn maybe_unlock_shell_after_file_change(
+    train_bifrost: bool,
+    p2t_enabled: bool,
+    registry: &ToolRegistry,
+    tool_exchanges: &[ToolExchange],
+    tools: &mut Vec<ToolDefinition>,
+    depth: usize,
+) {
+    if !(train_bifrost || p2t_enabled)
+        || !has_successful_file_change(tool_exchanges)
+        || registry
+            .is_builtin_tool_advertised("run_shell_command")
+            .await
+    {
+        return;
+    }
+
+    registry
+        .set_builtin_tools(train_bifrost_post_edit_builtin_tools())
+        .await;
+    *tools = registry.tool_definitions().await;
+    if depth >= MAX_SUBAGENT_DEPTH {
+        tools.retain(|t| t.function.name != "task");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_step_tool_calls(
+    llm: &Arc<dyn LlmBackend>,
+    registry: &ToolRegistry,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    calls: &[ToolCall],
+    advertised_this_request: &std::collections::HashSet<String>,
+    messages: &mut Vec<ChatMessage>,
+    tool_exchanges: &mut Vec<ToolExchange>,
+    turn_usage: &mut TokenUsage,
+    max_turns: usize,
+    idle_timeout: Duration,
+    cancel: CancellationToken,
+    spawned_cx: &SpawnedCx<'_>,
+    session_id: &str,
+    sessions: &SessionStore,
+    notifications: NotificationMode,
+    depth: usize,
+) -> ExecutedStepOutcome {
+    let mut step_results = Vec::new();
+
+    for call_index in ordered_tool_call_indices(calls, |name| registry.is_bifrost_tool(name)) {
+        let call = &calls[call_index];
+        if cancel.is_cancelled() {
+            return ExecutedStepOutcome {
+                results: step_results,
+                cancelled: true,
+            };
+        }
+
+        let tool_name = call.function.name.clone();
+        let kind = ToolRegistry::tool_kind(&tool_name);
+
+        let parsed_input = match serde_json::from_str::<Value>(&call.function.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                let reason = format!(
+                    "Error: tool arguments are not valid JSON ({e}). \
+                     Please retry with a valid JSON object matching the tool schema."
+                );
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCall(announce::initial_tool_call(
+                        &call.id,
+                        &tool_name,
+                        kind,
+                        &Value::String(call.function.arguments.clone()),
+                    )),
+                );
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCallUpdate(announce::update_failed(
+                        &call.id,
+                        &reason,
+                        Some(Value::String(reason.clone())),
+                    )),
+                );
+                messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
+                step_results.push(p2t::PrefixToolResult {
+                    call_id: call.id.clone(),
+                    content: reason.clone(),
+                });
+                tool_exchanges.push(ToolExchange {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    result: reason,
+                });
+                continue;
+            }
+        };
+
+        if let Some(reason) = announce::rejection_for_oversized_title(&tool_name, &parsed_input)
+            .or_else(|| announce::rejection_for_oversized_input_content(&tool_name, &parsed_input))
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                tool_name = %tool_name,
+                title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
+                    .chars()
+                    .count(),
+                "rejecting tool call: rendered permission card would hide input",
+            );
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
+                    &call.id,
+                    &tool_name,
+                    kind,
+                    &parsed_input,
+                )),
+            );
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(announce::update_failed(
+                    &call.id,
+                    &reason,
+                    Some(Value::String(reason.clone())),
+                )),
+            );
+            messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
+            step_results.push(p2t::PrefixToolResult {
+                call_id: call.id.clone(),
+                content: reason.clone(),
+            });
+            tool_exchanges.push(ToolExchange {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: call.function.arguments.clone(),
+                result: reason,
+            });
+            continue;
+        }
+
+        if let Some(message) = deterministic_gate_rejection(
+            sessions,
+            session_id,
+            &tool_name,
+            kind,
+            &parsed_input,
+            registry.cwd(),
+        )
+        .await
+        {
+            let (blocked_call, failed_update) =
+                blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCall(blocked_call),
+            );
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(failed_update),
+            );
+            messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
+            step_results.push(p2t::PrefixToolResult {
+                call_id: call.id.clone(),
+                content: message.clone(),
+            });
+            tool_exchanges.push(ToolExchange {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: call.function.arguments.clone(),
+                result: message,
+            });
+            continue;
+        }
+
+        maybe_send_session_update(
+            notifications,
+            spawned_cx.cx(),
+            session_id,
+            SessionUpdate::ToolCall(announce::initial_tool_call(
+                &call.id,
+                &tool_name,
+                kind,
+                &parsed_input,
+            )),
+        );
+
+        if !advertised_this_request.contains(tool_name.as_str()) {
+            let message = tool_unavailable_message(&tool_name);
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(announce::update_failed(
+                    &call.id,
+                    &message,
+                    Some(Value::String(message.clone())),
+                )),
+            );
+            messages.push(ChatMessage::tool_result(&call.id, &tool_name, &message));
+            step_results.push(p2t::PrefixToolResult {
+                call_id: call.id.clone(),
+                content: message.clone(),
+            });
+            tool_exchanges.push(ToolExchange {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: call.function.arguments.clone(),
+                result: message,
+            });
+            continue;
+        }
+
+        let decision = consult_gate(
+            sessions,
+            spawned_cx,
+            &cancel,
+            GateCheck {
+                session_id,
+                tool_name: &tool_name,
+                kind,
+                tool_call_id: &call.id,
+                raw_input: &parsed_input,
+                cwd: registry.cwd(),
+            },
+        )
+        .await;
+
+        let output = match decision {
+            GateDecision::Reject(message) => {
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCallUpdate(announce::update_failed(
+                        &call.id,
+                        &message,
+                        Some(Value::String(message.clone())),
+                    )),
+                );
+                message
+            }
+            GateDecision::Allow {
+                sandbox_policy_override,
+                sandbox_mode,
+            } => {
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+                );
+
+                let pre_write: Option<Option<String>> =
+                    if matches!(tool_name.as_str(), "write_file" | "edit") {
+                        capture_pre_write_text(registry.cwd(), &parsed_input)
+                    } else {
+                        None
+                    };
+
+                let permission_mode = sessions.permission_mode(session_id).await;
+                if permission_mode.is_none() {
+                    tracing::warn!(
+                        session_id,
+                        tool_name,
+                        outside_sandbox_once = sandbox_policy_override.is_some(),
+                        "session vanished between gate-accept and exec; falling back to ReadOnly sandbox"
+                    );
+                }
+                let (policy, outside_sandbox_once) = resolve_execution_policy(
+                    permission_mode,
+                    sandbox_mode,
+                    sandbox_policy_override,
+                );
+
+                tracing::info!(
+                    "executing tool {} with args: {} (sandbox={:?}, outside_sandbox_once={})",
+                    tool_name,
+                    call.function.arguments,
+                    policy,
+                    outside_sandbox_once
+                );
+
+                let exec = if tool_name == "task" {
+                    let (exec, nested_usage) = execute_subagent(
+                        llm,
+                        registry,
+                        model,
+                        reasoning_effort,
+                        structured_output,
+                        &parsed_input,
+                        max_turns,
+                        idle_timeout,
+                        cancel.clone(),
+                        spawned_cx,
+                        session_id,
+                        sessions,
+                        depth + 1,
+                    )
+                    .await;
+                    turn_usage.add(nested_usage);
+                    exec
+                } else {
+                    trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
+                    execute_tool(
+                        registry,
+                        &tool_name,
+                        parsed_input.clone(),
+                        policy,
+                        outside_sandbox_once,
+                        sandbox_mode,
+                    )
+                    .await
+                };
+
+                let update = if exec.failed {
+                    announce::update_failed_with_input(
+                        &call.id,
+                        &tool_name,
+                        &parsed_input,
+                        &exec.output,
+                        Some(Value::String(exec.output.clone())),
+                    )
+                } else {
+                    let diff = pre_write
+                        .and_then(|prior| build_editing_diff(&tool_name, &parsed_input, prior));
+                    announce::update_completed(
+                        &call.id,
+                        &tool_name,
+                        &parsed_input,
+                        &exec.output,
+                        diff,
+                    )
+                };
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCallUpdate(update),
+                );
+                exec.output
+            }
+        };
+
+        messages.push(ChatMessage::tool_result(&call.id, &tool_name, &output));
+        step_results.push(p2t::PrefixToolResult {
+            call_id: call.id.clone(),
+            content: output.clone(),
+        });
+        tool_exchanges.push(ToolExchange {
+            call_id: call.id.clone(),
+            tool_name: tool_name.clone(),
+            arguments: call.function.arguments.clone(),
+            result: output,
+        });
+    }
+
+    ExecutedStepOutcome {
+        results: step_results,
+        cancelled: false,
+    }
 }
 
 fn blocked_tool_call_updates(
@@ -2575,6 +2815,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
@@ -2604,6 +2845,7 @@ mod tests {
             0,
             "codex::test",
             &[ChatMessage::user("hello")],
+            None,
             None,
             None,
             None,
@@ -2639,6 +2881,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
@@ -2671,6 +2914,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
@@ -2700,6 +2944,7 @@ mod tests {
             0,
             "bedrock::openai.gpt-5.4",
             &[ChatMessage::user("hello")],
+            None,
             None,
             None,
             None,

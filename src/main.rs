@@ -18,6 +18,7 @@ mod llm_client;
 mod mcp;
 mod multi_backend;
 mod openrouter_auth;
+mod p2t;
 mod responses_api;
 mod sandbox_backend;
 mod session;

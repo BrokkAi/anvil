@@ -228,6 +228,7 @@ impl CodexClient {
             messages,
             tools,
             reasoning_effort,
+            temperature: _temperature,
             structured_output,
             on_token,
             on_thought,
