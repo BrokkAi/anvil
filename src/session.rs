@@ -176,6 +176,8 @@ impl std::fmt::Display for PromptStartError {
 
 impl std::error::Error for PromptStartError {}
 
+pub(crate) const REASONING_EFFORT_OFF_VALUE: &str = "off";
+
 fn select_session_model(
     persisted_model: Option<String>,
     default_model: String,
@@ -204,6 +206,9 @@ fn select_session_reasoning_effort(
     let requested = persisted_reasoning_effort?.trim().to_string();
     if requested.is_empty() || model.is_empty() {
         return None;
+    }
+    if requested.eq_ignore_ascii_case(REASONING_EFFORT_OFF_VALUE) {
+        return Some(REASONING_EFFORT_OFF_VALUE.to_string());
     }
 
     let Some(meta) = catalog.iter().find(|meta| meta.id == model) else {
@@ -541,7 +546,8 @@ pub struct Session {
     always_allow_order: Vec<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
     /// `None` means "use the active model's `default_reasoning_level`";
-    /// `Some(_)` means "honor this exact level, fail if unsupported".
+    /// `Some("off")` means "omit reasoning controls"; any other `Some(_)`
+    /// means "honor this exact level, fail if unsupported".
     /// In-memory only -- the issue scope explicitly excludes
     /// workspace-level persistence for this knob.
     pub selected_reasoning_effort: Option<String>,
@@ -807,8 +813,9 @@ pub struct SessionSnapshot {
     pub history: Vec<ConversationTurn>,
     /// Reasoning-effort level to send on this turn, already resolved
     /// against the user's pick and the active model's
-    /// `default_reasoning_level`. `None` means the model exposes no
-    /// effort presets, so the backend will simply omit the field.
+    /// `default_reasoning_level`. `None` means either the model exposes no
+    /// effort presets or the user explicitly selected reasoning `off`, so
+    /// the backend will omit the field.
     pub reasoning_effort: Option<String>,
     /// Per-session override of the LLM SSE idle timeout (seconds).
     /// `None` means the caller should fall back to the binary-wide default.
@@ -2414,8 +2421,11 @@ impl SessionStore {
         // Resolve "user has no pick" to the model's
         // default_reasoning_level so the backend gets a concrete
         // intent. Models that publish no presets resolve to None and
-        // the backend omits the field entirely.
+        // the backend omits the field entirely. The explicit "off" pick
+        // also resolves to None, but unlike a missing pick it never falls
+        // through to the model default.
         let reasoning_effort = match selected_effort {
+            Some(eff) if eff == REASONING_EFFORT_OFF_VALUE => None,
             Some(eff) => Some(eff),
             None => self
                 .available_models
@@ -2994,6 +3004,8 @@ impl SessionStore {
     /// When the previously-selected reasoning effort isn't in the new
     /// model's supported set, the selection is auto-cleared so the next
     /// turn falls back to the new model's `default_reasoning_level`.
+    /// The explicit `off` pick is always preserved because it means
+    /// "send no reasoning controls" rather than a provider effort level.
     /// Returns the cleared value (if any) so the caller can notify the
     /// user, since silently dropping the pick would look like a bug
     /// next time they wonder why thoughts shortened.
@@ -3023,10 +3035,14 @@ impl SessionStore {
                     } else {
                         Some(model.clone())
                     };
-                    // Auto-fallback: if the user had a pick but the new
-                    // model doesn't advertise it, drop the pick. The
-                    // next snapshot resolves to the new model's default.
+                    // Auto-fallback: if the user had a provider effort
+                    // pick but the new model doesn't advertise it, drop
+                    // the pick. The next snapshot resolves to the new
+                    // model's default. Keep the explicit "off" sentinel:
+                    // it sends no provider effort and remains valid across
+                    // every model.
                     let cleared = match (&session.selected_reasoning_effort, &supported_effort) {
+                        (Some(eff), _) if eff == REASONING_EFFORT_OFF_VALUE => None,
                         (Some(eff), Some(supported)) if !supported.iter().any(|s| s == eff) => {
                             session.selected_reasoning_effort.take()
                         }
@@ -3072,7 +3088,8 @@ impl SessionStore {
     }
 
     /// Record the user's reasoning-effort pick for this session.
-    /// `None` clears it (back to "use model default"). Returns false
+    /// `None` clears it (back to "use model default"); `Some("off")`
+    /// explicitly omits provider reasoning controls. Returns false
     /// if the session is unknown. The session manifest still does not
     /// persist this; the install-wide preference file is updated
     /// separately so new sessions can inherit the last explicit pick.
@@ -4545,6 +4562,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// A configured default reasoning effort of "off" should seed later
+    /// sessions as an explicit opt-out and therefore omit provider
+    /// reasoning controls rather than falling back to the model default.
+    #[tokio::test]
+    async fn set_default_reasoning_off_drives_subsequent_create_session() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let store = SessionStore::new("gpt-mini".to_string());
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "gpt-mini".to_string(),
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevelPreset {
+                        effort: "low".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "medium".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    },
+                ],
+                supports_images: None,
+                context_length: None,
+                pricing: None,
+            }])
+            .await;
+        store
+            .set_default_reasoning_effort(Some(REASONING_EFFORT_OFF_VALUE.to_string()))
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-default-reasoning-off-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+        assert_eq!(
+            s.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&s.id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.reasoning_effort, None);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     /// `set_available_models` round-trips through `available_models` --
     /// this is the cache the agent populates on init and reuses for every
     /// `session/new` and `session/set_config_option` validation.
@@ -4647,6 +4715,82 @@ mod tests {
             .await
             .expect("session still loadable");
         assert_eq!(snap.reasoning_effort.as_deref(), Some("medium"));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The explicit "off" reasoning pick means "send no provider reasoning
+    /// controls", so it remains valid when switching to any model and must
+    /// not fall back to the new model's default.
+    #[tokio::test]
+    async fn set_model_preserves_reasoning_off_when_unsupported() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let store = SessionStore::new("gpt-big".to_string());
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "gpt-big".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![
+                        ReasoningLevelPreset {
+                            effort: "low".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "medium".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "high".to_string(),
+                            description: "".to_string(),
+                        },
+                    ],
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+                ModelMetadata {
+                    id: "plain-model".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: Vec::new(),
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+            ])
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-set-model-preserves-off-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+        assert!(
+            store
+                .set_reasoning_effort(&id, Some(REASONING_EFFORT_OFF_VALUE.to_string()))
+                .await
+        );
+
+        let (ok, cleared) = store.set_model(&id, "plain-model".to_string()).await;
+        assert!(ok);
+        assert!(cleared.is_none(), "off is not a provider effort to clear");
+        let session = store
+            .get_session(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(
+            session.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(
+            snap.reasoning_effort, None,
+            "off must omit reasoning even when the new model has a default"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

@@ -52,8 +52,9 @@ struct Args {
     default_model: String,
 
     /// Seed new sessions with a reasoning effort such as `low`,
-    /// `medium`, or `high`. Models that do not support configurable
-    /// reasoning ignore this and fall back to their default behavior.
+    /// `medium`, or `high`, or `off` to omit provider reasoning
+    /// controls. Models that do not support configurable reasoning
+    /// ignore unsupported effort levels and fall back to their default behavior.
     #[arg(long)]
     reasoning_effort: Option<String>,
 

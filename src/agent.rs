@@ -24,8 +24,8 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
-    SessionSnapshot, SessionStore, acp_mcp_servers_to_configs,
+    ConversationTurn, PermissionMode, PromptStartError, REASONING_EFFORT_OFF_VALUE, Session,
+    SessionManifest, SessionMode, SessionSnapshot, SessionStore, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -44,9 +44,10 @@ const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
 const MODEL_CONFIG_ID: &str = "model_selection";
-/// Per-session reasoning-effort knob, scoped to the Codex/ChatGPT backend.
+/// Per-session reasoning-effort knob.
 /// Empty string in the wire payload clears the user's pick (back to the
-/// model's `default_reasoning_level`).
+/// model's `default_reasoning_level`). The `off` option explicitly omits
+/// reasoning controls even when the model advertises a default.
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// Sentinel value the client sends to clear the user's pick. We accept
 /// either an empty string or this token so editor implementations that
@@ -191,9 +192,11 @@ fn model_config_option(current: &str, available_models: &[String]) -> Option<Ses
 /// omitted entirely in that case rather than shown empty.
 ///
 /// Layout: an explicit "(default)" entry at the head represents "no user
-/// pick, server uses `default_reasoning_level`". The user's stored pick
-/// (`current`) selects whichever option matches; when no pick exists, the
-/// default entry is selected so the picker reflects actual intent.
+/// pick, server uses `default_reasoning_level`". The following "off" entry
+/// represents an explicit user pick to omit reasoning controls even for models
+/// that default to reasoning. The user's stored pick (`current`) selects
+/// whichever option matches; when no pick exists, the default entry is selected
+/// so the picker reflects actual intent.
 fn reasoning_effort_config_option(
     current: Option<&str>,
     catalog: &[ModelMetadata],
@@ -210,6 +213,8 @@ fn reasoning_effort_config_option(
     let mut options = vec![
         SessionConfigSelectOption::new(REASONING_EFFORT_DEFAULT_VALUE, default_label)
             .description("Use the model's default reasoning effort."),
+        SessionConfigSelectOption::new(REASONING_EFFORT_OFF_VALUE, "Off")
+            .description("Do not send reasoning controls for this session."),
     ];
     options.extend(model.supported_reasoning_levels.iter().map(|preset| {
         let opt = SessionConfigSelectOption::new(preset.effort.clone(), preset.effort.clone());
@@ -223,6 +228,7 @@ fn reasoning_effort_config_option(
     // to the default sentinel so the picker always renders against an
     // entry it advertises.
     let current_value = match current {
+        Some(eff) if eff == REASONING_EFFORT_OFF_VALUE => REASONING_EFFORT_OFF_VALUE.to_string(),
         Some(eff)
             if model
                 .supported_reasoning_levels
@@ -417,7 +423,10 @@ async fn apply_config_option(
         }
         REASONING_EFFORT_CONFIG_ID => {
             // Empty string or the "(default)" sentinel both mean "clear my
-            // pick, use the model default".
+            // pick, use the model default". The explicit "off" selection is
+            // stored as a real pick; snapshot() interprets it as "omit
+            // reasoning controls" rather than falling back to the model
+            // default.
             let effort = if value.is_empty() || value == REASONING_EFFORT_DEFAULT_VALUE {
                 None
             } else {
@@ -426,8 +435,12 @@ async fn apply_config_option(
             // Validate against the active model's published levels when
             // one is known. An unknown catalog (e.g. discovery never
             // finished) accepts any string so a manually-configured
-            // backend still works.
-            if let Some(eff) = &effort {
+            // backend still works. "off" sends no provider reasoning
+            // parameter, so it is harmless and always accepted even if the
+            // current model has no configurable reasoning presets.
+            if let Some(eff) = &effort
+                && eff != REASONING_EFFORT_OFF_VALUE
+            {
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
                 let active_model = sessions
                     .get_session(session_id, &fallback_cwd)
@@ -3664,12 +3677,14 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "reasoning" | "reasoning-effort" => {
             if rest.is_empty() {
-                "Use `/setup reasoning default` or `/setup reasoning <level>`.\n\
+                "Use `/setup reasoning default`, `/setup reasoning off`, or `/setup reasoning <level>`.\n\
                  This is an advanced setting; most users should leave it alone."
                     .to_string()
             } else {
                 let value = if rest.eq_ignore_ascii_case("default") {
                     REASONING_EFFORT_DEFAULT_VALUE
+                } else if rest.eq_ignore_ascii_case(REASONING_EFFORT_OFF_VALUE) {
+                    REASONING_EFFORT_OFF_VALUE
                 } else {
                     rest
                 };
@@ -4456,7 +4471,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     );
     out.push_str("- `/setup mode` - change assistant behavior.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
-    out.push_str("- `/setup reasoning default|<level>` - advanced reasoning setting.\n");
+    out.push_str("- `/setup reasoning default|off|<level>` - advanced reasoning setting.\n");
     if !openrouter_picks.is_empty() {
         out.push_str("\nFiltered OpenRouter coding candidates:\n");
         for id in openrouter_picks {
@@ -6494,6 +6509,106 @@ mod tests {
             .await
             .expect("swap model");
         assert_eq!(outcome.cleared_reasoning.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_sets_reasoning_off_and_omits_default() {
+        use crate::llm_client::ReasoningLevelPreset;
+        use agent_client_protocol::schema::{SessionConfigKind, SessionConfigSelectOptions};
+
+        let (store, id) = make_store_with_session("model-a").await;
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "model-a".into(),
+                default_reasoning_level: Some("medium".into()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevelPreset {
+                        effort: "low".into(),
+                        description: "Low".into(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "medium".into(),
+                        description: "Medium".into(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "high".into(),
+                        description: "High".into(),
+                    },
+                ],
+                supports_images: None,
+                context_length: None,
+                pricing: None,
+            }])
+            .await;
+
+        let outcome = apply_config_option(&store, &id, REASONING_EFFORT_CONFIG_ID, "off")
+            .await
+            .expect("off is a valid reasoning selection");
+        let session = store
+            .get_session(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            session.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            snap.reasoning_effort, None,
+            "explicit off must not fall back to model default"
+        );
+
+        let reasoning_option = outcome
+            .updated_options
+            .iter()
+            .find(|opt| opt.id.to_string() == REASONING_EFFORT_CONFIG_ID)
+            .expect("reasoning option still advertised");
+        match &reasoning_option.kind {
+            SessionConfigKind::Select(select) => {
+                assert_eq!(select.current_value.to_string(), REASONING_EFFORT_OFF_VALUE);
+                match &select.options {
+                    SessionConfigSelectOptions::Ungrouped(options) => {
+                        assert!(
+                            options
+                                .iter()
+                                .any(|opt| opt.value.to_string() == "(default)")
+                        );
+                        assert!(options.iter().any(|opt| opt.value.to_string() == "off"));
+                        assert!(options.iter().any(|opt| opt.value.to_string() == "high"));
+                    }
+                    other => panic!("expected ungrouped reasoning options, got {other:?}"),
+                }
+            }
+            other => panic!("expected select reasoning option, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_accepts_reasoning_off_for_model_without_presets() {
+        let (store, id) = make_store_with_session("plain-model").await;
+        store
+            .set_available_models(vec![ModelMetadata::id_only("plain-model")])
+            .await;
+
+        apply_config_option(&store, &id, REASONING_EFFORT_CONFIG_ID, "off")
+            .await
+            .expect("off sends no provider parameter and should always be valid");
+        let session = store
+            .get_session(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            session.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(snap.reasoning_effort, None);
     }
 
     #[tokio::test]
