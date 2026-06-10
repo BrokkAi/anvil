@@ -190,7 +190,9 @@ Anvil is zero-config by default:
   an inference profile id/ARN; when a base model requires an inference profile,
   Anvil normalizes it to the matching profile automatically. Bedrock models
   expose `low`/`medium`/`high` reasoning presets in the effort picker and
-  default to `medium`. Native Anthropic requests send the corresponding
+  default to `medium`; choose `Off` in that picker (or `/setup reasoning off`)
+  to omit reasoning controls for a session. Native Anthropic requests send the
+  corresponding
   `thinking` block; Anvil sends the legacy `thinking.type=enabled` form first
   and, if the model responds that it requires `thinking.type=adaptive` +
   `output_config.effort`, retries with that shape and remembers the model's
