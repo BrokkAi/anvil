@@ -791,10 +791,13 @@ fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<Str
     a.extend(["--dev".into(), "/dev".into()]);
     a.extend(["--proc".into(), "/proc".into()]);
 
-    if policy.allows_workspace_writes() {
-        // Writable scratch
-        a.extend(["--tmpfs".into(), "/tmp".into()]);
+    // Writable scratch. Keep this available in both ReadOnly and
+    // WorkspaceWrite so common developer tools that need temporary files
+    // behave like they do under the macOS Seatbelt profile's tmp allowances.
+    // ReadOnly still cannot persist writes to the workspace or home caches.
+    a.extend(["--tmpfs".into(), "/tmp".into()]);
 
+    if policy.allows_workspace_writes() {
         let abs = cwd
             .to_str()
             .expect("validated UTF-8 in wrap_command")
@@ -1291,6 +1294,11 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/workspace" && w[2] == "/workspace");
         assert!(!workspace_bind, "ReadOnly must not bind workspace rw");
+        let has_tmpfs = argv.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp");
+        assert!(
+            has_tmpfs,
+            "ReadOnly should still provide writable scratch /tmp for common dev tools"
+        );
         let dash_idx = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[dash_idx + 1..], &["sh", "-c", "echo hi"]);
     }
