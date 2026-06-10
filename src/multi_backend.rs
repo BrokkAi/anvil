@@ -461,6 +461,7 @@ mod tests {
             messages: vec![],
             tools: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
+            temperature: None,
             structured_output: None,
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
