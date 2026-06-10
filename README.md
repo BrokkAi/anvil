@@ -289,7 +289,7 @@ filesystem, or process/namespace isolation), Anvil appends guidance to the tool
 result telling the model to verify that the sandbox is likely the limiting
 factor. If unsandboxed execution is actually necessary, the model retries
 `run_shell_command` with `sandbox_permissions: "require_escalated"`; only then
-does the permission prompt include a one-time **Run outside sandbox** choice.
+does the permission prompt include a **Run outside sandbox** choice.
 That approval is never remembered as an **Always allow** rule.
 
 Sandbox mode is a separate execution boundary. This matters because Anvil runs

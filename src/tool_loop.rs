@@ -263,6 +263,19 @@ fn permission_options_for_request(
 ) -> Vec<PermissionOption> {
     let mut options = Vec::with_capacity(4);
     if tool_name == "run_shell_command" {
+        if shell_sandboxed && sandbox_escalation_requested {
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("allow_outside_sandbox"),
+                "Run outside sandbox",
+                PermissionOptionKind::AllowOnce,
+            ));
+            options.push(PermissionOption::new(
+                PermissionOptionId::new("reject"),
+                "No",
+                PermissionOptionKind::RejectOnce,
+            ));
+            return options;
+        }
         if shell_sandboxed {
             options.push(PermissionOption::new(
                 PermissionOptionId::new("allow"),
@@ -274,13 +287,6 @@ fn permission_options_for_request(
                 "Always allow this command in sandbox",
                 PermissionOptionKind::AllowAlways,
             ));
-            if sandbox_escalation_requested {
-                options.push(PermissionOption::new(
-                    PermissionOptionId::new("allow_outside_sandbox"),
-                    "Run outside sandbox once",
-                    PermissionOptionKind::AllowOnce,
-                ));
-            }
         } else {
             options.push(PermissionOption::new(
                 PermissionOptionId::new("allow"),
@@ -3837,10 +3843,8 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                ("allow", "Allow in sandbox"),
-                ("allow_always", "Always allow this command in sandbox"),
-                ("allow_outside_sandbox", "Run outside sandbox once"),
-                ("reject", "Reject"),
+                ("allow_outside_sandbox", "Run outside sandbox"),
+                ("reject", "No"),
             ]
         );
     }
