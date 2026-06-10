@@ -496,25 +496,127 @@ fn should_auto_allow_shell_command(
 }
 
 fn is_auto_approvable_sandboxed_shell_command(command: &str) -> bool {
-    let Some(tokens) = tokenize_simple_shell_command(command) else {
+    let Some(commands) = split_simple_shell_command_sequence(command) else {
         return false;
     };
 
+    commands.iter().all(|command| {
+        let Some(tokens) = tokenize_simple_shell_command(command) else {
+            return false;
+        };
+        is_auto_approvable_sandboxed_shell_tokens(&tokens)
+    })
+}
+
+fn is_auto_approvable_sandboxed_shell_tokens(tokens: &[String]) -> bool {
     let Some(program) = tokens.first().map(String::as_str) else {
         return false;
     };
 
     match program {
-        "pwd" | "id" | "whoami" | "uname" | "echo" | "ls" | "cat" | "head" | "tail" | "wc"
-        | "cut" | "tr" | "sort" | "uniq" | "nl" | "stat" | "which" | "grep" | "rg" => {
-            !tokens_request_file_write(&tokens)
+        "pwd" | "id" | "whoami" | "uname" | "echo" | "true" | "false" | "ls" | "cat" | "head"
+        | "tail" | "wc" | "cut" | "tr" | "uniq" | "nl" | "stat" | "which" | "grep" => {
+            !tokens_request_file_write(tokens)
         }
-        "find" => is_safe_find_command(&tokens),
-        "sed" => is_safe_sed_command(&tokens),
-        "awk" => is_safe_awk_command(&tokens),
-        "git" => is_safe_git_command(&tokens),
+        "sort" => is_safe_sort_command(tokens),
+        "rg" => is_safe_rg_command(tokens),
+        "find" => is_safe_find_command(tokens),
+        "git" => is_safe_git_command(tokens),
         _ => false,
     }
+}
+
+fn split_simple_shell_command_sequence(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuoteState {
+        Plain,
+        Single,
+        Double,
+    }
+
+    fn push_segment(commands: &mut Vec<String>, current: &mut String) -> Option<()> {
+        let segment = current.trim();
+        if segment.is_empty() {
+            return None;
+        }
+        commands.push(segment.to_string());
+        current.clear();
+        Some(())
+    }
+
+    let mut state = QuoteState::Plain;
+    let mut current = String::new();
+    let mut commands = Vec::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match state {
+            QuoteState::Plain => match ch {
+                '\n' | '\r' => return None,
+                '\'' => {
+                    current.push(ch);
+                    state = QuoteState::Single;
+                }
+                '"' => {
+                    current.push(ch);
+                    state = QuoteState::Double;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(ch);
+                    current.push(escaped);
+                }
+                '|' => {
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    push_segment(&mut commands, &mut current)?;
+                }
+                '&' => {
+                    if chars.peek() != Some(&'&') {
+                        return None;
+                    }
+                    chars.next();
+                    push_segment(&mut commands, &mut current)?;
+                }
+                ch if ch.is_control() => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Single => match ch {
+                '\'' => {
+                    current.push(ch);
+                    state = QuoteState::Plain;
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Double => match ch {
+                '"' => {
+                    current.push(ch);
+                    state = QuoteState::Plain;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(ch);
+                    current.push(escaped);
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if state != QuoteState::Plain {
+        return None;
+    }
+    push_segment(&mut commands, &mut current)?;
+    Some(commands)
 }
 
 fn tokenize_simple_shell_command(command: &str) -> Option<Vec<String>> {
@@ -594,6 +696,61 @@ fn tokens_request_file_write(tokens: &[String]) -> bool {
             "-i" | "-o" | "-f" | "--in-place" | "--output"
         ) || token.starts_with("--in-place=")
             || token.starts_with("--output=")
+            || is_short_option_with_payload(token, 'o')
+    })
+}
+
+fn token_is_option(token: &str) -> bool {
+    token.starts_with('-') && token != "-"
+}
+
+fn is_short_option_with_payload(token: &str, option: char) -> bool {
+    let mut chars = token.chars();
+    chars.next() == Some('-') && chars.next() == Some(option) && chars.next().is_some()
+}
+
+fn has_forbidden_long_option(tokens: &[String], names: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        names.iter().any(|name| {
+            token == name
+                || token
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        })
+    })
+}
+
+fn is_safe_sort_command(tokens: &[String]) -> bool {
+    if tokens_request_file_write(tokens) || has_forbidden_long_option(tokens, &["--output"]) {
+        return false;
+    }
+    !tokens
+        .iter()
+        .any(|token| is_short_option_with_payload(token, 'o'))
+}
+
+fn is_safe_rg_command(tokens: &[String]) -> bool {
+    if tokens_request_file_write(tokens)
+        || has_forbidden_long_option(
+            tokens,
+            &[
+                "--files-with-matches",
+                "--files-without-match",
+                "--generate",
+                "--pre",
+                "--pre-glob",
+                "--sort",
+                "--sortr",
+            ],
+        )
+    {
+        return false;
+    }
+
+    !tokens.iter().any(|token| {
+        matches!(token.as_str(), "--files" | "-l" | "-L")
+            || is_short_option_with_payload(token, 'l')
+            || is_short_option_with_payload(token, 'L')
     })
 }
 
@@ -623,23 +780,47 @@ fn is_safe_find_command(tokens: &[String]) -> bool {
     })
 }
 
-fn is_safe_sed_command(tokens: &[String]) -> bool {
-    !tokens_request_file_write(tokens)
-}
-
-fn is_safe_awk_command(tokens: &[String]) -> bool {
-    !tokens_request_file_write(tokens)
-}
-
 fn is_safe_git_command(tokens: &[String]) -> bool {
     if tokens.len() < 2 || tokens[1].starts_with('-') {
         return false;
     }
 
-    matches!(
-        tokens[1].as_str(),
-        "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
-    )
+    match tokens[1].as_str() {
+        "status" | "diff" | "log" | "show" | "branch" | "rev-parse" => {}
+        _ => return false,
+    }
+
+    let mut end_of_options = false;
+    let mut iter = tokens.iter().skip(2).map(String::as_str);
+    while let Some(token) = iter.next() {
+        if end_of_options {
+            continue;
+        }
+        if token == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if !token_is_option(token) {
+            continue;
+        }
+        if token == "-c" || token == "--config" {
+            return false;
+        }
+        if token.starts_with("--config=") || is_short_option_with_payload(token, 'c') {
+            return false;
+        }
+        if matches!(token, "-C" | "--git-dir" | "--work-tree") {
+            if iter.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if token.starts_with("--git-dir=") || token.starts_with("--work-tree=") {
+            continue;
+        }
+    }
+
+    true
 }
 
 fn shell_command_will_run_sandboxed(
@@ -3380,6 +3561,52 @@ mod tests {
     }
 
     #[test]
+    fn safe_shell_classifier_accepts_pipelines_and_conditionals_of_read_only_commands() {
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs | head -n 5"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "rg PermissionMode src | sort | uniq | head"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "grep 'PermissionMode|ToolKind' src/tool_loop.rs | wc -l"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs && git status"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command("false || true"));
+    }
+
+    #[test]
+    fn safe_shell_classifier_rejects_pipelines_with_unsafe_segments() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs | python3 -c 'print(1)'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs | sed -i 's/a/b/'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs |"
+        ));
+    }
+
+    #[test]
+    fn command_sequence_splitter_splits_unquoted_connectors() {
+        assert_eq!(
+            split_simple_shell_command_sequence("grep 'a|b' file | head")
+                .expect("pipeline should split"),
+            vec!["grep 'a|b' file", "head"]
+        );
+        assert_eq!(
+            split_simple_shell_command_sequence("rg foo src && git status || pwd")
+                .expect("connectors should split"),
+            vec!["rg foo src", "git status", "pwd"]
+        );
+        assert!(split_simple_shell_command_sequence("| head").is_none());
+        assert!(split_simple_shell_command_sequence("grep a &&").is_none());
+        assert!(split_simple_shell_command_sequence("grep a & head").is_none());
+    }
+    #[test]
     fn safe_shell_classifier_rejects_writes_and_shell_metacharacters() {
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "sed -i 's/a/b/' src/main.rs"
@@ -3387,7 +3614,30 @@ mod tests {
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "python3 -c 'print(1)'"
         ));
-        assert!(!is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+        assert!(is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+        assert!(!is_auto_approvable_sandboxed_shell_command("pwd; ls"));
+    }
+
+    #[test]
+    fn safe_shell_classifier_rejects_command_options_with_side_effects() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sed '1w out.txt' src/main.rs"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "awk 'BEGIN { system(\"touch out.txt\") }'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sort -oout.txt Cargo.toml"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sort --output=out.txt Cargo.toml"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "rg --pre cat needle src"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "rg --sort path needle src"
+        ));
     }
 
     #[test]
@@ -3400,6 +3650,12 @@ mod tests {
         ));
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "git apply patch.diff"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git status -c core.pager='sh -c echo'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git log --config=core.pager=cat"
         ));
     }
 
