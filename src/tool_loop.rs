@@ -496,25 +496,126 @@ fn should_auto_allow_shell_command(
 }
 
 fn is_auto_approvable_sandboxed_shell_command(command: &str) -> bool {
-    let Some(tokens) = tokenize_simple_shell_command(command) else {
+    let Some(commands) = split_simple_shell_command_sequence(command) else {
         return false;
     };
 
+    commands.iter().all(|command| {
+        let Some(tokens) = tokenize_simple_shell_command(command) else {
+            return false;
+        };
+        is_auto_approvable_sandboxed_shell_tokens(&tokens)
+    })
+}
+
+fn is_auto_approvable_sandboxed_shell_tokens(tokens: &[String]) -> bool {
     let Some(program) = tokens.first().map(String::as_str) else {
         return false;
     };
 
     match program {
-        "pwd" | "id" | "whoami" | "uname" | "echo" | "ls" | "cat" | "head" | "tail" | "wc"
-        | "cut" | "tr" | "sort" | "uniq" | "nl" | "stat" | "which" | "grep" | "rg" => {
-            !tokens_request_file_write(&tokens)
-        }
-        "find" => is_safe_find_command(&tokens),
-        "sed" => is_safe_sed_command(&tokens),
-        "awk" => is_safe_awk_command(&tokens),
-        "git" => is_safe_git_command(&tokens),
+        "pwd" | "id" | "whoami" | "uname" | "echo" | "true" | "false" | "ls" | "cat" | "head"
+        | "tail" | "wc" | "cut" | "tr" | "sort" | "uniq" | "nl" | "stat" | "which" | "grep"
+        | "rg" => !tokens_request_file_write(tokens),
+        "find" => is_safe_find_command(tokens),
+        "sed" => is_safe_sed_command(tokens),
+        "awk" => is_safe_awk_command(tokens),
+        "git" => is_safe_git_command(tokens),
         _ => false,
     }
+}
+
+fn split_simple_shell_command_sequence(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuoteState {
+        Plain,
+        Single,
+        Double,
+    }
+
+    fn push_segment(commands: &mut Vec<String>, current: &mut String) -> Option<()> {
+        let segment = current.trim();
+        if segment.is_empty() {
+            return None;
+        }
+        commands.push(segment.to_string());
+        current.clear();
+        Some(())
+    }
+
+    let mut state = QuoteState::Plain;
+    let mut current = String::new();
+    let mut commands = Vec::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match state {
+            QuoteState::Plain => match ch {
+                '\n' | '\r' => return None,
+                '\'' => {
+                    current.push(ch);
+                    state = QuoteState::Single;
+                }
+                '"' => {
+                    current.push(ch);
+                    state = QuoteState::Double;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(ch);
+                    current.push(escaped);
+                }
+                '|' => {
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    push_segment(&mut commands, &mut current)?;
+                }
+                '&' => {
+                    if chars.peek() != Some(&'&') {
+                        return None;
+                    }
+                    chars.next();
+                    push_segment(&mut commands, &mut current)?;
+                }
+                ch if ch.is_control() => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Single => match ch {
+                '\'' => {
+                    current.push(ch);
+                    state = QuoteState::Plain;
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+            QuoteState::Double => match ch {
+                '"' => {
+                    current.push(ch);
+                    state = QuoteState::Plain;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    current.push(ch);
+                    current.push(escaped);
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if state != QuoteState::Plain {
+        return None;
+    }
+    push_segment(&mut commands, &mut current)?;
+    Some(commands)
 }
 
 fn tokenize_simple_shell_command(command: &str) -> Option<Vec<String>> {
@@ -3380,6 +3481,52 @@ mod tests {
     }
 
     #[test]
+    fn safe_shell_classifier_accepts_pipelines_and_conditionals_of_read_only_commands() {
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs | head -n 5"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "rg PermissionMode src | sort | uniq | head"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "grep 'PermissionMode|ToolKind' src/tool_loop.rs | wc -l"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs && git status"
+        ));
+        assert!(is_auto_approvable_sandboxed_shell_command("false || true"));
+    }
+
+    #[test]
+    fn safe_shell_classifier_rejects_pipelines_with_unsafe_segments() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs | python3 -c 'print(1)'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs | sed -i 's/a/b/'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "grep PermissionMode src/tool_loop.rs |"
+        ));
+    }
+
+    #[test]
+    fn command_sequence_splitter_splits_unquoted_connectors() {
+        assert_eq!(
+            split_simple_shell_command_sequence("grep 'a|b' file | head")
+                .expect("pipeline should split"),
+            vec!["grep 'a|b' file", "head"]
+        );
+        assert_eq!(
+            split_simple_shell_command_sequence("rg foo src && git status || pwd")
+                .expect("connectors should split"),
+            vec!["rg foo src", "git status", "pwd"]
+        );
+        assert!(split_simple_shell_command_sequence("| head").is_none());
+        assert!(split_simple_shell_command_sequence("grep a &&").is_none());
+        assert!(split_simple_shell_command_sequence("grep a & head").is_none());
+    }
+    #[test]
     fn safe_shell_classifier_rejects_writes_and_shell_metacharacters() {
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "sed -i 's/a/b/' src/main.rs"
@@ -3387,7 +3534,8 @@ mod tests {
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "python3 -c 'print(1)'"
         ));
-        assert!(!is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+        assert!(is_auto_approvable_sandboxed_shell_command("pwd && ls"));
+        assert!(!is_auto_approvable_sandboxed_shell_command("pwd; ls"));
     }
 
     #[test]
