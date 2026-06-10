@@ -515,11 +515,12 @@ fn is_auto_approvable_sandboxed_shell_tokens(tokens: &[String]) -> bool {
 
     match program {
         "pwd" | "id" | "whoami" | "uname" | "echo" | "true" | "false" | "ls" | "cat" | "head"
-        | "tail" | "wc" | "cut" | "tr" | "sort" | "uniq" | "nl" | "stat" | "which" | "grep"
-        | "rg" => !tokens_request_file_write(tokens),
+        | "tail" | "wc" | "cut" | "tr" | "uniq" | "nl" | "stat" | "which" | "grep" => {
+            !tokens_request_file_write(tokens)
+        }
+        "sort" => is_safe_sort_command(tokens),
+        "rg" => is_safe_rg_command(tokens),
         "find" => is_safe_find_command(tokens),
-        "sed" => is_safe_sed_command(tokens),
-        "awk" => is_safe_awk_command(tokens),
         "git" => is_safe_git_command(tokens),
         _ => false,
     }
@@ -695,6 +696,61 @@ fn tokens_request_file_write(tokens: &[String]) -> bool {
             "-i" | "-o" | "-f" | "--in-place" | "--output"
         ) || token.starts_with("--in-place=")
             || token.starts_with("--output=")
+            || is_short_option_with_payload(token, 'o')
+    })
+}
+
+fn token_is_option(token: &str) -> bool {
+    token.starts_with('-') && token != "-"
+}
+
+fn is_short_option_with_payload(token: &str, option: char) -> bool {
+    let mut chars = token.chars();
+    chars.next() == Some('-') && chars.next() == Some(option) && chars.next().is_some()
+}
+
+fn has_forbidden_long_option(tokens: &[String], names: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        names.iter().any(|name| {
+            token == name
+                || token
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        })
+    })
+}
+
+fn is_safe_sort_command(tokens: &[String]) -> bool {
+    if tokens_request_file_write(tokens) || has_forbidden_long_option(tokens, &["--output"]) {
+        return false;
+    }
+    !tokens
+        .iter()
+        .any(|token| is_short_option_with_payload(token, 'o'))
+}
+
+fn is_safe_rg_command(tokens: &[String]) -> bool {
+    if tokens_request_file_write(tokens)
+        || has_forbidden_long_option(
+            tokens,
+            &[
+                "--files-with-matches",
+                "--files-without-match",
+                "--generate",
+                "--pre",
+                "--pre-glob",
+                "--sort",
+                "--sortr",
+            ],
+        )
+    {
+        return false;
+    }
+
+    !tokens.iter().any(|token| {
+        matches!(token.as_str(), "--files" | "-l" | "-L")
+            || is_short_option_with_payload(token, 'l')
+            || is_short_option_with_payload(token, 'L')
     })
 }
 
@@ -724,23 +780,47 @@ fn is_safe_find_command(tokens: &[String]) -> bool {
     })
 }
 
-fn is_safe_sed_command(tokens: &[String]) -> bool {
-    !tokens_request_file_write(tokens)
-}
-
-fn is_safe_awk_command(tokens: &[String]) -> bool {
-    !tokens_request_file_write(tokens)
-}
-
 fn is_safe_git_command(tokens: &[String]) -> bool {
     if tokens.len() < 2 || tokens[1].starts_with('-') {
         return false;
     }
 
-    matches!(
-        tokens[1].as_str(),
-        "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
-    )
+    match tokens[1].as_str() {
+        "status" | "diff" | "log" | "show" | "branch" | "rev-parse" => {}
+        _ => return false,
+    }
+
+    let mut end_of_options = false;
+    let mut iter = tokens.iter().skip(2).map(String::as_str);
+    while let Some(token) = iter.next() {
+        if end_of_options {
+            continue;
+        }
+        if token == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if !token_is_option(token) {
+            continue;
+        }
+        if token == "-c" || token == "--config" {
+            return false;
+        }
+        if token.starts_with("--config=") || is_short_option_with_payload(token, 'c') {
+            return false;
+        }
+        if matches!(token, "-C" | "--git-dir" | "--work-tree") {
+            if iter.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if token.starts_with("--git-dir=") || token.starts_with("--work-tree=") {
+            continue;
+        }
+    }
+
+    true
 }
 
 fn shell_command_will_run_sandboxed(
@@ -3539,6 +3619,28 @@ mod tests {
     }
 
     #[test]
+    fn safe_shell_classifier_rejects_command_options_with_side_effects() {
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sed '1w out.txt' src/main.rs"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "awk 'BEGIN { system(\"touch out.txt\") }'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sort -oout.txt Cargo.toml"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "sort --output=out.txt Cargo.toml"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "rg --pre cat needle src"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "rg --sort path needle src"
+        ));
+    }
+
+    #[test]
     fn safe_git_classifier_rejects_global_flags_and_mutating_subcommands() {
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "git -C /tmp status"
@@ -3548,6 +3650,12 @@ mod tests {
         ));
         assert!(!is_auto_approvable_sandboxed_shell_command(
             "git apply patch.diff"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git status -c core.pager='sh -c echo'"
+        ));
+        assert!(!is_auto_approvable_sandboxed_shell_command(
+            "git log --config=core.pager=cat"
         ));
     }
 
