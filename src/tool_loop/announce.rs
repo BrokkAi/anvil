@@ -286,7 +286,6 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
         "run_shell_command" => command
             .map(|c| format!("Run `{}`", first_line(c)))
             .unwrap_or_else(|| display.to_string()),
-        "think" => "Think".to_string(),
         "task" => {
             // Prefer the human-readable `description` (short label) over
             // `subagent_type` (catalog key) and the full `prompt` (often
@@ -547,12 +546,6 @@ mod tests {
     }
 
     #[test]
-    fn think_title_is_constant() {
-        let title = tool_title("think", &json!({"thought": "..."}));
-        assert_eq!(title, "Think");
-    }
-
-    #[test]
     fn unknown_tool_falls_back_to_display_name_with_summary() {
         // search_symbols isn't special-cased here; it goes through
         // ToolRegistry::display_name + brief_input_summary.
@@ -624,7 +617,6 @@ mod tests {
     fn locations_empty_for_non_filesystem_tools() {
         assert!(tool_locations("run_shell_command", &json!({"command": "ls"})).is_empty());
         assert!(tool_locations("grep_search", &json!({"pattern": "x"})).is_empty());
-        assert!(tool_locations("think", &json!({"thought": "..."})).is_empty());
         assert!(tool_locations("search_symbols", &json!({"patterns": ["x"]})).is_empty());
     }
 

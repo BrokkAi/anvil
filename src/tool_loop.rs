@@ -44,7 +44,7 @@ fn train_bifrost_enabled() -> bool {
 }
 
 fn train_bifrost_initial_builtin_tools() -> std::collections::HashSet<String> {
-    ["think", "write_file", "edit", "list_directory"]
+    ["write_file", "edit", "list_directory"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -432,14 +432,11 @@ fn pure_gate_decision(
     // is refused so the user-visible "Refuse every edit, deletion, move, or
     // shell command" promise actually holds.
     if matches!(mode, PermissionMode::ReadOnly)
-        && !matches!(
-            kind,
-            ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch
-        )
+        && !matches!(kind, ToolKind::Read | ToolKind::Search | ToolKind::Fetch)
     {
         return PureGateDecision::Reject(
             "Tool use denied: read-only mode forbids edits, deletions, moves, shell execution, \
-             and any tool not classified as read/search/think/fetch. \
+             and any tool not classified as read/search/fetch. \
              Switch the Permission menu to 'default' or 'acceptEdits' to run this tool."
                 .to_string(),
         );
@@ -450,7 +447,7 @@ fn pure_gate_decision(
     // run without a prompt in the editable modes; the OS sandbox remains the
     // hard boundary for filesystem writes.
     let auto_allow = match kind {
-        ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch => true,
+        ToolKind::Read | ToolKind::Search | ToolKind::Fetch => true,
         ToolKind::Edit if matches!(mode, PermissionMode::AcceptEdits) => true,
         ToolKind::Execute
             if tool_name == "run_shell_command"
@@ -2497,22 +2494,22 @@ mod tests {
     #[test]
     fn tool_call_order_leaves_non_bifrost_batch_unchanged() {
         let calls = vec![
-            tool_call_for_test("think"),
+            tool_call_for_test("edit"),
             tool_call_for_test("read_file"),
             tool_call_for_test("run_shell_command"),
         ];
 
         let names = ordered_names_for_test(&calls, &["search_symbols"]);
 
-        assert_eq!(names, vec!["think", "read_file", "run_shell_command"]);
+        assert_eq!(names, vec!["edit", "read_file", "run_shell_command"]);
     }
 
     #[test]
     fn advertised_tool_names_match_current_request_catalog() {
-        let tools = vec![tool_def_for_test("think"), tool_def_for_test("edit")];
+        let tools = vec![tool_def_for_test("read_file"), tool_def_for_test("edit")];
         let names = advertised_tool_names(Some(&tools));
 
-        assert!(names.contains("think"));
+        assert!(names.contains("read_file"));
         assert!(names.contains("edit"));
         assert!(!names.contains("run_shell_command"));
     }
@@ -2530,7 +2527,6 @@ mod tests {
         let initial = train_bifrost_initial_builtin_tools();
         let post_edit = train_bifrost_post_edit_builtin_tools();
 
-        assert!(initial.contains("think"));
         assert!(initial.contains("edit"));
         assert!(initial.contains("write_file"));
         assert!(initial.contains("list_directory"));
@@ -3087,12 +3083,7 @@ mod tests {
 
     #[test]
     fn read_only_allows_only_info_kinds() {
-        for kind in [
-            ToolKind::Read,
-            ToolKind::Search,
-            ToolKind::Think,
-            ToolKind::Fetch,
-        ] {
+        for kind in [ToolKind::Read, ToolKind::Search, ToolKind::Fetch] {
             assert_eq!(
                 decide(PermissionMode::ReadOnly, kind, "anything", false, false),
                 PureGateDecision::Allow,
@@ -3239,12 +3230,7 @@ mod tests {
 
     #[test]
     fn default_auto_allows_info_kinds_without_always_allow() {
-        for kind in [
-            ToolKind::Read,
-            ToolKind::Search,
-            ToolKind::Think,
-            ToolKind::Fetch,
-        ] {
+        for kind in [ToolKind::Read, ToolKind::Search, ToolKind::Fetch] {
             assert_eq!(
                 decide(PermissionMode::Default, kind, "anything", false, false),
                 PureGateDecision::Allow

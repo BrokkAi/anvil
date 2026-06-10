@@ -40,11 +40,6 @@ struct ToolMeta {
 const TOOLS: &[ToolMeta] = &[
     // --- Built-in tools (executed inline in `ToolRegistry::execute`) -------
     ToolMeta {
-        name: "think",
-        kind: ToolKind::Think,
-        display_name: "Thinking",
-    },
-    ToolMeta {
         name: "read_file",
         kind: ToolKind::Read,
         display_name: "Reading file",
@@ -251,7 +246,6 @@ pub(crate) fn is_known_tool(name: &str) -> bool {
 /// `ToolRegistry::execute`. Used by tests to keep the metadata table
 /// in sync with the actual builtin dispatch.
 const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "think",
     "read_file",
     "write_file",
     "edit",
@@ -268,7 +262,7 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
     name == "refresh"
 }
 
-/// Unified tool registry: filesystem tools + shell + think + configured
+/// Unified tool registry: filesystem tools + shell + configured
 /// MCP tools + Agent Skills activation.
 ///
 /// `skills` is wrapped in `RwLock` so the session can swap in a fresh
@@ -403,22 +397,6 @@ impl ToolRegistry {
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let builtin_tools = self.active_builtin_tools().await;
         let mut defs = Vec::new();
-        if builtin_tools.contains("think") {
-            defs.push(tool_def(
-                "think",
-                "Use this tool to think through a problem step by step before acting. The input is not used for anything -- it is just a scratchpad for your thoughts.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "thought": {
-                            "type": "string",
-                            "description": "Your reasoning or thought process."
-                        }
-                    },
-                    "required": ["thought"]
-                }),
-            ));
-        }
         if builtin_tools.contains("read_file") {
             defs.push(tool_def(
                 "read_file",
@@ -712,13 +690,6 @@ impl ToolRegistry {
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     ) -> ToolResult {
         match name {
-            "think" => {
-                let thought = args.get("thought").and_then(|v| v.as_str()).unwrap_or("");
-                ToolResult {
-                    status: ToolStatus::Success,
-                    output: format!("Thought noted: {thought}"),
-                }
-            }
             "read_file" => {
                 let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
                 let offset = args
@@ -1304,7 +1275,7 @@ mod tests {
         let registry = registry_with_skills(vec![]);
         registry
             .set_builtin_tools(
-                ["think", "edit", "write_file", "list_directory"]
+                ["edit", "write_file", "list_directory"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -1317,7 +1288,6 @@ mod tests {
             .map(|d| d.function.name)
             .collect();
 
-        assert!(advertised.iter().any(|name| name == "think"));
         assert!(advertised.iter().any(|name| name == "edit"));
         assert!(advertised.iter().any(|name| name == "write_file"));
         assert!(advertised.iter().any(|name| name == "list_directory"));
@@ -1329,9 +1299,7 @@ mod tests {
     #[tokio::test]
     async fn hidden_builtins_still_execute_for_non_llm_callers() {
         let registry = registry_with_skills(vec![]);
-        registry
-            .set_builtin_tools(["think"].into_iter().map(str::to_string).collect())
-            .await;
+        registry.set_builtin_tools(HashSet::new()).await;
 
         #[cfg(target_os = "windows")]
         let command = "echo ok";

@@ -27,8 +27,7 @@ one reusable ACP subprocess and put a small client in front of it.
   Bifrost is preinstalled as a pinned, Anvil-managed local MCP server for
   symbol search, cross-references, and structural analysis.
 - **Real agent tooling.** Built-in file reads/writes, grep, directory listing,
-  shell execution, explicit `think`, MCP tools, subagents, and skill slash
-  commands.
+  shell execution, MCP tools, subagents, and skill slash commands.
 - **Designed for unattended and attended flows.** Clients can run read-only,
   ask before edits, auto-accept edits, or trust all tool calls. Permission
   prompts are protocol messages, not hardcoded UI.
@@ -67,7 +66,7 @@ Core modules:
   timeouts.
 - `session`: persisted session state, conversation history, model/mode
   selection, and context compression storage.
-- `tools`: built-in filesystem, grep, edit, think, and shell tools.
+- `tools`: built-in filesystem, grep, edit, and shell tools.
 - `mcp`: persisted MCP server configuration and stdio MCP subprocess
   lifecycles.
 
@@ -359,7 +358,6 @@ by `/permissions`.
 
 Core tools include:
 
-- `think`
 - `read_file`
 - `write_file`
 - `edit`
