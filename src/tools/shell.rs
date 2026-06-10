@@ -1,19 +1,17 @@
 use super::sandbox::{self, ENV_WHITELIST, SandboxPolicy};
 use super::{ToolResult, ToolStatus};
-use anyhow::Context;
-use std::ffi::OsString;
-use std::io::Read;
 use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::process::Command;
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as StdCommandExt;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
 const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
+const ANVIL_RTK_PROXY_PREFIX_ENV: &str = "ANVIL_RTK_PROXY_PREFIX";
+const RTK_DISABLED_ENV: &str = "RTK_DISABLED";
+const RTK_HOSTED_ENV: &str = "RTK_HOSTED";
+const RTK_TELEMETRY_DISABLED_ENV: &str = "RTK_TELEMETRY_DISABLED";
+const RTK_TRACKING_DISABLED_ENV: &str = "RTK_TRACKING_DISABLED";
+const ANVIL_RTK_SUBCOMMAND: &str = "__rtk";
 const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
     "Notice: this command was explicitly approved to run outside the OS sandbox once.";
 
@@ -321,121 +319,6 @@ where
     }
 }
 
-struct AnvilRtkRunner {
-    cwd: PathBuf,
-    policy: SandboxPolicy,
-    sandbox_path: OsString,
-    deadline: Instant,
-}
-
-impl rtk_core::ProcessRunner for AnvilRtkRunner {
-    fn run(&self, request: rtk_core::ProcessRequest) -> anyhow::Result<rtk_core::ProcessOutput> {
-        let mut argv = Vec::with_capacity(1 + request.args.len());
-        argv.push(request.program.to_string_lossy().into_owned());
-        argv.extend(
-            request
-                .args
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned()),
-        );
-
-        let wrapped = sandbox::wrap_argv(self.policy, &self.cwd, &argv)
-            .with_context(|| format!("preparing RTK child sandbox for `{}`", argv.join(" ")))?;
-
-        let mut cmd = std::process::Command::new(&wrapped.argv[0]);
-        cmd.args(&wrapped.argv[1..])
-            .current_dir(request.cwd.as_deref().unwrap_or(&self.cwd))
-            .env_clear()
-            .env("PATH", &self.sandbox_path)
-            .env("TERM", "dumb")
-            .stdin(match request.stdin {
-                rtk_core::ProcessStdin::Null => std::process::Stdio::null(),
-                rtk_core::ProcessStdin::Inherit => std::process::Stdio::null(),
-            })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        for key in ENV_WHITELIST {
-            if let Some(value) = std::env::var_os(key) {
-                cmd.env(key, value);
-            }
-        }
-        for (key, value) in request.envs {
-            match value {
-                Some(value) => {
-                    cmd.env(key, value);
-                }
-                None => {
-                    cmd.env_remove(key);
-                }
-            }
-        }
-
-        #[cfg(unix)]
-        {
-            let rlimits = RlimitConfig::from_env().clamp_to_parent_hard_limits();
-            // SAFETY: `apply_rlimits` only calls async-signal-safe libc functions.
-            unsafe {
-                cmd.pre_exec(move || apply_rlimits(&rlimits));
-            }
-        }
-
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning RTK child `{}`", wrapped.argv.join(" ")))?;
-        let mut stdout = child.stdout.take().context("capturing RTK child stdout")?;
-        let mut stderr = child.stderr.take().context("capturing RTK child stderr")?;
-        let stdout_thread = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr_thread = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
-
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if Instant::now() >= self.deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("RTK child timed out");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-
-        let stdout = stdout_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("RTK stdout reader panicked"))??;
-        let stderr = stderr_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("RTK stderr reader panicked"))??;
-
-        drop(wrapped);
-
-        Ok(rtk_core::ProcessOutput {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            exit_code: exit_code_from_status(status),
-        })
-    }
-}
-
-fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-    1
-}
-
 fn format_shell_tool_result(
     stdout: &str,
     stderr: &str,
@@ -492,6 +375,59 @@ fn format_shell_tool_result(
     }
 }
 
+fn rtk_rewritten_command(command: &str) -> String {
+    if std::env::var_os(ANVIL_RTK_DISABLED_ENV).is_some()
+        || std::env::var_os(RTK_DISABLED_ENV).is_some()
+        || command.contains("RTK_DISABLED=")
+        || command.contains(ANVIL_RTK_SUBCOMMAND)
+    {
+        return command.to_string();
+    }
+
+    let proxy = if let Some(value) = std::env::var(ANVIL_RTK_PROXY_PREFIX_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        value
+    } else {
+        match std::env::current_exe() {
+            Ok(path) => format!("{} {}", shell_quote_path(&path), ANVIL_RTK_SUBCOMMAND),
+            Err(e) => {
+                tracing::warn!("could not resolve current executable for RTK rewrite: {e}");
+                return command.to_string();
+            }
+        }
+    };
+    let proxy = format!(
+        "{RTK_HOSTED_ENV}=1 {RTK_TELEMETRY_DISABLED_ENV}=1 {RTK_TRACKING_DISABLED_ENV}=1 {proxy}"
+    );
+
+    match rtk_core::rewrite_command_with_proxy(command, &[], &[], &proxy) {
+        Some(rewritten) => {
+            tracing::debug!(
+                target: "brokk_acp_rust::tools::shell",
+                original = %command,
+                rewritten = %rewritten,
+                "rewrote shell command through hosted RTK",
+            );
+            rewritten
+        }
+        None => command.to_string(),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "windows")]
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("\"{}\"", raw.replace('"', "\\\""))
+}
+
 pub async fn run_shell_command(
     cwd: &Path,
     command: &str,
@@ -506,9 +442,11 @@ pub async fn run_shell_command(
         };
     }
 
+    let command_to_run = rtk_rewritten_command(command);
+
     // Wrap once. `wrapped` owns the temp policy file (Seatbelt) and must
     // outlive the spawned child.
-    let wrapped = match sandbox::wrap_command(policy, cwd, command) {
+    let wrapped = match sandbox::wrap_command(policy, cwd, &command_to_run) {
         Ok(w) => w,
         Err(e) => {
             // Sandbox-layer errors are tagged with `[sandbox]` by sandbox.rs
@@ -556,52 +494,6 @@ pub async fn run_shell_command(
     let sandbox_path = sandbox::discover_sandbox_path();
     #[cfg(not(unix))]
     let sandbox_path = std::env::var_os("PATH").unwrap_or_default();
-
-    if std::env::var_os(ANVIL_RTK_DISABLED_ENV).is_none() {
-        let rtk_command = command.to_string();
-        let rtk_cwd = cwd.to_path_buf();
-        let rtk_runner = Arc::new(AnvilRtkRunner {
-            cwd: rtk_cwd.clone(),
-            policy,
-            sandbox_path: sandbox_path.clone().into(),
-            deadline: Instant::now() + Duration::from_secs(timeout_seconds),
-        });
-        let rtk_result = tokio::task::spawn_blocking(move || {
-            let rtk_input = rtk_core::ShellCommandInput {
-                command: &rtk_command,
-                cwd: &rtk_cwd,
-                verbose: 0,
-                excluded_commands: &[],
-                transparent_prefixes: &[],
-            };
-            rtk_core::try_run_shell_command(rtk_input, rtk_runner)
-        })
-        .await;
-        match rtk_result {
-            Ok(Ok(Some(output))) => {
-                drop(wrapped);
-                return format_shell_tool_result(
-                    &output.stdout,
-                    &output.stderr,
-                    output.exit_code,
-                    output.exit_code == 0,
-                    outside_sandbox_once,
-                    bypass_warning,
-                );
-            }
-            Ok(Ok(None)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "embedded RTK shell handling failed; falling back to native shell: {e:#}"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "embedded RTK shell task panicked; falling back to native shell: {e}"
-                );
-            }
-        }
-    }
 
     let mut cmd = Command::new(&wrapped.argv[0]);
     cmd.args(&wrapped.argv[1..])
@@ -728,6 +620,33 @@ mod tests {
                 std::env::remove_var(self.var);
             }
         }
+    }
+
+    fn fake_rtk_proxy(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-rtk-proxy.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             if [ \"$1\" = cargo ] && [ \"$2\" = test ]; then\n\
+               echo hosted-rtk-cargo-test\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = git ] && [ \"$2\" = status ]; then\n\
+               echo '## main'\n\
+               echo '?? changed.txt'\n\
+               exit 0\n\
+             fi\n\
+             echo \"unexpected hosted rtk args: $*\" >&2\n\
+             exit 42\n",
+        )
+        .expect("write fake RTK proxy");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat fake RTK proxy")
+            .permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake RTK proxy");
+        path
     }
 
     #[test]
@@ -914,9 +833,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_shell_command_uses_embedded_rtk_for_cargo_test() {
+    async fn run_shell_command_rewrites_to_hosted_rtk_for_cargo_test() {
         let _guard = ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("create temp cargo project");
+        let proxy = fake_rtk_proxy(dir.path());
+        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
         std::fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"rtk-filter-demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -949,21 +870,23 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("cargo test: 1 passed"),
-            "cargo test output should be compacted by RTK; got: {}",
+            result.output.contains("hosted-rtk-cargo-test"),
+            "cargo test should be routed through the hosted RTK proxy; got: {}",
             result.output
         );
         assert!(
             !result.output.contains("running 1 test"),
-            "raw cargo test progress should be filtered; got: {}",
+            "native cargo test output means the rewrite did not run; got: {}",
             result.output
         );
     }
 
     #[tokio::test]
-    async fn run_shell_command_uses_embedded_rtk_for_git_status() {
+    async fn run_shell_command_rewrites_to_hosted_rtk_for_git_status() {
         let _guard = ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("create temp git repo");
+        let proxy = fake_rtk_proxy(dir.path());
+        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
         let init = run_shell_command(dir.path(), "git init", 30, SandboxPolicy::None, false).await;
         assert!(
             matches!(init.status, ToolStatus::Success),
@@ -982,12 +905,12 @@ mod tests {
         );
         assert!(
             result.output.contains("changed.txt") || result.output.contains("??"),
-            "RTK git status output should mention the untracked file; got: {}",
+            "hosted RTK git status output should mention the untracked file; got: {}",
             result.output
         );
         assert!(
             !result.output.contains("On branch"),
-            "RTK git status should compact native porcelain; got: {}",
+            "native git status output means the rewrite did not run; got: {}",
             result.output
         );
     }

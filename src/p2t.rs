@@ -210,9 +210,11 @@ fn assistant_message_with_tool_calls(
 ) -> ChatMessage {
     ChatMessage {
         role: "assistant".to_string(),
-        content: (!assistant_text.is_empty())
-            .then(|| vec![ChatContentPart::text(assistant_text.to_string())])
-            .unwrap_or_default(),
+        content: if !assistant_text.is_empty() {
+            vec![ChatContentPart::text(assistant_text.to_string())]
+        } else {
+            Vec::new()
+        },
         tool_calls: Some(tool_calls_from_prefix(tool_calls)),
         tool_call_id: None,
         name: None,

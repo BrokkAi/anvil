@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -380,6 +381,11 @@ fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__rtk")) {
+        let rtk_args = std::iter::once(OsString::from("rtk")).chain(std::env::args_os().skip(2));
+        std::process::exit(rtk_core::cli_entry_code(rtk_args));
+    }
+
     // Configure tracing to stderr only (stdout is reserved for JSON-RPC)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
