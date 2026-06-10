@@ -176,8 +176,9 @@ async fn stream_chat_with_transient_retry(
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
-/// normal sandbox. A one-time outside-sandbox approval is intentionally never
-/// persisted.
+/// normal sandbox. A one-time outside-sandbox approval is available only when
+/// the model explicitly requests sandbox escalation for a shell command; it is
+/// intentionally never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PermissionGrant {
     allow_always: bool,
@@ -250,7 +251,16 @@ fn trace_usage(usage: TokenUsage) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 fn permission_options(tool_name: &str, shell_sandboxed: bool) -> Vec<PermissionOption> {
+    permission_options_for_request(tool_name, shell_sandboxed, false)
+}
+
+fn permission_options_for_request(
+    tool_name: &str,
+    shell_sandboxed: bool,
+    sandbox_escalation_requested: bool,
+) -> Vec<PermissionOption> {
     let mut options = Vec::with_capacity(4);
     if tool_name == "run_shell_command" {
         if shell_sandboxed {
@@ -264,11 +274,13 @@ fn permission_options(tool_name: &str, shell_sandboxed: bool) -> Vec<PermissionO
                 "Always allow this command in sandbox",
                 PermissionOptionKind::AllowAlways,
             ));
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow_outside_sandbox"),
-                "Run outside sandbox once",
-                PermissionOptionKind::AllowOnce,
-            ));
+            if sandbox_escalation_requested {
+                options.push(PermissionOption::new(
+                    PermissionOptionId::new("allow_outside_sandbox"),
+                    "Run outside sandbox once",
+                    PermissionOptionKind::AllowOnce,
+                ));
+            }
         } else {
             options.push(PermissionOption::new(
                 PermissionOptionId::new("allow"),
@@ -305,6 +317,7 @@ fn permission_grant_for_selection(
     tool_name: &str,
     option_id: &str,
     shell_sandboxed: bool,
+    sandbox_escalation_requested: bool,
 ) -> Result<PermissionGrant, String> {
     match option_id {
         "allow_always" => Ok(PermissionGrant {
@@ -315,7 +328,11 @@ fn permission_grant_for_selection(
             allow_always: false,
             sandbox_policy_override: None,
         }),
-        "allow_outside_sandbox" if tool_name == "run_shell_command" && shell_sandboxed => {
+        "allow_outside_sandbox"
+            if tool_name == "run_shell_command"
+                && shell_sandboxed
+                && sandbox_escalation_requested =>
+        {
             Ok(PermissionGrant {
                 allow_always: false,
                 sandbox_policy_override: Some(SandboxPolicy::None),
@@ -828,6 +845,16 @@ fn shell_command_will_run_sandboxed(
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
 ) -> bool {
     crate::tools::sandbox::shell_command_will_run_sandboxed(permission_mode, sandbox_mode)
+}
+
+const SANDBOX_ESCALATION_COMMAND_FIELD: &str = "sandbox_permissions";
+const SANDBOX_ESCALATION_REQUEST_VALUE: &str = "require_escalated";
+
+fn shell_sandbox_escalation_requested(raw_input: &Value) -> bool {
+    raw_input
+        .get(SANDBOX_ESCALATION_COMMAND_FIELD)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == SANDBOX_ESCALATION_REQUEST_VALUE)
 }
 
 fn always_allow_key(
@@ -1719,12 +1746,17 @@ async fn evaluate_pure_gate(
     let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
     let shell_sandboxed =
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
+    let sandbox_escalation_requested = tool_name == "run_shell_command"
+        && shell_sandboxed
+        && shell_sandbox_escalation_requested(raw_input);
     let shell_auto_allow = tool_name == "run_shell_command"
+        && !sandbox_escalation_requested
         && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
     let always_allow_keys = always_allow_lookup_keys(tool_name, raw_input, cwd, shell_sandboxed);
-    let is_always_allowed = sessions
-        .is_any_always_allowed(session_id, &always_allow_keys)
-        .await;
+    let is_always_allowed = !sandbox_escalation_requested
+        && sessions
+            .is_any_always_allowed(session_id, &always_allow_keys)
+            .await;
     let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
 
     Ok(PureGateEvaluation {
@@ -1797,6 +1829,9 @@ async fn consult_gate(
                     tool_call_id: request.tool_call_id,
                     raw_input: request.raw_input,
                     shell_sandboxed: evaluation.shell_sandboxed,
+                    sandbox_escalation_requested: shell_sandbox_escalation_requested(
+                        request.raw_input,
+                    ),
                 },
             )
             .await
@@ -1850,6 +1885,7 @@ struct PermissionRequest<'a> {
     tool_call_id: &'a str,
     raw_input: &'a Value,
     shell_sandboxed: bool,
+    sandbox_escalation_requested: bool,
 }
 
 async fn request_user_permission(
@@ -1864,6 +1900,7 @@ async fn request_user_permission(
         tool_call_id,
         raw_input,
         shell_sandboxed,
+        sandbox_escalation_requested,
     } = request;
 
     // The permission modal needs to show *what* is being approved, not just
@@ -1896,7 +1933,8 @@ async fn request_user_permission(
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 
-    let options = permission_options(tool_name, shell_sandboxed);
+    let options =
+        permission_options_for_request(tool_name, shell_sandboxed, sandbox_escalation_requested);
 
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
     emit_terminal_notification(TerminalNotificationEvent::Prompt);
@@ -1924,7 +1962,12 @@ async fn request_user_permission(
         Ok(resp) => match resp.outcome {
             RequestPermissionOutcome::Selected(selected) => {
                 let id: &str = &selected.option_id.0;
-                permission_grant_for_selection(tool_name, id, shell_sandboxed)
+                permission_grant_for_selection(
+                    tool_name,
+                    id,
+                    shell_sandboxed,
+                    sandbox_escalation_requested,
+                )
             }
             RequestPermissionOutcome::Cancelled => Err(
                 "Tool use denied: the prompt was cancelled before the user responded.".to_string(),
@@ -2223,16 +2266,29 @@ async fn execute_tool(
     let result = registry
         .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
         .await;
-    tool_result_to_execution(result)
+    tool_result_to_execution(tool_name, policy, outside_sandbox_once, result)
 }
 
-fn tool_result_to_execution(result: crate::tools::ToolResult) -> ToolExecution {
+fn tool_result_to_execution(
+    tool_name: &str,
+    policy: SandboxPolicy,
+    outside_sandbox_once: bool,
+    result: crate::tools::ToolResult,
+) -> ToolExecution {
     let (status_prefix, failed) = match result.status {
         ToolStatus::Success => ("", false),
         ToolStatus::RequestError => ("Error: ", true),
         ToolStatus::InternalError => ("Internal error: ", true),
     };
     let mut output = format!("{}{}", status_prefix, result.output);
+    if tool_name == "run_shell_command"
+        && failed
+        && !outside_sandbox_once
+        && !matches!(policy, SandboxPolicy::None)
+        && is_likely_sandbox_limitation(&output)
+    {
+        output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
+    }
     if output.len() > MAX_TOOL_RESULT_BYTES {
         // Truncate on a UTF-8 char boundary; otherwise an emoji or accented
         // byte sequence could leave the slice mid-codepoint.
@@ -2244,6 +2300,30 @@ fn tool_result_to_execution(result: crate::tools::ToolResult) -> ToolExecution {
         output.push_str("\n... output truncated");
     }
     ToolExecution { output, failed }
+}
+
+const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\nSandbox note: this failure looks consistent with the sandbox boundary (for example permission denied, operation not permitted, read-only filesystem, or namespace/process isolation). First verify from the command output and any safe read-only checks that the sandbox is likely the limiting factor rather than a normal command error. If unsandboxed execution is necessary to complete the user's request, retry the same `run_shell_command` call with `sandbox_permissions` set to `require_escalated`; Brokk will then ask the user for one-time permission to run it outside the OS sandbox.";
+
+fn is_likely_sandbox_limitation(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    [
+        "permission denied",
+        "operation not permitted",
+        "read-only file system",
+        "readonly file system",
+        "read-only filesystem",
+        "read only file system",
+        "access denied",
+        "not permitted",
+        "eperm",
+        "eacces",
+        "namespace",
+        "seccomp",
+        "cannot create directory",
+        "cannot touch",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Dispatch the `task` meta-tool: look up the named subagent, build a
@@ -3729,8 +3809,26 @@ mod tests {
     }
 
     #[test]
-    fn shell_permission_prompt_includes_explicit_outside_sandbox_choice() {
+    fn shell_permission_prompt_omits_explicit_outside_sandbox_choice_by_default() {
         let options = permission_options("run_shell_command", true);
+        let labels: Vec<_> = options
+            .iter()
+            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                ("allow", "Allow in sandbox"),
+                ("allow_always", "Always allow this command in sandbox"),
+                ("reject", "Reject"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_permission_prompt_includes_explicit_outside_sandbox_choice_when_requested() {
+        let options = permission_options_for_request("run_shell_command", true, true);
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -3767,8 +3865,9 @@ mod tests {
 
     #[test]
     fn shell_allow_always_choice_maps_to_sandboxed_session_approval() {
-        let grant = permission_grant_for_selection("run_shell_command", "allow_always", true)
-            .expect("shell sticky sandbox approval should be accepted");
+        let grant =
+            permission_grant_for_selection("run_shell_command", "allow_always", true, false)
+                .expect("shell sticky sandbox approval should be accepted");
 
         assert_eq!(
             grant,
@@ -3841,9 +3940,13 @@ mod tests {
 
     #[test]
     fn shell_outside_sandbox_choice_maps_to_policy_override() {
-        let grant =
-            permission_grant_for_selection("run_shell_command", "allow_outside_sandbox", true)
-                .expect("shell override should be accepted");
+        let grant = permission_grant_for_selection(
+            "run_shell_command",
+            "allow_outside_sandbox",
+            true,
+            true,
+        )
+        .expect("shell override should be accepted");
 
         assert_eq!(
             grant,
@@ -3856,11 +3959,13 @@ mod tests {
 
     #[test]
     fn shell_outside_sandbox_choice_is_rejected_when_shell_sandbox_disabled() {
-        let err =
-            permission_grant_for_selection("run_shell_command", "allow_outside_sandbox", false)
-                .expect_err(
-                    "outside-sandbox option is not valid when shell sandboxing is disabled",
-                );
+        let err = permission_grant_for_selection(
+            "run_shell_command",
+            "allow_outside_sandbox",
+            false,
+            true,
+        )
+        .expect_err("outside-sandbox option is not valid when shell sandboxing is disabled");
         assert!(err.contains("unknown option"), "got: {err}");
     }
 
@@ -3941,7 +4046,7 @@ mod tests {
             ]
         );
 
-        let grant = permission_grant_for_selection("write_file", "allow_always", false)
+        let grant = permission_grant_for_selection("write_file", "allow_always", false, false)
             .expect("non-shell sticky allow should still be accepted");
         assert_eq!(
             grant,

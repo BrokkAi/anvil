@@ -283,6 +283,15 @@ setup state on disk and can be inspected or revoked with:
 /permissions clear
 ```
 
+When a shell command fails with output that looks like a sandbox boundary issue
+(for example `permission denied`, `operation not permitted`, a read-only
+filesystem, or process/namespace isolation), Anvil appends guidance to the tool
+result telling the model to verify that the sandbox is likely the limiting
+factor. If unsandboxed execution is actually necessary, the model retries
+`run_shell_command` with `sandbox_permissions: "require_escalated"`; only then
+does the permission prompt include a one-time **Run outside sandbox** choice.
+That approval is never remembered as an **Always allow** rule.
+
 Sandbox mode is a separate execution boundary. This matters because Anvil runs
 in more places than a single blessed desktop environment: macOS has the Seatbelt
 sandbox exposed through `sandbox-exec`, many Linux installs have Bubblewrap
