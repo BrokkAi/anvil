@@ -30,6 +30,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # Pure-parsing library, also built as a wasm32-wasip2 binary that
 # wasmtime hosts when the wasm sandbox is enabled.
 brokk-acp-sandbox = "0.1.0"
+rtk_core = { package = "rtk", git = "https://github.com/BrokkAi/rtk", rev = "b5957a3bd82136d9a67429d17f69e568ccd30010" }
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.

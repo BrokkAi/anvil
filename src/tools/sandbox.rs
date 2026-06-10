@@ -198,6 +198,14 @@ impl WrappedCommand {
             _policy_file: None,
         }
     }
+
+    fn unwrapped_argv(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            sandboxed: false,
+            _policy_file: None,
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -249,6 +257,38 @@ pub fn wrap_command(
     }
 }
 
+pub fn wrap_argv(
+    policy: SandboxPolicy,
+    cwd: &Path,
+    argv: &[String],
+) -> std::io::Result<WrappedCommand> {
+    if argv.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox argv must not be empty",
+        ));
+    }
+    match policy {
+        SandboxPolicy::None => Ok(WrappedCommand::unwrapped_argv(argv.to_vec())),
+        SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite => {
+            if !cwd.is_absolute() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("sandbox cwd must be absolute, got '{}'", cwd.display()),
+                ));
+            }
+            if cwd.to_str().is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "sandbox cwd must be valid UTF-8 (non-UTF-8 paths cannot be safely \
+                     interpolated into seatbelt or bwrap rules)",
+                ));
+            }
+            wrap_platform_argv(policy, cwd, argv)
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn wrap_platform(
     policy: SandboxPolicy,
@@ -287,6 +327,33 @@ fn wrap_platform(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn wrap_platform_argv(
+    policy: SandboxPolicy,
+    cwd: &Path,
+    argv: &[String],
+) -> std::io::Result<WrappedCommand> {
+    let policy_content = build_seatbelt_policy(policy, cwd);
+    let path = std::env::temp_dir().join(format!("brokk-seatbelt-{}.sb", uuid::Uuid::new_v4()));
+    write_policy_file_secure(&path, &policy_content)
+        .map_err(|e| sandbox_io_error(format!("write seatbelt profile: {e}")))?;
+    let temp = TempPolicyFile::new(path.clone());
+
+    let mut wrapped = vec![
+        "sandbox-exec".to_string(),
+        "-f".to_string(),
+        path.to_string_lossy().into_owned(),
+        "--".to_string(),
+    ];
+    wrapped.extend(argv.iter().cloned());
+
+    Ok(WrappedCommand {
+        argv: wrapped,
+        sandboxed: true,
+        _policy_file: Some(temp),
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn wrap_platform(
     policy: SandboxPolicy,
@@ -315,6 +382,24 @@ fn wrap_platform(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn wrap_platform_argv(
+    policy: SandboxPolicy,
+    cwd: &Path,
+    argv: &[String],
+) -> std::io::Result<WrappedCommand> {
+    if !is_bubblewrap_available() {
+        warn_missing_bwrap_once();
+        return Ok(WrappedCommand::unwrapped_argv(argv.to_vec()));
+    }
+
+    Ok(WrappedCommand {
+        argv: build_bwrap_argv_with_tail(policy, cwd, argv),
+        sandboxed: true,
+        _policy_file: None,
+    })
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn wrap_platform(
     _policy: SandboxPolicy,
@@ -323,6 +408,16 @@ fn wrap_platform(
 ) -> std::io::Result<WrappedCommand> {
     warn_unsupported_os_once();
     Ok(WrappedCommand::unwrapped(command))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn wrap_platform_argv(
+    _policy: SandboxPolicy,
+    _cwd: &Path,
+    argv: &[String],
+) -> std::io::Result<WrappedCommand> {
+    warn_unsupported_os_once();
+    Ok(WrappedCommand::unwrapped_argv(argv.to_vec()))
 }
 
 /// Tag an io error as coming from the sandbox layer (not the user's command),
@@ -783,6 +878,19 @@ fn is_safe_parent_path_entry(path: &Path) -> bool {
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<String> {
+    build_bwrap_argv_with_tail(
+        policy,
+        cwd,
+        &["sh".to_string(), "-c".to_string(), command.to_string()],
+    )
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn build_bwrap_argv_with_tail(
+    policy: SandboxPolicy,
+    cwd: &Path,
+    tail_argv: &[String],
+) -> Vec<String> {
     let mut a: Vec<String> = Vec::with_capacity(48);
     a.push("bwrap".into());
 
@@ -843,9 +951,7 @@ fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<Str
     a.push("--die-with-parent".into());
     a.push("--".into());
 
-    a.push("sh".into());
-    a.push("-c".into());
-    a.push(command.into());
+    a.extend(tail_argv.iter().cloned());
 
     a
 }

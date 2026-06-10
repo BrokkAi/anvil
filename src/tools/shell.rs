@@ -1,10 +1,19 @@
 use super::sandbox::{self, ENV_WHITELIST, SandboxPolicy};
 use super::{ToolResult, ToolStatus};
+use anyhow::Context;
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as StdCommandExt;
+
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
+const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
 const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
     "Notice: this command was explicitly approved to run outside the OS sandbox once.";
 
@@ -312,6 +321,177 @@ where
     }
 }
 
+struct AnvilRtkRunner {
+    cwd: PathBuf,
+    policy: SandboxPolicy,
+    sandbox_path: OsString,
+    deadline: Instant,
+}
+
+impl rtk_core::ProcessRunner for AnvilRtkRunner {
+    fn run(&self, request: rtk_core::ProcessRequest) -> anyhow::Result<rtk_core::ProcessOutput> {
+        let mut argv = Vec::with_capacity(1 + request.args.len());
+        argv.push(request.program.to_string_lossy().into_owned());
+        argv.extend(
+            request
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned()),
+        );
+
+        let wrapped = sandbox::wrap_argv(self.policy, &self.cwd, &argv)
+            .with_context(|| format!("preparing RTK child sandbox for `{}`", argv.join(" ")))?;
+
+        let mut cmd = std::process::Command::new(&wrapped.argv[0]);
+        cmd.args(&wrapped.argv[1..])
+            .current_dir(request.cwd.as_deref().unwrap_or(&self.cwd))
+            .env_clear()
+            .env("PATH", &self.sandbox_path)
+            .env("TERM", "dumb")
+            .stdin(match request.stdin {
+                rtk_core::ProcessStdin::Null => std::process::Stdio::null(),
+                rtk_core::ProcessStdin::Inherit => std::process::Stdio::null(),
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for key in ENV_WHITELIST {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        for (key, value) in request.envs {
+            match value {
+                Some(value) => {
+                    cmd.env(key, value);
+                }
+                None => {
+                    cmd.env_remove(key);
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let rlimits = RlimitConfig::from_env().clamp_to_parent_hard_limits();
+            // SAFETY: `apply_rlimits` only calls async-signal-safe libc functions.
+            unsafe {
+                cmd.pre_exec(move || apply_rlimits(&rlimits));
+            }
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning RTK child `{}`", wrapped.argv.join(" ")))?;
+        let mut stdout = child.stdout.take().context("capturing RTK child stdout")?;
+        let mut stderr = child.stderr.take().context("capturing RTK child stderr")?;
+        let stdout_thread = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= self.deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("RTK child timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let stdout = stdout_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("RTK stdout reader panicked"))??;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("RTK stderr reader panicked"))??;
+
+        drop(wrapped);
+
+        Ok(rtk_core::ProcessOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            exit_code: exit_code_from_status(status),
+        })
+    }
+}
+
+fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+fn format_shell_tool_result(
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+    success: bool,
+    outside_sandbox_once: bool,
+    bypass_warning: bool,
+) -> ToolResult {
+    let mut combined = String::new();
+    if !stdout.is_empty() {
+        combined.push_str(stdout);
+    }
+
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push_str("\n--- stderr ---\n");
+        }
+        combined.push_str(stderr);
+    }
+
+    if !success {
+        combined.push_str(&format!("\n\nExit code: {exit_code}"));
+        #[cfg(unix)]
+        if exit_code == 127 {
+            combined.push_str(EXIT_127_HINT);
+        }
+    }
+
+    if combined.is_empty() {
+        combined = format!("Command completed with exit code {exit_code}");
+    }
+
+    if outside_sandbox_once {
+        combined = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{combined}");
+    }
+
+    if combined.len() > MAX_OUTPUT_BYTES {
+        combined.truncate(MAX_OUTPUT_BYTES);
+        combined.push_str("\n... output truncated");
+    }
+
+    if bypass_warning {
+        combined.push('\n');
+        combined.push_str(SANDBOX_BYPASS_WARNING);
+    }
+
+    ToolResult {
+        status: if success {
+            ToolStatus::Success
+        } else {
+            ToolStatus::RequestError
+        },
+        output: combined,
+    }
+}
+
 pub async fn run_shell_command(
     cwd: &Path,
     command: &str,
@@ -376,6 +556,53 @@ pub async fn run_shell_command(
     let sandbox_path = sandbox::discover_sandbox_path();
     #[cfg(not(unix))]
     let sandbox_path = std::env::var_os("PATH").unwrap_or_default();
+
+    if std::env::var_os(ANVIL_RTK_DISABLED_ENV).is_none() {
+        let rtk_command = command.to_string();
+        let rtk_cwd = cwd.to_path_buf();
+        let rtk_runner = Arc::new(AnvilRtkRunner {
+            cwd: rtk_cwd.clone(),
+            policy,
+            sandbox_path: sandbox_path.clone().into(),
+            deadline: Instant::now() + Duration::from_secs(timeout_seconds),
+        });
+        let rtk_result = tokio::task::spawn_blocking(move || {
+            let rtk_input = rtk_core::ShellCommandInput {
+                command: &rtk_command,
+                cwd: &rtk_cwd,
+                verbose: 0,
+                excluded_commands: &[],
+                transparent_prefixes: &[],
+            };
+            rtk_core::try_run_shell_command(rtk_input, rtk_runner)
+        })
+        .await;
+        match rtk_result {
+            Ok(Ok(Some(output))) => {
+                drop(wrapped);
+                return format_shell_tool_result(
+                    &output.stdout,
+                    &output.stderr,
+                    output.exit_code,
+                    output.exit_code == 0,
+                    outside_sandbox_once,
+                    bypass_warning,
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "embedded RTK shell handling failed; falling back to native shell: {e:#}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "embedded RTK shell task panicked; falling back to native shell: {e}"
+                );
+            }
+        }
+    }
+
     let mut cmd = Command::new(&wrapped.argv[0]);
     cmd.args(&wrapped.argv[1..])
         .current_dir(cwd)
@@ -425,56 +652,17 @@ pub async fn run_shell_command(
 
     match result {
         Ok(Ok(output)) => {
-            let mut combined = String::new();
-
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                combined.push_str(&stdout);
-            }
-
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                if !combined.is_empty() {
-                    combined.push_str("\n--- stderr ---\n");
-                }
-                combined.push_str(&stderr);
-            }
-
             let exit_code = output.status.code().unwrap_or(-1);
-            if !output.status.success() {
-                combined.push_str(&format!("\n\nExit code: {exit_code}"));
-                #[cfg(unix)]
-                if exit_code == 127 {
-                    combined.push_str(EXIT_127_HINT);
-                }
-            }
-
-            if combined.is_empty() {
-                combined = format!("Command completed with exit code {exit_code}");
-            }
-
-            if outside_sandbox_once {
-                combined = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{combined}");
-            }
-
-            if combined.len() > MAX_OUTPUT_BYTES {
-                combined.truncate(MAX_OUTPUT_BYTES);
-                combined.push_str("\n... output truncated");
-            }
-
-            if bypass_warning {
-                combined.push('\n');
-                combined.push_str(SANDBOX_BYPASS_WARNING);
-            }
-
-            ToolResult {
-                status: if output.status.success() {
-                    ToolStatus::Success
-                } else {
-                    ToolStatus::RequestError
-                },
-                output: combined,
-            }
+            format_shell_tool_result(
+                &stdout,
+                &stderr,
+                exit_code,
+                output.status.success(),
+                outside_sandbox_once,
+                bypass_warning,
+            )
         }
         Ok(Err(e)) => ToolResult {
             status: ToolStatus::InternalError,
@@ -721,6 +909,85 @@ mod tests {
         assert!(
             !result.output.contains("Hint: exit 127"),
             "successful command must not contain exit-127 hint; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_uses_embedded_rtk_for_cargo_test() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("create temp cargo project");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rtk-filter-demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::create_dir(dir.path().join("src")).expect("create src");
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+                 #[test]\n\
+                 fn adds() { assert_eq!(super::add(1, 2), 3); }\n\
+             }\n",
+        )
+        .expect("write lib.rs");
+
+        let result = run_shell_command(
+            dir.path(),
+            "cargo test --quiet",
+            120,
+            SandboxPolicy::None,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "cargo test must succeed; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("cargo test: 1 passed"),
+            "cargo test output should be compacted by RTK; got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("running 1 test"),
+            "raw cargo test progress should be filtered; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_uses_embedded_rtk_for_git_status() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("create temp git repo");
+        let init = run_shell_command(dir.path(), "git init", 30, SandboxPolicy::None, false).await;
+        assert!(
+            matches!(init.status, ToolStatus::Success),
+            "git init must succeed; got: {}",
+            init.output
+        );
+        std::fs::write(dir.path().join("changed.txt"), "hello\n").expect("write file");
+
+        let result =
+            run_shell_command(dir.path(), "git status", 30, SandboxPolicy::None, false).await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "git status must succeed; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("changed.txt") || result.output.contains("??"),
+            "RTK git status output should mention the untracked file; got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("On branch"),
+            "RTK git status should compact native porcelain; got: {}",
             result.output
         );
     }
