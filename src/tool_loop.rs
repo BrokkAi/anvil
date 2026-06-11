@@ -325,6 +325,18 @@ fn permission_grant_for_selection(
     shell_sandboxed: bool,
     sandbox_escalation_requested: bool,
 ) -> Result<PermissionGrant, String> {
+    let valid_options =
+        permission_options_for_request(tool_name, shell_sandboxed, sandbox_escalation_requested);
+    if !valid_options
+        .iter()
+        .any(|option| option.option_id.0.as_ref() == option_id)
+    {
+        tracing::warn!(
+            "request_permission returned unknown option id '{option_id}'; treating as reject"
+        );
+        return Err("Tool use denied (unknown option selected).".to_string());
+    }
+
     match option_id {
         "allow_always" => Ok(PermissionGrant {
             allow_always: true,
@@ -334,16 +346,10 @@ fn permission_grant_for_selection(
             allow_always: false,
             sandbox_policy_override: None,
         }),
-        "allow_outside_sandbox"
-            if tool_name == "run_shell_command"
-                && shell_sandboxed
-                && sandbox_escalation_requested =>
-        {
-            Ok(PermissionGrant {
-                allow_always: false,
-                sandbox_policy_override: Some(SandboxPolicy::None),
-            })
-        }
+        "allow_outside_sandbox" => Ok(PermissionGrant {
+            allow_always: false,
+            sandbox_policy_override: Some(SandboxPolicy::None),
+        }),
         "reject" => Err("Tool use denied by user.".to_string()),
         other => {
             tracing::warn!(
@@ -392,6 +398,7 @@ enum GateDecision {
     Allow {
         sandbox_policy_override: Option<SandboxPolicy>,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        shell_sandboxed: bool,
     },
     /// Refuse the call; feed the LLM the given denial message instead.
     Reject(String),
@@ -1480,6 +1487,7 @@ pub(crate) async fn run(
                         GateDecision::Allow {
                             sandbox_policy_override,
                             sandbox_mode,
+                            shell_sandboxed,
                         } => {
                             maybe_send_session_update(
                                 notifications,
@@ -1575,6 +1583,7 @@ pub(crate) async fn run(
                                     policy,
                                     outside_sandbox_once,
                                     sandbox_mode,
+                                    sandbox_policy_override.is_none() && shell_sandboxed,
                                 )
                                 .await
                             };
@@ -1822,6 +1831,7 @@ async fn consult_gate(
         PureGateDecision::Allow => GateDecision::Allow {
             sandbox_policy_override: None,
             sandbox_mode: evaluation.sandbox_mode,
+            shell_sandboxed: evaluation.shell_sandboxed,
         },
         PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
         PureGateDecision::Prompt => {
@@ -1864,6 +1874,7 @@ async fn consult_gate(
                     GateDecision::Allow {
                         sandbox_policy_override: grant.sandbox_policy_override,
                         sandbox_mode: evaluation.sandbox_mode,
+                        shell_sandboxed: evaluation.shell_sandboxed,
                     }
                 }
                 Err(reason) => GateDecision::Reject(reason),
@@ -2268,16 +2279,17 @@ async fn execute_tool(
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
 ) -> ToolExecution {
     let result = registry
         .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
         .await;
-    tool_result_to_execution(tool_name, policy, outside_sandbox_once, result)
+    tool_result_to_execution(tool_name, shell_sandboxed, outside_sandbox_once, result)
 }
 
 fn tool_result_to_execution(
     tool_name: &str,
-    policy: SandboxPolicy,
+    shell_sandboxed: bool,
     outside_sandbox_once: bool,
     result: crate::tools::ToolResult,
 ) -> ToolExecution {
@@ -2290,7 +2302,7 @@ fn tool_result_to_execution(
     if tool_name == "run_shell_command"
         && failed
         && !outside_sandbox_once
-        && !matches!(policy, SandboxPolicy::None)
+        && shell_sandboxed
         && is_likely_sandbox_limitation(&output)
     {
         output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
@@ -3962,6 +3974,15 @@ mod tests {
     }
 
     #[test]
+    fn shell_escalation_prompt_rejects_sticky_sandbox_options() {
+        for option_id in ["allow", "allow_always"] {
+            let err = permission_grant_for_selection("run_shell_command", option_id, true, true)
+                .expect_err("escalation prompt must reject options it did not offer");
+            assert!(err.contains("unknown option"), "got: {err}");
+        }
+    }
+
+    #[test]
     fn shell_outside_sandbox_choice_is_rejected_when_shell_sandbox_disabled() {
         let err = permission_grant_for_selection(
             "run_shell_command",
@@ -4059,6 +4080,30 @@ mod tests {
                 sandbox_policy_override: None,
             }
         );
+    }
+
+    #[test]
+    fn sandbox_escalation_hint_requires_actual_shell_sandbox() {
+        let result = crate::tools::ToolResult {
+            status: ToolStatus::RequestError,
+            output: "permission denied".to_string(),
+        };
+
+        let exec = tool_result_to_execution("run_shell_command", false, false, result);
+
+        assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
+    }
+
+    #[test]
+    fn sandbox_escalation_hint_is_added_for_sandboxed_shell_failures() {
+        let result = crate::tools::ToolResult {
+            status: ToolStatus::RequestError,
+            output: "permission denied".to_string(),
+        };
+
+        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+
+        assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
 
     #[test]
