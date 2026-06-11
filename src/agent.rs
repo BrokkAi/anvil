@@ -4071,41 +4071,61 @@ async fn handle_setup_bedrock(
         auth.default_model = Some(model.to_string());
         match crate::bedrock_auth::write(&auth) {
             Ok(()) => {
-                format!(
-                    "Bedrock default model set to {model}. Run `/setup bedrock refresh` to pick it up."
-                )
+                let backend: Arc<dyn crate::llm_client::LlmBackend> =
+                    Arc::new(crate::bedrock_client::BedrockClient::new(
+                        auth.bearer_token.clone(),
+                        auth.region
+                            .clone()
+                            .unwrap_or_else(crate::bedrock_auth::region_from_any_source),
+                        model.to_string(),
+                    ));
+                llm.install_bedrock(backend);
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Bedrock model change...",
+                    )),
+                    None,
+                );
+                format!("Bedrock default model set to {model}.")
             }
             Err(e) => format!("Failed to save Bedrock model: {e:#}"),
         }
     } else {
         match lower.as_str() {
-            "status" => match crate::bedrock_auth::read() {
-                Ok(Some(auth)) => {
-                    let region = auth.region.as_deref().unwrap_or("(default)");
-                    let model = auth.default_model.as_deref().unwrap_or("(default)");
+            "status" => {
+                let state = crate::bedrock_auth::CredentialState::snapshot();
+                if state.env_set {
                     format!(
-                        "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}",
-                        auth.bearer_token.len()
+                        "Bedrock is configured via {} environment variable.\n\
+                         Region: {}\n\
+                         Model: {}",
+                        crate::bedrock_client::BEDROCK_API_KEY_ENV,
+                        crate::bedrock_auth::region_from_any_source(),
+                        crate::bedrock_auth::model_from_any_source(),
                     )
-                }
-                Ok(None) => {
-                    let state = crate::bedrock_auth::CredentialState::snapshot();
-                    if state.env_set {
-                        format!(
-                            "Bedrock is configured via {} environment variable.\n\
-                             Region: {}\n\
-                             Model: {}",
-                            crate::bedrock_client::BEDROCK_API_KEY_ENV,
-                            crate::bedrock_auth::region_from_any_source(),
-                            crate::bedrock_auth::model_from_any_source(),
-                        )
-                    } else {
-                        "No Bedrock credentials found. Run `/setup bedrock key <token>`."
-                            .to_string()
+                } else {
+                    match crate::bedrock_auth::read() {
+                        Ok(Some(auth)) => {
+                            let region = auth.region.as_deref().unwrap_or("(default)");
+                            let model = auth.default_model.as_deref().unwrap_or("(default)");
+                            format!(
+                                "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}",
+                                auth.bearer_token.len()
+                            )
+                        }
+                        Ok(None) => {
+                            "No Bedrock credentials found. Run `/setup bedrock key <token>`."
+                                .to_string()
+                        }
+                        Err(e) => format!("Failed to read Bedrock credentials: {e:#}"),
                     }
                 }
-                Err(e) => format!("Failed to read Bedrock credentials: {e:#}"),
-            },
+            }
             "disconnect" if crate::bedrock_auth::CredentialState::snapshot().env_owns() => {
                 format!(
                     "Bedrock credentials are managed by the {} environment variable. \
