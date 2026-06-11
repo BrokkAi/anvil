@@ -48,7 +48,7 @@ const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// it (the daemon either listens on the default port or it doesn't),
 /// so the slot is set once at construction and never mutated.
 pub struct MultiBackend {
-    bedrock: Option<Arc<dyn LlmBackend>>,
+    bedrock: RwLock<Option<Arc<dyn LlmBackend>>>,
     codex: RwLock<Option<Arc<dyn LlmBackend>>>,
     openrouter: RwLock<Option<Arc<dyn LlmBackend>>>,
     ollama: Option<Arc<dyn LlmBackend>>,
@@ -62,11 +62,26 @@ impl MultiBackend {
         ollama: Option<Arc<dyn LlmBackend>>,
     ) -> Self {
         Self {
-            bedrock,
+            bedrock: RwLock::new(bedrock),
             codex: RwLock::new(codex),
             openrouter: RwLock::new(openrouter),
             ollama,
         }
+    }
+
+    /// Install (or replace) the Bedrock backend at runtime. Called from
+    /// `/setup bedrock key <token>` so a session that started without
+    /// Bedrock credentials picks up the new key on the next discovery
+    /// refresh.
+    pub fn install_bedrock(&self, backend: Arc<dyn LlmBackend>) {
+        *self.bedrock.write().unwrap() = Some(backend);
+    }
+
+    /// Drop the currently-installed Bedrock backend, if any. Called
+    /// from `/setup bedrock disconnect` after the on-disk credentials
+    /// are wiped.
+    pub fn uninstall_bedrock(&self) {
+        *self.bedrock.write().unwrap() = None;
     }
 
     /// Install (or replace) the Codex backend at runtime. Called from
@@ -114,6 +129,13 @@ impl MultiBackend {
         *self.openrouter.write().unwrap() = None;
     }
 
+    /// Snapshot the current Bedrock backend, if any. Cloning the inner Arc
+    /// lets callers release the read lock immediately; they can then
+    /// `.await` the backend without holding a guard.
+    fn bedrock_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
+        self.bedrock.read().unwrap().clone()
+    }
+
     /// Snapshot the current Codex backend, if any. Cloning the inner Arc
     /// lets callers release the read lock immediately; they can then
     /// `.await` the backend without holding a guard.
@@ -135,7 +157,7 @@ impl MultiBackend {
             crate::openrouter_auth::append_refresh_log("Snapshotting configured backends...");
             let _ = tx.send("Snapshotting configured backends...\n".to_string());
         }
-        let bedrock = self.bedrock.clone();
+        let bedrock = self.bedrock_snapshot();
         let codex = self.codex_snapshot();
         let openrouter = self.openrouter_snapshot();
         if let Some(tx) = &progress {
@@ -264,7 +286,7 @@ impl MultiBackend {
 
     fn pick(&self, source: ModelSource) -> Option<Arc<dyn LlmBackend>> {
         match source {
-            ModelSource::Bedrock => self.bedrock.clone(),
+            ModelSource::Bedrock => self.bedrock_snapshot(),
             ModelSource::Codex => self.codex_snapshot(),
             ModelSource::OpenRouter => self.openrouter_snapshot(),
             ModelSource::Ollama => self.ollama.clone(),
@@ -273,13 +295,15 @@ impl MultiBackend {
 
     /// Source to use when a chat request arrives with no `<source>::` prefix.
     /// Computed on demand (rather than cached at construction) so a Codex
-    /// login mid-session promotes Codex to the preferred fallback.
+    /// login or Bedrock key paste mid-session promotes it to the preferred
+    /// fallback.
     ///
     /// Priority is Bedrock > Codex > Ollama > OpenRouter. Bedrock wins
     /// when configured because its model ids are otherwise easy to type
     /// bare from the environment-driven setup.
     fn fallback_source(&self) -> Option<ModelSource> {
-        if self.bedrock.is_some() {
+        let bedrock_present = self.bedrock.read().unwrap().is_some();
+        if bedrock_present {
             return Some(ModelSource::Bedrock);
         }
         let codex_present = self.codex.read().unwrap().is_some();
@@ -752,6 +776,83 @@ mod tests {
         assert!(
             format!("{err:#}").contains("codex"),
             "error must mention codex backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_installed_after_setup_is_routable() {
+        let multi = MultiBackend::new(None, None, None, None);
+
+        let err = multi
+            .stream_chat(chat_request(
+                "bedrock::us.anthropic.claude-sonnet-4-6",
+                None,
+            ))
+            .await
+            .expect_err("bedrock route must fail before install");
+        assert!(format!("{err:#}").contains("bedrock"));
+
+        let (bedrock_backend, bedrock_handles) = recording("bedrock");
+        multi.install_bedrock(bedrock_backend);
+
+        let _ = multi
+            .stream_chat(chat_request(
+                "bedrock::us.anthropic.claude-sonnet-4-6",
+                None,
+            ))
+            .await
+            .expect("bedrock route must succeed after install");
+        assert_eq!(
+            bedrock_handles.last_model.lock().unwrap().as_deref(),
+            Some("us.anthropic.claude-sonnet-4-6")
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_id_falls_back_to_bedrock_after_install() {
+        let (codex_backend, codex_handles) = recording("codex");
+        let multi = MultiBackend::new(None, Some(codex_backend), None, None);
+
+        let (bedrock_backend, bedrock_handles) = recording("bedrock");
+        multi.install_bedrock(bedrock_backend);
+
+        let _ = multi
+            .stream_chat(chat_request("us.anthropic.claude-sonnet-4-6", None))
+            .await
+            .expect("bare id must route to newly-installed bedrock");
+        assert_eq!(
+            bedrock_handles.last_model.lock().unwrap().as_deref(),
+            Some("us.anthropic.claude-sonnet-4-6")
+        );
+        assert!(codex_handles.last_model.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bedrock_uninstall_unroutes_bedrock_requests() {
+        let multi = MultiBackend::new(None, None, None, None);
+        let (bedrock_backend, _bedrock_handles) = recording("bedrock");
+        multi.install_bedrock(bedrock_backend);
+
+        let _ = multi
+            .stream_chat(chat_request(
+                "bedrock::us.anthropic.claude-sonnet-4-6",
+                None,
+            ))
+            .await
+            .expect("bedrock route must succeed while installed");
+
+        multi.uninstall_bedrock();
+
+        let err = multi
+            .stream_chat(chat_request(
+                "bedrock::us.anthropic.claude-sonnet-4-6",
+                None,
+            ))
+            .await
+            .expect_err("bedrock route must fail after uninstall");
+        assert!(
+            format!("{err:#}").contains("bedrock"),
+            "error must mention bedrock backend"
         );
     }
 

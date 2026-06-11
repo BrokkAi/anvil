@@ -769,12 +769,21 @@ fn mantle_base_url(region: &str) -> String {
     format!("https://bedrock-mantle.{region}.api.aws/v1")
 }
 
+/// Resolve bearer token, region, and model from all available sources.
+/// Precedence for each: env > brokk config file > ~/.secrets/ > default.
+/// Kept as thin wrappers for backward compat; the authoritative
+/// resolution lives in `bedrock_auth` so the setup handlers and startup
+/// path share the same precedence logic.
 pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
     if let Ok(raw) = std::env::var(BEDROCK_API_KEY_ENV) {
         let token = raw.trim();
         if !token.is_empty() {
             return Ok(Some(token.to_string()));
         }
+    }
+
+    if let Some(token) = bearer_token_from_brokk_config()? {
+        return Ok(Some(token));
     }
 
     for name in ["aws_bearer_token_bedrock", "bedrock_api_key"] {
@@ -785,6 +794,13 @@ pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
     Ok(None)
 }
 
+pub fn bearer_token_from_brokk_config() -> Result<Option<String>> {
+    Ok(crate::bedrock_auth::read()?.and_then(|auth| {
+        let token = auth.bearer_token.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }))
+}
+
 pub fn region_from_env() -> String {
     std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -792,7 +808,17 @@ pub fn region_from_env() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(region_from_config)
         .unwrap_or_else(|| BEDROCK_DEFAULT_REGION.to_string())
+}
+
+pub fn region_from_config() -> Option<String> {
+    crate::bedrock_auth::read().ok().flatten().and_then(|auth| {
+        auth.region.and_then(|region| {
+            let region = region.trim();
+            (!region.is_empty()).then(|| region.to_string())
+        })
+    })
 }
 
 pub fn model_from_env() -> String {
@@ -800,7 +826,28 @@ pub fn model_from_env() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(model_from_config)
         .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string())
+}
+
+pub fn model_from_config() -> Option<String> {
+    crate::bedrock_auth::read().ok().flatten().and_then(|auth| {
+        auth.default_model.and_then(|model| {
+            let model = model.trim();
+            (!model.is_empty()).then(|| model.to_string())
+        })
+    })
+}
+
+pub fn build_backend_from_config() -> Result<Option<Arc<dyn LlmBackend>>> {
+    let Some(token) = bearer_token_from_env_or_secrets()? else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(BedrockClient::new(
+        token,
+        region_from_env(),
+        model_from_env(),
+    ))))
 }
 
 fn needs_inference_profile_retry(status: reqwest::StatusCode, body: &str) -> bool {

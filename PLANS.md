@@ -1,154 +1,72 @@
-# Context Window Management — shipped
+# Bedrock Setup Fix — Plan
 
-A history of conversation, especially with tool-use, will eventually
-exceed the model's context window. Anvil's defense is a **per-turn
-summary** layer, persisted in the existing `summaryContentId` slot of
-the session zip (the same slot Brokk's Java side already reads).
+## Problems
 
-This document describes what's in the tree today. Open issues and
-follow-up work are listed at the bottom.
+1. **Bedrock missing from `/setup` "Pick one" list**: `render_setup_home_for_model` lists only Codex, local, and OpenRouter as setup options. Bedrock appears only in "Found now" status.
 
-## What lands in the prompt
+2. **No `/setup bedrock` handler**: `handle_setup` has no `"bedrock"` dispatch arm — typing `/setup bedrock` falls to the `other => "Unknown setup option"` error.
 
-`build_prompt_messages` in `src/agent.rs` walks the session's
-`ConversationTurn` history and, for each turn:
+3. **Credentials inconsistent**: Bedrock uses `~/.secrets/` while Codex uses `~/.codex/auth.json` and OpenRouter uses `~/.config/brokk/openrouter.json`. Bedrock should additionally support `~/.config/brokk/bedrock.json`.
 
-- If the turn carries a `summary`, emit a single user message wrapping
-  it in `<conversation_summary>...</conversation_summary>`. The
-  verbatim user prompt / tool exchanges / assistant response for that
-  turn are **not** re-emitted.
-- Otherwise replay the turn verbatim (user prompt, optional
-  `assistant_tool_calls` + `tool_result` pairs, optional assistant text).
+4. **No runtime install/uninstall**: `MultiBackend` has `install_codex`/`uninstall_codex` and `install_openrouter`/`uninstall_openrouter` but no bedrock equivalents. The Bedrock backend is static at startup.
 
-The full log stays on disk regardless — `set_turn_summary` only
-flips the `summaryContentId` reference. A session reload from disk
-reproduces the same prompt the live session would build.
+5. **Can't paste key via setup**: No `/setup bedrock key <token>` command.
 
-## Two trigger paths
+6. **Region/model not settable via setup**: Bedrock also needs a region (env only) and model override — these should be configurable via `/setup bedrock`.
 
-### Automatic, per prompt
+## Plan
 
-`build_prompt_messages_with_compression` runs before each turn's
-prompt is dispatched. It:
+### Step 1: Create `src/bedrock_auth.rs` (mirror `openrouter_auth.rs`)
 
-1. Builds the messages.
-2. Estimates tokens via `tokens::approximate_tokens_messages` (the
-   same `o200k_base` tokenizer used by Brokk's
-   `Messages.getApproximateTokens`).
-3. If projected tokens exceed `context_budget(model_context_length)`
-   — i.e. 75% of the model's declared window, falling back to 128k —
-   walks the history oldest-first and compresses each uncompressed
-   turn via `summarize_turn`, mutating the in-memory snapshot and
-   persisting via `set_turn_summary` until the prompt fits or every
-   turn is compressed.
+- On-disk credential file at `<config>/brokk/bedrock.json`
+- Schema: `{ bearer_token, region?, default_model? }`
+- Atomic write (tmp + rename + chmod 600)
+- `CredentialState` for env vs file ownership
+- Read/write/logout functions
+- Precedence: env > file > ~/.secrets/ (legacy fallback)
 
-### User-initiated: `/compress`
+### Step 2: Update `src/bedrock_client.rs`
 
-Runs the same compression loop, but unconditionally for every
-uncompressed turn, with progress notifications streamed to the
-client. Dispatched after `start_prompt` so a `session/cancel` aborts
-the in-flight summarization and stops the loop between turns.
+- Add `bearer_token_from_brokk_config()` that reads from `bedrock_auth`
+- Update `bearer_token_from_env_or_secrets()` to try brokk config first, then env, then secrets
+- Add `region_from_config()` and `model_from_config()` that check the auth file
+- Export `build_backend_from_config()` that assembles a `BedrockClient` from all sources
 
-Idempotent: re-running reports "Nothing to compress: N turn(s), all
-already summarized." Failed turns stay verbatim and the rest of the
-session still gets compressed.
+### Step 3: Add `install_bedrock` / `uninstall_bedrock` to `MultiBackend`
 
-## How a single turn gets summarized
+- Add `RwLock<Option<Arc<dyn LlmBackend>>>` for bedrock slot
+- Add `install_bedrock()` / `uninstall_bedrock()` methods
+- Update `fallback_source()` to consult the live bedrock slot
+- Update `pick()` to read from the RwLock (not the static field)
 
-`context_manager::summarize_turn` is the single entry point.
+### Step 4: Add `/setup bedrock` handler
 
-**Fast path.** If the full turn (user prompt + tool exchanges +
-assistant response, wrapped with `SYSTEM_PROMPT_TURN`) fits inside
-`summarizer_input_budget = 65% * context_length` (fallback 128k →
-~83k tokens), it goes out as one LLM call. The model returns a
-bulleted summary inside `<conversation_summary>` tags; tags are
-stripped before persistence.
+- In `handle_setup`: add `"bedrock" =>` dispatch arm → calls `handle_setup_bedrock`
+- `handle_setup_bedrock()`: like `handle_setup_openrouter` but simpler:
+  - bare → render bedrock setup help
+  - `key <token>` → write to bedrock_auth, install backend, refresh catalog
+  - `status` → show credential state
+  - `disconnect` → wipe creds, uninstall backend
+  - `region <region>` → set region
+  - `model <id>` → set default model
+  - `refresh` → refresh catalog
 
-**Hierarchical path.** When the turn is too big for one call:
+### Step 5: Update `render_setup_home_for_model`
 
-1. **Atomize.** Split the turn into ordered atoms: `User: <prompt>`,
-   one `Tool <name> args=... -> <result>` per exchange, `Assistant:
-   <response>`.
-2. **Pack.** Greedily pack atoms into chunks at
-   `per_chunk_budget = budget - CHUNK_OVERHEAD_TOKENS`, with a hard
-   floor of `MIN_CHUNK_TOKENS`. Atoms larger than the per-chunk
-   budget are split — by line first, then by character as a
-   last-resort fallback.
-3. **Chunk summarize.** Each chunk goes through the LLM with
-   `SYSTEM_PROMPT_CHUNK`, which tells the model it's summarizing
-   *one part of a larger turn* and that a later step will combine
-   its output. Output is plain bullets, no tags.
-4. **Meta summarize.** Combined chunk summaries are fed back to
-   the LLM with `SYSTEM_PROMPT_META`, which produces one coherent
-   summary wrapped in `<conversation_summary>` tags. If the
-   combined input still overruns, recurses — chunk the combined
-   summaries, meta-pass over those, etc.
+- Add `- /setup bedrock - Use AWS Bedrock.` to "Pick one" list
 
-The recursion is bounded: each level shrinks the input
-materially (chunk summaries are bullet-only output), and the
-`MIN_CHUNK_TOKENS` floor combined with a "no further split possible"
-check in `combine_chunk_summaries` guarantees termination.
+### Step 6: Update `src/main.rs`
 
-This guarantees a session never reaches the "too big to send AND too
-big to compress" wedge state: every turn either gets a summary (lossy
-if the original was monstrous, but the verbatim log stays on disk) or
-returns a clean `Err` that the caller surfaces to the user.
+- Wire `build_bedrock_backend()` to use `bedrock_auth` as an additional source
+- Load bedrock auth at startup for the initial backend
 
-## On-disk schema
+### Step 7: Update messages (help text, advanced setup)
 
-No new files. The summary text lives under `content/<uuid>.txt` and
-is referenced from the `summaryContentId` field of the matching task
-entry in `contexts.jsonl` — the exact slot Brokk's Java side already
-reads. Sessions compressed by Anvil open cleanly in Brokk and render
-the "compressed" indicator; sessions compressed by Brokk get their
-summaries picked up by Anvil's load path.
+- Update `render_setup_models` Bedrock empty hint to mention `/setup bedrock`
+- Update `render_setup_advanced` if needed
 
-`append_turn_to_zip` returns the assigned fragment id so the
-in-memory `ConversationTurn` knows where it lives on disk;
-`set_turn_summary` uses that id to surgically rewrite just the
-matching task's `summaryContentId` plus add one new `content/*.txt`
-blob, atomically via `with_temp_zip_writer`.
+### Step 8: Tests
 
-## Counterpart in Brokk
-
-This layer mirrors Brokk's `ContextManager.compressHistory(TaskEntry)`
-and `ContextManager.compressHistoryAsync(Context)`. Differences:
-
-| Concern | Brokk | Anvil |
-| --- | --- | --- |
-| Wedge prevention | Upstream via `ContextSizeGuard` at add-time | Downstream via hierarchical summarization |
-| Concurrency | Parallel via `compressHistoryAsync` | Sequential (one prompt per session at a time, gated by `start_prompt`) |
-| Trigger | UI button + automatic in `ArchitectAgent` | `/compress` slash command + automatic per-prompt threshold |
-| Oversized turn | `compressHistory` returns the original on failure | `summarize_turn` chunks and recurses; returns `Err` only on actual LLM/network failure |
-
-## Concurrency
-
-Chunk summarization within `summarize_turn_hierarchical` and the
-recursive meta path in `combine_chunk_summaries` both run through
-`summarize_chunks_parallel`, which uses `futures::buffered(N)` with
-`MAX_CONCURRENT_CHUNK_REQUESTS = 2` to keep up to two chunk requests
-in flight at once. The cap is intentionally low: raising it without
-a per-backend rate-limit story will trigger `429`s on long compress
-runs.
-
-`buffered` preserves submission order, so the combine step sees
-chunk summaries in chronological turn order. `try_collect`
-short-circuits on the first `Err` so a single chunk failure aborts
-the rest of the run rather than burning credits on doomed work.
-
-## Open follow-ups
-
-- **No input-time gate.** Anvil could add one (ACP's `session/prompt`
-  is a real server-side intake; tool output is already bounded
-  per-call). The downstream summarizer makes this optional, not
-  required.
-- **Cost surfacing.** A `/compress` run on a long session can fire
-  many LLM calls (one per chunk + meta). We report verbatim-vs-summary
-  token tallies but don't expose dollar/credit cost.
-- **Summarizer model selection.** Today summarization uses the
-  session's active model with `reasoning_effort: "low"`. A
-  `/setup advanced` knob would let users route summarization to a
-  cheaper model.
-- **Provider-aware concurrency.** Once we have provider-level rate
-  awareness, `MAX_CONCURRENT_CHUNK_REQUESTS` can be lifted (or made
-  per-backend) to speed up long compress runs.
+- `bedrock_auth.rs`: round-trip, logout, credential state, env precedence
+- `handle_setup_bedrock` tests in agent tests
+- MultiBackend bedrock install/uninstall tests

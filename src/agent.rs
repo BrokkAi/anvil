@@ -883,6 +883,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          Pick one:\n\
          - `/setup choose` - Choose for me.\n\
          - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
+         - `/setup bedrock` - Use AWS Bedrock.\n\
          - `/setup local` - Use free local models on this computer.\n\
          - `/setup openrouter` - Use OpenRouter.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
@@ -3640,6 +3641,17 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             )
             .await
         }
+        "bedrock" => {
+            handle_setup_bedrock(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
+        }
         "openrouter" => {
             handle_setup_openrouter(
                 ctx.cx,
@@ -3897,6 +3909,266 @@ fn render_local_setup_help() -> String {
      4. Run `/setup local use`.\n\n\
      llama.cpp and custom local servers belong in `/setup advanced`."
         .to_string()
+}
+
+async fn handle_setup_bedrock(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    rest: &str,
+) -> String {
+    use crate::bedrock_client::BEDROCK_DEFAULT_MODEL;
+
+    if rest.is_empty() {
+        return render_bedrock_setup_help();
+    }
+    let lower = rest.to_ascii_lowercase();
+    if matches!(lower.as_str(), "refresh" | "try-again") {
+        return match refresh_model_catalog_now(
+            Some(cx),
+            Some(session_id),
+            llm,
+            sessions,
+            refresh_lock,
+        )
+        .await
+        {
+            Ok(catalog) => {
+                let count = source_count(&catalog, ModelSource::Bedrock);
+                if count > 0 {
+                    format!(
+                        "Bedrock models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
+                    )
+                } else {
+                    format!(
+                        "Bedrock is not showing models yet.\n\n{}",
+                        render_bedrock_setup_help()
+                    )
+                }
+            }
+            Err(e) => format!(
+                "Could not check Bedrock yet: {e}\n\n{}",
+                render_bedrock_setup_help()
+            ),
+        };
+    }
+
+    if let Some(key) = rest.strip_prefix("key ") {
+        let state = crate::bedrock_auth::CredentialState::snapshot();
+        if state.env_owns() {
+            return format!(
+                "Bedrock credentials are managed by the {} environment variable. \
+                 Unset it and restart before using `/setup bedrock key`.",
+                crate::bedrock_client::BEDROCK_API_KEY_ENV
+            );
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return "Provide a bearer token: `/setup bedrock key <token>`.".to_string();
+        }
+
+        let existing = crate::bedrock_auth::read().unwrap_or(None);
+        let region = existing
+            .as_ref()
+            .and_then(|a| a.region.clone())
+            .unwrap_or_else(crate::bedrock_auth::region_from_any_source);
+        let default_model = existing
+            .as_ref()
+            .and_then(|a| a.default_model.clone())
+            .unwrap_or_else(crate::bedrock_auth::model_from_any_source);
+        let auth = crate::bedrock_auth::BedrockAuth {
+            bearer_token: key.to_string(),
+            region: Some(region.clone()),
+            default_model: Some(default_model.clone()),
+        };
+        match crate::bedrock_auth::write(&auth) {
+            Ok(()) => {
+                let backend: Arc<dyn crate::llm_client::LlmBackend> =
+                    Arc::new(crate::bedrock_client::BedrockClient::new(
+                        key.to_string(),
+                        region.clone(),
+                        default_model.clone(),
+                    ));
+                llm.install_bedrock(backend);
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Bedrock setup...",
+                    )),
+                    None,
+                );
+                format!(
+                    "Bedrock credentials saved.\n\
+                     Token: saved (length {})\n\
+                     Region: {region}\n\
+                     Model: {default_model}\n\n\
+                     Run `/setup choose` or `/setup model` to pick a Bedrock model.\n\n\
+                     Tip: change region with `/setup bedrock region <region>`\n\
+                     Tip: change model with `/setup bedrock model <model_id>`",
+                    key.len()
+                )
+            }
+            Err(e) => format!("Failed to save Bedrock credentials: {e:#}"),
+        }
+    } else if let Some(region) = rest.strip_prefix("region ") {
+        let region = region.trim();
+        if region.is_empty() {
+            return "Provide a region: `/setup bedrock region <region>` (e.g. us-east-1)."
+                .to_string();
+        }
+        let mut auth = match crate::bedrock_auth::read() {
+            Ok(Some(a)) => a,
+            _ => {
+                return "No Bedrock credentials saved yet. Run `/setup bedrock key <token>` first."
+                    .to_string();
+            }
+        };
+        auth.region = Some(region.to_string());
+        match crate::bedrock_auth::write(&auth) {
+            Ok(()) => {
+                let backend: Arc<dyn crate::llm_client::LlmBackend> =
+                    Arc::new(crate::bedrock_client::BedrockClient::new(
+                        auth.bearer_token.clone(),
+                        region.to_string(),
+                        auth.default_model
+                            .clone()
+                            .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string()),
+                    ));
+                llm.install_bedrock(backend);
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Bedrock region change...",
+                    )),
+                    None,
+                );
+                format!("Bedrock region set to {region}.")
+            }
+            Err(e) => format!("Failed to save Bedrock region: {e:#}"),
+        }
+    } else if let Some(model) = rest.strip_prefix("model ") {
+        let model = model.trim();
+        if model.is_empty() {
+            return "Provide a model id: `/setup bedrock model <model_id>` (e.g. us.anthropic.claude-sonnet-4-6).".to_string();
+        }
+        let mut auth = match crate::bedrock_auth::read() {
+            Ok(Some(a)) => a,
+            _ => {
+                return "No Bedrock credentials saved yet. Run `/setup bedrock key <token>` first."
+                    .to_string();
+            }
+        };
+        auth.default_model = Some(model.to_string());
+        match crate::bedrock_auth::write(&auth) {
+            Ok(()) => {
+                format!(
+                    "Bedrock default model set to {model}. Run `/setup bedrock refresh` to pick it up."
+                )
+            }
+            Err(e) => format!("Failed to save Bedrock model: {e:#}"),
+        }
+    } else {
+        match lower.as_str() {
+            "status" => match crate::bedrock_auth::read() {
+                Ok(Some(auth)) => {
+                    let region = auth.region.as_deref().unwrap_or("(default)");
+                    let model = auth.default_model.as_deref().unwrap_or("(default)");
+                    format!(
+                        "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}",
+                        auth.bearer_token.len()
+                    )
+                }
+                Ok(None) => {
+                    let state = crate::bedrock_auth::CredentialState::snapshot();
+                    if state.env_set {
+                        format!(
+                            "Bedrock is configured via {} environment variable.\n\
+                             Region: {}\n\
+                             Model: {}",
+                            crate::bedrock_client::BEDROCK_API_KEY_ENV,
+                            crate::bedrock_auth::region_from_any_source(),
+                            crate::bedrock_auth::model_from_any_source(),
+                        )
+                    } else {
+                        "No Bedrock credentials found. Run `/setup bedrock key <token>`."
+                            .to_string()
+                    }
+                }
+                Err(e) => format!("Failed to read Bedrock credentials: {e:#}"),
+            },
+            "disconnect" if crate::bedrock_auth::CredentialState::snapshot().env_owns() => {
+                format!(
+                    "Bedrock credentials are managed by the {} environment variable. \
+                     Unset it and restart to disconnect Bedrock.",
+                    crate::bedrock_client::BEDROCK_API_KEY_ENV
+                )
+            }
+            "disconnect" => match crate::bedrock_auth::logout() {
+                Ok(()) => {
+                    llm.uninstall_bedrock();
+                    spawn_background_refresh(
+                        refresh_lock.clone(),
+                        llm.clone(),
+                        sessions.clone(),
+                        Some((
+                            cx.clone(),
+                            session_id.to_string(),
+                            "Refreshing model catalog after Bedrock disconnect...",
+                        )),
+                        None,
+                    );
+                    "Bedrock credentials cleared. Run `/setup bedrock key <token>` to reconnect."
+                        .to_string()
+                }
+                Err(e) => format!("Failed to remove Bedrock credentials: {e:#}"),
+            },
+            _ => format!(
+                "Unknown Bedrock setup option `{rest}`.\n\n{}",
+                render_bedrock_setup_help()
+            ),
+        }
+    }
+}
+
+fn render_bedrock_setup_help() -> String {
+    let state = crate::bedrock_auth::CredentialState::snapshot();
+    let status = match state.active_source() {
+        "env" => format!(
+            "Bedrock is connected from the {} environment variable.",
+            crate::bedrock_client::BEDROCK_API_KEY_ENV
+        ),
+        "file" => "Bedrock is connected from saved credentials.".to_string(),
+        _ => "Bedrock is not connected.".to_string(),
+    };
+    let key_help = if state.env_owns() {
+        "Credentials are managed by the environment variable. Unset it and restart to use `/setup bedrock key`."
+            .to_string()
+    } else {
+        "If you have a Bedrock bearer token, run:\n`/setup bedrock key <token>`".to_string()
+    };
+    format!(
+        "Use AWS Bedrock\n\n\
+         {status}\n\n\
+         {key_help}\n\n\
+         You also need:\n\
+         - A region (default: us-east-1): `/setup bedrock region <region>`\n\
+         - A model (default: us.anthropic.claude-sonnet-4-6): `/setup bedrock model <id>`\n\n\
+         Other commands:\n\
+         - `/setup bedrock status`\n\
+         - `/setup bedrock disconnect`\n\
+         - `/setup bedrock refresh`\n\n\
+         Choose for me: `/setup choose`."
+    )
 }
 
 async fn handle_setup_openrouter(
@@ -4352,7 +4624,7 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
         write_group(
             "Bedrock",
             source_model_ids(catalog, ModelSource::Bedrock, 12),
-            "No Bedrock models found. Set AWS_BEARER_TOKEN_BEDROCK or ~/.secrets/bedrock_api_key.",
+            "No Bedrock models found. Run `/setup bedrock` to configure your token and region.",
         );
         write_group(
             "Codex",
@@ -6194,6 +6466,63 @@ mod tests {
             "dump:\n{dump}"
         );
         assert!(dump.contains("/setup openrouter key <your key>"));
+    }
+
+    #[tokio::test]
+    async fn bedrock_setup_reports_env_owned_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _env = EnvScope::set("AWS_BEARER_TOKEN_BEDROCK", "bedrock-from-env");
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(
+            dump.contains("AWS_BEARER_TOKEN_BEDROCK"),
+            "dump must report env as active source; got:\n{dump}"
+        );
+        assert!(
+            dump.contains("Unset it and restart"),
+            "env-owned setup should not invite file writes; got:\n{dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_setup_reports_file_owned_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
+        crate::bedrock_auth::write(&crate::bedrock_auth::BedrockAuth {
+            bearer_token: "bedrock-on-disk".to_string(),
+            region: Some("eu-west-1".to_string()),
+            default_model: Some("us.anthropic.claude-sonnet-4-6".to_string()),
+        })
+        .unwrap();
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(
+            dump.contains("saved credentials"),
+            "dump must report file as active source; got:\n{dump}"
+        );
+        assert!(dump.contains("/setup bedrock status"));
+    }
+
+    #[tokio::test]
+    async fn bedrock_setup_reports_no_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(dump.contains("Bedrock is not connected"), "dump:\n{dump}");
+        assert!(dump.contains("/setup bedrock key <token>"));
     }
 
     /// The handler short-circuits with the env-owned explanation for
