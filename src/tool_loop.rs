@@ -1592,12 +1592,13 @@ pub(crate) async fn run(
                             // Diff for write/edit tools when we have prior content)
                             // or Failed (for tool-reported errors).
                             let update = if exec.failed {
+                                let clean = strip_sandbox_escalation_hint(&exec.output);
                                 announce::update_failed_with_input(
                                     &call.id,
                                     &tool_name,
                                     &parsed_input,
-                                    &exec.output,
-                                    Some(Value::String(exec.output.clone())),
+                                    clean,
+                                    Some(Value::String(clean.to_string())),
                                 )
                             } else {
                                 let diff = pre_write.and_then(|prior| {
@@ -2320,7 +2321,17 @@ fn tool_result_to_execution(
     ToolExecution { output, failed }
 }
 
-const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\nSandbox note: this failure looks consistent with the sandbox boundary (for example permission denied, operation not permitted, read-only filesystem, or namespace/process isolation). First verify from the command output and any safe read-only checks that the sandbox is likely the limiting factor rather than a normal command error. If unsandboxed execution is necessary to complete the user's request, retry the same `run_shell_command` call with `sandbox_permissions` set to `require_escalated`; Brokk will then ask the user for one-time permission to run it outside the OS sandbox.";
+const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command was blocked by the OS sandbox. Retry it with `sandbox_permissions: \"require_escalated\"` to run outside the sandbox.";
+
+/// Strip the sandbox-escalation hint from output so client-facing
+/// tool-call cards show a clean message. The full hint still flows
+/// to the LLM via `ToolExecution.output`.
+fn strip_sandbox_escalation_hint(output: &str) -> &str {
+    output
+        .trim_end()
+        .strip_suffix(SANDBOX_FAILURE_ESCALATION_HINT)
+        .unwrap_or(output)
+}
 
 fn is_likely_sandbox_limitation(output: &str) -> bool {
     let lower = output.to_ascii_lowercase();
