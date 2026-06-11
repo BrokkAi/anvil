@@ -263,7 +263,12 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         .to_lowercase();
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let actual_hex = format!("{:x}", hasher.finalize());
+    let actual_hex = hasher
+        .finalize()
+        .as_slice()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     anyhow::ensure!(
         actual_hex == expected_hex,
         "bundled bifrost sha256 mismatch for {url}: got {actual_hex}, expected {expected_hex}"
