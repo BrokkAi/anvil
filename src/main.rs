@@ -8,6 +8,7 @@ use clap::builder::RangedU64ValueParser;
 mod agent;
 mod agents;
 mod agents_md;
+mod bedrock_auth;
 mod bedrock_client;
 mod codex_auth;
 mod codex_client;
@@ -359,8 +360,8 @@ fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
 }
 
 fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
-    let token = match bedrock_client::bearer_token_from_env_or_secrets() {
-        Ok(Some(token)) => token,
+    let backend = match bedrock_client::build_backend_from_config() {
+        Ok(Some(backend)) => backend,
         Ok(None) => return None,
         Err(e) => {
             tracing::warn!("failed to read Bedrock credentials: {e:#}");
@@ -369,13 +370,12 @@ fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
     };
     let region = bedrock_client::region_from_env();
     let model = bedrock_client::model_from_env();
+    let state = bedrock_auth::CredentialState::snapshot();
     tracing::info!(
-        "Bedrock backend wired from {} or ~/.secrets at region {region}; default model {model}",
-        bedrock_client::BEDROCK_API_KEY_ENV
+        "Bedrock backend wired from {} at region {region}; default model {model}",
+        state.active_source()
     );
-    Some(Arc::new(bedrock_client::BedrockClient::new(
-        token, region, model,
-    )))
+    Some(backend)
 }
 
 #[tokio::main]
@@ -480,7 +480,7 @@ async fn main() -> Result<()> {
 
     if bedrock_backend.is_none() {
         tracing::info!(
-            "Bedrock backend not available; set {} or add ~/.secrets/bedrock_api_key to enable it.",
+            "Bedrock backend not available; set {} or run `/setup bedrock key <token>` from a session to enable it.",
             bedrock_client::BEDROCK_API_KEY_ENV
         );
     }
