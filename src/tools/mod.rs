@@ -516,7 +516,7 @@ impl ToolRegistry {
         if builtin_tools.contains("run_shell_command") {
             defs.push(tool_def(
                 "run_shell_command",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. Commands run in the sandbox by default; if a sandboxed attempt fails and you determine the sandbox boundary is likely the cause, retry with `sandbox_permissions: \"require_escalated\"` to ask the user for one-time unsandboxed permission.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses OS sandboxing, commands run in that sandbox by default; if a sandboxed attempt fails and you determine the sandbox boundary is likely the cause, retry with `sandbox_permissions: \"require_escalated\"` to ask the user for one-time unsandboxed permission.",
                 json!({
                     "type": "object",
                     "properties": {

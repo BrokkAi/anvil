@@ -791,14 +791,17 @@ fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<Str
     a.extend(["--dev".into(), "/dev".into()]);
     a.extend(["--proc".into(), "/proc".into()]);
 
-    if policy.allows_workspace_writes() {
-        // Writable scratch
-        a.extend(["--tmpfs".into(), "/tmp".into()]);
+    // Writable scratch. Keep this available in both ReadOnly and
+    // WorkspaceWrite so common developer tools that need temporary files
+    // behave like they do under the macOS Seatbelt profile's tmp allowances.
+    // ReadOnly still cannot persist writes to the workspace or home caches.
+    a.extend(["--tmpfs".into(), "/tmp".into()]);
 
-        let abs = cwd
-            .to_str()
-            .expect("validated UTF-8 in wrap_command")
-            .to_string();
+    let abs = cwd
+        .to_str()
+        .expect("validated UTF-8 in wrap_command")
+        .to_string();
+    if policy.allows_workspace_writes() {
         a.extend(["--bind".into(), abs.clone(), abs.clone()]);
 
         if let Ok(real) = cwd.canonicalize()
@@ -819,6 +822,21 @@ fn build_bwrap_argv(policy: SandboxPolicy, cwd: &Path, command: &str) -> Vec<Str
                     a.extend(["--bind".into(), s.to_string(), s.to_string()]);
                 }
             }
+        }
+    } else {
+        // Re-expose the workspace after mounting /tmp. Without this, a
+        // checkout located under /tmp would be hidden by the scratch tmpfs in
+        // ReadOnly mode even though the initial root ro-bind exposed it.
+        a.extend(["--ro-bind".into(), abs.clone(), abs.clone()]);
+        if let Ok(real) = cwd.canonicalize()
+            && let Some(real_str) = real.to_str()
+            && real_str != abs
+        {
+            a.extend([
+                "--ro-bind".into(),
+                real_str.to_string(),
+                real_str.to_string(),
+            ]);
         }
     }
 
@@ -1291,6 +1309,18 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/workspace" && w[2] == "/workspace");
         assert!(!workspace_bind, "ReadOnly must not bind workspace rw");
+        let workspace_ro_bind = argv
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == "/workspace" && w[2] == "/workspace");
+        assert!(
+            workspace_ro_bind,
+            "ReadOnly must re-expose the workspace read-only after /tmp tmpfs"
+        );
+        let has_tmpfs = argv.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp");
+        assert!(
+            has_tmpfs,
+            "ReadOnly should still provide writable scratch /tmp for common dev tools"
+        );
         let dash_idx = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[dash_idx + 1..], &["sh", "-c", "echo hi"]);
     }
