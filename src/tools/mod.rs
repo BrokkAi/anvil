@@ -905,9 +905,10 @@ impl ToolRegistry {
 ///
 /// We coerce only at the host boundary, right before dispatch; the advertised
 /// schema is left untouched, so well-behaved callers still send arrays and the
-/// model is still nudged toward the correct shape. A lone scalar can only have
-/// meant a one-element array, so wrapping is unambiguous. Values already shaped
-/// as arrays (or absent/null) are left alone.
+/// model is still nudged toward the correct shape. Values already shaped as
+/// arrays (or absent/null) are left alone, as are scalars whose own type the
+/// schema already accepts -- so a field declared `"type": ["string", "array"]`
+/// keeps a bare string intact rather than silently changing its serde variant.
 pub(crate) fn coerce_scalar_args_to_array(
     args: serde_json::Value,
     input_schema: &serde_json::Value,
@@ -923,8 +924,10 @@ pub(crate) fn coerce_scalar_args_to_array(
         if value.is_array() || value.is_null() {
             continue;
         }
-        let declares_array = properties.get(key).is_some_and(schema_type_is_array);
-        if declares_array {
+        let Some(property_schema) = properties.get(key) else {
+            continue;
+        };
+        if scalar_needs_array_wrapping(property_schema, value) {
             let scalar = value.take();
             *value = Value::Array(vec![scalar]);
         }
@@ -932,15 +935,44 @@ pub(crate) fn coerce_scalar_args_to_array(
     Value::Object(map)
 }
 
-/// True when a JSON-schema property node declares an array type, accepting both
-/// the scalar form (`"type": "array"`) and the union form
-/// (`"type": ["array", "null"]`) that nullable fields use.
-fn schema_type_is_array(property_schema: &serde_json::Value) -> bool {
+/// Whether a scalar `value` must be wrapped in a single-element array to satisfy
+/// `property_schema`. True only when the schema declares an array type AND does
+/// not already accept the scalar's own type: a strict array field (`"array"` or
+/// `["array", "null"]`) gets a bare scalar wrapped, while a field that genuinely
+/// accepts either form (`["string", "array"]`) leaves the scalar untouched.
+fn scalar_needs_array_wrapping(
+    property_schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> bool {
+    let types = schema_declared_types(property_schema);
+    types.contains(&"array") && !scalar_type_accepted(&types, value)
+}
+
+/// The JSON-schema `type` values a property node declares, accepting both the
+/// scalar form (`"type": "array"`) and the union form (`"type": ["array", "null"]`).
+fn schema_declared_types(property_schema: &serde_json::Value) -> Vec<&str> {
     match property_schema.get("type") {
-        Some(serde_json::Value::String(t)) => t == "array",
-        Some(serde_json::Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("array")),
-        _ => false,
+        Some(serde_json::Value::String(t)) => vec![t.as_str()],
+        Some(serde_json::Value::Array(types)) => {
+            types.iter().filter_map(serde_json::Value::as_str).collect()
+        }
+        _ => Vec::new(),
     }
+}
+
+/// Whether `value`'s own JSON type is among the schema's declared types, meaning
+/// it is already valid as-is and must not be wrapped. A JSON integer satisfies
+/// both `integer` and `number`. Arrays and null never reach here.
+fn scalar_type_accepted(types: &[&str], value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    types.iter().any(|t| match value {
+        Value::String(_) => *t == "string",
+        Value::Bool(_) => *t == "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => *t == "integer" || *t == "number",
+        Value::Number(_) => *t == "number",
+        Value::Object(_) => *t == "object",
+        Value::Array(_) | Value::Null => false,
+    })
 }
 
 fn tool_def(name: &str, description: &str, parameters: serde_json::Value) -> ToolDefinition {
@@ -1525,6 +1557,44 @@ mod tests {
         assert_eq!(
             coerce_scalar_args_to_array(json!({ "globs": null }), &schema),
             json!({ "globs": null })
+        );
+    }
+
+    /// A field that accepts either form (`"type": ["string", "array"]`) must
+    /// leave a bare string intact: the string is already valid, and wrapping it
+    /// could flip which serde variant the server deserializes. An explicit array
+    /// for the same field also passes through unchanged.
+    #[test]
+    fn coerce_leaves_scalar_for_string_or_array_union() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": ["string", "array"], "items": { "type": "string" } }
+            }
+        });
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "query": "McpClient" }), &schema),
+            json!({ "query": "McpClient" })
+        );
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "query": ["a", "b"] }), &schema),
+            json!({ "query": ["a", "b"] })
+        );
+    }
+
+    /// A numeric value for a `["number", "array"]` union is already valid and
+    /// must not be wrapped; a JSON integer satisfies the `number` type.
+    #[test]
+    fn coerce_leaves_number_for_number_or_array_union() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "weights": { "type": ["number", "array"] }
+            }
+        });
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "weights": 5 }), &schema),
+            json!({ "weights": 5 })
         );
     }
 }
