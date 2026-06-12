@@ -863,11 +863,59 @@ fn shell_command_will_run_sandboxed(
 const SANDBOX_ESCALATION_COMMAND_FIELD: &str = "sandbox_permissions";
 const SANDBOX_ESCALATION_REQUEST_VALUE: &str = "require_escalated";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShellSandboxRetryState {
+    cwd: String,
+    command: String,
+    effective_directory: String,
+}
+
+impl ShellSandboxRetryState {
+    fn from_raw_input(raw_input: &Value, cwd: &Path) -> Option<Self> {
+        let command = raw_input.get("command")?.as_str()?.to_string();
+        let cwd = cwd.canonicalize().ok()?;
+        let effective_directory = match raw_input.get("directory").and_then(Value::as_str) {
+            Some(directory) if !directory.trim().is_empty() => {
+                crate::tools::safe_resolve(&cwd, directory).ok()?
+            }
+            _ => cwd.clone(),
+        };
+        Some(Self {
+            cwd: cwd.display().to_string(),
+            command,
+            effective_directory: effective_directory.display().to_string(),
+        })
+    }
+
+    fn matches_raw_input(&self, raw_input: &Value, cwd: &Path) -> bool {
+        Self::from_raw_input(raw_input, cwd).is_some_and(|candidate| candidate == *self)
+    }
+}
+
 fn shell_sandbox_escalation_requested(raw_input: &Value) -> bool {
     raw_input
         .get(SANDBOX_ESCALATION_COMMAND_FIELD)
         .and_then(Value::as_str)
         .is_some_and(|value| value == SANDBOX_ESCALATION_REQUEST_VALUE)
+}
+
+fn shell_sandbox_retry_state_index(
+    states: &[ShellSandboxRetryState],
+    raw_input: &Value,
+    cwd: &Path,
+) -> Option<usize> {
+    states
+        .iter()
+        .position(|state| state.matches_raw_input(raw_input, cwd))
+}
+
+fn push_unique_shell_sandbox_retry_state(
+    states: &mut Vec<ShellSandboxRetryState>,
+    state: ShellSandboxRetryState,
+) {
+    if !states.contains(&state) {
+        states.push(state);
+    }
 }
 
 fn always_allow_key(
@@ -1019,7 +1067,12 @@ pub(crate) async fn run(
             .set_builtin_tools(train_bifrost_initial_builtin_tools())
             .await;
     }
-    let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
+    let mut shell_sandbox_retry_states: Vec<ShellSandboxRetryState> = Vec::new();
+    let mut tools: Vec<ToolDefinition> = if !shell_sandbox_retry_states.is_empty() {
+        registry.tool_definitions_with_shell_escalation(true).await
+    } else {
+        registry.tool_definitions().await
+    };
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
     // catalog at deeper levels prevents an unbounded recursion of
@@ -1119,6 +1172,8 @@ pub(crate) async fn run(
         // override.
         let request_tools = turn_tools.clone();
         let advertised_this_request = advertised_tool_names(request_tools.as_ref());
+        let mut available_shell_sandbox_retry_states = shell_sandbox_retry_states.clone();
+        let mut next_shell_sandbox_retry_states = Vec::new();
         trace_llm_request(
             turn,
             model,
@@ -1383,6 +1438,7 @@ pub(crate) async fn run(
                         kind,
                         &parsed_input,
                         registry.cwd(),
+                        &available_shell_sandbox_retry_states,
                     )
                     .await
                     {
@@ -1453,6 +1509,17 @@ pub(crate) async fn run(
                     }
 
                     // Consult the gate before announcing or executing the call.
+                    let consume_shell_sandbox_retry_state =
+                        shell_sandbox_escalation_requested(&parsed_input)
+                            .then(|| {
+                                shell_sandbox_retry_state_index(
+                                    &available_shell_sandbox_retry_states,
+                                    &parsed_input,
+                                    registry.cwd(),
+                                )
+                            })
+                            .flatten();
+
                     let decision = consult_gate(
                         &sessions,
                         &spawned_cx,
@@ -1464,9 +1531,14 @@ pub(crate) async fn run(
                             tool_call_id: &call.id,
                             raw_input: &parsed_input,
                             cwd: registry.cwd(),
+                            shell_sandbox_retry_states: &available_shell_sandbox_retry_states,
                         },
                     )
                     .await;
+
+                    if let Some(index) = consume_shell_sandbox_retry_state {
+                        available_shell_sandbox_retry_states.remove(index);
+                    }
 
                     let output = match decision {
                         GateDecision::Reject(message) => {
@@ -1588,6 +1660,18 @@ pub(crate) async fn run(
                                 .await
                             };
 
+                            if exec.sandbox_retry_available
+                                && let Some(state) = ShellSandboxRetryState::from_raw_input(
+                                    &parsed_input,
+                                    registry.cwd(),
+                                )
+                            {
+                                push_unique_shell_sandbox_retry_state(
+                                    &mut next_shell_sandbox_retry_states,
+                                    state,
+                                );
+                            }
+
                             // Build the terminal update -- Completed (with a
                             // Diff for write/edit tools when we have prior content)
                             // or Failed (for tool-reported errors).
@@ -1630,6 +1714,21 @@ pub(crate) async fn run(
                         result: output,
                     });
                 }
+                let previous_shell_sandbox_retry_states = shell_sandbox_retry_states.clone();
+                shell_sandbox_retry_states = available_shell_sandbox_retry_states;
+                for state in next_shell_sandbox_retry_states {
+                    push_unique_shell_sandbox_retry_state(&mut shell_sandbox_retry_states, state);
+                }
+                if shell_sandbox_retry_states != previous_shell_sandbox_retry_states {
+                    tools = registry
+                        .tool_definitions_with_shell_escalation(
+                            !shell_sandbox_retry_states.is_empty(),
+                        )
+                        .await;
+                    if depth >= MAX_SUBAGENT_DEPTH {
+                        tools.retain(|t| t.function.name != "task");
+                    }
+                }
                 if train_bifrost
                     && has_successful_file_change(&tool_exchanges)
                     && !registry
@@ -1639,7 +1738,11 @@ pub(crate) async fn run(
                     registry
                         .set_builtin_tools(train_bifrost_post_edit_builtin_tools())
                         .await;
-                    tools = registry.tool_definitions().await;
+                    tools = registry
+                        .tool_definitions_with_shell_escalation(
+                            !shell_sandbox_retry_states.is_empty(),
+                        )
+                        .await;
                     if depth >= MAX_SUBAGENT_DEPTH {
                         tools.retain(|t| t.function.name != "task");
                     }
@@ -1745,6 +1848,7 @@ async fn evaluate_pure_gate(
     kind: ToolKind,
     raw_input: &Value,
     cwd: &Path,
+    shell_sandbox_retry_states: &[ShellSandboxRetryState],
 ) -> Result<PureGateEvaluation, String> {
     let mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
@@ -1762,9 +1866,23 @@ async fn evaluate_pure_gate(
     let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
     let shell_sandboxed =
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
-    let sandbox_escalation_requested = tool_name == "run_shell_command"
-        && shell_sandboxed
-        && shell_sandbox_escalation_requested(raw_input);
+    let shell_sandbox_escalation_requested =
+        tool_name == "run_shell_command" && shell_sandbox_escalation_requested(raw_input);
+    if shell_sandbox_escalation_requested && shell_sandbox_retry_states.is_empty() {
+        return Err("Tool use denied: outside-sandbox permission can only be requested after a sandboxed shell command fails and reports that retry option. Retry the command in the sandbox first."
+            .to_string());
+    }
+    if shell_sandbox_escalation_requested
+        && shell_sandbox_retry_state_index(shell_sandbox_retry_states, raw_input, cwd).is_none()
+    {
+        return Err("Tool use denied: outside-sandbox permission can only be requested when retrying the same shell command that failed under the sandbox. Retry this command in the sandbox first."
+            .to_string());
+    }
+    if shell_sandbox_escalation_requested && !shell_sandboxed {
+        return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
+            .to_string());
+    }
+    let sandbox_escalation_requested = shell_sandboxed && shell_sandbox_escalation_requested;
     let shell_auto_allow = tool_name == "run_shell_command"
         && !sandbox_escalation_requested
         && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
@@ -1792,8 +1910,19 @@ async fn deterministic_gate_rejection(
     kind: ToolKind,
     raw_input: &Value,
     cwd: &Path,
+    shell_sandbox_retry_states: &[ShellSandboxRetryState],
 ) -> Option<String> {
-    match evaluate_pure_gate(sessions, session_id, tool_name, kind, raw_input, cwd).await {
+    match evaluate_pure_gate(
+        sessions,
+        session_id,
+        tool_name,
+        kind,
+        raw_input,
+        cwd,
+        shell_sandbox_retry_states,
+    )
+    .await
+    {
         Err(msg) => Some(msg),
         Ok(PureGateEvaluation {
             decision: PureGateDecision::Reject(msg),
@@ -1821,6 +1950,7 @@ async fn consult_gate(
         request.kind,
         request.raw_input,
         request.cwd,
+        request.shell_sandbox_retry_states,
     )
     .await
     {
@@ -1894,6 +2024,7 @@ struct GateCheck<'a> {
     tool_call_id: &'a str,
     raw_input: &'a Value,
     cwd: &'a Path,
+    shell_sandbox_retry_states: &'a [ShellSandboxRetryState],
 }
 
 struct PermissionRequest<'a> {
@@ -2008,6 +2139,7 @@ async fn request_user_permission(
 struct ToolExecution {
     output: String,
     failed: bool,
+    sandbox_retry_available: bool,
 }
 
 #[cfg(test)]
@@ -2300,12 +2432,12 @@ fn tool_result_to_execution(
         ToolStatus::InternalError => ("Internal error: ", true),
     };
     let mut output = format!("{}{}", status_prefix, result.output);
-    if tool_name == "run_shell_command"
+    let sandbox_retry_available = tool_name == "run_shell_command"
         && failed
         && !outside_sandbox_once
         && shell_sandboxed
-        && is_likely_sandbox_limitation(&output)
-    {
+        && is_likely_sandbox_limitation(&output);
+    if sandbox_retry_available {
         output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
     }
     if output.len() > MAX_TOOL_RESULT_BYTES {
@@ -2318,7 +2450,11 @@ fn tool_result_to_execution(
         output.truncate(cut);
         output.push_str("\n... output truncated");
     }
-    ToolExecution { output, failed }
+    ToolExecution {
+        output,
+        failed,
+        sandbox_retry_available,
+    }
 }
 
 const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command was blocked by the OS sandbox. Retry it with `sandbox_permissions: \"require_escalated\"` to run outside the sandbox.";
@@ -2403,6 +2539,7 @@ async fn execute_subagent(
                 ToolExecution {
                     output: "Error: `task` requires a non-empty `subagent_type`.".to_string(),
                     failed: true,
+                    sandbox_retry_available: false,
                 },
                 TokenUsage::default(),
             );
@@ -2415,6 +2552,7 @@ async fn execute_subagent(
                 ToolExecution {
                     output: "Error: `task` requires a non-empty `prompt`.".to_string(),
                     failed: true,
+                    sandbox_retry_available: false,
                 },
                 TokenUsage::default(),
             );
@@ -2438,6 +2576,7 @@ async fn execute_subagent(
                             available.join(", ")
                         ),
                         failed: true,
+                        sandbox_retry_available: false,
                     },
                     TokenUsage::default(),
                 );
@@ -2452,6 +2591,7 @@ async fn execute_subagent(
                 ToolExecution {
                     output: format!("Error: failed to load subagent '{subagent_name}': {e}"),
                     failed: true,
+                    sandbox_retry_available: false,
                 },
                 TokenUsage::default(),
             );
@@ -2505,11 +2645,13 @@ async fn execute_subagent(
         ToolExecution {
             output: format!("Error: subagent '{subagent_name}' returned an empty response."),
             failed: true,
+            sandbox_retry_available: false,
         }
     } else {
         ToolExecution {
             output: text,
             failed: false,
+            sandbox_retry_available: false,
         }
     };
     (exec, nested_usage)
@@ -3447,6 +3589,7 @@ mod tests {
                 kind,
                 &input,
                 cwd.path(),
+                &[],
             )
             .await
             .unwrap_or_else(|| panic!("{tool_name} should be rejected before execution"));
@@ -3471,6 +3614,7 @@ mod tests {
             ToolRegistry::tool_kind("write_file"),
             &serde_json::json!({"file_path": "app.js", "content": "x"}),
             cwd.path(),
+            &[],
         )
         .await;
         assert!(
@@ -3490,9 +3634,113 @@ mod tests {
             ToolRegistry::tool_kind("read_file"),
             &serde_json::json!({"file_path": "app.js"}),
             cwd.path(),
+            &[],
         )
         .await;
         assert!(read.is_none(), "read-only should allow read tools");
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_shell_sandbox_escalation_before_retry_field_enabled() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        let rejection = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({
+                "command": "echo ok",
+                "sandbox_permissions": "require_escalated",
+            }),
+            cwd.path(),
+            &[],
+        )
+        .await
+        .expect("premature outside-sandbox retry must be rejected before prompting");
+
+        assert!(
+            rejection.contains("outside-sandbox permission can only be requested"),
+            "unexpected rejection: {rejection}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn preflight_allows_matching_shell_sandbox_retry() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        std::fs::create_dir_all(cwd.path().join("crates/app")).expect("test directory");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_sandbox_mode(&session.id, Some(SandboxMode::Os))
+                .await
+        );
+        let original = serde_json::json!({"command": "cargo test", "directory": "crates/app"});
+        let retry_state =
+            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+
+        let rejection = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({
+                "command": "cargo test",
+                "directory": "crates/app",
+                "sandbox_permissions": "require_escalated",
+            }),
+            cwd.path(),
+            std::slice::from_ref(&retry_state),
+        )
+        .await;
+
+        assert!(
+            rejection.is_none(),
+            "matching retry should reach the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_shell_sandbox_retry_for_different_command() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_sandbox_mode(&session.id, Some(SandboxMode::Os))
+                .await
+        );
+        let original = serde_json::json!({"command": "cargo test"});
+        let retry_state =
+            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+
+        let rejection = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({
+                "command": "cargo check",
+                "sandbox_permissions": "require_escalated",
+            }),
+            cwd.path(),
+            std::slice::from_ref(&retry_state),
+        )
+        .await
+        .expect("different command should be rejected");
+
+        assert!(
+            rejection.contains("retrying the same shell command"),
+            "unexpected rejection: {rejection}"
+        );
     }
 
     #[test]
@@ -4103,6 +4351,7 @@ mod tests {
         let exec = tool_result_to_execution("run_shell_command", false, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
+        assert!(!exec.sandbox_retry_available);
     }
 
     #[test]
@@ -4115,6 +4364,94 @@ mod tests {
         let exec = tool_result_to_execution("run_shell_command", true, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
+        assert!(exec.sandbox_retry_available);
+    }
+
+    #[test]
+    fn sandbox_retry_is_not_unlocked_by_spoofed_hint_text() {
+        let result = crate::tools::ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("script printed this text:{SANDBOX_FAILURE_ESCALATION_HINT}"),
+        };
+
+        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+
+        assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
+        assert!(!exec.sandbox_retry_available);
+    }
+
+    #[test]
+    fn shell_sandbox_retry_state_normalizes_equivalent_directories() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        std::fs::create_dir_all(cwd.path().join("crates/app")).expect("test directory");
+        let original = serde_json::json!({
+            "command": "cargo test",
+            "directory": "crates/app",
+        });
+        let retry_state =
+            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+
+        assert!(retry_state.matches_raw_input(
+            &serde_json::json!({
+                "command": "cargo test",
+                "directory": "./crates/app",
+            }),
+            cwd.path(),
+        ));
+    }
+
+    #[test]
+    fn shell_sandbox_retry_state_treats_dot_directory_as_cwd() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let original = serde_json::json!({"command": "cargo test"});
+        let retry_state =
+            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+
+        assert!(retry_state.matches_raw_input(
+            &serde_json::json!({
+                "command": "cargo test",
+                "directory": ".",
+            }),
+            cwd.path(),
+        ));
+    }
+
+    #[test]
+    fn shell_sandbox_retry_state_index_matches_normalized_retry() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        std::fs::create_dir_all(cwd.path().join("crates/app")).expect("test directory");
+        let original = serde_json::json!({
+            "command": "cargo test",
+            "directory": "crates/app",
+        });
+        let retry_state =
+            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+        let states = vec![retry_state];
+
+        assert_eq!(
+            shell_sandbox_retry_state_index(
+                &states,
+                &serde_json::json!({
+                    "command": "cargo test",
+                    "directory": "./crates/app",
+                    "sandbox_permissions": "require_escalated",
+                }),
+                cwd.path(),
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            shell_sandbox_retry_state_index(
+                &states,
+                &serde_json::json!({
+                    "command": "cargo check",
+                    "directory": "./crates/app",
+                    "sandbox_permissions": "require_escalated",
+                }),
+                cwd.path(),
+            ),
+            None
+        );
     }
 
     #[test]

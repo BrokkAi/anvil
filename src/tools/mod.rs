@@ -395,6 +395,19 @@ impl ToolRegistry {
 
     /// All tool definitions for the OpenAI tools parameter.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tool_definitions_with_shell_escalation(false).await
+    }
+
+    /// Tool definitions for the OpenAI tools parameter.
+    ///
+    /// The outside-sandbox retry field is intentionally hidden until a
+    /// sandboxed shell command fails with a sandbox-looking error. If the model
+    /// sees that field in the first schema, some providers eagerly choose it
+    /// even though the description says it is only for retries.
+    pub async fn tool_definitions_with_shell_escalation(
+        &self,
+        allow_shell_sandbox_escalation: bool,
+    ) -> Vec<ToolDefinition> {
         let builtin_tools = self.active_builtin_tools().await;
         let mut defs = Vec::new();
         if builtin_tools.contains("read_file") {
@@ -514,34 +527,37 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("run_shell_command") {
+            let mut shell_properties = json!({
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute (passed to sh -c)."
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional timeout in milliseconds."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of the command for the user. Accepted for compatibility and not used for execution."
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
+                }
+            });
+            if allow_shell_sandbox_escalation {
+                shell_properties["sandbox_permissions"] = json!({
+                    "type": "string",
+                    "enum": ["require_escalated"],
+                    "description": "Set to `require_escalated` only when retrying a command that already failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation or writes outside the workspace). This asks the user for permission to run the command outside the OS sandbox once."
+                });
+            }
             defs.push(tool_def(
                 "run_shell_command",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses OS sandboxing, commands run in that sandbox by default; if a sandboxed attempt fails and you determine the sandbox boundary is likely the cause, retry with `sandbox_permissions: \"require_escalated\"` to ask the user for one-time unsandboxed permission.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses OS sandboxing, commands run in that sandbox by default. If a sandboxed attempt fails because of the sandbox boundary, the retry field for requesting one-time outside-sandbox permission will be exposed in the next tool schema.",
                 json!({
                     "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to execute (passed to sh -c)."
-                        },
-                        "timeout": {
-                            "type": "number",
-                            "description": "Optional timeout in milliseconds."
-                        },
-                        "sandbox_permissions": {
-                            "type": "string",
-                            "enum": ["require_escalated"],
-                            "description": "Set to `require_escalated` only when retrying a command that failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation or writes outside the workspace). This asks the user for permission to run the command outside the OS sandbox once. Do not set it on the first attempt."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Brief description of the command for the user. Accepted for compatibility and not used for execution."
-                        },
-                        "directory": {
-                            "type": "string",
-                            "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
-                        }
-                    },
+                    "properties": shell_properties,
                     "required": ["command"]
                 }),
             ));
@@ -1363,6 +1379,44 @@ mod tests {
                 "tool_definitions() advertises '{advertised_name}' but it is missing from the TOOLS metadata table"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn shell_tool_schema_hides_sandbox_escalation_by_default() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions().await;
+        let shell = defs
+            .iter()
+            .find(|def| def.function.name == "run_shell_command")
+            .expect("run_shell_command should be advertised");
+
+        assert!(
+            shell
+                .function
+                .parameters
+                .pointer("/properties/sandbox_permissions")
+                .is_none(),
+            "first-attempt shell schema must not expose sandbox escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_tool_schema_exposes_sandbox_escalation_when_enabled() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions_with_shell_escalation(true).await;
+        let shell = defs
+            .iter()
+            .find(|def| def.function.name == "run_shell_command")
+            .expect("run_shell_command should be advertised");
+
+        assert!(
+            shell
+                .function
+                .parameters
+                .pointer("/properties/sandbox_permissions")
+                .is_some(),
+            "retry shell schema must expose sandbox escalation"
+        );
     }
 
     #[tokio::test]
