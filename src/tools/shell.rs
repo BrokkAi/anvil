@@ -7,7 +7,6 @@ use tokio::process::Command;
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
 const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
 const ANVIL_RTK_PROXY_PREFIX_ENV: &str = "ANVIL_RTK_PROXY_PREFIX";
-const RTK_DISABLED_ENV: &str = "RTK_DISABLED";
 const RTK_HOSTED_ENV: &str = "RTK_HOSTED";
 const RTK_TELEMETRY_DISABLED_ENV: &str = "RTK_TELEMETRY_DISABLED";
 const RTK_TRACKING_DISABLED_ENV: &str = "RTK_TRACKING_DISABLED";
@@ -375,10 +374,47 @@ fn format_shell_tool_result(
     }
 }
 
+fn env_var_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| env_value_truthy(&value))
+}
+
+fn rtk_disabled_in_command_prefix(command: &str) -> bool {
+    for token in command.split_whitespace() {
+        if token.contains('=') && !token.starts_with('-') {
+            if let Some(value) = token.strip_prefix("RTK_DISABLED=") {
+                return env_value_truthy(value);
+            }
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn env_value_truthy(value: &str) -> bool {
+    matches!(
+        value
+            .trim_matches(|c| matches!(c, '\'' | '"'))
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn rtk_rewritten_command(command: &str) -> String {
-    if std::env::var_os(ANVIL_RTK_DISABLED_ENV).is_some()
-        || std::env::var_os(RTK_DISABLED_ENV).is_some()
-        || command.contains("RTK_DISABLED=")
+    // RTK's native Windows support is CLI/filtering-oriented; its automatic
+    // rewrite hook path requires Unix shell semantics. Anvil's hosted rewrite
+    // emits POSIX env-prefix syntax, so leave native Windows shell commands
+    // untouched. WSL is a Linux target and still takes the rewrite path.
+    #[cfg(target_os = "windows")]
+    {
+        return command.to_string();
+    }
+
+    if env_var_truthy(ANVIL_RTK_DISABLED_ENV)
+        || rtk_disabled_in_command_prefix(command)
         || command.contains(ANVIL_RTK_SUBCOMMAND)
     {
         return command.to_string();
@@ -828,6 +864,58 @@ mod tests {
         assert!(
             !result.output.contains("Hint: exit 127"),
             "successful command must not contain exit-127 hint; got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn rtk_disabled_prefix_requires_truthy_value() {
+        assert!(rtk_disabled_in_command_prefix("RTK_DISABLED=1 cargo test"));
+        assert!(rtk_disabled_in_command_prefix(
+            "FOO=bar RTK_DISABLED=true git status"
+        ));
+        assert!(rtk_disabled_in_command_prefix(
+            "RTK_DISABLED='yes' git status"
+        ));
+        assert!(!rtk_disabled_in_command_prefix("RTK_DISABLED=0 cargo test"));
+        assert!(!rtk_disabled_in_command_prefix(
+            "RTK_DISABLED=false cargo test"
+        ));
+        assert!(!rtk_disabled_in_command_prefix("echo RTK_DISABLED=1"));
+    }
+
+    #[tokio::test]
+    async fn anvil_rtk_disabled_env_requires_truthy_value() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("create temp project");
+        let proxy = fake_rtk_proxy(dir.path());
+        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
+        let _disabled_env = EnvGuard::set(ANVIL_RTK_DISABLED_ENV, "0");
+
+        let result =
+            run_shell_command(dir.path(), "git status", 30, SandboxPolicy::None, false).await;
+
+        assert!(
+            result.output.contains("## main"),
+            "ANVIL_RTK_DISABLED=0 should not disable hosted RTK rewrite; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn anvil_rtk_disabled_env_truthy_skips_rewrite() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("create temp project");
+        let proxy = fake_rtk_proxy(dir.path());
+        let _proxy_env = EnvGuard::set(ANVIL_RTK_PROXY_PREFIX_ENV, &shell_quote_path(&proxy));
+        let _disabled_env = EnvGuard::set(ANVIL_RTK_DISABLED_ENV, "1");
+
+        let result =
+            run_shell_command(dir.path(), "git status", 30, SandboxPolicy::None, false).await;
+
+        assert!(
+            !result.output.contains("## main"),
+            "ANVIL_RTK_DISABLED=1 should skip hosted RTK rewrite; got: {}",
             result.output
         );
     }
