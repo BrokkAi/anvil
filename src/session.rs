@@ -997,6 +997,23 @@ struct RepoPermissionState {
     legacy_shell_prefixes: Vec<String>,
 }
 
+/// Whether a stored approval key is one we still honor. Shell approvals are
+/// kept only in argv-prefix form; legacy exact-command keys (`"rule":"exact"`
+/// or the old `cwd`/`command` shape) are dropped so they are both ignored at
+/// runtime and physically purged on the next write. Non-shell keys (plain tool
+/// names, future JSON shapes) are always kept.
+fn is_retained_always_allow_key(key: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(key) {
+        Ok(value)
+            if value.get("tool").and_then(serde_json::Value::as_str)
+                == Some("run_shell_command") =>
+        {
+            value.get("rule").and_then(serde_json::Value::as_str) == Some("prefix")
+        }
+        _ => true,
+    }
+}
+
 impl RepoPermissionState {
     fn merged_approvals(&self) -> Vec<String> {
         let mut seen = HashSet::new();
@@ -1006,11 +1023,20 @@ impl RepoPermissionState {
             .iter()
             .chain(self.legacy_shell_prefixes.iter())
         {
-            if !key.is_empty() && seen.insert(key.clone()) {
+            if !key.is_empty() && is_retained_always_allow_key(key) && seen.insert(key.clone()) {
                 out.push(key.clone());
             }
         }
         out
+    }
+
+    /// True if any persisted key would be dropped by [`is_retained_always_allow_key`],
+    /// i.e. the on-disk file still holds legacy exact-command approvals.
+    fn has_purgeable_keys(&self) -> bool {
+        self.always_allow
+            .iter()
+            .chain(self.legacy_shell_prefixes.iter())
+            .any(|key| !key.is_empty() && !is_retained_always_allow_key(key))
     }
 
     fn migrate_legacy(&mut self) {
@@ -1079,8 +1105,23 @@ fn update_repo_permission_state(
     write_repo_permission_state(scope_root, &state)
 }
 
-fn read_repo_always_allow_keys(scope_root: &Path) -> Vec<String> {
-    read_repo_permission_state(scope_root).merged_approvals()
+/// Load the repo's remembered approvals, physically purging any legacy
+/// exact-command keys from disk in the process. Used when a session attaches to
+/// a repo so stale exact approvals are rewritten away on first contact rather
+/// than merely ignored in memory.
+fn load_repo_always_allow_keys(scope_root: &Path) -> Vec<String> {
+    let state = read_repo_permission_state(scope_root);
+    if state.has_purgeable_keys() {
+        // An empty mutator still runs `migrate_legacy` (which drops the
+        // exact keys) and rewrites the file atomically.
+        if let Err(e) = update_repo_permission_state(scope_root, |_| {}) {
+            tracing::warn!(
+                repo_root = %scope_root.display(),
+                "failed to purge legacy exact-command permission keys: {e:#}"
+            );
+        }
+    }
+    state.merged_approvals()
 }
 
 fn remember_repo_always_allow_key(scope_root: &Path, key: &str) -> anyhow::Result<()> {
@@ -2427,7 +2468,7 @@ impl SessionStore {
         session.mcp_servers = mcp_servers.clone();
         session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
-        session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
+        session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
         // Persistence failures are logged but not surfaced: `create_session` returns
@@ -2551,7 +2592,7 @@ impl SessionStore {
                 return false;
             }
         };
-        session.set_always_allow_keys(read_repo_always_allow_keys(&session.permission_scope_root));
+        session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
             let mut sessions = self.sessions.write().await;
             // Race window: another task may have inserted under the same id while
@@ -2724,7 +2765,7 @@ impl SessionStore {
             sandbox_mode,
         ));
         let permission_scope_root = permission_scope_root(&cwd);
-        let repo_always_allow = read_repo_always_allow_keys(&permission_scope_root);
+        let repo_always_allow = load_repo_always_allow_keys(&permission_scope_root);
         if let Some(session) = self.sessions.write().await.get_mut(id) {
             session.cwd = cwd;
             session.permission_scope_root = permission_scope_root;
@@ -2887,6 +2928,25 @@ impl SessionStore {
                 approval_keys
                     .iter()
                     .any(|key| s.always_allow_tools.contains(key))
+            })
+            .unwrap_or(false)
+    }
+
+    /// True only when `approval_keys` is non-empty and *every* key is
+    /// remembered. Shell commands decompose into one key per sub-command, so a
+    /// compound command is auto-allowed only if all of its sub-commands are.
+    pub async fn are_all_always_allowed(&self, id: &str, approval_keys: &[String]) -> bool {
+        if approval_keys.is_empty() {
+            return false;
+        }
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .map(|s| {
+                approval_keys
+                    .iter()
+                    .all(|key| s.always_allow_tools.contains(key))
             })
             .unwrap_or(false)
     }
@@ -4621,6 +4681,119 @@ mod tests {
         assert_eq!(store.always_allow_keys("no-such").await, None);
         assert_eq!(store.remove_always_allow("no-such", "x").await, None);
         assert_eq!(store.clear_always_allow("no-such").await, None);
+    }
+
+    #[test]
+    fn retained_key_filter_keeps_only_prefix_shell_keys() {
+        let prefix = serde_json::json!({
+            "tool": "run_shell_command", "rule": "prefix",
+            "argvPrefix": ["cargo", "fmt"], "shellSandboxed": true,
+        })
+        .to_string();
+        let exact = serde_json::json!({
+            "tool": "run_shell_command", "rule": "exact",
+            "command": "cargo fmt && cargo clippy", "shellSandboxed": true,
+        })
+        .to_string();
+        let legacy = serde_json::json!({
+            "tool": "run_shell_command", "cwd": "/x",
+            "command": "cargo fmt", "shellSandboxed": true,
+        })
+        .to_string();
+
+        assert!(is_retained_always_allow_key(&prefix));
+        assert!(!is_retained_always_allow_key(&exact));
+        assert!(!is_retained_always_allow_key(&legacy));
+        assert!(is_retained_always_allow_key("write_file"));
+
+        let state = RepoPermissionState {
+            always_allow: vec![prefix.clone(), exact, legacy, "edit".to_string()],
+            legacy_shell_prefixes: Vec::new(),
+        };
+        assert!(state.has_purgeable_keys());
+        assert_eq!(state.merged_approvals(), vec![prefix, "edit".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_keys_are_purged_on_load() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("git dir");
+
+        let prefix_key = serde_json::json!({
+            "tool": "run_shell_command", "rule": "prefix",
+            "argvPrefix": ["cargo", "fmt"], "shellSandboxed": true,
+        })
+        .to_string();
+        let exact_key = serde_json::json!({
+            "tool": "run_shell_command", "rule": "exact",
+            "command": "cargo fmt && cargo clippy", "shellSandboxed": true,
+        })
+        .to_string();
+
+        // Seed the file with a legacy exact key bypassing the write-time filter.
+        write_repo_permission_state(
+            repo.path(),
+            &RepoPermissionState {
+                always_allow: vec![
+                    prefix_key.clone(),
+                    exact_key.clone(),
+                    "write_file".to_string(),
+                ],
+                legacy_shell_prefixes: Vec::new(),
+            },
+        )
+        .expect("seed permissions file");
+        assert!(
+            read_repo_permission_state(repo.path())
+                .always_allow
+                .contains(&exact_key),
+            "precondition: exact key seeded on disk"
+        );
+
+        let s = store.create_session(repo.path().to_path_buf()).await;
+
+        // In memory: exact key dropped, prefix + non-shell retained, order kept.
+        assert_eq!(
+            store.always_allow_keys(&s.id).await,
+            Some(vec![prefix_key.clone(), "write_file".to_string()])
+        );
+        // On disk: physically purged.
+        assert_eq!(
+            read_repo_permission_state(repo.path()).always_allow,
+            vec![prefix_key, "write_file".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn are_all_always_allowed_requires_every_key() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".git")).expect("git dir");
+        let s = store.create_session(repo.path().to_path_buf()).await;
+
+        let a = "key-a".to_string();
+        let b = "key-b".to_string();
+        store.add_always_allow(&s.id, &a).await;
+
+        assert!(!store.are_all_always_allowed(&s.id, &[]).await);
+        assert!(
+            store
+                .are_all_always_allowed(&s.id, std::slice::from_ref(&a))
+                .await
+        );
+        assert!(
+            !store
+                .are_all_always_allowed(&s.id, &[a.clone(), b.clone()])
+                .await
+        );
+
+        store.add_always_allow(&s.id, &b).await;
+        assert!(store.are_all_always_allowed(&s.id, &[a, b]).await);
     }
 
     /// `start_prompt` registers a token, `cancel_prompt` flips it,
