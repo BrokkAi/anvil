@@ -870,6 +870,34 @@ fn shell_sandbox_escalation_requested(raw_input: &Value) -> bool {
         .is_some_and(|value| value == SANDBOX_ESCALATION_REQUEST_VALUE)
 }
 
+fn shell_sandbox_escalation_is_supported(
+    raw_input: &Value,
+    prior_tool_exchanges: &[ToolExchange],
+) -> bool {
+    let Some(command) = raw_input.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let directory = raw_input.get("directory").and_then(Value::as_str);
+
+    prior_tool_exchanges.iter().rev().any(|exchange| {
+        if exchange.tool_name != "run_shell_command"
+            || !exchange.result.contains(SANDBOX_FAILURE_ESCALATION_HINT)
+        {
+            return false;
+        }
+
+        let Ok(previous_input) = serde_json::from_str::<Value>(&exchange.arguments) else {
+            return false;
+        };
+        previous_input
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|previous_command| previous_command == command)
+            && previous_input.get("directory").and_then(Value::as_str) == directory
+            && !shell_sandbox_escalation_requested(&previous_input)
+    })
+}
+
 fn always_allow_key(
     tool_name: &str,
     raw_input: &Value,
@@ -1383,6 +1411,7 @@ pub(crate) async fn run(
                         kind,
                         &parsed_input,
                         registry.cwd(),
+                        &tool_exchanges,
                     )
                     .await
                     {
@@ -1464,6 +1493,7 @@ pub(crate) async fn run(
                             tool_call_id: &call.id,
                             raw_input: &parsed_input,
                             cwd: registry.cwd(),
+                            prior_tool_exchanges: &tool_exchanges,
                         },
                     )
                     .await;
@@ -1745,6 +1775,7 @@ async fn evaluate_pure_gate(
     kind: ToolKind,
     raw_input: &Value,
     cwd: &Path,
+    prior_tool_exchanges: &[ToolExchange],
 ) -> Result<PureGateEvaluation, String> {
     let mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
@@ -1765,6 +1796,22 @@ async fn evaluate_pure_gate(
     let sandbox_escalation_requested = tool_name == "run_shell_command"
         && shell_sandboxed
         && shell_sandbox_escalation_requested(raw_input);
+    if sandbox_escalation_requested
+        && !shell_sandbox_escalation_is_supported(raw_input, prior_tool_exchanges)
+    {
+        return Ok(PureGateEvaluation {
+            decision: PureGateDecision::Reject(
+                "Tool use denied: `sandbox_permissions: \"require_escalated\"` is only valid \
+                 when retrying the same `run_shell_command` after a sandboxed failure in this \
+                 turn. Retry without `sandbox_permissions` first; if that sandboxed attempt \
+                 fails with an escalation hint, retry the same command with \
+                 `sandbox_permissions: \"require_escalated\"`."
+                    .to_string(),
+            ),
+            sandbox_mode,
+            shell_sandboxed,
+        });
+    }
     let shell_auto_allow = tool_name == "run_shell_command"
         && !sandbox_escalation_requested
         && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
@@ -1792,8 +1839,19 @@ async fn deterministic_gate_rejection(
     kind: ToolKind,
     raw_input: &Value,
     cwd: &Path,
+    prior_tool_exchanges: &[ToolExchange],
 ) -> Option<String> {
-    match evaluate_pure_gate(sessions, session_id, tool_name, kind, raw_input, cwd).await {
+    match evaluate_pure_gate(
+        sessions,
+        session_id,
+        tool_name,
+        kind,
+        raw_input,
+        cwd,
+        prior_tool_exchanges,
+    )
+    .await
+    {
         Err(msg) => Some(msg),
         Ok(PureGateEvaluation {
             decision: PureGateDecision::Reject(msg),
@@ -1821,6 +1879,7 @@ async fn consult_gate(
         request.kind,
         request.raw_input,
         request.cwd,
+        request.prior_tool_exchanges,
     )
     .await
     {
@@ -1894,6 +1953,7 @@ struct GateCheck<'a> {
     tool_call_id: &'a str,
     raw_input: &'a Value,
     cwd: &'a Path,
+    prior_tool_exchanges: &'a [ToolExchange],
 }
 
 struct PermissionRequest<'a> {
@@ -3447,6 +3507,7 @@ mod tests {
                 kind,
                 &input,
                 cwd.path(),
+                &[],
             )
             .await
             .unwrap_or_else(|| panic!("{tool_name} should be rejected before execution"));
@@ -3471,6 +3532,7 @@ mod tests {
             ToolRegistry::tool_kind("write_file"),
             &serde_json::json!({"file_path": "app.js", "content": "x"}),
             cwd.path(),
+            &[],
         )
         .await;
         assert!(
@@ -3490,6 +3552,7 @@ mod tests {
             ToolRegistry::tool_kind("read_file"),
             &serde_json::json!({"file_path": "app.js"}),
             cwd.path(),
+            &[],
         )
         .await;
         assert!(read.is_none(), "read-only should allow read tools");
@@ -4003,6 +4066,72 @@ mod tests {
         )
         .expect_err("outside-sandbox option is not valid when shell sandboxing is disabled");
         assert!(err.contains("unknown option"), "got: {err}");
+    }
+
+    #[test]
+    fn shell_sandbox_escalation_requires_prior_matching_sandbox_failure() {
+        let input = serde_json::json!({
+            "command": "cargo test",
+            "sandbox_permissions": "require_escalated",
+        });
+
+        assert!(!shell_sandbox_escalation_is_supported(&input, &[]));
+
+        let unrelated_failure = ToolExchange {
+            call_id: "call-1".to_string(),
+            tool_name: "run_shell_command".to_string(),
+            arguments: serde_json::json!({"command": "cargo fmt"}).to_string(),
+            result: format!("Error: permission denied{SANDBOX_FAILURE_ESCALATION_HINT}"),
+        };
+        assert!(!shell_sandbox_escalation_is_supported(
+            &input,
+            &[unrelated_failure]
+        ));
+
+        let matching_failure = ToolExchange {
+            call_id: "call-2".to_string(),
+            tool_name: "run_shell_command".to_string(),
+            arguments: serde_json::json!({"command": "cargo test"}).to_string(),
+            result: format!("Error: permission denied{SANDBOX_FAILURE_ESCALATION_HINT}"),
+        };
+        assert!(shell_sandbox_escalation_is_supported(
+            &input,
+            &[matching_failure]
+        ));
+    }
+
+    #[test]
+    fn shell_sandbox_escalation_matches_directory() {
+        let input = serde_json::json!({
+            "command": "cargo test",
+            "directory": "crates/core",
+            "sandbox_permissions": "require_escalated",
+        });
+        let previous_without_directory = ToolExchange {
+            call_id: "call-1".to_string(),
+            tool_name: "run_shell_command".to_string(),
+            arguments: serde_json::json!({"command": "cargo test"}).to_string(),
+            result: format!("Error: permission denied{SANDBOX_FAILURE_ESCALATION_HINT}"),
+        };
+        let previous_with_directory = ToolExchange {
+            call_id: "call-2".to_string(),
+            tool_name: "run_shell_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "cargo test",
+                "directory": "crates/core",
+            })
+            .to_string(),
+            result: format!("Error: permission denied{SANDBOX_FAILURE_ESCALATION_HINT}"),
+        };
+
+        assert!(!shell_sandbox_escalation_is_supported(
+            &input,
+            &[previous_without_directory]
+        ));
+        assert!(shell_sandbox_escalation_is_supported(
+            &input,
+            &[previous_with_directory]
+        ));
     }
 
     #[test]
