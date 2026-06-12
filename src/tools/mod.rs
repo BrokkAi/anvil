@@ -838,6 +838,13 @@ impl ToolRegistry {
                 ),
             };
         };
+        // Reshape a few honest model mistakes (e.g. a bare string where the
+        // tool's schema asks for an array) before dispatch, so they don't burn
+        // a turn on a server-side -32602.
+        let args = match client.tools().iter().find(|tool| tool.name == name) {
+            Some(tool) => coerce_scalar_args_to_array(args, &tool.input_schema),
+            None => args,
+        };
         match client.call_tool(name, args).await {
             Ok(value) => {
                 let output = if let Some(s) = value.as_str() {
@@ -882,6 +889,57 @@ impl ToolRegistry {
         tool_meta(tool_name)
             .map(|t| t.display_name)
             .unwrap_or("Executing tool")
+    }
+}
+
+/// Wrap scalar arguments in a single-element array wherever an MCP tool's
+/// input schema declares an array-typed property.
+///
+/// Models routinely emit `{"file_patterns": "src/main.rs"}` instead of
+/// `{"file_patterns": ["src/main.rs"]}`. The schema we advertise (forwarded
+/// verbatim from the MCP server) correctly asks for an array, but a single
+/// path is the most common case and the model elides the brackets. Without
+/// this the call reaches bifrost as a bare string and serde rejects it with
+/// `-32602 invalid type: string "src/main.rs", expected a sequence`, costing
+/// the model a turn to self-correct.
+///
+/// We coerce only at the host boundary, right before dispatch; the advertised
+/// schema is left untouched, so well-behaved callers still send arrays and the
+/// model is still nudged toward the correct shape. A lone scalar can only have
+/// meant a one-element array, so wrapping is unambiguous. Values already shaped
+/// as arrays (or absent/null) are left alone.
+pub(crate) fn coerce_scalar_args_to_array(
+    args: serde_json::Value,
+    input_schema: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let Value::Object(mut map) = args else {
+        return args;
+    };
+    let Some(properties) = input_schema.get("properties").and_then(Value::as_object) else {
+        return Value::Object(map);
+    };
+    for (key, value) in map.iter_mut() {
+        if value.is_array() || value.is_null() {
+            continue;
+        }
+        let declares_array = properties.get(key).is_some_and(schema_type_is_array);
+        if declares_array {
+            let scalar = value.take();
+            *value = Value::Array(vec![scalar]);
+        }
+    }
+    Value::Object(map)
+}
+
+/// True when a JSON-schema property node declares an array type, accepting both
+/// the scalar form (`"type": "array"`) and the union form
+/// (`"type": ["array", "null"]`) that nullable fields use.
+fn schema_type_is_array(property_schema: &serde_json::Value) -> bool {
+    match property_schema.get("type") {
+        Some(serde_json::Value::String(t)) => t == "array",
+        Some(serde_json::Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("array")),
+        _ => false,
     }
 }
 
@@ -1390,5 +1448,83 @@ mod tests {
             task_def.function.description
         );
         assert!(task_def.function.description.contains("bug-hunter"));
+    }
+
+    /// The reported bug: `list_symbols` called with a bare string where the
+    /// schema asks for an array. The host must wrap it into a single-element
+    /// array so bifrost no longer rejects it with `-32602 expected a sequence`.
+    #[test]
+    fn coerce_wraps_scalar_string_for_array_property() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "file_patterns": { "type": "array", "items": { "type": "string" } }
+            }
+        });
+        let coerced =
+            coerce_scalar_args_to_array(json!({ "file_patterns": "src/main.rs" }), &schema);
+        assert_eq!(coerced, json!({ "file_patterns": ["src/main.rs"] }));
+    }
+
+    /// A correctly-shaped array argument must pass through untouched -- the
+    /// coercion only rescues scalars, it never re-wraps an existing array.
+    #[test]
+    fn coerce_leaves_array_argument_untouched() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "file_patterns": { "type": "array", "items": { "type": "string" } }
+            }
+        });
+        let args = json!({ "file_patterns": ["src/main.rs", "src/lib.rs"] });
+        assert_eq!(coerce_scalar_args_to_array(args.clone(), &schema), args);
+    }
+
+    /// Non-array properties (and properties absent from the schema) must keep
+    /// their scalar value; we only reshape where the schema declares an array.
+    #[test]
+    fn coerce_leaves_non_array_properties_untouched() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "patterns": { "type": "array", "items": { "type": "string" } },
+                "max_results": { "type": "number" }
+            }
+        });
+        let args = json!({
+            "patterns": "McpClient",
+            "max_results": 10,
+            "unschema'd": "left as-is"
+        });
+        let coerced = coerce_scalar_args_to_array(args, &schema);
+        assert_eq!(
+            coerced,
+            json!({
+                "patterns": ["McpClient"],
+                "max_results": 10,
+                "unschema'd": "left as-is"
+            })
+        );
+    }
+
+    /// Nullable array fields advertise `"type": ["array", "null"]`; a scalar
+    /// supplied for one must still be wrapped, but an explicit null stays null
+    /// (absent/optional), never `[null]`.
+    #[test]
+    fn coerce_handles_nullable_array_union_type() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "globs": { "type": ["array", "null"], "items": { "type": "string" } }
+            }
+        });
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "globs": "*.rs" }), &schema),
+            json!({ "globs": ["*.rs"] })
+        );
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "globs": null }), &schema),
+            json!({ "globs": null })
+        );
     }
 }
