@@ -1090,8 +1090,19 @@ fn shell_command_segments(command: &str) -> Option<Vec<ShellSegment>> {
                         chars.next();
                         end_segment!(false);
                         start_next_segment!();
-                    } else {
+                    } else if chars.peek() == Some(&'>') || cur.ends_with('>') || cur.ends_with('<')
+                    {
+                        // Part of a redirection (`2>&1`, `>&2`, `&>file`): the `&`
+                        // stays inside the current (dirty) token and never starts
+                        // a new command.
                         non_literal_push!('&');
+                    } else {
+                        // A bare `&` backgrounds the preceding command and runs
+                        // whatever follows as a *separate* command. Decomposing
+                        // would drop that trailing command from the per-sub-command
+                        // analysis while the shell still runs it, so refuse to
+                        // decompose -- the caller then prompts.
+                        return None;
                     }
                 }
                 '\'' => {
@@ -4528,19 +4539,45 @@ mod tests {
     #[test]
     fn shell_command_segments_reject_unsafe_or_malformed() {
         for command in [
-            "echo $(rm -rf /)", // command substitution
-            "echo `whoami`",    // backtick substitution
-            "diff <(a) <(b)",   // process substitution
-            "(cd /tmp && ls)",  // subshell
-            "a || | b",         // empty middle sub-command
-            "   ",              // no command
-            "\"unbalanced",     // unbalanced quote
+            "echo $(rm -rf /)",       // command substitution
+            "echo `whoami`",          // backtick substitution
+            "diff <(a) <(b)",         // process substitution
+            "(cd /tmp && ls)",        // subshell
+            "a || | b",               // empty middle sub-command
+            "   ",                    // no command
+            "\"unbalanced",           // unbalanced quote
+            "cargo build & rm -rf ~", // background `&` hides a second command
+            "true & true & rm -rf /", // chained backgrounding
+            "ls &",                   // trailing background
+            "a |& b",                 // pipe-both then background
         ] {
             assert!(
                 shell_command_segments(command).is_none(),
                 "expected None for {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn shell_background_ampersand_never_rides_a_remembered_prefix() {
+        // A bare `&` backgrounds the head and runs the rest as a separate
+        // command the shell still executes. Decomposing would drop it from the
+        // analysis, so the whole line must refuse to decompose (-> prompt) even
+        // when the first sub-command's prefix is remembered.
+        let bg = serde_json::json!({"command": "cargo build & rm -rf ~"});
+        assert!(shell_always_allow_plan(&bg, true, true).is_none());
+        assert!(shell_always_allow_plan(&bg, true, false).is_none());
+
+        // But `&` inside a redirection (`2>&1`) is preserved, not rejected.
+        let redir = serde_json::json!({"command": "cargo test --lib 2>&1 | tail -40"});
+        let plan = shell_always_allow_plan(&redir, true, true).expect("redirection plan");
+        assert_eq!(
+            plan.required_keys,
+            vec![shell_prefix_key(
+                &["cargo".into(), "test".into(), "--lib".into()],
+                true
+            )]
+        );
     }
 
     #[test]
