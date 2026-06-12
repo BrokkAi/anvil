@@ -121,12 +121,9 @@ impl SandboxPolicy {
 /// Returns `true` when the current session really has a sandbox boundary the
 /// permission prompt may advertise.
 ///
-/// This uses the session's effective mode plus the backend that can actually
-/// be obtained for that mode. It intentionally does not trust the stored mode
-/// by itself:
-/// - `os` counts only when the OS sandbox exists on this host.
-/// - `wasm` counts only when this session really resolves to a wasm backend.
-/// - `off` never counts.
+/// Shell commands are only sandboxed by the OS sandbox. The WASM sandbox is
+/// used for parser/file helper isolation and does not wrap `run_shell_command`,
+/// so it must not advertise or enable outside-sandbox shell retries.
 pub fn shell_command_will_run_sandboxed(
     permission_mode: PermissionMode,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
@@ -135,10 +132,6 @@ pub fn shell_command_will_run_sandboxed(
         permission_mode,
         crate::sandbox_backend::resolve_mode(sandbox_mode),
         is_os_sandbox_available(),
-        matches!(
-            crate::sandbox_backend::backend_for_mode(sandbox_mode),
-            Ok(crate::sandbox_backend::SandboxBackend::WasmFallback(_))
-        ),
     )
 }
 
@@ -146,11 +139,10 @@ fn shell_command_will_run_sandboxed_with_default(
     _permission_mode: PermissionMode,
     effective_mode: crate::sandbox_backend::SandboxMode,
     os_sandbox_available: bool,
-    wasm_sandbox_active: bool,
 ) -> bool {
     match effective_mode {
         crate::sandbox_backend::SandboxMode::Os => os_sandbox_available,
-        crate::sandbox_backend::SandboxMode::Wasm => wasm_sandbox_active,
+        crate::sandbox_backend::SandboxMode::Wasm => false,
         crate::sandbox_backend::SandboxMode::Off => false,
     }
 }
@@ -804,14 +796,17 @@ fn build_bwrap_argv_with_tail(
     a.extend(["--dev".into(), "/dev".into()]);
     a.extend(["--proc".into(), "/proc".into()]);
 
-    if policy.allows_workspace_writes() {
-        // Writable scratch
-        a.extend(["--tmpfs".into(), "/tmp".into()]);
+    // Writable scratch. Keep this available in both ReadOnly and
+    // WorkspaceWrite so common developer tools that need temporary files
+    // behave like they do under the macOS Seatbelt profile's tmp allowances.
+    // ReadOnly still cannot persist writes to the workspace or home caches.
+    a.extend(["--tmpfs".into(), "/tmp".into()]);
 
-        let abs = cwd
-            .to_str()
-            .expect("validated UTF-8 in wrap_command")
-            .to_string();
+    let abs = cwd
+        .to_str()
+        .expect("validated UTF-8 in wrap_command")
+        .to_string();
+    if policy.allows_workspace_writes() {
         a.extend(["--bind".into(), abs.clone(), abs.clone()]);
 
         if let Ok(real) = cwd.canonicalize()
@@ -832,6 +827,21 @@ fn build_bwrap_argv_with_tail(
                     a.extend(["--bind".into(), s.to_string(), s.to_string()]);
                 }
             }
+        }
+    } else {
+        // Re-expose the workspace after mounting /tmp. Without this, a
+        // checkout located under /tmp would be hidden by the scratch tmpfs in
+        // ReadOnly mode even though the initial root ro-bind exposed it.
+        a.extend(["--ro-bind".into(), abs.clone(), abs.clone()]);
+        if let Ok(real) = cwd.canonicalize()
+            && let Some(real_str) = real.to_str()
+            && real_str != abs
+        {
+            a.extend([
+                "--ro-bind".into(),
+                real_str.to_string(),
+                real_str.to_string(),
+            ]);
         }
     }
 
@@ -999,7 +1009,6 @@ mod tests {
                 PermissionMode::Default,
                 SandboxMode::Os,
                 false,
-                true
             ),
             "missing OS sandbox must suppress sandbox-specific prompt language"
         );
@@ -1014,39 +1023,36 @@ mod tests {
                 PermissionMode::Default,
                 SandboxMode::Os,
                 false,
-                false
             ),
             "an explicit os override must stay unsandboxed even if the process default uses wasm"
         );
     }
 
     #[test]
-    fn shell_prompt_treats_wasm_default_as_sandboxed() {
+    fn shell_prompt_treats_wasm_default_as_unsandboxed() {
         use crate::sandbox_backend::SandboxMode;
 
         assert!(
-            shell_command_will_run_sandboxed_with_default(
+            !shell_command_will_run_sandboxed_with_default(
                 PermissionMode::Default,
                 SandboxMode::Wasm,
                 false,
-                true
             ),
-            "the wasm fallback counts as a real sandbox for permission UX"
+            "the wasm fallback does not sandbox shell commands"
         );
     }
 
     #[test]
-    fn shell_prompt_treats_explicit_wasm_override_as_sandboxed() {
+    fn shell_prompt_treats_explicit_wasm_override_as_unsandboxed() {
         use crate::sandbox_backend::SandboxMode;
 
         assert!(
-            shell_command_will_run_sandboxed_with_default(
+            !shell_command_will_run_sandboxed_with_default(
                 PermissionMode::Default,
                 SandboxMode::Wasm,
                 false,
-                true
             ),
-            "an explicit wasm sandbox mode should keep sandbox wording in prompts"
+            "an explicit wasm sandbox mode must not advertise shell sandboxing"
         );
     }
 
@@ -1059,7 +1065,6 @@ mod tests {
                 PermissionMode::Default,
                 SandboxMode::Wasm,
                 false,
-                false
             ),
             "a missing wasm runtime must suppress sandbox wording even if wasm is the default"
         );
@@ -1074,7 +1079,6 @@ mod tests {
                 PermissionMode::Default,
                 SandboxMode::Wasm,
                 true,
-                false
             ),
             "an explicit wasm override must not look sandboxed when wasm is unavailable"
         );
@@ -1302,6 +1306,18 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/workspace" && w[2] == "/workspace");
         assert!(!workspace_bind, "ReadOnly must not bind workspace rw");
+        let workspace_ro_bind = argv
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == "/workspace" && w[2] == "/workspace");
+        assert!(
+            workspace_ro_bind,
+            "ReadOnly must re-expose the workspace read-only after /tmp tmpfs"
+        );
+        let has_tmpfs = argv.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp");
+        assert!(
+            has_tmpfs,
+            "ReadOnly should still provide writable scratch /tmp for common dev tools"
+        );
         let dash_idx = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[dash_idx + 1..], &["sh", "-c", "echo hi"]);
     }

@@ -24,8 +24,8 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    ConversationTurn, PermissionMode, PromptStartError, Session, SessionManifest, SessionMode,
-    SessionSnapshot, SessionStore, acp_mcp_servers_to_configs,
+    ConversationTurn, PermissionMode, PromptStartError, REASONING_EFFORT_OFF_VALUE, Session,
+    SessionManifest, SessionMode, SessionSnapshot, SessionStore, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -44,9 +44,10 @@ const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
 const MODEL_CONFIG_ID: &str = "model_selection";
-/// Per-session reasoning-effort knob, scoped to the Codex/ChatGPT backend.
+/// Per-session reasoning-effort knob.
 /// Empty string in the wire payload clears the user's pick (back to the
-/// model's `default_reasoning_level`).
+/// model's `default_reasoning_level`). The `off` option explicitly omits
+/// reasoning controls even when the model advertises a default.
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// Sentinel value the client sends to clear the user's pick. We accept
 /// either an empty string or this token so editor implementations that
@@ -191,9 +192,11 @@ fn model_config_option(current: &str, available_models: &[String]) -> Option<Ses
 /// omitted entirely in that case rather than shown empty.
 ///
 /// Layout: an explicit "(default)" entry at the head represents "no user
-/// pick, server uses `default_reasoning_level`". The user's stored pick
-/// (`current`) selects whichever option matches; when no pick exists, the
-/// default entry is selected so the picker reflects actual intent.
+/// pick, server uses `default_reasoning_level`". The following "off" entry
+/// represents an explicit user pick to omit reasoning controls even for models
+/// that default to reasoning. The user's stored pick (`current`) selects
+/// whichever option matches; when no pick exists, the default entry is selected
+/// so the picker reflects actual intent.
 fn reasoning_effort_config_option(
     current: Option<&str>,
     catalog: &[ModelMetadata],
@@ -210,6 +213,8 @@ fn reasoning_effort_config_option(
     let mut options = vec![
         SessionConfigSelectOption::new(REASONING_EFFORT_DEFAULT_VALUE, default_label)
             .description("Use the model's default reasoning effort."),
+        SessionConfigSelectOption::new(REASONING_EFFORT_OFF_VALUE, "Off")
+            .description("Do not send reasoning controls for this session."),
     ];
     options.extend(model.supported_reasoning_levels.iter().map(|preset| {
         let opt = SessionConfigSelectOption::new(preset.effort.clone(), preset.effort.clone());
@@ -223,6 +228,7 @@ fn reasoning_effort_config_option(
     // to the default sentinel so the picker always renders against an
     // entry it advertises.
     let current_value = match current {
+        Some(eff) if eff == REASONING_EFFORT_OFF_VALUE => REASONING_EFFORT_OFF_VALUE.to_string(),
         Some(eff)
             if model
                 .supported_reasoning_levels
@@ -417,7 +423,10 @@ async fn apply_config_option(
         }
         REASONING_EFFORT_CONFIG_ID => {
             // Empty string or the "(default)" sentinel both mean "clear my
-            // pick, use the model default".
+            // pick, use the model default". The explicit "off" selection is
+            // stored as a real pick; snapshot() interprets it as "omit
+            // reasoning controls" rather than falling back to the model
+            // default.
             let effort = if value.is_empty() || value == REASONING_EFFORT_DEFAULT_VALUE {
                 None
             } else {
@@ -426,8 +435,12 @@ async fn apply_config_option(
             // Validate against the active model's published levels when
             // one is known. An unknown catalog (e.g. discovery never
             // finished) accepts any string so a manually-configured
-            // backend still works.
-            if let Some(eff) = &effort {
+            // backend still works. "off" sends no provider reasoning
+            // parameter, so it is harmless and always accepted even if the
+            // current model has no configurable reasoning presets.
+            if let Some(eff) = &effort
+                && eff != REASONING_EFFORT_OFF_VALUE
+            {
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
                 let active_model = sessions
                     .get_session(session_id, &fallback_cwd)
@@ -870,6 +883,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          Pick one:\n\
          - `/setup choose` - Choose for me.\n\
          - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
+         - `/setup bedrock` - Use AWS Bedrock.\n\
          - `/setup local` - Use free local models on this computer.\n\
          - `/setup openrouter` - Use OpenRouter.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
@@ -3627,6 +3641,17 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             )
             .await
         }
+        "bedrock" => {
+            handle_setup_bedrock(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
+        }
         "openrouter" => {
             handle_setup_openrouter(
                 ctx.cx,
@@ -3664,12 +3689,14 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "reasoning" | "reasoning-effort" => {
             if rest.is_empty() {
-                "Use `/setup reasoning default` or `/setup reasoning <level>`.\n\
+                "Use `/setup reasoning default`, `/setup reasoning off`, or `/setup reasoning <level>`.\n\
                  This is an advanced setting; most users should leave it alone."
                     .to_string()
             } else {
                 let value = if rest.eq_ignore_ascii_case("default") {
                     REASONING_EFFORT_DEFAULT_VALUE
+                } else if rest.eq_ignore_ascii_case(REASONING_EFFORT_OFF_VALUE) {
+                    REASONING_EFFORT_OFF_VALUE
                 } else {
                     rest
                 };
@@ -3882,6 +3909,286 @@ fn render_local_setup_help() -> String {
      4. Run `/setup local use`.\n\n\
      llama.cpp and custom local servers belong in `/setup advanced`."
         .to_string()
+}
+
+async fn handle_setup_bedrock(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    rest: &str,
+) -> String {
+    use crate::bedrock_client::BEDROCK_DEFAULT_MODEL;
+
+    if rest.is_empty() {
+        return render_bedrock_setup_help();
+    }
+    let lower = rest.to_ascii_lowercase();
+    if matches!(lower.as_str(), "refresh" | "try-again") {
+        return match refresh_model_catalog_now(
+            Some(cx),
+            Some(session_id),
+            llm,
+            sessions,
+            refresh_lock,
+        )
+        .await
+        {
+            Ok(catalog) => {
+                let count = source_count(&catalog, ModelSource::Bedrock);
+                if count > 0 {
+                    format!(
+                        "Bedrock models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
+                    )
+                } else {
+                    format!(
+                        "Bedrock is not showing models yet.\n\n{}",
+                        render_bedrock_setup_help()
+                    )
+                }
+            }
+            Err(e) => format!(
+                "Could not check Bedrock yet: {e}\n\n{}",
+                render_bedrock_setup_help()
+            ),
+        };
+    }
+
+    if let Some(key) = rest.strip_prefix("key ") {
+        let state = crate::bedrock_auth::CredentialState::snapshot();
+        if state.env_owns() {
+            return format!(
+                "Bedrock credentials are managed by the {} environment variable. \
+                 Unset it and restart before using `/setup bedrock key`.",
+                crate::bedrock_client::BEDROCK_API_KEY_ENV
+            );
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return "Provide a bearer token: `/setup bedrock key <token>`.".to_string();
+        }
+
+        let existing = crate::bedrock_auth::read().unwrap_or(None);
+        let region = existing
+            .as_ref()
+            .and_then(|a| a.region.clone())
+            .unwrap_or_else(crate::bedrock_auth::region_from_any_source);
+        let default_model = existing
+            .as_ref()
+            .and_then(|a| a.default_model.clone())
+            .unwrap_or_else(crate::bedrock_auth::model_from_any_source);
+        let auth = crate::bedrock_auth::BedrockAuth {
+            bearer_token: key.to_string(),
+            region: Some(region.clone()),
+            default_model: Some(default_model.clone()),
+        };
+        match crate::bedrock_auth::write(&auth) {
+            Ok(()) => {
+                let backend: Arc<dyn crate::llm_client::LlmBackend> =
+                    Arc::new(crate::bedrock_client::BedrockClient::new(
+                        key.to_string(),
+                        region.clone(),
+                        default_model.clone(),
+                    ));
+                llm.install_bedrock(backend);
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Bedrock setup...",
+                    )),
+                    None,
+                );
+                format!(
+                    "Bedrock credentials saved.\n\
+                     Token: saved (length {})\n\
+                     Region: {region}\n\
+                     Model: {default_model}\n\n\
+                     Run `/setup choose` or `/setup model` to pick a Bedrock model.\n\n\
+                     Tip: change region with `/setup bedrock region <region>`\n\
+                     Tip: change model with `/setup bedrock model <model_id>`",
+                    key.len()
+                )
+            }
+            Err(e) => format!("Failed to save Bedrock credentials: {e:#}"),
+        }
+    } else if let Some(region) = rest.strip_prefix("region ") {
+        let region = region.trim();
+        if region.is_empty() {
+            return "Provide a region: `/setup bedrock region <region>` (e.g. us-east-1)."
+                .to_string();
+        }
+        let mut auth = match crate::bedrock_auth::read() {
+            Ok(Some(a)) => a,
+            _ => {
+                return "No Bedrock credentials saved yet. Run `/setup bedrock key <token>` first."
+                    .to_string();
+            }
+        };
+        auth.region = Some(region.to_string());
+        match crate::bedrock_auth::write(&auth) {
+            Ok(()) => {
+                let backend: Arc<dyn crate::llm_client::LlmBackend> =
+                    Arc::new(crate::bedrock_client::BedrockClient::new(
+                        auth.bearer_token.clone(),
+                        region.to_string(),
+                        auth.default_model
+                            .clone()
+                            .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string()),
+                    ));
+                llm.install_bedrock(backend);
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Bedrock region change...",
+                    )),
+                    None,
+                );
+                format!("Bedrock region set to {region}.")
+            }
+            Err(e) => format!("Failed to save Bedrock region: {e:#}"),
+        }
+    } else if let Some(model) = rest.strip_prefix("model ") {
+        let model = model.trim();
+        if model.is_empty() {
+            return "Provide a model id: `/setup bedrock model <model_id>` (e.g. us.anthropic.claude-sonnet-4-6).".to_string();
+        }
+        let mut auth = match crate::bedrock_auth::read() {
+            Ok(Some(a)) => a,
+            _ => {
+                return "No Bedrock credentials saved yet. Run `/setup bedrock key <token>` first."
+                    .to_string();
+            }
+        };
+        auth.default_model = Some(model.to_string());
+        match crate::bedrock_auth::write(&auth) {
+            Ok(()) => {
+                let backend: Arc<dyn crate::llm_client::LlmBackend> =
+                    Arc::new(crate::bedrock_client::BedrockClient::new(
+                        auth.bearer_token.clone(),
+                        auth.region
+                            .clone()
+                            .unwrap_or_else(crate::bedrock_auth::region_from_any_source),
+                        model.to_string(),
+                    ));
+                llm.install_bedrock(backend);
+                spawn_background_refresh(
+                    refresh_lock.clone(),
+                    llm.clone(),
+                    sessions.clone(),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Bedrock model change...",
+                    )),
+                    None,
+                );
+                format!("Bedrock default model set to {model}.")
+            }
+            Err(e) => format!("Failed to save Bedrock model: {e:#}"),
+        }
+    } else {
+        match lower.as_str() {
+            "status" => {
+                let state = crate::bedrock_auth::CredentialState::snapshot();
+                if state.env_set {
+                    format!(
+                        "Bedrock is configured via {} environment variable.\n\
+                         Region: {}\n\
+                         Model: {}",
+                        crate::bedrock_client::BEDROCK_API_KEY_ENV,
+                        crate::bedrock_auth::region_from_any_source(),
+                        crate::bedrock_auth::model_from_any_source(),
+                    )
+                } else {
+                    match crate::bedrock_auth::read() {
+                        Ok(Some(auth)) => {
+                            let region = auth.region.as_deref().unwrap_or("(default)");
+                            let model = auth.default_model.as_deref().unwrap_or("(default)");
+                            format!(
+                                "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}",
+                                auth.bearer_token.len()
+                            )
+                        }
+                        Ok(None) => {
+                            "No Bedrock credentials found. Run `/setup bedrock key <token>`."
+                                .to_string()
+                        }
+                        Err(e) => format!("Failed to read Bedrock credentials: {e:#}"),
+                    }
+                }
+            }
+            "disconnect" if crate::bedrock_auth::CredentialState::snapshot().env_owns() => {
+                format!(
+                    "Bedrock credentials are managed by the {} environment variable. \
+                     Unset it and restart to disconnect Bedrock.",
+                    crate::bedrock_client::BEDROCK_API_KEY_ENV
+                )
+            }
+            "disconnect" => match crate::bedrock_auth::logout() {
+                Ok(()) => {
+                    llm.uninstall_bedrock();
+                    spawn_background_refresh(
+                        refresh_lock.clone(),
+                        llm.clone(),
+                        sessions.clone(),
+                        Some((
+                            cx.clone(),
+                            session_id.to_string(),
+                            "Refreshing model catalog after Bedrock disconnect...",
+                        )),
+                        None,
+                    );
+                    "Bedrock credentials cleared. Run `/setup bedrock key <token>` to reconnect."
+                        .to_string()
+                }
+                Err(e) => format!("Failed to remove Bedrock credentials: {e:#}"),
+            },
+            _ => format!(
+                "Unknown Bedrock setup option `{rest}`.\n\n{}",
+                render_bedrock_setup_help()
+            ),
+        }
+    }
+}
+
+fn render_bedrock_setup_help() -> String {
+    let state = crate::bedrock_auth::CredentialState::snapshot();
+    let status = match state.active_source() {
+        "env" => format!(
+            "Bedrock is connected from the {} environment variable.",
+            crate::bedrock_client::BEDROCK_API_KEY_ENV
+        ),
+        "file" => "Bedrock is connected from saved credentials.".to_string(),
+        _ => "Bedrock is not connected.".to_string(),
+    };
+    let key_help = if state.env_owns() {
+        "Credentials are managed by the environment variable. Unset it and restart to use `/setup bedrock key`."
+            .to_string()
+    } else {
+        "If you have a Bedrock bearer token, run:\n`/setup bedrock key <token>`".to_string()
+    };
+    format!(
+        "Use AWS Bedrock\n\n\
+         {status}\n\n\
+         {key_help}\n\n\
+         You also need:\n\
+         - A region (default: us-east-1): `/setup bedrock region <region>`\n\
+         - A model (default: us.anthropic.claude-sonnet-4-6): `/setup bedrock model <id>`\n\n\
+         Other commands:\n\
+         - `/setup bedrock status`\n\
+         - `/setup bedrock disconnect`\n\
+         - `/setup bedrock refresh`\n\n\
+         Choose for me: `/setup choose`."
+    )
 }
 
 async fn handle_setup_openrouter(
@@ -4337,7 +4644,7 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
         write_group(
             "Bedrock",
             source_model_ids(catalog, ModelSource::Bedrock, 12),
-            "No Bedrock models found. Set AWS_BEARER_TOKEN_BEDROCK or ~/.secrets/bedrock_api_key.",
+            "No Bedrock models found. Run `/setup bedrock` to configure your token and region.",
         );
         write_group(
             "Codex",
@@ -4456,7 +4763,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     );
     out.push_str("- `/setup mode` - change assistant behavior.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
-    out.push_str("- `/setup reasoning default|<level>` - advanced reasoning setting.\n");
+    out.push_str("- `/setup reasoning default|off|<level>` - advanced reasoning setting.\n");
     if !openrouter_picks.is_empty() {
         out.push_str("\nFiltered OpenRouter coding candidates:\n");
         for id in openrouter_picks {
@@ -6181,6 +6488,63 @@ mod tests {
         assert!(dump.contains("/setup openrouter key <your key>"));
     }
 
+    #[tokio::test]
+    async fn bedrock_setup_reports_env_owned_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _env = EnvScope::set("AWS_BEARER_TOKEN_BEDROCK", "bedrock-from-env");
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(
+            dump.contains("AWS_BEARER_TOKEN_BEDROCK"),
+            "dump must report env as active source; got:\n{dump}"
+        );
+        assert!(
+            dump.contains("Unset it and restart"),
+            "env-owned setup should not invite file writes; got:\n{dump}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_setup_reports_file_owned_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
+        crate::bedrock_auth::write(&crate::bedrock_auth::BedrockAuth {
+            bearer_token: "bedrock-on-disk".to_string(),
+            region: Some("eu-west-1".to_string()),
+            default_model: Some("us.anthropic.claude-sonnet-4-6".to_string()),
+        })
+        .unwrap();
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(
+            dump.contains("saved credentials"),
+            "dump must report file as active source; got:\n{dump}"
+        );
+        assert!(dump.contains("/setup bedrock status"));
+    }
+
+    #[tokio::test]
+    async fn bedrock_setup_reports_no_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(dump.contains("Bedrock is not connected"), "dump:\n{dump}");
+        assert!(dump.contains("/setup bedrock key <token>"));
+    }
+
     /// The handler short-circuits with the env-owned explanation for
     /// every subcommand when `OPENROUTER_API_KEY` is set. We assert the
     /// bare and `<key>` paths -- they're the ones that would mutate
@@ -6494,6 +6858,106 @@ mod tests {
             .await
             .expect("swap model");
         assert_eq!(outcome.cleared_reasoning.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_sets_reasoning_off_and_omits_default() {
+        use crate::llm_client::ReasoningLevelPreset;
+        use agent_client_protocol::schema::{SessionConfigKind, SessionConfigSelectOptions};
+
+        let (store, id) = make_store_with_session("model-a").await;
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "model-a".into(),
+                default_reasoning_level: Some("medium".into()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevelPreset {
+                        effort: "low".into(),
+                        description: "Low".into(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "medium".into(),
+                        description: "Medium".into(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "high".into(),
+                        description: "High".into(),
+                    },
+                ],
+                supports_images: None,
+                context_length: None,
+                pricing: None,
+            }])
+            .await;
+
+        let outcome = apply_config_option(&store, &id, REASONING_EFFORT_CONFIG_ID, "off")
+            .await
+            .expect("off is a valid reasoning selection");
+        let session = store
+            .get_session(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            session.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            snap.reasoning_effort, None,
+            "explicit off must not fall back to model default"
+        );
+
+        let reasoning_option = outcome
+            .updated_options
+            .iter()
+            .find(|opt| opt.id.to_string() == REASONING_EFFORT_CONFIG_ID)
+            .expect("reasoning option still advertised");
+        match &reasoning_option.kind {
+            SessionConfigKind::Select(select) => {
+                assert_eq!(select.current_value.to_string(), REASONING_EFFORT_OFF_VALUE);
+                match &select.options {
+                    SessionConfigSelectOptions::Ungrouped(options) => {
+                        assert!(
+                            options
+                                .iter()
+                                .any(|opt| opt.value.to_string() == "(default)")
+                        );
+                        assert!(options.iter().any(|opt| opt.value.to_string() == "off"));
+                        assert!(options.iter().any(|opt| opt.value.to_string() == "high"));
+                    }
+                    other => panic!("expected ungrouped reasoning options, got {other:?}"),
+                }
+            }
+            other => panic!("expected select reasoning option, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_accepts_reasoning_off_for_model_without_presets() {
+        let (store, id) = make_store_with_session("plain-model").await;
+        store
+            .set_available_models(vec![ModelMetadata::id_only("plain-model")])
+            .await;
+
+        apply_config_option(&store, &id, REASONING_EFFORT_CONFIG_ID, "off")
+            .await
+            .expect("off sends no provider parameter and should always be valid");
+        let session = store
+            .get_session(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            session.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(snap.reasoning_effort, None);
     }
 
     #[tokio::test]

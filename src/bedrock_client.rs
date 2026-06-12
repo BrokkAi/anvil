@@ -24,27 +24,16 @@ fn requires_explicit_caching(model: &str) -> bool {
     model.contains("anthropic")
 }
 
-/// Returns true when the Bedrock-hosted Anthropic model supports the
-/// extended-thinking ("reasoning") feature. Claude 3.7 Sonnet and the
-/// Claude 4 family (Sonnet/Opus) expose a `thinking` request block; older
-/// Claude 3.x models (3.5 and earlier) do not.
-fn supports_extended_thinking(model: &str) -> bool {
-    if !model.contains("anthropic") {
-        return false;
-    }
-    // Claude 4 family ids look like `...claude-sonnet-4-*`, `...claude-opus-4-*`.
-    let claude_4 = model.contains("claude-sonnet-4")
-        || model.contains("claude-opus-4")
-        || model.contains("claude-haiku-4");
-    // Claude 3.7 Sonnet introduced extended thinking on the 3.x line.
-    let claude_3_7 = model.contains("claude-3-7");
-    claude_4 || claude_3_7
+/// Bedrock reasoning is intentionally enabled for every Bedrock model we
+/// advertise. Some models may reject the provider-specific wire field at
+/// runtime; in that case the provider error is surfaced to the user.
+fn supports_extended_thinking(_model: &str) -> bool {
+    true
 }
 
-/// Reasoning-effort presets surfaced for Bedrock Anthropic models that
-/// support extended thinking. `default_reasoning_level` is left `None` so
-/// the feature stays opt-in: with no explicit pick the session omits the
-/// effort and the request carries no `thinking` block (current behavior).
+/// Reasoning-effort presets surfaced for Bedrock models. `medium` is used as
+/// the default so sessions send reasoning unless the user selects another
+/// effort.
 fn anthropic_thinking_presets() -> Vec<ReasoningLevelPreset> {
     [
         ("low", "Light reasoning for shorter problems."),
@@ -135,15 +124,13 @@ fn error_requires_adaptive_thinking(err: &anyhow::Error) -> bool {
         && (msg.contains("adaptive") || msg.contains("output_config"))
 }
 
-/// Attach reasoning presets to every thinking-capable Anthropic model in
-/// the merged catalog that doesn't already advertise them. Keyed on the
-/// final (post-normalization) invocable id, so it's independent of which
-/// discovery source produced the entry or how merge dedup ordered them.
+/// Attach reasoning presets to every Bedrock model in the merged catalog.
 fn attach_anthropic_reasoning_presets(models: &mut [ModelMetadata]) {
     for model in models.iter_mut() {
-        if model.supported_reasoning_levels.is_empty() && supports_extended_thinking(&model.id) {
-            model.supported_reasoning_levels = anthropic_thinking_presets();
-        }
+        model.supported_reasoning_levels = anthropic_thinking_presets();
+        model
+            .default_reasoning_level
+            .get_or_insert_with(|| "medium".to_string());
     }
 }
 
@@ -403,13 +390,11 @@ impl BedrockClient {
         };
         let tools = tools.map(|t| convert_tools(t, enable_cache));
 
-        // Decide whether to request reasoning at all. The Bedrock catalog
-        // publishes no per-model reasoning capability, so this gate is the
-        // one unavoidable id-based check; the *wire shape* below is detected
-        // at runtime instead of guessed from the id.
+        // Bedrock reasoning is enabled for every Bedrock model we advertise;
+        // validate the requested/default effort before emitting the native
+        // `thinking` block.
         let effort = reasoning_effort
             .as_deref()
-            .filter(|_| supports_extended_thinking(&resolved_model))
             .filter(|e| thinking_budget_for_effort(e).is_some())
             .map(str::to_string);
 
@@ -758,15 +743,10 @@ impl LlmBackend for BedrockClient {
             attach_anthropic_reasoning_presets(&mut models);
 
             if !models.iter().any(|m| m.id == default_model) {
-                let supported_reasoning_levels = if supports_extended_thinking(&default_model) {
-                    anthropic_thinking_presets()
-                } else {
-                    Vec::new()
-                };
                 models.push(ModelMetadata {
                     id: default_model.clone(),
-                    default_reasoning_level: None,
-                    supported_reasoning_levels,
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: anthropic_thinking_presets(),
                     supports_images: None,
                     context_length: Some(200_000),
                     pricing: None,
@@ -795,12 +775,21 @@ fn mantle_base_url(region: &str) -> String {
     format!("https://bedrock-mantle.{region}.api.aws/v1")
 }
 
+/// Resolve bearer token, region, and model from all available sources.
+/// Precedence for each: env > brokk config file > ~/.secrets/ > default.
+/// Kept as thin wrappers for backward compat; the authoritative
+/// resolution lives in `bedrock_auth` so the setup handlers and startup
+/// path share the same precedence logic.
 pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
     if let Ok(raw) = std::env::var(BEDROCK_API_KEY_ENV) {
         let token = raw.trim();
         if !token.is_empty() {
             return Ok(Some(token.to_string()));
         }
+    }
+
+    if let Some(token) = bearer_token_from_brokk_config()? {
+        return Ok(Some(token));
     }
 
     for name in ["aws_bearer_token_bedrock", "bedrock_api_key"] {
@@ -811,6 +800,13 @@ pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
     Ok(None)
 }
 
+pub fn bearer_token_from_brokk_config() -> Result<Option<String>> {
+    Ok(crate::bedrock_auth::read()?.and_then(|auth| {
+        let token = auth.bearer_token.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }))
+}
+
 pub fn region_from_env() -> String {
     std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -818,7 +814,17 @@ pub fn region_from_env() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(region_from_config)
         .unwrap_or_else(|| BEDROCK_DEFAULT_REGION.to_string())
+}
+
+pub fn region_from_config() -> Option<String> {
+    crate::bedrock_auth::read().ok().flatten().and_then(|auth| {
+        auth.region.and_then(|region| {
+            let region = region.trim();
+            (!region.is_empty()).then(|| region.to_string())
+        })
+    })
 }
 
 pub fn model_from_env() -> String {
@@ -826,7 +832,28 @@ pub fn model_from_env() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(model_from_config)
         .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string())
+}
+
+pub fn model_from_config() -> Option<String> {
+    crate::bedrock_auth::read().ok().flatten().and_then(|auth| {
+        auth.default_model.and_then(|model| {
+            let model = model.trim();
+            (!model.is_empty()).then(|| model.to_string())
+        })
+    })
+}
+
+pub fn build_backend_from_config() -> Result<Option<Arc<dyn LlmBackend>>> {
+    let Some(token) = bearer_token_from_env_or_secrets()? else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(BedrockClient::new(
+        token,
+        region_from_env(),
+        model_from_env(),
+    ))))
 }
 
 fn needs_inference_profile_retry(status: reqwest::StatusCode, body: &str) -> bool {
@@ -1426,9 +1453,7 @@ impl BedrockFoundationModelSummary {
         };
         ModelMetadata {
             id: self.model_id,
-            // Opt-in: leave the default unset so reasoning is only sent when
-            // the user explicitly picks an effort from the dropdown.
-            default_reasoning_level: None,
+            default_reasoning_level: Some("medium".to_string()),
             supported_reasoning_levels,
             supports_images: Some(supports_images),
             context_length: None,
@@ -1457,17 +1482,15 @@ mod tests {
     }
 
     #[test]
-    fn extended_thinking_support_is_scoped_to_claude_37_and_4() {
+    fn extended_thinking_support_is_enabled_for_all_bedrock_models() {
         assert!(supports_extended_thinking("us.anthropic.claude-sonnet-4-6"));
         assert!(supports_extended_thinking(
             "global.anthropic.claude-opus-4-8"
         ));
         assert!(supports_extended_thinking("anthropic.claude-3-7-sonnet"));
-        assert!(!supports_extended_thinking(
-            "us.anthropic.claude-3-5-sonnet"
-        ));
-        assert!(!supports_extended_thinking("openai.gpt-5.4"));
-        assert!(!supports_extended_thinking("amazon.titan-text"));
+        assert!(supports_extended_thinking("us.anthropic.claude-3-5-sonnet"));
+        assert!(supports_extended_thinking("openai.gpt-5.4"));
+        assert!(supports_extended_thinking("amazon.titan-text"));
     }
 
     #[test]
@@ -1489,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_models_advertise_reasoning_presets() {
+    fn foundation_models_advertise_reasoning_presets() {
         let summary = BedrockFoundationModelSummary {
             model_id: "anthropic.claude-sonnet-4-6".to_string(),
             input_modalities: vec!["TEXT".to_string()],
@@ -1497,7 +1520,7 @@ mod tests {
             response_streaming_supported: Some(true),
         };
         let meta = summary.into_model_metadata();
-        assert!(meta.default_reasoning_level.is_none());
+        assert_eq!(meta.default_reasoning_level.as_deref(), Some("medium"));
         let efforts: Vec<_> = meta
             .supported_reasoning_levels
             .iter()
@@ -1512,14 +1535,20 @@ mod tests {
             response_streaming_supported: Some(true),
         };
         let plain_meta = plain.into_model_metadata();
-        assert!(plain_meta.supported_reasoning_levels.is_empty());
+        assert_eq!(
+            plain_meta.default_reasoning_level.as_deref(),
+            Some("medium")
+        );
+        let plain_efforts: Vec<_> = plain_meta
+            .supported_reasoning_levels
+            .iter()
+            .map(|p| p.effort.as_str())
+            .collect();
+        assert_eq!(plain_efforts, ["low", "medium", "high"]);
     }
 
     #[test]
-    fn enrichment_attaches_presets_regardless_of_source() {
-        // Simulates the merge result where a Mantle-sourced Anthropic entry
-        // (no presets) wins dedup over the foundation entry. The post-merge
-        // enrichment must still surface the reasoning presets.
+    fn enrichment_attaches_presets_to_every_bedrock_model() {
         let mut models = vec![
             ModelMetadata {
                 id: "us.anthropic.claude-sonnet-4-6".to_string(),
@@ -1548,18 +1577,17 @@ mod tests {
         ];
         attach_anthropic_reasoning_presets(&mut models);
 
-        let sonnet4 = &models[0];
-        assert_eq!(
-            sonnet4
-                .supported_reasoning_levels
-                .iter()
-                .map(|p| p.effort.as_str())
-                .collect::<Vec<_>>(),
-            ["low", "medium", "high"]
-        );
-        // Claude 3.5 and openai.* must remain preset-free.
-        assert!(models[1].supported_reasoning_levels.is_empty());
-        assert!(models[2].supported_reasoning_levels.is_empty());
+        for model in &models {
+            assert_eq!(model.default_reasoning_level.as_deref(), Some("medium"));
+            assert_eq!(
+                model
+                    .supported_reasoning_levels
+                    .iter()
+                    .map(|p| p.effort.as_str())
+                    .collect::<Vec<_>>(),
+                ["low", "medium", "high"]
+            );
+        }
     }
 
     #[test]
@@ -1576,8 +1604,14 @@ mod tests {
             pricing: None,
         }];
         attach_anthropic_reasoning_presets(&mut models);
-        // Existing presets are not clobbered.
-        assert_eq!(models[0].supported_reasoning_levels.len(), 1);
+        assert_eq!(
+            models[0]
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
         assert_eq!(models[0].default_reasoning_level.as_deref(), Some("high"));
     }
 
@@ -1834,26 +1868,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_effort_ignored_for_models_without_thinking() {
-        use wiremock::{Match, Request};
-
-        // Custom matcher asserting the request body carries NO `thinking`
-        // field, since Claude 3.5 does not support extended thinking and the
-        // effort must be dropped rather than forwarded.
-        struct NoThinkingField;
-        impl Match for NoThinkingField {
-            fn matches(&self, request: &Request) -> bool {
-                serde_json::from_slice::<serde_json::Value>(&request.body)
-                    .ok()
-                    .and_then(|v| v.get("thinking").cloned())
-                    .is_none()
-            }
-        }
+    async fn reasoning_effort_adds_thinking_for_all_native_bedrock_models() {
+        use wiremock::matchers::body_partial_json;
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/model/us.anthropic.claude-3-5-sonnet/invoke"))
-            .and(NoThinkingField)
+            .and(body_partial_json(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 8192},
+                "max_tokens": 16_384
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{"type": "text", "text": "plain"}],
                 "usage": {"input_tokens": 2, "output_tokens": 1}
@@ -1883,7 +1907,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(5),
             })
             .await
-            .expect("native request without thinking should succeed");
+            .expect("native request with thinking should succeed");
         match response {
             LlmResponse::Text { text, .. } => assert_eq!(text, "plain"),
             other => panic!("expected text response, got {other:?}"),

@@ -22,7 +22,7 @@ use crate::tools::ToolRegistry;
 /// Upper bound on the size of a session zip we will read off disk. Any
 /// archive larger than this is rejected before bytes flow through
 /// `SandboxBackend::read_zip_entry_text`, so a corrupted or hostile
-/// `~/.brokk/sessions/<id>.zip` cannot OOM the agent. 256 MiB is well
+/// `.brokk/sessions/<id>.zip` cannot OOM the agent. 256 MiB is well
 /// above what `write_new_session_zip` produces in practice (sessions
 /// dominated by conversation text rarely cross a few MB).
 const MAX_SESSION_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -176,6 +176,8 @@ impl std::fmt::Display for PromptStartError {
 
 impl std::error::Error for PromptStartError {}
 
+pub(crate) const REASONING_EFFORT_OFF_VALUE: &str = "off";
+
 fn select_session_model(
     persisted_model: Option<String>,
     default_model: String,
@@ -204,6 +206,9 @@ fn select_session_reasoning_effort(
     let requested = persisted_reasoning_effort?.trim().to_string();
     if requested.is_empty() || model.is_empty() {
         return None;
+    }
+    if requested.eq_ignore_ascii_case(REASONING_EFFORT_OFF_VALUE) {
+        return Some(REASONING_EFFORT_OFF_VALUE.to_string());
     }
 
     let Some(meta) = catalog.iter().find(|meta| meta.id == model) else {
@@ -541,7 +546,8 @@ pub struct Session {
     always_allow_order: Vec<String>,
     /// User's explicit pick from the reasoning-effort dropdown, if any.
     /// `None` means "use the active model's `default_reasoning_level`";
-    /// `Some(_)` means "honor this exact level, fail if unsupported".
+    /// `Some("off")` means "omit reasoning controls"; any other `Some(_)`
+    /// means "honor this exact level, fail if unsupported".
     /// In-memory only -- the issue scope explicitly excludes
     /// workspace-level persistence for this knob.
     pub selected_reasoning_effort: Option<String>,
@@ -807,8 +813,9 @@ pub struct SessionSnapshot {
     pub history: Vec<ConversationTurn>,
     /// Reasoning-effort level to send on this turn, already resolved
     /// against the user's pick and the active model's
-    /// `default_reasoning_level`. `None` means the model exposes no
-    /// effort presets, so the backend will simply omit the field.
+    /// `default_reasoning_level`. `None` means either the model exposes no
+    /// effort presets or the user explicitly selected reasoning `off`, so
+    /// the backend will omit the field.
     pub reasoning_effort: Option<String>,
     /// Per-session override of the LLM SSE idle timeout (seconds).
     /// `None` means the caller should fall back to the binary-wide default.
@@ -832,12 +839,154 @@ pub(crate) struct SessionMetadata {
 // Zip I/O: read/write executor-compatible session zips
 // ---------------------------------------------------------------------------
 
+fn session_storage_root(cwd: &Path) -> PathBuf {
+    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    for ancestor in start.ancestors() {
+        let git_marker = ancestor.join(".git");
+        if git_marker.is_dir() && git_marker.join("HEAD").is_file() {
+            return ancestor.to_path_buf();
+        }
+        if git_marker.is_file() {
+            return main_worktree_repo_root(ancestor, &git_marker)
+                .unwrap_or_else(|| ancestor.to_path_buf());
+        }
+    }
+    start
+}
+
+fn main_worktree_repo_root(worktree_root: &Path, git_marker: &Path) -> Option<PathBuf> {
+    let git_dir = read_gitdir_marker(worktree_root, git_marker)?;
+
+    // Linked Git worktrees store their private gitdir under
+    // `<main repo>/.git/worktrees/<name>`. A `.git` file can also be used by
+    // submodules or `--separate-git-dir`; those must keep their own worktree
+    // root, so only promote true linked worktrees to the common repo root.
+    let worktrees_dir = git_dir.parent()?;
+    if worktrees_dir.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
+        return None;
+    }
+
+    let common_git_dir = read_common_git_dir(&git_dir).unwrap_or_else(|| {
+        worktrees_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| git_dir.clone())
+    });
+    if common_git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
+        return None;
+    }
+    common_git_dir.parent().map(Path::to_path_buf)
+}
+
+fn read_gitdir_marker(worktree_root: &Path, git_marker: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_marker).ok()?;
+    let raw = content
+        .lines()
+        .next()?
+        .trim()
+        .strip_prefix("gitdir:")?
+        .trim();
+    let path = PathBuf::from(raw);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        worktree_root.join(path)
+    };
+    Some(resolved.canonicalize().unwrap_or(resolved))
+}
+
+fn read_common_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let raw = raw.lines().next()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        git_dir.join(path)
+    };
+    Some(resolved.canonicalize().unwrap_or(resolved))
+}
+
 fn sessions_dir(cwd: &Path) -> PathBuf {
+    session_storage_root(cwd).join(".brokk").join("sessions")
+}
+
+fn legacy_sessions_dir(cwd: &Path) -> PathBuf {
     cwd.join(".brokk").join("sessions")
 }
 
 fn session_zip_path(cwd: &Path, id: &str) -> PathBuf {
     sessions_dir(cwd).join(format!("{id}.zip"))
+}
+
+fn legacy_session_zip_path(cwd: &Path, id: &str) -> PathBuf {
+    legacy_sessions_dir(cwd).join(format!("{id}.zip"))
+}
+
+fn existing_session_zip_path(cwd: &Path, id: &str) -> PathBuf {
+    let primary = session_zip_path(cwd, id);
+    if primary.exists() {
+        return primary;
+    }
+    let legacy = legacy_session_zip_path(cwd, id);
+    if legacy != primary && legacy.exists() {
+        return legacy;
+    }
+    primary
+}
+
+fn migrate_legacy_session_zip(legacy_path: &Path, primary_path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    if legacy_path == primary_path || primary_path.exists() {
+        return Ok(());
+    }
+    let len = std::fs::metadata(legacy_path)
+        .with_context(|| {
+            format!(
+                "reading metadata for legacy session {}",
+                legacy_path.display()
+            )
+        })?
+        .len();
+    if len > MAX_SESSION_ARCHIVE_BYTES {
+        anyhow::bail!(
+            "legacy session archive {} is larger than the {} byte limit",
+            legacy_path.display(),
+            MAX_SESSION_ARCHIVE_BYTES
+        );
+    }
+    let parent = primary_path.parent().with_context(|| {
+        format!(
+            "primary session path has no parent directory: {}",
+            primary_path.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating primary sessions dir {}", parent.display()))?;
+    let file_name = primary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.zip");
+    let tmp = primary_path.with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+    std::fs::copy(legacy_path, &tmp).with_context(|| {
+        format!(
+            "copying legacy session {} to {}",
+            legacy_path.display(),
+            tmp.display()
+        )
+    })?;
+    std::fs::rename(&tmp, primary_path).with_context(|| {
+        format!(
+            "renaming migrated session {} to {}",
+            tmp.display(),
+            primary_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1877,10 +2026,8 @@ fn rewrite_manifest_in_zip(zip_path: &Path, manifest: &SessionManifest) -> anyho
     })
 }
 
-/// List all session manifests from the executor's sessions directory.
-fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
-    let dir = sessions_dir(cwd);
-    let entries = match std::fs::read_dir(&dir) {
+fn list_manifests_in_dir(dir: &Path) -> Vec<SessionManifest> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return vec![],
     };
@@ -1894,6 +2041,32 @@ fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
             read_manifest_from_zip(&path)
         })
         .collect()
+}
+
+/// List all session manifests from the executor's sessions directory.
+fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
+    let primary_dir = sessions_dir(cwd);
+    let legacy_dir = legacy_sessions_dir(cwd);
+    let mut seen = HashSet::new();
+    let mut manifests = Vec::new();
+
+    for manifest in list_manifests_in_dir(&primary_dir) {
+        seen.insert(manifest.id.clone());
+        manifests.push(manifest);
+    }
+
+    // Compatibility: sessions created before linked-worktree-aware storage
+    // lived under the worktree itself. Keep listing them so users can resume
+    // and migrate instead of losing old sessions immediately after upgrade.
+    if legacy_dir != primary_dir {
+        for manifest in list_manifests_in_dir(&legacy_dir) {
+            if seen.insert(manifest.id.clone()) {
+                manifests.push(manifest);
+            }
+        }
+    }
+
+    manifests
 }
 
 /// Normalize a cwd before comparing or rooting a per-session registry.
@@ -2309,10 +2482,22 @@ impl SessionStore {
         if self.sessions.read().await.contains_key(id) {
             return true;
         }
-        let zip_path = session_zip_path(cwd, id);
+        let primary_zip_path = session_zip_path(cwd, id);
+        let legacy_zip_path = legacy_session_zip_path(cwd, id);
+        let zip_path = existing_session_zip_path(cwd, id);
         let loaded = tokio::task::spawn_blocking(move || {
             let manifest = read_manifest_from_zip(&zip_path)?;
             let history = read_history_from_zip(&zip_path);
+            if zip_path == legacy_zip_path
+                && legacy_zip_path != primary_zip_path
+                && let Err(e) = migrate_legacy_session_zip(&legacy_zip_path, &primary_zip_path)
+            {
+                tracing::warn!(
+                    path = %legacy_zip_path.display(),
+                    target = %primary_zip_path.display(),
+                    "failed to migrate legacy worktree session zip to primary repo: {e:#}"
+                );
+            }
             Some((manifest, history))
         })
         .await
@@ -2414,8 +2599,11 @@ impl SessionStore {
         // Resolve "user has no pick" to the model's
         // default_reasoning_level so the backend gets a concrete
         // intent. Models that publish no presets resolve to None and
-        // the backend omits the field entirely.
+        // the backend omits the field entirely. The explicit "off" pick
+        // also resolves to None, but unlike a missing pick it never falls
+        // through to the model default.
         let reasoning_effort = match selected_effort {
+            Some(eff) if eff == REASONING_EFFORT_OFF_VALUE => None,
             Some(eff) => Some(eff),
             None => self
                 .available_models
@@ -2994,6 +3182,8 @@ impl SessionStore {
     /// When the previously-selected reasoning effort isn't in the new
     /// model's supported set, the selection is auto-cleared so the next
     /// turn falls back to the new model's `default_reasoning_level`.
+    /// The explicit `off` pick is always preserved because it means
+    /// "send no reasoning controls" rather than a provider effort level.
     /// Returns the cleared value (if any) so the caller can notify the
     /// user, since silently dropping the pick would look like a bug
     /// next time they wonder why thoughts shortened.
@@ -3023,10 +3213,14 @@ impl SessionStore {
                     } else {
                         Some(model.clone())
                     };
-                    // Auto-fallback: if the user had a pick but the new
-                    // model doesn't advertise it, drop the pick. The
-                    // next snapshot resolves to the new model's default.
+                    // Auto-fallback: if the user had a provider effort
+                    // pick but the new model doesn't advertise it, drop
+                    // the pick. The next snapshot resolves to the new
+                    // model's default. Keep the explicit "off" sentinel:
+                    // it sends no provider effort and remains valid across
+                    // every model.
                     let cleared = match (&session.selected_reasoning_effort, &supported_effort) {
+                        (Some(eff), _) if eff == REASONING_EFFORT_OFF_VALUE => None,
                         (Some(eff), Some(supported)) if !supported.iter().any(|s| s == eff) => {
                             session.selected_reasoning_effort.take()
                         }
@@ -3072,7 +3266,8 @@ impl SessionStore {
     }
 
     /// Record the user's reasoning-effort pick for this session.
-    /// `None` clears it (back to "use model default"). Returns false
+    /// `None` clears it (back to "use model default"); `Some("off")`
+    /// explicitly omits provider reasoning controls. Returns false
     /// if the session is unknown. The session manifest still does not
     /// persist this; the install-wide preference file is updated
     /// separately so new sessions can inherit the last explicit pick.
@@ -4545,6 +4740,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// A configured default reasoning effort of "off" should seed later
+    /// sessions as an explicit opt-out and therefore omit provider
+    /// reasoning controls rather than falling back to the model default.
+    #[tokio::test]
+    async fn set_default_reasoning_off_drives_subsequent_create_session() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let store = SessionStore::new("gpt-mini".to_string());
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "gpt-mini".to_string(),
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: vec![
+                    ReasoningLevelPreset {
+                        effort: "low".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "medium".to_string(),
+                        description: "".to_string(),
+                    },
+                    ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    },
+                ],
+                supports_images: None,
+                context_length: None,
+                pricing: None,
+            }])
+            .await;
+        store
+            .set_default_reasoning_effort(Some(REASONING_EFFORT_OFF_VALUE.to_string()))
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-default-reasoning-off-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+        assert_eq!(
+            s.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&s.id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.reasoning_effort, None);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     /// `set_available_models` round-trips through `available_models` --
     /// this is the cache the agent populates on init and reuses for every
     /// `session/new` and `session/set_config_option` validation.
@@ -4651,6 +4897,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// The explicit "off" reasoning pick means "send no provider reasoning
+    /// controls", so it remains valid when switching to any model and must
+    /// not fall back to the new model's default.
+    #[tokio::test]
+    async fn set_model_preserves_reasoning_off_when_unsupported() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let store = SessionStore::new("gpt-big".to_string());
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "gpt-big".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![
+                        ReasoningLevelPreset {
+                            effort: "low".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "medium".to_string(),
+                            description: "".to_string(),
+                        },
+                        ReasoningLevelPreset {
+                            effort: "high".to_string(),
+                            description: "".to_string(),
+                        },
+                    ],
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+                ModelMetadata {
+                    id: "plain-model".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: Vec::new(),
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+            ])
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-set-model-preserves-off-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+        assert!(
+            store
+                .set_reasoning_effort(&id, Some(REASONING_EFFORT_OFF_VALUE.to_string()))
+                .await
+        );
+
+        let (ok, cleared) = store.set_model(&id, "plain-model".to_string()).await;
+        assert!(ok);
+        assert!(cleared.is_none(), "off is not a provider effort to clear");
+        let session = store
+            .get_session(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(
+            session.selected_reasoning_effort.as_deref(),
+            Some(REASONING_EFFORT_OFF_VALUE)
+        );
+        let snap = store
+            .snapshot(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(
+            snap.reasoning_effort, None,
+            "off must omit reasoning even when the new model has a default"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     /// Picking a level that *is* still supported by the new model
     /// must NOT be cleared -- this protects the user's intent across
     /// a slug bump within the same family (e.g. gpt-5.4 -> gpt-5.5).
@@ -4715,6 +5037,90 @@ mod tests {
         assert_eq!(snap.reasoning_effort.as_deref(), Some("high"));
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn make_fake_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
+        let main = tempfile::tempdir().expect("main repo");
+        let worktree = tempfile::tempdir().expect("linked worktree");
+        let private_git_dir = main.path().join(".git").join("worktrees").join("quick-owl");
+        std::fs::create_dir_all(&private_git_dir).expect("create private worktree gitdir");
+        std::fs::write(
+            main.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("write main HEAD");
+        std::fs::write(private_git_dir.join("commondir"), "../..\n").expect("write commondir");
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", private_git_dir.display()),
+        )
+        .expect("write worktree .git file");
+        (main, worktree)
+    }
+
+    /// Linked worktrees are disposable; session zips must live under the
+    /// main repository root so deleting the worktree does not delete history.
+    #[tokio::test]
+    async fn linked_worktree_sessions_are_stored_in_main_repo() {
+        let (main, worktree) = make_fake_linked_worktree();
+        let store = SessionStore::new("m".to_string());
+
+        let session = store.create_session(worktree.path().to_path_buf()).await;
+
+        assert!(
+            main.path()
+                .join(".brokk")
+                .join("sessions")
+                .join(format!("{}.zip", session.id))
+                .exists(),
+            "session zip should be stored under the main repo"
+        );
+        assert!(
+            !legacy_session_zip_path(worktree.path(), &session.id).exists(),
+            "session zip should not be stored inside the linked worktree"
+        );
+    }
+
+    /// Sessions written by older builds under the worktree itself should still
+    /// be visible and loadable after upgrading. On first load we copy them into
+    /// the main repo location so future worktree deletion is safe.
+    #[tokio::test]
+    async fn legacy_linked_worktree_session_is_listed_loaded_and_migrated() {
+        let (main, worktree) = make_fake_linked_worktree();
+        let store = SessionStore::new("m".to_string());
+        let id = uuid::Uuid::new_v4().to_string();
+        let manifest = SessionManifest {
+            id: id.clone(),
+            name: "legacy".to_string(),
+            created: 1,
+            modified: 2,
+            version: "4.0".to_string(),
+            mode: None,
+            model: Some("m".to_string()),
+            brokk_mcp_servers: None,
+        };
+        let legacy_path = legacy_session_zip_path(worktree.path(), &id);
+        write_new_session_zip(&legacy_path, &manifest).expect("write legacy session zip");
+
+        let listed = store.list_sessions_from_disk(worktree.path()).await;
+        assert!(
+            listed.iter().any(|manifest| manifest.id == id),
+            "legacy worktree session should still be listed"
+        );
+
+        let loaded = store
+            .get_session(&id, worktree.path())
+            .await
+            .expect("legacy session should load");
+        assert_eq!(loaded.id, id);
+        assert!(
+            main.path()
+                .join(".brokk")
+                .join("sessions")
+                .join(format!("{}.zip", loaded.id))
+                .exists(),
+            "legacy session should be migrated into the main repo"
+        );
     }
 
     /// `list_sessions_from_disk` ignores non-zip files in the sessions

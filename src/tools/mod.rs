@@ -395,6 +395,19 @@ impl ToolRegistry {
 
     /// All tool definitions for the OpenAI tools parameter.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tool_definitions_with_shell_escalation(false).await
+    }
+
+    /// Tool definitions for the OpenAI tools parameter.
+    ///
+    /// The outside-sandbox retry field is intentionally hidden until a
+    /// sandboxed shell command fails with a sandbox-looking error. If the model
+    /// sees that field in the first schema, some providers eagerly choose it
+    /// even though the description says it is only for retries.
+    pub async fn tool_definitions_with_shell_escalation(
+        &self,
+        allow_shell_sandbox_escalation: bool,
+    ) -> Vec<ToolDefinition> {
         let builtin_tools = self.active_builtin_tools().await;
         let mut defs = Vec::new();
         if builtin_tools.contains("read_file") {
@@ -514,29 +527,37 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("run_shell_command") {
+            let mut shell_properties = json!({
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute (passed to sh -c)."
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional timeout in milliseconds."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of the command for the user. Accepted for compatibility and not used for execution."
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
+                }
+            });
+            if allow_shell_sandbox_escalation {
+                shell_properties["sandbox_permissions"] = json!({
+                    "type": "string",
+                    "enum": ["require_escalated"],
+                    "description": "Set to `require_escalated` only when retrying a command that already failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation or writes outside the workspace). This asks the user for permission to run the command outside the OS sandbox once."
+                });
+            }
             defs.push(tool_def(
                 "run_shell_command",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses OS sandboxing, commands run in that sandbox by default. If a sandboxed attempt fails because of the sandbox boundary, the retry field for requesting one-time outside-sandbox permission will be exposed in the next tool schema.",
                 json!({
                     "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to execute (passed to sh -c)."
-                        },
-                        "timeout": {
-                            "type": "number",
-                            "description": "Optional timeout in milliseconds."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Brief description of the command for the user. Accepted for compatibility and not used for execution."
-                        },
-                        "directory": {
-                            "type": "string",
-                            "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
-                        }
-                    },
+                    "properties": shell_properties,
                     "required": ["command"]
                 }),
             ));
@@ -833,6 +854,13 @@ impl ToolRegistry {
                 ),
             };
         };
+        // Reshape a few honest model mistakes (e.g. a bare string where the
+        // tool's schema asks for an array) before dispatch, so they don't burn
+        // a turn on a server-side -32602.
+        let args = match client.tools().iter().find(|tool| tool.name == name) {
+            Some(tool) => coerce_scalar_args_to_array(args, &tool.input_schema),
+            None => args,
+        };
         match client.call_tool(name, args).await {
             Ok(value) => {
                 let output = if let Some(s) = value.as_str() {
@@ -878,6 +906,89 @@ impl ToolRegistry {
             .map(|t| t.display_name)
             .unwrap_or("Executing tool")
     }
+}
+
+/// Wrap scalar arguments in a single-element array wherever an MCP tool's
+/// input schema declares an array-typed property.
+///
+/// Models routinely emit `{"file_patterns": "src/main.rs"}` instead of
+/// `{"file_patterns": ["src/main.rs"]}`. The schema we advertise (forwarded
+/// verbatim from the MCP server) correctly asks for an array, but a single
+/// path is the most common case and the model elides the brackets. Without
+/// this the call reaches bifrost as a bare string and serde rejects it with
+/// `-32602 invalid type: string "src/main.rs", expected a sequence`, costing
+/// the model a turn to self-correct.
+///
+/// We coerce only at the host boundary, right before dispatch; the advertised
+/// schema is left untouched, so well-behaved callers still send arrays and the
+/// model is still nudged toward the correct shape. Values already shaped as
+/// arrays (or absent/null) are left alone, as are scalars whose own type the
+/// schema already accepts -- so a field declared `"type": ["string", "array"]`
+/// keeps a bare string intact rather than silently changing its serde variant.
+pub(crate) fn coerce_scalar_args_to_array(
+    args: serde_json::Value,
+    input_schema: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let Value::Object(mut map) = args else {
+        return args;
+    };
+    let Some(properties) = input_schema.get("properties").and_then(Value::as_object) else {
+        return Value::Object(map);
+    };
+    for (key, value) in map.iter_mut() {
+        if value.is_array() || value.is_null() {
+            continue;
+        }
+        let Some(property_schema) = properties.get(key) else {
+            continue;
+        };
+        if scalar_needs_array_wrapping(property_schema, value) {
+            let scalar = value.take();
+            *value = Value::Array(vec![scalar]);
+        }
+    }
+    Value::Object(map)
+}
+
+/// Whether a scalar `value` must be wrapped in a single-element array to satisfy
+/// `property_schema`. True only when the schema declares an array type AND does
+/// not already accept the scalar's own type: a strict array field (`"array"` or
+/// `["array", "null"]`) gets a bare scalar wrapped, while a field that genuinely
+/// accepts either form (`["string", "array"]`) leaves the scalar untouched.
+fn scalar_needs_array_wrapping(
+    property_schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> bool {
+    let types = schema_declared_types(property_schema);
+    types.contains(&"array") && !scalar_type_accepted(&types, value)
+}
+
+/// The JSON-schema `type` values a property node declares, accepting both the
+/// scalar form (`"type": "array"`) and the union form (`"type": ["array", "null"]`).
+fn schema_declared_types(property_schema: &serde_json::Value) -> Vec<&str> {
+    match property_schema.get("type") {
+        Some(serde_json::Value::String(t)) => vec![t.as_str()],
+        Some(serde_json::Value::Array(types)) => {
+            types.iter().filter_map(serde_json::Value::as_str).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `value`'s own JSON type is among the schema's declared types, meaning
+/// it is already valid as-is and must not be wrapped. A JSON integer satisfies
+/// both `integer` and `number`. Arrays and null never reach here.
+fn scalar_type_accepted(types: &[&str], value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    types.iter().any(|t| match value {
+        Value::String(_) => *t == "string",
+        Value::Bool(_) => *t == "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => *t == "integer" || *t == "number",
+        Value::Number(_) => *t == "number",
+        Value::Object(_) => *t == "object",
+        Value::Array(_) | Value::Null => false,
+    })
 }
 
 fn tool_def(name: &str, description: &str, parameters: serde_json::Value) -> ToolDefinition {
@@ -1271,6 +1382,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_tool_schema_hides_sandbox_escalation_by_default() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions().await;
+        let shell = defs
+            .iter()
+            .find(|def| def.function.name == "run_shell_command")
+            .expect("run_shell_command should be advertised");
+
+        assert!(
+            shell
+                .function
+                .parameters
+                .pointer("/properties/sandbox_permissions")
+                .is_none(),
+            "first-attempt shell schema must not expose sandbox escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_tool_schema_exposes_sandbox_escalation_when_enabled() {
+        let registry = registry_with_skills(vec![]);
+        let defs = registry.tool_definitions_with_shell_escalation(true).await;
+        let shell = defs
+            .iter()
+            .find(|def| def.function.name == "run_shell_command")
+            .expect("run_shell_command should be advertised");
+
+        assert!(
+            shell
+                .function
+                .parameters
+                .pointer("/properties/sandbox_permissions")
+                .is_some(),
+            "retry shell schema must expose sandbox escalation"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_definitions_respect_filtered_builtin_set() {
         let registry = registry_with_skills(vec![]);
         registry
@@ -1385,5 +1534,121 @@ mod tests {
             task_def.function.description
         );
         assert!(task_def.function.description.contains("bug-hunter"));
+    }
+
+    /// The reported bug: `list_symbols` called with a bare string where the
+    /// schema asks for an array. The host must wrap it into a single-element
+    /// array so bifrost no longer rejects it with `-32602 expected a sequence`.
+    #[test]
+    fn coerce_wraps_scalar_string_for_array_property() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "file_patterns": { "type": "array", "items": { "type": "string" } }
+            }
+        });
+        let coerced =
+            coerce_scalar_args_to_array(json!({ "file_patterns": "src/main.rs" }), &schema);
+        assert_eq!(coerced, json!({ "file_patterns": ["src/main.rs"] }));
+    }
+
+    /// A correctly-shaped array argument must pass through untouched -- the
+    /// coercion only rescues scalars, it never re-wraps an existing array.
+    #[test]
+    fn coerce_leaves_array_argument_untouched() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "file_patterns": { "type": "array", "items": { "type": "string" } }
+            }
+        });
+        let args = json!({ "file_patterns": ["src/main.rs", "src/lib.rs"] });
+        assert_eq!(coerce_scalar_args_to_array(args.clone(), &schema), args);
+    }
+
+    /// Non-array properties (and properties absent from the schema) must keep
+    /// their scalar value; we only reshape where the schema declares an array.
+    #[test]
+    fn coerce_leaves_non_array_properties_untouched() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "patterns": { "type": "array", "items": { "type": "string" } },
+                "max_results": { "type": "number" }
+            }
+        });
+        let args = json!({
+            "patterns": "McpClient",
+            "max_results": 10,
+            "unschema'd": "left as-is"
+        });
+        let coerced = coerce_scalar_args_to_array(args, &schema);
+        assert_eq!(
+            coerced,
+            json!({
+                "patterns": ["McpClient"],
+                "max_results": 10,
+                "unschema'd": "left as-is"
+            })
+        );
+    }
+
+    /// Nullable array fields advertise `"type": ["array", "null"]`; a scalar
+    /// supplied for one must still be wrapped, but an explicit null stays null
+    /// (absent/optional), never `[null]`.
+    #[test]
+    fn coerce_handles_nullable_array_union_type() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "globs": { "type": ["array", "null"], "items": { "type": "string" } }
+            }
+        });
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "globs": "*.rs" }), &schema),
+            json!({ "globs": ["*.rs"] })
+        );
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "globs": null }), &schema),
+            json!({ "globs": null })
+        );
+    }
+
+    /// A field that accepts either form (`"type": ["string", "array"]`) must
+    /// leave a bare string intact: the string is already valid, and wrapping it
+    /// could flip which serde variant the server deserializes. An explicit array
+    /// for the same field also passes through unchanged.
+    #[test]
+    fn coerce_leaves_scalar_for_string_or_array_union() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": ["string", "array"], "items": { "type": "string" } }
+            }
+        });
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "query": "McpClient" }), &schema),
+            json!({ "query": "McpClient" })
+        );
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "query": ["a", "b"] }), &schema),
+            json!({ "query": ["a", "b"] })
+        );
+    }
+
+    /// A numeric value for a `["number", "array"]` union is already valid and
+    /// must not be wrapped; a JSON integer satisfies the `number` type.
+    #[test]
+    fn coerce_leaves_number_for_number_or_array_union() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "weights": { "type": ["number", "array"] }
+            }
+        });
+        assert_eq!(
+            coerce_scalar_args_to_array(json!({ "weights": 5 }), &schema),
+            json!({ "weights": 5 })
+        );
     }
 }

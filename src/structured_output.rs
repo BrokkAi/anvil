@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use jsonschema::{ErrorIterator, JSONSchema};
+use jsonschema::ErrorIterator;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -91,7 +91,7 @@ pub fn parse_structured_output_request(
         anyhow::bail!("`schema` must be a JSON object");
     }
     let schema_for_compile = schema.clone();
-    JSONSchema::compile(&schema_for_compile)
+    jsonschema::validator_for(&schema_for_compile)
         .map_err(|err| anyhow!("invalid structured-output schema: {err}"))?;
     if allow_coercion {
         reject_unsupported_coercion_schema_shapes(&schema_for_compile)?;
@@ -136,7 +136,7 @@ pub fn validate_response(
     };
 
     let schema_for_compile = request.schema.clone();
-    let compiled = match JSONSchema::compile(&schema_for_compile) {
+    let compiled = match jsonschema::validator_for(&schema_for_compile) {
         Ok(compiled) => compiled,
         Err(err) => {
             return validation_error_result(
@@ -158,10 +158,7 @@ pub fn validate_response(
             coercion_requested: request.allow_coercion,
         })
     } else {
-        let errors = compiled
-            .validate(&parsed)
-            .expect_err("is_valid false must produce validation errors");
-        let original_errors = collect_schema_errors(errors);
+        let original_errors = collect_schema_errors(compiled.iter_errors(&parsed));
         if !request.allow_coercion {
             return validation_error_result(request, original_errors, response_text);
         }
@@ -191,10 +188,11 @@ pub fn validate_response(
                 coercion_requested: true,
             })
         } else {
-            let errors = compiled
-                .validate(&coerced)
-                .expect_err("is_valid false must produce validation errors");
-            validation_error_result(request, collect_schema_errors(errors), response_text)
+            validation_error_result(
+                request,
+                collect_schema_errors(compiled.iter_errors(&coerced)),
+                response_text,
+            )
         }
     }
 }
@@ -238,8 +236,8 @@ fn validation_error_result(
 fn collect_schema_errors(errors: ErrorIterator<'_>) -> Vec<StructuredOutputSchemaError> {
     errors
         .map(|error| StructuredOutputSchemaError {
-            instance_location: error.instance_path.to_string(),
-            schema_location: error.schema_path.to_string(),
+            instance_location: error.instance_path().to_string(),
+            schema_location: error.schema_path().to_string(),
             message: error.to_string(),
         })
         .collect()

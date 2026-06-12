@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.10.8"
+version = "0.11.0"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"
@@ -40,16 +40,16 @@ rtk_core = { package = "rtk", git = "https://github.com/BrokkAi/rtk", rev = "600
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.
-wasmtime = { version = "44", optional = true, default-features = false, features = ["cranelift", "cache", "parallel-compilation", "component-model", "runtime"] }
-wasmtime-wasi = { version = "44", optional = true }
+wasmtime = { version = "45", optional = true, default-features = false, features = ["cranelift", "cache", "parallel-compilation", "component-model", "runtime"] }
+wasmtime-wasi = { version = "45", optional = true }
 zip = "8"
 futures = "0.3"
 regex = "1"
 reqwest = { version = "0.13", features = ["stream", "json", "cookies", "form"] }
-rand = "0.9"
+rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-jsonschema = "0.18"
+jsonschema = "0.46"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tracing = "0.1"
@@ -57,7 +57,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 rustls-native-certs = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 # Codex login. We deliberately avoid single-maintainer credential crates:
 # `oauth2` is the de-facto Rust OAuth2 implementation (~32M downloads,
 # depended on by Servo etc.) and gives us PKCE + refresh. The RFC 8693
@@ -83,7 +83,7 @@ serde_yaml = "0.9"
 # to every model since no small/accurate alternative exists for
 # Claude/Gemini/Llama and the count is an approximation used to trigger
 # compression, not a billing figure.
-tiktoken-rs = "0.7"
+tiktoken-rs = "0.12"
 
 # Unix-only: `setrlimit` via `Command::pre_exec` for per-process resource caps
 # applied to `runShellCommand`. See `tools/shell.rs::apply_rlimits`.

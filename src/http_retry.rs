@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rand::Rng;
+use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const LLM_MAX_ATTEMPTS: u64 = 4;
