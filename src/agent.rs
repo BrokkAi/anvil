@@ -4418,48 +4418,15 @@ fn describe_always_allow_key(key: &str) -> String {
                 })
                 .filter(|joined| !joined.is_empty())
                 .unwrap_or_else(|| "(unknown prefix)".to_string());
-            let sandbox = match value
-                .get("shellSandboxed")
-                .and_then(serde_json::Value::as_bool)
-            {
-                Some(true) => "sandboxed",
-                Some(false) => "unsandboxed",
-                None => "sandbox unknown",
-            };
-            return format!("run_shell_command prefix `{prefix}` in this repo ({sandbox})");
+            return format!("run_shell_command prefix `{prefix}` in this repo");
         }
-        if value.get("rule").and_then(serde_json::Value::as_str) == Some("exact") {
-            let command = value
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("(unknown command)");
-            let sandbox = match value
-                .get("shellSandboxed")
-                .and_then(serde_json::Value::as_bool)
-            {
-                Some(true) => "sandboxed",
-                Some(false) => "unsandboxed",
-                None => "sandbox unknown",
-            };
-            return format!("run_shell_command `{command}` in this repo ({sandbox})");
-        }
+        // Legacy exact-command keys are no longer stored (they are purged on
+        // load), but describe any straggler passed in by `/permissions revoke`.
         let command = value
             .get("command")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(unknown command)");
-        let cwd = value
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("(unknown cwd)");
-        let sandbox = match value
-            .get("shellSandboxed")
-            .and_then(serde_json::Value::as_bool)
-        {
-            Some(true) => "sandboxed",
-            Some(false) => "unsandboxed",
-            None => "sandbox unknown",
-        };
-        return format!("run_shell_command `{command}` in `{cwd}` ({sandbox})");
+        return format!("run_shell_command `{command}` in this repo");
     }
 
     format!("tool `{key}`")
@@ -6712,11 +6679,11 @@ mod tests {
 
         assert_eq!(
             describe_always_allow_key(&repo_prefix_key),
-            "run_shell_command prefix `cargo test` in this repo (sandboxed)"
+            "run_shell_command prefix `cargo test` in this repo"
         );
         assert_eq!(
             describe_always_allow_key(&legacy_key),
-            "run_shell_command `cargo test` in `/work/repo` (sandboxed)"
+            "run_shell_command `cargo test` in this repo"
         );
         assert_eq!(describe_always_allow_key("write_file"), "tool `write_file`");
     }
@@ -6737,7 +6704,7 @@ mod tests {
         let listed = render_always_allowed_permissions(&store, &id).await;
         assert!(listed.contains("1. tool `write_file`"), "{listed}");
         assert!(
-            listed.contains("2. run_shell_command prefix `cargo test` in this repo (sandboxed)"),
+            listed.contains("2. run_shell_command prefix `cargo test` in this repo"),
             "{listed}"
         );
 
