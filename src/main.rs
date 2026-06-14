@@ -138,6 +138,14 @@ struct Args {
     /// runs without any sandbox of any kind.
     #[arg(long, env = "ANVIL_NO_WASM_SANDBOX", default_value_t = false)]
     no_wasm_sandbox: bool,
+
+    /// Open the system prompt with a general-purpose framing instead of
+    /// the default "AI coding assistant" preamble. Coding remains the
+    /// stated specialty, but the model is told it may help with any task
+    /// — useful when driving Anvil from a host (e.g. `mj`) that mixes
+    /// coding and non-coding prompts. Default behavior is unchanged.
+    #[arg(long, env = "ANVIL_GENERAL_SCOPE", default_value_t = false)]
+    general: bool,
 }
 
 impl std::fmt::Debug for Args {
@@ -151,6 +159,7 @@ impl std::fmt::Debug for Args {
             .field("bifrost_binary", &self.bifrost_binary)
             .field("llm_idle_timeout_secs", &self.llm_idle_timeout_secs)
             .field("transient_setup", &self.transient_setup)
+            .field("general", &self.general)
             // Deprecated flags omitted from Debug to avoid leaking api_key.
             .finish()
     }
@@ -528,6 +537,7 @@ async fn main() -> Result<()> {
         args.default_model,
         limits,
         args.transient_setup,
+        args.general,
     );
     sessions
         .set_default_reasoning_effort(args.reasoning_effort)
