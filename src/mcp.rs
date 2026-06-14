@@ -778,7 +778,7 @@ mod tests {
             client.tools().len()
         );
 
-        for expected in ["search_symbols", "list_symbols", "get_summaries"] {
+        for expected in ["search_symbols", "get_summaries"] {
             assert!(
                 names.contains(&expected),
                 "missing tool {expected} in {names:?}"
@@ -814,72 +814,15 @@ mod tests {
 
         let result = client
             .call_tool(
-                "list_symbols",
-                json!({ "file_patterns": ["brokk-acp-rust/src/mcp.rs"] }),
+                "get_summaries",
+                json!({ "targets": ["brokk-acp-rust/src/mcp.rs"] }),
             )
             .await
-            .expect("list_symbols call should succeed");
+            .expect("get_summaries call should succeed");
         eprintln!(
-            "list_symbols result: {}",
+            "get_summaries result: {}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
-    }
-
-    /// End-to-end proof for the `list_symbols` string-arg bug: a bare string
-    /// where the schema asks for an array makes the real bifrost server reject
-    /// the call with `-32602 ... expected a sequence`, while the same value run
-    /// through the host's production coercion (`coerce_scalar_args_to_array`)
-    /// is accepted. This pins both halves against the actual server -- the
-    /// reproduction and the fix -- so a regression in either surfaces here.
-    #[tokio::test]
-    async fn list_symbols_tolerates_string_file_pattern_via_coercion() {
-        let binary = ensure_test_bifrost_binary().await;
-        let cwd = std::env::current_dir()
-            .expect("cwd")
-            .canonicalize()
-            .expect("canonicalize");
-
-        let config = McpServerConfig {
-            name: "bifrost".to_string(),
-            command: binary.display().to_string(),
-            args: McpServerConfig::bifrost().args,
-            env: Vec::new(),
-            framing: McpFraming::Line,
-            enabled: true,
-        };
-        let client = McpClient::spawn(&config, &cwd)
-            .await
-            .expect("bifrost subprocess should start");
-
-        let schema = client
-            .tools()
-            .iter()
-            .find(|t| t.name == "list_symbols")
-            .map(|t| t.input_schema.clone())
-            .expect("bifrost should expose list_symbols with a schema");
-
-        // Reproduce the bug: the raw string is rejected with JSON-RPC -32602.
-        let raw_args = json!({ "file_patterns": "src/mcp.rs" });
-        let err = client
-            .call_tool("list_symbols", raw_args.clone())
-            .await
-            .expect_err("bare string file_patterns should be rejected by bifrost");
-        match &err {
-            McpError::JsonRpc { code, .. } => assert_eq!(
-                *code, -32602,
-                "expected invalid-params (-32602), got: {err}"
-            ),
-            other => panic!("expected a JSON-RPC error, got: {other}"),
-        }
-
-        // The fix: the host's coercion wraps the scalar into a single-element
-        // array, and bifrost now accepts the call.
-        let coerced = crate::tools::coerce_scalar_args_to_array(raw_args, &schema);
-        assert_eq!(coerced, json!({ "file_patterns": ["src/mcp.rs"] }));
-        client
-            .call_tool("list_symbols", coerced)
-            .await
-            .expect("coerced array file_patterns should be accepted by bifrost");
     }
 
     #[cfg(unix)]

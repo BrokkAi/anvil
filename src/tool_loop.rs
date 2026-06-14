@@ -2476,7 +2476,6 @@ fn is_bifrost_context_tool(name: &str) -> bool {
             | "get_symbol_sources"
             | "scan_usages"
             | "get_summaries"
-            | "list_symbols"
             | "get_symbol_locations"
     )
 }

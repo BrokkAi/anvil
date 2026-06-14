@@ -110,11 +110,6 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Fetching symbol source",
     },
     ToolMeta {
-        name: "list_symbols",
-        kind: ToolKind::Search,
-        display_name: "Listing symbols",
-    },
-    ToolMeta {
         name: "most_relevant_files",
         kind: ToolKind::Search,
         display_name: "Finding related files",
@@ -1536,9 +1531,8 @@ mod tests {
         assert!(task_def.function.description.contains("bug-hunter"));
     }
 
-    /// The reported bug: `list_symbols` called with a bare string where the
-    /// schema asks for an array. The host must wrap it into a single-element
-    /// array so bifrost no longer rejects it with `-32602 expected a sequence`.
+    /// MCP schemas often ask for arrays. The host must wrap scalar strings into
+    /// single-element arrays so servers do not reject them with invalid params.
     #[test]
     fn coerce_wraps_scalar_string_for_array_property() {
         let schema = json!({
