@@ -2393,9 +2393,7 @@ fn build_prompt_messages_with_parts(
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
     messages.push(ChatMessage::system(build_system_prompt(
-        &snap.mode,
-        &snap.cwd,
-        snap.general_scope,
+        &snap.mode, &snap.cwd,
     )));
     if !snap.project_instructions.is_empty() {
         messages.push(ChatMessage::user(format!(
@@ -2703,66 +2701,46 @@ async fn run_model_turn_in_spawn(
     (structured_output_result, cumulative_usage)
 }
 
-fn build_system_prompt(mode: &SessionMode, cwd: &Path, general_scope: bool) -> String {
+fn build_system_prompt(mode: &SessionMode, cwd: &Path) -> String {
     let cwd_context = format!(
         "The user's working directory is: {}\n\
          All file paths should be interpreted relative to this directory.\n\n",
         cwd.display()
     );
 
-    // When `--general` is set, replace the coding-only framing with a
-    // general-purpose preamble that still highlights software-engineering
-    // expertise. Coding behavior is unchanged; the model just stops
-    // refusing off-topic prompts.
-    let mode_prompt = if general_scope {
-        match mode {
-            SessionMode::Lutz => {
-                "You are Brokk, an AI assistant running in a terminal environment. You specialize \
-                 in software engineering — code analysis, generation, refactoring, debugging, and \
-                 architecture — but you can help with any task the user brings to you. You help \
-                 users using an agentic approach: break complex tasks into steps, execute them, \
-                 and report results. When appropriate, create a task list to track progress."
-            }
-            SessionMode::Code => {
-                "You are Brokk, an AI assistant running in a terminal environment. You specialize \
-                 in software engineering — code analysis, generation, refactoring, debugging, and \
-                 architecture — but you can help with any task the user brings to you. For coding \
-                 work, generate code modifications, refactors, and implementations. Be concise \
-                 and focus on the change at hand."
-            }
-            SessionMode::Ask => {
-                "You are Brokk, an AI assistant running in a terminal environment. You specialize \
-                 in software engineering — code analysis, generation, refactoring, debugging, and \
-                 architecture — but you can help with any task the user brings to you. Answer \
-                 questions thoroughly but concisely."
-            }
-            SessionMode::Plan => {
-                "You are Brokk, an AI assistant running in a terminal environment. You specialize \
-                 in software engineering — code analysis, generation, refactoring, debugging, and \
-                 architecture — but you can help with any task the user brings to you. In this \
-                 mode, focus on planning: analyze requirements, design solutions, and produce \
-                 implementation plans. Do not write code directly."
-            }
+    // The identity line is intentionally general-purpose: Anvil is often
+    // driven by hosts (e.g. `mj`) that mix coding and non-coding prompts,
+    // and "AI coding assistant" wording was enough for some models to
+    // refuse off-topic questions. We still name software engineering as
+    // the specialty so coding behavior is unchanged.
+    let mode_prompt = match mode {
+        SessionMode::Lutz => {
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. You work \
+             using an agentic approach: break complex tasks into steps, execute them, and report \
+             results. When appropriate, create a task list to track progress."
         }
-    } else {
-        match mode {
-            SessionMode::Lutz => {
-                "You are Brokk, an AI coding assistant. You help users with software engineering \
-                 tasks using an agentic approach: break complex tasks into steps, execute them, \
-                 and report results. When appropriate, create a task list to track progress."
-            }
-            SessionMode::Code => {
-                "You are Brokk, an AI coding assistant focused on code changes. Generate code \
-                 modifications, refactors, and implementations. Be concise and focus on the code."
-            }
-            SessionMode::Ask => {
-                "You are Brokk, an AI coding assistant. Answer questions about code, architecture, \
-                 and software engineering concepts. Be thorough but concise."
-            }
-            SessionMode::Plan => {
-                "You are Brokk, an AI coding assistant focused on planning. Analyze requirements, \
-                 design solutions, and create implementation plans. Do not write code directly."
-            }
+        SessionMode::Code => {
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. In this mode, \
+             focus on code changes: generate modifications, refactors, and implementations. Be \
+             concise and focus on the code."
+        }
+        SessionMode::Ask => {
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. Answer \
+             questions about code, architecture, and software engineering concepts thoroughly \
+             but concisely."
+        }
+        SessionMode::Plan => {
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. In this mode, \
+             focus on planning: analyze requirements, design solutions, and create implementation \
+             plans. Do not write code directly."
         }
     };
 
@@ -5602,7 +5580,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let plan = plan_compress(&snap);
         assert_eq!(plan.total, 4);
@@ -5629,7 +5606,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         assert!(plan_compress(&snap).uncompressed.is_empty());
     }
@@ -5865,19 +5841,21 @@ mod tests {
         );
     }
 
-    /// All four behavior modes embed the cwd into the system prompt so
-    /// the model can resolve relative paths, and each mode picks a
-    /// distinct mode-specific paragraph.
+    /// All four behavior modes embed the cwd into the system prompt and
+    /// open with the shared general-purpose identity line, while still
+    /// carrying a distinct mode-specific paragraph. The "AI coding
+    /// assistant" wording must stay gone -- some models refuse non-coding
+    /// prompts when it's present, which is the regression this guards.
     #[test]
     fn build_system_prompt_includes_cwd_and_mode_specific_text() {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         for (mode, marker) in [
             (SessionMode::Lutz, "agentic approach"),
-            (SessionMode::Code, "focused on code changes"),
+            (SessionMode::Code, "focus on code changes"),
             (SessionMode::Ask, "Answer questions about code"),
-            (SessionMode::Plan, "focused on planning"),
+            (SessionMode::Plan, "focus on planning"),
         ] {
-            let prompt = build_system_prompt(&mode, cwd, false);
+            let prompt = build_system_prompt(&mode, cwd);
             assert!(
                 prompt.contains("/tmp/some-cwd") || prompt.contains("\\tmp\\some-cwd"),
                 "system prompt for {mode:?} must embed the cwd, got: {prompt}"
@@ -5887,37 +5865,12 @@ mod tests {
                 "system prompt for {mode:?} must mention '{marker}', got: {prompt}"
             );
             assert!(
-                prompt.contains("AI coding assistant"),
-                "default (non-general) prompt for {mode:?} must use the coding-only framing, got: {prompt}"
+                prompt.contains("any task the user brings to you"),
+                "system prompt for {mode:?} must use the general-purpose identity opening, got: {prompt}"
             );
-        }
-    }
-
-    /// With `--general` set, the system prompt drops the "AI coding
-    /// assistant" framing in favor of the broader "you can help with
-    /// any task" opening, while still naming software engineering as a
-    /// specialty.
-    #[test]
-    fn build_system_prompt_general_scope_uses_broader_framing() {
-        let cwd = std::path::Path::new("/tmp/some-cwd");
-        for mode in [
-            SessionMode::Lutz,
-            SessionMode::Code,
-            SessionMode::Ask,
-            SessionMode::Plan,
-        ] {
-            let prompt = build_system_prompt(&mode, cwd, true);
             assert!(
                 !prompt.contains("AI coding assistant"),
-                "general-scope prompt for {mode:?} must not say 'AI coding assistant', got: {prompt}"
-            );
-            assert!(
-                prompt.contains("any task the user brings to you"),
-                "general-scope prompt for {mode:?} must include the general-purpose opening, got: {prompt}"
-            );
-            assert!(
-                prompt.contains("specialize in software engineering"),
-                "general-scope prompt for {mode:?} must still name software engineering as a specialty, got: {prompt}"
+                "system prompt for {mode:?} must not revive the 'AI coding assistant' wording, got: {prompt}"
             );
         }
     }
@@ -5943,7 +5896,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let catalog = vec![ModelMetadata {
             id: "gpt-99".into(),
@@ -5980,7 +5932,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let report = render_context_report(&snap, PermissionMode::Default, &[]);
         assert!(report.contains("Model: `(none)`"));
@@ -6009,7 +5960,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let catalog = vec![ModelMetadata {
             id: "gpt-99".into(),
@@ -6043,7 +5993,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let catalog = vec![ModelMetadata {
             id: "codex::gpt-5-codex".into(),
@@ -6076,7 +6025,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let catalog = vec![ModelMetadata {
             id: "openrouter::openai/gpt-4o".into(),
@@ -6139,7 +6087,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "follow up");
         // system + user(history) + assistant(history) + user(new)
@@ -6189,7 +6136,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "now fix them");
 
@@ -6240,7 +6186,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         assert_eq!(msgs.len(), 2);
@@ -6261,7 +6206,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
 
         let msgs = build_prompt_messages(&snap, "hi");
@@ -6315,7 +6259,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "next");
 
@@ -6382,7 +6325,6 @@ mod tests {
                 ("hello-world", "Greet the user with a single short line."),
                 ("pdf-processing", "Extract text from PDFs."),
             ]),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         // system, catalog (user context), user(new) -> 3
@@ -6411,7 +6353,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "hi");
         // Just system + the user prompt -- no catalog message.
@@ -7107,7 +7048,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "next");
         // system + summary(turn 0) + user(turn 1) + assistant(turn 1) + user(new) = 5
@@ -7154,7 +7094,6 @@ mod tests {
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-            general_scope: false,
         };
         let msgs = build_prompt_messages(&snap, "next");
         let bodies: Vec<&str> = msgs.iter().filter_map(|m| m.text_content()).collect();
