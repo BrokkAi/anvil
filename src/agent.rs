@@ -2708,23 +2708,39 @@ fn build_system_prompt(mode: &SessionMode, cwd: &Path) -> String {
         cwd.display()
     );
 
+    // The identity line is intentionally general-purpose: Anvil is often
+    // driven by hosts (e.g. `mj`) that mix coding and non-coding prompts,
+    // and "AI coding assistant" wording was enough for some models to
+    // refuse off-topic questions. We still name software engineering as
+    // the specialty so coding behavior is unchanged.
     let mode_prompt = match mode {
         SessionMode::Lutz => {
-            "You are Brokk, an AI coding assistant. You help users with software engineering tasks \
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. You work \
              using an agentic approach: break complex tasks into steps, execute them, and report \
              results. When appropriate, create a task list to track progress."
         }
         SessionMode::Code => {
-            "You are Brokk, an AI coding assistant focused on code changes. Generate code \
-             modifications, refactors, and implementations. Be concise and focus on the code."
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. In this mode, \
+             focus on code changes: generate modifications, refactors, and implementations. Be \
+             concise and focus on the code."
         }
         SessionMode::Ask => {
-            "You are Brokk, an AI coding assistant. Answer questions about code, architecture, \
-             and software engineering concepts. Be thorough but concise."
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. Answer \
+             questions about code, architecture, and software engineering concepts thoroughly \
+             but concisely."
         }
         SessionMode::Plan => {
-            "You are Brokk, an AI coding assistant focused on planning. Analyze requirements, \
-             design solutions, and create implementation plans. Do not write code directly."
+            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
+             software engineering — code analysis, generation, refactoring, debugging, and \
+             architecture — but you can help with any task the user brings to you. In this mode, \
+             focus on planning: analyze requirements, design solutions, and create implementation \
+             plans. Do not write code directly."
         }
     };
 
@@ -5825,17 +5841,19 @@ mod tests {
         );
     }
 
-    /// All four behavior modes embed the cwd into the system prompt so
-    /// the model can resolve relative paths, and each mode picks a
-    /// distinct mode-specific paragraph.
+    /// All four behavior modes embed the cwd into the system prompt and
+    /// open with the shared general-purpose identity line, while still
+    /// carrying a distinct mode-specific paragraph. The "AI coding
+    /// assistant" wording must stay gone -- some models refuse non-coding
+    /// prompts when it's present, which is the regression this guards.
     #[test]
     fn build_system_prompt_includes_cwd_and_mode_specific_text() {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         for (mode, marker) in [
             (SessionMode::Lutz, "agentic approach"),
-            (SessionMode::Code, "focused on code changes"),
+            (SessionMode::Code, "focus on code changes"),
             (SessionMode::Ask, "Answer questions about code"),
-            (SessionMode::Plan, "focused on planning"),
+            (SessionMode::Plan, "focus on planning"),
         ] {
             let prompt = build_system_prompt(&mode, cwd);
             assert!(
@@ -5845,6 +5863,14 @@ mod tests {
             assert!(
                 prompt.contains(marker),
                 "system prompt for {mode:?} must mention '{marker}', got: {prompt}"
+            );
+            assert!(
+                prompt.contains("any task the user brings to you"),
+                "system prompt for {mode:?} must use the general-purpose identity opening, got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("AI coding assistant"),
+                "system prompt for {mode:?} must not revive the 'AI coding assistant' wording, got: {prompt}"
             );
         }
     }
