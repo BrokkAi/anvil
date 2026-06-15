@@ -519,7 +519,7 @@ pub async fn run_shell_command_cancellable(
             }
         }
         ShellRunResult::Cancelled => {
-            let mut msg = "Command cancelled before it completed".to_string();
+            let mut msg = "Command was cancelled before it completed".to_string();
             if outside_sandbox_once {
                 msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
             }
@@ -561,33 +561,31 @@ async fn run_child_to_completion(
     let timeout = tokio::time::sleep(Duration::from_secs(timeout_seconds));
     tokio::pin!(timeout);
 
-    let termination = if let Some(cancel) = cancel {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                terminate_child_tree(&mut child).await;
-                ShellTermination::Cancelled
-            }
-            _ = &mut timeout => {
-                terminate_child_tree(&mut child).await;
-                ShellTermination::TimedOut
-            }
-            wait_result = child.wait() => match wait_result {
-                Ok(status) => ShellTermination::Completed(status),
-                Err(error) => ShellTermination::FailedToWait(error),
-            },
+    // When there is no cancel token, a `pending()` future keeps the select
+    // arm shape identical without ever firing -- avoiding two near-duplicate
+    // `select!` blocks that drift apart over time.
+    let cancelled = async {
+        match cancel {
+            Some(cancel) => cancel.cancelled().await,
+            None => std::future::pending::<()>().await,
         }
-    } else {
-        tokio::select! {
-            _ = &mut timeout => {
-                terminate_child_tree(&mut child).await;
-                ShellTermination::TimedOut
-            }
-            wait_result = child.wait() => match wait_result {
-                Ok(status) => ShellTermination::Completed(status),
-                Err(error) => ShellTermination::FailedToWait(error),
-            },
+    };
+    tokio::pin!(cancelled);
+
+    let termination = tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            terminate_child_tree(&mut child).await;
+            ShellTermination::Cancelled
         }
+        _ = &mut timeout => {
+            terminate_child_tree(&mut child).await;
+            ShellTermination::TimedOut
+        }
+        wait_result = child.wait() => match wait_result {
+            Ok(status) => ShellTermination::Completed(status),
+            Err(error) => ShellTermination::FailedToWait(error),
+        },
     };
 
     match termination {
@@ -597,14 +595,20 @@ async fn run_child_to_completion(
             stderr: join_pipe_output(stderr_task).await,
         },
         ShellTermination::FailedToWait(error) => ShellRunResult::FailedToExecute(error),
+        // The child tree has been SIGKILLed/taskkilled, but a grandchild that
+        // escaped the process group (e.g. `setsid`) can keep the stdout/stderr
+        // pipe open, so `read_to_end` would never see EOF. We discard the
+        // output on these paths anyway, so abort the readers instead of
+        // awaiting them -- otherwise the join would hang indefinitely (there
+        // is no outer timeout around shell cancellation).
         ShellTermination::TimedOut => {
-            let _ = join_pipe_output(stdout_task).await;
-            let _ = join_pipe_output(stderr_task).await;
+            stdout_task.abort();
+            stderr_task.abort();
             ShellRunResult::TimedOut
         }
         ShellTermination::Cancelled => {
-            let _ = join_pipe_output(stdout_task).await;
-            let _ = join_pipe_output(stderr_task).await;
+            stdout_task.abort();
+            stderr_task.abort();
             ShellRunResult::Cancelled
         }
     }
@@ -912,6 +916,82 @@ mod tests {
             result.output.starts_with(EXPLICIT_OUTSIDE_SANDBOX_NOTICE),
             "explicit outside-sandbox runs must prefix an audit notice; got: {}",
             result.output
+        );
+    }
+
+    /// True if `name` resolves on PATH. Used to skip tests that rely on an
+    /// optional tool (e.g. `setsid`, which stock macOS does not ship).
+    async fn command_on_path(name: &str) -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {name}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Regression test for the unbounded-drain hang: a grandchild that
+    /// detaches into its own session via `setsid` escapes the shell's
+    /// process group, so the SIGKILL we send to that group never reaches it
+    /// and it keeps the inherited stdout pipe open. If the cancel path
+    /// `await`ed the pipe readers, `read_to_end` would never see EOF and the
+    /// call would hang forever (there is no outer timeout around shell
+    /// cancellation). `abort()`ing the readers keeps cancellation prompt.
+    #[tokio::test]
+    async fn cancellation_returns_even_when_grandchild_escapes_process_group() {
+        let _guard = ENV_LOCK.lock().await;
+
+        if !command_on_path("setsid").await {
+            eprintln!("skipping: `setsid` not available on this host");
+            return;
+        }
+
+        let dir = std::env::temp_dir();
+        // The outer shell backgrounds a setsid grandchild (new session, so it
+        // outlives the process-group kill while still holding the stdout pipe)
+        // and then blocks itself so cancellation -- not natural exit -- ends
+        // the call.
+        let command = "setsid sh -c 'sleep 10' & sleep 10";
+
+        let cancel = CancellationToken::new();
+        let cancel_from_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_from_task.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_shell_command_cancellable(
+                &dir,
+                command,
+                10,
+                SandboxPolicy::None,
+                false,
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancellation must return even when a grandchild keeps the pipe open");
+
+        assert!(
+            matches!(result.status, ToolStatus::RequestError),
+            "cancelled command should report a request error; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("cancelled"),
+            "cancelled command should explain cancellation; got: {}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation waited too long: {:?}",
+            started.elapsed()
         );
     }
 }

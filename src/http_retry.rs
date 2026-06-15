@@ -22,7 +22,7 @@ pub(crate) async fn send_with_retries(
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    anyhow::bail!("{operation} cancelled while sending request");
+                    anyhow::bail!("{operation} was cancelled while sending request");
                 }
                 response = send => response,
             }
