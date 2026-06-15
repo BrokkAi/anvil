@@ -511,7 +511,10 @@ impl BedrockClient {
             reasoning_effort.as_deref(),
             structured_output.as_ref(),
         );
-        let url = format!("{}/responses", self.mantle_base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/responses",
+            mantle_base_url_for_model(&self.mantle_base_url, &model)
+        );
         let resp = crate::http_retry::send_with_retries(
             "posting Bedrock Responses API request",
             || {
@@ -763,6 +766,32 @@ impl LlmBackend for BedrockClient {
 
 fn uses_responses_api(model: &str) -> bool {
     model.starts_with("openai.")
+}
+
+/// The gpt-5.4 and gpt-5.5 model families are served from a dedicated
+/// `/openai/v1` path on Bedrock Mantle rather than the shared `/v1` path every
+/// other Mantle model uses (per their Bedrock model cards). Match the bare ids
+/// and any suffixed derivative (e.g. `openai.gpt-5.5-codex`), but not unrelated
+/// ids that merely share the numeric prefix (e.g. a future `openai.gpt-5.40`).
+fn uses_openai_mantle_path(model: &str) -> bool {
+    ["openai.gpt-5.4", "openai.gpt-5.5"]
+        .iter()
+        .any(|base| match model.strip_prefix(base) {
+            Some(rest) => rest.is_empty() || rest.starts_with('-'),
+            None => false,
+        })
+}
+
+/// Resolve the Mantle base URL for a specific model: the shared `.../v1` base
+/// for most models, rewritten to `.../openai/v1` for the families that require
+/// the dedicated path. Falls back to the base unchanged if it lacks the
+/// expected `/v1` suffix so an unusual override can never produce a broken URL.
+fn mantle_base_url_for_model(base: &str, model: &str) -> String {
+    let base = base.trim_end_matches('/');
+    match base.strip_suffix("/v1") {
+        Some(prefix) if uses_openai_mantle_path(model) => format!("{prefix}/openai/v1"),
+        _ => base.to_string(),
+    }
 }
 
 fn mantle_base_url(region: &str) -> String {
@@ -2014,8 +2043,80 @@ mod tests {
         assert_eq!(adaptive_hits.load(Ordering::SeqCst), 2);
     }
 
+    #[test]
+    fn gpt5_families_use_dedicated_openai_mantle_path() {
+        // gpt-5.4 / gpt-5.5 and their suffixed derivatives route to /openai/v1.
+        assert!(uses_openai_mantle_path("openai.gpt-5.4"));
+        assert!(uses_openai_mantle_path("openai.gpt-5.5"));
+        assert!(uses_openai_mantle_path("openai.gpt-5.5-codex"));
+        assert!(uses_openai_mantle_path("openai.gpt-5.4-2026-01-01"));
+        // Other Mantle models -- including a hypothetical id that merely shares
+        // the numeric prefix -- stay on the shared /v1 path.
+        assert!(!uses_openai_mantle_path("openai.gpt-oss-120b"));
+        assert!(!uses_openai_mantle_path("openai.gpt-5.40"));
+        assert!(!uses_openai_mantle_path("openai.gpt-5.3"));
+
+        let base = "https://bedrock-mantle.us-east-2.api.aws/v1";
+        assert_eq!(
+            mantle_base_url_for_model(base, "openai.gpt-5.5"),
+            "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
+        );
+        assert_eq!(mantle_base_url_for_model(base, "openai.gpt-oss-120b"), base);
+        // A base without the expected /v1 suffix is returned unchanged.
+        let odd = "https://example.test/custom";
+        assert_eq!(mantle_base_url_for_model(odd, "openai.gpt-5.5"), odd);
+    }
+
     #[tokio::test]
-    async fn responses_models_route_to_mantle_responses() {
+    async fn gpt5_responses_models_route_to_openai_mantle_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "openai.gpt-5.5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("responses request should succeed");
+        match response {
+            LlmResponse::Text { text, usage } => {
+                assert_eq!(text, "ok");
+                assert_eq!(usage.input_tokens, 3);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn other_responses_models_use_shared_mantle_path() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -2041,7 +2142,7 @@ mod tests {
         );
         let response = client
             .stream_chat(StreamChatRequest {
-                model: "openai.gpt-5.4".to_string(),
+                model: "openai.gpt-oss-120b".to_string(),
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: None,
