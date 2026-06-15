@@ -1312,8 +1312,12 @@ pub async fn run_agent(
                         .await
                         .unwrap_or_default();
                     let cost_usd = sessions_prompt.exact_usage_cost_usd(&session_id).await;
-                    let credits = fetch_openrouter_credits_for_usage(&snap.model).await;
-                    let report = render_usage_report(&snap, usage, cost_usd, credits);
+                    let (credits, codex_usage) = tokio::join!(
+                        fetch_openrouter_credits_for_usage(&snap.model),
+                        fetch_codex_credits_for_usage(&snap.model),
+                    );
+                    let report =
+                        render_usage_report(&snap, usage, cost_usd, credits, codex_usage);
                     send_message(&cx, &session_id, &report);
                     return responder.respond(prompt_end_turn_response());
                 }
@@ -2216,11 +2220,14 @@ async fn run_loop_iteration(
             .await
             .unwrap_or_default();
         let cost_usd = sessions.exact_usage_cost_usd(session_id).await;
-        let credits = fetch_openrouter_credits_for_usage(&snap.model).await;
+        let (credits, codex_usage) = tokio::join!(
+            fetch_openrouter_credits_for_usage(&snap.model),
+            fetch_codex_credits_for_usage(&snap.model),
+        );
         send_message(
             cx,
             session_id,
-            &render_usage_report(&snap, usage, cost_usd, credits),
+            &render_usage_report(&snap, usage, cost_usd, credits, codex_usage),
         );
         return Ok(LoopIterationOutcome::without_usage());
     }
@@ -5317,6 +5324,19 @@ enum OpenRouterCreditsOutcome {
     Failed(String),
 }
 
+/// Outcome of the ChatGPT `wham/usage` lookup performed by `/usage`.
+/// Same 3-state shape as `OpenRouterCreditsOutcome` -- in practice
+/// only one of the two ever returns `Fetched` since the lookup is
+/// gated on the active model, but the user might still have stale
+/// credentials lying around for the other provider so each side
+/// surfaces its own diagnostic.
+#[derive(Debug, Clone)]
+enum CodexCreditsOutcome {
+    Skipped,
+    Fetched(crate::codex_credits::CodexUsage),
+    Failed(String),
+}
+
 /// Run the `/credits` lookup only when it makes sense:
 /// - The active model is an OpenRouter one (`openrouter::<id>`), so the
 ///   balance is relevant to the bill the user is racking up right now;
@@ -5341,6 +5361,65 @@ async fn fetch_openrouter_credits_for_usage(model_wire_id: &str) -> OpenRouterCr
     }
 }
 
+/// Run the Codex `wham/usage` lookup only when:
+/// - The active model is a Codex one (`codex::<id>`), so the credits
+///   are relevant to the bill the user is racking up right now; AND
+/// - The on-disk `auth.json` is in `chatgpt` mode (api-key mode means
+///   spend goes through the OpenAI billing dashboard, not the ChatGPT
+///   subscription credits this endpoint reports).
+///
+/// Returns `Skipped` for any other configuration so the report stays
+/// quiet on non-Codex sessions instead of dragging in an irrelevant
+/// network call.
+async fn fetch_codex_credits_for_usage(model_wire_id: &str) -> CodexCreditsOutcome {
+    let active_source = split_wire_id(model_wire_id).map(|(src, _)| src);
+    if active_source != Some(ModelSource::Codex) {
+        return CodexCreditsOutcome::Skipped;
+    }
+    match crate::codex_credits::fetch().await {
+        Ok(Some(usage)) => CodexCreditsOutcome::Fetched(usage),
+        Ok(None) => CodexCreditsOutcome::Skipped,
+        Err(e) => CodexCreditsOutcome::Failed(format!("{e:#}")),
+    }
+}
+
+/// Capitalize a plan slug for human display. The wire form is
+/// snake_case (`"free_workspace"`, `"self_serve_business_usage_based"`)
+/// which reads poorly inline; we replace underscores with spaces and
+/// title-case each word. Unknown slugs pass through unchanged because
+/// the server may add new plan tokens we haven't seen.
+fn humanize_plan_type(plan: &str) -> String {
+    plan.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render `reset_after_seconds` as a short human-friendly string.
+/// Returns `"soon"` for sub-minute values to avoid a noisy "0m" line.
+fn format_reset_after(seconds: i32) -> String {
+    if seconds <= 60 {
+        return "soon".to_string();
+    }
+    let total = seconds as u64;
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 /// `/usage` body: session token totals + USD cost + (for OpenRouter
 /// sessions) the live credit balance. Kept pure so it's unit-testable
 /// without standing up a session store or a mock HTTP server -- the
@@ -5351,6 +5430,7 @@ fn render_usage_report(
     usage: crate::llm_client::TokenUsage,
     cost_usd: Option<f64>,
     openrouter_credits: OpenRouterCreditsOutcome,
+    codex_credits: CodexCreditsOutcome,
 ) -> String {
     let (model_display, source_display) = match split_wire_id(&snap.model) {
         Some((source, bare)) => (bare.to_string(), source.as_str().to_string()),
@@ -5407,6 +5487,63 @@ fn render_usage_report(
             } else {
                 out.push_str(
                     "- OpenRouter balance: not applicable (active model is not OpenRouter)\n",
+                );
+            }
+        }
+    }
+
+    match codex_credits {
+        CodexCreditsOutcome::Fetched(usage) => {
+            let plan = usage
+                .plan_type
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(humanize_plan_type)
+                .unwrap_or_else(|| "Unknown".to_string());
+            out.push_str(&format!("- ChatGPT plan: {plan}\n"));
+            match usage.credits {
+                Some(c) if c.unlimited => {
+                    out.push_str("- Codex credits: unlimited on this plan\n");
+                }
+                Some(c) if c.has_credits => match c.balance.as_deref() {
+                    Some(balance) if !balance.is_empty() => {
+                        out.push_str(&format!("- Codex credits: ${balance} remaining\n"));
+                    }
+                    _ => out.push_str("- Codex credits: available\n"),
+                },
+                Some(_) => {
+                    out.push_str(
+                        "- Codex credits: depleted (subscription rate-limit still applies)\n",
+                    );
+                }
+                None => {
+                    // No credits block -- typical for Pro/Team plans
+                    // where access is gated by rate-limits rather than
+                    // metered credits. Silent here; the rate-limit
+                    // line below carries the actionable info.
+                }
+            }
+            if let Some(window) = usage.rate_limit.and_then(|r| r.primary_window) {
+                let reset = format_reset_after(window.reset_after_seconds);
+                out.push_str(&format!(
+                    "- Codex rate limit: {}% of primary window used (resets in {reset})\n",
+                    window.used_percent
+                ));
+            }
+        }
+        CodexCreditsOutcome::Failed(msg) => {
+            out.push_str(&format!(
+                "- Codex (ChatGPT) status: lookup failed ({msg})\n"
+            ));
+        }
+        CodexCreditsOutcome::Skipped => {
+            // Only mention Codex on a Codex session -- otherwise stay
+            // quiet so the `/usage` report doesn't grow a line per
+            // unconfigured provider.
+            if split_wire_id(&snap.model).map(|(src, _)| src) == Some(ModelSource::Codex) {
+                out.push_str(
+                    "- Codex (ChatGPT) status: no ChatGPT credentials. Run `/setup codex` \
+                     to authenticate, or set `OPENAI_API_KEY` to bill against the API.\n",
                 );
             }
         }
@@ -6141,6 +6278,7 @@ mod tests {
             usage,
             Some(0.1234),
             OpenRouterCreditsOutcome::Fetched(credits),
+            CodexCreditsOutcome::Skipped,
         );
 
         assert!(report.contains("Model: `anthropic/claude-sonnet-4.5` (openrouter)"));
@@ -6165,6 +6303,7 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Skipped,
         );
         assert!(report.contains("Model: `gpt-5-codex` (codex)"));
         assert!(report.contains("no LLM turns recorded yet this session"));
@@ -6172,6 +6311,11 @@ mod tests {
         // "pricing unavailable" wording.
         assert!(report.contains("$0.0000 USD (no billable turns yet)"));
         assert!(report.contains("not applicable (active model is not OpenRouter)"));
+        // Skipped Codex on a Codex session must surface the actionable
+        // hint, not stay silent -- the user is clearly trying to use
+        // ChatGPT-subscription routing.
+        assert!(report.contains("Codex (ChatGPT) status: no ChatGPT credentials"));
+        assert!(report.contains("/setup codex"));
     }
 
     #[test]
@@ -6182,11 +6326,18 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Skipped,
         );
         // The "no credential" branch must fire for OpenRouter models,
         // distinct from "not applicable" for non-OpenRouter ones.
         assert!(report.contains("no credential configured"));
         assert!(report.contains("/setup openrouter key"));
+        // Skipped Codex on a non-Codex session stays silent so the
+        // report doesn't grow a line per unconfigured provider.
+        assert!(
+            !report.contains("Codex"),
+            "Codex line must be silent on non-Codex session: {report}"
+        );
     }
 
     #[test]
@@ -6197,6 +6348,7 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Failed("HTTP 401: invalid api key".into()),
+            CodexCreditsOutcome::Skipped,
         );
         assert!(report.contains("OpenRouter balance: lookup failed"));
         assert!(report.contains("HTTP 401: invalid api key"));
@@ -6213,7 +6365,13 @@ mod tests {
         // cost_usd = None *with* non-zero usage means at least one turn
         // ran without pricing metadata. Distinct from the no-LLM-yet
         // wording (covered above).
-        let report = render_usage_report(&snap, usage, None, OpenRouterCreditsOutcome::Skipped);
+        let report = render_usage_report(
+            &snap,
+            usage,
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Skipped,
+        );
         assert!(report.contains("Session cost: unavailable"));
         assert!(report.contains("at least one turn lacked pricing metadata"));
     }
@@ -6228,9 +6386,108 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Skipped,
         );
         assert!(report.contains("Model: `llama3:latest` ((unknown))"));
         assert!(report.contains("not applicable"));
+    }
+
+    #[test]
+    fn render_usage_report_shows_codex_metered_credits() {
+        let snap = usage_snapshot("codex::gpt-5-codex");
+        let usage = crate::codex_credits::CodexUsage {
+            plan_type: Some("plus".to_string()),
+            credits: Some(crate::codex_credits::CreditStatus {
+                has_credits: true,
+                unlimited: false,
+                balance: Some("12.50".to_string()),
+            }),
+            rate_limit: Some(crate::codex_credits::RateLimitStatus {
+                primary_window: Some(crate::codex_credits::RateLimitWindow {
+                    used_percent: 42,
+                    reset_after_seconds: 7_200,
+                }),
+            }),
+        };
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Fetched(usage),
+        );
+        assert!(report.contains("ChatGPT plan: Plus"));
+        assert!(report.contains("Codex credits: $12.50 remaining"));
+        assert!(report.contains("Codex rate limit: 42% of primary window used"));
+        assert!(report.contains("resets in 2h 0m"));
+    }
+
+    #[test]
+    fn render_usage_report_shows_codex_unlimited_plan() {
+        let snap = usage_snapshot("codex::gpt-5-codex");
+        let usage = crate::codex_credits::CodexUsage {
+            plan_type: Some("pro".to_string()),
+            credits: Some(crate::codex_credits::CreditStatus {
+                has_credits: true,
+                unlimited: true,
+                balance: None,
+            }),
+            rate_limit: None,
+        };
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Fetched(usage),
+        );
+        assert!(report.contains("ChatGPT plan: Pro"));
+        assert!(report.contains("Codex credits: unlimited on this plan"));
+        // No rate-limit info on the wire -> renderer omits the line
+        // rather than guessing.
+        assert!(!report.contains("Codex rate limit"));
+    }
+
+    #[test]
+    fn render_usage_report_codex_failure_includes_diagnostic() {
+        let snap = usage_snapshot("codex::gpt-5-codex");
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::Failed(
+                "chatgpt /wham/usage returned HTTP 401: invalid_token".into(),
+            ),
+        );
+        assert!(report.contains("Codex (ChatGPT) status: lookup failed"));
+        assert!(report.contains("HTTP 401"));
+        // The actual bearer token must never appear in the failure
+        // line -- we only echo upstream body excerpts, not local state.
+        assert!(!report.contains("Bearer"));
+    }
+
+    #[test]
+    fn humanize_plan_type_title_cases_known_snakes() {
+        assert_eq!(humanize_plan_type("plus"), "Plus");
+        assert_eq!(humanize_plan_type("free_workspace"), "Free Workspace");
+        assert_eq!(
+            humanize_plan_type("self_serve_business_usage_based"),
+            "Self Serve Business Usage Based"
+        );
+        // Unknown slugs pass through with whatever casing the server sent.
+        assert_eq!(humanize_plan_type("hyperspace"), "Hyperspace");
+    }
+
+    #[test]
+    fn format_reset_after_renders_sane_durations() {
+        assert_eq!(format_reset_after(0), "soon");
+        assert_eq!(format_reset_after(30), "soon");
+        assert_eq!(format_reset_after(60), "soon");
+        assert_eq!(format_reset_after(125), "2m");
+        assert_eq!(format_reset_after(3_600), "1h 0m");
+        assert_eq!(format_reset_after(7_320), "2h 2m");
+        assert_eq!(format_reset_after(90_000), "1d 1h");
     }
 
     #[test]
