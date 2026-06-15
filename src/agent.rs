@@ -533,6 +533,10 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "pr-create",
             "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
         ),
+        AvailableCommand::new(
+            "usage",
+            "Show session token totals, USD cost, and OpenRouter credit balance",
+        ),
     ]
 }
 
@@ -549,6 +553,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
         "compress",
         "mcp",
         "pr-create",
+        "usage",
     ]
     .into_iter()
     .collect()
@@ -1297,6 +1302,18 @@ pub async fn run_agent(
                         .unwrap_or(PermissionMode::Default);
                     let available_models = sessions_prompt.available_model_metadata().await;
                     let report = render_context_report(&snap, permission_mode, &available_models);
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(prompt_end_turn_response());
+                }
+
+                if is_slash_command(&raw_prompt_text, "usage") {
+                    let usage = sessions_prompt
+                        .cumulative_token_usage(&session_id)
+                        .await
+                        .unwrap_or_default();
+                    let cost_usd = sessions_prompt.exact_usage_cost_usd(&session_id).await;
+                    let credits = fetch_openrouter_credits_for_usage(&snap.model).await;
+                    let report = render_usage_report(&snap, usage, cost_usd, credits);
                     send_message(&cx, &session_id, &report);
                     return responder.respond(prompt_end_turn_response());
                 }
@@ -2189,6 +2206,21 @@ async fn run_loop_iteration(
             cx,
             session_id,
             &render_context_report(&snap, permission_mode, &available_models),
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "usage") {
+        let usage = sessions
+            .cumulative_token_usage(session_id)
+            .await
+            .unwrap_or_default();
+        let cost_usd = sessions.exact_usage_cost_usd(session_id).await;
+        let credits = fetch_openrouter_credits_for_usage(&snap.model).await;
+        send_message(
+            cx,
+            session_id,
+            &render_usage_report(&snap, usage, cost_usd, credits),
         );
         return Ok(LoopIterationOutcome::without_usage());
     }
@@ -4780,6 +4812,7 @@ fn loop_target_runs_without_model(target: &str) -> bool {
         || is_slash_command(target, "permissions")
         || is_slash_command(target, "mcp")
         || is_slash_command(target, "pr-create")
+        || is_slash_command(target, "usage")
 }
 
 fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
@@ -5269,6 +5302,118 @@ fn render_context_report(
     out
 }
 
+/// Outcome of the OpenRouter `/credits` lookup performed by `/usage`.
+/// Modelled as a 3-state enum (rather than `Result<Option<...>>`) so
+/// `render_usage_report` can render a distinct line for "no credential
+/// found" vs. "credential found but the upstream call failed" without
+/// the call site re-shaping a nested type.
+#[derive(Debug, Clone)]
+enum OpenRouterCreditsOutcome {
+    /// No credential resolved (no env var, no on-disk file). Either the
+    /// user hasn't logged in, or the active model isn't an OpenRouter
+    /// one and we deliberately skipped the lookup.
+    Skipped,
+    Fetched(crate::openrouter_credits::Credits),
+    Failed(String),
+}
+
+/// Run the `/credits` lookup only when it makes sense:
+/// - The active model is an OpenRouter one (`openrouter::<id>`), so the
+///   balance is relevant to the bill the user is racking up right now;
+///   AND
+/// - A credential is resolvable via env or on-disk file (same
+///   precedence as `build_openrouter_backend`).
+///
+/// Returns `Skipped` for any other configuration so the report stays
+/// quiet on non-OpenRouter sessions instead of dragging in an
+/// irrelevant network call.
+async fn fetch_openrouter_credits_for_usage(model_wire_id: &str) -> OpenRouterCreditsOutcome {
+    let active_source = split_wire_id(model_wire_id).map(|(src, _)| src);
+    if active_source != Some(ModelSource::OpenRouter) {
+        return OpenRouterCreditsOutcome::Skipped;
+    }
+    let Some(key) = crate::openrouter_credits::active_api_key() else {
+        return OpenRouterCreditsOutcome::Skipped;
+    };
+    match crate::openrouter_credits::fetch(&key).await {
+        Ok(credits) => OpenRouterCreditsOutcome::Fetched(credits),
+        Err(e) => OpenRouterCreditsOutcome::Failed(format!("{e:#}")),
+    }
+}
+
+/// `/usage` body: session token totals + USD cost + (for OpenRouter
+/// sessions) the live credit balance. Kept pure so it's unit-testable
+/// without standing up a session store or a mock HTTP server -- the
+/// network call sits in `fetch_openrouter_credits_for_usage` above and
+/// is invoked by the slash dispatch sites.
+fn render_usage_report(
+    snap: &crate::session::SessionSnapshot,
+    usage: crate::llm_client::TokenUsage,
+    cost_usd: Option<f64>,
+    openrouter_credits: OpenRouterCreditsOutcome,
+) -> String {
+    let (model_display, source_display) = match split_wire_id(&snap.model) {
+        Some((source, bare)) => (bare.to_string(), source.as_str().to_string()),
+        None if snap.model.is_empty() => ("(none)".to_string(), "(unset)".to_string()),
+        None => (snap.model.clone(), "(unknown)".to_string()),
+    };
+
+    let mut out = String::new();
+    out.push_str("**Session usage**\n\n");
+    out.push_str(&format!("- Model: `{model_display}` ({source_display})\n"));
+    if usage.is_zero() {
+        out.push_str("- Tokens: no LLM turns recorded yet this session\n");
+    } else {
+        out.push_str(&format!(
+            "- Tokens: {} total (input {}, output {}, reasoning {}, cached read {}, cached write {})\n",
+            usage.total_tokens(),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.thought_tokens,
+            usage.cached_read_tokens,
+            usage.cached_write_tokens,
+        ));
+    }
+    match cost_usd {
+        Some(amount) => out.push_str(&format!("- Session cost: ${amount:.4} USD\n")),
+        None if usage.is_zero() => {
+            out.push_str("- Session cost: $0.0000 USD (no billable turns yet)\n")
+        }
+        None => out
+            .push_str("- Session cost: unavailable (at least one turn lacked pricing metadata)\n"),
+    }
+
+    match openrouter_credits {
+        OpenRouterCreditsOutcome::Fetched(credits) => {
+            out.push_str(&format!(
+                "- OpenRouter balance: ${:.4} remaining (${:.4} purchased − ${:.4} used)\n",
+                credits.balance(),
+                credits.total_credits,
+                credits.total_usage,
+            ));
+        }
+        OpenRouterCreditsOutcome::Failed(msg) => {
+            out.push_str(&format!("- OpenRouter balance: lookup failed ({msg})\n"));
+        }
+        OpenRouterCreditsOutcome::Skipped => {
+            // Two distinct skip reasons, distinguished by inspecting
+            // the active model id. We keep the message short and
+            // actionable rather than dumping internal state.
+            if split_wire_id(&snap.model).map(|(src, _)| src) == Some(ModelSource::OpenRouter) {
+                out.push_str(
+                    "- OpenRouter balance: no credential configured. Set \
+                     OPENROUTER_API_KEY or run `/setup openrouter key <key>`.\n",
+                );
+            } else {
+                out.push_str(
+                    "- OpenRouter balance: not applicable (active model is not OpenRouter)\n",
+                );
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5492,6 +5637,28 @@ mod tests {
         assert!(
             builtin_command_names().contains("loop"),
             "builtin_command_names() missing loop"
+        );
+    }
+
+    /// `/usage` must surface in autocomplete and the collision set
+    /// (so a skill named "usage" can't shadow it) and must be allowed
+    /// as a `/loop` target without a configured model (the report is
+    /// generated locally and doesn't need an LLM round-trip).
+    #[test]
+    fn builtin_commands_include_usage() {
+        let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "usage"),
+            "builtin_commands() missing usage; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            builtin_command_names().contains("usage"),
+            "builtin_command_names() missing usage"
+        );
+        assert!(
+            loop_target_runs_without_model("/usage"),
+            "/usage must be runnable in a /loop without a configured model"
         );
     }
 
@@ -5942,6 +6109,130 @@ mod tests {
         assert!(report.contains("model max unknown"));
     }
 
+    fn usage_snapshot(model: &str) -> crate::session::SessionSnapshot {
+        crate::session::SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: model.into(),
+            history: vec![],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        }
+    }
+
+    #[test]
+    fn render_usage_report_with_openrouter_balance_shows_all_lines() {
+        let snap = usage_snapshot("openrouter::anthropic/claude-sonnet-4.5");
+        let usage = crate::llm_client::TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            thought_tokens: 200,
+            cached_read_tokens: 50,
+            cached_write_tokens: 25,
+        };
+        let credits = crate::openrouter_credits::Credits {
+            total_credits: 50.0,
+            total_usage: 7.5,
+        };
+        let report = render_usage_report(
+            &snap,
+            usage,
+            Some(0.1234),
+            OpenRouterCreditsOutcome::Fetched(credits),
+        );
+
+        assert!(report.contains("Model: `anthropic/claude-sonnet-4.5` (openrouter)"));
+        // 1000+500+200+50+25 = 1775 across the five buckets.
+        assert!(report.contains("1775 total"));
+        assert!(report.contains("input 1000"));
+        assert!(report.contains("reasoning 200"));
+        assert!(report.contains("Session cost: $0.1234 USD"));
+        assert!(
+            report.contains("$42.5000 remaining"),
+            "expected balance line in: {report}"
+        );
+        assert!(report.contains("$50.0000 purchased"));
+        assert!(report.contains("$7.5000 used"));
+    }
+
+    #[test]
+    fn render_usage_report_skips_openrouter_when_model_is_codex() {
+        let snap = usage_snapshot("codex::gpt-5-codex");
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+        );
+        assert!(report.contains("Model: `gpt-5-codex` (codex)"));
+        assert!(report.contains("no LLM turns recorded yet this session"));
+        // No billable turns yet should show $0 rather than the
+        // "pricing unavailable" wording.
+        assert!(report.contains("$0.0000 USD (no billable turns yet)"));
+        assert!(report.contains("not applicable (active model is not OpenRouter)"));
+    }
+
+    #[test]
+    fn render_usage_report_distinguishes_no_credential_for_openrouter_model() {
+        let snap = usage_snapshot("openrouter::openai/gpt-4o");
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+        );
+        // The "no credential" branch must fire for OpenRouter models,
+        // distinct from "not applicable" for non-OpenRouter ones.
+        assert!(report.contains("no credential configured"));
+        assert!(report.contains("/setup openrouter key"));
+    }
+
+    #[test]
+    fn render_usage_report_surfaces_upstream_failure() {
+        let snap = usage_snapshot("openrouter::openai/gpt-4o");
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Failed("HTTP 401: invalid api key".into()),
+        );
+        assert!(report.contains("OpenRouter balance: lookup failed"));
+        assert!(report.contains("HTTP 401: invalid api key"));
+    }
+
+    #[test]
+    fn render_usage_report_marks_partial_pricing_as_unavailable() {
+        let snap = usage_snapshot("openrouter::openai/gpt-4o");
+        let usage = crate::llm_client::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        // cost_usd = None *with* non-zero usage means at least one turn
+        // ran without pricing metadata. Distinct from the no-LLM-yet
+        // wording (covered above).
+        let report = render_usage_report(&snap, usage, None, OpenRouterCreditsOutcome::Skipped);
+        assert!(report.contains("Session cost: unavailable"));
+        assert!(report.contains("at least one turn lacked pricing metadata"));
+    }
+
+    #[test]
+    fn render_usage_report_handles_bare_model_id_without_panic() {
+        // A bare id (no `source::` prefix) is legal on the wire when
+        // the user typed a default model that routes to a backend.
+        let snap = usage_snapshot("llama3:latest");
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+        );
+        assert!(report.contains("Model: `llama3:latest` ((unknown))"));
+        assert!(report.contains("not applicable"));
+    }
+
     #[test]
     fn session_usage_update_reports_replayed_prompt_tokens() {
         use crate::llm_client::ModelMetadata;
@@ -6384,6 +6675,7 @@ mod tests {
                 "compress",
                 "mcp",
                 "pr-create",
+                "usage",
                 "apple",
                 "zebra"
             ]

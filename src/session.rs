@@ -3099,6 +3099,16 @@ impl SessionStore {
             .and_then(|session| session.usage_cost.exact_usd())
     }
 
+    /// Cumulative provider-reported token usage for a live session.
+    /// `None` only when the session id is unknown -- a session that
+    /// hasn't issued any LLM turns yet still returns a zero-filled
+    /// `TokenUsage`. Used by `/usage` so the report can show the same
+    /// numbers `PromptResponse.usage` carries.
+    pub async fn cumulative_token_usage(&self, id: &str) -> Option<crate::llm_client::TokenUsage> {
+        let sessions = self.sessions.read().await;
+        sessions.get(id).map(|session| session.usage)
+    }
+
     /// Update the session's behavior mode and persist the new manifest.
     ///
     /// Returns `Ok(true)` on success, `Ok(false)` if the session is unknown
