@@ -1,8 +1,12 @@
 use super::sandbox::{self, ENV_WHITELIST, SandboxPolicy};
 use super::{ToolResult, ToolStatus};
+use std::io;
 use std::path::Path;
+use std::process::ExitStatus;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
 const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
@@ -312,12 +316,13 @@ where
     }
 }
 
-pub async fn run_shell_command(
+pub async fn run_shell_command_cancellable(
     cwd: &Path,
     command: &str,
     timeout_seconds: u64,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
+    cancel: Option<&CancellationToken>,
 ) -> ToolResult {
     if command.trim().is_empty() {
         return ToolResult {
@@ -415,7 +420,22 @@ pub async fn run_shell_command(
         }
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), cmd.output()).await;
+    #[cfg(unix)]
+    {
+        // Give each shell command its own process group so cancellation and
+        // timeout can kill descendants that outlive the shell wrapper.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+
+    let result = run_child_to_completion(cmd, timeout_seconds, cancel).await;
 
     // `wrapped` MUST stay in scope until output() resolves so the
     // TempPolicyFile Drop guard doesn't yank `sandbox-exec`'s `-f` profile
@@ -424,15 +444,19 @@ pub async fn run_shell_command(
     drop(wrapped);
 
     match result {
-        Ok(Ok(output)) => {
+        ShellRunResult::Completed {
+            status,
+            stdout,
+            stderr,
+        } => {
             let mut combined = String::new();
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&stdout);
             if !stdout.is_empty() {
                 combined.push_str(&stdout);
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&stderr);
             if !stderr.is_empty() {
                 if !combined.is_empty() {
                     combined.push_str("\n--- stderr ---\n");
@@ -440,8 +464,8 @@ pub async fn run_shell_command(
                 combined.push_str(&stderr);
             }
 
-            let exit_code = output.status.code().unwrap_or(-1);
-            if !output.status.success() {
+            let exit_code = status.code().unwrap_or(-1);
+            if !status.success() {
                 combined.push_str(&format!("\n\nExit code: {exit_code}"));
                 #[cfg(unix)]
                 if exit_code == 127 {
@@ -468,7 +492,7 @@ pub async fn run_shell_command(
             }
 
             ToolResult {
-                status: if output.status.success() {
+                status: if status.success() {
                     ToolStatus::Success
                 } else {
                     ToolStatus::RequestError
@@ -476,12 +500,26 @@ pub async fn run_shell_command(
                 output: combined,
             }
         }
-        Ok(Err(e)) => ToolResult {
+        ShellRunResult::FailedToExecute(e) => ToolResult {
             status: ToolStatus::InternalError,
             output: format!("Failed to execute command: {e}"),
         },
-        Err(_) => {
+        ShellRunResult::TimedOut => {
             let mut msg = format!("Command timed out after {timeout_seconds}s");
+            if outside_sandbox_once {
+                msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
+            }
+            if bypass_warning {
+                msg.push('\n');
+                msg.push_str(SANDBOX_BYPASS_WARNING);
+            }
+            ToolResult {
+                status: ToolStatus::RequestError,
+                output: msg,
+            }
+        }
+        ShellRunResult::Cancelled => {
+            let mut msg = "Command cancelled before it completed".to_string();
             if outside_sandbox_once {
                 msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
             }
@@ -497,6 +535,128 @@ pub async fn run_shell_command(
     }
 }
 
+enum ShellRunResult {
+    Completed {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    FailedToExecute(io::Error),
+    TimedOut,
+    Cancelled,
+}
+
+async fn run_child_to_completion(
+    mut cmd: Command,
+    timeout_seconds: u64,
+    cancel: Option<&CancellationToken>,
+) -> ShellRunResult {
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => return ShellRunResult::FailedToExecute(error),
+    };
+
+    let stdout_task = tokio::spawn(read_pipe_to_end(child.stdout.take()));
+    let stderr_task = tokio::spawn(read_pipe_to_end(child.stderr.take()));
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_seconds));
+    tokio::pin!(timeout);
+
+    let termination = if let Some(cancel) = cancel {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                terminate_child_tree(&mut child).await;
+                ShellTermination::Cancelled
+            }
+            _ = &mut timeout => {
+                terminate_child_tree(&mut child).await;
+                ShellTermination::TimedOut
+            }
+            wait_result = child.wait() => match wait_result {
+                Ok(status) => ShellTermination::Completed(status),
+                Err(error) => ShellTermination::FailedToWait(error),
+            },
+        }
+    } else {
+        tokio::select! {
+            _ = &mut timeout => {
+                terminate_child_tree(&mut child).await;
+                ShellTermination::TimedOut
+            }
+            wait_result = child.wait() => match wait_result {
+                Ok(status) => ShellTermination::Completed(status),
+                Err(error) => ShellTermination::FailedToWait(error),
+            },
+        }
+    };
+
+    match termination {
+        ShellTermination::Completed(status) => ShellRunResult::Completed {
+            status,
+            stdout: join_pipe_output(stdout_task).await,
+            stderr: join_pipe_output(stderr_task).await,
+        },
+        ShellTermination::FailedToWait(error) => ShellRunResult::FailedToExecute(error),
+        ShellTermination::TimedOut => {
+            let _ = join_pipe_output(stdout_task).await;
+            let _ = join_pipe_output(stderr_task).await;
+            ShellRunResult::TimedOut
+        }
+        ShellTermination::Cancelled => {
+            let _ = join_pipe_output(stdout_task).await;
+            let _ = join_pipe_output(stderr_task).await;
+            ShellRunResult::Cancelled
+        }
+    }
+}
+
+async fn terminate_child_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pgid = -(pid as libc::pid_t);
+        // SAFETY: `kill` is called with a negative process-group id that we
+        // created in `pre_exec`; errors just fall through to the child kill
+        // fallback below.
+        let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+
+    let _ = child.kill().await;
+}
+
+enum ShellTermination {
+    Completed(ExitStatus),
+    FailedToWait(io::Error),
+    TimedOut,
+    Cancelled,
+}
+
+async fn read_pipe_to_end<R>(pipe: Option<R>) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = pipe.read_to_end(&mut bytes).await;
+    bytes
+}
+
+async fn join_pipe_output(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    task.await.unwrap_or_default()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -510,7 +670,7 @@ mod tests {
     /// test's setup races against another's `from_env()`.
     ///
     /// `tokio::sync::Mutex` because the guard is held across `await`
-    /// points (the test invokes `run_shell_command(...).await`); a
+    /// points (the test invokes `run_shell_command_cancellable(...).await`); a
     /// `std::sync::Mutex` here would trigger `clippy::await_holding_lock`.
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -633,7 +793,8 @@ mod tests {
             target.display()
         );
 
-        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false).await;
+        let result =
+            run_shell_command_cancellable(&dir, &cmd, 30, SandboxPolicy::None, false, None).await;
         let written = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&target);
 
@@ -666,7 +827,8 @@ mod tests {
             target.display()
         );
 
-        let result = run_shell_command(&dir, &cmd, 30, SandboxPolicy::None, false).await;
+        let result =
+            run_shell_command_cancellable(&dir, &cmd, 30, SandboxPolicy::None, false, None).await;
         let _ = std::fs::remove_file(&target);
 
         assert!(
@@ -684,12 +846,13 @@ mod tests {
     async fn shell_exit_127_appends_brokk_acp_path_hint() {
         let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
-        let result = run_shell_command(
+        let result = run_shell_command_cancellable(
             &dir,
             "nonexistent_brokk_acp_command_xyz_qqq_42",
             30,
             SandboxPolicy::None,
             false,
+            None,
         )
         .await;
         assert!(
@@ -711,8 +874,15 @@ mod tests {
     async fn shell_exit_zero_omits_hint() {
         let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
-        let result =
-            run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None, false).await;
+        let result = run_shell_command_cancellable(
+            &dir,
+            "echo hello-brokk",
+            30,
+            SandboxPolicy::None,
+            false,
+            None,
+        )
+        .await;
         assert!(
             matches!(result.status, ToolStatus::Success),
             "echo must succeed; got: {}",
@@ -729,8 +899,15 @@ mod tests {
     async fn explicit_outside_sandbox_once_adds_audit_notice() {
         let _guard = ENV_LOCK.lock().await;
         let dir = std::env::temp_dir();
-        let result =
-            run_shell_command(&dir, "echo hello-brokk", 30, SandboxPolicy::None, true).await;
+        let result = run_shell_command_cancellable(
+            &dir,
+            "echo hello-brokk",
+            30,
+            SandboxPolicy::None,
+            true,
+            None,
+        )
+        .await;
         assert!(
             result.output.starts_with(EXPLICIT_OUTSIDE_SANDBOX_NOTICE),
             "explicit outside-sandbox runs must prefix an audit notice; got: {}",

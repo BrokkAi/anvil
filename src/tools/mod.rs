@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Result of executing a tool.
 pub struct ToolResult {
@@ -24,6 +25,13 @@ pub enum ToolStatus {
     Success,
     RequestError,
     InternalError,
+}
+
+fn cancelled_tool_result(name: &str) -> ToolResult {
+    ToolResult {
+        status: ToolStatus::RequestError,
+        output: format!("Tool '{name}' was cancelled before it completed."),
+    }
 }
 
 /// Single source of truth for per-tool metadata (`ToolKind` for the
@@ -710,6 +718,66 @@ impl ToolRegistry {
         outside_sandbox_once: bool,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     ) -> ToolResult {
+        self.execute_with_sandbox_mode_cancellable(
+            name,
+            args,
+            policy,
+            outside_sandbox_once,
+            sandbox_mode,
+            None,
+        )
+        .await
+    }
+
+    /// Same as `execute_with_sandbox_mode`, but returns promptly when the
+    /// session cancellation token fires. Shell calls receive the token so
+    /// they can terminate their child process tree instead of waiting for
+    /// the wall-clock timeout.
+    pub(crate) async fn execute_with_sandbox_mode_cancellable(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        policy: SandboxPolicy,
+        outside_sandbox_once: bool,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolResult {
+        if let Some(cancel) = cancel
+            && cancel.is_cancelled()
+        {
+            return cancelled_tool_result(name);
+        }
+
+        let execute = self.execute_with_sandbox_mode_inner(
+            name,
+            args,
+            policy,
+            outside_sandbox_once,
+            sandbox_mode,
+            cancel,
+        );
+        if let Some(cancel) = cancel
+            && name != "run_shell_command"
+        {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => cancelled_tool_result(name),
+                result = execute => result,
+            }
+        } else {
+            execute.await
+        }
+    }
+
+    async fn execute_with_sandbox_mode_inner(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        policy: SandboxPolicy,
+        outside_sandbox_once: bool,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolResult {
         match name {
             "read_file" => {
                 let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -790,12 +858,13 @@ impl ToolRegistry {
                     }
                     _ => self.cwd.clone(),
                 };
-                shell::run_shell_command(
+                shell::run_shell_command_cancellable(
                     &command_cwd,
                     command,
                     timeout_seconds,
                     policy,
                     outside_sandbox_once,
+                    cancel,
                 )
                 .await
             }
@@ -1469,6 +1538,51 @@ mod tests {
             result.output
         );
         assert_eq!(result.output.trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shell_tool_returns_promptly_on_cancellation() {
+        let registry = registry_with_skills(vec![]);
+        let cancel = CancellationToken::new();
+        let cancel_from_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_from_task.cancel();
+        });
+
+        #[cfg(target_os = "windows")]
+        let command = "ping 127.0.0.1 -n 30 > nul";
+        #[cfg(not(target_os = "windows"))]
+        let command = "sleep 30";
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry.execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": command, "timeout": 30_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancelled shell command should return before the test timeout");
+
+        assert!(
+            matches!(result.status, ToolStatus::RequestError),
+            "cancelled shell command should report a request error"
+        );
+        assert!(
+            result.output.contains("cancelled"),
+            "cancelled shell command should explain cancellation; output={}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancelled shell command waited too long"
+        );
     }
 
     /// `task` is gated on having at least one discovered subagent.
