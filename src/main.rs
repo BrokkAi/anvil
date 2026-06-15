@@ -12,6 +12,7 @@ mod bedrock_auth;
 mod bedrock_client;
 mod codex_auth;
 mod codex_client;
+mod codex_credits;
 mod context_manager;
 mod discovery;
 mod http_retry;
