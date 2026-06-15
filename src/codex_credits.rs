@@ -148,10 +148,13 @@ pub fn auth_status() -> Result<AuthStatus> {
 
 /// Short-timeout HTTP client tuned for the `/usage` slash command: the
 /// user is staring at the prompt waiting for the report, so we'd rather
-/// fail in a few seconds than block on a stuck TLS handshake. The
-/// cookie jar matches `CodexClient`'s posture -- the ChatGPT backend
-/// sits behind Cloudflare's bot manager, which gets unhappy when we
-/// drop the `__cf_bm` cookie it sets on the first response.
+/// fail in a few seconds than block on a stuck TLS handshake. The 5s
+/// `timeout` is the total request budget (connect + response);
+/// `connect_timeout` is the tighter inner cap so a stuck handshake
+/// fails fast without burning the full window. The cookie jar matches
+/// `CodexClient`'s posture -- the ChatGPT backend sits behind
+/// Cloudflare's bot manager, which gets unhappy when we drop the
+/// `__cf_bm` cookie it sets on the first response.
 fn credits_http_client() -> Result<reqwest::Client> {
     let user_agent = format!(
         "{ORIGINATOR}/{ver} (brokk-acp; {os})",
@@ -160,7 +163,7 @@ fn credits_http_client() -> Result<reqwest::Client> {
     );
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(5))
         .cookie_store(true)
         .user_agent(user_agent)
         .build()
@@ -346,6 +349,44 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(usage.plan_type.as_deref(), Some("experimental_new_tier"));
+    }
+
+    /// A slow upstream must NOT hang the `/usage` slash command for the
+    /// 30+ seconds reqwest waits by default -- the `credits_http_client`
+    /// caps the request at 5s so a stuck Cloudflare/ChatGPT response
+    /// fails fast and the renderer can show a "lookup failed" line
+    /// instead of leaving the user staring at a blank prompt.
+    /// Regression test for the original /usage hang where the client
+    /// had no enforced wall-clock budget.
+    #[tokio::test]
+    async fn credits_http_client_enforces_total_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let http = credits_http_client().expect("client builds");
+        let url = format!("{}/wham/usage", server.uri());
+        let start = std::time::Instant::now();
+        let err = fetch_with(&http, &url, &mock_credentials())
+            .await
+            .expect_err("must time out before the 30s server delay");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "timeout took too long: {elapsed:?}; client budget is meant to be ~5s"
+        );
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout"),
+            "expected timeout wording in: {msg}"
+        );
     }
 
     /// Non-2xx responses surface the status and a short body excerpt so

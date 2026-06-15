@@ -5343,6 +5343,16 @@ enum CodexCreditsOutcome {
     Failed(String),
 }
 
+/// Hard wall-clock ceiling for each `/usage` credits fetch. The inner
+/// reqwest client already has a 5s request budget, but `codex_credits`
+/// runs `refresh_if_stale` first against a *different* client that has
+/// no timeout configured -- without an outer cancel the slash command
+/// can hang on a stuck token refresh for as long as the OS waits on a
+/// dead TCP connection. Sized to match the inner request budget so a
+/// clean reqwest error normally surfaces first; the outer timeout only
+/// fires when something upstream of the credits request itself stalls.
+const USAGE_CREDITS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Run the `/credits` lookup only when it makes sense:
 /// - The active model is an OpenRouter one (`openrouter::<id>`), so the
 ///   balance is relevant to the bill the user is racking up right now;
@@ -5361,9 +5371,18 @@ async fn fetch_openrouter_credits_for_usage(model_wire_id: &str) -> OpenRouterCr
     let Some(key) = crate::openrouter_credits::active_api_key() else {
         return OpenRouterCreditsOutcome::Skipped;
     };
-    match crate::openrouter_credits::fetch(&key).await {
-        Ok(credits) => OpenRouterCreditsOutcome::Fetched(credits),
-        Err(e) => OpenRouterCreditsOutcome::Failed(format!("{e:#}")),
+    match tokio::time::timeout(
+        USAGE_CREDITS_FETCH_TIMEOUT,
+        crate::openrouter_credits::fetch(&key),
+    )
+    .await
+    {
+        Ok(Ok(credits)) => OpenRouterCreditsOutcome::Fetched(credits),
+        Ok(Err(e)) => OpenRouterCreditsOutcome::Failed(format!("{e:#}")),
+        Err(_) => OpenRouterCreditsOutcome::Failed(format!(
+            "timed out after {}s",
+            USAGE_CREDITS_FETCH_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -5391,14 +5410,18 @@ async fn fetch_codex_credits_for_usage(model_wire_id: &str) -> CodexCreditsOutco
         Ok(crate::codex_credits::AuthStatus::ChatGptMode) => {}
         Err(e) => return CodexCreditsOutcome::Failed(format!("{e:#}")),
     }
-    match crate::codex_credits::fetch().await {
-        Ok(Some(usage)) => CodexCreditsOutcome::Fetched(usage),
+    match tokio::time::timeout(USAGE_CREDITS_FETCH_TIMEOUT, crate::codex_credits::fetch()).await {
+        Ok(Ok(Some(usage))) => CodexCreditsOutcome::Fetched(usage),
         // `fetch` only returns Ok(None) for the same conditions
         // `auth_status` already classified, but auth.json could have
         // been deleted between the two calls. Treat as no-auth in
         // that race.
-        Ok(None) => CodexCreditsOutcome::NoAuth,
-        Err(e) => CodexCreditsOutcome::Failed(format!("{e:#}")),
+        Ok(Ok(None)) => CodexCreditsOutcome::NoAuth,
+        Ok(Err(e)) => CodexCreditsOutcome::Failed(format!("{e:#}")),
+        Err(_) => CodexCreditsOutcome::Failed(format!(
+            "timed out after {}s",
+            USAGE_CREDITS_FETCH_TIMEOUT.as_secs()
+        )),
     }
 }
 
