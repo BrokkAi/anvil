@@ -1,4 +1,4 @@
-//! `GET chatgpt.com/backend-api/codex/wham/usage` query for the `/usage`
+//! `GET chatgpt.com/backend-api/wham/usage` query for the `/usage`
 //! slash command.
 //!
 //! Surfaces the same numbers Codex CLI shows in `/status`: which
@@ -27,7 +27,7 @@ use crate::llm_client::OpenAiClient;
 /// Endpoint Codex CLI hits for plan + rate-limit info. Spelled out
 /// rather than concatenated from a shared base so the URL is greppable
 /// verbatim alongside `codex_client::CHATGPT_RESPONSES_URL`.
-const CHATGPT_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/wham/usage";
+const CHATGPT_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Originator header Codex CLI sends. The server gates ChatGPT-
 /// subscription usage on this identity (alongside the OAuth token) so
