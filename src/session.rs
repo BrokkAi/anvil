@@ -826,11 +826,6 @@ pub struct SessionSnapshot {
     /// Agent Skills (`SKILL.md`) discovered for this session. Wrapped
     /// in `Arc` so cloning the snapshot doesn't copy the registry.
     pub skills: Arc<crate::skills::SkillRegistry>,
-    /// When `true`, the system prompt is framed as a general-purpose
-    /// assistant (still expert at coding) rather than a coding-only
-    /// assistant. Driven by the `--general` CLI flag and constant for
-    /// the lifetime of the server.
-    pub general_scope: bool,
 }
 
 /// Human-readable session metadata for ACP notifications and lists.
@@ -2160,10 +2155,6 @@ pub struct SessionStore {
     last_accessed: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     next_access: Arc<AtomicU64>,
     limits: SessionLimits,
-    /// `--general` flag from the CLI. Surfaced on every `SessionSnapshot`
-    /// so `build_system_prompt` can swap the coding-only framing for a
-    /// general-purpose one. Set once at startup, never mutated.
-    general_scope: bool,
 }
 
 impl SessionStore {
@@ -2179,14 +2170,13 @@ impl SessionStore {
 
     #[cfg(test)]
     pub fn with_limits(default_model: String, limits: SessionLimits) -> Self {
-        Self::with_limits_and_transient_setup(default_model, limits, false, false)
+        Self::with_limits_and_transient_setup(default_model, limits, false)
     }
 
     pub fn with_limits_and_transient_setup(
         default_model: String,
         limits: SessionLimits,
         transient_setup: bool,
-        general_scope: bool,
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -2203,7 +2193,6 @@ impl SessionStore {
             last_accessed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_access: Arc::new(AtomicU64::new(0)),
             limits,
-            general_scope,
         }
     }
 
@@ -2675,7 +2664,6 @@ impl SessionStore {
             idle_timeout_secs,
             project_instructions,
             skills,
-            general_scope: self.general_scope,
         })
     }
 
@@ -4394,7 +4382,6 @@ mod tests {
             "default-model".to_string(),
             SessionLimits::default(),
             true,
-            false,
         );
         store
             .set_available_models(vec![
