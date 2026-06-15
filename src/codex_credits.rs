@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::codex_auth::{AuthDotJson, read_auth_dot_json, refresh_if_stale};
+use crate::llm_client::OpenAiClient;
 
 /// Endpoint Codex CLI hits for plan + rate-limit info. Spelled out
 /// rather than concatenated from a shared base so the URL is greppable
@@ -161,13 +162,16 @@ fn credits_http_client() -> Result<reqwest::Client> {
         ver = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
     );
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5))
-        .cookie_store(true)
-        .user_agent(user_agent)
-        .build()
-        .context("building ChatGPT credits HTTP client")
+    OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .cookie_store(true)
+            .user_agent(user_agent),
+        CHATGPT_WHAM_USAGE_URL,
+    )
+    .build()
+    .context("building ChatGPT credits HTTP client")
 }
 
 /// Hit the live ChatGPT backend using whatever credentials are in

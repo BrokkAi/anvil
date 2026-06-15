@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::discovery::{OPENROUTER_API_KEY_ENV, OPENROUTER_BASE_URL};
+use crate::llm_client::OpenAiClient;
 
 /// `data` wrapper on the wire; flatten it so callers see plain fields.
 #[derive(Debug, Deserialize)]
@@ -67,11 +68,14 @@ pub fn active_api_key() -> Option<String> {
 /// (connect + response); `connect_timeout` is the tighter inner cap so
 /// a stuck handshake fails fast without burning the full window.
 fn credits_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("building OpenRouter credits HTTP client")
+    OpenAiClient::apply_runtime_tls_workarounds(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5)),
+        OPENROUTER_BASE_URL,
+    )
+    .build()
+    .context("building OpenRouter credits HTTP client")
 }
 
 /// `GET /api/v1/credits` against the live OpenRouter API using `api_key`
