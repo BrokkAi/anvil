@@ -1904,12 +1904,16 @@ pub(crate) async fn run(
                                 );
                                 execute_tool(
                                     registry,
-                                    &tool_name,
-                                    parsed_input.clone(),
-                                    policy,
-                                    outside_sandbox_once,
-                                    sandbox_mode,
-                                    sandbox_policy_override.is_none() && shell_sandboxed,
+                                    ToolExecRequest {
+                                        tool_name: &tool_name,
+                                        args: parsed_input.clone(),
+                                        policy,
+                                        outside_sandbox_once,
+                                        sandbox_mode,
+                                        shell_sandboxed: sandbox_policy_override.is_none()
+                                            && shell_sandboxed,
+                                        cancel: &cancel,
+                                    },
                                 )
                                 .await
                             };
@@ -2716,19 +2720,33 @@ fn maybe_text_navigation_gate(
 /// Run the tool against the registry and format the result for the LLM.
 /// Arg-parse failure is handled in the caller so it can render a Failed
 /// card; this function only sees already-parsed inputs.
-async fn execute_tool(
-    registry: &ToolRegistry,
-    tool_name: &str,
+struct ToolExecRequest<'a> {
+    tool_name: &'a str,
     args: Value,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
-) -> ToolExecution {
+    cancel: &'a CancellationToken,
+}
+
+async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
     let result = registry
-        .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
+        .execute_with_sandbox_mode_cancellable(
+            request.tool_name,
+            request.args,
+            request.policy,
+            request.outside_sandbox_once,
+            request.sandbox_mode,
+            Some(request.cancel),
+        )
         .await;
-    tool_result_to_execution(tool_name, shell_sandboxed, outside_sandbox_once, result)
+    tool_result_to_execution(
+        request.tool_name,
+        request.shell_sandboxed,
+        request.outside_sandbox_once,
+        result,
+    )
 }
 
 fn tool_result_to_execution(

@@ -17,7 +17,19 @@ pub(crate) async fn send_with_retries(
     cancel: Option<&CancellationToken>,
 ) -> Result<reqwest::Response> {
     for attempt in 1..=LLM_MAX_ATTEMPTS {
-        match make_request().send().await {
+        let send = make_request().send();
+        let response = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("{operation} cancelled while sending request");
+                }
+                response = send => response,
+            }
+        } else {
+            send.await
+        };
+        match response {
             Ok(resp) if is_retryable_status(resp.status()) && attempt < LLM_MAX_ATTEMPTS => {
                 let status = resp.status();
                 sleep_before_retry(operation, attempt, format!("HTTP {status}"), cancel).await?;
@@ -81,6 +93,8 @@ pub(crate) fn retry_backoff(attempt: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn backoff_uses_codex_base_delay() {
@@ -110,5 +124,49 @@ mod tests {
     #[test]
     fn shared_attempt_budget_uses_four_total_attempts() {
         assert_eq!(LLM_MAX_ATTEMPTS, 4);
+    }
+
+    #[tokio::test]
+    async fn send_with_retries_honors_cancellation_during_send() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("eventually")
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("build reqwest client");
+        let url = format!("{}/slow", server.uri());
+        let cancel = CancellationToken::new();
+        let cancel_from_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_from_task.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_with_retries("slow HTTP test", || http.get(&url), Some(&cancel)),
+        )
+        .await
+        .expect("cancelled HTTP request should return before test timeout")
+        .expect_err("cancelled HTTP request should fail");
+
+        assert!(
+            format!("{err:#}").contains("cancelled while sending request"),
+            "unexpected cancellation error: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancelled HTTP request waited too long"
+        );
     }
 }
