@@ -132,6 +132,15 @@ fn default_bifrost_args() -> Vec<String> {
         "--root".to_string(),
         "{cwd}".to_string(),
         "--server".to_string(),
+        "core|slopcop".to_string(),
+    ]
+}
+
+fn legacy_core_bifrost_args() -> Vec<String> {
+    vec![
+        "--root".to_string(),
+        "{cwd}".to_string(),
+        "--server".to_string(),
         "core".to_string(),
     ]
 }
@@ -168,7 +177,7 @@ fn is_legacy_or_managed_bifrost_command(command: &str) -> bool {
 /// Normalises a stored Bifrost server entry so it always uses Anvil's managed
 /// local binary with the correct line framing.
 ///
-/// The function matches on name, default args, and a legacy (`"bifrost"`) or
+/// The function matches on name, current-or-legacy default args, and a legacy (`"bifrost"`) or
 /// managed-path command.  When all three match the **entire** `McpServerConfig`
 /// is replaced by [`McpServerConfig::bifrost()`]; only `enabled` is preserved.
 /// Any other customisation (e.g. a manually-set framing override) is
@@ -176,7 +185,11 @@ fn is_legacy_or_managed_bifrost_command(command: &str) -> bool {
 /// the command must point to the pinned managed binary.
 pub fn normalize_preinstalled_bifrost_server(server: &mut McpServerConfig) {
     if server.name != "bifrost"
-        || server.args != default_bifrost_args()
+        || !matches!(
+            server.args.as_slice(),
+            args if args == default_bifrost_args().as_slice()
+                || args == legacy_core_bifrost_args().as_slice()
+        )
         || !is_legacy_or_managed_bifrost_command(&server.command)
     {
         return;
@@ -368,6 +381,12 @@ pub struct McpToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub annotations: McpToolAnnotations,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct McpToolAnnotations {
+    pub read_only_hint: Option<bool>,
 }
 
 /// JSON-RPC client for a long-lived stdio MCP subprocess.
@@ -446,6 +465,10 @@ impl McpClient {
         write_request(&mut io, list_id, "tools/list", json!({})).await?;
         let list = read_response(&mut io, list_id).await?;
         let tools = parse_tool_list(list)?;
+        let read_only_hint_count = tools
+            .iter()
+            .filter(|tool| tool.annotations.read_only_hint == Some(true))
+            .count();
 
         tracing::info!(
             server = %config.name,
@@ -454,6 +477,7 @@ impl McpClient {
             framing = %config.framing.as_str(),
             cwd = %cwd.display(),
             tool_count = tools.len(),
+            read_only_hint_count,
             "mcp server ready"
         );
 
@@ -678,13 +702,24 @@ fn parse_tool_list(result: Value) -> Result<Vec<McpToolDef>, McpError> {
                 .get("inputSchema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object" }));
+            let annotations = parse_tool_annotations(tool.get("annotations"));
             Ok(McpToolDef {
                 name,
                 description,
                 input_schema,
+                annotations,
             })
         })
         .collect()
+}
+
+fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
+    let Some(annotations) = value.and_then(Value::as_object) else {
+        return McpToolAnnotations::default();
+    };
+    McpToolAnnotations {
+        read_only_hint: annotations.get("readOnlyHint").and_then(Value::as_bool),
+    }
 }
 
 #[cfg(test)]
@@ -778,7 +813,14 @@ mod tests {
             client.tools().len()
         );
 
-        for expected in ["search_symbols", "list_symbols", "get_summaries"] {
+        for expected in ["search_symbols", "list_symbols", "get_summaries"]
+            .into_iter()
+            .chain(
+                crate::tools::SLOPCOP_BIFROST_READ_ONLY_TOOLS
+                    .iter()
+                    .copied(),
+            )
+        {
             assert!(
                 names.contains(&expected),
                 "missing tool {expected} in {names:?}"
@@ -792,12 +834,29 @@ mod tests {
         // tool" in the UI. If this assertion fires, bifrost likely
         // added or renamed a tool -- update `TOOLS` in
         // `tools/mod.rs` to match.
-        for tool_name in &names {
+        for tool in client.tools() {
             assert!(
-                crate::tools::is_known_tool(tool_name),
-                "bifrost advertises '{tool_name}' but it is not in the TOOLS metadata table; \
-                 add a ToolMeta row in tools/mod.rs (current bifrost surface: {names:?})"
+                crate::tools::is_known_tool(&tool.name),
+                "bifrost advertises '{}' but it is not in the TOOLS metadata table; \
+                 add a ToolMeta row in tools/mod.rs (current bifrost surface: {names:?})",
+                tool.name
             );
+
+            let kind = crate::tools::ToolRegistry::tool_kind(&tool.name);
+            if matches!(
+                kind,
+                agent_client_protocol::schema::ToolKind::Read
+                    | agent_client_protocol::schema::ToolKind::Search
+                    | agent_client_protocol::schema::ToolKind::Fetch
+            ) {
+                assert_eq!(
+                    tool.annotations.read_only_hint,
+                    Some(true),
+                    "bifrost advertises '{}' as {kind:?} in Anvil, but MCP readOnlyHint is {:?}",
+                    tool.name,
+                    tool.annotations.read_only_hint
+                );
+            }
         }
 
         // Round-trip two distinct tool calls so we exercise back-to-back use

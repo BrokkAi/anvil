@@ -133,6 +133,11 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Scanning symbol usages",
     },
     ToolMeta {
+        name: "semantic_search",
+        kind: ToolKind::Search,
+        display_name: "Searching semantically",
+    },
+    ToolMeta {
         name: "get_file_contents",
         kind: ToolKind::Read,
         display_name: "Reading file contents",
@@ -197,6 +202,56 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Read,
         display_name: "Computing cyclomatic complexity",
     },
+    ToolMeta {
+        name: "compute_cognitive_complexity",
+        kind: ToolKind::Read,
+        display_name: "Computing cognitive complexity",
+    },
+    ToolMeta {
+        name: "report_comment_density_for_code_unit",
+        kind: ToolKind::Read,
+        display_name: "Reporting comment density",
+    },
+    ToolMeta {
+        name: "report_comment_density_for_files",
+        kind: ToolKind::Read,
+        display_name: "Reporting file comment density",
+    },
+    ToolMeta {
+        name: "report_exception_handling_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting exception handling smells",
+    },
+    ToolMeta {
+        name: "report_test_assertion_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting test assertion smells",
+    },
+    ToolMeta {
+        name: "report_structural_clone_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting structural clone smells",
+    },
+    ToolMeta {
+        name: "report_long_method_and_god_object_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting long method and god object smells",
+    },
+    ToolMeta {
+        name: "report_dead_code_and_unused_abstraction_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting dead code smells",
+    },
+    ToolMeta {
+        name: "report_secret_like_code",
+        kind: ToolKind::Read,
+        display_name: "Reporting secret-like code",
+    },
+    ToolMeta {
+        name: "analyze_git_hotspots",
+        kind: ToolKind::Read,
+        display_name: "Analyzing git hotspots",
+    },
     // `activate_workspace` and `refresh` mutate analyzer state, so they
     // stay `Other` rather than `Read`: prompted in `default`, refused in
     // `readOnly`.
@@ -234,6 +289,21 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Other,
         display_name: "Running subagent",
     },
+];
+
+#[cfg(test)]
+pub(crate) const SLOPCOP_BIFROST_READ_ONLY_TOOLS: &[&str] = &[
+    "compute_cyclomatic_complexity",
+    "compute_cognitive_complexity",
+    "report_comment_density_for_code_unit",
+    "report_comment_density_for_files",
+    "report_exception_handling_smells",
+    "report_test_assertion_smells",
+    "report_structural_clone_smells",
+    "report_long_method_and_god_object_smells",
+    "report_dead_code_and_unused_abstraction_smells",
+    "report_secret_like_code",
+    "analyze_git_hotspots",
 ];
 
 fn tool_meta(name: &str) -> Option<&'static ToolMeta> {
@@ -1446,6 +1516,17 @@ mod tests {
             assert!(
                 TOOLS.iter().any(|t| t.name == advertised_name.as_str()),
                 "tool_definitions() advertises '{advertised_name}' but it is missing from the TOOLS metadata table"
+            );
+        }
+    }
+
+    #[test]
+    fn slopcop_bifrost_reporters_are_read_safe() {
+        for name in SLOPCOP_BIFROST_READ_ONLY_TOOLS {
+            assert_eq!(
+                ToolRegistry::tool_kind(name),
+                ToolKind::Read,
+                "{name} must remain callable in read-only ACP sessions"
             );
         }
     }
