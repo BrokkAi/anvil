@@ -9,19 +9,19 @@
 //! slash command.
 //!
 //! Auth mirrors `codex_client`: Bearer access token, `ChatGPT-Account-ID`
-//! header, `originator: codex_cli_rs`. We deliberately do NOT proactively
-//! refresh stale tokens here -- the `/usage` lookup happens on a hot
-//! path with the user waiting and we don't want to block on the OAuth
-//! refresh endpoint just to render a balance line. If the token is
-//! stale the request will 401 and we surface a short diagnostic; the
-//! next agent turn does the real refresh.
+//! header, `originator: codex_cli_rs`. We refresh past-staleness tokens
+//! proactively before the call -- failing to do so means `/usage` 401s
+//! every time on accounts whose tokens are >8 days old until the next
+//! agent prompt happens to refresh them. Refresh failures are logged
+//! and we still attempt the fetch with whatever's on disk; the 401 then
+//! surfaces in the report so the user can re-authenticate.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::codex_auth::{AuthDotJson, read_auth_dot_json};
+use crate::codex_auth::{AuthDotJson, read_auth_dot_json, refresh_if_stale};
 
 /// Endpoint Codex CLI hits for plan + rate-limit info. Spelled out
 /// rather than concatenated from a shared base so the URL is greppable
@@ -117,6 +117,35 @@ fn is_chatgpt_mode(auth: &AuthDotJson) -> bool {
     matches!(auth.auth_mode.as_deref(), Some("chatgpt"))
 }
 
+/// Classification of `~/.codex/auth.json` for the `/usage` renderer.
+/// The renderer needs to tell three skip reasons apart so it can show
+/// an actionable hint:
+/// - `Missing`: no auth.json at all -> "run /setup codex"
+/// - `ApiKeyMode`: auth.json present but billing through OPENAI_API_KEY
+///   -> tell the user `wham/usage` doesn't apply and they should check
+///   their OpenAI dashboard instead
+/// - `ChatGptMode`: ready to hit the endpoint
+///
+/// Returned by `auth_status` so the agent layer doesn't have to read
+/// auth.json a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStatus {
+    Missing,
+    ApiKeyMode,
+    ChatGptMode,
+}
+
+/// Inspect `~/.codex/auth.json` and report which auth path is active.
+/// Cheap; meant to be called by `/usage` rendering before deciding
+/// whether to hit the network.
+pub fn auth_status() -> Result<AuthStatus> {
+    match read_auth_dot_json()? {
+        None => Ok(AuthStatus::Missing),
+        Some(auth) if is_chatgpt_mode(&auth) => Ok(AuthStatus::ChatGptMode),
+        Some(_) => Ok(AuthStatus::ApiKeyMode),
+    }
+}
+
 /// Short-timeout HTTP client tuned for the `/usage` slash command: the
 /// user is staring at the prompt waiting for the report, so we'd rather
 /// fail in a few seconds than block on a stuck TLS handshake. The
@@ -140,14 +169,25 @@ fn credits_http_client() -> Result<reqwest::Client> {
 
 /// Hit the live ChatGPT backend using whatever credentials are in
 /// `~/.codex/auth.json`. Returns `Ok(None)` when the user isn't on the
-/// ChatGPT auth path so the slash-command renderer can show a clean
-/// "not applicable" line.
+/// ChatGPT auth path (no auth.json, or apikey mode) so the slash-command
+/// renderer can show a clean "not applicable" line. Refreshes stale
+/// tokens proactively before the call -- without it `/usage` 401s on
+/// accounts whose tokens have aged past Codex's 8-day window until
+/// the next agent prompt happens to refresh them.
 pub async fn fetch() -> Result<Option<CodexUsage>> {
-    let Some(auth) = read_auth_dot_json()? else {
+    let Some(mut auth) = read_auth_dot_json()? else {
         return Ok(None);
     };
     if !is_chatgpt_mode(&auth) {
         return Ok(None);
+    }
+    if let Err(e) = refresh_if_stale(&mut auth).await {
+        // Best-effort: a refresh failure here doesn't fail the whole
+        // `/usage` lookup. Either the tokens are still valid (the
+        // staleness check is conservative), in which case the request
+        // succeeds and the user gets their report, or they really are
+        // expired and the upstream 401 will surface in the diagnostic.
+        tracing::warn!("codex token refresh during /usage failed: {e:#}");
     }
     let creds = ChatGptCredentials::from_auth(&auth)?;
     let http = credits_http_client()?;

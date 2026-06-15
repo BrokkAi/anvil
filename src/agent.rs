@@ -5325,14 +5325,20 @@ enum OpenRouterCreditsOutcome {
 }
 
 /// Outcome of the ChatGPT `wham/usage` lookup performed by `/usage`.
-/// Same 3-state shape as `OpenRouterCreditsOutcome` -- in practice
-/// only one of the two ever returns `Fetched` since the lookup is
-/// gated on the active model, but the user might still have stale
-/// credentials lying around for the other provider so each side
-/// surfaces its own diagnostic.
+/// Carries more skip reasons than the OpenRouter sibling because Codex
+/// has two distinct "logged in but the endpoint doesn't apply to you"
+/// states: api-key mode (billing through OPENAI_API_KEY) vs no auth at
+/// all. Conflating them would tell an api-key user to "run /setup
+/// codex" when their setup is actually fine.
 #[derive(Debug, Clone)]
 enum CodexCreditsOutcome {
-    Skipped,
+    /// Active model isn't a Codex one; no Codex line in the report.
+    NotApplicable,
+    /// On a Codex model but `~/.codex/auth.json` is missing.
+    NoAuth,
+    /// On a Codex model and authenticated, but with an api-key billing
+    /// path that the subscription `wham/usage` endpoint doesn't cover.
+    ApiKeyMode,
     Fetched(crate::codex_credits::CodexUsage),
     Failed(String),
 }
@@ -5368,17 +5374,30 @@ async fn fetch_openrouter_credits_for_usage(model_wire_id: &str) -> OpenRouterCr
 ///   spend goes through the OpenAI billing dashboard, not the ChatGPT
 ///   subscription credits this endpoint reports).
 ///
-/// Returns `Skipped` for any other configuration so the report stays
-/// quiet on non-Codex sessions instead of dragging in an irrelevant
-/// network call.
+/// Inspects `auth_status` before the network call so the report can
+/// distinguish "no auth at all" from "api-key billing" -- the previous
+/// implementation conflated them and told api-key users to re-run
+/// `/setup codex` when their setup was already correct.
 async fn fetch_codex_credits_for_usage(model_wire_id: &str) -> CodexCreditsOutcome {
     let active_source = split_wire_id(model_wire_id).map(|(src, _)| src);
     if active_source != Some(ModelSource::Codex) {
-        return CodexCreditsOutcome::Skipped;
+        return CodexCreditsOutcome::NotApplicable;
+    }
+    match crate::codex_credits::auth_status() {
+        Ok(crate::codex_credits::AuthStatus::Missing) => return CodexCreditsOutcome::NoAuth,
+        Ok(crate::codex_credits::AuthStatus::ApiKeyMode) => {
+            return CodexCreditsOutcome::ApiKeyMode;
+        }
+        Ok(crate::codex_credits::AuthStatus::ChatGptMode) => {}
+        Err(e) => return CodexCreditsOutcome::Failed(format!("{e:#}")),
     }
     match crate::codex_credits::fetch().await {
         Ok(Some(usage)) => CodexCreditsOutcome::Fetched(usage),
-        Ok(None) => CodexCreditsOutcome::Skipped,
+        // `fetch` only returns Ok(None) for the same conditions
+        // `auth_status` already classified, but auth.json could have
+        // been deleted between the two calls. Treat as no-auth in
+        // that race.
+        Ok(None) => CodexCreditsOutcome::NoAuth,
         Err(e) => CodexCreditsOutcome::Failed(format!("{e:#}")),
     }
 }
@@ -5536,16 +5555,25 @@ fn render_usage_report(
                 "- Codex (ChatGPT) status: lookup failed ({msg})\n"
             ));
         }
-        CodexCreditsOutcome::Skipped => {
-            // Only mention Codex on a Codex session -- otherwise stay
-            // quiet so the `/usage` report doesn't grow a line per
-            // unconfigured provider.
-            if split_wire_id(&snap.model).map(|(src, _)| src) == Some(ModelSource::Codex) {
-                out.push_str(
-                    "- Codex (ChatGPT) status: no ChatGPT credentials. Run `/setup codex` \
-                     to authenticate, or set `OPENAI_API_KEY` to bill against the API.\n",
-                );
-            }
+        CodexCreditsOutcome::NoAuth => {
+            out.push_str(
+                "- Codex (ChatGPT) status: no ChatGPT credentials. Run `/setup codex` \
+                 to authenticate, or set `OPENAI_API_KEY` to bill against the API.\n",
+            );
+        }
+        CodexCreditsOutcome::ApiKeyMode => {
+            // The wham/usage endpoint only reports ChatGPT-subscription
+            // state. Calls in api-key mode bill the OpenAI account
+            // dashboard instead, so point the user there rather than
+            // surfacing an irrelevant "balance: unknown" line.
+            out.push_str(
+                "- Codex billing: OPENAI_API_KEY (api-key mode); subscription credit \
+                 balance not applicable. See platform.openai.com/usage for spend.\n",
+            );
+        }
+        CodexCreditsOutcome::NotApplicable => {
+            // Stay quiet on non-Codex sessions so the `/usage` report
+            // doesn't grow a line per unconfigured provider.
         }
     }
     out
@@ -6278,7 +6306,7 @@ mod tests {
             usage,
             Some(0.1234),
             OpenRouterCreditsOutcome::Fetched(credits),
-            CodexCreditsOutcome::Skipped,
+            CodexCreditsOutcome::NotApplicable,
         );
 
         assert!(report.contains("Model: `anthropic/claude-sonnet-4.5` (openrouter)"));
@@ -6303,7 +6331,7 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
-            CodexCreditsOutcome::Skipped,
+            CodexCreditsOutcome::NoAuth,
         );
         assert!(report.contains("Model: `gpt-5-codex` (codex)"));
         assert!(report.contains("no LLM turns recorded yet this session"));
@@ -6311,11 +6339,34 @@ mod tests {
         // "pricing unavailable" wording.
         assert!(report.contains("$0.0000 USD (no billable turns yet)"));
         assert!(report.contains("not applicable (active model is not OpenRouter)"));
-        // Skipped Codex on a Codex session must surface the actionable
-        // hint, not stay silent -- the user is clearly trying to use
-        // ChatGPT-subscription routing.
+        // NoAuth on a Codex session must surface the actionable hint --
+        // the user is clearly trying to use ChatGPT-subscription routing.
         assert!(report.contains("Codex (ChatGPT) status: no ChatGPT credentials"));
         assert!(report.contains("/setup codex"));
+    }
+
+    #[test]
+    fn render_usage_report_api_key_mode_on_codex_session_points_at_dashboard() {
+        // api-key-mode Codex users (auth.json with OPENAI_API_KEY but
+        // no chatgpt tokens) must not be told to run `/setup codex` --
+        // their setup is correct, the subscription endpoint just
+        // doesn't apply. Verify the renderer points them at the
+        // OpenAI dashboard instead.
+        let snap = usage_snapshot("codex::gpt-5-codex");
+        let report = render_usage_report(
+            &snap,
+            crate::llm_client::TokenUsage::default(),
+            None,
+            OpenRouterCreditsOutcome::Skipped,
+            CodexCreditsOutcome::ApiKeyMode,
+        );
+        assert!(report.contains("Codex billing: OPENAI_API_KEY"));
+        assert!(report.contains("platform.openai.com/usage"));
+        // Critically: must NOT tell them to re-authenticate.
+        assert!(
+            !report.contains("/setup codex"),
+            "api-key-mode users should not be told to re-auth: {report}"
+        );
     }
 
     #[test]
@@ -6326,7 +6377,7 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
-            CodexCreditsOutcome::Skipped,
+            CodexCreditsOutcome::NotApplicable,
         );
         // The "no credential" branch must fire for OpenRouter models,
         // distinct from "not applicable" for non-OpenRouter ones.
@@ -6348,7 +6399,7 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Failed("HTTP 401: invalid api key".into()),
-            CodexCreditsOutcome::Skipped,
+            CodexCreditsOutcome::NotApplicable,
         );
         assert!(report.contains("OpenRouter balance: lookup failed"));
         assert!(report.contains("HTTP 401: invalid api key"));
@@ -6370,7 +6421,7 @@ mod tests {
             usage,
             None,
             OpenRouterCreditsOutcome::Skipped,
-            CodexCreditsOutcome::Skipped,
+            CodexCreditsOutcome::NotApplicable,
         );
         assert!(report.contains("Session cost: unavailable"));
         assert!(report.contains("at least one turn lacked pricing metadata"));
@@ -6386,7 +6437,7 @@ mod tests {
             crate::llm_client::TokenUsage::default(),
             None,
             OpenRouterCreditsOutcome::Skipped,
-            CodexCreditsOutcome::Skipped,
+            CodexCreditsOutcome::NotApplicable,
         );
         assert!(report.contains("Model: `llama3:latest` ((unknown))"));
         assert!(report.contains("not applicable"));
