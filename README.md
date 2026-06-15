@@ -233,7 +233,7 @@ Bifrost is preinstalled as an enabled MCP server backed by Anvil's managed
 local binary:
 
 ```text
-<managed-bifrost> --root {cwd} --server core  # line framing
+<managed-bifrost> --root {cwd} --server core|slopcop  # line framing
 ```
 
 Use `/mcp` in the editor to list or change MCP servers:

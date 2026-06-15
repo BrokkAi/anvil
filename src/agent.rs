@@ -3546,7 +3546,7 @@ fn mcp_usage() -> String {
      servers. Use `line` only for NDJSON-speaking servers. Use shell-style quoting \
      for commands or args that contain spaces, and use `{cwd}` in args to pass the \
      current workspace root. Bifrost is preinstalled as Anvil's managed local \
-     binary with the equivalent args `--root '{cwd}' --server core`."
+     binary with the equivalent args `--root '{cwd}' --server core|slopcop`."
         .to_string()
 }
 
