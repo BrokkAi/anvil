@@ -618,23 +618,97 @@ impl BedrockClient {
         body: &BedrockAnthropicRequest,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<(reqwest::StatusCode, String)>> {
-        let send = self
-            .http
-            .post(url)
-            .bearer_auth(&self.bearer_token)
-            .json(body)
-            .send();
+        // The native Anthropic path buffers the whole response before emitting a
+        // single token, so replaying it on a transient failure is always safe --
+        // nothing partial has reached the client. Retry generously: Bedrock
+        // frequently drops connections mid-flight, which used to require a manual
+        // retry from the user.
+        let max_attempts = crate::http_retry::max_stream_attempts();
+        for attempt in 1..=max_attempts {
+            let send = self
+                .http
+                .post(url)
+                .bearer_auth(&self.bearer_token)
+                .json(body)
+                .send();
 
-        let resp = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Ok(None);
+            let resp = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Ok(None);
+                }
+                resp = send => resp,
+            };
+
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(err)
+                    if attempt < max_attempts
+                        && crate::http_retry::is_retryable_reqwest_error(&err) =>
+                {
+                    if !self
+                        .backoff_before_native_retry(attempt, format!("{err}"), cancel)
+                        .await
+                    {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err).context("failed to send Bedrock request"),
+            };
+
+            let status = resp.status();
+            // Pure-transient server statuses (408/429/5xx) carry only an error
+            // body; replay the whole request rather than surface it. 4xx --
+            // including the on-demand-throughput 400 that drives inference-profile
+            // fallback -- is returned to the caller untouched.
+            if crate::http_retry::is_retryable_status(status) && attempt < max_attempts {
+                if !self
+                    .backoff_before_native_retry(attempt, format!("HTTP {status}"), cancel)
+                    .await
+                {
+                    return Ok(None);
+                }
+                continue;
             }
-            resp = send => resp.context("failed to send Bedrock request")?,
-        };
 
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        Ok(Some((status, body_text)))
+            // A disconnect while reading the body is the classic "stream just
+            // stopped" failure. Replay it instead of swallowing it: the previous
+            // `unwrap_or_default()` produced a bogus empty body that then failed
+            // JSON parsing with a misleading, non-retryable error.
+            match resp.text().await {
+                Ok(body_text) => return Ok(Some((status, body_text))),
+                Err(err) if attempt < max_attempts => {
+                    if !self
+                        .backoff_before_native_retry(attempt, format!("body read: {err}"), cancel)
+                        .await
+                    {
+                        return Ok(None);
+                    }
+                }
+                Err(err) => return Err(err).context("reading Bedrock response body"),
+            }
+        }
+        unreachable!("native Bedrock retry loop always returns on the last attempt")
+    }
+
+    /// Sleep with exponential backoff before replaying a native Bedrock request.
+    /// Returns `false` if the turn was cancelled while waiting, so the caller can
+    /// abort quietly (mirroring the cancel branch of the send `select!`).
+    async fn backoff_before_native_retry(
+        &self,
+        attempt: u64,
+        reason: String,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        let delay = crate::http_retry::retry_backoff(attempt);
+        tracing::warn!(
+            attempt,
+            "Bedrock native invoke failed ({reason}); retrying in {delay:?}"
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
     }
 
     async fn inference_profile_candidates_for_model(&self, model: &str) -> Vec<String> {

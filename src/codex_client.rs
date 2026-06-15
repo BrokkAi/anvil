@@ -1192,6 +1192,17 @@ where
         });
     }
 
+    // A stream that ends without `[DONE]`/`response.completed` was cut short by
+    // the provider or transport: the model's final answer never arrived. Treat
+    // it as a retryable failure rather than silently returning the truncated
+    // text as if it were complete.
+    if !completed {
+        anyhow::bail!(
+            "Responses stream closed before completion ({} chars received); aborting",
+            full_text.len()
+        );
+    }
+
     if tool_calls.is_empty() {
         Ok(LlmResponse::Text {
             text: full_text,

@@ -254,24 +254,48 @@ async fn run_summarization_request(
     idle_timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<String> {
-    let on_token: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
-    let on_thought: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
-    let response = llm
-        .stream_chat(StreamChatRequest {
-            model: model.to_string(),
-            messages,
-            tools: None,
-            // Summarization is structured extraction, not deep
-            // reasoning -- "low" keeps cost down on reasoning-capable
-            // models that bill thinking tokens.
-            reasoning_effort: Some("low".to_string()),
-            structured_output: None,
-            on_token,
-            on_thought,
-            cancel,
-            idle_timeout,
-        })
-        .await?;
+    // Summaries discard token deltas, so a stream dropped by a flaky provider
+    // can always be replayed without any user-visible duplication.
+    let max_attempts = crate::http_retry::max_stream_attempts();
+    let mut attempt = 1u64;
+    let response = loop {
+        let on_token: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
+        let on_thought: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
+        let result = llm
+            .stream_chat(StreamChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: None,
+                // Summarization is structured extraction, not deep
+                // reasoning -- "low" keeps cost down on reasoning-capable
+                // models that bill thinking tokens.
+                reasoning_effort: Some("low".to_string()),
+                structured_output: None,
+                on_token,
+                on_thought,
+                cancel: cancel.clone(),
+                idle_timeout,
+            })
+            .await;
+        match result {
+            Ok(response) => break response,
+            Err(error)
+                if attempt < max_attempts
+                    && !cancel.is_cancelled()
+                    && crate::http_retry::is_retryable_llm_error(&error) =>
+            {
+                crate::http_retry::sleep_before_retry(
+                    "summarization LLM response",
+                    attempt,
+                    format!("{error:#}"),
+                    Some(&cancel),
+                )
+                .await?;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let text = match response {
         LlmResponse::Text { text, .. } => text,
         LlmResponse::ToolCalls { text, .. } => text,

@@ -7,6 +7,47 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const LLM_MAX_ATTEMPTS: u64 = 4;
 const REQUEST_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 
+/// Default number of *additional* attempts for a whole streaming LLM turn after
+/// the first one. Whole-turn retries are deliberately more generous than the
+/// pre-stream HTTP budget (`LLM_MAX_ATTEMPTS`): flaky providers -- AWS Bedrock
+/// in particular -- routinely drop a response stream mid-flight, and replaying
+/// the request is the only way to recover. It is safe because the successful
+/// attempt's response is what lands in conversation history; any partial output
+/// from a failed attempt is display-only.
+const DEFAULT_LLM_STREAM_RETRIES: u64 = 7;
+
+/// Total attempts (first try + retries) for a whole streaming LLM turn.
+///
+/// Overridable via `ANVIL_LLM_MAX_STREAM_RETRIES`, which sets the number of
+/// retries (clamped to 0..=100); the returned value includes the initial
+/// attempt, so the default of 7 retries yields 8 total attempts.
+pub(crate) fn max_stream_attempts() -> u64 {
+    let retries = std::env::var("ANVIL_LLM_MAX_STREAM_RETRIES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|retries| retries.min(100))
+        .unwrap_or(DEFAULT_LLM_STREAM_RETRIES);
+    retries.saturating_add(1)
+}
+
+/// Classify an error surfaced by a streaming LLM turn as a transient failure
+/// worth replaying the whole request for. Matches on rendered error text
+/// because the failure can originate several layers down (SSE driver, provider
+/// adapter, transport) and is flattened into an `anyhow` chain by the time it
+/// reaches a retry site.
+pub(crate) fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}");
+    error.contains("stream read error")
+        || error.contains("no meaningful progress")
+        || error.contains("closed before completion")
+        || error.contains("Responses stream failed: server_error")
+        || error.contains("Responses stream failed: server_is_overloaded")
+        || error.contains("Responses stream failed: rate_limit_exceeded")
+        || error.contains("server_is_overloaded")
+        || error.contains("server_error")
+        || error.contains("rate_limit_exceeded")
+}
+
 /// Retry a request until it either succeeds, fails deterministically, or
 /// exhausts Codex-compatible retry budget. This is intentionally limited
 /// to the pre-stream HTTP exchange: once an SSE body starts producing
@@ -46,13 +87,13 @@ pub(crate) async fn send_with_retries(
     unreachable!("retry loop always returns on the last attempt")
 }
 
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
 }
 
-fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     !err.is_builder() && !err.is_redirect() && !err.is_status() && !err.is_decode()
 }
 
@@ -64,7 +105,7 @@ pub(crate) async fn sleep_before_retry(
 ) -> Result<()> {
     let delay = retry_backoff(attempt);
     tracing::warn!(
-        "{operation} failed ({reason}); retrying request ({attempt}/{LLM_MAX_ATTEMPTS}) in {delay:?}"
+        "{operation} failed ({reason}); retrying request (attempt {attempt}) in {delay:?}"
     );
 
     if let Some(cancel) = cancel {

@@ -69,17 +69,14 @@ fn tool_unavailable_message(tool_name: &str) -> String {
     )
 }
 
-fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
-    let error = format!("{error:#}");
-    error.contains("stream read error")
-        || error.contains("no meaningful progress")
-        || error.contains("Responses stream failed: server_error")
-        || error.contains("Responses stream failed: server_is_overloaded")
-        || error.contains("Responses stream failed: rate_limit_exceeded")
-        || error.contains("server_is_overloaded")
-        || error.contains("server_error")
-        || error.contains("rate_limit_exceeded")
-}
+/// Marker streamed to the client when a transient failure forces anvil to
+/// restart a response that had *already* begun streaming. ACP message chunks
+/// are additive (the partial output can't be retracted), so this notice makes
+/// the regeneration visible instead of silently appending a second answer. It
+/// is display-only: the persisted assistant message uses the successful
+/// attempt's clean text, never this marker or the discarded partial.
+const STREAM_RESTART_NOTICE: &str =
+    "\n\n↻ The provider dropped the response stream; regenerating the answer…\n\n";
 
 #[allow(clippy::too_many_arguments)]
 async fn stream_chat_with_transient_retry(
@@ -96,6 +93,7 @@ async fn stream_chat_with_transient_retry(
     idle_timeout: Duration,
 ) -> anyhow::Result<LlmResponse> {
     let mut attempt = 1u64;
+    let max_attempts = crate::http_retry::max_stream_attempts();
     loop {
         let emitted_output = Arc::new(AtomicBool::new(false));
 
@@ -138,26 +136,35 @@ async fn stream_chat_with_transient_retry(
         match response {
             Ok(response) => return Ok(response),
             Err(error)
-                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
+                if attempt < max_attempts
                     && !cancel.is_cancelled()
-                    && !emitted_output.load(Ordering::SeqCst)
-                    && is_retryable_llm_error(&error) =>
+                    && crate::http_retry::is_retryable_llm_error(&error) =>
             {
+                let restarting_after_output = emitted_output.load(Ordering::SeqCst);
+                // Partial output already reached the client. We can't retract
+                // additive ACP chunks, so surface a visible restart marker
+                // before replaying; otherwise the regenerated answer would look
+                // like a confusing second response glued onto the first.
+                if restarting_after_output && let Ok(mut cb) = on_text.lock() {
+                    cb(STREAM_RESTART_NOTICE);
+                }
                 let delay = crate::http_retry::retry_backoff(attempt);
                 append_trace_record(serde_json::json!({
                     "type": "llm_retry",
                     "turn": turn,
                     "attempt": attempt,
-                    "max_attempts": crate::http_retry::LLM_MAX_ATTEMPTS,
+                    "max_attempts": max_attempts,
                     "phase": "stream",
+                    "after_partial_output": restarting_after_output,
                     "reason": format!("{error:#}"),
                     "delay_ms": delay.as_millis(),
                 }));
                 tracing::warn!(
                     turn,
                     attempt,
-                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
-                    "retrying transient LLM stream failure before any output was emitted"
+                    max_attempts,
+                    after_partial_output = restarting_after_output,
+                    "retrying transient LLM stream failure"
                 );
                 crate::http_retry::sleep_before_retry(
                     "streaming LLM response",
@@ -3350,7 +3357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_does_not_retry_after_partial_output() {
+    async fn stream_chat_retries_after_partial_output_with_restart_notice() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
@@ -3360,7 +3367,7 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
 
-        let error = stream_chat_with_transient_retry(
+        let response = stream_chat_with_transient_retry(
             &backend,
             0,
             "codex::test",
@@ -3374,11 +3381,49 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect_err("partial output makes retry unsafe");
+        .expect("transient drops are recoverable even after partial output");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(format!("{error:#}").contains("Codex stream read error"));
-        assert_eq!(output.lock().unwrap().as_str(), "partial");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        // The discarded partial and the restart marker are both visible to the
+        // client, but the returned response (what history keeps) is clean.
+        let shown = output.lock().unwrap().clone();
+        assert!(shown.starts_with("partial"), "partial output: {shown:?}");
+        assert!(
+            shown.contains(STREAM_RESTART_NOTICE),
+            "restart notice should be surfaced: {shown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_stream_closed_before_completion() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+            first_error: "Responses stream closed before completion (12 chars received); aborting",
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("an early stream close should be retried");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
     }
 
     #[tokio::test]
