@@ -2681,6 +2681,7 @@ async fn run_model_turn_in_spawn(
         spawned_cx,
         session_id.to_string(),
         sessions.clone(),
+        prompt_text_for_turn.clone(),
         crate::tool_loop::NotificationMode::Live,
         0,
     ))

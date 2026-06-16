@@ -14,6 +14,7 @@ use agent_client_protocol::schema::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +34,8 @@ use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
+const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 
 fn train_bifrost_enabled() -> bool {
     env::var(TRAIN_BIFROST_ENV).ok().is_some_and(|value| {
@@ -446,6 +449,26 @@ enum PureGateDecision {
     Allow,
     Reject(String),
     Prompt,
+}
+
+struct GateOutcome {
+    decision: GateDecision,
+    usage: TokenUsage,
+}
+
+impl GateOutcome {
+    fn without_usage(decision: GateDecision) -> Self {
+        Self {
+            decision,
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PermissionScopeClassification {
+    allow: bool,
+    rationale: String,
 }
 
 /// Pure permission-gate logic. Given the snapshot of mode + kind + name +
@@ -1294,6 +1317,7 @@ pub(crate) async fn run(
     spawned_cx: SpawnedCx<'_>,
     session_id: String,
     sessions: SessionStore,
+    original_user_request: String,
     notifications: NotificationMode,
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
@@ -1779,6 +1803,11 @@ pub(crate) async fn run(
                         &spawned_cx,
                         &cancel,
                         GateCheck {
+                            llm,
+                            model,
+                            reasoning_effort,
+                            original_user_request: &original_user_request,
+                            idle_timeout,
                             session_id: &session_id,
                             tool_name: &tool_name,
                             kind,
@@ -1789,6 +1818,8 @@ pub(crate) async fn run(
                         },
                     )
                     .await;
+                    turn_usage.add(decision.usage);
+                    let decision = decision.decision;
 
                     if let Some(index) = consume_shell_sandbox_retry_state {
                         available_shell_sandbox_retry_states.remove(index);
@@ -2222,7 +2253,7 @@ async fn consult_gate(
     spawned_cx: &SpawnedCx<'_>,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
-) -> GateDecision {
+) -> GateOutcome {
     let evaluation = match evaluate_pure_gate(
         sessions,
         request.session_id,
@@ -2235,95 +2266,313 @@ async fn consult_gate(
     .await
     {
         Ok(evaluation) => evaluation,
-        Err(reason) => return GateDecision::Reject(reason),
+        Err(reason) => return GateOutcome::without_usage(GateDecision::Reject(reason)),
     };
 
     match evaluation.decision {
-        PureGateDecision::Allow => GateDecision::Allow {
+        PureGateDecision::Allow => GateOutcome::without_usage(GateDecision::Allow {
             sandbox_policy_override: None,
             sandbox_mode: evaluation.sandbox_mode,
             shell_sandboxed: evaluation.shell_sandboxed,
-        },
-        PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
+        }),
+        PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
         PureGateDecision::Prompt => {
             let escalation_requested = shell_sandbox_escalation_requested(request.raw_input);
-            // "Always allow" remembers the first sub-command that actually needs
-            // remembering (safelist sub-commands like `tail` are skipped).
-            let shell_always_allow_prefix =
-                if request.tool_name == "run_shell_command" && !escalation_requested {
-                    shell_always_allow_plan(
-                        request.raw_input,
-                        evaluation.shell_sandboxed,
-                        evaluation.safelist_credit,
-                    )
-                    .and_then(|plan| plan.first_required_prefix)
-                } else {
-                    None
-                };
-            // Offer it only when that prefix isn't already remembered: if it is,
-            // a *different* sub-command is forcing the prompt, so remembering the
-            // first prefix again wouldn't help.
-            let always_allow_label = match &shell_always_allow_prefix {
-                Some(prefix) => {
-                    let key = shell_prefix_key(prefix, evaluation.shell_sandboxed);
-                    if sessions
-                        .is_any_always_allowed(request.session_id, std::slice::from_ref(&key))
-                        .await
-                    {
-                        None
-                    } else {
-                        Some(prefix.join(" "))
-                    }
+            if !escalation_requested
+                && (request.tool_name != "run_shell_command" || evaluation.shell_sandboxed)
+                && let Some((classification, usage)) =
+                    classify_permission_scope_with_model(&request, cancel).await
+            {
+                if classification.allow {
+                    tracing::info!(
+                        session_id = request.session_id,
+                        tool_name = request.tool_name,
+                        rationale = %classification.rationale,
+                        "permission gate: auto-classifier approved tool call for this turn"
+                    );
+                    return GateOutcome {
+                        decision: GateDecision::Allow {
+                            sandbox_policy_override: None,
+                            sandbox_mode: evaluation.sandbox_mode,
+                            shell_sandboxed: evaluation.shell_sandboxed,
+                        },
+                        usage,
+                    };
                 }
-                None => None,
-            };
-            match request_user_permission(
-                spawned_cx,
-                cancel,
-                PermissionRequest {
-                    session_id: request.session_id,
-                    tool_name: request.tool_name,
-                    kind: request.kind,
-                    tool_call_id: request.tool_call_id,
-                    raw_input: request.raw_input,
-                    shell_sandboxed: evaluation.shell_sandboxed,
-                    sandbox_escalation_requested: escalation_requested,
-                    always_allow_label,
+                tracing::info!(
+                    session_id = request.session_id,
+                    tool_name = request.tool_name,
+                    rationale = %classification.rationale,
+                    "permission gate: auto-classifier declined to approve tool call; prompting user"
+                );
+                // Preserve token accounting while falling back to the human prompt.
+                return GateOutcome {
+                    decision: match request_user_permission_with_evaluation(
+                        sessions,
+                        spawned_cx,
+                        cancel,
+                        request,
+                        evaluation,
+                        escalation_requested,
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(reason) => GateDecision::Reject(reason),
+                    },
+                    usage,
+                };
+            }
+            GateOutcome::without_usage(
+                match request_user_permission_with_evaluation(
+                    sessions,
+                    spawned_cx,
+                    cancel,
+                    request,
+                    evaluation,
+                    escalation_requested,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(reason) => GateDecision::Reject(reason),
                 },
             )
-            .await
-            {
-                Ok(grant) => {
-                    // Awaited inline so the next tool call in the same batch
-                    // sees the updated set without re-prompting.
-                    if grant.allow_always && grant.sandbox_policy_override.is_none() {
-                        if request.tool_name == "run_shell_command" {
-                            if let Some(prefix) = &shell_always_allow_prefix {
-                                let key = shell_prefix_key(prefix, evaluation.shell_sandboxed);
-                                sessions.add_always_allow(request.session_id, &key).await;
-                            }
-                        } else {
-                            sessions
-                                .add_always_allow(request.session_id, request.tool_name)
-                                .await;
-                        }
-                    }
-                    GateDecision::Allow {
-                        sandbox_policy_override: grant.sandbox_policy_override,
-                        sandbox_mode: evaluation.sandbox_mode,
-                        shell_sandboxed: evaluation.shell_sandboxed,
-                    }
-                }
-                Err(reason) => GateDecision::Reject(reason),
-            }
         }
     }
+}
+
+async fn request_user_permission_with_evaluation(
+    sessions: &SessionStore,
+    spawned_cx: &SpawnedCx<'_>,
+    cancel: &CancellationToken,
+    request: GateCheck<'_>,
+    evaluation: PureGateEvaluation,
+    escalation_requested: bool,
+) -> Result<GateDecision, String> {
+    // "Always allow" remembers the first sub-command that actually needs
+    // remembering (safelist sub-commands like `tail` are skipped).
+    let shell_always_allow_prefix =
+        if request.tool_name == "run_shell_command" && !escalation_requested {
+            shell_always_allow_plan(
+                request.raw_input,
+                evaluation.shell_sandboxed,
+                evaluation.safelist_credit,
+            )
+            .and_then(|plan| plan.first_required_prefix)
+        } else {
+            None
+        };
+    // Offer it only when that prefix isn't already remembered: if it is,
+    // a *different* sub-command is forcing the prompt, so remembering the
+    // first prefix again wouldn't help.
+    let always_allow_label = match &shell_always_allow_prefix {
+        Some(prefix) => {
+            let key = shell_prefix_key(prefix, evaluation.shell_sandboxed);
+            if sessions
+                .is_any_always_allowed(request.session_id, std::slice::from_ref(&key))
+                .await
+            {
+                None
+            } else {
+                Some(prefix.join(" "))
+            }
+        }
+        None => None,
+    };
+    let grant = request_user_permission(
+        spawned_cx,
+        cancel,
+        PermissionRequest {
+            session_id: request.session_id,
+            tool_name: request.tool_name,
+            kind: request.kind,
+            tool_call_id: request.tool_call_id,
+            raw_input: request.raw_input,
+            shell_sandboxed: evaluation.shell_sandboxed,
+            sandbox_escalation_requested: escalation_requested,
+            always_allow_label,
+        },
+    )
+    .await?;
+
+    // Awaited inline so the next tool call in the same batch sees the updated
+    // set without re-prompting.
+    if grant.allow_always && grant.sandbox_policy_override.is_none() {
+        if request.tool_name == "run_shell_command" {
+            if let Some(prefix) = &shell_always_allow_prefix {
+                let key = shell_prefix_key(prefix, evaluation.shell_sandboxed);
+                sessions.add_always_allow(request.session_id, &key).await;
+            }
+        } else {
+            sessions
+                .add_always_allow(request.session_id, request.tool_name)
+                .await;
+        }
+    }
+    Ok(GateDecision::Allow {
+        sandbox_policy_override: grant.sandbox_policy_override,
+        sandbox_mode: evaluation.sandbox_mode,
+        shell_sandboxed: evaluation.shell_sandboxed,
+    })
+}
+
+async fn classify_permission_scope_with_model(
+    request: &GateCheck<'_>,
+    cancel: &CancellationToken,
+) -> Option<(PermissionScopeClassification, TokenUsage)> {
+    if request.original_user_request.trim().is_empty() {
+        return None;
+    }
+
+    let raw_input = truncate_for_permission_classifier(
+        &serde_json::to_string_pretty(request.raw_input)
+            .unwrap_or_else(|_| request.raw_input.to_string()),
+    );
+    let user_request = truncate_for_permission_classifier(request.original_user_request);
+    let action_title = truncate_for_permission_classifier(&announce::permission_prompt_title(
+        request.tool_name,
+        request.raw_input,
+    ));
+    let prompt = format!(
+        "Original user request:\n{user_request}\n\n\
+         Proposed tool call:\n\
+         - tool: {tool}\n\
+         - kind: {kind:?}\n\
+         - cwd: {cwd}\n\
+         - title: {action_title}\n\
+         - input JSON:\n{raw_input}\n\n\
+         Decide whether the proposed tool call is clearly within the scope of \
+         the original user request.",
+        tool = request.tool_name,
+        kind = request.kind,
+        cwd = request.cwd.display(),
+    );
+    let messages = vec![
+        ChatMessage::system(AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT),
+        ChatMessage::user(prompt),
+    ];
+    let result = request
+        .llm
+        .stream_chat(StreamChatRequest {
+            model: request.model.to_string(),
+            messages,
+            tools: None,
+            reasoning_effort: request.reasoning_effort.map(str::to_string),
+            structured_output: Some(permission_classifier_schema().clone()),
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel.clone(),
+            idle_timeout: request
+                .idle_timeout
+                .min(AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT),
+        })
+        .await;
+
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                session_id = request.session_id,
+                tool_name = request.tool_name,
+                "permission auto-classifier failed; falling back to user prompt: {error:#}"
+            );
+            return None;
+        }
+    };
+    let usage = response.usage();
+    let text = match response {
+        LlmResponse::Text { text, .. } => text,
+        LlmResponse::ToolCalls { .. } => {
+            tracing::warn!(
+                session_id = request.session_id,
+                tool_name = request.tool_name,
+                "permission auto-classifier returned tool calls; falling back to user prompt"
+            );
+            return None;
+        }
+    };
+    match parse_permission_scope_classification(&text) {
+        Some(classification) => Some((classification, usage)),
+        None => {
+            tracing::warn!(
+                session_id = request.session_id,
+                tool_name = request.tool_name,
+                output = %truncate_for_permission_classifier(&text),
+                "permission auto-classifier returned invalid JSON; falling back to user prompt"
+            );
+            None
+        }
+    }
+}
+
+const AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT: &str = "\
+You are a conservative permission scope classifier for a coding agent.\n\
+Return JSON only.\n\
+\n\
+Set allow=true only when the proposed tool call is a direct, ordinary, and \
+reasonably necessary step toward the user's original request. Examples include \
+editing files the user asked to change, running focused tests, inspecting \
+nearby code, or using a helper tool whose purpose matches the task.\n\
+\n\
+Set allow=false when the action starts a new task, broadens the request, \
+changes credentials or secrets, performs unrelated destructive work, asks for \
+outside-sandbox execution, spends money, publishes externally, or is ambiguous.\n\
+\n\
+The classifier only grants one tool call. It must not approve based on what \
+would be convenient for the agent; it must be clearly covered by the user.";
+
+fn permission_classifier_schema() -> &'static StructuredOutputRequest {
+    static SCHEMA: std::sync::OnceLock<StructuredOutputRequest> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| StructuredOutputRequest {
+        schema_name: "permission_scope_classification".to_string(),
+        allow_coercion: false,
+        schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allow", "rationale"],
+            "properties": {
+                "allow": {
+                    "type": "boolean",
+                    "description": "True only when the tool call is clearly within the original user request."
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "A short reason for the decision."
+                }
+            }
+        }),
+    })
+}
+
+fn parse_permission_scope_classification(text: &str) -> Option<PermissionScopeClassification> {
+    let classification: PermissionScopeClassification = serde_json::from_str(text.trim()).ok()?;
+    if classification.rationale.trim().is_empty() {
+        return None;
+    }
+    Some(classification)
+}
+
+fn truncate_for_permission_classifier(text: &str) -> String {
+    if text.len() <= AUTO_PERMISSION_CLASSIFIER_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut end = AUTO_PERMISSION_CLASSIFIER_MAX_CHARS;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... truncated", &text[..end])
 }
 
 /// Send `session/request_permission` to the client and await the outcome.
 /// Returns `Ok(grant)` if the user approved (with or without remembering),
 /// or `Err(reason)` describing the rejection or transport failure.
 struct GateCheck<'a> {
+    llm: &'a Arc<dyn LlmBackend>,
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+    original_user_request: &'a str,
+    idle_timeout: Duration,
     session_id: &'a str,
     tool_name: &'a str,
     kind: ToolKind,
@@ -2964,6 +3213,7 @@ async fn execute_subagent(
         SpawnedCx::new(spawned_cx.cx()),
         session_id.to_string(),
         sessions.clone(),
+        prompt.to_string(),
         NotificationMode::Silent,
         depth,
     ))
@@ -3189,10 +3439,106 @@ mod tests {
         }
     }
 
+    struct StaticClassifierBackend {
+        response: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for StaticClassifierBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let response = self.response.to_string();
+            let calls = self.calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(request.tools.is_none());
+                assert!(request.structured_output.is_some());
+                assert!(
+                    request.messages[1]
+                        .content_text()
+                        .contains("Original user request:")
+                );
+                Ok(LlmResponse::Text {
+                    text: response,
+                    usage: TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        thought_tokens: 1,
+                        cached_read_tokens: 0,
+                        cached_write_tokens: 0,
+                    },
+                })
+            }
+            .boxed()
+        }
+    }
+
     fn text_sink_for_test(buffer: Arc<Mutex<String>>) -> TextSink {
         Arc::new(Mutex::new(move |text: &str| {
             buffer.lock().unwrap().push_str(text);
         }))
+    }
+
+    #[test]
+    fn permission_scope_classification_requires_valid_json_and_rationale() {
+        assert!(parse_permission_scope_classification("not json").is_none());
+        assert!(
+            parse_permission_scope_classification(r#"{"allow":true,"rationale":""}"#).is_none()
+        );
+
+        let parsed =
+            parse_permission_scope_classification(r#"{"allow":false,"rationale":"too broad"}"#)
+                .expect("valid classifier JSON should parse");
+        assert!(!parsed.allow);
+        assert_eq!(parsed.rationale, "too broad");
+    }
+
+    #[test]
+    fn permission_classifier_truncation_preserves_utf8_boundary() {
+        let text = "é".repeat(AUTO_PERMISSION_CLASSIFIER_MAX_CHARS);
+        let truncated = truncate_for_permission_classifier(&text);
+        assert!(truncated.ends_with("\n... truncated"));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[tokio::test]
+    async fn permission_auto_classifier_uses_model_and_returns_usage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(StaticClassifierBackend {
+            response: r#"{"allow":true,"rationale":"focused test command"}"#,
+            calls: calls.clone(),
+        });
+        let raw_input = serde_json::json!({"command": "cargo test"});
+        let request = GateCheck {
+            llm: &llm,
+            model: "test-model",
+            reasoning_effort: None,
+            original_user_request: "fix the failing tests",
+            idle_timeout: Duration::from_secs(300),
+            session_id: "session",
+            tool_name: "run_shell_command",
+            kind: ToolKind::Execute,
+            tool_call_id: "call",
+            raw_input: &raw_input,
+            cwd: Path::new("/tmp/project"),
+            shell_sandbox_retry_states: &[],
+        };
+
+        let (classification, usage) =
+            classify_permission_scope_with_model(&request, &CancellationToken::new())
+                .await
+                .expect("classifier should parse valid model output");
+
+        assert!(classification.allow);
+        assert_eq!(classification.rationale, "focused test command");
+        assert_eq!(usage.total_tokens(), 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn decide(
