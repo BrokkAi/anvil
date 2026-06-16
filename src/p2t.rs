@@ -437,6 +437,9 @@ mod tests {
     #[test]
     fn load_config_accepts_forced_first_step() {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let snapshot_dir = tempdir.path().join("p2t-snaps");
+        let step_trace_out = tempdir.path().join("out.jsonl");
         std::fs::write(
             file.path(),
             serde_json::json!({
@@ -446,9 +449,9 @@ mod tests {
                     "tool_calls": [{"id":"c1","name":"edit","arguments":"{}"}]
                 },
                 "max_steps": 10,
-                "snapshot_dir": "/tmp/p2t-snaps",
+                "snapshot_dir": snapshot_dir,
                 "temperature": 0.6,
-                "step_trace_out": "/tmp/out.jsonl"
+                "step_trace_out": step_trace_out
             })
             .to_string(),
         )
@@ -466,12 +469,14 @@ mod tests {
                 }],
             })
         );
-        assert_eq!(config.snapshot_dir, Some(PathBuf::from("/tmp/p2t-snaps")));
+        assert_eq!(config.snapshot_dir, Some(snapshot_dir));
     }
 
     #[test]
     fn load_config_accepts_null_forced_first_step() {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let step_trace_out = tempdir.path().join("out.jsonl");
         std::fs::write(
             file.path(),
             serde_json::json!({
@@ -480,7 +485,7 @@ mod tests {
                 "max_steps": 10,
                 "snapshot_dir": null,
                 "temperature": 0.6,
-                "step_trace_out": "/tmp/out.jsonl"
+                "step_trace_out": step_trace_out
             })
             .to_string(),
         )
@@ -494,6 +499,8 @@ mod tests {
     #[test]
     fn load_config_rejects_relative_snapshot_dir() {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let step_trace_out = tempdir.path().join("out.jsonl");
         std::fs::write(
             file.path(),
             serde_json::json!({
@@ -502,7 +509,7 @@ mod tests {
                 "max_steps": 10,
                 "snapshot_dir": "relative/snaps",
                 "temperature": 0.6,
-                "step_trace_out": "/tmp/out.jsonl"
+                "step_trace_out": step_trace_out
             })
             .to_string(),
         )
