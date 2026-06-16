@@ -407,16 +407,17 @@ fn env_value_truthy(value: &str) -> bool {
     )
 }
 
+#[cfg(target_os = "windows")]
+fn rtk_rewritten_command(command: &str) -> String {
+    command.to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
 fn rtk_rewritten_command(command: &str) -> String {
     // RTK's native Windows support is CLI/filtering-oriented; its automatic
     // rewrite hook path requires Unix shell semantics. Anvil's hosted rewrite
     // emits POSIX env-prefix syntax, so leave native Windows shell commands
     // untouched. WSL is a Linux target and still takes the rewrite path.
-    #[cfg(target_os = "windows")]
-    {
-        return command.to_string();
-    }
-
     if env_var_truthy(ANVIL_RTK_DISABLED_ENV)
         || rtk_disabled_in_command_prefix(command)
         || command.contains(ANVIL_RTK_SUBCOMMAND)
