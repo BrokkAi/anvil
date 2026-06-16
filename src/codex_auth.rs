@@ -64,6 +64,32 @@ const REFRESH_AFTER: chrono::Duration = chrono::Duration::days(8);
 /// Wait at most this long for the user to complete sign-in in the browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CODEX_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TestCodexHomeScope {
+    prev: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl TestCodexHomeScope {
+    fn set(path: PathBuf) -> Self {
+        let prev = TEST_CODEX_HOME.with(|slot| slot.borrow().clone());
+        TEST_CODEX_HOME.with(|slot| *slot.borrow_mut() = Some(path));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCodexHomeScope {
+    fn drop(&mut self) {
+        TEST_CODEX_HOME.with(|slot| *slot.borrow_mut() = self.prev.take());
+    }
+}
+
 /// Schema of `~/.codex/auth.json`. Field names (and the `OPENAI_API_KEY`
 /// SHOUTING case) are dictated by Codex CLI's storage format -- do not
 /// rename without breaking cross-compat.
@@ -94,6 +120,10 @@ pub struct TokenData {
 /// Resolve `~/.codex/auth.json`. Honours `$CODEX_HOME` if set, matching
 /// Codex CLI's override convention.
 pub fn auth_json_path() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(custom) = TEST_CODEX_HOME.with(|slot| slot.borrow().clone()) {
+        return Ok(custom.join("auth.json"));
+    }
     if let Ok(custom) = std::env::var("CODEX_HOME") {
         return Ok(PathBuf::from(custom).join("auth.json"));
     }
@@ -616,22 +646,12 @@ mod tests {
 
     #[test]
     fn auth_json_path_honours_codex_home_override() {
-        // Save and restore so we don't pollute other tests sharing the env.
-        let prior = std::env::var("CODEX_HOME").ok();
-        unsafe {
-            std::env::set_var("CODEX_HOME", "/tmp/codex-home-test-xyz");
-        }
+        let _scope = TestCodexHomeScope::set(PathBuf::from("/tmp/codex-home-test-xyz"));
         let p = auth_json_path().unwrap();
         assert_eq!(
             p,
             std::path::PathBuf::from("/tmp/codex-home-test-xyz/auth.json")
         );
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
     }
 
     #[test]
