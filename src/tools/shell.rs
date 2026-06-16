@@ -9,11 +9,17 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
+#[cfg(not(target_os = "windows"))]
 const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
+#[cfg(not(target_os = "windows"))]
 const ANVIL_RTK_PROXY_PREFIX_ENV: &str = "ANVIL_RTK_PROXY_PREFIX";
+#[cfg(not(target_os = "windows"))]
 const RTK_HOSTED_ENV: &str = "RTK_HOSTED";
+#[cfg(not(target_os = "windows"))]
 const RTK_TELEMETRY_DISABLED_ENV: &str = "RTK_TELEMETRY_DISABLED";
+#[cfg(not(target_os = "windows"))]
 const RTK_TRACKING_DISABLED_ENV: &str = "RTK_TRACKING_DISABLED";
+#[cfg(not(target_os = "windows"))]
 const ANVIL_RTK_SUBCOMMAND: &str = "__rtk";
 const EXPLICIT_OUTSIDE_SANDBOX_NOTICE: &str =
     "Notice: this command was explicitly approved to run outside the OS sandbox once.";
@@ -378,12 +384,14 @@ fn format_shell_tool_result(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn env_var_truthy(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .is_some_and(|value| env_value_truthy(&value))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn rtk_disabled_in_command_prefix(command: &str) -> bool {
     for token in command.split_whitespace() {
         if token.contains('=') && !token.starts_with('-') {
@@ -397,6 +405,7 @@ fn rtk_disabled_in_command_prefix(command: &str) -> bool {
     false
 }
 
+#[cfg(not(target_os = "windows"))]
 fn env_value_truthy(value: &str) -> bool {
     matches!(
         value
@@ -461,12 +470,6 @@ fn rtk_rewritten_command(command: &str) -> String {
 fn shell_quote_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     format!("'{}'", raw.replace('\'', "'\\''"))
-}
-
-#[cfg(target_os = "windows")]
-fn shell_quote_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("\"{}\"", raw.replace('"', "\\\""))
 }
 
 pub async fn run_shell_command_cancellable(
