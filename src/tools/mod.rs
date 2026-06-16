@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Result of executing a tool.
 pub struct ToolResult {
@@ -24,6 +25,13 @@ pub enum ToolStatus {
     Success,
     RequestError,
     InternalError,
+}
+
+fn cancelled_tool_result(name: &str) -> ToolResult {
+    ToolResult {
+        status: ToolStatus::RequestError,
+        output: format!("Tool '{name}' was cancelled before it completed."),
+    }
 }
 
 /// Single source of truth for per-tool metadata (`ToolKind` for the
@@ -120,6 +128,11 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Scanning symbol usages",
     },
     ToolMeta {
+        name: "semantic_search",
+        kind: ToolKind::Search,
+        display_name: "Searching semantically",
+    },
+    ToolMeta {
         name: "get_file_contents",
         kind: ToolKind::Read,
         display_name: "Reading file contents",
@@ -184,6 +197,56 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Read,
         display_name: "Computing cyclomatic complexity",
     },
+    ToolMeta {
+        name: "compute_cognitive_complexity",
+        kind: ToolKind::Read,
+        display_name: "Computing cognitive complexity",
+    },
+    ToolMeta {
+        name: "report_comment_density_for_code_unit",
+        kind: ToolKind::Read,
+        display_name: "Reporting comment density",
+    },
+    ToolMeta {
+        name: "report_comment_density_for_files",
+        kind: ToolKind::Read,
+        display_name: "Reporting file comment density",
+    },
+    ToolMeta {
+        name: "report_exception_handling_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting exception handling smells",
+    },
+    ToolMeta {
+        name: "report_test_assertion_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting test assertion smells",
+    },
+    ToolMeta {
+        name: "report_structural_clone_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting structural clone smells",
+    },
+    ToolMeta {
+        name: "report_long_method_and_god_object_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting long method and god object smells",
+    },
+    ToolMeta {
+        name: "report_dead_code_and_unused_abstraction_smells",
+        kind: ToolKind::Read,
+        display_name: "Reporting dead code smells",
+    },
+    ToolMeta {
+        name: "report_secret_like_code",
+        kind: ToolKind::Read,
+        display_name: "Reporting secret-like code",
+    },
+    ToolMeta {
+        name: "analyze_git_hotspots",
+        kind: ToolKind::Read,
+        display_name: "Analyzing git hotspots",
+    },
     // `activate_workspace` and `refresh` mutate analyzer state, so they
     // stay `Other` rather than `Read`: prompted in `default`, refused in
     // `readOnly`.
@@ -221,6 +284,21 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Other,
         display_name: "Running subagent",
     },
+];
+
+#[cfg(test)]
+pub(crate) const SLOPCOP_BIFROST_READ_ONLY_TOOLS: &[&str] = &[
+    "compute_cyclomatic_complexity",
+    "compute_cognitive_complexity",
+    "report_comment_density_for_code_unit",
+    "report_comment_density_for_files",
+    "report_exception_handling_smells",
+    "report_test_assertion_smells",
+    "report_structural_clone_smells",
+    "report_long_method_and_god_object_smells",
+    "report_dead_code_and_unused_abstraction_smells",
+    "report_secret_like_code",
+    "analyze_git_hotspots",
 ];
 
 fn tool_meta(name: &str) -> Option<&'static ToolMeta> {
@@ -705,6 +783,66 @@ impl ToolRegistry {
         outside_sandbox_once: bool,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     ) -> ToolResult {
+        self.execute_with_sandbox_mode_cancellable(
+            name,
+            args,
+            policy,
+            outside_sandbox_once,
+            sandbox_mode,
+            None,
+        )
+        .await
+    }
+
+    /// Same as `execute_with_sandbox_mode`, but returns promptly when the
+    /// session cancellation token fires. Shell calls receive the token so
+    /// they can terminate their child process tree instead of waiting for
+    /// the wall-clock timeout.
+    pub(crate) async fn execute_with_sandbox_mode_cancellable(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        policy: SandboxPolicy,
+        outside_sandbox_once: bool,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolResult {
+        if let Some(cancel) = cancel
+            && cancel.is_cancelled()
+        {
+            return cancelled_tool_result(name);
+        }
+
+        let execute = self.execute_with_sandbox_mode_inner(
+            name,
+            args,
+            policy,
+            outside_sandbox_once,
+            sandbox_mode,
+            cancel,
+        );
+        if let Some(cancel) = cancel
+            && name != "run_shell_command"
+        {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => cancelled_tool_result(name),
+                result = execute => result,
+            }
+        } else {
+            execute.await
+        }
+    }
+
+    async fn execute_with_sandbox_mode_inner(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        policy: SandboxPolicy,
+        outside_sandbox_once: bool,
+        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolResult {
         match name {
             "read_file" => {
                 let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -785,12 +923,13 @@ impl ToolRegistry {
                     }
                     _ => self.cwd.clone(),
                 };
-                shell::run_shell_command(
+                shell::run_shell_command_cancellable(
                     &command_cwd,
                     command,
                     timeout_seconds,
                     policy,
                     outside_sandbox_once,
+                    cancel,
                 )
                 .await
             }
@@ -1376,6 +1515,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slopcop_bifrost_reporters_are_read_safe() {
+        for name in SLOPCOP_BIFROST_READ_ONLY_TOOLS {
+            assert_eq!(
+                ToolRegistry::tool_kind(name),
+                ToolKind::Read,
+                "{name} must remain callable in read-only ACP sessions"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shell_tool_schema_hides_sandbox_escalation_by_default() {
         let registry = registry_with_skills(vec![]);
@@ -1464,6 +1614,51 @@ mod tests {
             result.output
         );
         assert_eq!(result.output.trim(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shell_tool_returns_promptly_on_cancellation() {
+        let registry = registry_with_skills(vec![]);
+        let cancel = CancellationToken::new();
+        let cancel_from_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_from_task.cancel();
+        });
+
+        #[cfg(target_os = "windows")]
+        let command = "ping 127.0.0.1 -n 30 > nul";
+        #[cfg(not(target_os = "windows"))]
+        let command = "sleep 30";
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry.execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": command, "timeout": 30_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancelled shell command should return before the test timeout");
+
+        assert!(
+            matches!(result.status, ToolStatus::RequestError),
+            "cancelled shell command should report a request error"
+        );
+        assert!(
+            result.output.contains("cancelled"),
+            "cancelled shell command should explain cancellation; output={}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancelled shell command waited too long"
+        );
     }
 
     /// `task` is gated on having at least one discovered subagent.

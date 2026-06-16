@@ -9,6 +9,14 @@ on:
 permissions:
   contents: write
 
+# Harden cargo's network layer against transient crates.io index fetches that
+# intermittently abort the release with `[16] Error in the HTTP2 framing layer`
+# while curl pulls the sparse index over HTTP/2. Forcing HTTP/1.1 sidesteps the
+# multiplexing bug and the retry bump rides out brief CDN blips.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   build-linux:
     name: Build x86_64-unknown-linux-gnu

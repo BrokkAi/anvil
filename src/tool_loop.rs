@@ -13,6 +13,7 @@ use agent_client_protocol::schema::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +34,8 @@ use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
+const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 
 fn train_bifrost_enabled() -> bool {
     p2t::env_var_truthy(TRAIN_BIFROST_ENV)
@@ -250,14 +253,27 @@ fn trace_usage(usage: TokenUsage) -> serde_json::Value {
 }
 
 #[cfg(test)]
-fn permission_options(tool_name: &str, shell_sandboxed: bool) -> Vec<PermissionOption> {
-    permission_options_for_request(tool_name, shell_sandboxed, false)
+fn permission_options(
+    tool_name: &str,
+    shell_sandboxed: bool,
+    always_allow_label: Option<&str>,
+) -> Vec<PermissionOption> {
+    permission_options_for_request(tool_name, shell_sandboxed, false, always_allow_label)
 }
 
+/// Build the permission-modal options.
+///
+/// For shell commands the prompt never mentions the sandbox (the title already
+/// shows the full command) and the "Always allow" choice is offered only when
+/// `always_allow_label` is `Some` -- i.e. the first sub-command has an
+/// extractable argv prefix that isn't already remembered. The label is the
+/// prefix itself (e.g. `cargo fmt --check`), making clear that approving a
+/// compound command only ever remembers its first command's prefix.
 fn permission_options_for_request(
     tool_name: &str,
     shell_sandboxed: bool,
     sandbox_escalation_requested: bool,
+    always_allow_label: Option<&str>,
 ) -> Vec<PermissionOption> {
     let mut options = Vec::with_capacity(4);
     if tool_name == "run_shell_command" {
@@ -274,26 +290,15 @@ fn permission_options_for_request(
             ));
             return options;
         }
-        if shell_sandboxed {
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow"),
-                "Allow in sandbox",
-                PermissionOptionKind::AllowOnce,
-            ));
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow_always"),
-                "Always allow this command in sandbox",
-                PermissionOptionKind::AllowAlways,
-            ));
-        } else {
-            options.push(PermissionOption::new(
-                PermissionOptionId::new("allow"),
-                "Allow",
-                PermissionOptionKind::AllowOnce,
-            ));
+        options.push(PermissionOption::new(
+            PermissionOptionId::new("allow"),
+            "Allow",
+            PermissionOptionKind::AllowOnce,
+        ));
+        if let Some(label) = always_allow_label {
             options.push(PermissionOption::new(
                 PermissionOptionId::new("allow_always"),
-                "Always allow this command",
+                format!("Always allow {label}"),
                 PermissionOptionKind::AllowAlways,
             ));
         }
@@ -322,9 +327,14 @@ fn permission_grant_for_selection(
     option_id: &str,
     shell_sandboxed: bool,
     sandbox_escalation_requested: bool,
+    always_allow_label: Option<&str>,
 ) -> Result<PermissionGrant, String> {
-    let valid_options =
-        permission_options_for_request(tool_name, shell_sandboxed, sandbox_escalation_requested);
+    let valid_options = permission_options_for_request(
+        tool_name,
+        shell_sandboxed,
+        sandbox_escalation_requested,
+        always_allow_label,
+    );
     if !valid_options
         .iter()
         .any(|option| option.option_id.0.as_ref() == option_id)
@@ -439,6 +449,26 @@ enum PureGateDecision {
     Prompt,
 }
 
+struct GateOutcome {
+    decision: GateDecision,
+    usage: TokenUsage,
+}
+
+impl GateOutcome {
+    fn without_usage(decision: GateDecision) -> Self {
+        Self {
+            decision,
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PermissionScopeClassification {
+    allow: bool,
+    rationale: String,
+}
+
 /// Pure permission-gate logic. Given the snapshot of mode + kind + name +
 /// always-allow membership, decide whether to allow, reject, or escalate to
 /// the user. Kept separate from `consult_gate` so it can be tested in
@@ -491,13 +521,27 @@ fn pure_gate_decision(
     }
 
     // Remembered "Always allow". `consult_gate` chooses the cache key; shell
-    // commands use repo-scoped prefix or exact-command keys, while regular
-    // tools use the tool name.
+    // commands use repo-scoped argv-prefix keys (one per sub-command), while
+    // regular tools use the tool name.
     if is_always_allowed {
         return PureGateDecision::Allow;
     }
 
     PureGateDecision::Prompt
+}
+
+/// Whether the OS-sandbox read-only safelist applies in this context: an
+/// editable mode running shell commands under a real OS sandbox. Both the
+/// whole-command auto-allow and the per-sub-command safelist credit gate on it.
+fn shell_safelist_context(
+    mode: PermissionMode,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
+) -> bool {
+    matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits)
+        && shell_sandboxed
+        && crate::sandbox_backend::resolve_mode(sandbox_mode)
+            == crate::sandbox_backend::SandboxMode::Os
 }
 
 fn should_auto_allow_shell_command(
@@ -506,21 +550,11 @@ fn should_auto_allow_shell_command(
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
 ) -> bool {
-    if !matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits) {
-        return false;
-    }
-    if !shell_sandboxed {
-        return false;
-    }
-    if crate::sandbox_backend::resolve_mode(sandbox_mode) != crate::sandbox_backend::SandboxMode::Os
-    {
-        return false;
-    }
-
-    raw_input
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(is_auto_approvable_sandboxed_shell_command)
+    shell_safelist_context(mode, sandbox_mode, shell_sandboxed)
+        && raw_input
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(is_auto_approvable_sandboxed_shell_command)
 }
 
 fn is_auto_approvable_sandboxed_shell_command(command: &str) -> bool {
@@ -916,74 +950,317 @@ fn push_unique_shell_sandbox_retry_state(
     }
 }
 
-fn always_allow_key(
-    tool_name: &str,
-    raw_input: &Value,
-    cwd: &Path,
-    shell_sandboxed: bool,
-) -> String {
-    if tool_name == "run_shell_command"
-        && let Some(command) = raw_input.get("command").and_then(Value::as_str)
-    {
-        return serde_json::json!({
-            "tool": tool_name,
-            "cwd": cwd.display().to_string(),
-            "command": command,
-            "shellSandboxed": shell_sandboxed,
-        })
-        .to_string();
-    }
+/// Number of leading argv tokens kept as a shell "Always allow" prefix.
+const SHELL_PREFIX_TOKENS: usize = 3;
 
-    tool_name.to_string()
+/// One top-level sub-command of a shell command line.
+struct ShellSegment {
+    /// Leading literal argv tokens, capped at [`SHELL_PREFIX_TOKENS`]; the basis
+    /// for this sub-command's always-allow key.
+    prefix: Vec<String>,
+    /// All of the sub-command's literal argv tokens, present only when the whole
+    /// sub-command is literal (no redirection, glob, or expansion). Used to test
+    /// the built-in read-only safelist; `None` means "not eligible".
+    safe_tokens: Option<Vec<String>>,
 }
 
-fn shell_always_allow_rule_key(raw_input: &Value, shell_sandboxed: bool) -> Option<String> {
-    let command = raw_input.get("command").and_then(Value::as_str)?;
-    if let Some(tokens) = tokenize_simple_shell_command(command) {
-        let argv_prefix: Vec<String> = tokens.into_iter().take(3).collect();
-        if !argv_prefix.is_empty() {
-            return Some(
-                serde_json::json!({
-                    "tool": "run_shell_command",
-                    "rule": "prefix",
-                    "argvPrefix": argv_prefix,
-                    "shellSandboxed": shell_sandboxed,
-                })
-                .to_string(),
+/// Decompose a shell command into its top-level sub-commands -- split on `;`,
+/// `&&`, `||`, and `|`.
+///
+/// A "literal" token carries no redirection, glob, brace, tilde, or parameter
+/// expansion, so each sub-command's `prefix` is the leading run of literal
+/// tokens (capped at [`SHELL_PREFIX_TOKENS`]): trailing `2>&1` redirections and
+/// `$?`-style expansions are excluded rather than stored verbatim. The whole
+/// command is rejected (returns `None`) when it uses command or process
+/// substitution (`` ` ``, `$(`, `<(`, `>(`) anywhere, opens a subshell
+/// `( … )`, has unbalanced quotes, or contains an empty sub-command -- none of
+/// those can be reduced to a prefix we are willing to vouch for, so the caller
+/// must prompt instead of auto-allowing.
+fn shell_command_segments(command: &str) -> Option<Vec<ShellSegment>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum QuoteState {
+        Plain,
+        Single,
+        Double,
+    }
+
+    // Fold the current token into the sub-command. Literal tokens extend both
+    // the capped `prefix` run and the full `all` list; a non-literal token
+    // (redirection/glob/expansion) closes the prefix run and marks the
+    // sub-command "dirty" so it is excluded from the read-only safelist.
+    #[allow(clippy::too_many_arguments)]
+    fn absorb_token(
+        seg_prefix: &mut Vec<String>,
+        seg_all: &mut Vec<String>,
+        seg_closed: &mut bool,
+        seg_dirty: &mut bool,
+        cur: &mut String,
+        cur_started: &mut bool,
+        cur_literal: &mut bool,
+    ) {
+        if *cur_started {
+            if *cur_literal {
+                let token = std::mem::take(cur);
+                if !*seg_closed {
+                    seg_prefix.push(token.clone());
+                    if seg_prefix.len() >= SHELL_PREFIX_TOKENS {
+                        *seg_closed = true;
+                    }
+                }
+                seg_all.push(token);
+            } else {
+                *seg_closed = true;
+                *seg_dirty = true;
+            }
+        }
+        cur.clear();
+        *cur_started = false;
+        *cur_literal = true;
+    }
+
+    let mut state = QuoteState::Plain;
+    let mut chars = command.chars().peekable();
+
+    let mut segments: Vec<ShellSegment> = Vec::new();
+    let mut seg_prefix: Vec<String> = Vec::new();
+    let mut seg_all: Vec<String> = Vec::new();
+    let mut seg_closed = false;
+    let mut seg_dirty = false;
+    let mut cur = String::new();
+    let mut cur_started = false;
+    let mut cur_literal = true;
+
+    // Close the current sub-command. `$is_final` is true only for the flush
+    // after the last char, where a trailing-empty segment (e.g. `cargo build
+    // &&`) is tolerated rather than rejected. Operator arms that continue into a
+    // new segment reset `seg_closed`/`seg_dirty` themselves.
+    macro_rules! end_segment {
+        ($is_final:expr) => {{
+            absorb_token(
+                &mut seg_prefix,
+                &mut seg_all,
+                &mut seg_closed,
+                &mut seg_dirty,
+                &mut cur,
+                &mut cur_started,
+                &mut cur_literal,
             );
+            if seg_prefix.is_empty() {
+                if !$is_final {
+                    return None; // empty sub-command between operators
+                }
+            } else {
+                let safe_tokens = if seg_dirty {
+                    None
+                } else {
+                    Some(std::mem::take(&mut seg_all))
+                };
+                segments.push(ShellSegment {
+                    prefix: std::mem::take(&mut seg_prefix),
+                    safe_tokens,
+                });
+            }
+            seg_all.clear();
+        }};
+    }
+    macro_rules! non_literal_push {
+        ($ch:expr) => {{
+            cur_literal = false;
+            cur_started = true;
+            cur.push($ch);
+        }};
+    }
+    macro_rules! start_next_segment {
+        () => {{
+            seg_closed = false;
+            seg_dirty = false;
+        }};
+    }
+
+    while let Some(ch) = chars.next() {
+        match state {
+            QuoteState::Plain => match ch {
+                '\n' | '\r' => return None,
+                '`' => return None,
+                '$' => {
+                    if chars.peek() == Some(&'(') {
+                        return None; // command substitution
+                    }
+                    non_literal_push!('$');
+                }
+                '<' | '>' => {
+                    if chars.peek() == Some(&'(') {
+                        return None; // process substitution
+                    }
+                    non_literal_push!(ch);
+                }
+                '(' | ')' => return None, // subshell / grouping
+                ';' => {
+                    end_segment!(false);
+                    start_next_segment!();
+                }
+                '|' => {
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    end_segment!(false);
+                    start_next_segment!();
+                }
+                '&' => {
+                    if chars.peek() == Some(&'&') {
+                        chars.next();
+                        end_segment!(false);
+                        start_next_segment!();
+                    } else if chars.peek() == Some(&'>') || cur.ends_with('>') || cur.ends_with('<')
+                    {
+                        // Part of a redirection (`2>&1`, `>&2`, `&>file`): the `&`
+                        // stays inside the current (dirty) token and never starts
+                        // a new command.
+                        non_literal_push!('&');
+                    } else {
+                        // A bare `&` backgrounds the preceding command and runs
+                        // whatever follows as a *separate* command. Decomposing
+                        // would drop that trailing command from the per-sub-command
+                        // analysis while the shell still runs it, so refuse to
+                        // decompose -- the caller then prompts.
+                        return None;
+                    }
+                }
+                '\'' => {
+                    cur_started = true;
+                    state = QuoteState::Single;
+                }
+                '"' => {
+                    cur_started = true;
+                    state = QuoteState::Double;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    cur_started = true;
+                    cur.push(escaped);
+                }
+                '*' | '?' | '[' | ']' | '{' | '}' | '~' | '!' => non_literal_push!(ch),
+                ch if ch.is_whitespace() => absorb_token(
+                    &mut seg_prefix,
+                    &mut seg_all,
+                    &mut seg_closed,
+                    &mut seg_dirty,
+                    &mut cur,
+                    &mut cur_started,
+                    &mut cur_literal,
+                ),
+                ch if ch.is_control() => return None,
+                _ => {
+                    cur_started = true;
+                    cur.push(ch);
+                }
+            },
+            QuoteState::Single => match ch {
+                '\'' => state = QuoteState::Plain,
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => cur.push(ch),
+            },
+            QuoteState::Double => match ch {
+                '"' => state = QuoteState::Plain,
+                '`' => return None,
+                '$' => {
+                    if chars.peek() == Some(&'(') {
+                        return None;
+                    }
+                    cur_literal = false;
+                    cur.push('$');
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' || escaped == '\r' {
+                        return None;
+                    }
+                    cur.push(escaped);
+                }
+                ch if ch.is_control() && ch != '\t' => return None,
+                _ => cur.push(ch),
+            },
         }
     }
 
-    Some(
-        serde_json::json!({
-            "tool": "run_shell_command",
-            "rule": "exact",
-            "command": command,
-            "shellSandboxed": shell_sandboxed,
-        })
-        .to_string(),
-    )
+    if state != QuoteState::Plain {
+        return None; // unbalanced quotes
+    }
+    end_segment!(true);
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
+    }
 }
 
-fn always_allow_lookup_keys(
-    tool_name: &str,
+/// Whether a sub-command is covered by the built-in read-only safelist (`head`,
+/// `tail`, `grep`, `ls`, read-only `git`, …) and therefore needs no remembered
+/// approval. Only fully-literal sub-commands are eligible.
+fn shell_segment_is_safe(segment: &ShellSegment) -> bool {
+    segment
+        .safe_tokens
+        .as_deref()
+        .is_some_and(is_auto_approvable_sandboxed_shell_tokens)
+}
+
+/// Build the repo-scoped always-allow key for one argv prefix. Prefixes are the
+/// only shape ever stored for shell commands -- exact command lines are never
+/// persisted.
+fn shell_prefix_key(argv_prefix: &[String], shell_sandboxed: bool) -> String {
+    serde_json::json!({
+        "tool": "run_shell_command",
+        "rule": "prefix",
+        "argvPrefix": argv_prefix,
+        "shellSandboxed": shell_sandboxed,
+    })
+    .to_string()
+}
+
+/// How a shell command relates to the always-allow list.
+struct ShellAlwaysAllowPlan {
+    /// Prefix keys of every sub-command that still needs an explicit approval --
+    /// i.e. not covered by the built-in read-only safelist. The command skips
+    /// the prompt only when all of these are remembered.
+    required_keys: Vec<String>,
+    /// The first such sub-command's prefix: what "Always allow" stores and
+    /// displays. `None` when every sub-command is already safelist-covered (the
+    /// "Always allow" option is then withheld -- there is nothing to remember).
+    first_required_prefix: Option<Vec<String>>,
+}
+
+/// Build the always-allow plan for a shell command. `safelist_credit` enables
+/// crediting read-only safelist sub-commands (`head`, `tail`, …) as already
+/// allowed; it should mirror the OS-sandbox auto-allow context. `None` if the
+/// command can't be decomposed into prefixes, in which case the caller prompts.
+fn shell_always_allow_plan(
     raw_input: &Value,
-    cwd: &Path,
     shell_sandboxed: bool,
-) -> Vec<String> {
-    if tool_name == "run_shell_command" {
-        let mut keys = Vec::with_capacity(2);
-        if let Some(rule_key) = shell_always_allow_rule_key(raw_input, shell_sandboxed) {
-            keys.push(rule_key);
+    safelist_credit: bool,
+) -> Option<ShellAlwaysAllowPlan> {
+    let command = raw_input.get("command").and_then(Value::as_str)?;
+    let segments = shell_command_segments(command)?;
+
+    let mut required_keys = Vec::new();
+    let mut first_required_prefix = None;
+    for segment in &segments {
+        if safelist_credit && shell_segment_is_safe(segment) {
+            continue;
         }
-        let legacy_key = always_allow_key(tool_name, raw_input, cwd, shell_sandboxed);
-        if !legacy_key.is_empty() {
-            keys.push(legacy_key);
+        if first_required_prefix.is_none() {
+            first_required_prefix = Some(segment.prefix.clone());
         }
-        return keys;
+        required_keys.push(shell_prefix_key(&segment.prefix, shell_sandboxed));
     }
 
-    vec![tool_name.to_string()]
+    Some(ShellAlwaysAllowPlan {
+        required_keys,
+        first_required_prefix,
+    })
 }
 
 /// Decide which sandbox policy to use for an approved tool call.
@@ -1038,6 +1315,7 @@ pub(crate) async fn run(
     spawned_cx: SpawnedCx<'_>,
     session_id: String,
     sessions: SessionStore,
+    original_user_request: String,
     notifications: NotificationMode,
     depth: usize,
 ) -> (String, Vec<ToolExchange>, TokenUsage) {
@@ -1187,6 +1465,7 @@ pub(crate) async fn run(
                 model,
                 reasoning_effort,
                 structured_output,
+                &original_user_request,
                 &calls,
                 &advertised_this_request,
                 &mut messages,
@@ -1478,6 +1757,7 @@ pub(crate) async fn run(
                     model,
                     reasoning_effort,
                     structured_output,
+                    &original_user_request,
                     &calls,
                     &advertised_this_request,
                     &mut messages,
@@ -1692,6 +1972,7 @@ async fn execute_step_tool_calls(
     model: &str,
     reasoning_effort: Option<&str>,
     structured_output: Option<&StructuredOutputRequest>,
+    original_user_request: &str,
     calls: &[ToolCall],
     advertised_this_request: &std::collections::HashSet<String>,
     messages: &mut Vec<ChatMessage>,
@@ -1905,6 +2186,11 @@ async fn execute_step_tool_calls(
             spawned_cx,
             &cancel,
             GateCheck {
+                llm,
+                model,
+                reasoning_effort,
+                original_user_request,
+                idle_timeout,
                 session_id,
                 tool_name: &tool_name,
                 kind,
@@ -1915,6 +2201,8 @@ async fn execute_step_tool_calls(
             },
         )
         .await;
+        turn_usage.add(decision.usage);
+        let decision = decision.decision;
 
         if let Some(index) = consume_shell_sandbox_retry_state {
             available_shell_sandbox_retry_states.remove(index);
@@ -1999,12 +2287,15 @@ async fn execute_step_tool_calls(
                     trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
                     execute_tool(
                         registry,
-                        &tool_name,
-                        parsed_input.clone(),
-                        policy,
-                        outside_sandbox_once,
-                        sandbox_mode,
-                        sandbox_policy_override.is_none() && shell_sandboxed,
+                        ToolExecRequest {
+                            tool_name: &tool_name,
+                            args: parsed_input.clone(),
+                            policy,
+                            outside_sandbox_once,
+                            sandbox_mode,
+                            shell_sandboxed: sandbox_policy_override.is_none() && shell_sandboxed,
+                            cancel: &cancel,
+                        },
                     )
                     .await
                 };
@@ -2094,6 +2385,10 @@ struct PureGateEvaluation {
     decision: PureGateDecision,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
+    /// Whether read-only safelist sub-commands count as already-allowed in this
+    /// context. Threaded to the prompt path so the "Always allow" key/label is
+    /// computed the same way the gate decided to prompt.
+    safelist_credit: bool,
 }
 
 async fn evaluate_pure_gate(
@@ -2141,17 +2436,35 @@ async fn evaluate_pure_gate(
     let shell_auto_allow = tool_name == "run_shell_command"
         && !sandbox_escalation_requested
         && should_auto_allow_shell_command(raw_input, mode, sandbox_mode, shell_sandboxed);
-    let always_allow_keys = always_allow_lookup_keys(tool_name, raw_input, cwd, shell_sandboxed);
-    let is_always_allowed = !sandbox_escalation_requested
-        && sessions
-            .is_any_always_allowed(session_id, &always_allow_keys)
-            .await;
+    let safelist_credit = tool_name == "run_shell_command"
+        && shell_safelist_context(mode, sandbox_mode, shell_sandboxed);
+    let is_always_allowed = if sandbox_escalation_requested {
+        false
+    } else if tool_name == "run_shell_command" {
+        // Each sub-command must be either remembered or covered by the read-only
+        // safelist; otherwise we prompt. A command we can't decompose into
+        // prefixes (substitution, subshell, …) always prompts.
+        match shell_always_allow_plan(raw_input, shell_sandboxed, safelist_credit) {
+            Some(plan) => {
+                plan.required_keys.is_empty()
+                    || sessions
+                        .are_all_always_allowed(session_id, &plan.required_keys)
+                        .await
+            }
+            None => false,
+        }
+    } else {
+        sessions
+            .is_any_always_allowed(session_id, &[tool_name.to_string()])
+            .await
+    };
     let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
 
     Ok(PureGateEvaluation {
         decision,
         sandbox_mode,
         shell_sandboxed,
+        safelist_credit,
     })
 }
 
@@ -2197,7 +2510,7 @@ async fn consult_gate(
     spawned_cx: &SpawnedCx<'_>,
     cancel: &CancellationToken,
     request: GateCheck<'_>,
-) -> GateDecision {
+) -> GateOutcome {
     let evaluation = match evaluate_pure_gate(
         sessions,
         request.session_id,
@@ -2210,69 +2523,314 @@ async fn consult_gate(
     .await
     {
         Ok(evaluation) => evaluation,
-        Err(reason) => return GateDecision::Reject(reason),
+        Err(reason) => return GateOutcome::without_usage(GateDecision::Reject(reason)),
     };
 
     match evaluation.decision {
-        PureGateDecision::Allow => GateDecision::Allow {
+        PureGateDecision::Allow => GateOutcome::without_usage(GateDecision::Allow {
             sandbox_policy_override: None,
             sandbox_mode: evaluation.sandbox_mode,
             shell_sandboxed: evaluation.shell_sandboxed,
-        },
-        PureGateDecision::Reject(msg) => GateDecision::Reject(msg),
+        }),
+        PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
         PureGateDecision::Prompt => {
-            match request_user_permission(
-                spawned_cx,
-                cancel,
-                PermissionRequest {
-                    session_id: request.session_id,
-                    tool_name: request.tool_name,
-                    kind: request.kind,
-                    tool_call_id: request.tool_call_id,
-                    raw_input: request.raw_input,
-                    shell_sandboxed: evaluation.shell_sandboxed,
-                    sandbox_escalation_requested: shell_sandbox_escalation_requested(
-                        request.raw_input,
-                    ),
+            let escalation_requested = shell_sandbox_escalation_requested(request.raw_input);
+            if !escalation_requested
+                && (request.tool_name != "run_shell_command" || evaluation.shell_sandboxed)
+                && let Some((classification, usage)) =
+                    classify_permission_scope_with_model(&request, cancel).await
+            {
+                if classification.allow {
+                    tracing::info!(
+                        session_id = request.session_id,
+                        tool_name = request.tool_name,
+                        rationale = %classification.rationale,
+                        "permission gate: auto-classifier approved tool call for this turn"
+                    );
+                    return GateOutcome {
+                        decision: GateDecision::Allow {
+                            sandbox_policy_override: None,
+                            sandbox_mode: evaluation.sandbox_mode,
+                            shell_sandboxed: evaluation.shell_sandboxed,
+                        },
+                        usage,
+                    };
+                }
+                tracing::info!(
+                    session_id = request.session_id,
+                    tool_name = request.tool_name,
+                    rationale = %classification.rationale,
+                    "permission gate: auto-classifier declined to approve tool call; prompting user"
+                );
+                // Preserve token accounting while falling back to the human prompt.
+                return GateOutcome {
+                    decision: match request_user_permission_with_evaluation(
+                        sessions,
+                        spawned_cx,
+                        cancel,
+                        request,
+                        evaluation,
+                        escalation_requested,
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(reason) => GateDecision::Reject(reason),
+                    },
+                    usage,
+                };
+            }
+            GateOutcome::without_usage(
+                match request_user_permission_with_evaluation(
+                    sessions,
+                    spawned_cx,
+                    cancel,
+                    request,
+                    evaluation,
+                    escalation_requested,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(reason) => GateDecision::Reject(reason),
                 },
             )
-            .await
-            {
-                Ok(grant) => {
-                    // Awaited inline so the next tool call in the same batch
-                    // sees the updated set without re-prompting.
-                    if grant.allow_always && grant.sandbox_policy_override.is_none() {
-                        if request.tool_name == "run_shell_command" {
-                            if let Some(rule_key) = shell_always_allow_rule_key(
-                                request.raw_input,
-                                evaluation.shell_sandboxed,
-                            ) {
-                                sessions
-                                    .add_always_allow(request.session_id, &rule_key)
-                                    .await;
-                            }
-                        } else {
-                            sessions
-                                .add_always_allow(request.session_id, request.tool_name)
-                                .await;
-                        }
-                    }
-                    GateDecision::Allow {
-                        sandbox_policy_override: grant.sandbox_policy_override,
-                        sandbox_mode: evaluation.sandbox_mode,
-                        shell_sandboxed: evaluation.shell_sandboxed,
-                    }
-                }
-                Err(reason) => GateDecision::Reject(reason),
-            }
         }
     }
+}
+
+async fn request_user_permission_with_evaluation(
+    sessions: &SessionStore,
+    spawned_cx: &SpawnedCx<'_>,
+    cancel: &CancellationToken,
+    request: GateCheck<'_>,
+    evaluation: PureGateEvaluation,
+    escalation_requested: bool,
+) -> Result<GateDecision, String> {
+    // "Always allow" remembers the first sub-command that actually needs
+    // remembering (safelist sub-commands like `tail` are skipped).
+    let shell_always_allow_prefix =
+        if request.tool_name == "run_shell_command" && !escalation_requested {
+            shell_always_allow_plan(
+                request.raw_input,
+                evaluation.shell_sandboxed,
+                evaluation.safelist_credit,
+            )
+            .and_then(|plan| plan.first_required_prefix)
+        } else {
+            None
+        };
+    // Offer it only when that prefix isn't already remembered: if it is,
+    // a *different* sub-command is forcing the prompt, so remembering the
+    // first prefix again wouldn't help.
+    let always_allow_label = match &shell_always_allow_prefix {
+        Some(prefix) => {
+            let key = shell_prefix_key(prefix, evaluation.shell_sandboxed);
+            if sessions
+                .is_any_always_allowed(request.session_id, std::slice::from_ref(&key))
+                .await
+            {
+                None
+            } else {
+                Some(prefix.join(" "))
+            }
+        }
+        None => None,
+    };
+    let grant = request_user_permission(
+        spawned_cx,
+        cancel,
+        PermissionRequest {
+            session_id: request.session_id,
+            tool_name: request.tool_name,
+            kind: request.kind,
+            tool_call_id: request.tool_call_id,
+            raw_input: request.raw_input,
+            shell_sandboxed: evaluation.shell_sandboxed,
+            sandbox_escalation_requested: escalation_requested,
+            always_allow_label,
+        },
+    )
+    .await?;
+
+    // Awaited inline so the next tool call in the same batch sees the updated
+    // set without re-prompting.
+    if grant.allow_always && grant.sandbox_policy_override.is_none() {
+        if request.tool_name == "run_shell_command" {
+            if let Some(prefix) = &shell_always_allow_prefix {
+                let key = shell_prefix_key(prefix, evaluation.shell_sandboxed);
+                sessions.add_always_allow(request.session_id, &key).await;
+            }
+        } else {
+            sessions
+                .add_always_allow(request.session_id, request.tool_name)
+                .await;
+        }
+    }
+    Ok(GateDecision::Allow {
+        sandbox_policy_override: grant.sandbox_policy_override,
+        sandbox_mode: evaluation.sandbox_mode,
+        shell_sandboxed: evaluation.shell_sandboxed,
+    })
+}
+
+async fn classify_permission_scope_with_model(
+    request: &GateCheck<'_>,
+    cancel: &CancellationToken,
+) -> Option<(PermissionScopeClassification, TokenUsage)> {
+    if request.original_user_request.trim().is_empty() {
+        return None;
+    }
+
+    let raw_input = truncate_for_permission_classifier(
+        &serde_json::to_string_pretty(request.raw_input)
+            .unwrap_or_else(|_| request.raw_input.to_string()),
+    );
+    let user_request = truncate_for_permission_classifier(request.original_user_request);
+    let action_title = truncate_for_permission_classifier(&announce::permission_prompt_title(
+        request.tool_name,
+        request.raw_input,
+    ));
+    let prompt = format!(
+        "Original user request:\n{user_request}\n\n\
+         Proposed tool call:\n\
+         - tool: {tool}\n\
+         - kind: {kind:?}\n\
+         - cwd: {cwd}\n\
+         - title: {action_title}\n\
+         - input JSON:\n{raw_input}\n\n\
+         Decide whether the proposed tool call is clearly within the scope of \
+         the original user request.",
+        tool = request.tool_name,
+        kind = request.kind,
+        cwd = request.cwd.display(),
+    );
+    let messages = vec![
+        ChatMessage::system(AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT),
+        ChatMessage::user(prompt),
+    ];
+    let result = request
+        .llm
+        .stream_chat(StreamChatRequest {
+            model: request.model.to_string(),
+            messages,
+            tools: None,
+            reasoning_effort: request.reasoning_effort.map(str::to_string),
+            temperature: None,
+            structured_output: Some(permission_classifier_schema().clone()),
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel.clone(),
+            idle_timeout: request
+                .idle_timeout
+                .min(AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT),
+        })
+        .await;
+
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                session_id = request.session_id,
+                tool_name = request.tool_name,
+                "permission auto-classifier failed; falling back to user prompt: {error:#}"
+            );
+            return None;
+        }
+    };
+    let usage = response.usage();
+    let text = match response {
+        LlmResponse::Text { text, .. } => text,
+        LlmResponse::ToolCalls { .. } => {
+            tracing::warn!(
+                session_id = request.session_id,
+                tool_name = request.tool_name,
+                "permission auto-classifier returned tool calls; falling back to user prompt"
+            );
+            return None;
+        }
+    };
+    match parse_permission_scope_classification(&text) {
+        Some(classification) => Some((classification, usage)),
+        None => {
+            tracing::warn!(
+                session_id = request.session_id,
+                tool_name = request.tool_name,
+                output = %truncate_for_permission_classifier(&text),
+                "permission auto-classifier returned invalid JSON; falling back to user prompt"
+            );
+            None
+        }
+    }
+}
+
+const AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT: &str = "\
+You are a conservative permission scope classifier for a coding agent.\n\
+Return JSON only.\n\
+\n\
+Set allow=true only when the proposed tool call is a direct, ordinary, and \
+reasonably necessary step toward the user's original request. Examples include \
+editing files the user asked to change, running focused tests, inspecting \
+nearby code, or using a helper tool whose purpose matches the task.\n\
+\n\
+Set allow=false when the action starts a new task, broadens the request, \
+changes credentials or secrets, performs unrelated destructive work, asks for \
+outside-sandbox execution, spends money, publishes externally, or is ambiguous.\n\
+\n\
+The classifier only grants one tool call. It must not approve based on what \
+would be convenient for the agent; it must be clearly covered by the user.";
+
+fn permission_classifier_schema() -> &'static StructuredOutputRequest {
+    static SCHEMA: std::sync::OnceLock<StructuredOutputRequest> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| StructuredOutputRequest {
+        schema_name: "permission_scope_classification".to_string(),
+        allow_coercion: false,
+        schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allow", "rationale"],
+            "properties": {
+                "allow": {
+                    "type": "boolean",
+                    "description": "True only when the tool call is clearly within the original user request."
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "A short reason for the decision."
+                }
+            }
+        }),
+    })
+}
+
+fn parse_permission_scope_classification(text: &str) -> Option<PermissionScopeClassification> {
+    let classification: PermissionScopeClassification = serde_json::from_str(text.trim()).ok()?;
+    if classification.rationale.trim().is_empty() {
+        return None;
+    }
+    Some(classification)
+}
+
+fn truncate_for_permission_classifier(text: &str) -> String {
+    if text.len() <= AUTO_PERMISSION_CLASSIFIER_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut end = AUTO_PERMISSION_CLASSIFIER_MAX_CHARS;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... truncated", &text[..end])
 }
 
 /// Send `session/request_permission` to the client and await the outcome.
 /// Returns `Ok(grant)` if the user approved (with or without remembering),
 /// or `Err(reason)` describing the rejection or transport failure.
 struct GateCheck<'a> {
+    llm: &'a Arc<dyn LlmBackend>,
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+    original_user_request: &'a str,
+    idle_timeout: Duration,
     session_id: &'a str,
     tool_name: &'a str,
     kind: ToolKind,
@@ -2290,6 +2848,9 @@ struct PermissionRequest<'a> {
     raw_input: &'a Value,
     shell_sandboxed: bool,
     sandbox_escalation_requested: bool,
+    /// `Some(prefix)` offers a shell "Always allow <prefix>" choice; `None`
+    /// withholds it (non-shell tools ignore this and always offer their own).
+    always_allow_label: Option<String>,
 }
 
 async fn request_user_permission(
@@ -2305,6 +2866,7 @@ async fn request_user_permission(
         raw_input,
         shell_sandboxed,
         sandbox_escalation_requested,
+        always_allow_label,
     } = request;
 
     // The permission modal needs to show *what* is being approved, not just
@@ -2337,8 +2899,12 @@ async fn request_user_permission(
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 
-    let options =
-        permission_options_for_request(tool_name, shell_sandboxed, sandbox_escalation_requested);
+    let options = permission_options_for_request(
+        tool_name,
+        shell_sandboxed,
+        sandbox_escalation_requested,
+        always_allow_label.as_deref(),
+    );
 
     let request = RequestPermissionRequest::new(session_id.to_string(), tool_call, options);
     emit_terminal_notification(TerminalNotificationEvent::Prompt);
@@ -2371,6 +2937,7 @@ async fn request_user_permission(
                     id,
                     shell_sandboxed,
                     sandbox_escalation_requested,
+                    always_allow_label.as_deref(),
                 )
             }
             RequestPermissionOutcome::Cancelled => Err(
@@ -2659,19 +3226,33 @@ fn maybe_text_navigation_gate(
 /// Run the tool against the registry and format the result for the LLM.
 /// Arg-parse failure is handled in the caller so it can render a Failed
 /// card; this function only sees already-parsed inputs.
-async fn execute_tool(
-    registry: &ToolRegistry,
-    tool_name: &str,
+struct ToolExecRequest<'a> {
+    tool_name: &'a str,
     args: Value,
     policy: SandboxPolicy,
     outside_sandbox_once: bool,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
-) -> ToolExecution {
+    cancel: &'a CancellationToken,
+}
+
+async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
     let result = registry
-        .execute_with_sandbox_mode(tool_name, args, policy, outside_sandbox_once, sandbox_mode)
+        .execute_with_sandbox_mode_cancellable(
+            request.tool_name,
+            request.args,
+            request.policy,
+            request.outside_sandbox_once,
+            request.sandbox_mode,
+            Some(request.cancel),
+        )
         .await;
-    tool_result_to_execution(tool_name, shell_sandboxed, outside_sandbox_once, result)
+    tool_result_to_execution(
+        request.tool_name,
+        request.shell_sandboxed,
+        request.outside_sandbox_once,
+        result,
+    )
 }
 
 fn tool_result_to_execution(
@@ -2889,6 +3470,7 @@ async fn execute_subagent(
         SpawnedCx::new(spawned_cx.cx()),
         session_id.to_string(),
         sessions.clone(),
+        prompt.to_string(),
         NotificationMode::Silent,
         depth,
     ))
@@ -3114,10 +3696,106 @@ mod tests {
         }
     }
 
+    struct StaticClassifierBackend {
+        response: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for StaticClassifierBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let response = self.response.to_string();
+            let calls = self.calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(request.tools.is_none());
+                assert!(request.structured_output.is_some());
+                assert!(
+                    request.messages[1]
+                        .content_text()
+                        .contains("Original user request:")
+                );
+                Ok(LlmResponse::Text {
+                    text: response,
+                    usage: TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        thought_tokens: 1,
+                        cached_read_tokens: 0,
+                        cached_write_tokens: 0,
+                    },
+                })
+            }
+            .boxed()
+        }
+    }
+
     fn text_sink_for_test(buffer: Arc<Mutex<String>>) -> TextSink {
         Arc::new(Mutex::new(move |text: &str| {
             buffer.lock().unwrap().push_str(text);
         }))
+    }
+
+    #[test]
+    fn permission_scope_classification_requires_valid_json_and_rationale() {
+        assert!(parse_permission_scope_classification("not json").is_none());
+        assert!(
+            parse_permission_scope_classification(r#"{"allow":true,"rationale":""}"#).is_none()
+        );
+
+        let parsed =
+            parse_permission_scope_classification(r#"{"allow":false,"rationale":"too broad"}"#)
+                .expect("valid classifier JSON should parse");
+        assert!(!parsed.allow);
+        assert_eq!(parsed.rationale, "too broad");
+    }
+
+    #[test]
+    fn permission_classifier_truncation_preserves_utf8_boundary() {
+        let text = "é".repeat(AUTO_PERMISSION_CLASSIFIER_MAX_CHARS);
+        let truncated = truncate_for_permission_classifier(&text);
+        assert!(truncated.ends_with("\n... truncated"));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[tokio::test]
+    async fn permission_auto_classifier_uses_model_and_returns_usage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(StaticClassifierBackend {
+            response: r#"{"allow":true,"rationale":"focused test command"}"#,
+            calls: calls.clone(),
+        });
+        let raw_input = serde_json::json!({"command": "cargo test"});
+        let request = GateCheck {
+            llm: &llm,
+            model: "test-model",
+            reasoning_effort: None,
+            original_user_request: "fix the failing tests",
+            idle_timeout: Duration::from_secs(300),
+            session_id: "session",
+            tool_name: "run_shell_command",
+            kind: ToolKind::Execute,
+            tool_call_id: "call",
+            raw_input: &raw_input,
+            cwd: Path::new("/tmp/project"),
+            shell_sandbox_retry_states: &[],
+        };
+
+        let (classification, usage) =
+            classify_permission_scope_with_model(&request, &CancellationToken::new())
+                .await
+                .expect("classifier should parse valid model output");
+
+        assert!(classification.allow);
+        assert_eq!(classification.rationale, "focused test command");
+        assert_eq!(usage.total_tokens(), 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn decide(
@@ -4345,26 +5023,47 @@ mod tests {
     }
 
     #[test]
-    fn shell_permission_prompt_omits_explicit_outside_sandbox_choice_by_default() {
-        let options = permission_options("run_shell_command", true);
-        let labels: Vec<_> = options
+    fn shell_permission_prompt_omits_sandbox_language_and_uses_prefix_label() {
+        // Sandboxed and unsandboxed prompts read identically now: no sandbox
+        // text, and "Always allow" carries the first sub-command's prefix.
+        for shell_sandboxed in [true, false] {
+            let options = permission_options(
+                "run_shell_command",
+                shell_sandboxed,
+                Some("cargo fmt --check"),
+            );
+            let labels: Vec<_> = options
+                .iter()
+                .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+                .collect();
+
+            assert_eq!(
+                labels,
+                vec![
+                    ("allow", "Allow"),
+                    ("allow_always", "Always allow cargo fmt --check"),
+                    ("reject", "Reject"),
+                ],
+                "shell_sandboxed={shell_sandboxed}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_permission_prompt_hides_always_allow_without_prefix() {
+        // No extractable/offerable prefix -> no "Always allow" choice.
+        let options = permission_options("run_shell_command", true, None);
+        let ids: Vec<_> = options
             .iter()
-            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
+            .map(|option| option.option_id.0.as_ref())
             .collect();
 
-        assert_eq!(
-            labels,
-            vec![
-                ("allow", "Allow in sandbox"),
-                ("allow_always", "Always allow this command in sandbox"),
-                ("reject", "Reject"),
-            ]
-        );
+        assert_eq!(ids, vec!["allow", "reject"]);
     }
 
     #[test]
     fn shell_permission_prompt_includes_explicit_outside_sandbox_choice_when_requested() {
-        let options = permission_options_for_request("run_shell_command", true, true);
+        let options = permission_options_for_request("run_shell_command", true, true, None);
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -4380,28 +5079,25 @@ mod tests {
     }
 
     #[test]
-    fn shell_permission_prompt_omits_sandbox_language_when_disabled() {
-        let options = permission_options("run_shell_command", false);
-        let labels: Vec<_> = options
-            .iter()
-            .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
-            .collect();
-
-        assert_eq!(
-            labels,
-            vec![
-                ("allow", "Allow"),
-                ("allow_always", "Always allow this command"),
-                ("reject", "Reject"),
-            ]
-        );
+    fn shell_allow_always_choice_is_rejected_when_not_offered() {
+        // Selecting "allow_always" when no prefix label was offered must not
+        // smuggle in an approval.
+        let err =
+            permission_grant_for_selection("run_shell_command", "allow_always", true, false, None)
+                .expect_err("allow_always must be rejected when it was not offered");
+        assert!(err.contains("unknown option"), "got: {err}");
     }
 
     #[test]
     fn shell_allow_always_choice_maps_to_sandboxed_session_approval() {
-        let grant =
-            permission_grant_for_selection("run_shell_command", "allow_always", true, false)
-                .expect("shell sticky sandbox approval should be accepted");
+        let grant = permission_grant_for_selection(
+            "run_shell_command",
+            "allow_always",
+            true,
+            false,
+            Some("cargo fmt --check"),
+        )
+        .expect("shell sticky sandbox approval should be accepted");
 
         assert_eq!(
             grant,
@@ -4412,64 +5108,137 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_always_allow_key_is_command_and_cwd_scoped() {
-        let cwd = Path::new("/tmp/project");
-        let first = always_allow_key(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test", "timeout": 60}),
-            cwd,
-            true,
-        );
-        let same_without_timeout = always_allow_key(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test"}),
-            cwd,
-            true,
-        );
-        let different_command = always_allow_key(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo check"}),
-            cwd,
-            true,
-        );
-        let different_cwd = always_allow_key(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test"}),
-            Path::new("/tmp/other"),
-            true,
-        );
-        let different_sandbox_mode = always_allow_key(
-            "run_shell_command",
-            &serde_json::json!({"command": "cargo test"}),
-            cwd,
-            false,
-        );
-
-        assert_eq!(first, same_without_timeout);
-        assert_ne!(first, different_command);
-        assert_ne!(first, different_cwd);
-        assert_ne!(first, different_sandbox_mode);
+    // Convenience: the leading argv prefix of each sub-command.
+    fn segment_prefixes(command: &str) -> Option<Vec<Vec<String>>> {
+        Some(
+            shell_command_segments(command)?
+                .into_iter()
+                .map(|segment| segment.prefix)
+                .collect(),
+        )
     }
 
     #[test]
-    fn shell_repo_always_allow_rule_uses_first_three_tokens() {
-        let key = shell_always_allow_rule_key(
-            &serde_json::json!({"command": "cargo test --workspace --lib"}),
-            true,
-        )
-        .expect("shell rule key");
+    fn shell_first_command_prefix_strips_redirections_and_pipes() {
+        let cases: [(&str, &[&str]); 6] = [
+            // Trailing `2>&1 | …` is excluded; the first command's prefix stands.
+            (
+                "cargo fmt --check 2>&1 | tail -5",
+                &["cargo", "fmt", "--check"],
+            ),
+            (
+                "cargo test --workspace --lib",
+                &["cargo", "test", "--workspace"],
+            ),
+            (
+                "git status --short && git diff -- x",
+                &["git", "status", "--short"],
+            ),
+            ("cargo fmt && cargo clippy", &["cargo", "fmt"]),
+            ("tail -5 file", &["tail", "-5", "file"]),
+            // `$?` keeps the literal head; expansion just closes the prefix.
+            ("echo done $?", &["echo", "done"]),
+        ];
+        for (command, want) in cases {
+            let got = segment_prefixes(command).expect(command);
+            assert_eq!(got[0], want, "command={command}");
+        }
+    }
 
+    #[test]
+    fn shell_command_segments_split_each_subcommand() {
         assert_eq!(
-            key,
-            serde_json::json!({
-                "tool": "run_shell_command",
-                "rule": "prefix",
-                "argvPrefix": ["cargo", "test", "--workspace"],
-                "shellSandboxed": true,
-            })
-            .to_string()
+            segment_prefixes("cargo fmt && cargo clippy --all-targets | tail -8")
+                .expect("prefixes"),
+            vec![
+                vec!["cargo".to_string(), "fmt".to_string()],
+                vec![
+                    "cargo".to_string(),
+                    "clippy".to_string(),
+                    "--all-targets".to_string()
+                ],
+                vec!["tail".to_string(), "-8".to_string()],
+            ]
         );
+    }
+
+    #[test]
+    fn shell_command_segments_reject_unsafe_or_malformed() {
+        for command in [
+            "echo $(rm -rf /)",       // command substitution
+            "echo `whoami`",          // backtick substitution
+            "diff <(a) <(b)",         // process substitution
+            "(cd /tmp && ls)",        // subshell
+            "a || | b",               // empty middle sub-command
+            "   ",                    // no command
+            "\"unbalanced",           // unbalanced quote
+            "cargo build & rm -rf ~", // background `&` hides a second command
+            "true & true & rm -rf /", // chained backgrounding
+            "ls &",                   // trailing background
+            "a |& b",                 // pipe-both then background
+        ] {
+            assert!(
+                shell_command_segments(command).is_none(),
+                "expected None for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_background_ampersand_never_rides_a_remembered_prefix() {
+        // A bare `&` backgrounds the head and runs the rest as a separate
+        // command the shell still executes. Decomposing would drop it from the
+        // analysis, so the whole line must refuse to decompose (-> prompt) even
+        // when the first sub-command's prefix is remembered.
+        let bg = serde_json::json!({"command": "cargo build & rm -rf ~"});
+        assert!(shell_always_allow_plan(&bg, true, true).is_none());
+        assert!(shell_always_allow_plan(&bg, true, false).is_none());
+
+        // But `&` inside a redirection (`2>&1`) is preserved, not rejected.
+        let redir = serde_json::json!({"command": "cargo test --lib 2>&1 | tail -40"});
+        let plan = shell_always_allow_plan(&redir, true, true).expect("redirection plan");
+        assert_eq!(
+            plan.required_keys,
+            vec![shell_prefix_key(
+                &["cargo".into(), "test".into(), "--lib".into()],
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn shell_plan_required_keys_skip_safelisted_subcommands_only_with_credit() {
+        // `cargo test … | tail` mixes a non-safe head with a safe tail.
+        let raw = serde_json::json!({"command": "cargo test --lib 2>&1 | tail -40"});
+        let cargo_key = shell_prefix_key(&["cargo".into(), "test".into(), "--lib".into()], true);
+        let tail_key = shell_prefix_key(&["tail".into(), "-40".into()], true);
+
+        // No credit: every sub-command must be remembered.
+        let no_credit = shell_always_allow_plan(&raw, true, false).expect("plan");
+        assert_eq!(no_credit.required_keys, vec![cargo_key.clone(), tail_key]);
+
+        // With credit: `tail` is covered by the built-in safelist, so only the
+        // cargo prefix needs remembering -- and that's what "Always allow" stores.
+        let with_credit = shell_always_allow_plan(&raw, true, true).expect("plan");
+        assert_eq!(with_credit.required_keys, vec![cargo_key]);
+        assert_eq!(
+            with_credit.first_required_prefix,
+            Some(vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "--lib".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn shell_plan_is_empty_when_every_subcommand_is_safelisted() {
+        // `grep … | head` is entirely read-only: nothing to remember, and no
+        // "Always allow" prefix to offer.
+        let raw = serde_json::json!({"command": "grep foo file | head -5"});
+        let plan = shell_always_allow_plan(&raw, true, true).expect("plan");
+        assert!(plan.required_keys.is_empty());
+        assert!(plan.first_required_prefix.is_none());
     }
 
     #[test]
@@ -4479,6 +5248,7 @@ mod tests {
             "allow_outside_sandbox",
             true,
             true,
+            None,
         )
         .expect("shell override should be accepted");
 
@@ -4494,8 +5264,9 @@ mod tests {
     #[test]
     fn shell_escalation_prompt_rejects_sticky_sandbox_options() {
         for option_id in ["allow", "allow_always"] {
-            let err = permission_grant_for_selection("run_shell_command", option_id, true, true)
-                .expect_err("escalation prompt must reject options it did not offer");
+            let err =
+                permission_grant_for_selection("run_shell_command", option_id, true, true, None)
+                    .expect_err("escalation prompt must reject options it did not offer");
             assert!(err.contains("unknown option"), "got: {err}");
         }
     }
@@ -4507,6 +5278,7 @@ mod tests {
             "allow_outside_sandbox",
             false,
             true,
+            None,
         )
         .expect_err("outside-sandbox option is not valid when shell sandboxing is disabled");
         assert!(err.contains("unknown option"), "got: {err}");
@@ -4574,7 +5346,7 @@ mod tests {
 
     #[test]
     fn non_shell_permission_prompt_keeps_sticky_allow_and_no_override() {
-        let options = permission_options("write_file", false);
+        let options = permission_options("write_file", false, None);
         let labels: Vec<_> = options
             .iter()
             .map(|option| (option.option_id.0.as_ref(), option.name.as_str()))
@@ -4589,8 +5361,9 @@ mod tests {
             ]
         );
 
-        let grant = permission_grant_for_selection("write_file", "allow_always", false, false)
-            .expect("non-shell sticky allow should still be accepted");
+        let grant =
+            permission_grant_for_selection("write_file", "allow_always", false, false, None)
+                .expect("non-shell sticky allow should still be accepted");
         assert_eq!(
             grant,
             PermissionGrant {
