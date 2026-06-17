@@ -2535,10 +2535,17 @@ async fn consult_gate(
         PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
         PureGateDecision::Prompt => {
             let escalation_requested = shell_sandbox_escalation_requested(request.raw_input);
-            if !escalation_requested
-                && (request.tool_name != "run_shell_command" || evaluation.shell_sandboxed)
-                && let Some((classification, usage)) =
-                    classify_permission_scope_with_model(&request, cancel).await
+            let auto_permission_classifier = sessions
+                .auto_permission_classifier(request.session_id)
+                .await
+                .unwrap_or(false);
+            if should_run_permission_auto_classifier(
+                auto_permission_classifier,
+                request.tool_name,
+                evaluation.shell_sandboxed,
+                escalation_requested,
+            ) && let Some((classification, usage)) =
+                classify_permission_scope_with_model(&request, cancel).await
             {
                 if classification.allow {
                     tracing::info!(
@@ -2597,6 +2604,15 @@ async fn consult_gate(
             )
         }
     }
+}
+
+fn should_run_permission_auto_classifier(
+    enabled: bool,
+    tool_name: &str,
+    shell_sandboxed: bool,
+    escalation_requested: bool,
+) -> bool {
+    enabled && !escalation_requested && (tool_name != "run_shell_command" || shell_sandboxed)
 }
 
 async fn request_user_permission_with_evaluation(
@@ -3796,6 +3812,34 @@ mod tests {
         assert_eq!(classification.rationale, "focused test command");
         assert_eq!(usage.total_tokens(), 6);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn permission_auto_classifier_is_opt_in() {
+        assert!(!should_run_permission_auto_classifier(
+            false,
+            "write_file",
+            false,
+            false
+        ));
+        assert!(should_run_permission_auto_classifier(
+            true,
+            "write_file",
+            false,
+            false
+        ));
+        assert!(!should_run_permission_auto_classifier(
+            true,
+            "run_shell_command",
+            false,
+            false
+        ));
+        assert!(!should_run_permission_auto_classifier(
+            true,
+            "run_shell_command",
+            true,
+            true
+        ));
     }
 
     fn decide(

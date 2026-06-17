@@ -476,6 +476,14 @@ pub struct SessionManifest {
         rename = "brokkModel"
     )]
     pub model: Option<String>,
+    /// Brokk ACP-specific: whether the session may use the active model to
+    /// approve promptable permission checks. Defaults to false when absent.
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        rename = "brokkAutoPermissionClassifier"
+    )]
+    pub auto_permission_classifier: bool,
     /// Brokk ACP-specific: additional MCP server configuration for this
     /// session, supplied by ACP `session/new`.
     ///
@@ -505,6 +513,10 @@ fn default_version() -> String {
     "4.0".to_string()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ---------------------------------------------------------------------------
 // Per-session state (in-memory)
 // ---------------------------------------------------------------------------
@@ -519,6 +531,11 @@ pub struct Session {
     pub history: Vec<ConversationTurn>,
     pub manifest: SessionManifest,
     pub permission_mode: PermissionMode,
+    /// When true, promptable permission checks may ask the active model to
+    /// classify whether a tool call is clearly inside the user's current
+    /// request. Disabled by default so "default" permission mode still means
+    /// the user is asked before each promptable call.
+    pub auto_permission_classifier: bool,
     /// Effective sandbox mode override for this session. Controls both
     /// shell command wrapping (OS sandbox: bwrap / seatbelt) and parsing
     /// backend (wasm vs native). `None` means use the global default
@@ -663,6 +680,7 @@ impl Session {
             } else {
                 Some(model.clone())
             },
+            auto_permission_classifier: false,
             brokk_mcp_servers: None,
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
@@ -676,6 +694,7 @@ impl Session {
             history: Vec::new(),
             manifest,
             permission_mode,
+            auto_permission_classifier: false,
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
@@ -696,10 +715,11 @@ impl Session {
     ///
     /// SECURITY: transient fields that intentionally do NOT come from the
     /// workspace session zip (`permission_mode`, `always_allow_tools`,
-    /// `always_allow_order`) are reset here. `SessionStore` rehydrates
-    /// remembered approvals from trusted repo-local permission state after
-    /// construction, so a stale or tampered zip still cannot silently
-    /// auto-allow tool calls on launch.
+    /// `always_allow_order`) are reset here. `auto_permission_classifier`
+    /// is persisted as explicit session configuration and defaults to false
+    /// in older zips. `SessionStore` rehydrates remembered approvals from
+    /// trusted repo-local permission state after construction, so a stale or
+    /// tampered zip still cannot silently auto-allow tool calls on launch.
     ///
     /// Also rejects a mismatch between `id` (the caller's requested id, used
     /// to locate the zip and to key the in-memory map) and `manifest.id`
@@ -736,6 +756,7 @@ impl Session {
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
         let mcp_servers = manifest.brokk_mcp_servers.clone();
+        let auto_permission_classifier = manifest.auto_permission_classifier;
         Ok(Self {
             id,
             cwd,
@@ -745,6 +766,7 @@ impl Session {
             history,
             manifest,
             permission_mode: PermissionMode::Default,
+            auto_permission_classifier,
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
@@ -2814,6 +2836,71 @@ impl SessionStore {
             .map(|s| s.permission_mode)
     }
 
+    /// Update the session's automatic permission classifier toggle and persist
+    /// the new manifest. Returns `Ok(false)` if the session is unknown.
+    pub async fn set_auto_permission_classifier(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<bool> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get_mut(id) {
+                Some(session) => {
+                    let prev = session.auto_permission_classifier;
+                    let prev_manifest = session.manifest.auto_permission_classifier;
+                    session.auto_permission_classifier = enabled;
+                    session.manifest.auto_permission_classifier = enabled;
+                    Some((
+                        session.cwd.clone(),
+                        session.manifest.clone(),
+                        prev,
+                        prev_manifest,
+                    ))
+                }
+                None => None,
+            }
+        };
+        let Some((cwd, manifest, prev, prev_manifest)) = snapshot else {
+            return Ok(false);
+        };
+
+        let zip_path = session_zip_path(&cwd, id);
+        let join_result =
+            tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
+                .await;
+
+        let persist_result = match join_result {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!(
+                "session persistence task panicked: {join_err}"
+            )),
+        };
+
+        if let Err(e) = persist_result {
+            tracing::error!(
+                session_id = %id,
+                "failed to persist auto permission classifier; rolling back in-memory state: {e:#}"
+            );
+            if let Some(session) = self.sessions.write().await.get_mut(id) {
+                session.auto_permission_classifier = prev;
+                session.manifest.auto_permission_classifier = prev_manifest;
+            }
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Read the automatic permission classifier toggle for a session.
+    /// Returns None if unknown.
+    pub async fn auto_permission_classifier(&self, id: &str) -> Option<bool> {
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .map(|s| s.auto_permission_classifier)
+    }
+
     /// Update the session's sandbox mode override. Returns false if the
     /// session is unknown. The choice is also saved as an install-level
     /// setup preference for future new/reloaded sessions, but it is not
@@ -3645,6 +3732,7 @@ mod tests {
             version: "4.0".into(),
             mode: Some("CODE".into()),
             model: Some("m".into()),
+            auto_permission_classifier: true,
             brokk_mcp_servers: None,
         };
         let history = vec![ConversationTurn {
@@ -3664,6 +3752,7 @@ mod tests {
         .expect("matching ids should succeed");
 
         assert_eq!(session.permission_mode, PermissionMode::Default);
+        assert!(session.auto_permission_classifier);
         assert!(session.always_allow_tools.is_empty());
         assert!(session.always_allow_order.is_empty());
 
@@ -3873,6 +3962,7 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            auto_permission_classifier: false,
             brokk_mcp_servers: None,
         };
 
@@ -4539,6 +4629,46 @@ mod tests {
                 .await
         );
         assert_eq!(store.permission_mode("no-such").await, None);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The automatic permission classifier is opt-in session configuration,
+    /// persists across reload, and reports false for unknown sessions instead
+    /// of inserting one.
+    #[tokio::test]
+    async fn auto_permission_classifier_setter_and_getter_round_trip() {
+        let store = SessionStore::new("m".to_string());
+        let cwd =
+            std::env::temp_dir().join(format!("brokk-acp-rust-auto-perm-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+
+        assert_eq!(store.auto_permission_classifier(&id).await, Some(false));
+
+        assert!(
+            store
+                .set_auto_permission_classifier(&id, true)
+                .await
+                .expect("persist auto permission classifier")
+        );
+        assert_eq!(store.auto_permission_classifier(&id).await, Some(true));
+
+        store.sessions.write().await.remove(&id);
+        store.registries.write().await.remove(&id);
+        let reloaded = store
+            .get_session(&id, &cwd)
+            .await
+            .expect("session should reload from disk");
+        assert!(reloaded.auto_permission_classifier);
+
+        assert!(
+            !store
+                .set_auto_permission_classifier("no-such", true)
+                .await
+                .expect("unknown session is not a persistence failure")
+        );
+        assert_eq!(store.auto_permission_classifier("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -5322,6 +5452,7 @@ mod tests {
             version: "4.0".to_string(),
             mode: None,
             model: Some("m".to_string()),
+            auto_permission_classifier: false,
             brokk_mcp_servers: None,
         };
         let legacy_path = legacy_session_zip_path(worktree.path(), &id);

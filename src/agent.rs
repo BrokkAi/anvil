@@ -40,6 +40,7 @@ use crate::terminal_notifications::{
 /// ignore the legacy `modes` channel when configOptions is present (Zed
 /// does), so once we expose any configOption we have to expose all of them.
 const PERMISSION_CONFIG_ID: &str = "permission_mode";
+const AUTO_PERMISSION_CLASSIFIER_CONFIG_ID: &str = "auto_permission_classifier";
 const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
@@ -124,9 +125,9 @@ fn mode_state(current: &str) -> SessionModeState {
 fn permission_config_option(current: PermissionMode) -> SessionConfigOption {
     let options = vec![
         SessionConfigSelectOption::new("default", "Default")
-            .description("Ask for permission before each tool call"),
+            .description("Ask before promptable tool calls; allow read/search/fetch calls"),
         SessionConfigSelectOption::new("acceptEdits", "Accept Edits")
-            .description("Auto-allow edits; ask for everything else"),
+            .description("Auto-allow edits; ask before other promptable tool calls"),
         SessionConfigSelectOption::new("readOnly", "Read-only")
             .description("Refuse every edit, deletion, move, or shell command"),
         SessionConfigSelectOption::new("bypassPermissions", "Bypass Permissions")
@@ -138,7 +139,20 @@ fn permission_config_option(current: PermissionMode) -> SessionConfigOption {
         current.as_str(),
         options,
     )
-    .description("Controls which tool calls require user approval.")
+    .description("Controls the deterministic permission policy for tool calls.")
+    .category(SessionConfigOptionCategory::Mode)
+}
+
+/// Build the automatic permission-classifier toggle reflecting `current`.
+fn auto_permission_classifier_config_option(current: bool) -> SessionConfigOption {
+    SessionConfigOption::boolean(
+        AUTO_PERMISSION_CLASSIFIER_CONFIG_ID,
+        "Auto Permission Classifier",
+        current,
+    )
+    .description(
+        "Allow Anvil to use the active model to approve promptable tool calls that are clearly inside the current user request.",
+    )
     .category(SessionConfigOptionCategory::Mode)
 }
 
@@ -262,6 +276,7 @@ fn reasoning_effort_config_option(
 fn all_config_options(
     behavior: SessionMode,
     permission: PermissionMode,
+    auto_permission_classifier: bool,
     current_model: &str,
     available_models: &[ModelMetadata],
     current_reasoning_effort: Option<&str>,
@@ -270,6 +285,7 @@ fn all_config_options(
     let mut opts = vec![
         behavior_config_option(behavior),
         permission_config_option(permission),
+        auto_permission_classifier_config_option(auto_permission_classifier),
     ];
     if let Some(model_opt) = model_config_option(current_model, &model_ids) {
         opts.push(model_opt);
@@ -288,6 +304,7 @@ fn all_config_options(
 const CONFIGURE_KNOWN_KEYS: &[&str] = &[
     BEHAVIOR_CONFIG_ID,
     PERMISSION_CONFIG_ID,
+    AUTO_PERMISSION_CLASSIFIER_CONFIG_ID,
     MODEL_CONFIG_ID,
     REASONING_EFFORT_CONFIG_ID,
 ];
@@ -373,6 +390,30 @@ async fn apply_config_option(
                 .await
             {
                 return Err(ConfigApplyError::UnknownSession);
+            }
+        }
+        AUTO_PERMISSION_CLASSIFIER_CONFIG_ID => {
+            let enabled = match value {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(ConfigApplyError::InvalidValue {
+                        reason: format!("unknown auto permission classifier value '{value}'"),
+                        supported: vec!["true".to_string(), "false".to_string()],
+                    });
+                }
+            };
+            match sessions
+                .set_auto_permission_classifier(session_id, enabled)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(ConfigApplyError::UnknownSession),
+                Err(e) => {
+                    return Err(ConfigApplyError::PersistFailed {
+                        details: format!("{e:#}"),
+                    });
+                }
             }
         }
         BEHAVIOR_CONFIG_ID => {
@@ -495,6 +536,7 @@ async fn apply_config_option(
     let updated_options = all_config_options(
         session.mode,
         session.permission_mode,
+        session.auto_permission_classifier,
         &session.model,
         &catalog,
         session.selected_reasoning_effort.as_deref(),
@@ -1063,6 +1105,7 @@ pub async fn run_agent(
                     .config_options(all_config_options(
                         session.mode,
                         session.permission_mode,
+                        session.auto_permission_classifier,
                         &session.model,
                         &catalog,
                         session.selected_reasoning_effort.as_deref(),
@@ -1142,6 +1185,7 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             session.mode,
                             session.permission_mode,
+                            session.auto_permission_classifier,
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
@@ -1192,6 +1236,7 @@ pub async fn run_agent(
                                 .config_options(all_config_options(
                                     session.mode,
                                     session.permission_mode,
+                                    session.auto_permission_classifier,
                                     &session.model,
                                     &catalog,
                                     session.selected_reasoning_effort.as_deref(),
@@ -6687,6 +6732,7 @@ mod tests {
             version: "4.0".into(),
             mode: None,
             model: None,
+            auto_permission_classifier: false,
             brokk_mcp_servers: None,
         };
         let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
@@ -7399,6 +7445,30 @@ mod tests {
         assert_eq!(pm, PermissionMode::AcceptEdits);
         // updated_options must reflect the new value.
         assert!(!outcome.updated_options.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_sets_auto_permission_classifier() {
+        use agent_client_protocol::schema::SessionConfigKind;
+
+        let (store, id) = make_store_with_session("m").await;
+        assert_eq!(store.auto_permission_classifier(&id).await, Some(false));
+
+        let outcome =
+            apply_config_option(&store, &id, AUTO_PERMISSION_CLASSIFIER_CONFIG_ID, "true")
+                .await
+                .expect("auto permission classifier update");
+        assert_eq!(store.auto_permission_classifier(&id).await, Some(true));
+
+        let option = outcome
+            .updated_options
+            .iter()
+            .find(|opt| opt.id.to_string() == AUTO_PERMISSION_CLASSIFIER_CONFIG_ID)
+            .expect("auto permission classifier option advertised");
+        match &option.kind {
+            SessionConfigKind::Boolean(boolean) => assert!(boolean.current_value),
+            other => panic!("expected boolean auto permission option, got {other:?}"),
+        }
     }
 
     #[tokio::test]
