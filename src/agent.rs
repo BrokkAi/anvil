@@ -125,6 +125,8 @@ fn permission_config_option(current: PermissionMode) -> SessionConfigOption {
     let options = vec![
         SessionConfigSelectOption::new("default", "Default")
             .description("Ask for permission before each tool call"),
+        SessionConfigSelectOption::new("auto", "Auto")
+            .description("Use the permission classifier only for promptable tool calls"),
         SessionConfigSelectOption::new("acceptEdits", "Accept Edits")
             .description("Auto-allow edits; ask for everything else"),
         SessionConfigSelectOption::new("readOnly", "Read-only")
@@ -362,6 +364,7 @@ async fn apply_config_option(
                     reason: format!("unknown permission mode '{value}'"),
                     supported: vec![
                         "default".to_string(),
+                        "auto".to_string(),
                         "acceptEdits".to_string(),
                         "readOnly".to_string(),
                         "bypassPermissions".to_string(),
@@ -506,9 +509,9 @@ async fn apply_config_option(
     })
 }
 
-/// `/setup` remains the model/provider and advanced configuration entry point;
-/// permission mode has its own `/permissions` command so approval controls are
-/// easy to find without entering setup.
+/// `/setup` remains the model/provider and advanced configuration entry point.
+/// Permission mode is exposed through the ACP session config selector; the
+/// `/permissions` slash command only manages remembered Always allow entries.
 fn builtin_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::new("context", "Show current session context snapshot"),
@@ -522,7 +525,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
         ),
         AvailableCommand::new(
             "permissions",
-            "Change edit/command approvals and remembered Always allow entries",
+            "List and clear remembered Always allow entries",
         ),
         AvailableCommand::new(
             "compress",
@@ -1355,8 +1358,7 @@ pub async fn run_agent(
 
                 if is_slash_command(&raw_prompt_text, "permissions") {
                     let report =
-                        handle_permissions(&cx, &sessions_prompt, &session_id, &raw_prompt_text)
-                            .await;
+                        handle_permissions(&sessions_prompt, &session_id, &raw_prompt_text).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(prompt_end_turn_response());
                 }
@@ -2255,7 +2257,7 @@ async fn run_loop_iteration(
         send_message(
             cx,
             session_id,
-            &handle_permissions(cx, sessions, session_id, target).await,
+            &handle_permissions(sessions, session_id, target).await,
         );
         return Ok(LoopIterationOutcome::without_usage());
     }
@@ -3635,9 +3637,8 @@ struct SetupContext<'a> {
 /// Handle `/setup`, the model/provider and advanced configuration surface.
 /// The command is intentionally task-oriented: it offers "choose for me",
 /// Codex sign-in, local models, OpenRouter, sandbox/behavior settings, and an
-/// advanced page. Permission mode lives under `/permissions` so approval
-/// controls are easy to find. Internal config ids stay hidden unless the user
-/// explicitly enters `advanced`.
+/// advanced page. Permission mode lives in the ACP session config selector.
+/// Internal config ids stay hidden unless the user explicitly enters `advanced`.
 async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &str) -> String {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
@@ -4337,19 +4338,14 @@ fn render_openrouter_setup_help() -> String {
 }
 
 async fn handle_permissions(
-    cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
     session_id: &str,
     prompt_text: &str,
 ) -> String {
     let rest = slash_command_args(prompt_text);
     if rest.is_empty() {
-        return "How should Anvil make changes?\n\n\
-                - `/permissions ask` - Ask before edits and commands.\n\
-                - `/permissions auto-edits` - Edit files automatically, ask for commands.\n\
-                - `/permissions read-only` - Do not change files or run commands.\n\
-                - `/permissions trusted` - Allow tool calls without prompting.\n\
-                - `/permissions list` - Show remembered Always allow approvals for this repo.\n\
+        return "Remembered Always allow approvals:\n\n\
+                - `/permissions list` - Show remembered approvals for this repo.\n\
                 - `/permissions revoke <number-or-key>` - Forget one remembered approval.\n\
                 - `/permissions clear` - Forget all remembered approvals."
             .to_string();
@@ -4363,20 +4359,11 @@ async fn handle_permissions(
             return revoke_always_allowed_permission(sessions, session_id, arg).await;
         }
         "clear" | "reset" => return clear_always_allowed_permissions(sessions, session_id).await,
-        _ => {}
+        _ => "Unknown permissions command. Try `/permissions list`, \
+                    `revoke`, or `clear`. Permission mode is changed through \
+                    the session Permission selector."
+            .to_string(),
     }
-    let value = match rest.to_ascii_lowercase().as_str() {
-        "ask" | "default" => "default",
-        "auto-edits" | "edits" | "accept-edits" => "acceptEdits",
-        "read-only" | "readonly" => "readOnly",
-        "trusted" | "bypass" | "bypass-permissions" => "bypassPermissions",
-        _ => {
-            return "Unknown permission choice. Try `/permissions ask`, \
-                    `auto-edits`, `read-only`, `trusted`, `list`, `revoke`, or `clear`."
-                .to_string();
-        }
-    };
-    apply_setup_config(cx, sessions, session_id, PERMISSION_CONFIG_ID, value).await
 }
 
 fn split_setup_action(input: &str) -> (&str, &str) {
@@ -4489,11 +4476,9 @@ fn describe_always_allow_key(key: &str) -> String {
     format!("tool `{key}`")
 }
 
-/// Configure the session's effective sandbox mode. Separate from `/permissions`:
-/// this controls the sandbox boundary and parser backend, not whether the user
-/// is prompted before each tool call. `/permissions trusted` disables both the
-/// prompt and the sandbox; this command keeps the permission prompt behavior
-/// unchanged.
+/// Configure the session's effective sandbox mode. Separate from permission
+/// mode: this controls the sandbox boundary and parser backend, not whether
+/// the user is prompted before each tool call.
 ///
 /// The choice is saved as an install-level setup preference and seeds new
 /// sessions and cold reloads. It is still kept out of session manifests so
@@ -4786,7 +4771,8 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     out.push_str("Commands:\n");
     out.push_str("- `/setup model` - list model ids.\n");
     out.push_str("- `/setup model <model id>` - choose a specific model.\n");
-    out.push_str("- `/permissions` - change edit/command approvals.\n");
+    out.push_str("- Permission selector - change edit/command approval mode.\n");
+    out.push_str("- `/permissions` - list or revoke remembered Always allow approvals.\n");
     out.push_str(
         "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
     );
@@ -4957,8 +4943,7 @@ async fn handle_pr_create(
 ) -> String {
     if matches!(permission_mode, PermissionMode::ReadOnly) {
         return "Error: `/pr-create` is disabled in read-only permission mode. \
-                Switch to `default`, `acceptEdits`, or `bypassPermissions` to \
-                create PRs."
+                Change the session Permission selector to a non-read-only mode to create PRs."
             .to_string();
     }
 
@@ -5772,7 +5757,7 @@ mod tests {
     #[test]
     fn builtin_commands_include_setup_permissions_and_pr_create() {
         // `/setup` owns model/provider configuration, `/permissions` owns
-        // approval controls, and `/pr-create` remains an explicit workflow command.
+        // remembered approval management, and `/pr-create` remains an explicit workflow command.
         let cmds = builtin_commands();
         assert!(
             cmds.iter().any(|c| c.name == "setup"),
@@ -7390,15 +7375,33 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_option_sets_permission_mode() {
+        use agent_client_protocol::schema::{SessionConfigKind, SessionConfigSelectOptions};
+
         let (store, id) = make_store_with_session("m").await;
-        let outcome = apply_config_option(&store, &id, PERMISSION_CONFIG_ID, "acceptEdits")
+        let outcome = apply_config_option(&store, &id, PERMISSION_CONFIG_ID, "auto")
             .await
             .expect("permission mode update");
         assert!(outcome.cleared_reasoning.is_none());
         let pm = store.permission_mode(&id).await.expect("session present");
-        assert_eq!(pm, PermissionMode::AcceptEdits);
-        // updated_options must reflect the new value.
-        assert!(!outcome.updated_options.is_empty());
+        assert_eq!(pm, PermissionMode::Auto);
+
+        let permission_option = outcome
+            .updated_options
+            .iter()
+            .find(|opt| opt.id.to_string() == PERMISSION_CONFIG_ID)
+            .expect("permission option advertised");
+        match &permission_option.kind {
+            SessionConfigKind::Select(select) => {
+                assert_eq!(select.current_value.to_string(), "auto");
+                match &select.options {
+                    SessionConfigSelectOptions::Ungrouped(options) => {
+                        assert!(options.iter().any(|opt| opt.value.to_string() == "auto"));
+                    }
+                    other => panic!("expected ungrouped permission options, got {other:?}"),
+                }
+            }
+            other => panic!("expected select permission option, got {other:?}"),
+        }
     }
 
     #[tokio::test]
