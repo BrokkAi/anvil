@@ -28,6 +28,11 @@ pub(crate) struct P2tConfig {
     pub snapshot_dir: Option<PathBuf>,
     pub temperature: Option<f64>,
     pub step_trace_out: PathBuf,
+    /// Base for the FIRST step's snapshot link-dest: the workspace's source
+    /// (the overlay lower / canonical the caller branched from). Lets step-0's
+    /// snapshot hardlink unchanged files to that base instead of full-copying,
+    /// so it costs no disk. Later steps already link against the previous step.
+    pub link_base: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +43,7 @@ struct P2tConfigFile {
     snapshot_dir: Option<PathBuf>,
     temperature: Option<f64>,
     step_trace_out: PathBuf,
+    link_base: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -128,6 +134,13 @@ fn load_config(path: &Path) -> Result<P2tConfig> {
     {
         bail!("snapshot_dir must be an absolute path when set");
     }
+    if parsed
+        .link_base
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        bail!("link_base must be an absolute path when set");
+    }
     Ok(P2tConfig {
         prefix_steps: parsed.prefix_steps,
         forced_first_step: parsed.forced_first_step,
@@ -135,6 +148,7 @@ fn load_config(path: &Path) -> Result<P2tConfig> {
         snapshot_dir: parsed.snapshot_dir,
         temperature: parsed.temperature,
         step_trace_out: parsed.step_trace_out,
+        link_base: parsed.link_base,
     })
 }
 
@@ -352,19 +366,35 @@ pub(crate) fn snapshot_plan(
     snapshot_dir: &Path,
     step: usize,
     previous_exists: bool,
+    link_base: Option<&Path>,
 ) -> SnapshotPlan {
+    // Snapshots are copy-on-write via rsync `--link-dest`: unchanged files are
+    // hardlinked from the link-dest into the new snapshot (only changed files
+    // cost disk). Normally each step links against the previous step; the first
+    // step (no previous) links against `link_base` — the workspace's source
+    // (overlay lower / canonical) — so even step-0 hardlinks unchanged files
+    // instead of full-copying the whole workspace.
+    let link_dest = if step > 0 && previous_exists {
+        Some(snapshot_dir.join(format!("step-{}", step - 1)))
+    } else {
+        link_base.map(Path::to_path_buf)
+    };
     SnapshotPlan {
         dest: snapshot_dir.join(format!("step-{step}")),
-        link_dest: (step > 0 && previous_exists)
-            .then(|| snapshot_dir.join(format!("step-{}", step - 1))),
+        link_dest,
     }
 }
 
-pub(crate) fn snapshot_workspace(cwd: &Path, snapshot_dir: &Path, step: usize) -> Result<()> {
+pub(crate) fn snapshot_workspace(
+    cwd: &Path,
+    snapshot_dir: &Path,
+    step: usize,
+    link_base: Option<&Path>,
+) -> Result<()> {
     std::fs::create_dir_all(snapshot_dir)
         .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
     let previous_exists = step > 0 && snapshot_dir.join(format!("step-{}", step - 1)).exists();
-    let plan = snapshot_plan(snapshot_dir, step, previous_exists);
+    let plan = snapshot_plan(snapshot_dir, step, previous_exists, link_base);
 
     let mut command = Command::new("rsync");
     command
@@ -626,25 +656,41 @@ mod tests {
     #[test]
     fn snapshot_plan_uses_previous_step_as_link_dest() {
         let root = Path::new("/tmp/p2t-snapshots");
-        let plan = snapshot_plan(root, 3, true);
+        // Previous step wins over link_base.
+        let plan = snapshot_plan(root, 3, true, Some(Path::new("/tmp/canonical")));
 
         assert_eq!(plan.dest, root.join("step-3"));
         assert_eq!(plan.link_dest, Some(root.join("step-2")));
     }
 
     #[test]
-    fn snapshot_plan_skips_link_dest_without_previous_snapshot() {
+    fn snapshot_plan_first_step_links_against_base() {
+        let root = Path::new("/tmp/p2t-snapshots");
+        let base = Path::new("/tmp/canonical");
+        // No previous step -> link against the workspace source so step-0 is
+        // hardlinked (CoW), not a full copy.
+        assert_eq!(
+            snapshot_plan(root, 0, false, Some(base)),
+            SnapshotPlan {
+                dest: root.join("step-0"),
+                link_dest: Some(base.to_path_buf()),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_plan_no_link_dest_without_previous_or_base() {
         let root = Path::new("/tmp/p2t-snapshots");
 
         assert_eq!(
-            snapshot_plan(root, 0, false),
+            snapshot_plan(root, 0, false, None),
             SnapshotPlan {
                 dest: root.join("step-0"),
                 link_dest: None,
             }
         );
         assert_eq!(
-            snapshot_plan(root, 1, false),
+            snapshot_plan(root, 1, false, None),
             SnapshotPlan {
                 dest: root.join("step-1"),
                 link_dest: None,
