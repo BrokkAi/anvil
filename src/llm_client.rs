@@ -5,6 +5,7 @@ use futures::future::BoxFuture;
 use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +42,39 @@ pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
 /// run for minutes; setup refreshes should not inherit that wall-clock.
 const MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 12;
 const MODEL_DISCOVERY_TASK_TIMEOUT_SECS: u64 = 20;
+
+#[derive(Debug)]
+pub(crate) struct IncompleteStreamError {
+    protocol: &'static str,
+    expected_marker: &'static str,
+}
+
+impl IncompleteStreamError {
+    pub(crate) fn new(protocol: &'static str, expected_marker: &'static str) -> Self {
+        Self {
+            protocol,
+            expected_marker,
+        }
+    }
+}
+
+impl fmt::Display for IncompleteStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} stream ended before completion marker {}",
+            self.protocol, self.expected_marker
+        )
+    }
+}
+
+impl std::error::Error for IncompleteStreamError {}
+
+pub(crate) fn is_incomplete_stream_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<IncompleteStreamError>().is_some())
+}
 
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
@@ -1279,8 +1313,9 @@ fn supports_native_structured_output(base_url: &str) -> bool {
     base_url.contains("api.openai.com") || base_url.contains("openrouter.ai")
 }
 
-/// Drive an SSE byte stream until the LLM emits `[DONE]`, the stream
-/// ends, or the cancellation token fires. Aborts with a clear error if
+/// Drive an SSE byte stream until the LLM emits `[DONE]` or the
+/// cancellation token fires. Aborts with a clear error if the stream
+/// ends before `[DONE]`, or if
 /// no *meaningful progress* (parsed `data:` event contributing content
 /// or tool-call deltas, or `[DONE]`) is observed within `idle`. SSE
 /// keepalive comments (`:\n`), blank lines, and partial bytes that
@@ -1405,18 +1440,10 @@ where
         });
     }
 
-    if tool_acc.is_empty() {
-        Ok(LlmResponse::Text {
-            text: full_text,
-            usage,
-        })
-    } else {
-        Ok(LlmResponse::ToolCalls {
-            text: full_text,
-            calls: tool_acc.into_tool_calls(),
-            usage,
-        })
-    }
+    Err(anyhow::Error::new(IncompleteStreamError::new(
+        "chat completions SSE",
+        "[DONE]",
+    )))
 }
 
 #[cfg(test)]
@@ -1675,24 +1702,38 @@ mod tests {
         }
     }
 
-    /// Stream that ends without `[DONE]` returns whatever has been
-    /// accumulated -- some upstream proxies don't forward the terminator.
-    /// Tool-call accumulation flushes on stream end if no text arrived.
+    /// Stream EOF without `[DONE]` is incomplete, even if the server
+    /// already emitted text. The caller may only retry this safely when
+    /// no user-visible output escaped.
     #[tokio::test]
-    async fn drive_sse_stream_returns_on_eof_without_done() {
+    async fn drive_sse_stream_errors_on_eof_without_done() {
         let chunks: Vec<Result<Vec<u8>>> = vec![Ok(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n".to_vec(),
         )];
         let s = stream::iter(chunks);
 
-        let (on_token, _) = collect_tokens();
+        let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let err = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90))
+            .await
+            .expect_err("EOF before [DONE] must be an incomplete stream");
 
-        match result.expect("should complete") {
-            LlmResponse::Text { text: t, .. } => assert_eq!(t, "partial"),
-            other => panic!("expected text response, got {other:?}"),
-        }
+        assert!(is_incomplete_stream_error(&err));
+        assert_eq!(*collected.lock().unwrap(), vec!["partial"]);
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_errors_on_empty_eof_without_done() {
+        let s = stream::iter(Vec::<Result<Vec<u8>>>::new());
+
+        let (on_token, collected) = collect_tokens();
+        let cancel = CancellationToken::new();
+        let err = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90))
+            .await
+            .expect_err("empty EOF before [DONE] must be incomplete");
+
+        assert!(is_incomplete_stream_error(&err));
+        assert!(collected.lock().unwrap().is_empty());
     }
 
     /// The base URL is normalized to drop a trailing slash, and `/v1` is

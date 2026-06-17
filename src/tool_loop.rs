@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
-    messages_include_images, rewrite_image_prompt_provider_error,
+    is_incomplete_stream_error, messages_include_images, rewrite_image_prompt_provider_error,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
@@ -69,6 +69,10 @@ struct ExecutedStepOutcome {
 }
 
 fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+    if is_incomplete_stream_error(error) {
+        return true;
+    }
+
     let error = format!("{error:#}");
     error.contains("stream read error")
         || error.contains("no meaningful progress")
@@ -3600,7 +3604,7 @@ fn ordered_tool_call_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{FunctionCall, FunctionDef};
+    use crate::llm_client::{FunctionCall, FunctionDef, IncompleteStreamError};
     use futures::future::{BoxFuture, FutureExt};
     use std::sync::atomic::AtomicUsize;
 
@@ -3686,6 +3690,42 @@ mod tests {
                         (request.on_token)("partial");
                     }
                     anyhow::bail!(first_error);
+                }
+                Ok(LlmResponse::Text {
+                    text: "ok".to_string(),
+                    usage: TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
+    struct IncompleteStreamRetryBackend {
+        attempts: Arc<AtomicUsize>,
+        emit_before_error: bool,
+    }
+
+    impl LlmBackend for IncompleteStreamRetryBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            mut request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            let emit_before_error = self.emit_before_error;
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    if emit_before_error {
+                        (request.on_token)("partial");
+                    }
+                    return Err(anyhow::Error::new(IncompleteStreamError::new(
+                        "test SSE",
+                        "response.completed",
+                    )));
                 }
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
@@ -3954,6 +3994,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_retries_incomplete_stream_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(IncompleteStreamRetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("incomplete streams should retry before output");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[tokio::test]
     async fn stream_chat_does_not_retry_after_partial_output() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
@@ -3984,6 +4056,53 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(format!("{error:#}").contains("Codex stream read error"));
         assert_eq!(output.lock().unwrap().as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_incomplete_stream_after_partial_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(IncompleteStreamRetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: true,
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let error = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("partial output makes retry unsafe");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(is_incomplete_stream_error(&error));
+        assert_eq!(output.lock().unwrap().as_str(), "partial");
+    }
+
+    #[test]
+    fn retryable_llm_error_recognizes_incomplete_stream_chain() {
+        let err = anyhow::Error::new(IncompleteStreamError::new("test SSE", "[DONE]"))
+            .context("driving test stream");
+
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn retryable_llm_error_does_not_treat_cancellation_as_incomplete_stream() {
+        let err = anyhow::anyhow!("streaming cancelled by client");
+
+        assert!(!is_retryable_llm_error(&err));
     }
 
     #[tokio::test]

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatContentPart, ChatMessage, FunctionCall, LlmResponse, TokenSink, TokenUsage, ToolCall,
-    ToolDefinition,
+    ChatContentPart, ChatMessage, FunctionCall, IncompleteStreamError, LlmResponse, TokenSink,
+    TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
@@ -344,8 +344,8 @@ where
                         continue;
                     };
                     if data == "[DONE]" {
-                        completed = true;
-                        break;
+                        made_progress = true;
+                        continue;
                     }
 
                     let Ok(event) = serde_json::from_str::<StreamEvent>(data) else {
@@ -440,6 +440,18 @@ where
     if let Some(err) = failure {
         return Err(err);
     }
+    if cancel.is_cancelled() {
+        return Ok(LlmResponse::Text {
+            text: full_text,
+            usage,
+        });
+    }
+    if !completed {
+        return Err(anyhow::Error::new(IncompleteStreamError::new(
+            "Responses SSE",
+            "response.completed",
+        )));
+    }
     if tool_calls.is_empty() {
         Ok(LlmResponse::Text {
             text: full_text,
@@ -451,5 +463,117 @@ where
             calls: tool_calls,
             usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    use std::sync::{Arc, Mutex};
+
+    fn collect_tokens() -> (TokenSink, Arc<Mutex<String>>) {
+        let collected = Arc::new(Mutex::new(String::new()));
+        let inner = collected.clone();
+        let cb: TokenSink = Box::new(move |t| {
+            inner.lock().unwrap().push_str(t);
+        });
+        (cb, collected)
+    }
+
+    fn noop_sink() -> TokenSink {
+        Box::new(|_| {})
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_requires_response_completed() {
+        let raw = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, collected) = collect_tokens();
+
+        let err = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("EOF before response.completed must be incomplete");
+
+        assert!(crate::llm_client::is_incomplete_stream_error(&err));
+        assert_eq!(collected.lock().unwrap().as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_does_not_accept_done_as_completion() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, collected) = collect_tokens();
+
+        let err = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("[DONE] is not the Responses completion marker");
+
+        assert!(crate::llm_client::is_incomplete_stream_error(&err));
+        assert_eq!(collected.lock().unwrap().as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_returns_text_on_response_completed() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, collected) = collect_tokens();
+
+        let resp = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("response.completed should finish the stream");
+
+        match resp {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(collected.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_cancellation_is_not_incomplete_eof() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let stream = stream::pending::<Result<Vec<u8>>>();
+        let (on_token, _) = collect_tokens();
+
+        let resp = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            cancel,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("cancellation should return normally");
+
+        match resp {
+            LlmResponse::Text { text, .. } => assert_eq!(text, ""),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 }
