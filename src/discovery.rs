@@ -1,7 +1,8 @@
 //! Auto-discover available LLM models from Bedrock, Codex
 //! (`~/.codex/auth.json`), a local Ollama daemon
-//! (`http://localhost:11434/v1/models`), and OpenRouter
-//! (`https://openrouter.ai/api/v1/models`, gated on the
+//! (`http://localhost:11434/v1/models`), a local ds4-server
+//! (antirez/ds4, an OpenAI-compatible DeepSeek V4 inference engine), and
+//! OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
 //! `OPENROUTER_API_KEY` env var).
 //!
 //! Zero-config by design: the Ollama URL is fixed at the daemon's default
@@ -10,6 +11,14 @@
 //! discoverable. OpenRouter is enabled only when `OPENROUTER_API_KEY` is
 //! set in the environment; absent the key, the catalog simply omits its
 //! models with no warning.
+//!
+//! ds4 is the one source whose port is *not* fixed: `ds4-server` has no
+//! standard port, so instead of probing a constant we detect a running
+//! `ds4-server` process and resolve the TCP port it is actually listening
+//! on (see [`ds4_base_url`]). It is therefore discovered only when ds4 is
+//! genuinely running -- the running process is the opt-in. ds4 targets
+//! macOS (Metal) and Linux (CUDA/ROCm) only, so the process probe is
+//! `cfg(unix)`; elsewhere only the `DS4_BASE_URL` env override is honored.
 //!
 //! Each discovered model carries a `ModelSource` tag so the routing backend
 //! (`MultiBackend`) can pick the right HTTP client at request time. The
@@ -40,6 +49,7 @@ use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
 pub enum ModelSource {
     Bedrock,
     Codex,
+    Ds4,
     Ollama,
     OpenRouter,
 }
@@ -49,6 +59,7 @@ impl ModelSource {
         match self {
             Self::Bedrock => "bedrock",
             Self::Codex => "codex",
+            Self::Ds4 => "ds4",
             Self::Ollama => "ollama",
             Self::OpenRouter => "openrouter",
         }
@@ -79,6 +90,7 @@ pub fn split_wire_id(wire: &str) -> Option<(ModelSource, &str)> {
     let source = match prefix {
         "bedrock" => ModelSource::Bedrock,
         "codex" => ModelSource::Codex,
+        "ds4" => ModelSource::Ds4,
         "ollama" => ModelSource::Ollama,
         "openrouter" => ModelSource::OpenRouter,
         _ => return None,
@@ -103,6 +115,140 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// alias so the same shell that already works with `openrouter` / OpenAI
 /// SDK / litellm works here too.
 pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+// ---------------------------------------------------------------------------
+// ds4 (antirez/ds4) discovery
+// ---------------------------------------------------------------------------
+
+/// Fallback ds4-server base URL. `ds4-server` binds `127.0.0.1:8000` unless
+/// launched with a different `--host`; we probe this only when a running
+/// `ds4-server` process is detected but its actual listening port could not
+/// be resolved from the OS.
+#[cfg(unix)]
+pub const DS4_DEFAULT_URL: &str = "http://127.0.0.1:8000";
+
+/// Env override for the ds4-server base URL. The escape hatch for setups the
+/// process probe can't see: a non-default `--host`, a remote box, or a
+/// reverse proxy (e.g. `DS4_BASE_URL=http://127.0.0.1:9000`). When set it
+/// short-circuits process/port autodetection entirely. Mirrors the
+/// `OPENROUTER_API_KEY` convention of using the upstream-style env name with
+/// no `BROKK_`/`ANVIL_` prefix.
+pub const DS4_BASE_URL_ENV: &str = "DS4_BASE_URL";
+
+/// Resolve the base URL to probe for a local `ds4-server`, or `None` when
+/// ds4 should be skipped this round.
+///
+/// Priority:
+///   1. `DS4_BASE_URL` env override (trimmed, trailing slash removed). When
+///      set we always probe it, even if no local process is visible -- this
+///      covers remote/proxied ds4 the process probe can't detect.
+///   2. A running `ds4-server` process whose listening TCP port we resolve
+///      from the OS, yielding `http://127.0.0.1:<port>`.
+///   3. A running `ds4-server` process whose port could not be resolved,
+///      falling back to the documented default `DS4_DEFAULT_URL`.
+///
+/// Returns `None` when neither the env override nor a running process is
+/// present, so discovery omits ds4 entirely -- the running process *is* the
+/// opt-in. This is re-evaluated on every discovery refresh, so starting
+/// ds4-server after Anvil (and then creating/refreshing a session) brings it
+/// online on whatever port it ended up on.
+pub fn ds4_base_url() -> Option<String> {
+    if let Ok(url) = std::env::var(DS4_BASE_URL_ENV) {
+        let url = url.trim();
+        if !url.is_empty() {
+            return Some(url.trim_end_matches('/').to_string());
+        }
+    }
+    detect_ds4_server_url()
+}
+
+/// Detect a running `ds4-server` and the URL it serves on.
+///
+/// ds4 (antirez/ds4) ships for macOS (Metal) and Linux (CUDA/ROCm) only,
+/// so process/port detection is Unix-only. We shell out to `pgrep`/`lsof`
+/// rather than take a process-listing crate dependency: both ship by
+/// default on the two supported platforms, the calls are short-lived, and
+/// this keeps the dependency surface flat. Any failure (tool missing,
+/// non-zero exit, unparsable output) degrades to `None`/default, never an
+/// error.
+#[cfg(unix)]
+fn detect_ds4_server_url() -> Option<String> {
+    let pid = find_ds4_server_pid()?;
+    match ds4_listen_port_for_pid(pid) {
+        Some(port) => Some(format!("http://127.0.0.1:{port}")),
+        None => {
+            tracing::info!(
+                "ds4-server process {pid} detected but its listening port could not be \
+                 resolved; falling back to {DS4_DEFAULT_URL}"
+            );
+            Some(DS4_DEFAULT_URL.to_string())
+        }
+    }
+}
+
+/// On non-Unix targets ds4 has no native build, so there is nothing to
+/// detect: only the `DS4_BASE_URL` override (handled by [`ds4_base_url`])
+/// can bring it online.
+#[cfg(not(unix))]
+fn detect_ds4_server_url() -> Option<String> {
+    None
+}
+
+/// PID of a running `ds4-server`, via `pgrep -x ds4-server`. `-x` matches
+/// the process *name* exactly, so it ignores our own discovery commands and
+/// unrelated processes that merely mention "ds4-server" on their command
+/// line. Returns the first match; ds4 may fork workers but they all listen
+/// behind the same accept socket, so any one PID resolves the same port.
+#[cfg(unix)]
+fn find_ds4_server_pid() -> Option<u32> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", "ds4-server"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.split_whitespace().next()?.parse::<u32>().ok()
+}
+
+/// Listening TCP port for `pid`, via
+/// `lsof -nP -iTCP -sTCP:LISTEN -a -p <pid>`. `-n`/`-P` skip DNS/port-name
+/// lookups (faster, and keeps the NAME column numeric for parsing).
+#[cfg(unix)]
+fn ds4_listen_port_for_pid(pid: u32) -> Option<u16> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_lsof_listen_port(&stdout)
+}
+
+/// Extract the first listening port from `lsof` output. Each listen line
+/// ends with the NAME column followed by `(LISTEN)`, e.g.
+/// `... TCP 127.0.0.1:8000 (LISTEN)` or `... TCP [::1]:8000 (LISTEN)`; the
+/// port is the segment after the final `:` of the address token preceding
+/// `(LISTEN)`. Returns `None` if no listen line parses.
+#[cfg(unix)]
+fn parse_lsof_listen_port(output: &str) -> Option<u16> {
+    for line in output.lines() {
+        let mut prev: Option<&str> = None;
+        for tok in line.split_whitespace() {
+            if tok == "(LISTEN)"
+                && let Some(port) = prev.and_then(|addr| addr.rsplit(':').next())
+                && let Ok(port) = port.parse::<u16>()
+            {
+                return Some(port);
+            }
+            prev = Some(tok);
+        }
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Ollama discovery (OpenAI-compatible /v1/models)
@@ -137,6 +283,25 @@ async fn discover_ollama_models(
     http: &reqwest::Client,
     base_url: &str,
 ) -> Result<Vec<DiscoveredModel>> {
+    discover_openai_compatible_models(http, base_url, ModelSource::Ollama).await
+}
+
+/// Discover models from a local `ds4-server` (antirez/ds4). ds4 speaks the
+/// same OpenAI-compatible `/v1/models` shape as Ollama, so this is the same
+/// probe tagged with [`ModelSource::Ds4`]. `base_url` comes from
+/// [`ds4_base_url`], which already resolved the running server's port.
+pub async fn discover_ds4(http: &reqwest::Client, base_url: &str) -> Result<Vec<DiscoveredModel>> {
+    discover_openai_compatible_models(http, base_url, ModelSource::Ds4).await
+}
+
+/// Shared `/v1/models` probe for any OpenAI-compatible local server. Tags
+/// every returned id with `source` so the catalog routes it back to the
+/// right backend.
+async fn discover_openai_compatible_models(
+    http: &reqwest::Client,
+    base_url: &str,
+    source: ModelSource,
+) -> Result<Vec<DiscoveredModel>> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{base}/v1/models");
     let resp = http
@@ -146,17 +311,14 @@ async fn discover_ollama_models(
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("ollama /v1/models returned HTTP {status}");
+        anyhow::bail!("{} /v1/models returned HTTP {status}", source.as_str());
     }
     let parsed: crate::llm_client::ModelsResponse =
         resp.json().await.context("parsing /v1/models JSON")?;
     Ok(parsed
         .data
         .into_iter()
-        .map(|m| DiscoveredModel {
-            id: m.id,
-            source: ModelSource::Ollama,
-        })
+        .map(|m| DiscoveredModel { id: m.id, source })
         .collect())
 }
 
@@ -301,14 +463,20 @@ pub async fn discover_ollama_model_metadata(
 /// vars. Each closure keeps `discovery.rs` agnostic of those concerns
 /// while still running all sources in parallel.
 ///
-/// Output ordering is fixed: Codex first, then Ollama, then OpenRouter.
+/// `ds4_url` is `Some` only when a local `ds4-server` was detected (or
+/// `DS4_BASE_URL` is set); `None` skips ds4 entirely. See [`ds4_base_url`].
+///
+/// Output ordering is fixed: Bedrock, Codex, Ollama, ds4, then OpenRouter.
 /// The first model in the merged list is auto-selected as the session
 /// default elsewhere -- keeping ordering deterministic stops users from
 /// seeing a different default just because one source happened to be
-/// slow on a given boot.
+/// slow on a given boot. ds4 sits after Ollama so an existing Ollama
+/// user's default is unchanged, and before OpenRouter because it is a
+/// free local source rather than the explicit paid/cloud choice.
 pub async fn discover_all<FB, FutB, FC, FutC, FOR, FutOR>(
     http: &reqwest::Client,
     ollama_url: &str,
+    ds4_url: Option<&str>,
     bedrock_lookup: FB,
     codex_lookup: FC,
     openrouter_lookup: FOR,
@@ -379,12 +547,28 @@ where
         }
     };
 
-    let (bedrock, codex, openrouter, ollama) =
-        tokio::join!(bedrock_fut, codex_fut, openrouter_fut, ollama_fut);
-    let mut all = Vec::with_capacity(bedrock.len() + codex.len() + openrouter.len() + ollama.len());
+    let ds4_fut = async {
+        match ds4_url {
+            Some(url) => match discover_ds4(http, url).await {
+                Ok(models) => models,
+                Err(e) => {
+                    tracing::info!("ds4 model discovery skipped at {url}: {e:#}");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }
+    };
+
+    let (bedrock, codex, openrouter, ollama, ds4) =
+        tokio::join!(bedrock_fut, codex_fut, openrouter_fut, ollama_fut, ds4_fut);
+    let mut all = Vec::with_capacity(
+        bedrock.len() + codex.len() + ollama.len() + ds4.len() + openrouter.len(),
+    );
     all.extend(bedrock);
     all.extend(codex);
     all.extend(ollama);
+    all.extend(ds4);
     all.extend(openrouter);
     all
 }
@@ -523,6 +707,16 @@ mod tests {
         // the bare id keeps its tag suffix and routes correctly to Ollama.
         assert_eq!(id, "llama3:latest");
 
+        let ds4 = DiscoveredModel {
+            id: "deepseek-v4-flash".into(),
+            source: ModelSource::Ds4,
+        };
+        let ds4_wire = ds4.wire_id();
+        assert_eq!(ds4_wire, "ds4::deepseek-v4-flash");
+        let (src, id) = split_wire_id(&ds4_wire).expect("must parse");
+        assert_eq!(src, ModelSource::Ds4);
+        assert_eq!(id, "deepseek-v4-flash");
+
         let openrouter = DiscoveredModel {
             id: "anthropic/claude-3.5-sonnet".into(),
             source: ModelSource::OpenRouter,
@@ -575,9 +769,12 @@ mod tests {
             .await;
 
         let http = discovery_http_client();
+        // Point ds4 at the same mock /v1/models so it also yields one model;
+        // this exercises the fixed ordering with every source populated.
         let models = discover_all(
             &http,
             &server.uri(),
+            Some(&server.uri()),
             || async { Ok(vec!["us.anthropic.claude-sonnet-4-6".to_string()]) },
             || async { Ok(vec!["gpt-5-codex".to_string(), "gpt-4o".to_string()]) },
             || async {
@@ -588,8 +785,8 @@ mod tests {
             },
         )
         .await;
-        // Bedrock returned 1; Codex returned 2; Ollama returned 1; OpenRouter returned 2.
-        assert_eq!(models.len(), 6);
+        // Bedrock 1; Codex 2; Ollama 1; ds4 1; OpenRouter 2.
+        assert_eq!(models.len(), 7);
         assert_eq!(models[0].source, ModelSource::Bedrock);
         assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
         assert_eq!(models[1].source, ModelSource::Codex);
@@ -597,9 +794,11 @@ mod tests {
         assert_eq!(models[2].source, ModelSource::Codex);
         assert_eq!(models[3].source, ModelSource::Ollama);
         assert_eq!(models[3].id, "llama3:latest");
-        assert_eq!(models[4].source, ModelSource::OpenRouter);
-        assert_eq!(models[4].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[4].source, ModelSource::Ds4);
+        assert_eq!(models[4].id, "llama3:latest");
         assert_eq!(models[5].source, ModelSource::OpenRouter);
+        assert_eq!(models[5].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[6].source, ModelSource::OpenRouter);
     }
 
     /// When every source fails, the merged vec is empty rather than an
@@ -612,6 +811,7 @@ mod tests {
         let models = discover_all(
             &http,
             TEST_DEAD_OLLAMA_URL,
+            None,
             || async { anyhow::bail!("no Bedrock token") },
             || async { anyhow::bail!("no auth.json") },
             || async { anyhow::bail!("no OPENROUTER_API_KEY") },
@@ -631,6 +831,7 @@ mod tests {
         let models = discover_all(
             &http,
             TEST_DEAD_OLLAMA_URL,
+            None,
             || async { anyhow::bail!("no Bedrock token") },
             || async { anyhow::bail!("no auth.json") },
             || async { Ok(vec!["anthropic/claude-3.5-sonnet".to_string()]) },
@@ -639,5 +840,56 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].source, ModelSource::OpenRouter);
         assert_eq!(models[0].id, "anthropic/claude-3.5-sonnet");
+    }
+
+    /// `discover_ds4` hits the same OpenAI-compatible `/v1/models` shape as
+    /// Ollama but tags the results [`ModelSource::Ds4`]. ds4 reports
+    /// `deepseek-v4-flash` / `deepseek-v4-pro`, so verify both come back
+    /// verbatim and routed to the ds4 source.
+    #[tokio::test]
+    async fn discover_ds4_parses_v1_models_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "deepseek-v4-flash", "object": "model"},
+                    {"id": "deepseek-v4-pro", "object": "model"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let http = discovery_http_client();
+        let models = discover_ds4(&http, &server.uri()).await.expect("ok");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "deepseek-v4-flash");
+        assert_eq!(models[0].source, ModelSource::Ds4);
+        assert_eq!(models[1].id, "deepseek-v4-pro");
+    }
+
+    /// `parse_lsof_listen_port` pulls the port out of the first `(LISTEN)`
+    /// line, coping with the IPv4/IPv6 address forms `lsof -nP` emits and
+    /// ignoring the header and any non-listen rows.
+    #[cfg(unix)]
+    #[test]
+    fn parse_lsof_listen_port_extracts_first_listen_port() {
+        let ipv4 = "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+                    ds4-serve 123 user    6u  IPv4 0x1234      0t0  TCP 127.0.0.1:8000 (LISTEN)\n";
+        assert_eq!(parse_lsof_listen_port(ipv4), Some(8000));
+
+        let ipv6 = "ds4-serve 123 user    7u  IPv6 0x9abc      0t0  TCP [::1]:9000 (LISTEN)\n";
+        assert_eq!(parse_lsof_listen_port(ipv6), Some(9000));
+
+        // Wildcard bind form.
+        let wildcard = "ds4-serve 123 user    8u  IPv4 0x1111      0t0  TCP *:7070 (LISTEN)\n";
+        assert_eq!(parse_lsof_listen_port(wildcard), Some(7070));
+
+        // No listen line -> None.
+        let established = "ds4-serve 123 user    9u  IPv4 0x2222      0t0  TCP 127.0.0.1:55000->1.2.3.4:443 (ESTABLISHED)\n";
+        assert_eq!(parse_lsof_listen_port(established), None);
+
+        assert_eq!(parse_lsof_listen_port(""), None);
     }
 }
