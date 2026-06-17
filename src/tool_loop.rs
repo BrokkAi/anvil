@@ -495,7 +495,7 @@ fn pure_gate_decision(
         return PureGateDecision::Reject(
             "Tool use denied: read-only mode forbids edits, deletions, moves, shell execution, \
              and any tool not classified as read/search/fetch. \
-             Switch the Permission menu to 'default' or 'acceptEdits' to run this tool."
+             Change the session Permission selector to a non-read-only mode to run this tool."
                 .to_string(),
         );
     }
@@ -509,7 +509,10 @@ fn pure_gate_decision(
         ToolKind::Edit if matches!(mode, PermissionMode::AcceptEdits) => true,
         ToolKind::Execute
             if tool_name == "run_shell_command"
-                && matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits)
+                && matches!(
+                    mode,
+                    PermissionMode::Default | PermissionMode::Auto | PermissionMode::AcceptEdits
+                )
                 && shell_auto_allow =>
         {
             true
@@ -538,8 +541,10 @@ fn shell_safelist_context(
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
 ) -> bool {
-    matches!(mode, PermissionMode::Default | PermissionMode::AcceptEdits)
-        && shell_sandboxed
+    matches!(
+        mode,
+        PermissionMode::Default | PermissionMode::Auto | PermissionMode::AcceptEdits
+    ) && shell_sandboxed
         && crate::sandbox_backend::resolve_mode(sandbox_mode)
             == crate::sandbox_backend::SandboxMode::Os
 }
@@ -2382,6 +2387,7 @@ fn blocked_tool_call_updates(
 }
 
 struct PureGateEvaluation {
+    mode: PermissionMode,
     decision: PureGateDecision,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
@@ -2461,6 +2467,7 @@ async fn evaluate_pure_gate(
     let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
 
     Ok(PureGateEvaluation {
+        mode,
         decision,
         sandbox_mode,
         shell_sandboxed,
@@ -2535,10 +2542,13 @@ async fn consult_gate(
         PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
         PureGateDecision::Prompt => {
             let escalation_requested = shell_sandbox_escalation_requested(request.raw_input);
-            if !escalation_requested
-                && (request.tool_name != "run_shell_command" || evaluation.shell_sandboxed)
-                && let Some((classification, usage)) =
-                    classify_permission_scope_with_model(&request, cancel).await
+            if should_run_permission_auto_classifier(
+                evaluation.mode,
+                request.tool_name,
+                evaluation.shell_sandboxed,
+                escalation_requested,
+            ) && let Some((classification, usage)) =
+                classify_permission_scope_with_model(&request, cancel).await
             {
                 if classification.allow {
                     tracing::info!(
@@ -2597,6 +2607,17 @@ async fn consult_gate(
             )
         }
     }
+}
+
+fn should_run_permission_auto_classifier(
+    mode: PermissionMode,
+    tool_name: &str,
+    shell_sandboxed: bool,
+    escalation_requested: bool,
+) -> bool {
+    matches!(mode, PermissionMode::Auto)
+        && !escalation_requested
+        && (tool_name != "run_shell_command" || shell_sandboxed)
 }
 
 async fn request_user_permission_with_evaluation(
@@ -3798,6 +3819,45 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn permission_auto_classifier_runs_only_in_auto_mode() {
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::ReadOnly,
+            PermissionMode::BypassPermissions,
+        ] {
+            assert!(
+                !should_run_permission_auto_classifier(mode, "write_file", false, false),
+                "permission auto-classifier must not run in {mode:?}"
+            );
+        }
+        assert!(should_run_permission_auto_classifier(
+            PermissionMode::Auto,
+            "write_file",
+            false,
+            false
+        ));
+        assert!(should_run_permission_auto_classifier(
+            PermissionMode::Auto,
+            "run_shell_command",
+            true,
+            false
+        ));
+        assert!(!should_run_permission_auto_classifier(
+            PermissionMode::Auto,
+            "run_shell_command",
+            false,
+            false
+        ));
+        assert!(!should_run_permission_auto_classifier(
+            PermissionMode::Auto,
+            "run_shell_command",
+            true,
+            true
+        ));
+    }
+
     fn decide(
         mode: PermissionMode,
         kind: ToolKind,
@@ -4773,7 +4833,11 @@ mod tests {
     fn shell_command_uses_scoped_always_allow() {
         // The cache key is command-scoped for shell calls, so the pure gate
         // may trust a positive lookup without granting every shell command.
-        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::Auto,
+            PermissionMode::AcceptEdits,
+        ] {
             assert_eq!(
                 decide(mode, ToolKind::Execute, "run_shell_command", true, false),
                 PureGateDecision::Allow,
@@ -4802,6 +4866,20 @@ mod tests {
         assert_eq!(
             decide(
                 PermissionMode::AcceptEdits,
+                ToolKind::Execute,
+                "run_shell_command",
+                false,
+                true
+            ),
+            PureGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn auto_mode_auto_allows_conservative_sandboxed_shell_commands() {
+        assert_eq!(
+            decide(
+                PermissionMode::Auto,
                 ToolKind::Execute,
                 "run_shell_command",
                 false,
@@ -5490,6 +5568,7 @@ mod tests {
     fn permission_mode_round_trip() {
         for mode in [
             PermissionMode::Default,
+            PermissionMode::Auto,
             PermissionMode::AcceptEdits,
             PermissionMode::ReadOnly,
             PermissionMode::BypassPermissions,

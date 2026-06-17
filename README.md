@@ -95,8 +95,8 @@ Run it directly if you want to see the stdio server start:
 
 Most users connect Anvil through an ACP client rather than running it directly.
 The first session shows setup guidance; use `/setup` to choose a model provider,
-log in, refresh model discovery, or adjust advanced settings. Use `/permissions`
-to change permission mode.
+log in, refresh model discovery, or adjust advanced settings. Change permission
+mode through the session `Permission` selector.
 
 ## Editor Setup
 
@@ -218,8 +218,7 @@ Built-in commands:
 
 - `/setup`: model login, provider selection, behavior mode, sandbox mode,
   timeout, and advanced settings.
-- `/permissions`: change edit/command approvals and remembered Always allow
-  entries.
+- `/permissions`: list or revoke remembered Always allow entries.
 - `/context`: show the current session context snapshot and token estimate.
 - `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or
   prompt on an interval until the session is cancelled.
@@ -268,18 +267,13 @@ Bifrost provides structural code-intelligence tools such as:
 Permission mode controls whether Anvil asks before tool calls:
 
 - `default`: ask before edits, and before shell commands except for a conservative auto-approved subset of sandboxed read-only commands (for example `rg`, `git diff`, `git show`, `git status`).
+- `auto`: like `default`, but promptable tool calls may be approved by the permission classifier when clearly inside the user's request.
 - `acceptEdits`: allow file edits, and ask before shell commands except for a conservative auto-approved subset of sandboxed read-only commands (for example `rg`, `git diff`, `git show`, `git status`).
 - `readOnly`: block edits and shell commands.
 - `bypassPermissions`: allow tool calls without prompting.
 
-Use:
-
-```text
-/permissions ask
-/permissions auto-edits
-/permissions read-only
-/permissions trusted
-```
+Change permission mode with the session `Permission` selector exposed by the
+ACP client.
 
 Approvals remembered through an **Always allow** prompt are stored in Anvil's
 setup state on disk and can be inspected or revoked with:
@@ -368,7 +362,7 @@ You can override the effective mode per session:
 ```
 
 `/setup sandbox off` disables sandboxing; permission prompts remain controlled
-by `/permissions`.
+by the session `Permission` selector.
 
 ## Tools
 

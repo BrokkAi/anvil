@@ -355,13 +355,17 @@ impl SessionMode {
 // Permission mode
 // ---------------------------------------------------------------------------
 
-/// Per-session permission policy, mirroring the four reference modes that
-/// `claude-agent-acp` exposes (default / acceptEdits / plan / bypassPermissions).
+/// Per-session permission policy, mirroring the reference modes that
+/// `claude-agent-acp` exposes (default / acceptEdits / plan / bypassPermissions)
+/// plus Anvil's explicit model-classified approval mode.
 /// Surfaced to clients as a `SessionConfigOption` (its own dropdown), independent
 /// of `SessionMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     Default,
+    /// Like Default, but promptable tool calls may be approved by the
+    /// permission scope classifier when clearly inside the user's request.
+    Auto,
     AcceptEdits,
     /// Hard read-only: refuses every Edit / Delete / Move / Execute tool call.
     /// Renamed from the reference's "plan" to avoid colliding with Brokk's
@@ -374,6 +378,7 @@ impl PermissionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Auto => "auto",
             Self::AcceptEdits => "acceptEdits",
             Self::ReadOnly => "readOnly",
             Self::BypassPermissions => "bypassPermissions",
@@ -383,6 +388,7 @@ impl PermissionMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "default" => Some(Self::Default),
+            "auto" => Some(Self::Auto),
             "acceptEdits" => Some(Self::AcceptEdits),
             "readOnly" => Some(Self::ReadOnly),
             "bypassPermissions" => Some(Self::BypassPermissions),
@@ -3972,6 +3978,7 @@ mod tests {
     fn permission_mode_parse_round_trip_all_variants() {
         for mode in [
             PermissionMode::Default,
+            PermissionMode::Auto,
             PermissionMode::AcceptEdits,
             PermissionMode::ReadOnly,
             PermissionMode::BypassPermissions,

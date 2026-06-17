@@ -71,6 +71,7 @@ impl SandboxPolicy {
         match mode {
             PermissionMode::BypassPermissions => Self::None,
             PermissionMode::ReadOnly => Self::ReadOnly,
+            PermissionMode::Auto => Self::WorkspaceWrite,
             PermissionMode::Default => Self::WorkspaceWrite,
             PermissionMode::AcceptEdits => Self::WorkspaceWrite,
         }
@@ -964,6 +965,10 @@ mod tests {
         );
         assert_eq!(
             SandboxPolicy::from_permission_mode(PermissionMode::Default),
+            SandboxPolicy::WorkspaceWrite
+        );
+        assert_eq!(
+            SandboxPolicy::from_permission_mode(PermissionMode::Auto),
             SandboxPolicy::WorkspaceWrite
         );
         assert_eq!(
