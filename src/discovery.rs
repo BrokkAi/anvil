@@ -124,6 +124,7 @@ pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 /// launched with a different `--host`; we probe this only when a running
 /// `ds4-server` process is detected but its actual listening port could not
 /// be resolved from the OS.
+#[cfg(unix)]
 pub const DS4_DEFAULT_URL: &str = "http://127.0.0.1:8000";
 
 /// Env override for the ds4-server base URL. The escape hatch for setups the
@@ -144,7 +145,7 @@ pub const DS4_BASE_URL_ENV: &str = "DS4_BASE_URL";
 ///   2. A running `ds4-server` process whose listening TCP port we resolve
 ///      from the OS, yielding `http://127.0.0.1:<port>`.
 ///   3. A running `ds4-server` process whose port could not be resolved,
-///      falling back to the documented default [`DS4_DEFAULT_URL`].
+///      falling back to the documented default `DS4_DEFAULT_URL`.
 ///
 /// Returns `None` when neither the env override nor a running process is
 /// present, so discovery omits ds4 entirely -- the running process *is* the
