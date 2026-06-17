@@ -76,6 +76,63 @@ pub(crate) fn is_incomplete_stream_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<IncompleteStreamError>().is_some())
 }
 
+pub(crate) fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+    if is_incomplete_stream_error(error) {
+        return true;
+    }
+
+    let error = format!("{error:#}");
+    error.contains("stream read error")
+        || error.contains("no meaningful progress")
+        || error.contains("Responses stream failed: server_error")
+        || error.contains("Responses stream failed: server_is_overloaded")
+        || error.contains("Responses stream failed: rate_limit_exceeded")
+        || error.contains("server_is_overloaded")
+        || error.contains("server_error")
+        || error.contains("rate_limit_exceeded")
+}
+
+/// Retry a streamed LLM request when the caller guarantees streamed
+/// deltas are not user-visible. Use the main tool-loop wrapper instead
+/// when callbacks can emit text or thought updates to the client.
+pub(crate) async fn stream_chat_no_visible_output_with_retry<F>(
+    llm: &dyn LlmBackend,
+    operation: &str,
+    cancel: &CancellationToken,
+    mut build_request: F,
+) -> Result<LlmResponse>
+where
+    F: FnMut() -> StreamChatRequest,
+{
+    let mut attempt = 1u64;
+    loop {
+        match llm.stream_chat(build_request()).await {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
+                    && !cancel.is_cancelled()
+                    && is_retryable_llm_error(&error) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
+                    operation,
+                    "retrying transient LLM stream failure with no visible output"
+                );
+                crate::http_retry::sleep_before_retry(
+                    operation,
+                    attempt,
+                    format!("{error:#}"),
+                    Some(cancel),
+                )
+                .await?;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Owning callback handed token deltas as the LLM streams them.
 pub type TokenSink = Box<dyn FnMut(&str) + Send>;
 
@@ -1357,11 +1414,16 @@ where
                         );
                     }
                 };
-                let Some(chunk) = chunk_opt else {
+                let eof_after_buffer = if let Some(chunk) = chunk_opt {
+                    let chunk = chunk.context("stream read error")?;
+                    raw_buf.extend_from_slice(&chunk);
+                    false
+                } else if raw_buf.is_empty() {
                     break;
+                } else {
+                    raw_buf.push(b'\n');
+                    true
                 };
-                let chunk = chunk.context("stream read error")?;
-                raw_buf.extend_from_slice(&chunk);
 
                 let mut made_progress = false;
 
@@ -1425,6 +1487,9 @@ where
 
                 if made_progress {
                     deadline = tokio::time::Instant::now() + idle;
+                }
+                if eof_after_buffer {
+                    break;
                 }
             }
         }
@@ -1587,6 +1652,25 @@ mod tests {
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
         match result.expect("should complete") {
+            LlmResponse::Text { text: t, .. } => assert_eq!(t, "hi"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(*collected.lock().unwrap(), vec!["hi"]);
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_accepts_final_done_without_newline() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec()),
+            Ok(b"data: [DONE]".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, collected) = collect_tokens();
+        let cancel = CancellationToken::new();
+        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+
+        match result.expect("final buffered [DONE] should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "hi"),
             other => panic!("expected text response, got {other:?}"),
         }

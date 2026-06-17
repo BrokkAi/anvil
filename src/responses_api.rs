@@ -325,9 +325,16 @@ where
                         idle.as_secs()
                     ),
                 };
-                let Some(chunk) = chunk_opt else { break; };
-                let chunk = chunk?;
-                raw_buf.extend_from_slice(&chunk);
+                let eof_after_buffer = if let Some(chunk) = chunk_opt {
+                    let chunk = chunk?;
+                    raw_buf.extend_from_slice(&chunk);
+                    false
+                } else if raw_buf.is_empty() {
+                    break;
+                } else {
+                    raw_buf.push(b'\n');
+                    true
+                };
                 let mut made_progress = false;
 
                 while let Some(pos) = raw_buf.iter().position(|&b| b == b'\n') {
@@ -344,7 +351,6 @@ where
                         continue;
                     };
                     if data == "[DONE]" {
-                        made_progress = true;
                         continue;
                     }
 
@@ -433,6 +439,9 @@ where
                 if made_progress {
                     deadline = tokio::time::Instant::now() + idle;
                 }
+                if eof_after_buffer {
+                    break;
+                }
             }
         }
     }
@@ -469,6 +478,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use futures::stream;
     use std::sync::{Arc, Mutex};
 
@@ -528,6 +538,25 @@ mod tests {
         assert_eq!(collected.lock().unwrap().as_str(), "partial");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn shared_responses_stream_done_does_not_reset_idle_deadline() {
+        let stream = stream::iter(vec![Ok(b"data: [DONE]\n".to_vec())]).chain(stream::pending());
+        let (on_token, _) = collect_tokens();
+
+        let err = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("[DONE] should not keep a Responses stream alive");
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("no meaningful progress"), "got: {msg}");
+    }
+
     #[tokio::test]
     async fn shared_responses_stream_returns_text_on_response_completed() {
         let raw = concat!(
@@ -546,6 +575,32 @@ mod tests {
         )
         .await
         .expect("response.completed should finish the stream");
+
+        match resp {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(collected.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_accepts_final_completed_without_newline() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, collected) = collect_tokens();
+
+        let resp = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("final buffered response.completed should complete");
 
         match resp {
             LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),

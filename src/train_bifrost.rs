@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage};
+use crate::llm_client::{
+    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, is_retryable_llm_error,
+    stream_chat_no_visible_output_with_retry,
+};
 use crate::session::ToolExchange;
 use crate::trace_logging::append_trace_record;
 
@@ -431,6 +434,9 @@ async fn request_hint_with_retries(req: HintRequest<'_>) -> Result<(String, Toke
                     "max_attempts": HINT_MAX_ATTEMPTS,
                     "error": format!("{error:#}"),
                 }));
+                if is_retryable_llm_error(&error) {
+                    return Err(error);
+                }
                 last_error = Some(error);
             }
         }
@@ -458,11 +464,13 @@ async fn request_hint(req: &HintRequest<'_>, attempt: usize) -> Result<(String, 
         )),
     ];
 
-    let response = req
-        .llm
-        .stream_chat(StreamChatRequest {
+    let response = stream_chat_no_visible_output_with_retry(
+        req.llm.as_ref(),
+        "requesting train-bifrost hint",
+        req.cancel,
+        || StreamChatRequest {
             model: TRAIN_BIFROST_HINT_MODEL.to_string(),
-            messages: prompt_messages,
+            messages: prompt_messages.clone(),
             tools: None,
             reasoning_effort: None,
             temperature: None,
@@ -471,9 +479,10 @@ async fn request_hint(req: &HintRequest<'_>, attempt: usize) -> Result<(String, 
             on_thought: Box::new(|_| {}),
             cancel: req.cancel.clone(),
             idle_timeout: req.idle_timeout,
-        })
-        .await
-        .with_context(|| format!("hint model request failed for {}", req.context.file.path))?;
+        },
+    )
+    .await
+    .with_context(|| format!("hint model request failed for {}", req.context.file.path))?;
 
     let usage = response.usage();
     let text = match response {
@@ -718,6 +727,7 @@ mod tests {
     struct HintBackend {
         attempts: Arc<AtomicUsize>,
         fail_until: usize,
+        fail_first_incomplete: bool,
         last_prompt: Arc<Mutex<Option<String>>>,
     }
 
@@ -732,9 +742,18 @@ mod tests {
         ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
             let attempts = self.attempts.clone();
             let fail_until = self.fail_until;
+            let fail_first_incomplete = self.fail_first_incomplete;
             let last_prompt = self.last_prompt.clone();
             async move {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if fail_first_incomplete && attempt == 1 {
+                    return Err(anyhow::Error::new(
+                        crate::llm_client::IncompleteStreamError::new(
+                            "test SSE",
+                            "response.completed",
+                        ),
+                    ));
+                }
                 if attempt <= fail_until {
                     anyhow::bail!("temporary failure");
                 }
@@ -761,6 +780,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(HintBackend {
             attempts: attempts.clone(),
             fail_until: 2,
+            fail_first_incomplete: false,
             last_prompt: Arc::new(Mutex::new(None)),
         });
         let packet = TrainingPacket {
@@ -794,10 +814,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hint_request_retries_incomplete_stream_without_visible_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(HintBackend {
+            attempts: attempts.clone(),
+            fail_until: 0,
+            fail_first_incomplete: true,
+            last_prompt: Arc::new(Mutex::new(None)),
+        });
+        let packet = TrainingPacket {
+            files: vec![TrainingFile {
+                path: "src/lib.rs".to_string(),
+                diff: "diff".to_string(),
+            }],
+            related_files: Vec::new(),
+        };
+
+        let nudge = compose_no_edit_nudge(
+            &backend,
+            8,
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: vec![ChatContentPart::text("fix account bug")],
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            &[],
+            &packet,
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("transport retry should recover hint request");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(nudge.0.contains("Consider searching for account."));
+    }
+
+    #[tokio::test]
     async fn failed_hint_requests_skip_nudge() {
         let backend: Arc<dyn LlmBackend> = Arc::new(HintBackend {
             attempts: Arc::new(AtomicUsize::new(0)),
             fail_until: 3,
+            fail_first_incomplete: false,
             last_prompt: Arc::new(Mutex::new(None)),
         });
         let packet = TrainingPacket {
@@ -828,6 +888,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(HintBackend {
             attempts: attempts.clone(),
             fail_until: 0,
+            fail_first_incomplete: false,
             last_prompt: Arc::new(Mutex::new(None)),
         });
         let packet = TrainingPacket {
@@ -867,6 +928,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(HintBackend {
             attempts: attempts.clone(),
             fail_until: 0,
+            fail_first_incomplete: false,
             last_prompt: last_prompt.clone(),
         });
         let packet = TrainingPacket {
