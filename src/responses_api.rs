@@ -440,6 +440,18 @@ where
     if let Some(err) = failure {
         return Err(err);
     }
+
+    if cancel.is_cancelled() {
+        return Ok(LlmResponse::Text {
+            text: full_text,
+            usage,
+        });
+    }
+
+    if !completed {
+        anyhow::bail!("Responses stream closed before response.completed");
+    }
+
     if tool_calls.is_empty() {
         Ok(LlmResponse::Text {
             text: full_text,
@@ -451,5 +463,64 @@ where
             calls: tool_calls,
             usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn collect_tokens() -> (TokenSink, Arc<Mutex<Vec<String>>>) {
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let inner = collected.clone();
+        let cb: TokenSink = Box::new(move |t| {
+            inner.lock().unwrap().push(t.to_string());
+        });
+        (cb, collected)
+    }
+
+    fn noop_sink() -> TokenSink {
+        Box::new(|_| {})
+    }
+
+    #[tokio::test]
+    async fn drive_responses_sse_stream_errors_on_eof_before_completed() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n".to_vec(),
+        )];
+        let s = stream::iter(chunks);
+
+        let (on_token, tokens) = collect_tokens();
+        let cancel = CancellationToken::new();
+        let result =
+            drive_responses_sse_stream(s, on_token, noop_sink(), cancel, Duration::from_secs(90))
+                .await;
+
+        let err = result.expect_err("EOF before response.completed should fail");
+        assert!(
+            err.to_string().contains("closed before response.completed"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(*tokens.lock().unwrap(), vec!["partial".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drive_responses_sse_stream_allows_cancel_without_completed() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let s = stream::pending::<Result<Vec<u8>>>();
+
+        let (on_token, _) = collect_tokens();
+        let result =
+            drive_responses_sse_stream(s, on_token, noop_sink(), cancel, Duration::from_secs(90))
+                .await;
+
+        match result.expect("cancellation should return accumulated text") {
+            LlmResponse::Text { text, .. } => assert_eq!(text, ""),
+            other => panic!("expected text response, got {other:?}"),
+        }
     }
 }

@@ -1193,6 +1193,10 @@ where
         });
     }
 
+    if !completed {
+        anyhow::bail!("Codex Responses stream closed before response.completed");
+    }
+
     if tool_calls.is_empty() {
         Ok(LlmResponse::Text {
             text: full_text,
@@ -1495,6 +1499,24 @@ mod tests {
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(collected.lock().unwrap().as_str(), "hello");
+    }
+
+    #[tokio::test]
+    async fn sse_parser_errors_on_eof_before_completed() {
+        let raw = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+        let stream = futures::stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cb = sink_collecting(collected.clone());
+        let cancel = CancellationToken::new();
+        let err =
+            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
+                .await
+                .expect_err("EOF before response.completed should fail");
+        assert!(
+            err.to_string().contains("closed before response.completed"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(collected.lock().unwrap().as_str(), "partial");
     }
 
     #[tokio::test]

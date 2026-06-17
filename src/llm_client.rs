@@ -1405,18 +1405,7 @@ where
         });
     }
 
-    if tool_acc.is_empty() {
-        Ok(LlmResponse::Text {
-            text: full_text,
-            usage,
-        })
-    } else {
-        Ok(LlmResponse::ToolCalls {
-            text: full_text,
-            calls: tool_acc.into_tool_calls(),
-            usage,
-        })
-    }
+    anyhow::bail!("LLM stream closed before [DONE]")
 }
 
 #[cfg(test)]
@@ -1675,11 +1664,12 @@ mod tests {
         }
     }
 
-    /// Stream that ends without `[DONE]` returns whatever has been
-    /// accumulated -- some upstream proxies don't forward the terminator.
-    /// Tool-call accumulation flushes on stream end if no text arrived.
+    /// Stream EOF before `[DONE]` is a transport failure, not a completed
+    /// model response. Returning partial text here makes vanished streams
+    /// look like successful turns and prevents the caller's retry/error
+    /// handling from running.
     #[tokio::test]
-    async fn drive_sse_stream_returns_on_eof_without_done() {
+    async fn drive_sse_stream_errors_on_eof_without_done() {
         let chunks: Vec<Result<Vec<u8>>> = vec![Ok(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n".to_vec(),
         )];
@@ -1689,10 +1679,11 @@ mod tests {
         let cancel = CancellationToken::new();
         let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
 
-        match result.expect("should complete") {
-            LlmResponse::Text { text: t, .. } => assert_eq!(t, "partial"),
-            other => panic!("expected text response, got {other:?}"),
-        }
+        let err = result.expect_err("EOF before [DONE] should fail");
+        assert!(
+            err.to_string().contains("closed before [DONE]"),
+            "unexpected error: {err:#}"
+        );
     }
 
     /// The base URL is normalized to drop a trailing slash, and `/v1` is
