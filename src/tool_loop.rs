@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
     ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
-    messages_include_images, rewrite_image_prompt_provider_error,
+    is_retryable_llm_error, messages_include_images, rewrite_image_prompt_provider_error,
+    stream_chat_no_visible_output_with_retry,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
@@ -66,18 +67,6 @@ struct ExecutedStepOutcome {
     results: Vec<p2t::PrefixToolResult>,
     shell_sandbox_retry_states: Vec<ShellSandboxRetryState>,
     cancelled: bool,
-}
-
-fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
-    let error = format!("{error:#}");
-    error.contains("stream read error")
-        || error.contains("no meaningful progress")
-        || error.contains("Responses stream failed: server_error")
-        || error.contains("Responses stream failed: server_is_overloaded")
-        || error.contains("Responses stream failed: rate_limit_exceeded")
-        || error.contains("server_is_overloaded")
-        || error.contains("server_error")
-        || error.contains("rate_limit_exceeded")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2730,11 +2719,13 @@ async fn classify_permission_scope_with_model(
         ChatMessage::system(AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT),
         ChatMessage::user(prompt),
     ];
-    let result = request
-        .llm
-        .stream_chat(StreamChatRequest {
+    let result = stream_chat_no_visible_output_with_retry(
+        request.llm.as_ref(),
+        "classifying permission scope",
+        cancel,
+        || StreamChatRequest {
             model: request.model.to_string(),
-            messages,
+            messages: messages.clone(),
             tools: None,
             reasoning_effort: request.reasoning_effort.map(str::to_string),
             temperature: None,
@@ -2745,8 +2736,9 @@ async fn classify_permission_scope_with_model(
             idle_timeout: request
                 .idle_timeout
                 .min(AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let response = match result {
         Ok(response) => response,
@@ -3621,7 +3613,9 @@ fn ordered_tool_call_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{FunctionCall, FunctionDef};
+    use crate::llm_client::{
+        FunctionCall, FunctionDef, IncompleteStreamError, is_incomplete_stream_error,
+    };
     use futures::future::{BoxFuture, FutureExt};
     use std::sync::atomic::AtomicUsize;
 
@@ -3717,9 +3711,46 @@ mod tests {
         }
     }
 
+    struct IncompleteStreamRetryBackend {
+        attempts: Arc<AtomicUsize>,
+        emit_before_error: bool,
+    }
+
+    impl LlmBackend for IncompleteStreamRetryBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            mut request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            let emit_before_error = self.emit_before_error;
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    if emit_before_error {
+                        (request.on_token)("partial");
+                    }
+                    return Err(anyhow::Error::new(IncompleteStreamError::new(
+                        "test SSE",
+                        "response.completed",
+                    )));
+                }
+                Ok(LlmResponse::Text {
+                    text: "ok".to_string(),
+                    usage: TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
     struct StaticClassifierBackend {
         response: &'static str,
         calls: Arc<AtomicUsize>,
+        fail_first_incomplete: bool,
     }
 
     impl LlmBackend for StaticClassifierBackend {
@@ -3733,8 +3764,9 @@ mod tests {
         ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
             let response = self.response.to_string();
             let calls = self.calls.clone();
+            let fail_first_incomplete = self.fail_first_incomplete;
             async move {
-                calls.fetch_add(1, Ordering::SeqCst);
+                let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 assert!(request.tools.is_none());
                 assert!(request.structured_output.is_some());
                 assert!(
@@ -3742,6 +3774,12 @@ mod tests {
                         .content_text()
                         .contains("Original user request:")
                 );
+                if fail_first_incomplete && attempt == 1 {
+                    return Err(anyhow::Error::new(IncompleteStreamError::new(
+                        "test SSE",
+                        "response.completed",
+                    )));
+                }
                 Ok(LlmResponse::Text {
                     text: response,
                     usage: TokenUsage {
@@ -3791,6 +3829,7 @@ mod tests {
         let llm: Arc<dyn LlmBackend> = Arc::new(StaticClassifierBackend {
             response: r#"{"allow":true,"rationale":"focused test command"}"#,
             calls: calls.clone(),
+            fail_first_incomplete: false,
         });
         let raw_input = serde_json::json!({"command": "cargo test"});
         let request = GateCheck {
@@ -3817,6 +3856,39 @@ mod tests {
         assert_eq!(classification.rationale, "focused test command");
         assert_eq!(usage.total_tokens(), 6);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn permission_auto_classifier_retries_incomplete_stream_without_visible_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(StaticClassifierBackend {
+            response: r#"{"allow":true,"rationale":"focused test command"}"#,
+            calls: calls.clone(),
+            fail_first_incomplete: true,
+        });
+        let raw_input = serde_json::json!({"command": "cargo test"});
+        let request = GateCheck {
+            llm: &llm,
+            model: "test-model",
+            reasoning_effort: None,
+            original_user_request: "fix the failing tests",
+            idle_timeout: Duration::from_secs(300),
+            session_id: "session",
+            tool_name: "run_shell_command",
+            kind: ToolKind::Execute,
+            tool_call_id: "call",
+            raw_input: &raw_input,
+            cwd: Path::new("/tmp/project"),
+            shell_sandbox_retry_states: &[],
+        };
+
+        let (classification, _) =
+            classify_permission_scope_with_model(&request, &CancellationToken::new())
+                .await
+                .expect("retry should recover classifier output");
+
+        assert!(classification.allow);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -4014,6 +4086,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_retries_incomplete_stream_before_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(IncompleteStreamRetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: false,
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("incomplete streams should retry before output");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "");
+    }
+
+    #[tokio::test]
     async fn stream_chat_does_not_retry_after_partial_output() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
@@ -4044,6 +4148,53 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(format!("{error:#}").contains("Codex stream read error"));
         assert_eq!(output.lock().unwrap().as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_incomplete_stream_after_partial_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(IncompleteStreamRetryBackend {
+            attempts: attempts.clone(),
+            emit_before_error: true,
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let error = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("partial output makes retry unsafe");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(is_incomplete_stream_error(&error));
+        assert_eq!(output.lock().unwrap().as_str(), "partial");
+    }
+
+    #[test]
+    fn retryable_llm_error_recognizes_incomplete_stream_chain() {
+        let err = anyhow::Error::new(IncompleteStreamError::new("test SSE", "[DONE]"))
+            .context("driving test stream");
+
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn retryable_llm_error_does_not_treat_cancellation_as_incomplete_stream() {
+        let err = anyhow::anyhow!("streaming cancelled by client");
+
+        assert!(!is_retryable_llm_error(&err));
     }
 
     #[tokio::test]

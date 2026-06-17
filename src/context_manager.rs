@@ -33,7 +33,10 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::llm_client::{ChatMessage, LlmBackend, LlmResponse, StreamChatRequest};
+use crate::llm_client::{
+    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest,
+    stream_chat_no_visible_output_with_retry,
+};
 use crate::session::ConversationTurn;
 use crate::tokens::{approximate_tokens, approximate_tokens_messages};
 
@@ -254,12 +257,13 @@ async fn run_summarization_request(
     idle_timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<String> {
-    let on_token: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
-    let on_thought: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
-    let response = llm
-        .stream_chat(StreamChatRequest {
+    let response = stream_chat_no_visible_output_with_retry(
+        llm,
+        "summarizing conversation turn",
+        &cancel,
+        || StreamChatRequest {
             model: model.to_string(),
-            messages,
+            messages: messages.clone(),
             tools: None,
             // Summarization is structured extraction, not deep
             // reasoning -- "low" keeps cost down on reasoning-capable
@@ -267,12 +271,13 @@ async fn run_summarization_request(
             reasoning_effort: Some("low".to_string()),
             temperature: None,
             structured_output: None,
-            on_token,
-            on_thought,
-            cancel,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel.clone(),
             idle_timeout,
-        })
-        .await?;
+        },
+    )
+    .await?;
     let text = match response {
         LlmResponse::Text { text, .. } => text,
         LlmResponse::ToolCalls { text, .. } => text,
@@ -605,6 +610,7 @@ fn split_string_by_chars(s: &str, per_chunk_budget: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use futures::FutureExt;
@@ -843,6 +849,37 @@ mod tests {
         }
     }
 
+    struct IncompleteThenSummaryBackend {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for IncompleteThenSummaryBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            async { Ok(vec!["mock".into()]) }.boxed()
+        }
+
+        fn stream_chat(&self, _request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    return Err(anyhow::Error::new(
+                        crate::llm_client::IncompleteStreamError::new(
+                            "test SSE",
+                            "response.completed",
+                        ),
+                    ));
+                }
+                Ok(LlmResponse::Text {
+                    text: "<conversation_summary>\n- recovered\n</conversation_summary>"
+                        .to_string(),
+                    usage: crate::llm_client::TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
     /// The fast path: a small turn produces exactly one LLM call and
     /// that call uses the single-turn system prompt.
     #[tokio::test]
@@ -875,6 +912,29 @@ mod tests {
             "should use turn-level system prompt; got: {}",
             &prompts[0][..prompts[0].len().min(120)]
         );
+    }
+
+    #[tokio::test]
+    async fn summarize_turn_retries_incomplete_stream_without_visible_output() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend = IncompleteThenSummaryBackend {
+            attempts: attempts.clone(),
+        };
+        let t = turn("hello", "hi");
+
+        let out = summarize_turn(
+            &backend,
+            "mock",
+            &t,
+            Some(200_000),
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("retry should recover summarization");
+
+        assert_eq!(out, "- recovered");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     /// The hierarchical path: a turn that overflows budget triggers
