@@ -2084,6 +2084,12 @@ fn list_manifests_in_dir(dir: &Path) -> Vec<SessionManifest> {
         .collect()
 }
 
+fn filter_and_sort_listed_manifests(mut manifests: Vec<SessionManifest>) -> Vec<SessionManifest> {
+    manifests.retain(|manifest| manifest.title().is_some());
+    manifests.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
+    manifests
+}
+
 /// List all session manifests from the executor's sessions directory.
 fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
     let primary_dir = sessions_dir(cwd);
@@ -2107,7 +2113,7 @@ fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
         }
     }
 
-    manifests
+    filter_and_sort_listed_manifests(manifests)
 }
 
 /// Normalize a cwd before comparing or rooting a per-session registry.
@@ -5306,6 +5312,80 @@ mod tests {
         );
     }
 
+    fn test_manifest(id: &str, name: &str, modified: u64) -> SessionManifest {
+        SessionManifest {
+            id: id.to_string(),
+            name: name.to_string(),
+            created: modified,
+            modified,
+            version: "4.0".to_string(),
+            mode: None,
+            model: Some("m".to_string()),
+            brokk_mcp_servers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_from_disk_filters_unnamed_sessions() {
+        let store = SessionStore::new("m".to_string());
+        let cwd =
+            std::env::temp_dir().join(format!("brokk-acp-rust-named-{}", uuid::Uuid::new_v4()));
+
+        write_new_session_zip(
+            &session_zip_path(&cwd, "named"),
+            &test_manifest("named", "Named session", 1),
+        )
+        .expect("write named session");
+        write_new_session_zip(
+            &session_zip_path(&cwd, "empty"),
+            &test_manifest("empty", "", 2),
+        )
+        .expect("write empty-name session");
+        write_new_session_zip(
+            &session_zip_path(&cwd, "blank"),
+            &test_manifest("blank", "   ", 3),
+        )
+        .expect("write blank-name session");
+        write_new_session_zip(
+            &session_zip_path(&cwd, "placeholder"),
+            &test_manifest("placeholder", DEFAULT_SESSION_NAME, 4),
+        )
+        .expect("write placeholder-name session");
+
+        let listed = store.list_sessions_from_disk(&cwd).await;
+        assert_eq!(
+            listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["named"]
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_from_disk_sorts_by_last_update_descending() {
+        let store = SessionStore::new("m".to_string());
+        let cwd =
+            std::env::temp_dir().join(format!("brokk-acp-rust-sorted-{}", uuid::Uuid::new_v4()));
+
+        for manifest in [
+            test_manifest("old", "Old", 10),
+            test_manifest("tie-b", "Tie B", 20),
+            test_manifest("new", "New", 30),
+            test_manifest("tie-a", "Tie A", 20),
+        ] {
+            write_new_session_zip(&session_zip_path(&cwd, &manifest.id), &manifest)
+                .expect("write session");
+        }
+
+        let listed = store.list_sessions_from_disk(&cwd).await;
+        assert_eq!(
+            listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "tie-a", "tie-b", "old"]
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     /// `list_sessions_from_disk` ignores non-zip files in the sessions
     /// directory (e.g. half-written `.tmp` files from a crashed write,
     /// or stray editor backups). Otherwise the list could surface entries
@@ -5316,6 +5396,10 @@ mod tests {
         let cwd =
             std::env::temp_dir().join(format!("brokk-acp-rust-list-{}", uuid::Uuid::new_v4()));
         let s = store.create_session(cwd.clone()).await;
+        store
+            .maybe_rename_from_prompt(&s.id, "Named session")
+            .await
+            .expect("rename session");
 
         // Drop a non-zip file alongside the real session zip.
         let dir = sessions_dir(&cwd);
