@@ -1047,14 +1047,14 @@ impl RepoPermissionState {
 
 static REPO_PERMISSION_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Root under which a repo's remembered approvals (`.brokk/permissions.json`)
+/// live. Shares [`session_storage_root`] so the permission store and the
+/// session store always resolve to the same `.brokk` directory: a `.git` file
+/// means a linked worktree, which is promoted to the main repo root so every
+/// worktree inherits (and contributes to) the shared approvals rather than
+/// keeping a throwaway per-worktree store.
 fn permission_scope_root(cwd: &Path) -> PathBuf {
-    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    for ancestor in start.ancestors() {
-        if ancestor.join(".git").exists() {
-            return ancestor.to_path_buf();
-        }
-    }
-    start
+    session_storage_root(cwd)
 }
 
 fn repo_permission_path(scope_root: &Path) -> PathBuf {
@@ -5261,6 +5261,48 @@ mod tests {
         assert!(
             !legacy_session_zip_path(worktree.path(), &session.id).exists(),
             "session zip should not be stored inside the linked worktree"
+        );
+    }
+
+    /// Remembered approvals must follow the same shared-root rule as sessions:
+    /// an "Always allow" granted from inside a linked worktree is persisted to
+    /// the main repo's `.brokk/permissions.json`, so it survives the worktree
+    /// being thrown away and is honored from the main checkout and sibling
+    /// worktrees. Previously each worktree kept a throwaway per-worktree store,
+    /// which is why approvals appeared to "never save".
+    #[tokio::test]
+    async fn linked_worktree_always_allow_is_shared_with_main_repo() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let (main, worktree) = make_fake_linked_worktree();
+        let store = SessionStore::new("m".to_string());
+
+        // Approve from inside the worktree.
+        let in_worktree = store.create_session(worktree.path().to_path_buf()).await;
+        store.add_always_allow(&in_worktree.id, "write_file").await;
+
+        // It lands in the main repo's store, not a throwaway worktree store.
+        assert_eq!(
+            read_repo_permission_state(main.path()).always_allow,
+            vec!["write_file".to_string()],
+            "approval should persist under the main repo root"
+        );
+        assert!(
+            !worktree
+                .path()
+                .join(".brokk")
+                .join("permissions.json")
+                .exists(),
+            "approval must not be stranded in the disposable worktree"
+        );
+
+        // A session created from the main checkout sees the approval.
+        let in_main = store.create_session(main.path().to_path_buf()).await;
+        assert!(
+            store
+                .is_any_always_allowed(&in_main.id, &["write_file".to_string()])
+                .await,
+            "approval granted in a worktree should be honored from the main repo"
         );
     }
 
