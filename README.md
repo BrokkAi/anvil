@@ -20,8 +20,9 @@ one reusable ACP subprocess and put a small client in front of it.
   boundary: initialize, create or resume a session, send prompts, receive
   streamed updates, answer permission requests.
 - **Model routing built in.** Anvil discovers Codex/ChatGPT credentials,
-  Ollama, and OpenRouter, then exposes collision-free wire ids such as
-  `codex::gpt-5-codex`, `ollama::llama3:latest`, and
+  Ollama, a local ds4-server (antirez/ds4), and OpenRouter, then exposes
+  collision-free wire ids such as `codex::gpt-5-codex`,
+  `ollama::llama3:latest`, `ds4::deepseek-v4-flash`, and
   `openrouter::anthropic/claude-sonnet-4.5`.
 - **MCP-native extensibility.** Anvil manages stdio MCP servers per session.
   Bifrost is preinstalled as a pinned, Anvil-managed local MCP server for
@@ -177,6 +178,12 @@ Anvil is zero-config by default:
   stale credentials. Run `/setup codex` from a session to sign in.
 - **Ollama**: probes `http://localhost:11434/v1/models`. Run Ollama on the
   default port, then use `/setup local refresh`.
+- **ds4** (antirez/ds4): when a `ds4-server` process is running, Anvil detects
+  it and resolves the TCP port it is listening on (no fixed port assumed),
+  then probes its OpenAI-compatible `/v1/models`. macOS and Linux only. Set
+  `DS4_BASE_URL` (e.g. `http://127.0.0.1:9000`) to point at a non-default host,
+  a remote box, or a reverse proxy instead. Discovered only while ds4-server
+  is up; start it and `/setup local refresh` to bring it online.
 - **OpenRouter**: uses `OPENROUTER_API_KEY` or credentials saved through
   `/setup openrouter key <key>`.
 - **Bedrock**: uses `AWS_BEARER_TOKEN_BEDROCK` or `~/.secrets/bedrock_api_key`.
@@ -201,8 +208,9 @@ Anvil is zero-config by default:
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.
 
-Provider priority for `/setup choose` is Codex first, Ollama second, OpenRouter
-last. You can also select a specific model with `/setup model <wire id>`.
+Provider priority for `/setup choose` is Codex first, then local models (Ollama,
+then ds4), with OpenRouter last. You can also select a specific model with
+`/setup model <wire id>`.
 
 ## Slash Commands
 

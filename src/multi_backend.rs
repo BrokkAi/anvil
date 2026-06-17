@@ -47,11 +47,19 @@ const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Ollama stays a plain `Option<Arc<...>>`: there's no login flow for
 /// it (the daemon either listens on the default port or it doesn't),
 /// so the slot is set once at construction and never mutated.
+///
+/// ds4 is behind an `RwLock` like Codex/OpenRouter, but for a different
+/// reason: ds4-server has no fixed port, so each discovery refresh
+/// re-resolves the running server's port (see `discovery::ds4_base_url`)
+/// and reinstalls a backend pointed at it. That keeps `ds4::*` chat
+/// routing aimed at the same port discovery just found, and lets ds4 come
+/// online when it's started after Anvil.
 pub struct MultiBackend {
     bedrock: RwLock<Option<Arc<dyn LlmBackend>>>,
     codex: RwLock<Option<Arc<dyn LlmBackend>>>,
     openrouter: RwLock<Option<Arc<dyn LlmBackend>>>,
     ollama: Option<Arc<dyn LlmBackend>>,
+    ds4: RwLock<Option<Arc<dyn LlmBackend>>>,
 }
 
 impl MultiBackend {
@@ -66,6 +74,9 @@ impl MultiBackend {
             codex: RwLock::new(codex),
             openrouter: RwLock::new(openrouter),
             ollama,
+            // Resolved on the first discovery refresh (the eager startup
+            // probe), then on every refresh thereafter.
+            ds4: RwLock::new(None),
         }
     }
 
@@ -149,6 +160,47 @@ impl MultiBackend {
         self.openrouter.read().unwrap().clone()
     }
 
+    /// Install (or replace) the ds4 backend. Called from each discovery
+    /// refresh with a backend pointed at the port the running ds4-server is
+    /// currently listening on. In-flight requests holding the old `Arc`
+    /// finish against it; new `ds4::*` routes pick up the new port.
+    fn install_ds4(&self, backend: Arc<dyn LlmBackend>) {
+        *self.ds4.write().unwrap() = Some(backend);
+    }
+
+    /// Drop the ds4 backend. Called from a discovery refresh that no longer
+    /// sees a running ds4-server, so a subsequent `ds4::*` request fails
+    /// with the standard "backend not configured" error instead of hitting
+    /// a now-dead port.
+    fn uninstall_ds4(&self) {
+        *self.ds4.write().unwrap() = None;
+    }
+
+    /// Snapshot the current ds4 backend, if any. Same shape as
+    /// `codex_snapshot` -- callers release the read lock before awaiting.
+    fn ds4_snapshot(&self) -> Option<Arc<dyn LlmBackend>> {
+        self.ds4.read().unwrap().clone()
+    }
+
+    /// Re-resolve the local ds4-server URL and (re)install or drop the ds4
+    /// chat backend so `ds4::*` routes to whatever port ds4-server is on
+    /// right now. Returns the resolved base URL for the discovery probe, or
+    /// `None` when no ds4-server is detected. The process/port probe is
+    /// blocking, so it runs off the async worker via `spawn_blocking`.
+    async fn refresh_ds4_backend(&self) -> Option<String> {
+        let url = tokio::task::spawn_blocking(crate::discovery::ds4_base_url)
+            .await
+            .unwrap_or(None);
+        match &url {
+            Some(u) => {
+                self.install_ds4(build_ds4_backend(u));
+                tracing::info!("ds4-server detected at {u}; ds4::* chat routes there");
+            }
+            None => self.uninstall_ds4(),
+        }
+        url
+    }
+
     async fn list_model_metadata_inner(
         &self,
         progress: Option<UnboundedSender<String>>,
@@ -205,9 +257,14 @@ impl MultiBackend {
             openrouter_metadata.iter().map(|m| m.id.clone()).collect();
         let openrouter_lookup = move || async move { Ok::<_, anyhow::Error>(openrouter_ids) };
 
+        // Re-resolve ds4-server's port and (re)install its chat backend, so
+        // discovery and `ds4::*` routing agree on the same port this round.
+        let ds4_url = self.refresh_ds4_backend().await;
+
         let discovered: Vec<DiscoveredModel> = discover_all(
             &http,
             OLLAMA_DEFAULT_URL,
+            ds4_url.as_deref(),
             bedrock_lookup,
             codex_lookup,
             openrouter_lookup,
@@ -261,6 +318,11 @@ impl MultiBackend {
                             pricing: meta.pricing,
                         })
                         .unwrap_or_else(|| ModelMetadata::id_only(wire)),
+                    // ds4-server's OpenAI shim only reports model ids (no
+                    // capability/context metadata like Ollama's /api/show),
+                    // so we expose ids alone and let the compression layer
+                    // fall back to its default context window.
+                    ModelSource::Ds4 => ModelMetadata::id_only(wire),
                     ModelSource::OpenRouter => openrouter_by_id
                         .get(&m.id)
                         .map(|meta| ModelMetadata {
@@ -290,6 +352,7 @@ impl MultiBackend {
             ModelSource::Codex => self.codex_snapshot(),
             ModelSource::OpenRouter => self.openrouter_snapshot(),
             ModelSource::Ollama => self.ollama.clone(),
+            ModelSource::Ds4 => self.ds4_snapshot(),
         }
     }
 
@@ -298,9 +361,10 @@ impl MultiBackend {
     /// login or Bedrock key paste mid-session promotes it to the preferred
     /// fallback.
     ///
-    /// Priority is Bedrock > Codex > Ollama > OpenRouter. Bedrock wins
+    /// Priority is Bedrock > Codex > Ollama > ds4 > OpenRouter. Bedrock wins
     /// when configured because its model ids are otherwise easy to type
-    /// bare from the environment-driven setup.
+    /// bare from the environment-driven setup. ds4 sits after Ollama so an
+    /// existing Ollama user's bare-id fallback is unchanged.
     fn fallback_source(&self) -> Option<ModelSource> {
         let bedrock_present = self.bedrock.read().unwrap().is_some();
         if bedrock_present {
@@ -312,6 +376,9 @@ impl MultiBackend {
         }
         if self.ollama.is_some() {
             return Some(ModelSource::Ollama);
+        }
+        if self.ds4.read().unwrap().is_some() {
+            return Some(ModelSource::Ds4);
         }
         let openrouter_present = self.openrouter.read().unwrap().is_some();
         if openrouter_present {
@@ -471,6 +538,20 @@ async fn discover_ollama_metadata(
             HashMap::new()
         }
     }
+}
+
+/// Build a ds4 chat backend pointed at `base_url` (already resolved to the
+/// running ds4-server's port by `discovery::ds4_base_url`). ds4-server is
+/// OpenAI-compatible, so this mirrors the Ollama backend: an `OpenAiClient`
+/// against `{base}/v1` with no API key.
+fn build_ds4_backend(base_url: &str) -> Arc<dyn LlmBackend> {
+    let base = base_url.trim_end_matches('/');
+    let chat_url = format!("{base}/v1");
+    Arc::new(crate::llm_client::OpenAiClient::with_reasoning_support(
+        chat_url,
+        None,
+        reqwest::header::HeaderMap::new(),
+    ))
 }
 
 #[cfg(test)]

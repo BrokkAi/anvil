@@ -848,6 +848,7 @@ fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
         ModelSource::Bedrock,
         ModelSource::Codex,
         ModelSource::Ollama,
+        ModelSource::Ds4,
         ModelSource::OpenRouter,
     ]
     .into_iter()
@@ -4678,6 +4679,11 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
             "Local models",
             source_model_ids(catalog, ModelSource::Ollama, 12),
             "No local models found. Run `/setup local`.",
+        );
+        write_group(
+            "ds4 (DeepSeek V4)",
+            source_model_ids(catalog, ModelSource::Ds4, 12),
+            "No ds4 models found. Start `ds4-server` (antirez/ds4), or set DS4_BASE_URL.",
         );
         write_group(
             "OpenRouter",
