@@ -133,15 +133,7 @@ fn default_bifrost_args() -> Vec<String> {
         "{cwd}".to_string(),
         "--server".to_string(),
         "core".to_string(),
-    ]
-}
-
-fn legacy_core_bifrost_args() -> Vec<String> {
-    vec![
-        "--root".to_string(),
-        "{cwd}".to_string(),
-        "--server".to_string(),
-        "core".to_string(),
+        "--no-line-numbers".to_string(),
     ]
 }
 
@@ -170,27 +162,24 @@ fn managed_bifrost_command() -> String {
         .unwrap_or_else(|| "bifrost".to_string())
 }
 
-fn is_legacy_or_managed_bifrost_command(command: &str) -> bool {
+fn is_default_or_managed_bifrost_command(command: &str) -> bool {
     command == "bifrost" || command == managed_bifrost_command()
 }
 
 /// Normalises a stored Bifrost server entry so it always uses Anvil's managed
 /// local binary with the correct line framing.
 ///
-/// The function matches on name, current-or-legacy default args, and a legacy (`"bifrost"`) or
-/// managed-path command.  When all three match the **entire** `McpServerConfig`
-/// is replaced by [`McpServerConfig::bifrost()`]; only `enabled` is preserved.
-/// Any other customisation (e.g. a manually-set framing override) is
-/// intentionally discarded — Bifrost's wire protocol requires line framing and
-/// the command must point to the pinned managed binary.
+/// The function matches on name, the current default args, and the default
+/// (`"bifrost"`) or managed-path command. When all three match the **entire**
+/// `McpServerConfig` is replaced by [`McpServerConfig::bifrost()`]; only
+/// `enabled` is preserved. Any other customisation (e.g. a manually-set
+/// framing override) is intentionally discarded — Bifrost's wire protocol
+/// requires line framing and the command must point to the pinned managed
+/// binary.
 pub fn normalize_preinstalled_bifrost_server(server: &mut McpServerConfig) {
     if server.name != "bifrost"
-        || !matches!(
-            server.args.as_slice(),
-            args if args == default_bifrost_args().as_slice()
-                || args == legacy_core_bifrost_args().as_slice()
-        )
-        || !is_legacy_or_managed_bifrost_command(&server.command)
+        || server.args.as_slice() != default_bifrost_args().as_slice()
+        || !is_default_or_managed_bifrost_command(&server.command)
     {
         return;
     }
@@ -813,7 +802,15 @@ mod tests {
             client.tools().len()
         );
 
-        for expected in ["search_symbols", "get_summaries"] {
+        for expected in [
+            "search_symbols",
+            "get_symbol_sources",
+            "get_summaries",
+            "scan_usages",
+            "usage_graph",
+            "activate_workspace",
+            "get_active_workspace",
+        ] {
             assert!(
                 names.contains(&expected),
                 "missing tool {expected} in {names:?}"

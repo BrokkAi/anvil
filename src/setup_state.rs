@@ -195,7 +195,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_mcp_servers_migrates_legacy_bifrost_command_to_managed_binary() {
+    fn read_mcp_servers_migrates_default_bifrost_command_to_managed_binary() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         remember_mcp_servers(vec![crate::mcp::McpServerConfig {
@@ -227,35 +227,6 @@ mod tests {
             bifrost.command,
         );
         assert_eq!(bifrost.framing, crate::mcp::McpFraming::Line);
-    }
-
-    #[test]
-    fn read_mcp_servers_uses_canonical_core_bifrost_args() {
-        let config_dir = tempfile::tempdir().expect("config dir");
-        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        remember_mcp_servers(vec![crate::mcp::McpServerConfig {
-            name: "bifrost".to_string(),
-            command: "bifrost".to_string(),
-            args: vec![
-                "--root".to_string(),
-                "{cwd}".to_string(),
-                "--server".to_string(),
-                "core".to_string(),
-            ],
-            env: Vec::new(),
-            framing: crate::mcp::McpFraming::Line,
-            enabled: true,
-        }])
-        .expect("remember mcp servers");
-
-        let servers = read_mcp_servers();
-        let bifrost = servers
-            .into_iter()
-            .find(|server| server.name == "bifrost")
-            .expect("bifrost server");
-
-        assert_eq!(bifrost.args, crate::mcp::McpServerConfig::bifrost().args);
-        assert_eq!(bifrost.args.get(3).map(String::as_str), Some("core"));
     }
 
     #[test]

@@ -5908,6 +5908,7 @@ done
             cwd.display().to_string(),
             "--server".to_string(),
             "core".to_string(),
+            "--no-line-numbers".to_string(),
         ]
     }
 
