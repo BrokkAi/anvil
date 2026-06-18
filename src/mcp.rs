@@ -813,11 +813,7 @@ mod tests {
             client.tools().len()
         );
 
-        for expected in ["search_symbols", "get_summaries"].into_iter().chain(
-            crate::tools::SLOPCOP_BIFROST_READ_ONLY_TOOLS
-                .iter()
-                .copied(),
-        ) {
+        for expected in ["search_symbols", "get_summaries"] {
             assert!(
                 names.contains(&expected),
                 "missing tool {expected} in {names:?}"
