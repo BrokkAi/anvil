@@ -622,12 +622,12 @@ impl ToolRegistry {
                 shell_properties["sandbox_permissions"] = json!({
                     "type": "string",
                     "enum": ["require_escalated"],
-                    "description": "Set to `require_escalated` only when retrying a command that already failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation or writes outside the workspace). This asks the user for permission to run the command outside the OS sandbox once."
+                    "description": "Set to `require_escalated` only when retrying a command that already failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation, writes outside the workspace, or sandbox-blocked network/DNS access). This asks the user for permission to run the command outside the sandbox once."
                 });
             }
             defs.push(tool_def(
                 "run_shell_command",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses OS sandboxing, commands run in that sandbox by default. If a sandboxed attempt fails because of the sandbox boundary, the retry field for requesting one-time outside-sandbox permission will be exposed in the next tool schema.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses sandboxing, commands run in that sandbox by default. If a sandboxed attempt fails because of the sandbox boundary, including blocked network or DNS access, the retry field for requesting one-time outside-sandbox permission will be exposed in the next tool schema.",
                 json!({
                     "type": "object",
                     "properties": shell_properties,
