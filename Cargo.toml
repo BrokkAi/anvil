@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"
@@ -36,7 +36,7 @@ brokk-acp-sandbox = "0.1.0"
 # We intentionally do not try to compile out RTK's `src/hooks`: it is wired into
 # command parsing, filter trust checks, discovery, and analytics, while hosted
 # mode already avoids the hook installer/runtime side effects Anvil cares about.
-rtk_core = { package = "rtk", git = "https://github.com/BrokkAi/rtk", rev = "6002c7bc55a5e5ee8e6a0ee3d059b630adf130bd", features = ["hosted"] }
+rtk_core = { package = "brokk-rtk", version = "0.42.4", features = ["hosted"] }
 # Embedded wasm runtime + WASI Preview 2 bindings for the sandboxed
 # parser. Used to host `brokk-acp-sandbox.wasm` in-process with
 # fuel-based CPU limits and capability-scoped fs access.

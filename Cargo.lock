@@ -419,12 +419,13 @@ dependencies = [
 
 [[package]]
 name = "brokk-anvil"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
  "base64",
  "brokk-acp-sandbox",
+ "brokk-rtk",
  "chrono",
  "clap",
  "dirs 6.0.0",
@@ -435,7 +436,6 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "reqwest",
- "rtk",
  "rustls-native-certs",
  "serde",
  "serde_json",
@@ -455,6 +455,36 @@ dependencies = [
  "webbrowser",
  "wiremock",
  "zip",
+]
+
+[[package]]
+name = "brokk-rtk"
+version = "0.42.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0446439aaafeb35f7955d85d3de3d10c6f321d9c49a6d87fb14434900f53e88"
+dependencies = [
+ "anyhow",
+ "automod",
+ "chrono",
+ "clap",
+ "colored",
+ "dirs 5.0.1",
+ "flate2",
+ "getrandom 0.4.2",
+ "ignore",
+ "lazy_static",
+ "libc",
+ "quick-xml",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "toml 0.8.23",
+ "ureq",
+ "walkdir",
+ "which",
 ]
 
 [[package]]
@@ -3151,35 +3181,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rtk"
-version = "0.42.2"
-source = "git+https://github.com/BrokkAi/rtk?rev=6002c7bc55a5e5ee8e6a0ee3d059b630adf130bd#6002c7bc55a5e5ee8e6a0ee3d059b630adf130bd"
-dependencies = [
- "anyhow",
- "automod",
- "chrono",
- "clap",
- "colored",
- "dirs 5.0.1",
- "flate2",
- "getrandom 0.4.2",
- "ignore",
- "lazy_static",
- "libc",
- "quick-xml",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "toml 0.8.23",
- "ureq",
- "walkdir",
- "which",
 ]
 
 [[package]]

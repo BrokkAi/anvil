@@ -13,7 +13,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.6.3";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.6.5";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 
 #[cfg(target_os = "macos")]
