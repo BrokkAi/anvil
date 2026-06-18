@@ -132,7 +132,7 @@ fn default_bifrost_args() -> Vec<String> {
         "--root".to_string(),
         "{cwd}".to_string(),
         "--server".to_string(),
-        "core|slopcop".to_string(),
+        "core".to_string(),
     ]
 }
 
