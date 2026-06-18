@@ -3305,7 +3305,7 @@ fn tool_result_to_execution(
     }
 }
 
-const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command was blocked by the OS sandbox. Retry it with `sandbox_permissions: \"require_escalated\"` to run outside the sandbox.";
+const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command appears to be blocked by the sandbox boundary. Retry it with `sandbox_permissions: \"require_escalated\"` to run outside the sandbox.";
 
 /// Strip the sandbox-escalation hint from output so client-facing
 /// tool-call cards show a clean message. The full hint still flows
@@ -3334,6 +3334,18 @@ fn is_likely_sandbox_limitation(output: &str) -> bool {
         "seccomp",
         "cannot create directory",
         "cannot touch",
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "nodename nor servname provided",
+        "getaddrinfo enotfound",
+        "getaddrinfo eai_again",
+        "eai_again",
+        "network is unreachable",
+        "network unreachable",
+        "no route to host",
+        "failed to download",
+        "failed to fetch",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -5620,6 +5632,32 @@ mod tests {
         let result = crate::tools::ToolResult {
             status: ToolStatus::RequestError,
             output: "permission denied".to_string(),
+        };
+
+        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+
+        assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
+        assert!(exec.sandbox_retry_available);
+    }
+
+    #[test]
+    fn sandbox_escalation_hint_is_added_for_sandboxed_network_failures() {
+        let result = crate::tools::ToolResult {
+            status: ToolStatus::RequestError,
+            output: "curl: (6) Could not resolve host: example.com".to_string(),
+        };
+
+        let exec = tool_result_to_execution("run_shell_command", true, false, result);
+
+        assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
+        assert!(exec.sandbox_retry_available);
+    }
+
+    #[test]
+    fn sandbox_escalation_hint_is_added_for_sandboxed_registry_network_failures() {
+        let result = crate::tools::ToolResult {
+            status: ToolStatus::RequestError,
+            output: "npm ERR! request to https://registry.npmjs.org/vite failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org".to_string(),
         };
 
         let exec = tool_result_to_execution("run_shell_command", true, false, result);
