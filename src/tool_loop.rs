@@ -1917,7 +1917,9 @@ fn snapshot_p2t_workspace_best_effort(
     snapshot_dir: &Path,
     step: usize,
 ) {
-    if let Err(error) = p2t::snapshot_workspace(cwd, snapshot_dir, step, config.link_base.as_deref()) {
+    if let Err(error) =
+        p2t::snapshot_workspace(cwd, snapshot_dir, step, config.link_base.as_deref())
+    {
         let rendered = format!("{error:#}");
         tracing::warn!(
             step,
