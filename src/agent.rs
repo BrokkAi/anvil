@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionConfigOption,
+    CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    Cost, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
     SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
     SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
@@ -24,8 +25,9 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    ConversationTurn, PermissionMode, PromptStartError, REASONING_EFFORT_OFF_VALUE, Session,
-    SessionManifest, SessionMode, SessionSnapshot, SessionStore, acp_mcp_servers_to_configs,
+    CloseSessionResult, ConversationTurn, PermissionMode, PromptStartError,
+    REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode, SessionSnapshot,
+    SessionStore, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -962,6 +964,7 @@ pub async fn run_agent(
     let sessions_login = sessions.clone();
 
     let sessions_cancel = sessions.clone();
+    let sessions_close = sessions.clone();
     let sessions_mode = sessions.clone();
     let sessions_perm = sessions.clone();
 
@@ -999,7 +1002,8 @@ pub async fn run_agent(
                     .session_capabilities(
                         SessionCapabilities::new()
                             .list(SessionListCapabilities::new())
-                            .resume(SessionResumeCapabilities::new()),
+                            .resume(SessionResumeCapabilities::new())
+                            .close(SessionCloseCapabilities::new()),
                     );
 
                 responder.respond(
@@ -1114,7 +1118,7 @@ pub async fn run_agent(
                 );
 
                 // Look up the session from memory or disk
-                let session = match sessions_load.get_session(&session_id, &cwd).await {
+                let session = match sessions_load.reopen_session(&session_id, &cwd).await {
                     Some(s) => {
                         sessions_load.update_cwd(&session_id, cwd).await;
                         s
@@ -1183,7 +1187,7 @@ pub async fn run_agent(
                     cwd.display()
                 );
 
-                match sessions_resume.get_session(&session_id, &cwd).await {
+                match sessions_resume.reopen_session(&session_id, &cwd).await {
                     Some(session) => {
                         sessions_resume.update_cwd(&session_id, cwd).await;
                         let catalog = sessions_resume.available_model_metadata().await;
@@ -1383,6 +1387,10 @@ pub async fn run_agent(
                     let registry = sessions_prompt
                         .get_or_create_registry(&session_id, snap.cwd.clone())
                         .await;
+                    let Some(registry) = registry else {
+                        send_message(&cx, &session_id, "Error: unknown session");
+                        return responder.respond(prompt_end_turn_response());
+                    };
                     let report = handle_pr_create(
                         &raw_prompt_text,
                         &registry,
@@ -1513,6 +1521,15 @@ pub async fn run_agent(
                                     "reason": format!(
                                         "prompt already in flight for session '{session_id}'"
                                     ),
+                                }),
+                            ),
+                        );
+                    }
+                    Err(PromptStartError::UnknownSession) => {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(
+                                serde_json::json!({
+                                    "reason": format!("unknown session '{session_id}'"),
                                 }),
                             ),
                         );
@@ -1787,9 +1804,17 @@ pub async fn run_agent(
                 .await;
 
                 // Build the tool registry up-front so we don't pay for it inside the spawn.
-                let registry = sessions_prompt
+                let Some(registry) = sessions_prompt
                     .get_or_create_registry(&session_id, snap.cwd)
-                    .await;
+                    .await
+                else {
+                    sessions_prompt.finish_prompt(&session_id).await;
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!("unknown session '{session_id}'"),
+                        })),
+                    );
+                };
 
                 // Capture everything the spawned task needs before we move into it.
                 // The tool loop calls `block_task()` to await `session/request_permission`,
@@ -1895,6 +1920,30 @@ pub async fn run_agent(
                 Ok(())
             },
             on_receive_notification!(),
+        )
+        // Handle session/close
+        .on_receive_request(
+            async move |req: CloseSessionRequest,
+                        responder: Responder<CloseSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let session_id = req.session_id.to_string();
+                tracing::info!("ACP close session={session_id}");
+
+                match sessions_close.close_session(&session_id).await {
+                    CloseSessionResult::Closed => responder.respond(CloseSessionResponse::new()),
+                    CloseSessionResult::Unknown => responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!("unknown session '{session_id}'"),
+                        })),
+                    ),
+                    CloseSessionResult::AlreadyClosed => responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": format!("session '{session_id}' is already closed"),
+                        })),
+                    ),
+                }
+            },
+            on_receive_request!(),
         )
         // Handle session/set_mode
         .on_receive_request(
@@ -2277,9 +2326,12 @@ async fn run_loop_iteration(
             .await
             .unwrap_or(PermissionMode::Default);
         let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
-        let registry = sessions
+        let Some(registry) = sessions
             .get_or_create_registry(session_id, snap.cwd.clone())
-            .await;
+            .await
+        else {
+            return Err(LoopIterationError::Terminal("unknown session".to_string()));
+        };
         send_message(
             cx,
             session_id,
@@ -2373,9 +2425,12 @@ async fn run_loop_iteration(
         context_length,
     )
     .await;
-    let registry = sessions
+    let Some(registry) = sessions
         .get_or_create_registry(session_id, snap.cwd.clone())
-        .await;
+        .await
+    else {
+        return Err(LoopIterationError::Terminal("unknown session".to_string()));
+    };
     let idle_timeout = Duration::from_secs(
         snap.idle_timeout_secs
             .unwrap_or(default_idle_timeout_secs)

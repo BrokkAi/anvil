@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::ModelMetadata;
@@ -160,16 +160,18 @@ fn effective_mcp_servers(extra_servers: Option<Vec<McpServerConfig>>) -> Vec<Mcp
     servers
 }
 
-/// Error returned when a session already has a prompt in flight.
+/// Error returned when a prompt cannot be started for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptStartError {
     AlreadyInFlight,
+    UnknownSession,
 }
 
 impl std::fmt::Display for PromptStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyInFlight => write!(f, "prompt already in flight"),
+            Self::UnknownSession => write!(f, "unknown session"),
         }
     }
 }
@@ -2161,12 +2163,31 @@ pub struct SessionStore {
     /// One ToolRegistry per session, kept warm across turns so any MCP
     /// subprocesses survive. Populated lazily on first prompt.
     registries: Arc<RwLock<HashMap<String, Arc<ToolRegistry>>>>,
+    /// Serializes lifecycle transitions that must agree across close,
+    /// prompt startup, cold-load, and registry creation.
+    lifecycle_lock: Arc<Mutex<()>>,
+    /// Sessions this server process has created or loaded. Eviction drops
+    /// only resident state, so these IDs remain closeable after LRU eviction.
+    known_sessions: Arc<RwLock<HashSet<String>>>,
+    /// Sessions explicitly closed during this server process. Closing is
+    /// intentionally non-destructive on disk, and explicit load/resume may
+    /// reopen the persisted zip. Prompt startup and registry creation still
+    /// treat these IDs as closed so a racing turn cannot accidentally
+    /// resurrect process-local resources after close.
+    closed_sessions: Arc<RwLock<HashSet<String>>>,
     /// Per-session monotonic access counter used for LRU eviction. Held
     /// behind a sync `Mutex` because every touch is a fast in-memory bump
     /// and must not require holding a tokio lock across `.await` points.
     last_accessed: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     next_access: Arc<AtomicU64>,
     limits: SessionLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseSessionResult {
+    Closed,
+    Unknown,
+    AlreadyClosed,
 }
 
 impl SessionStore {
@@ -2202,6 +2223,9 @@ impl SessionStore {
             available_models: Arc::new(RwLock::new(Vec::new())),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            known_sessions: Arc::new(RwLock::new(HashSet::new())),
+            closed_sessions: Arc::new(RwLock::new(HashSet::new())),
             last_accessed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_access: Arc::new(AtomicU64::new(0)),
             limits,
@@ -2302,6 +2326,27 @@ impl SessionStore {
         }
     }
 
+    async fn remove_resident_sessions(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut sessions = self.sessions.write().await;
+        let mut registries = self.registries.write().await;
+        let mut last_accessed = self
+            .last_accessed
+            .lock()
+            .expect("last_accessed mutex poisoned");
+        for id in ids {
+            sessions.remove(id);
+            registries.remove(id);
+            last_accessed.remove(id);
+        }
+    }
+
+    async fn remove_resident_session(&self, id: &str) {
+        self.remove_resident_sessions(&[id.to_string()]).await;
+    }
+
     /// If `sessions.len()` exceeds `limits.max_sessions`, evict the least
     /// recently used session(s) from memory. Sessions with an in-flight
     /// prompt (cancel token registered via `start_prompt`) are skipped --
@@ -2341,19 +2386,7 @@ impl SessionStore {
         if to_evict.is_empty() {
             return;
         }
-        {
-            let mut sessions = self.sessions.write().await;
-            let mut registries = self.registries.write().await;
-            let mut last_accessed = self
-                .last_accessed
-                .lock()
-                .expect("last_accessed mutex poisoned");
-            for id in &to_evict {
-                sessions.remove(id);
-                registries.remove(id);
-                last_accessed.remove(id);
-            }
-        }
+        self.remove_resident_sessions(&to_evict).await;
         tracing::info!(
             evicted = to_evict.len(),
             "evicted least-recently-used sessions from memory: {to_evict:?}"
@@ -2374,17 +2407,20 @@ impl SessionStore {
         &self,
         session_id: &str,
         cwd: PathBuf,
-    ) -> Arc<ToolRegistry> {
+    ) -> Option<Arc<ToolRegistry>> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let (skills, agents) = {
-            let sessions = self.sessions.read().await;
-            match sessions.get(session_id) {
-                Some(s) => (s.skills.clone(), s.agents.clone()),
-                None => (
-                    Arc::new(crate::skills::SkillRegistry::default()),
-                    Arc::new(crate::agents::AgentRegistry::default()),
-                ),
+        let (skills, agents, mcp_servers) = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.closed_sessions.read().await.contains(session_id) {
+                return None;
             }
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(session_id)?;
+            (
+                session.skills.clone(),
+                session.agents.clone(),
+                effective_mcp_servers(session.mcp_servers.clone()),
+            )
         };
 
         if let Some(existing) = self.registries.read().await.get(session_id).cloned()
@@ -2392,22 +2428,29 @@ impl SessionStore {
         {
             existing.set_skills(skills).await;
             existing.set_agents(agents).await;
-            return existing;
-        }
-        let mcp_servers = {
-            let sessions = self.sessions.read().await;
-            let extra_servers = sessions
-                .get(session_id)
-                .and_then(|session| session.mcp_servers.clone());
-            effective_mcp_servers(extra_servers)
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.closed_sessions.read().await.contains(session_id)
+                || !self.sessions.read().await.contains_key(session_id)
+            {
+                return None;
+            }
+            return Some(existing);
         };
         let registry =
             Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
-        self.registries
-            .write()
-            .await
-            .insert(session_id.to_string(), registry.clone());
-        registry
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.closed_sessions.read().await.contains(session_id)
+                || !self.sessions.read().await.contains_key(session_id)
+            {
+                return None;
+            }
+            self.registries
+                .write()
+                .await
+                .insert(session_id.to_string(), registry.clone());
+        }
+        Some(registry)
     }
 
     pub async fn invalidate_registry(&self, session_id: &str) {
@@ -2502,6 +2545,11 @@ impl SessionStore {
             .write()
             .await
             .insert(id.clone(), session.clone());
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            self.known_sessions.write().await.insert(id.clone());
+            self.closed_sessions.write().await.remove(&id);
+        }
         self.touch(&id);
         self.enforce_session_cap().await;
         session
@@ -2514,7 +2562,7 @@ impl SessionStore {
     /// which constructs the message list under the read lock without copying
     /// the history twice.
     pub async fn get_session(&self, id: &str, cwd: &Path) -> Option<Session> {
-        if !self.load_into_memory_if_cold(id, cwd).await {
+        if !self.load_into_memory_if_cold(id, cwd, false).await {
             return None;
         }
         let cloned = self.sessions.read().await.get(id).cloned();
@@ -2531,9 +2579,18 @@ impl SessionStore {
     /// disk copy is NOT re-read. Live in-memory state (e.g. an updated
     /// `permission_mode` or pushed history turn) takes precedence over
     /// whatever is on disk.
-    async fn load_into_memory_if_cold(&self, id: &str, cwd: &Path) -> bool {
-        if self.sessions.read().await.contains_key(id) {
-            return true;
+    async fn load_into_memory_if_cold(&self, id: &str, cwd: &Path, reopen_closed: bool) -> bool {
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if !reopen_closed && self.closed_sessions.read().await.contains(id) {
+                return false;
+            }
+            if self.sessions.read().await.contains_key(id) {
+                if reopen_closed {
+                    self.closed_sessions.write().await.remove(id);
+                }
+                return true;
+            }
         }
         let primary_zip_path = session_zip_path(cwd, id);
         let legacy_zip_path = legacy_session_zip_path(cwd, id);
@@ -2606,6 +2663,10 @@ impl SessionStore {
         };
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if !reopen_closed && self.closed_sessions.read().await.contains(id) {
+                return false;
+            }
             let mut sessions = self.sessions.write().await;
             // Race window: another task may have inserted under the same id while
             // we read from disk. `or_insert` keeps the existing in-memory entry
@@ -2615,7 +2676,12 @@ impl SessionStore {
             // information is lost.
             let len_before = sessions.len();
             sessions.entry(id.to_string()).or_insert(session);
-            sessions.len() > len_before
+            let inserted = sessions.len() > len_before;
+            self.known_sessions.write().await.insert(id.to_string());
+            if reopen_closed {
+                self.closed_sessions.write().await.remove(id);
+            }
+            inserted
         };
         if inserted {
             self.touch(id);
@@ -2624,12 +2690,27 @@ impl SessionStore {
         true
     }
 
+    /// Explicitly reopen a persisted session after it was closed in this
+    /// process. This is used by ACP session/load and session/resume; close
+    /// remains non-destructive, while prompt/registry paths still avoid
+    /// implicit cold-load resurrection.
+    pub async fn reopen_session(&self, id: &str, cwd: &Path) -> Option<Session> {
+        if !self.load_into_memory_if_cold(id, cwd, true).await {
+            return None;
+        }
+        let cloned = self.sessions.read().await.get(id).cloned();
+        if cloned.is_some() {
+            self.touch(id);
+        }
+        cloned
+    }
+
     /// Snapshot the per-session data needed to start a prompt turn,
     /// cloning the conversation history exactly once (under the read lock).
     /// Callers consume `history` to build protocol-specific message types
     /// without further string copies.
     pub async fn snapshot(&self, id: &str, fallback_cwd: &Path) -> Option<SessionSnapshot> {
-        if !self.load_into_memory_if_cold(id, fallback_cwd).await {
+        if !self.load_into_memory_if_cold(id, fallback_cwd, false).await {
             return None;
         }
         // Build the snapshot under the sessions read lock, then resolve
@@ -3509,6 +3590,10 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<CancellationToken, PromptStartError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        if self.closed_sessions.read().await.contains(session_id) {
+            return Err(PromptStartError::UnknownSession);
+        }
         let token = CancellationToken::new();
         let mut cancel_tokens = self.cancel_tokens.write().await;
         match cancel_tokens.entry(session_id.to_string()) {
@@ -3528,6 +3613,29 @@ impl SessionStore {
 
     pub async fn finish_prompt(&self, session_id: &str) {
         self.cancel_tokens.write().await.remove(session_id);
+    }
+
+    pub async fn close_session(&self, session_id: &str) -> CloseSessionResult {
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.closed_sessions.read().await.contains(session_id) {
+                return CloseSessionResult::AlreadyClosed;
+            }
+            let known = self.known_sessions.read().await.contains(session_id);
+            let resident = self.sessions.read().await.contains_key(session_id);
+            if !known && !resident {
+                return CloseSessionResult::Unknown;
+            }
+            self.closed_sessions
+                .write()
+                .await
+                .insert(session_id.to_string());
+            if let Some(token) = self.cancel_tokens.write().await.remove(session_id) {
+                token.cancel();
+            }
+        }
+        self.remove_resident_session(session_id).await;
+        CloseSessionResult::Closed
     }
 }
 
@@ -4847,6 +4955,184 @@ mod tests {
         store.cancel_prompt("never-started").await;
     }
 
+    #[tokio::test]
+    async fn close_session_removes_in_memory_state_and_registry() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store
+            .create_session_with_mcp_servers(cwd.path().to_path_buf(), Some(Vec::new()))
+            .await;
+
+        let _registry = store
+            .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+            .await
+            .expect("active session should create registry");
+        assert!(store.sessions.read().await.contains_key(&session.id));
+        assert!(store.registries.read().await.contains_key(&session.id));
+        assert!(
+            store
+                .last_accessed
+                .lock()
+                .expect("last_accessed mutex poisoned")
+                .contains_key(&session.id)
+        );
+
+        assert_eq!(
+            store.close_session(&session.id).await,
+            CloseSessionResult::Closed
+        );
+        assert!(!store.sessions.read().await.contains_key(&session.id));
+        assert!(!store.registries.read().await.contains_key(&session.id));
+        assert!(
+            !store
+                .last_accessed
+                .lock()
+                .expect("last_accessed mutex poisoned")
+                .contains_key(&session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_cancels_in_flight_prompt() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let token = store
+            .start_prompt(&session.id)
+            .await
+            .expect("prompt should start");
+
+        assert_eq!(
+            store.close_session(&session.id).await,
+            CloseSessionResult::Closed
+        );
+        assert!(token.is_cancelled(), "close_session should cancel prompt");
+        assert!(
+            !store.cancel_tokens.read().await.contains_key(&session.id),
+            "close_session should remove the prompt token"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_reports_unknown_and_already_closed() {
+        let store = SessionStore::new("m".to_string());
+        assert_eq!(
+            store.close_session("missing").await,
+            CloseSessionResult::Unknown
+        );
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert_eq!(
+            store.close_session(&session.id).await,
+            CloseSessionResult::Closed
+        );
+        assert_eq!(
+            store.close_session(&session.id).await,
+            CloseSessionResult::AlreadyClosed
+        );
+        assert!(
+            store.snapshot(&session.id, cwd.path()).await.is_none(),
+            "closed sessions should not be implicitly cold-loaded from disk"
+        );
+        assert!(
+            store
+                .reopen_session(&session.id, cwd.path())
+                .await
+                .is_some(),
+            "explicit load/resume should reopen persisted closed sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_prevents_registry_creation_after_prompt_started() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store
+            .create_session_with_mcp_servers(cwd.path().to_path_buf(), Some(Vec::new()))
+            .await;
+        let token = store
+            .start_prompt(&session.id)
+            .await
+            .expect("prompt should start");
+
+        assert_eq!(
+            store.close_session(&session.id).await,
+            CloseSessionResult::Closed
+        );
+        assert!(token.is_cancelled(), "close should cancel started prompt");
+        assert!(
+            store
+                .get_or_create_registry(&session.id, cwd.path().to_path_buf())
+                .await
+                .is_none(),
+            "closed sessions must not recreate registries"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_closes_known_evicted_session() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 1,
+                max_history_turns: 0,
+            },
+        );
+        let cwd1 = tempfile::tempdir().expect("cwd1");
+        let cwd2 = tempfile::tempdir().expect("cwd2");
+        let first = store.create_session(cwd1.path().to_path_buf()).await;
+        let _second = store.create_session(cwd2.path().to_path_buf()).await;
+        assert!(
+            !store.sessions.read().await.contains_key(&first.id),
+            "first session should be evicted from memory"
+        );
+
+        assert_eq!(
+            store.close_session(&first.id).await,
+            CloseSessionResult::Closed
+        );
+        assert!(
+            store.snapshot(&first.id, cwd1.path()).await.is_none(),
+            "closed evicted sessions should not implicitly cold-load"
+        );
+        assert!(
+            store.reopen_session(&first.id, cwd1.path()).await.is_some(),
+            "explicit load/resume should reopen persisted evicted sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_sessions_remain_in_disk_listing() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        store
+            .maybe_rename_from_prompt(&session.id, "Named close session")
+            .await
+            .expect("session title persists");
+        assert!(
+            store
+                .list_sessions_from_disk(cwd.path())
+                .await
+                .iter()
+                .any(|manifest| manifest.id == session.id)
+        );
+
+        assert_eq!(
+            store.close_session(&session.id).await,
+            CloseSessionResult::Closed
+        );
+        assert!(
+            store
+                .list_sessions_from_disk(cwd.path())
+                .await
+                .iter()
+                .any(|manifest| manifest.id == session.id),
+            "session/close should not hide persisted sessions from session/list"
+        );
+    }
+
     /// `start_prompt` must reject a second in-flight prompt for the same
     /// session instead of overwriting the original cancellation token.
     #[tokio::test]
@@ -5569,8 +5855,12 @@ mod tests {
 
         let registry1 = store
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
-            .await;
-        let registry2 = store.get_or_create_registry(&session.id, cwd_alias).await;
+            .await
+            .expect("active session should create registry");
+        let registry2 = store
+            .get_or_create_registry(&session.id, cwd_alias)
+            .await
+            .expect("active session should reuse registry");
 
         assert!(
             Arc::ptr_eq(&registry1, &registry2),
@@ -5684,7 +5974,8 @@ done
 
         let registry = store
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
-            .await;
+            .await
+            .expect("active session should create registry");
 
         assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
         assert!(
@@ -5730,7 +6021,8 @@ done
 
         let registry = store
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
-            .await;
+            .await
+            .expect("active session should create registry");
 
         assert_eq!(registry.cwd(), normalize_cwd(cwd.path()).as_path());
         assert!(
@@ -5779,7 +6071,8 @@ done
 
         let registry = store
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
-            .await;
+            .await
+            .expect("active session should create registry");
 
         let canonical_cwd = normalize_cwd(cwd.path());
         assert_eq!(registry.cwd(), canonical_cwd.as_path());
@@ -5839,7 +6132,8 @@ done
 
         let registry = store
             .get_or_create_registry(&session.id, cwd.path().to_path_buf())
-            .await;
+            .await
+            .expect("active session should create registry");
 
         let canonical_cwd = normalize_cwd(cwd.path());
         assert_eq!(registry.cwd(), canonical_cwd.as_path());
@@ -5882,7 +6176,8 @@ done
 
         let registry1 = store
             .get_or_create_registry(&session.id, cwd1.path().to_path_buf())
-            .await;
+            .await
+            .expect("active session should create registry");
         assert_eq!(registry1.cwd(), canonical_cwd1.as_path());
         assert_eq!(
             read_log_lines(&bifrost_log),
@@ -5895,7 +6190,8 @@ done
 
         let registry2 = store
             .get_or_create_registry(&session.id, cwd2.path().to_path_buf())
-            .await;
+            .await
+            .expect("active session should create registry");
 
         assert!(
             !Arc::ptr_eq(&registry1, &registry2),
