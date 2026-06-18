@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionConfigOption,
+    CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    Cost, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
     SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
     SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
@@ -962,6 +963,7 @@ pub async fn run_agent(
     let sessions_login = sessions.clone();
 
     let sessions_cancel = sessions.clone();
+    let sessions_close = sessions.clone();
     let sessions_mode = sessions.clone();
     let sessions_perm = sessions.clone();
 
@@ -999,7 +1001,8 @@ pub async fn run_agent(
                     .session_capabilities(
                         SessionCapabilities::new()
                             .list(SessionListCapabilities::new())
-                            .resume(SessionResumeCapabilities::new()),
+                            .resume(SessionResumeCapabilities::new())
+                            .close(SessionCloseCapabilities::new()),
                     );
 
                 responder.respond(
@@ -1895,6 +1898,18 @@ pub async fn run_agent(
                 Ok(())
             },
             on_receive_notification!(),
+        )
+        // Handle session/close
+        .on_receive_request(
+            async move |req: CloseSessionRequest,
+                        responder: Responder<CloseSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let session_id = req.session_id.to_string();
+                tracing::info!("ACP session/close session={session_id}");
+                sessions_close.close_session(&session_id).await;
+                responder.respond(CloseSessionResponse::new())
+            },
+            on_receive_request!(),
         )
         // Handle session/set_mode
         .on_receive_request(

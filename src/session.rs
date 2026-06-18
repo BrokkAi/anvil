@@ -3529,6 +3529,25 @@ impl SessionStore {
     pub async fn finish_prompt(&self, session_id: &str) {
         self.cancel_tokens.write().await.remove(session_id);
     }
+
+    /// Close an active ACP session.
+    ///
+    /// The ACP `session/close` contract says close must first behave like
+    /// `session/cancel`, then free resources associated with the session.
+    /// Persistence stays intact: closed sessions remain loadable from disk.
+    pub async fn close_session(&self, session_id: &str) {
+        let removed_token = self.cancel_tokens.write().await.remove(session_id);
+        if let Some(token) = removed_token {
+            token.cancel();
+        }
+
+        self.sessions.write().await.remove(session_id);
+        self.registries.write().await.remove(session_id);
+        self.last_accessed
+            .lock()
+            .expect("last_accessed mutex poisoned")
+            .remove(session_id);
+    }
 }
 
 #[cfg(test)]
@@ -4845,6 +4864,41 @@ mod tests {
     async fn cancel_prompt_unknown_session_is_noop() {
         let store = SessionStore::new("m".to_string());
         store.cancel_prompt("never-started").await;
+    }
+
+    /// `session/close` is stronger than cancel: it cancels in-flight work
+    /// and drops process-local resources, but keeps the persisted zip
+    /// loadable for a later `session/load` / `session/resume`.
+    #[tokio::test]
+    async fn close_session_cancels_and_drops_memory_only() {
+        let store = SessionStore::new("m".to_string());
+        let cwd =
+            std::env::temp_dir().join(format!("brokk-acp-rust-close-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd.clone()).await;
+        let token = store
+            .start_prompt(&session.id)
+            .await
+            .expect("prompt should start");
+
+        store.close_session(&session.id).await;
+
+        assert!(token.is_cancelled(), "close should cancel in-flight prompt");
+        assert!(!store.sessions.read().await.contains_key(&session.id));
+        assert!(!store.cancel_tokens.read().await.contains_key(&session.id));
+        assert!(!store.registries.read().await.contains_key(&session.id));
+        assert!(
+            !store
+                .last_accessed
+                .lock()
+                .expect("last_accessed mutex poisoned")
+                .contains_key(&session.id)
+        );
+
+        assert!(
+            store.get_session(&session.id, &cwd).await.is_some(),
+            "closed sessions should remain reloadable from disk"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// `start_prompt` must reject a second in-flight prompt for the same
