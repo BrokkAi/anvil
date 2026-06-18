@@ -13,7 +13,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.6.3";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.6.4";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 
 #[cfg(target_os = "macos")]
@@ -54,6 +54,10 @@ const BIFROST_BINARY_NAME: &str = "bifrost";
 
 static PREPARED_BIFROST_PATH: OnceLock<PathBuf> = OnceLock::new();
 static PREPARE_BIFROST_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Records the `--semantic-search` / `ANVIL_SEMANTIC_SEARCH` opt-in. Off by
+/// default; toggled once from `main` via [`set_semantic_search_enabled`].
+static SEMANTIC_SEARCH_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum McpError {
@@ -125,6 +129,44 @@ impl McpFraming {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Records whether the managed Bifrost server should run with semantic code
+/// search enabled. Called once from `main` after CLI/env parsing so every later
+/// [`McpServerConfig::bifrost`] (including the normalize-on-read path in
+/// `setup_state`) derives the same env. Idempotent: the first value wins.
+pub fn set_semantic_search_enabled(enabled: bool) {
+    let _ = SEMANTIC_SEARCH_ENABLED.set(enabled);
+}
+
+/// Defaults to `false` when `main` never recorded a value (tests, subcommands),
+/// matching the off-by-default CLI flag.
+fn semantic_search_enabled() -> bool {
+    SEMANTIC_SEARCH_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// Env for the managed Bifrost subprocess.
+///
+/// Semantic search (the `semantic_search` tool, new in Bifrost 0.6.4) stays
+/// dormant unless explicitly enabled: with `BIFROST_SEMANTIC_INDEX` unset
+/// Bifrost answers `semantic_search` with a "disabled for this session" error
+/// and never downloads models or builds an index. When enabled we set it to
+/// `auto`, opting into Bifrost's background indexing (and first-use HuggingFace
+/// model downloads). Kept as a pure helper of `enabled` so it is testable
+/// without touching the process-global.
+fn managed_bifrost_env_for(enabled: bool) -> Vec<McpEnvVar> {
+    if enabled {
+        vec![McpEnvVar {
+            name: "BIFROST_SEMANTIC_INDEX".to_string(),
+            value: "auto".to_string(),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn managed_bifrost_env() -> Vec<McpEnvVar> {
+    managed_bifrost_env_for(semantic_search_enabled())
 }
 
 fn default_bifrost_args() -> Vec<String> {
@@ -357,7 +399,7 @@ impl McpServerConfig {
             name: "bifrost".to_string(),
             command: managed_bifrost_command(),
             args: default_bifrost_args(),
-            env: Vec::new(),
+            env: managed_bifrost_env(),
             framing: McpFraming::Line,
             enabled: true,
         }
@@ -726,6 +768,22 @@ fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn managed_bifrost_env_opts_into_semantic_index_only_when_enabled() {
+        assert!(
+            managed_bifrost_env_for(false).is_empty(),
+            "semantic search stays dormant by default; no env should be injected"
+        );
+        assert_eq!(
+            managed_bifrost_env_for(true),
+            vec![McpEnvVar {
+                name: "BIFROST_SEMANTIC_INDEX".to_string(),
+                value: "auto".to_string(),
+            }],
+            "enabling semantic search must set BIFROST_SEMANTIC_INDEX=auto"
+        );
+    }
 
     /// Resolve the bifrost binary used by the handshake test.
     ///

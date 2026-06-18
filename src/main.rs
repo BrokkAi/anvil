@@ -142,6 +142,16 @@ struct Args {
     /// runs without any sandbox of any kind.
     #[arg(long, env = "ANVIL_NO_WASM_SANDBOX", default_value_t = false)]
     no_wasm_sandbox: bool,
+
+    /// Enable Bifrost's semantic code search (the `semantic_search` tool, new in
+    /// Bifrost 0.6.4). Off by default. When enabled, Anvil launches the managed
+    /// Bifrost server with `BIFROST_SEMANTIC_INDEX=auto`, which builds a
+    /// background semantic index and downloads embedding/reranker models from
+    /// the HuggingFace hub on first use. While disabled, `semantic_search` is
+    /// still advertised but returns a "disabled for this session" error and
+    /// downloads nothing.
+    #[arg(long, env = "ANVIL_SEMANTIC_SEARCH", default_value_t = false)]
+    semantic_search: bool,
 }
 
 impl std::fmt::Debug for Args {
@@ -155,6 +165,8 @@ impl std::fmt::Debug for Args {
             .field("bifrost_binary", &self.bifrost_binary)
             .field("llm_idle_timeout_secs", &self.llm_idle_timeout_secs)
             .field("transient_setup", &self.transient_setup)
+            .field("no_wasm_sandbox", &self.no_wasm_sandbox)
+            .field("semantic_search", &self.semantic_search)
             // Deprecated flags omitted from Debug to avoid leaking api_key.
             .finish()
     }
@@ -399,6 +411,18 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Record the semantic-search opt-in before any session reads MCP config, so
+    // the managed Bifrost server is normalized with the matching env from the
+    // first session onward.
+    crate::mcp::set_semantic_search_enabled(args.semantic_search);
+    if args.semantic_search {
+        tracing::info!(
+            "semantic code search enabled; managed Bifrost will run with \
+             BIFROST_SEMANTIC_INDEX=auto (builds a background index and downloads \
+             embedding/reranker models from the HuggingFace hub on first use)"
+        );
+    }
 
     // Install the parser sandbox before any code that might load a SKILL.md
     // (or, eventually, parse AGENTS.md / session zips / regex queries) so
