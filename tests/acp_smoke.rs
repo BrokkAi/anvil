@@ -68,6 +68,26 @@ fn run_smoke_case(case: &SmokeCase) {
         }),
     );
     assert_response_ok(case, "initialize", &initialize, &client);
+    assert!(
+        initialize["result"]["agentCapabilities"]["promptCapabilities"].is_object(),
+        "{}: initialize did not advertise promptCapabilities: {initialize}",
+        case.name
+    );
+    assert_eq!(
+        initialize["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"], true,
+        "{}: initialize did not advertise embedded prompt context support: {initialize}",
+        case.name
+    );
+    assert_eq!(
+        initialize["result"]["agentCapabilities"]["promptCapabilities"]["image"], true,
+        "{}: initialize did not advertise image prompt support: {initialize}",
+        case.name
+    );
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["close"].is_object(),
+        "{}: initialize did not advertise sessionCapabilities.close: {initialize}",
+        case.name
+    );
 
     let new_session = client.request(
         "session/new",
@@ -167,6 +187,65 @@ fn run_smoke_case(case: &SmokeCase) {
         case.name,
         trace,
         client.stderr_text()
+    );
+
+    let close = client.request(
+        "session/close",
+        json!({
+            "sessionId": session_id,
+        }),
+    );
+    assert_response_ok(case, "session/close", &close, &client);
+
+    let close_again = client.request(
+        "session/close",
+        json!({
+            "sessionId": session_id,
+        }),
+    );
+    assert_response_error_contains(
+        case,
+        "session/close",
+        &close_again,
+        "already closed",
+        &client,
+    );
+
+    let reload = client.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": []
+        }),
+    );
+    assert_response_ok(case, "session/load after close", &reload, &client);
+
+    let close_after_reload = client.request(
+        "session/close",
+        json!({
+            "sessionId": session_id,
+        }),
+    );
+    assert_response_ok(
+        case,
+        "session/close after session/load",
+        &close_after_reload,
+        &client,
+    );
+
+    let close_unknown = client.request(
+        "session/close",
+        json!({
+            "sessionId": "missing-session",
+        }),
+    );
+    assert_response_error_contains(
+        case,
+        "session/close",
+        &close_unknown,
+        "unknown session",
+        &client,
     );
 
     client.shutdown();
@@ -594,6 +673,25 @@ fn assert_response_ok(
     assert!(
         response.get("error").is_none(),
         "{}: {method} returned error: {response}\nstderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+}
+
+fn assert_response_error_contains(
+    case: &SmokeCase,
+    method: &str,
+    response: &Value,
+    expected: &str,
+    client: &JsonRpcClient<'_>,
+) {
+    let reason = response["error"]["data"]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains(expected),
+        "{}: {method} expected error reason containing '{expected}', got: {response}\nstderr:\n{}\ntrace:\n{}",
         case.name,
         client.stderr_text(),
         client.trace_text()
