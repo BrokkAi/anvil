@@ -128,6 +128,11 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Scanning symbol usages",
     },
     ToolMeta {
+        name: "usage_graph",
+        kind: ToolKind::Search,
+        display_name: "Building usage graph",
+    },
+    ToolMeta {
         name: "semantic_search",
         kind: ToolKind::Search,
         display_name: "Searching semantically",

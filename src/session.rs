@@ -5617,7 +5617,7 @@ done
             "--root".to_string(),
             cwd.display().to_string(),
             "--server".to_string(),
-            "core|slopcop".to_string(),
+            "core".to_string(),
         ]
     }
 

@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn read_mcp_servers_migrates_legacy_core_bifrost_args_to_core_slopcop() {
+    fn read_mcp_servers_uses_canonical_core_bifrost_args() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         remember_mcp_servers(vec![crate::mcp::McpServerConfig {
@@ -255,10 +255,7 @@ mod tests {
             .expect("bifrost server");
 
         assert_eq!(bifrost.args, crate::mcp::McpServerConfig::bifrost().args);
-        assert_eq!(
-            bifrost.args.get(3).map(String::as_str),
-            Some("core|slopcop")
-        );
+        assert_eq!(bifrost.args.get(3).map(String::as_str), Some("core"));
     }
 
     #[test]
