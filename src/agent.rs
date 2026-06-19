@@ -2770,8 +2770,9 @@ async fn run_goal_loop(
         {
             Ok(outcome) => {
                 cumulative = outcome.cumulative_usage;
-                match detect_goal_signal(&outcome.response) {
-                    GoalSignal::Complete => {
+                let signal = detect_goal_signal(&outcome.response);
+                match decide_after_goal_turn(signal, turn, spec.max_turns, consecutive_blocked) {
+                    GoalStep::Stop(GoalStop::Completed) => {
                         send_message(
                             cx,
                             session_id,
@@ -2782,31 +2783,47 @@ async fn run_goal_loop(
                         );
                         break;
                     }
-                    GoalSignal::Blocked(reason) => {
-                        consecutive_blocked += 1;
-                        if consecutive_blocked >= GOAL_BLOCKED_THRESHOLD {
-                            send_message(
-                                cx,
-                                session_id,
-                                &format!(
-                                    "\n⛔ Goal blocked after {turn} turn(s) \
-                                     ({consecutive_blocked} consecutive blocked reports). \
-                                     Stopping for user input.\nReason: {reason}\n"
-                                ),
-                            );
-                            break;
-                        }
-                        send_thought(
+                    GoalStep::Stop(GoalStop::Blocked(reason)) => {
+                        send_message(
                             cx,
                             session_id,
                             &format!(
-                                "[goal: blocked report {consecutive_blocked}/{GOAL_BLOCKED_THRESHOLD}; \
-                                 retrying]\n"
+                                "\n⛔ Goal blocked after {turn} turn(s) \
+                                 ({GOAL_BLOCKED_THRESHOLD} consecutive blocked reports). \
+                                 Stopping for user input.\nReason: {reason}\n"
                             ),
                         );
+                        break;
                     }
-                    GoalSignal::Continue => {
-                        consecutive_blocked = 0;
+                    GoalStep::Stop(GoalStop::CeilingReached) => {
+                        send_message(
+                            cx,
+                            session_id,
+                            &format!(
+                                "\n🛑 Goal stopped: reached the opt-in {}-turn ceiling without a \
+                                 completion signal. Review the progress above and re-run `/goal` \
+                                 (raise or drop `--max-turns`) to keep going.\n",
+                                spec.max_turns.unwrap_or(turn)
+                            ),
+                        );
+                        break;
+                    }
+                    GoalStep::Continue {
+                        consecutive_blocked: updated,
+                    } => {
+                        // A non-zero counter means this turn reported a blocker
+                        // that has not yet reached the threshold.
+                        if updated > 0 {
+                            send_thought(
+                                cx,
+                                session_id,
+                                &format!(
+                                    "[goal: blocked report {updated}/{GOAL_BLOCKED_THRESHOLD}; \
+                                     retrying]\n"
+                                ),
+                            );
+                        }
+                        consecutive_blocked = updated;
                     }
                 }
             }
@@ -2814,20 +2831,6 @@ async fn run_goal_loop(
                 send_message(cx, session_id, &format!("\nGoal stopped: {err}\n"));
                 break;
             }
-        }
-
-        if final_turn {
-            send_message(
-                cx,
-                session_id,
-                &format!(
-                    "\n🛑 Goal stopped: reached the opt-in {}-turn ceiling without a completion \
-                     signal. Review the progress above and re-run `/goal` (raise or drop \
-                     `--max-turns`) to keep going.\n",
-                    spec.max_turns.unwrap_or(turn)
-                ),
-            );
-            break;
         }
 
         if cancel.is_cancelled() {
@@ -5444,6 +5447,73 @@ fn detect_goal_signal(response: &str) -> GoalSignal {
     }
 }
 
+/// Why a goal loop stopped. Carried out of [`decide_after_goal_turn`] so the
+/// caller can render the right user-facing message.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalStop {
+    /// The model verified the objective and emitted the completion sentinel.
+    Completed,
+    /// The model reported the same blocker for [`GOAL_BLOCKED_THRESHOLD`]
+    /// consecutive turns; carries the latest reason.
+    Blocked(String),
+    /// The user's opt-in `--max-turns` ceiling was reached without a
+    /// completion signal. Never produced for an unbounded goal.
+    CeilingReached,
+}
+
+/// What the goal loop should do after a turn completes.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalStep {
+    /// Run another turn. `consecutive_blocked` is the updated counter to
+    /// carry forward (non-zero means the just-finished turn reported a
+    /// blocker that has not yet hit the threshold).
+    Continue { consecutive_blocked: u32 },
+    /// Stop the loop with this disposition.
+    Stop(GoalStop),
+}
+
+/// Pure control logic for the goal loop: given the signal parsed from a
+/// turn and the loop's counters, decide whether to continue or stop.
+///
+/// Cancellation and terminal errors are handled by the caller; they
+/// pre-empt this decision. Kept side-effect-free (no `cx`, no LLM) so the
+/// branching -- completion-wins-over-ceiling, the consecutive-blocked
+/// threshold and its reset, and the optional ceiling -- is unit-testable
+/// and the runtime loop and tests share one source of truth.
+fn decide_after_goal_turn(
+    signal: GoalSignal,
+    turn: u32,
+    max_turns: Option<u32>,
+    consecutive_blocked: u32,
+) -> GoalStep {
+    let ceiling_reached = max_turns.is_some_and(|max| turn >= max);
+    match signal {
+        // A verified completion wins even on the final allowed turn.
+        GoalSignal::Complete => GoalStep::Stop(GoalStop::Completed),
+        GoalSignal::Blocked(reason) => {
+            let blocked = consecutive_blocked + 1;
+            if blocked >= GOAL_BLOCKED_THRESHOLD {
+                GoalStep::Stop(GoalStop::Blocked(reason))
+            } else if ceiling_reached {
+                GoalStep::Stop(GoalStop::CeilingReached)
+            } else {
+                GoalStep::Continue {
+                    consecutive_blocked: blocked,
+                }
+            }
+        }
+        GoalSignal::Continue => {
+            if ceiling_reached {
+                GoalStep::Stop(GoalStop::CeilingReached)
+            } else {
+                GoalStep::Continue {
+                    consecutive_blocked: 0,
+                }
+            }
+        }
+    }
+}
+
 /// Build the continuation prompt injected as the user message for one goal
 /// turn. Adapts Codex's `continuation.md` (objective framing + completion
 /// audit + blocked discipline) to Anvil's sentinel-based stop signal.
@@ -6667,6 +6737,91 @@ mod tests {
         assert_eq!(
             detect_goal_signal("GOAL_BLOCKED: earlier note\nGOAL_COMPLETE"),
             GoalSignal::Complete
+        );
+    }
+
+    #[test]
+    fn decide_continue_runs_forever_when_unbounded() {
+        // No ceiling + no signal => keep going, counter stays reset.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Continue, 1_000, None, 0),
+            GoalStep::Continue {
+                consecutive_blocked: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decide_complete_stops_immediately() {
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Complete, 1, None, 0),
+            GoalStep::Stop(GoalStop::Completed)
+        );
+    }
+
+    #[test]
+    fn decide_complete_wins_on_the_final_turn() {
+        // Even when the ceiling is reached, a verified completion reports
+        // success rather than a budget stop.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Complete, 5, Some(5), 0),
+            GoalStep::Stop(GoalStop::Completed)
+        );
+    }
+
+    #[test]
+    fn decide_blocked_needs_three_consecutive_turns() {
+        // First two blocked reports keep going with an incrementing counter.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Blocked("x".into()), 1, None, 0),
+            GoalStep::Continue {
+                consecutive_blocked: 1
+            }
+        );
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Blocked("x".into()), 2, None, 1),
+            GoalStep::Continue {
+                consecutive_blocked: 2
+            }
+        );
+        // The third consecutive blocked report stops the loop.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Blocked("stuck".into()), 3, None, 2),
+            GoalStep::Stop(GoalStop::Blocked("stuck".into()))
+        );
+    }
+
+    #[test]
+    fn decide_continue_resets_the_blocked_counter() {
+        // A productive turn after some blocked reports clears the counter,
+        // so a later transient blocker starts counting from scratch.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Continue, 4, None, 2),
+            GoalStep::Continue {
+                consecutive_blocked: 0
+            }
+        );
+    }
+
+    #[test]
+    fn decide_ceiling_stops_only_when_opted_in() {
+        // Unbounded: never a ceiling stop.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Continue, 9_999, None, 0),
+            GoalStep::Continue {
+                consecutive_blocked: 0
+            }
+        );
+        // Opt-in ceiling reached with no completion => budget stop.
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Continue, 25, Some(25), 0),
+            GoalStep::Stop(GoalStop::CeilingReached)
+        );
+        // A sub-threshold blocker on the final allowed turn also yields a
+        // ceiling stop (it can't keep retrying past the budget).
+        assert_eq!(
+            decide_after_goal_turn(GoalSignal::Blocked("y".into()), 25, Some(25), 0),
+            GoalStep::Stop(GoalStop::CeilingReached)
         );
     }
 
