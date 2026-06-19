@@ -1351,7 +1351,8 @@ pub async fn run_agent(
                 // `/goal <objective>` drives the agent autonomously across
                 // turns until the objective is verifiably met (the model
                 // emits the completion sentinel), it is blocked, or the
-                // turn budget is exhausted. Parsed here so a malformed
+                // session is cancelled. Unbounded by default; an optional
+                // `--max-turns` ceiling can cap it. Parsed here so a malformed
                 // invocation prints usage and short-circuits, mirroring
                 // `/loop`; the spawn that actually runs the goal loop is
                 // dispatched further down, after model validation.
@@ -1764,7 +1765,7 @@ pub async fn run_agent(
 
                 // `/goal` dispatch. Like `/loop`, the goal runs in a spawned
                 // task that holds the session's in-flight slot until the
-                // objective is met, blocked, or the turn budget is spent;
+                // objective is met, blocked, or the optional ceiling is hit;
                 // `session/cancel` stops it early. Reaching this point means
                 // the model is configured (the empty-model guard above only
                 // skips for `loop_spec`, and a `/goal` prompt has none).
@@ -2692,9 +2693,10 @@ async fn run_goal_turn(
 ///   turns (mirrors Codex's "don't surrender on the first blocker" rule).
 /// - [`GoalSignal::Continue`] → keep going.
 ///
-/// The `max_turns` budget on the [`GoalSpec`] is the hard safety cap that
-/// guarantees termination even if the model never signals; the final
-/// allowed turn uses a wrap-up framing so the agent leaves clean state.
+/// By default the goal is unbounded -- it runs until one of those signals
+/// fires or the session is cancelled. The optional `--max-turns` ceiling on
+/// the [`GoalSpec`] is a user opt-in: when set, the final allowed turn uses a
+/// wrap-up framing so the agent leaves clean state before stopping.
 /// Returns the cumulative session usage for the `PromptResponse`.
 #[allow(clippy::too_many_arguments)]
 async fn run_goal_loop(
@@ -2709,14 +2711,17 @@ async fn run_goal_loop(
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
 ) -> crate::llm_client::TokenUsage {
+    let budget_note = match spec.max_turns {
+        Some(max) => format!(" (optional ceiling: {max} turns)"),
+        None => String::new(),
+    };
     send_message(
         cx,
         session_id,
         &format!(
-            "Starting `/goal` (up to {} turns). I'll keep working across turns until the \
-             objective is verifiably met, I'm blocked, or the turn budget is spent. \
-             Cancel the session to stop early.\n\nObjective:\n{}\n",
-            spec.max_turns,
+            "Starting `/goal`{budget_note}. I'll keep working across turns until the \
+             objective is verifiably met or I'm blocked. Cancel the session to stop \
+             early.\n\nObjective:\n{}\n",
             spec.objective.trim()
         ),
     );
@@ -2732,7 +2737,10 @@ async fn run_goal_loop(
         }
 
         turn += 1;
-        let final_turn = turn >= spec.max_turns;
+        // The ceiling only fires when the user opted into one; an unbounded
+        // goal never treats a turn as "final" and runs until it completes,
+        // blocks, or is cancelled.
+        let final_turn = spec.max_turns.is_some_and(|max| turn >= max);
         let phase = if final_turn {
             GoalPhase::FinalWrapUp
         } else {
@@ -2740,11 +2748,11 @@ async fn run_goal_loop(
         };
         let prompt = build_goal_prompt(&spec.objective, turn, spec.max_turns, phase);
 
-        send_thought(
-            cx,
-            session_id,
-            &format!("\n[goal turn {}/{}]\n", turn, spec.max_turns),
-        );
+        let turn_label = match spec.max_turns {
+            Some(max) => format!("\n[goal turn {turn}/{max}]\n"),
+            None => format!("\n[goal turn {turn}]\n"),
+        };
+        send_thought(cx, session_id, &turn_label);
 
         match run_goal_turn(
             cx,
@@ -2813,10 +2821,10 @@ async fn run_goal_loop(
                 cx,
                 session_id,
                 &format!(
-                    "\n🛑 Goal stopped: reached the {}-turn budget without a completion signal. \
-                     Review the progress above and re-run `/goal` (optionally with \
+                    "\n🛑 Goal stopped: reached the opt-in {}-turn ceiling without a completion \
+                     signal. Review the progress above and re-run `/goal` (raise or drop \
                      `--max-turns`) to keep going.\n",
-                    spec.max_turns
+                    spec.max_turns.unwrap_or(turn)
                 ),
             );
             break;
@@ -5283,12 +5291,15 @@ fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
     })
 }
 
-/// Default number of autonomous turns a `/goal` will run before forcing a
-/// wrap-up. This is the safety analog of Codex's token budget: it
-/// guarantees the loop terminates even if the model never signals.
-const GOAL_DEFAULT_MAX_TURNS: u32 = 25;
+/// Bounds for the *optional* `--max-turns` guardrail. A goal is unbounded by
+/// default: the stopping condition is the model's verified completion or a
+/// genuine block, not an arbitrary turn count -- a turn cap that fired on its
+/// own would stop the agent before the goal is met, defeating the purpose.
+/// (This matches Codex, whose token budget is `Option` and defaults to none.)
+/// `--max-turns` only applies when the user explicitly opts into a ceiling,
+/// and then must fall in this range.
 const GOAL_MIN_MAX_TURNS: u32 = 1;
-const GOAL_MAX_MAX_TURNS: u32 = 200;
+const GOAL_MAX_MAX_TURNS: u32 = 10_000;
 
 /// Sentinel the model emits, alone on the final line, once it has verified
 /// the objective is complete. Detected by [`detect_goal_signal`].
@@ -5300,11 +5311,12 @@ const GOAL_BLOCKED_SENTINEL: &str = "GOAL_BLOCKED";
 /// the agent doesn't surrender on a transient blocker.
 const GOAL_BLOCKED_THRESHOLD: u32 = 3;
 
-/// A parsed `/goal` invocation.
+/// A parsed `/goal` invocation. `max_turns` is `None` for an unbounded goal
+/// (the default) and `Some(n)` only when the user opts into a ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GoalSpec {
     objective: String,
-    max_turns: u32,
+    max_turns: Option<u32>,
 }
 
 /// Which framing the continuation prompt uses for a given turn.
@@ -5312,7 +5324,8 @@ struct GoalSpec {
 enum GoalPhase {
     /// A normal continuation turn: make verifiable progress.
     Continue,
-    /// The final turn of the budget: wrap up cleanly and summarize.
+    /// The last turn of an opt-in `--max-turns` ceiling: wrap up cleanly and
+    /// summarize. Never used for an unbounded goal.
     FinalWrapUp,
 }
 
@@ -5325,21 +5338,21 @@ enum GoalSignal {
 }
 
 fn goal_usage() -> String {
-    format!(
-        "Usage: `/goal [--max-turns N] <objective>`\n\
-         Example: `/goal make `cargo test` pass`\n\
-         Example: `/goal --max-turns 40 migrate the config loader to serde`\n\n\
-         Anvil works autonomously across turns until the objective is verifiably met, \
-         it is blocked, or the turn budget (default {GOAL_DEFAULT_MAX_TURNS}, max \
-         {GOAL_MAX_MAX_TURNS}) is exhausted. Cancel the session to stop early."
-    )
+    "Usage: `/goal [--max-turns N] <objective>`\n\
+     Example: `/goal make `cargo test` pass`\n\
+     Example: `/goal --max-turns 40 migrate the config loader to serde`\n\n\
+     Anvil works autonomously across turns until the objective is verifiably met or \
+     it is blocked -- there is no turn limit by default. Cancel the session to stop \
+     early, or pass `--max-turns N` to set an optional ceiling."
+        .to_string()
 }
 
 /// Parse `/goal [--max-turns N] <objective>`.
 ///
 /// `--max-turns` (also `--max-turns=N`) is optional and, when present, must
-/// lead. The remainder is the free-text objective. An empty objective or an
-/// out-of-range turn budget is a user error returned as a usage string.
+/// lead; without it the goal is unbounded (`max_turns: None`). The remainder
+/// is the free-text objective. An empty objective or an out-of-range ceiling
+/// is a user error returned as a usage string.
 fn parse_goal_command(prompt_text: &str) -> Result<GoalSpec, String> {
     let args = slash_command_args(prompt_text);
     let trimmed = args.trim();
@@ -5347,7 +5360,7 @@ fn parse_goal_command(prompt_text: &str) -> Result<GoalSpec, String> {
         return Err(goal_usage());
     }
 
-    let mut max_turns = GOAL_DEFAULT_MAX_TURNS;
+    let mut max_turns: Option<u32> = None;
     let mut rest = trimmed;
     loop {
         let head = rest.trim_start();
@@ -5376,7 +5389,7 @@ fn parse_goal_command(prompt_text: &str) -> Result<GoalSpec, String> {
                  {GOAL_MIN_MAX_TURNS} and {GOAL_MAX_MAX_TURNS}."
             ));
         }
-        max_turns = n;
+        max_turns = Some(n);
         rest = remainder;
     }
 
@@ -5434,9 +5447,18 @@ fn detect_goal_signal(response: &str) -> GoalSignal {
 /// Build the continuation prompt injected as the user message for one goal
 /// turn. Adapts Codex's `continuation.md` (objective framing + completion
 /// audit + blocked discipline) to Anvil's sentinel-based stop signal.
-fn build_goal_prompt(objective: &str, turn: u32, max_turns: u32, phase: GoalPhase) -> String {
-    let header =
-        format!("You are operating in autonomous goal mode (turn {turn} of at most {max_turns}).");
+fn build_goal_prompt(
+    objective: &str,
+    turn: u32,
+    max_turns: Option<u32>,
+    phase: GoalPhase,
+) -> String {
+    let header = match max_turns {
+        Some(max) => {
+            format!("You are operating in autonomous goal mode (turn {turn} of at most {max}).")
+        }
+        None => format!("You are operating in autonomous goal mode (turn {turn})."),
+    };
     let objective_block = format!("<objective>\n{}\n</objective>", objective.trim());
 
     let completion_protocol = format!(
@@ -5481,7 +5503,7 @@ fn build_goal_prompt(objective: &str, turn: u32, max_turns: u32, phase: GoalPhas
         ),
         GoalPhase::FinalWrapUp => format!(
             "{header}\n\n\
-             This is the FINAL turn of the goal's turn budget. Do not start new large work. \
+             This is the FINAL turn of the goal's opt-in turn ceiling. Do not start new large work. \
              Bring the current work to a safe, coherent stopping point, then summarize what was \
              accomplished, what remains, and the clear next step for the user.\n\n\
              {objective_block}\n\n\
@@ -6529,12 +6551,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_goal_command_uses_default_budget() {
+    fn parse_goal_command_is_unbounded_by_default() {
+        // No `--max-turns` means no ceiling: the goal runs until it is
+        // verifiably complete, blocked, or cancelled.
         assert_eq!(
             parse_goal_command("/goal make cargo test pass"),
             Ok(GoalSpec {
                 objective: "make cargo test pass".to_string(),
-                max_turns: GOAL_DEFAULT_MAX_TURNS,
+                max_turns: None,
             })
         );
     }
@@ -6545,7 +6569,7 @@ mod tests {
             parse_goal_command("/goal --max-turns 40 migrate the loader"),
             Ok(GoalSpec {
                 objective: "migrate the loader".to_string(),
-                max_turns: 40,
+                max_turns: Some(40),
             })
         );
         // `=` form is equivalent.
@@ -6553,7 +6577,7 @@ mod tests {
             parse_goal_command("/goal --max-turns=7 do the thing"),
             Ok(GoalSpec {
                 objective: "do the thing".to_string(),
-                max_turns: 7,
+                max_turns: Some(7),
             })
         );
     }
@@ -6578,19 +6602,19 @@ mod tests {
         assert!(err.contains("out of range"), "got: {err}");
 
         let err =
-            parse_goal_command("/goal --max-turns 999 do it").expect_err("too large must reject");
+            parse_goal_command("/goal --max-turns 99999 do it").expect_err("too large must reject");
         assert!(err.contains("out of range"), "got: {err}");
     }
 
     #[test]
     fn parse_goal_command_treats_lookalike_flag_as_objective() {
         // `--max-turnsy` is not the flag, so it stays part of the objective
-        // and the default budget applies.
+        // and the goal stays unbounded.
         assert_eq!(
             parse_goal_command("/goal --max-turnsy is a weird objective"),
             Ok(GoalSpec {
                 objective: "--max-turnsy is a weird objective".to_string(),
-                max_turns: GOAL_DEFAULT_MAX_TURNS,
+                max_turns: None,
             })
         );
     }
@@ -6648,7 +6672,8 @@ mod tests {
 
     #[test]
     fn build_goal_prompt_embeds_objective_and_sentinels() {
-        let p = build_goal_prompt("ship the feature", 1, 25, GoalPhase::Continue);
+        // Unbounded goal: header carries the turn number but no ceiling.
+        let p = build_goal_prompt("ship the feature", 1, None, GoalPhase::Continue);
         assert!(p.contains("ship the feature"), "objective missing");
         assert!(
             p.contains(GOAL_COMPLETE_SENTINEL),
@@ -6658,9 +6683,20 @@ mod tests {
             p.contains(GOAL_BLOCKED_SENTINEL),
             "blocked sentinel missing"
         );
-        assert!(p.contains("turn 1 of at most 25"), "turn header missing");
+        assert!(p.contains("turn 1)"), "unbounded turn header missing");
+        assert!(
+            !p.contains("of at most"),
+            "unbounded goal must not advertise a ceiling"
+        );
 
-        let wrap = build_goal_prompt("ship it", 25, 25, GoalPhase::FinalWrapUp);
+        // Capped goal: header advertises the ceiling.
+        let capped = build_goal_prompt("ship it", 3, Some(25), GoalPhase::Continue);
+        assert!(
+            capped.contains("turn 3 of at most 25"),
+            "capped turn header missing"
+        );
+
+        let wrap = build_goal_prompt("ship it", 25, Some(25), GoalPhase::FinalWrapUp);
         assert!(wrap.contains("FINAL turn"), "wrap-up framing missing");
     }
 
