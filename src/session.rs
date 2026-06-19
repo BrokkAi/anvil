@@ -742,7 +742,7 @@ impl Session {
         mode: SessionMode,
         model: String,
         history: Vec<ConversationTurn>,
-        manifest: SessionManifest,
+        mut manifest: SessionManifest,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     ) -> Result<Self, SessionIdMismatch> {
         if manifest.id != id {
@@ -754,7 +754,21 @@ impl Session {
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
         let mcp_servers = manifest.brokk_mcp_servers.clone();
-        let goal = manifest.brokk_goal.clone();
+        // The persisted manifest is untrusted (hand-edited, corrupted, or
+        // written by a different Anvil), so re-validate the goal here the same
+        // way the live create/update paths do. A rejected goal is dropped and
+        // the in-memory manifest mirror is cleared so a later persist does not
+        // write it back.
+        let goal = manifest.brokk_goal.take().and_then(|persisted| {
+            match crate::goal::sanitize_persisted_goal(persisted) {
+                Ok(goal) => Some(goal),
+                Err(error) => {
+                    tracing::warn!(session_id = %id, "dropping invalid persisted goal: {error}");
+                    None
+                }
+            }
+        });
+        manifest.brokk_goal = goal.clone();
         Ok(Self {
             id,
             cwd,
@@ -3504,6 +3518,49 @@ impl SessionStore {
         }
     }
 
+    /// Apply a mutation to the session's goal under the write lock and persist
+    /// the manifest, rolling the in-memory goal/manifest back if persistence
+    /// fails so memory and disk stay in sync. `mutate` must validate its
+    /// preconditions *before* touching `session.goal`, so an `Err` return
+    /// leaves the goal unchanged. Shared by every explicit goal mutator
+    /// (`create_goal` / `set_goal_status` / `set_goal_budget` / `clear_goal`).
+    async fn mutate_goal_and_persist<T>(
+        &self,
+        id: &str,
+        mutate: impl FnOnce(&mut Session) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| "unknown session".to_string())?;
+            let prev_goal = session.goal.clone();
+            let prev_manifest_goal = session.manifest.brokk_goal.clone();
+            let prev_modified = session.manifest.modified;
+            let value = mutate(session)?;
+            session.manifest.brokk_goal = session.goal.clone();
+            session.manifest.modified = current_timestamp_millis();
+            (
+                session_zip_path(&session.cwd, &session.id),
+                session.manifest.clone(),
+                prev_goal,
+                prev_manifest_goal,
+                prev_modified,
+                value,
+            )
+        };
+        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, value) = snapshot;
+        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
+            if let Some(session) = self.sessions.write().await.get_mut(id) {
+                session.goal = prev_goal;
+                session.manifest.brokk_goal = prev_manifest_goal;
+                session.manifest.modified = prev_modified;
+            }
+            return Err(format!("failed to persist goal: {error:#}"));
+        }
+        Ok(value)
+    }
+
     pub async fn create_goal(
         &self,
         id: &str,
@@ -3513,11 +3570,7 @@ impl SessionStore {
         crate::goal::validate_objective(&objective)?;
         crate::goal::validate_token_budget(token_budget)?;
         let objective = objective.trim().to_string();
-        let snapshot = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(id)
-                .ok_or_else(|| "unknown session".to_string())?;
+        self.mutate_goal_and_persist(id, move |session| {
             if session
                 .goal
                 .as_ref()
@@ -3528,136 +3581,84 @@ impl SessionStore {
                         .to_string(),
                 );
             }
-            let prev_goal = session.goal.clone();
-            let prev_manifest_goal = session.manifest.brokk_goal.clone();
-            let prev_modified = session.manifest.modified;
             let goal = Goal::new(objective, token_budget, current_timestamp_millis());
             session.goal = Some(goal.clone());
-            session.manifest.brokk_goal = Some(goal.clone());
-            session.manifest.modified = current_timestamp_millis();
-            (
-                session_zip_path(&session.cwd, &session.id),
-                session.manifest.clone(),
-                prev_goal,
-                prev_manifest_goal,
-                prev_modified,
-                goal,
-            )
-        };
-        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, goal) = snapshot;
-        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.goal = prev_goal;
-                session.manifest.brokk_goal = prev_manifest_goal;
-                session.manifest.modified = prev_modified;
-            }
-            return Err(format!("failed to persist goal: {error:#}"));
-        }
-        Ok(goal)
+            Ok(goal)
+        })
+        .await
     }
 
     pub async fn set_goal_status(&self, id: &str, status: GoalStatus) -> Result<Goal, String> {
-        let snapshot = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(id)
-                .ok_or_else(|| "unknown session".to_string())?;
-            let prev_goal = session.goal.clone();
-            let prev_manifest_goal = session.manifest.brokk_goal.clone();
-            let prev_modified = session.manifest.modified;
+        self.mutate_goal_and_persist(id, move |session| {
             let goal = session
                 .goal
                 .as_mut()
                 .ok_or_else(|| "cannot update goal because no goal exists".to_string())?;
             goal.status = status;
             goal.updated_at = current_timestamp_millis();
-            let goal = goal.clone();
-            session.manifest.brokk_goal = Some(goal.clone());
-            session.manifest.modified = current_timestamp_millis();
-            (
-                session_zip_path(&session.cwd, &session.id),
-                session.manifest.clone(),
-                prev_goal,
-                prev_manifest_goal,
-                prev_modified,
-                goal,
-            )
-        };
-        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, goal) = snapshot;
-        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.goal = prev_goal;
-                session.manifest.brokk_goal = prev_manifest_goal;
-                session.manifest.modified = prev_modified;
+            Ok(goal.clone())
+        })
+        .await
+    }
+
+    /// Set or raise the goal's token budget. When the new ceiling clears the
+    /// already-spent tokens it releases a `BudgetLimited` goal back to
+    /// `Active`; a lower ceiling re-arms the limit. This is the primary way a
+    /// user recovers from the hard-stop budget enforcement.
+    pub async fn set_goal_budget(&self, id: &str, budget: i64) -> Result<Goal, String> {
+        crate::goal::validate_token_budget(Some(budget))?;
+        self.mutate_goal_and_persist(id, move |session| {
+            let goal = session
+                .goal
+                .as_mut()
+                .ok_or_else(|| "cannot set a budget because no goal exists".to_string())?;
+            goal.token_budget = Some(budget);
+            if goal.status == GoalStatus::BudgetLimited && goal.tokens_used < budget {
+                goal.status = GoalStatus::Active;
+            } else if goal.status == GoalStatus::Active && goal.tokens_used >= budget {
+                goal.status = GoalStatus::BudgetLimited;
             }
-            return Err(format!("failed to persist goal: {error:#}"));
-        }
-        Ok(goal)
+            goal.updated_at = current_timestamp_millis();
+            Ok(goal.clone())
+        })
+        .await
     }
 
     pub async fn clear_goal(&self, id: &str) -> Result<bool, String> {
-        let snapshot = {
-            let mut sessions = self.sessions.write().await;
-            let session = sessions
-                .get_mut(id)
-                .ok_or_else(|| "unknown session".to_string())?;
-            let prev_goal = session.goal.clone();
-            let prev_manifest_goal = session.manifest.brokk_goal.clone();
-            let prev_modified = session.manifest.modified;
-            let cleared = session.goal.take().is_some();
-            session.manifest.brokk_goal = None;
-            session.manifest.modified = current_timestamp_millis();
-            (
-                session_zip_path(&session.cwd, &session.id),
-                session.manifest.clone(),
-                prev_goal,
-                prev_manifest_goal,
-                prev_modified,
-                cleared,
-            )
-        };
-        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, cleared) = snapshot;
-        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.goal = prev_goal;
-                session.manifest.brokk_goal = prev_manifest_goal;
-                session.manifest.modified = prev_modified;
-            }
-            return Err(format!("failed to persist goal: {error:#}"));
-        }
-        Ok(cleared)
+        self.mutate_goal_and_persist(id, |session| Ok(session.goal.take().is_some()))
+            .await
     }
 
-    pub async fn record_goal_usage(
-        &self,
-        id: &str,
-        delta: crate::llm_client::TokenUsage,
-        count_this_turn: bool,
-    ) {
+    /// Fold a turn's token usage into the session goal, in memory only.
+    ///
+    /// This deliberately does NOT persist the manifest:
+    /// `run_model_turn_in_spawn` always calls `add_turn` immediately after,
+    /// which rewrites the manifest (including the updated `brokk_goal`) exactly
+    /// once. Persisting here as well would do a second full-zip rewrite on
+    /// every turn. Only an `Active` goal accumulates usage (enforced inside
+    /// `Goal::record_usage`); crossing the budget flips it to `BudgetLimited`,
+    /// which the next turn's enforcement gate refuses to run.
+    pub async fn record_goal_usage(&self, id: &str, delta: crate::llm_client::TokenUsage) {
         if delta.is_zero() {
             return;
         }
-        let snapshot = {
-            let mut sessions = self.sessions.write().await;
-            let Some(session) = sessions.get_mut(id) else {
-                return;
-            };
-            let Some(goal) = session.goal.as_mut() else {
-                return;
-            };
-            if !(count_this_turn || goal.status == GoalStatus::Active) {
-                return;
-            }
-            goal.record_usage(delta, current_timestamp_millis());
-            session.manifest.brokk_goal = Some(goal.clone());
-            session.manifest.modified = current_timestamp_millis();
-            (session_zip_path(&session.cwd, id), session.manifest.clone())
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return;
         };
-        let (zip_path, manifest) = snapshot;
-        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
-            tracing::warn!(
+        let Some(goal) = session.goal.as_mut() else {
+            return;
+        };
+        let hit_budget = goal.record_usage(delta, current_timestamp_millis());
+        let tokens_used = goal.tokens_used;
+        let token_budget = goal.token_budget;
+        session.manifest.brokk_goal = Some(goal.clone());
+        if hit_budget {
+            tracing::info!(
                 session_id = %id,
-                "failed to persist goal token usage: {error:#}"
+                tokens_used,
+                token_budget = ?token_budget,
+                "session goal reached its token budget; pausing further turns until resumed or raised"
             );
         }
     }
@@ -4326,6 +4327,116 @@ mod tests {
         assert!(
             manifest.updated_at().is_some(),
             "manifest.modified must be serializable as ACP updatedAt"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    fn goal_usage_tokens(total: u64) -> crate::llm_client::TokenUsage {
+        crate::llm_client::TokenUsage {
+            input_tokens: total,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn record_goal_usage_counts_only_active_and_flips_budget() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-goal-usage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let id = store.create_session(cwd.clone()).await.id;
+
+        store
+            .create_goal(&id, "ship it".to_string(), Some(100))
+            .await
+            .expect("create goal");
+
+        // An active goal accumulates and trips its budget at the boundary.
+        store.record_goal_usage(&id, goal_usage_tokens(60)).await;
+        let goal = store.current_goal(&id).await.flatten().expect("goal");
+        assert_eq!(goal.tokens_used, 60);
+        assert_eq!(goal.status, GoalStatus::Active);
+
+        store.record_goal_usage(&id, goal_usage_tokens(40)).await;
+        let goal = store.current_goal(&id).await.flatten().expect("goal");
+        assert_eq!(goal.tokens_used, 100);
+        assert_eq!(goal.status, GoalStatus::BudgetLimited);
+
+        // Once budget-limited (no longer active) usage is frozen.
+        store.record_goal_usage(&id, goal_usage_tokens(500)).await;
+        let goal = store.current_goal(&id).await.flatten().expect("goal");
+        assert_eq!(goal.tokens_used, 100);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn set_goal_budget_releases_budget_limited_goal() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-goal-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let id = store.create_session(cwd.clone()).await.id;
+
+        store
+            .create_goal(&id, "ship it".to_string(), Some(50))
+            .await
+            .expect("create goal");
+        store.record_goal_usage(&id, goal_usage_tokens(50)).await;
+        assert_eq!(
+            store.current_goal(&id).await.flatten().unwrap().status,
+            GoalStatus::BudgetLimited
+        );
+
+        // Raising the ceiling above already-spent tokens reactivates the goal.
+        let goal = store.set_goal_budget(&id, 200).await.expect("raise budget");
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(goal.token_budget, Some(200));
+
+        // A non-positive budget is rejected.
+        assert!(store.set_goal_budget(&id, 0).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn create_goal_rejects_unfinished_goal_and_persists() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-goal-unfinished-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let id = store.create_session(cwd.clone()).await.id;
+
+        store
+            .create_goal(&id, "first".to_string(), None)
+            .await
+            .expect("create goal");
+        let err = store
+            .create_goal(&id, "second".to_string(), None)
+            .await
+            .expect_err("a second goal must be rejected while the first is unfinished");
+        assert!(err.contains("unfinished goal"), "got: {err}");
+
+        // Completing the existing goal frees creation again.
+        store
+            .set_goal_status(&id, GoalStatus::Complete)
+            .await
+            .expect("complete");
+        store
+            .create_goal(&id, "third".to_string(), None)
+            .await
+            .expect("create after complete");
+
+        // The latest goal round-trips through the persisted manifest zip.
+        let manifest =
+            read_manifest_from_zip(&session_zip_path(&cwd, &id)).expect("manifest round-trips");
+        assert_eq!(
+            manifest.brokk_goal.expect("persisted goal").objective,
+            "third"
         );
 
         let _ = std::fs::remove_dir_all(&cwd);

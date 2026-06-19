@@ -1798,6 +1798,17 @@ pub async fn run_agent(
                     return Ok(());
                 }
 
+                // Hard-stop goal enforcement: a budget-limited or blocked goal
+                // must not spend another model turn -- not even a compression
+                // summarization call. Refuse here, before building messages,
+                // and release the in-flight reservation taken by `start_prompt`.
+                if let Some(reason) = snap.goal.as_ref().and_then(crate::goal::turn_block_reason)
+                {
+                    send_message(&cx, &session_id, &reason);
+                    sessions_prompt.finish_prompt(&session_id).await;
+                    return responder.respond(prompt_end_turn_response());
+                }
+
                 let messages = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
@@ -1839,10 +1850,6 @@ pub async fn run_agent(
                 let session_id_for_loop = session_id.clone();
                 let fallback_cwd_for_loop = fallback_cwd.clone();
                 let prompt_text_for_turn = prompt_text;
-                let count_goal_usage_for_loop = snap
-                    .goal
-                    .as_ref()
-                    .is_some_and(|goal| goal.status != crate::goal::GoalStatus::Paused);
                 let model_for_loop = snap.model;
                 let orchestration_model_for_response =
                     llm_for_loop.resolve_model_info(&model_for_loop);
@@ -1872,7 +1879,6 @@ pub async fn run_agent(
                         idle_timeout_for_loop,
                         cancel,
                         prompt_text_for_turn,
-                        count_goal_usage_for_loop,
                     )
                     .await;
 
@@ -2426,6 +2432,13 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
+    // Hard-stop goal enforcement inside a `/loop`: a budget-limited or blocked
+    // goal ends the loop with an explanatory message rather than spinning a
+    // refused turn (and a possible compression call) every interval.
+    if let Some(reason) = snap.goal.as_ref().and_then(crate::goal::turn_block_reason) {
+        return Err(LoopIterationError::Terminal(reason));
+    }
+
     let context_length = available_models
         .iter()
         .find(|m| m.id == snap.model)
@@ -2458,10 +2471,6 @@ async fn run_loop_iteration(
             .unwrap_or(default_idle_timeout_secs)
             .max(1),
     );
-    let count_goal_usage_this_turn = snap
-        .goal
-        .as_ref()
-        .is_some_and(|goal| goal.status != crate::goal::GoalStatus::Paused);
 
     let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
         cx,
@@ -2478,7 +2487,6 @@ async fn run_loop_iteration(
         idle_timeout,
         cancel,
         prompt_text,
-        count_goal_usage_this_turn,
     )
     .await;
     Ok(LoopIterationOutcome {
@@ -2533,7 +2541,15 @@ fn build_prompt_messages_with_parts(
     if let Some(catalog) = build_skills_catalog(&snap.skills) {
         messages.push(ChatMessage::user(catalog));
     }
-    if let Some(goal) = snap.goal.as_ref() {
+    // Only an actively-pursued goal is injected as steering context. A paused,
+    // complete, or budget-limited/blocked goal must not keep nudging the model
+    // to "continue working toward the active goal" -- and limited/blocked goals
+    // never reach a model turn anyway (the enforcement gate stops them first).
+    if let Some(goal) = snap
+        .goal
+        .as_ref()
+        .filter(|goal| goal.status == crate::goal::GoalStatus::Active)
+    {
         messages.push(ChatMessage::user(crate::goal::render_goal_context(goal)));
     }
     for turn in &snap.history {
@@ -2731,7 +2747,6 @@ async fn run_model_turn_in_spawn(
     idle_timeout: Duration,
     cancel: tokio_util::sync::CancellationToken,
     prompt_text_for_turn: String,
-    count_goal_usage_this_turn: bool,
 ) -> (
     Option<StructuredOutputResult>,
     crate::llm_client::TokenUsage,
@@ -2799,9 +2814,7 @@ async fn run_model_turn_in_spawn(
         .record_usage(session_id, turn_usage, cost_delta_usd)
         .await
         .unwrap_or(turn_usage);
-    sessions
-        .record_goal_usage(session_id, turn_usage, count_goal_usage_this_turn)
-        .await;
+    sessions.record_goal_usage(session_id, turn_usage).await;
     let structured_output_result =
         structured_output_request.map(|request| validate_response(request, &response_text));
 
@@ -4465,6 +4478,16 @@ async fn handle_goal(sessions: &SessionStore, session_id: &str, prompt_text: &st
         "blocked" | "block" => {
             set_goal_status_report(sessions, session_id, crate::goal::GoalStatus::Blocked).await
         }
+        "budget" => match arg.trim().parse::<i64>() {
+            Ok(budget) => match sessions.set_goal_budget(session_id, budget).await {
+                Ok(goal) => format!(
+                    "Goal budget updated.\n\n{}",
+                    crate::goal::render_goal_report(Some(&goal))
+                ),
+                Err(error) => format!("Could not update goal budget: {error}"),
+            },
+            Err(_) => "Usage: `/goal budget <tokens>` (a positive integer).".to_string(),
+        },
         "clear" | "reset" | "delete" => match sessions.clear_goal(session_id).await {
             Ok(true) => "Goal cleared.".to_string(),
             Ok(false) => "No goal was set.".to_string(),
@@ -4508,6 +4531,7 @@ fn goal_usage() -> String {
      - `/goal` - Show the current goal.\n\
      - `/goal create <objective>` - Create a new goal.\n\
      - `/goal create budget <tokens> <objective>` - Create a goal with a token budget.\n\
+     - `/goal budget <tokens>` - Set or raise the token budget for the current goal.\n\
      - `/goal pause` - Pause the current goal.\n\
      - `/goal resume` - Resume the current goal.\n\
      - `/goal complete` - Mark the current goal complete.\n\

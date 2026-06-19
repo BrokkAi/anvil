@@ -684,14 +684,14 @@ impl ToolRegistry {
         ));
         defs.push(tool_def(
             crate::goal::UPDATE_GOAL_TOOL_NAME,
-            "Update the existing goal. Use this tool only to mark the goal achieved or genuinely blocked. Set status to complete only when the objective has actually been achieved and no required work remains. Set status to blocked only when the same blocking condition has repeated for at least three consecutive goal turns and the agent is at an impasse. You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.",
+            "Update the existing goal. Use this tool only to mark the goal achieved or genuinely blocked. Set status to complete only when the objective has actually been achieved and no required work remains. Set status to blocked only when you are at a genuine impasse you cannot resolve without the user. You cannot use this tool to pause, resume, or change the budget of a goal; those changes are controlled by the user.",
             json!({
                 "type": "object",
                 "properties": {
                     "status": {
                         "type": "string",
                         "enum": ["complete", "blocked"],
-                        "description": "Required. Set to complete only when done; set to blocked only after a genuine repeated blocking condition."
+                        "description": "Required. Set to complete only when the objective is fully achieved; set to blocked only at a genuine impasse."
                     }
                 },
                 "required": ["status"]
