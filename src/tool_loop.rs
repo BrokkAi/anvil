@@ -163,6 +163,20 @@ async fn stream_chat_with_transient_retry(
     }
 }
 
+/// Why a model turn ended without producing a usable assistant response.
+///
+/// Surfaced out of [`run`] so autonomous drivers (e.g. `/goal`) can decide
+/// whether to back off and retry (transient outage) or stop and hand back to
+/// the user (fatal). `retryable` mirrors the classification the inner
+/// stream-retry already uses via [`crate::llm_client::is_retryable_llm_error`]
+/// -- transient signals (server overload, rate limit, stream disconnect,
+/// network) are retryable; auth/invalid-request and panics are not.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnFailure {
+    pub retryable: bool,
+    pub message: String,
+}
+
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
@@ -1312,7 +1326,7 @@ pub(crate) async fn run(
     original_user_request: String,
     notifications: NotificationMode,
     depth: usize,
-) -> (String, Vec<ToolExchange>, TokenUsage) {
+) -> (String, Vec<ToolExchange>, TokenUsage, Option<TurnFailure>) {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
@@ -1321,10 +1335,17 @@ pub(crate) async fn run(
                 "type": "p2t_config_error",
                 "error": format!("{error:#}"),
             }));
+            // A misconfigured env var fails deterministically every turn, so
+            // mark it fatal: an autonomous driver should stop and surface it
+            // rather than retry the same broken config.
             return (
                 format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
                 Vec::new(),
                 TokenUsage::default(),
+                Some(TurnFailure {
+                    retryable: false,
+                    message: format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
+                }),
             );
         }
     };
@@ -1340,6 +1361,10 @@ pub(crate) async fn run(
                     format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
                     Vec::new(),
                     TokenUsage::default(),
+                    Some(TurnFailure {
+                        retryable: false,
+                        message: format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
+                    }),
                 );
             }
         }
@@ -1359,6 +1384,12 @@ pub(crate) async fn run(
                         format!("BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"),
                         Vec::new(),
                         TokenUsage::default(),
+                        Some(TurnFailure {
+                            retryable: false,
+                            message: format!(
+                                "BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"
+                            ),
+                        }),
                     );
                 }
             },
@@ -1402,6 +1433,12 @@ pub(crate) async fn run(
     // calls as it dispatches tools). The caller adds this to the
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
+    // Set only when a turn ends because the LLM call itself failed (after the
+    // inner stream-retry budget is exhausted) or the loop panicked. Left
+    // `None` for a normal completion, so an autonomous driver can tell a real
+    // model response apart from an outage. The error text is still appended to
+    // `full_response` and streamed, exactly as before.
+    let mut llm_failure: Option<TurnFailure> = None;
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
     if let Some(config) = p2t_config.as_ref() {
@@ -1875,6 +1912,12 @@ pub(crate) async fn run(
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
+                // Classify before consuming `e` so an autonomous driver can
+                // back off on a transient outage vs. stop on a fatal error.
+                llm_failure = Some(TurnFailure {
+                    retryable: crate::llm_client::is_retryable_llm_error(&e),
+                    message: e.to_string(),
+                });
                 let friendly = messages_include_images(&messages)
                     .then(|| rewrite_image_prompt_provider_error(&e.to_string()))
                     .flatten();
@@ -1900,7 +1943,7 @@ pub(crate) async fn run(
         );
     }
 
-    (full_response, tool_exchanges, turn_usage)
+    (full_response, tool_exchanges, turn_usage, llm_failure)
 }
 
 fn record_p2t_step(config: &p2t::P2tConfig, cwd: &Path, record: StepTraceRecord) {
@@ -3503,7 +3546,10 @@ async fn execute_subagent(
     ))
     .await;
 
-    let (text, _exchanges, nested_usage) = nested;
+    // The subagent surfaces failure via its returned text (an empty response
+    // becomes an error below); the structured failure class is for top-level
+    // autonomous drivers, so it is ignored for a nested run.
+    let (text, _exchanges, nested_usage, _failure) = nested;
     let exec = if text.trim().is_empty() {
         ToolExecution {
             output: format!("Error: subagent '{subagent_name}' returned an empty response."),

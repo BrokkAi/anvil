@@ -226,12 +226,15 @@ Built-in commands:
   the objective is verifiably met. Anvil re-prompts itself each turn with the
   objective plus a completion audit; it stops only when the model verifies
   every requirement against the actual worktree/command state and emits the
-  `GOAL_COMPLETE` sentinel, when the model reports the same blocker for three
-  consecutive turns, or when the session is cancelled. There is **no turn
-  limit by default** — the stopping condition is the verified completion, not
-  a turn count. Pass `--max-turns N` to set an optional ceiling (a wrap-up
-  turn runs when it is reached). Inspired by Codex's `/goal`, whose token
-  budget is likewise optional.
+  `GOAL_COMPLETE` sentinel, when the model reports a blocker on three
+  consecutive turns, when a model request fails fatally (e.g. auth or an
+  invalid request), or when the session is cancelled. A transient model or
+  network outage does **not** stop the goal: it is retried with a capped
+  backoff so the goal survives the outage and resumes when it clears. There is
+  **no turn limit by default** — the stopping condition is the verified
+  completion, not a turn count. Pass `--max-turns N` to set an optional ceiling
+  (a wrap-up turn runs when it is reached). Inspired by Codex's `/goal`, whose
+  token budget is likewise optional.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.

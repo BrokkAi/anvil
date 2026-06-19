@@ -1777,7 +1777,6 @@ pub async fn run_agent(
                     let cx_for_goal = cx.clone();
                     let session_id_for_goal = session_id.clone();
                     let fallback_cwd_for_goal = fallback_cwd.clone();
-                    let structured_output_request_for_goal = structured_output_request.clone();
 
                     let spawn_result = cx.spawn(async move {
                         use futures::FutureExt;
@@ -1790,7 +1789,6 @@ pub async fn run_agent(
                             &fallback_cwd_for_goal,
                             llm_for_goal,
                             &goal_spec,
-                            structured_output_request_for_goal.as_ref(),
                             default_idle_timeout_secs,
                             max_turns,
                             cancel.clone(),
@@ -1955,7 +1953,10 @@ pub async fn run_agent(
                 );
 
                 let spawn_result = cx.spawn(async move {
-                    let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
+                    // The normal prompt path uses only the structured output and
+                    // usage; `response`/`failure` are for autonomous drivers and
+                    // are ignored here (errors were already streamed to the user).
+                    let turn_result = run_model_turn_in_spawn(
                         &cx_for_loop,
                         &sessions_for_loop,
                         &session_id_for_loop,
@@ -1972,6 +1973,8 @@ pub async fn run_agent(
                         prompt_text_for_turn,
                     )
                     .await;
+                    let structured_output_result = turn_result.structured_output;
+                    let cumulative_usage = turn_result.cumulative_usage;
 
                     // Clean up cancellation token even on panic / persistence failure.
                     sessions_for_loop.finish_prompt(&session_id_for_loop).await;
@@ -2514,80 +2517,43 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
-    let context_length = available_models
-        .iter()
-        .find(|m| m.id == snap.model)
-        .and_then(|m| m.context_length);
-    let compression_idle_timeout = Duration::from_secs(
-        snap.idle_timeout_secs
-            .unwrap_or(default_idle_timeout_secs)
-            .max(1),
-    );
-    let messages = build_prompt_messages_with_compression(
-        &mut snap,
-        &prompt_text,
-        &prompt_parts,
-        llm.as_ref(),
-        sessions,
-        session_id,
-        cancel.clone(),
-        compression_idle_timeout,
-        context_length,
-    )
-    .await;
-    let Some(registry) = sessions
-        .get_or_create_registry(session_id, snap.cwd.clone())
-        .await
-    else {
-        return Err(LoopIterationError::Terminal("unknown session".to_string()));
-    };
-    let idle_timeout = Duration::from_secs(
-        snap.idle_timeout_secs
-            .unwrap_or(default_idle_timeout_secs)
-            .max(1),
-    );
-
-    let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
+    let turn = run_prepared_model_turn(
         cx,
         sessions,
         session_id,
         fallback_cwd,
         &llm,
-        &registry,
-        &snap.model,
-        snap.reasoning_effort.as_deref(),
+        &mut snap,
+        &prompt_text,
+        &prompt_parts,
         structured_output_request,
-        messages,
+        default_idle_timeout_secs,
         max_turns,
-        idle_timeout,
         cancel,
-        prompt_text,
     )
-    .await;
+    .await?;
     Ok(LoopIterationOutcome {
-        structured_output_result,
-        cumulative_usage,
+        structured_output_result: turn.structured_output,
+        cumulative_usage: turn.cumulative_usage,
     })
 }
 
 /// Outcome of a single autonomous goal turn: the assistant's final text
-/// (scanned for the completion/blocked sentinel) plus the cumulative
-/// session usage after the turn was accounted.
+/// (scanned for the completion/blocked sentinel), the cumulative session
+/// usage after the turn was accounted, and -- when the turn ended in an LLM
+/// error or panic instead of a real completion -- the classified failure so
+/// the loop can back off (transient) or stop (fatal).
 struct GoalTurnOutcome {
     response: String,
     cumulative_usage: crate::llm_client::TokenUsage,
+    failure: Option<crate::tool_loop::TurnFailure>,
 }
 
-/// Run one model turn for an active goal: inject `prompt_text` as the
-/// turn's user message, run the tool loop to completion, persist the
-/// turn, then re-read the persisted assistant text so the caller can
-/// look for the completion sentinel.
-///
-/// This is a trimmed cousin of [`run_loop_iteration`]: there is no
-/// slash-command dispatch (the goal prompt is always plain continuation
-/// text) and it returns the assistant text instead of a
-/// structured-output result, since the goal stop condition is the
-/// sentinel rather than schema validation.
+/// Run one model turn for an active goal: inject `prompt_text` as the turn's
+/// user message and run the shared per-turn pipeline to completion. Returns
+/// the assistant text directly (for the sentinel scan) plus any failure
+/// classification. The goal stop condition is the sentinel rather than schema
+/// validation, so no structured-output request is threaded.
 #[allow(clippy::too_many_arguments)]
 async fn run_goal_turn(
     cx: &ConnectionTo<Client>,
@@ -2595,7 +2561,6 @@ async fn run_goal_turn(
     session_id: &str,
     fallback_cwd: &Path,
     llm: Arc<dyn crate::llm_client::LlmBackend>,
-    structured_output_request: Option<&StructuredOutputRequest>,
     prompt_text: &str,
     default_idle_timeout_secs: u64,
     max_turns: usize,
@@ -2606,79 +2571,29 @@ async fn run_goal_turn(
         .await
         .ok_or_else(|| LoopIterationError::Terminal("unknown session".to_string()))?;
 
-    if snap.model.is_empty() {
-        return Err(LoopIterationError::Terminal(
-            "model not configured".to_string(),
-        ));
-    }
-
     let prompt_parts = vec![ChatContentPart::text(prompt_text.to_string())];
-    let available_models = sessions.available_model_metadata().await;
-    let context_length = available_models
-        .iter()
-        .find(|m| m.id == snap.model)
-        .and_then(|m| m.context_length);
-    let compression_idle_timeout = Duration::from_secs(
-        snap.idle_timeout_secs
-            .unwrap_or(default_idle_timeout_secs)
-            .max(1),
-    );
-    let messages = build_prompt_messages_with_compression(
-        &mut snap,
-        prompt_text,
-        &prompt_parts,
-        llm.as_ref(),
-        sessions,
-        session_id,
-        cancel.clone(),
-        compression_idle_timeout,
-        context_length,
-    )
-    .await;
-
-    let Some(registry) = sessions
-        .get_or_create_registry(session_id, snap.cwd.clone())
-        .await
-    else {
-        return Err(LoopIterationError::Terminal("unknown session".to_string()));
-    };
-    let idle_timeout = Duration::from_secs(
-        snap.idle_timeout_secs
-            .unwrap_or(default_idle_timeout_secs)
-            .max(1),
-    );
-
-    let (_structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
+    let turn = run_prepared_model_turn(
         cx,
         sessions,
         session_id,
         fallback_cwd,
         &llm,
-        &registry,
-        &snap.model,
-        snap.reasoning_effort.as_deref(),
-        structured_output_request,
-        messages,
+        &mut snap,
+        prompt_text,
+        &prompt_parts,
+        // A goal stops on the completion sentinel, not on a schema, so it
+        // never forces structured output on its turns.
+        None,
+        default_idle_timeout_secs,
         max_turns,
-        idle_timeout,
         cancel,
-        prompt_text.to_string(),
     )
-    .await;
-
-    // `run_model_turn_in_spawn` persists the turn via `add_turn` before it
-    // returns, so a fresh snapshot's last turn is the one we just ran. We
-    // read its assistant text rather than threading a new return value
-    // through the shared turn runner used by the normal prompt path.
-    let response = sessions
-        .snapshot(session_id, fallback_cwd)
-        .await
-        .and_then(|s| s.history.last().map(|t| t.agent_response.clone()))
-        .unwrap_or_default();
+    .await?;
 
     Ok(GoalTurnOutcome {
-        response,
-        cumulative_usage,
+        response: turn.response,
+        cumulative_usage: turn.cumulative_usage,
+        failure: turn.failure,
     })
 }
 
@@ -2688,9 +2603,10 @@ async fn run_goal_turn(
 /// audit + sentinel protocol), runs a model turn, then inspects the
 /// assistant's final text:
 /// - [`GoalSignal::Complete`] → the objective is verifiably met; stop.
-/// - [`GoalSignal::Blocked`] → count it; stop only once the same kind of
-///   blocker has been reported for [`GOAL_BLOCKED_THRESHOLD`] consecutive
-///   turns (mirrors Codex's "don't surrender on the first blocker" rule).
+/// - [`GoalSignal::Blocked`] → count it; stop only once a blocker has been
+///   reported for [`GOAL_BLOCKED_THRESHOLD`] consecutive turns (mirrors
+///   Codex's "don't surrender on the first blocker" rule). The reasons need
+///   not match -- any blocked report extends the streak.
 /// - [`GoalSignal::Continue`] → keep going.
 ///
 /// By default the goal is unbounded -- it runs until one of those signals
@@ -2706,7 +2622,6 @@ async fn run_goal_loop(
     fallback_cwd: &Path,
     llm: Arc<dyn crate::llm_client::LlmBackend>,
     spec: &GoalSpec,
-    structured_output_request: Option<&StructuredOutputRequest>,
     default_idle_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
@@ -2728,6 +2643,10 @@ async fn run_goal_loop(
 
     let mut cumulative = crate::llm_client::TokenUsage::default();
     let mut consecutive_blocked = 0u32;
+    // Consecutive transient LLM failures (outage). Drives a capped backoff so
+    // the goal survives an outage and resumes when it clears, instead of
+    // spinning. Reset by any turn that produced a real model response.
+    let mut consecutive_failures = 0u32;
     let mut turn = 0u32;
 
     loop {
@@ -2760,7 +2679,6 @@ async fn run_goal_loop(
             session_id,
             fallback_cwd,
             llm.clone(),
-            structured_output_request,
             &prompt,
             default_idle_timeout_secs,
             max_turns,
@@ -2770,6 +2688,60 @@ async fn run_goal_loop(
         {
             Ok(outcome) => {
                 cumulative = outcome.cumulative_usage;
+
+                // A turn that ended in an LLM failure produced no real
+                // assistant response to scan for a sentinel. Classify it:
+                // transient outages back off and retry (surviving the outage),
+                // fatal errors stop and hand back to the user. Handled before
+                // the sentinel scan so the error text can't be mistaken for a
+                // signal.
+                if let Some(failure) = outcome.failure {
+                    match decide_after_goal_failure(&failure, consecutive_failures) {
+                        GoalFailureAction::Stop => {
+                            send_message(
+                                cx,
+                                session_id,
+                                &format!(
+                                    "\n⛔ Goal stopped after {turn} turn(s): the model request \
+                                     failed and cannot be retried.\nReason: {}\n",
+                                    failure.message
+                                ),
+                            );
+                            break;
+                        }
+                        GoalFailureAction::Backoff {
+                            consecutive_failures: updated,
+                        } => {
+                            consecutive_failures = updated;
+                            let delay = goal_failure_backoff(consecutive_failures);
+                            send_thought(
+                                cx,
+                                session_id,
+                                &format!(
+                                    "[goal: transient failure (attempt {consecutive_failures}): \
+                                     {}; backing off {:.1}s and retrying]\n",
+                                    failure.message,
+                                    delay.as_secs_f64()
+                                ),
+                            );
+                            // A failed turn doesn't consume the opt-in ceiling;
+                            // retry reuses this turn number once the backoff
+                            // (cancellable) elapses.
+                            turn -= 1;
+                            tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    send_message(cx, session_id, "Goal cancelled.\n");
+                                    break;
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // A productive turn clears the outage streak.
+                consecutive_failures = 0;
                 let signal = detect_goal_signal(&outcome.response);
                 match decide_after_goal_turn(signal, turn, spec.max_turns, consecutive_blocked) {
                     GoalStep::Stop(GoalStop::Completed) => {
@@ -3067,6 +3039,21 @@ async fn build_prompt_messages_with_compression(
     }
 }
 
+/// Everything a single model turn produced, threaded back to the caller.
+///
+/// `response` is the assistant's final text (returned directly so callers no
+/// longer have to re-read it from persisted history), and `failure` is set
+/// only when the turn ended in an LLM error or panic rather than a real
+/// completion. The normal-prompt and `/loop` callers use just
+/// `structured_output` + `cumulative_usage`; `/goal` additionally inspects
+/// `response` (for the sentinel) and `failure` (to back off or stop).
+struct ModelTurnResult {
+    structured_output: Option<StructuredOutputResult>,
+    cumulative_usage: crate::llm_client::TokenUsage,
+    response: String,
+    failure: Option<crate::tool_loop::TurnFailure>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn_in_spawn(
     cx: &ConnectionTo<Client>,
@@ -3083,10 +3070,7 @@ async fn run_model_turn_in_spawn(
     idle_timeout: Duration,
     cancel: tokio_util::sync::CancellationToken,
     prompt_text_for_turn: String,
-) -> (
-    Option<StructuredOutputResult>,
-    crate::llm_client::TokenUsage,
-) {
+) -> ModelTurnResult {
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
 
@@ -3128,14 +3112,21 @@ async fn run_model_turn_in_spawn(
     .catch_unwind()
     .await;
 
-    let (response_text, tool_exchanges, turn_usage) = match loop_result {
-        Ok((text, exchanges, usage)) => (text, exchanges, usage),
+    let (response_text, tool_exchanges, turn_usage, failure) = match loop_result {
+        Ok((text, exchanges, usage, failure)) => (text, exchanges, usage, failure),
         Err(panic) => {
             tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
+            // A panic is treated as fatal (non-retryable): retrying a
+            // deterministic crash would just spin, so an autonomous driver
+            // should stop and surface it rather than back off and retry.
             (
                 "Error: agent loop panicked. See server logs.".to_string(),
                 Vec::new(),
                 crate::llm_client::TokenUsage::default(),
+                Some(crate::tool_loop::TurnFailure {
+                    retryable: false,
+                    message: "agent loop panicked".to_string(),
+                }),
             )
         }
     };
@@ -3158,7 +3149,7 @@ async fn run_model_turn_in_spawn(
             session_id,
             ConversationTurn {
                 user_prompt: prompt_text_for_turn,
-                agent_response: response_text,
+                agent_response: response_text.clone(),
                 tool_exchanges,
                 structured_output: structured_output_result.clone(),
                 summary: None,
@@ -3178,7 +3169,92 @@ async fn run_model_turn_in_spawn(
     }
 
     send_session_usage_update(cx, sessions, session_id, fallback_cwd).await;
-    (structured_output_result, cumulative_usage)
+    ModelTurnResult {
+        structured_output: structured_output_result,
+        cumulative_usage,
+        response: response_text,
+        failure,
+    }
+}
+
+/// Shared "run one model turn" pipeline behind both `/loop` and `/goal`:
+/// validate the model, resolve the context window, compress history to fit,
+/// snapshot the tool registry, then run the turn. Returns the threaded
+/// [`ModelTurnResult`] (assistant text + usage + structured output + failure
+/// classification). Callers keep only their own pre/post steps -- `/loop`'s
+/// image-prompt rejection, `/goal`'s sentinel scan -- so the per-turn pipeline
+/// lives in exactly one place. `snap` is taken by `&mut` because compression
+/// rewrites its in-memory history to fit the context budget.
+#[allow(clippy::too_many_arguments)]
+async fn run_prepared_model_turn(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    snap: &mut SessionSnapshot,
+    prompt_text: &str,
+    prompt_parts: &[ChatContentPart],
+    structured_output_request: Option<&StructuredOutputRequest>,
+    default_idle_timeout_secs: u64,
+    max_turns: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<ModelTurnResult, LoopIterationError> {
+    if snap.model.is_empty() {
+        return Err(LoopIterationError::Terminal(
+            "model not configured".to_string(),
+        ));
+    }
+
+    let context_length = sessions
+        .available_model_metadata()
+        .await
+        .iter()
+        .find(|m| m.id == snap.model)
+        .and_then(|m| m.context_length);
+    // The compression and chat calls share one idle timeout (the previous
+    // inline copies computed this same value twice).
+    let idle_timeout = Duration::from_secs(
+        snap.idle_timeout_secs
+            .unwrap_or(default_idle_timeout_secs)
+            .max(1),
+    );
+    let messages = build_prompt_messages_with_compression(
+        snap,
+        prompt_text,
+        prompt_parts,
+        llm.as_ref(),
+        sessions,
+        session_id,
+        cancel.clone(),
+        idle_timeout,
+        context_length,
+    )
+    .await;
+    let Some(registry) = sessions
+        .get_or_create_registry(session_id, snap.cwd.clone())
+        .await
+    else {
+        return Err(LoopIterationError::Terminal("unknown session".to_string()));
+    };
+
+    Ok(run_model_turn_in_spawn(
+        cx,
+        sessions,
+        session_id,
+        fallback_cwd,
+        llm,
+        &registry,
+        &snap.model,
+        snap.reasoning_effort.as_deref(),
+        structured_output_request,
+        messages,
+        max_turns,
+        idle_timeout,
+        cancel,
+        prompt_text.to_string(),
+    )
+    .await)
 }
 
 fn build_system_prompt(mode: &SessionMode, cwd: &Path) -> String {
@@ -5453,8 +5529,8 @@ fn detect_goal_signal(response: &str) -> GoalSignal {
 enum GoalStop {
     /// The model verified the objective and emitted the completion sentinel.
     Completed,
-    /// The model reported the same blocker for [`GOAL_BLOCKED_THRESHOLD`]
-    /// consecutive turns; carries the latest reason.
+    /// The model reported a blocker on [`GOAL_BLOCKED_THRESHOLD`] consecutive
+    /// turns (reasons need not match); carries the latest reason.
     Blocked(String),
     /// The user's opt-in `--max-turns` ceiling was reached without a
     /// completion signal. Never produced for an unbounded goal.
@@ -5512,6 +5588,53 @@ fn decide_after_goal_turn(
             }
         }
     }
+}
+
+/// What the goal loop should do about a turn that ended in an LLM failure
+/// (vs. a real model response). Kept side-effect-free so the
+/// transient-vs-fatal branch is unit-testable, like [`decide_after_goal_turn`].
+#[derive(Debug, PartialEq, Eq)]
+enum GoalFailureAction {
+    /// Transient outage (server overload, rate limit, stream/connection drop):
+    /// wait a backoff scaled by `consecutive_failures` and retry the turn.
+    /// Unbounded by design so the goal survives a long outage and resumes when
+    /// it clears -- the delay is capped instead of the retry count.
+    Backoff { consecutive_failures: u32 },
+    /// Fatal (auth, invalid request, panic): retrying would not help, so stop
+    /// the goal and hand back to the user.
+    Stop,
+}
+
+/// Classify a failed goal turn. Transient failures back off and retry; fatal
+/// ones stop. Mirrors Codex's retryable/fatal split (the underlying predicate
+/// is [`crate::llm_client::is_retryable_llm_error`], applied in
+/// [`crate::tool_loop::run`]); the divergence is deliberate -- Codex bounds
+/// transient retries by a fixed count then aborts the turn, whereas an
+/// unbounded goal keeps retrying (with a capped delay) to survive the outage.
+fn decide_after_goal_failure(
+    failure: &crate::tool_loop::TurnFailure,
+    consecutive_failures: u32,
+) -> GoalFailureAction {
+    if failure.retryable {
+        GoalFailureAction::Backoff {
+            consecutive_failures: consecutive_failures.saturating_add(1),
+        }
+    } else {
+        GoalFailureAction::Stop
+    }
+}
+
+/// Upper bound on the inter-turn backoff for a goal surviving an outage. The
+/// base schedule is the codex-compatible [`crate::http_retry::retry_backoff`]
+/// (200ms * 2^(n-1) + jitter); because a goal retries an unbounded number of
+/// times, the delay is capped here so a long outage settles into a steady
+/// ~1-minute poll rather than growing without limit.
+const GOAL_FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Capped exponential backoff for the `consecutive_failures`-th transient
+/// failure in a row (1-based).
+fn goal_failure_backoff(consecutive_failures: u32) -> Duration {
+    crate::http_retry::retry_backoff(u64::from(consecutive_failures)).min(GOAL_FAILURE_BACKOFF_CAP)
 }
 
 /// Build the continuation prompt injected as the user message for one goal
@@ -6823,6 +6946,61 @@ mod tests {
             decide_after_goal_turn(GoalSignal::Blocked("y".into()), 25, Some(25), 0),
             GoalStep::Stop(GoalStop::CeilingReached)
         );
+    }
+
+    #[test]
+    fn decide_after_goal_failure_backs_off_on_transient() {
+        // A retryable (transient) failure backs off and retries, incrementing
+        // the outage streak -- the goal survives the outage rather than stopping.
+        let transient = crate::tool_loop::TurnFailure {
+            retryable: true,
+            message: "server_is_overloaded".to_string(),
+        };
+        assert_eq!(
+            decide_after_goal_failure(&transient, 0),
+            GoalFailureAction::Backoff {
+                consecutive_failures: 1
+            }
+        );
+        assert_eq!(
+            decide_after_goal_failure(&transient, 4),
+            GoalFailureAction::Backoff {
+                consecutive_failures: 5
+            }
+        );
+    }
+
+    #[test]
+    fn decide_after_goal_failure_stops_on_fatal() {
+        // A non-retryable failure (auth, invalid request, panic) stops the goal:
+        // retrying would not help.
+        let fatal = crate::tool_loop::TurnFailure {
+            retryable: false,
+            message: "agent loop panicked".to_string(),
+        };
+        assert_eq!(
+            decide_after_goal_failure(&fatal, 0),
+            GoalFailureAction::Stop
+        );
+        assert_eq!(
+            decide_after_goal_failure(&fatal, 9),
+            GoalFailureAction::Stop
+        );
+    }
+
+    #[test]
+    fn goal_failure_backoff_grows_then_caps() {
+        // First failure ~200ms (codex base, jittered); the delay grows
+        // exponentially but never exceeds the cap, so a long outage settles
+        // into a steady poll instead of growing without bound.
+        let first = goal_failure_backoff(1);
+        assert!(
+            (180..=220).contains(&first.as_millis()),
+            "first backoff should jitter around 200ms, got {first:?}"
+        );
+        assert!(first <= GOAL_FAILURE_BACKOFF_CAP);
+        // A large streak is clamped to the cap (and must not overflow/panic).
+        assert_eq!(goal_failure_backoff(1_000), GOAL_FAILURE_BACKOFF_CAP);
     }
 
     #[test]
