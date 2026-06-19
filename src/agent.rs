@@ -5301,6 +5301,7 @@ const GOAL_BLOCKED_SENTINEL: &str = "GOAL_BLOCKED";
 const GOAL_BLOCKED_THRESHOLD: u32 = 3;
 
 /// A parsed `/goal` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GoalSpec {
     objective: String,
     max_turns: u32,
@@ -5316,6 +5317,7 @@ enum GoalPhase {
 }
 
 /// The stop signal (if any) parsed from a goal turn's assistant text.
+#[derive(Debug, PartialEq, Eq)]
 enum GoalSignal {
     Complete,
     Blocked(String),
@@ -6526,6 +6528,142 @@ mod tests {
         assert!(err.contains("Nested `/loop`"), "got: {err}");
     }
 
+    #[test]
+    fn parse_goal_command_uses_default_budget() {
+        assert_eq!(
+            parse_goal_command("/goal make cargo test pass"),
+            Ok(GoalSpec {
+                objective: "make cargo test pass".to_string(),
+                max_turns: GOAL_DEFAULT_MAX_TURNS,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_goal_command_parses_max_turns_flag() {
+        assert_eq!(
+            parse_goal_command("/goal --max-turns 40 migrate the loader"),
+            Ok(GoalSpec {
+                objective: "migrate the loader".to_string(),
+                max_turns: 40,
+            })
+        );
+        // `=` form is equivalent.
+        assert_eq!(
+            parse_goal_command("/goal --max-turns=7 do the thing"),
+            Ok(GoalSpec {
+                objective: "do the thing".to_string(),
+                max_turns: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_goal_command_requires_objective() {
+        let err = parse_goal_command("/goal").expect_err("bare /goal must reject");
+        assert!(err.contains("Usage:"), "got: {err}");
+        // A flag with no objective after it is still a usage error.
+        let err =
+            parse_goal_command("/goal --max-turns 5").expect_err("flag-only /goal must reject");
+        assert!(err.contains("Usage:"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_goal_command_rejects_bad_max_turns() {
+        let err = parse_goal_command("/goal --max-turns soon do it")
+            .expect_err("junk budget must reject");
+        assert!(err.contains("Invalid `--max-turns`"), "got: {err}");
+
+        let err = parse_goal_command("/goal --max-turns 0 do it").expect_err("zero must reject");
+        assert!(err.contains("out of range"), "got: {err}");
+
+        let err =
+            parse_goal_command("/goal --max-turns 999 do it").expect_err("too large must reject");
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_goal_command_treats_lookalike_flag_as_objective() {
+        // `--max-turnsy` is not the flag, so it stays part of the objective
+        // and the default budget applies.
+        assert_eq!(
+            parse_goal_command("/goal --max-turnsy is a weird objective"),
+            Ok(GoalSpec {
+                objective: "--max-turnsy is a weird objective".to_string(),
+                max_turns: GOAL_DEFAULT_MAX_TURNS,
+            })
+        );
+    }
+
+    #[test]
+    fn detect_goal_signal_recognizes_complete() {
+        assert_eq!(
+            detect_goal_signal("All tests pass now.\n\nGOAL_COMPLETE"),
+            GoalSignal::Complete
+        );
+        // Lightly decorated / trailing punctuation still matches.
+        assert_eq!(
+            detect_goal_signal("done\n`GOAL_COMPLETE`"),
+            GoalSignal::Complete
+        );
+        assert_eq!(
+            detect_goal_signal("**GOAL_COMPLETE.**"),
+            GoalSignal::Complete
+        );
+    }
+
+    #[test]
+    fn detect_goal_signal_recognizes_blocked_with_reason() {
+        assert_eq!(
+            detect_goal_signal("I cannot proceed.\nGOAL_BLOCKED: missing API credentials"),
+            GoalSignal::Blocked("missing API credentials".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_goal_signal_continue_when_no_sentinel() {
+        assert_eq!(
+            detect_goal_signal("Made progress: refactored the parser, two tests still red."),
+            GoalSignal::Continue
+        );
+    }
+
+    #[test]
+    fn detect_goal_signal_ignores_sentinel_discussed_in_prose() {
+        // The model mentioning the sentinel mid-sentence must NOT trip a
+        // stop -- only a standalone line counts.
+        assert_eq!(
+            detect_goal_signal("I will emit GOAL_COMPLETE once the suite is green."),
+            GoalSignal::Continue
+        );
+    }
+
+    #[test]
+    fn detect_goal_signal_complete_wins_over_blocked() {
+        assert_eq!(
+            detect_goal_signal("GOAL_BLOCKED: earlier note\nGOAL_COMPLETE"),
+            GoalSignal::Complete
+        );
+    }
+
+    #[test]
+    fn build_goal_prompt_embeds_objective_and_sentinels() {
+        let p = build_goal_prompt("ship the feature", 1, 25, GoalPhase::Continue);
+        assert!(p.contains("ship the feature"), "objective missing");
+        assert!(
+            p.contains(GOAL_COMPLETE_SENTINEL),
+            "complete sentinel missing"
+        );
+        assert!(
+            p.contains(GOAL_BLOCKED_SENTINEL),
+            "blocked sentinel missing"
+        );
+        assert!(p.contains("turn 1 of at most 25"), "turn header missing");
+
+        let wrap = build_goal_prompt("ship it", 25, 25, GoalPhase::FinalWrapUp);
+        assert!(wrap.contains("FINAL turn"), "wrap-up framing missing");
+    }
+
     /// `plan_compress` returns the indexes of every turn whose
     /// `summary` is `None`, in chronological order. Already-summarized
     /// turns must NOT appear -- `/compress` should be idempotent.
@@ -7626,6 +7764,7 @@ mod tests {
             vec![
                 "context",
                 "loop",
+                "goal",
                 "setup",
                 "permissions",
                 "compress",
