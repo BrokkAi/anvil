@@ -522,6 +522,11 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "Repeat a slash command or prompt on an interval until cancelled",
         ),
         AvailableCommand::new(
+            "goal",
+            "Work autonomously across turns until an objective is verifiably met \
+             (e.g. `/goal make `cargo test` pass`)",
+        ),
+        AvailableCommand::new(
             "setup",
             "Set up models, login, behavior, sandboxing, and advanced options",
         ),
@@ -553,6 +558,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
     [
         "context",
         "loop",
+        "goal",
         "setup",
         "permissions",
         "compress",
@@ -1342,6 +1348,25 @@ pub async fn run_agent(
                     None
                 };
 
+                // `/goal <objective>` drives the agent autonomously across
+                // turns until the objective is verifiably met (the model
+                // emits the completion sentinel), it is blocked, or the
+                // turn budget is exhausted. Parsed here so a malformed
+                // invocation prints usage and short-circuits, mirroring
+                // `/loop`; the spawn that actually runs the goal loop is
+                // dispatched further down, after model validation.
+                let goal_spec = if is_slash_command(&raw_prompt_text, "goal") {
+                    match parse_goal_command(&raw_prompt_text) {
+                        Ok(spec) => Some(spec),
+                        Err(report) => {
+                            send_message(&cx, &session_id, &report);
+                            return responder.respond(prompt_end_turn_response());
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let stream_setup_openrouter_refresh =
                     is_streamed_setup_openrouter_refresh(&raw_prompt_text);
 
@@ -1723,6 +1748,90 @@ pub async fn run_agent(
                         if let Err(e) = responder.respond(response) {
                             tracing::warn!(
                                 session_id = %session_id_for_loop,
+                                "failed to deliver PromptResponse: {e}"
+                            );
+                        }
+                        Ok(())
+                    });
+
+                    if let Err(e) = spawn_result {
+                        sessions_prompt.finish_prompt(&session_id).await;
+                        return Err(e);
+                    }
+
+                    return Ok(());
+                }
+
+                // `/goal` dispatch. Like `/loop`, the goal runs in a spawned
+                // task that holds the session's in-flight slot until the
+                // objective is met, blocked, or the turn budget is spent;
+                // `session/cancel` stops it early. Reaching this point means
+                // the model is configured (the empty-model guard above only
+                // skips for `loop_spec`, and a `/goal` prompt has none).
+                if let Some(goal_spec) = goal_spec {
+                    let llm_for_goal: Arc<dyn crate::llm_client::LlmBackend> = llm_prompt.clone();
+                    let orchestration_model_for_response =
+                        llm_for_goal.resolve_model_info(&snap.model);
+                    let sessions_for_goal = sessions_prompt.clone();
+                    let cx_for_goal = cx.clone();
+                    let session_id_for_goal = session_id.clone();
+                    let fallback_cwd_for_goal = fallback_cwd.clone();
+                    let structured_output_request_for_goal = structured_output_request.clone();
+
+                    let spawn_result = cx.spawn(async move {
+                        use futures::FutureExt;
+                        use std::panic::AssertUnwindSafe;
+
+                        let goal_result = AssertUnwindSafe(run_goal_loop(
+                            &cx_for_goal,
+                            &sessions_for_goal,
+                            &session_id_for_goal,
+                            &fallback_cwd_for_goal,
+                            llm_for_goal,
+                            &goal_spec,
+                            structured_output_request_for_goal.as_ref(),
+                            default_idle_timeout_secs,
+                            max_turns,
+                            cancel.clone(),
+                        ))
+                        .catch_unwind()
+                        .await;
+
+                        let cumulative_usage = match goal_result {
+                            Ok(usage) => usage,
+                            Err(panic) => {
+                                tracing::error!(
+                                    session_id = %session_id_for_goal,
+                                    "goal dispatcher panicked: {:?}",
+                                    panic
+                                );
+                                send_message(
+                                    &cx_for_goal,
+                                    &session_id_for_goal,
+                                    "Error: goal dispatcher panicked. See server logs.\n",
+                                );
+                                crate::llm_client::TokenUsage::default()
+                            }
+                        };
+
+                        sessions_for_goal.finish_prompt(&session_id_for_goal).await;
+                        let acp_usage = AcpUsage::new(
+                            cumulative_usage.total_tokens(),
+                            cumulative_usage.input_tokens,
+                            cumulative_usage.output_tokens,
+                        )
+                        .thought_tokens(cumulative_usage.thought_tokens)
+                        .cached_read_tokens(cumulative_usage.cached_read_tokens)
+                        .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                        let response = prompt_end_turn_response()
+                            .usage(Some(acp_usage))
+                            .meta(prompt_response_meta(
+                                None,
+                                Some(&orchestration_model_for_response),
+                            ));
+                        if let Err(e) = responder.respond(response) {
+                            tracing::warn!(
+                                session_id = %session_id_for_goal,
                                 "failed to deliver PromptResponse: {e}"
                             );
                         }
@@ -2458,6 +2567,268 @@ async fn run_loop_iteration(
         structured_output_result,
         cumulative_usage,
     })
+}
+
+/// Outcome of a single autonomous goal turn: the assistant's final text
+/// (scanned for the completion/blocked sentinel) plus the cumulative
+/// session usage after the turn was accounted.
+struct GoalTurnOutcome {
+    response: String,
+    cumulative_usage: crate::llm_client::TokenUsage,
+}
+
+/// Run one model turn for an active goal: inject `prompt_text` as the
+/// turn's user message, run the tool loop to completion, persist the
+/// turn, then re-read the persisted assistant text so the caller can
+/// look for the completion sentinel.
+///
+/// This is a trimmed cousin of [`run_loop_iteration`]: there is no
+/// slash-command dispatch (the goal prompt is always plain continuation
+/// text) and it returns the assistant text instead of a
+/// structured-output result, since the goal stop condition is the
+/// sentinel rather than schema validation.
+#[allow(clippy::too_many_arguments)]
+async fn run_goal_turn(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+    llm: Arc<dyn crate::llm_client::LlmBackend>,
+    structured_output_request: Option<&StructuredOutputRequest>,
+    prompt_text: &str,
+    default_idle_timeout_secs: u64,
+    max_turns: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<GoalTurnOutcome, LoopIterationError> {
+    let mut snap = sessions
+        .snapshot(session_id, fallback_cwd)
+        .await
+        .ok_or_else(|| LoopIterationError::Terminal("unknown session".to_string()))?;
+
+    if snap.model.is_empty() {
+        return Err(LoopIterationError::Terminal(
+            "model not configured".to_string(),
+        ));
+    }
+
+    let prompt_parts = vec![ChatContentPart::text(prompt_text.to_string())];
+    let available_models = sessions.available_model_metadata().await;
+    let context_length = available_models
+        .iter()
+        .find(|m| m.id == snap.model)
+        .and_then(|m| m.context_length);
+    let compression_idle_timeout = Duration::from_secs(
+        snap.idle_timeout_secs
+            .unwrap_or(default_idle_timeout_secs)
+            .max(1),
+    );
+    let messages = build_prompt_messages_with_compression(
+        &mut snap,
+        prompt_text,
+        &prompt_parts,
+        llm.as_ref(),
+        sessions,
+        session_id,
+        cancel.clone(),
+        compression_idle_timeout,
+        context_length,
+    )
+    .await;
+
+    let Some(registry) = sessions
+        .get_or_create_registry(session_id, snap.cwd.clone())
+        .await
+    else {
+        return Err(LoopIterationError::Terminal("unknown session".to_string()));
+    };
+    let idle_timeout = Duration::from_secs(
+        snap.idle_timeout_secs
+            .unwrap_or(default_idle_timeout_secs)
+            .max(1),
+    );
+
+    let (_structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
+        cx,
+        sessions,
+        session_id,
+        fallback_cwd,
+        &llm,
+        &registry,
+        &snap.model,
+        snap.reasoning_effort.as_deref(),
+        structured_output_request,
+        messages,
+        max_turns,
+        idle_timeout,
+        cancel,
+        prompt_text.to_string(),
+    )
+    .await;
+
+    // `run_model_turn_in_spawn` persists the turn via `add_turn` before it
+    // returns, so a fresh snapshot's last turn is the one we just ran. We
+    // read its assistant text rather than threading a new return value
+    // through the shared turn runner used by the normal prompt path.
+    let response = sessions
+        .snapshot(session_id, fallback_cwd)
+        .await
+        .and_then(|s| s.history.last().map(|t| t.agent_response.clone()))
+        .unwrap_or_default();
+
+    Ok(GoalTurnOutcome {
+        response,
+        cumulative_usage,
+    })
+}
+
+/// Drive a goal to completion across multiple autonomous turns.
+///
+/// Each iteration injects a continuation prompt (objective + completion
+/// audit + sentinel protocol), runs a model turn, then inspects the
+/// assistant's final text:
+/// - [`GoalSignal::Complete`] → the objective is verifiably met; stop.
+/// - [`GoalSignal::Blocked`] → count it; stop only once the same kind of
+///   blocker has been reported for [`GOAL_BLOCKED_THRESHOLD`] consecutive
+///   turns (mirrors Codex's "don't surrender on the first blocker" rule).
+/// - [`GoalSignal::Continue`] → keep going.
+///
+/// The `max_turns` budget on the [`GoalSpec`] is the hard safety cap that
+/// guarantees termination even if the model never signals; the final
+/// allowed turn uses a wrap-up framing so the agent leaves clean state.
+/// Returns the cumulative session usage for the `PromptResponse`.
+#[allow(clippy::too_many_arguments)]
+async fn run_goal_loop(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+    llm: Arc<dyn crate::llm_client::LlmBackend>,
+    spec: &GoalSpec,
+    structured_output_request: Option<&StructuredOutputRequest>,
+    default_idle_timeout_secs: u64,
+    max_turns: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> crate::llm_client::TokenUsage {
+    send_message(
+        cx,
+        session_id,
+        &format!(
+            "Starting `/goal` (up to {} turns). I'll keep working across turns until the \
+             objective is verifiably met, I'm blocked, or the turn budget is spent. \
+             Cancel the session to stop early.\n\nObjective:\n{}\n",
+            spec.max_turns,
+            spec.objective.trim()
+        ),
+    );
+
+    let mut cumulative = crate::llm_client::TokenUsage::default();
+    let mut consecutive_blocked = 0u32;
+    let mut turn = 0u32;
+
+    loop {
+        if cancel.is_cancelled() {
+            send_message(cx, session_id, "Goal cancelled.\n");
+            break;
+        }
+
+        turn += 1;
+        let final_turn = turn >= spec.max_turns;
+        let phase = if final_turn {
+            GoalPhase::FinalWrapUp
+        } else {
+            GoalPhase::Continue
+        };
+        let prompt = build_goal_prompt(&spec.objective, turn, spec.max_turns, phase);
+
+        send_thought(
+            cx,
+            session_id,
+            &format!("\n[goal turn {}/{}]\n", turn, spec.max_turns),
+        );
+
+        match run_goal_turn(
+            cx,
+            sessions,
+            session_id,
+            fallback_cwd,
+            llm.clone(),
+            structured_output_request,
+            &prompt,
+            default_idle_timeout_secs,
+            max_turns,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                cumulative = outcome.cumulative_usage;
+                match detect_goal_signal(&outcome.response) {
+                    GoalSignal::Complete => {
+                        send_message(
+                            cx,
+                            session_id,
+                            &format!(
+                                "\n✅ Goal achieved in {turn} turn(s): the agent reported the \
+                                 objective verifiably complete.\n"
+                            ),
+                        );
+                        break;
+                    }
+                    GoalSignal::Blocked(reason) => {
+                        consecutive_blocked += 1;
+                        if consecutive_blocked >= GOAL_BLOCKED_THRESHOLD {
+                            send_message(
+                                cx,
+                                session_id,
+                                &format!(
+                                    "\n⛔ Goal blocked after {turn} turn(s) \
+                                     ({consecutive_blocked} consecutive blocked reports). \
+                                     Stopping for user input.\nReason: {reason}\n"
+                                ),
+                            );
+                            break;
+                        }
+                        send_thought(
+                            cx,
+                            session_id,
+                            &format!(
+                                "[goal: blocked report {consecutive_blocked}/{GOAL_BLOCKED_THRESHOLD}; \
+                                 retrying]\n"
+                            ),
+                        );
+                    }
+                    GoalSignal::Continue => {
+                        consecutive_blocked = 0;
+                    }
+                }
+            }
+            Err(LoopIterationError::Terminal(err)) => {
+                send_message(cx, session_id, &format!("\nGoal stopped: {err}\n"));
+                break;
+            }
+        }
+
+        if final_turn {
+            send_message(
+                cx,
+                session_id,
+                &format!(
+                    "\n🛑 Goal stopped: reached the {}-turn budget without a completion signal. \
+                     Review the progress above and re-run `/goal` (optionally with \
+                     `--max-turns`) to keep going.\n",
+                    spec.max_turns
+                ),
+            );
+            break;
+        }
+
+        if cancel.is_cancelled() {
+            send_message(cx, session_id, "Goal cancelled.\n");
+            break;
+        }
+    }
+
+    cumulative
 }
 
 /// Build the `Vec<ChatMessage>` to send to the LLM for a fresh prompt.
@@ -4910,6 +5281,213 @@ fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
         interval_secs,
         target: target.to_string(),
     })
+}
+
+/// Default number of autonomous turns a `/goal` will run before forcing a
+/// wrap-up. This is the safety analog of Codex's token budget: it
+/// guarantees the loop terminates even if the model never signals.
+const GOAL_DEFAULT_MAX_TURNS: u32 = 25;
+const GOAL_MIN_MAX_TURNS: u32 = 1;
+const GOAL_MAX_MAX_TURNS: u32 = 200;
+
+/// Sentinel the model emits, alone on the final line, once it has verified
+/// the objective is complete. Detected by [`detect_goal_signal`].
+const GOAL_COMPLETE_SENTINEL: &str = "GOAL_COMPLETE";
+/// Sentinel prefix the model emits when genuinely at an impasse.
+const GOAL_BLOCKED_SENTINEL: &str = "GOAL_BLOCKED";
+/// How many consecutive blocked reports are required before the loop stops
+/// and hands back to the user. Mirrors Codex's three-turn blocked rule so
+/// the agent doesn't surrender on a transient blocker.
+const GOAL_BLOCKED_THRESHOLD: u32 = 3;
+
+/// A parsed `/goal` invocation.
+struct GoalSpec {
+    objective: String,
+    max_turns: u32,
+}
+
+/// Which framing the continuation prompt uses for a given turn.
+#[derive(Clone, Copy)]
+enum GoalPhase {
+    /// A normal continuation turn: make verifiable progress.
+    Continue,
+    /// The final turn of the budget: wrap up cleanly and summarize.
+    FinalWrapUp,
+}
+
+/// The stop signal (if any) parsed from a goal turn's assistant text.
+enum GoalSignal {
+    Complete,
+    Blocked(String),
+    Continue,
+}
+
+fn goal_usage() -> String {
+    format!(
+        "Usage: `/goal [--max-turns N] <objective>`\n\
+         Example: `/goal make `cargo test` pass`\n\
+         Example: `/goal --max-turns 40 migrate the config loader to serde`\n\n\
+         Anvil works autonomously across turns until the objective is verifiably met, \
+         it is blocked, or the turn budget (default {GOAL_DEFAULT_MAX_TURNS}, max \
+         {GOAL_MAX_MAX_TURNS}) is exhausted. Cancel the session to stop early."
+    )
+}
+
+/// Parse `/goal [--max-turns N] <objective>`.
+///
+/// `--max-turns` (also `--max-turns=N`) is optional and, when present, must
+/// lead. The remainder is the free-text objective. An empty objective or an
+/// out-of-range turn budget is a user error returned as a usage string.
+fn parse_goal_command(prompt_text: &str) -> Result<GoalSpec, String> {
+    let args = slash_command_args(prompt_text);
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err(goal_usage());
+    }
+
+    let mut max_turns = GOAL_DEFAULT_MAX_TURNS;
+    let mut rest = trimmed;
+    loop {
+        let head = rest.trim_start();
+        let Some(after) = head.strip_prefix("--max-turns") else {
+            break;
+        };
+        // Only treat this as the flag when `--max-turns` is a whole token
+        // (followed by `=`, whitespace, or end) -- otherwise it's the start
+        // of the objective and we leave it alone.
+        if !(after.is_empty() || after.starts_with('=') || after.starts_with(char::is_whitespace)) {
+            break;
+        }
+        let after = after.trim_start_matches('=').trim_start();
+        let mut parts = after.splitn(2, char::is_whitespace);
+        let raw = parts.next().unwrap_or("");
+        let remainder = parts.next().unwrap_or("");
+        let n = raw.parse::<u32>().map_err(|_| {
+            format!(
+                "Invalid `--max-turns` value `{raw}`. Pick an integer between \
+                 {GOAL_MIN_MAX_TURNS} and {GOAL_MAX_MAX_TURNS}."
+            )
+        })?;
+        if !(GOAL_MIN_MAX_TURNS..=GOAL_MAX_MAX_TURNS).contains(&n) {
+            return Err(format!(
+                "`--max-turns` {n} is out of range. Pick a value between \
+                 {GOAL_MIN_MAX_TURNS} and {GOAL_MAX_MAX_TURNS}."
+            ));
+        }
+        max_turns = n;
+        rest = remainder;
+    }
+
+    let objective = rest.trim().to_string();
+    if objective.is_empty() {
+        return Err(goal_usage());
+    }
+
+    Ok(GoalSpec {
+        objective,
+        max_turns,
+    })
+}
+
+/// Strip surrounding markdown emphasis, quoting, and trailing punctuation
+/// from a single line so a sentinel the model lightly decorated (e.g.
+/// `` `GOAL_COMPLETE` `` or `**GOAL_COMPLETE.**`) still matches.
+fn normalize_sentinel_line(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '*' | '_' | '#' | '"' | '\'' | '.' | '!' | ':' | ' '
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+/// Inspect a goal turn's assistant text for a stop signal.
+///
+/// A standalone line equal to [`GOAL_COMPLETE_SENTINEL`] wins outright. A
+/// standalone line starting with [`GOAL_BLOCKED_SENTINEL`] reports a
+/// blocker (the trailing text, if any, is the reason). Anything else means
+/// keep going. Only whole-line matches count, so the agent can discuss the
+/// sentinels in prose without accidentally tripping a stop.
+fn detect_goal_signal(response: &str) -> GoalSignal {
+    let mut blocked: Option<String> = None;
+    for raw in response.lines() {
+        let line = normalize_sentinel_line(raw);
+        if line == GOAL_COMPLETE_SENTINEL {
+            return GoalSignal::Complete;
+        }
+        if let Some(reason) = line.strip_prefix(GOAL_BLOCKED_SENTINEL) {
+            let reason = reason.trim_start_matches([':', '-', ' ']).trim();
+            blocked = Some(reason.to_string());
+        }
+    }
+    match blocked {
+        Some(reason) => GoalSignal::Blocked(reason),
+        None => GoalSignal::Continue,
+    }
+}
+
+/// Build the continuation prompt injected as the user message for one goal
+/// turn. Adapts Codex's `continuation.md` (objective framing + completion
+/// audit + blocked discipline) to Anvil's sentinel-based stop signal.
+fn build_goal_prompt(objective: &str, turn: u32, max_turns: u32, phase: GoalPhase) -> String {
+    let header =
+        format!("You are operating in autonomous goal mode (turn {turn} of at most {max_turns}).");
+    let objective_block = format!("<objective>\n{}\n</objective>", objective.trim());
+
+    let completion_protocol = format!(
+        "Completion protocol:\n\
+         - Treat completion as unproven. Before claiming success, derive concrete \
+         requirements from the objective and verify each against the ACTUAL current state \
+         of the worktree and any commands/tests it implies -- inspect file contents, command \
+         output, and test results rather than relying on intent, memory, or a plausible answer.\n\
+         - Keep the full objective intact; do not redefine success around a smaller or easier \
+         task just to finish.\n\
+         - Only when every requirement is satisfied and verified, end your message with a line \
+         containing exactly:\n\
+         {GOAL_COMPLETE_SENTINEL}\n\
+         Put it alone on the final line, with no surrounding text, quotes, or formatting. \
+         Emitting it is a claim that the full objective is done and can withstand \
+         requirement-by-requirement scrutiny. If any requirement is missing, weak, indirect, \
+         or unverified, do NOT emit it -- keep working."
+    );
+
+    let blocked_protocol = format!(
+        "If you are genuinely at an impasse and cannot make progress without user input or an \
+         external change, end your message with a line:\n\
+         {GOAL_BLOCKED_SENTINEL}: <one-line reason>\n\
+         Use this only when truly stuck -- never because the work is merely hard, slow, or \
+         incomplete. If the same blocker persists for {GOAL_BLOCKED_THRESHOLD} consecutive \
+         turns, the goal stops and hands back to the user."
+    );
+
+    match phase {
+        GoalPhase::Continue => format!(
+            "{header}\n\n\
+             Continue working toward the objective below. This goal persists across turns, so \
+             you do not need to shrink it to what fits in one turn -- make concrete, verifiable \
+             progress toward the real end state.\n\n\
+             {objective_block}\n\n\
+             Work from evidence: treat the current worktree and command output as authoritative \
+             before relying on earlier conversation. Use your tools to actually make the changes \
+             -- do not just describe them. If the next work is meaningfully multi-step, keep a \
+             short task list.\n\n\
+             {completion_protocol}\n\n\
+             {blocked_protocol}"
+        ),
+        GoalPhase::FinalWrapUp => format!(
+            "{header}\n\n\
+             This is the FINAL turn of the goal's turn budget. Do not start new large work. \
+             Bring the current work to a safe, coherent stopping point, then summarize what was \
+             accomplished, what remains, and the clear next step for the user.\n\n\
+             {objective_block}\n\n\
+             If -- and only if -- the objective is actually complete and verified, end with a \
+             line containing exactly {GOAL_COMPLETE_SENTINEL}. Otherwise do not emit it; just \
+             summarize."
+        ),
+    }
 }
 
 /// Parse the optional title from `/pr-create [title]`. Whitespace-only
