@@ -16,6 +16,7 @@ mod codex_client;
 mod codex_credits;
 mod context_manager;
 mod discovery;
+mod goal;
 mod http_retry;
 mod llm_client;
 mod mcp;

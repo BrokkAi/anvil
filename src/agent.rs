@@ -542,6 +542,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "usage",
             "Show session token totals, USD cost, and OpenRouter credit balance",
         ),
+        AvailableCommand::new("goal", "Get, create, update, or clear the session goal"),
     ]
 }
 
@@ -559,6 +560,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
         "mcp",
         "pr-create",
         "usage",
+        "goal",
     ]
     .into_iter()
     .collect()
@@ -1330,6 +1332,12 @@ pub async fn run_agent(
                     return responder.respond(prompt_end_turn_response());
                 }
 
+                if is_slash_command(&raw_prompt_text, "goal") {
+                    let report = handle_goal(&sessions_prompt, &session_id, &raw_prompt_text).await;
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(prompt_end_turn_response());
+                }
+
                 let loop_spec = if is_slash_command(&raw_prompt_text, "loop") {
                     match parse_loop_command(&raw_prompt_text) {
                         Ok(spec) => Some(spec),
@@ -1831,6 +1839,10 @@ pub async fn run_agent(
                 let session_id_for_loop = session_id.clone();
                 let fallback_cwd_for_loop = fallback_cwd.clone();
                 let prompt_text_for_turn = prompt_text;
+                let count_goal_usage_for_loop = snap
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status != crate::goal::GoalStatus::Paused);
                 let model_for_loop = snap.model;
                 let orchestration_model_for_response =
                     llm_for_loop.resolve_model_info(&model_for_loop);
@@ -1860,6 +1872,7 @@ pub async fn run_agent(
                         idle_timeout_for_loop,
                         cancel,
                         prompt_text_for_turn,
+                        count_goal_usage_for_loop,
                     )
                     .await;
 
@@ -2284,6 +2297,15 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
+    if is_slash_command(target, "goal") {
+        send_message(
+            cx,
+            session_id,
+            &handle_goal(sessions, session_id, target).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
     if is_slash_command(target, "setup") {
         let setup_ctx = SetupContext {
             cx,
@@ -2436,6 +2458,10 @@ async fn run_loop_iteration(
             .unwrap_or(default_idle_timeout_secs)
             .max(1),
     );
+    let count_goal_usage_this_turn = snap
+        .goal
+        .as_ref()
+        .is_some_and(|goal| goal.status != crate::goal::GoalStatus::Paused);
 
     let (structured_output_result, cumulative_usage) = run_model_turn_in_spawn(
         cx,
@@ -2452,6 +2478,7 @@ async fn run_loop_iteration(
         idle_timeout,
         cancel,
         prompt_text,
+        count_goal_usage_this_turn,
     )
     .await;
     Ok(LoopIterationOutcome {
@@ -2505,6 +2532,9 @@ fn build_prompt_messages_with_parts(
     // empty `<available_skills/>` block would just confuse the model.
     if let Some(catalog) = build_skills_catalog(&snap.skills) {
         messages.push(ChatMessage::user(catalog));
+    }
+    if let Some(goal) = snap.goal.as_ref() {
+        messages.push(ChatMessage::user(crate::goal::render_goal_context(goal)));
     }
     for turn in &snap.history {
         // Per-turn summarization (mirrors Brokk's `TaskEntry.summary`):
@@ -2701,6 +2731,7 @@ async fn run_model_turn_in_spawn(
     idle_timeout: Duration,
     cancel: tokio_util::sync::CancellationToken,
     prompt_text_for_turn: String,
+    count_goal_usage_this_turn: bool,
 ) -> (
     Option<StructuredOutputResult>,
     crate::llm_client::TokenUsage,
@@ -2768,6 +2799,9 @@ async fn run_model_turn_in_spawn(
         .record_usage(session_id, turn_usage, cost_delta_usd)
         .await
         .unwrap_or(turn_usage);
+    sessions
+        .record_goal_usage(session_id, turn_usage, count_goal_usage_this_turn)
+        .await;
     let structured_output_result =
         structured_output_request.map(|request| validate_response(request, &response_text));
 
@@ -4392,6 +4426,96 @@ fn render_openrouter_setup_help() -> String {
     )
 }
 
+async fn handle_goal(sessions: &SessionStore, session_id: &str, prompt_text: &str) -> String {
+    let rest = slash_command_args(prompt_text);
+    if rest.is_empty() || matches!(rest.as_str(), "show" | "status" | "get") {
+        return match sessions.current_goal(session_id).await {
+            Some(goal) => crate::goal::render_goal_report(goal.as_ref()),
+            None => "Unknown session.".to_string(),
+        };
+    }
+
+    let (action, arg) = split_setup_action(&rest);
+    match action.to_ascii_lowercase().as_str() {
+        "create" | "set" | "start" => {
+            let (token_budget, objective) = parse_goal_create_args(arg);
+            if objective.trim().is_empty() {
+                return goal_usage();
+            }
+            match sessions
+                .create_goal(session_id, objective.to_string(), token_budget)
+                .await
+            {
+                Ok(goal) => format!(
+                    "Goal created.\n\n{}",
+                    crate::goal::render_goal_report(Some(&goal))
+                ),
+                Err(error) => format!("Could not create goal: {error}"),
+            }
+        }
+        "pause" => {
+            set_goal_status_report(sessions, session_id, crate::goal::GoalStatus::Paused).await
+        }
+        "resume" | "active" => {
+            set_goal_status_report(sessions, session_id, crate::goal::GoalStatus::Active).await
+        }
+        "complete" | "done" => {
+            set_goal_status_report(sessions, session_id, crate::goal::GoalStatus::Complete).await
+        }
+        "blocked" | "block" => {
+            set_goal_status_report(sessions, session_id, crate::goal::GoalStatus::Blocked).await
+        }
+        "clear" | "reset" | "delete" => match sessions.clear_goal(session_id).await {
+            Ok(true) => "Goal cleared.".to_string(),
+            Ok(false) => "No goal was set.".to_string(),
+            Err(error) => format!("Could not clear goal: {error}"),
+        },
+        _ => goal_usage(),
+    }
+}
+
+fn parse_goal_create_args(input: &str) -> (Option<i64>, &str) {
+    let trimmed = input.trim();
+    let Some(after_budget) = trimmed.strip_prefix("budget ") else {
+        return (None, trimmed);
+    };
+    let mut parts = after_budget.splitn(2, char::is_whitespace);
+    let raw_budget = parts.next().unwrap_or_default();
+    let objective = parts.next().unwrap_or_default().trim();
+    match raw_budget.parse::<i64>() {
+        Ok(budget) => (Some(budget), objective),
+        Err(_) => (None, trimmed),
+    }
+}
+
+async fn set_goal_status_report(
+    sessions: &SessionStore,
+    session_id: &str,
+    status: crate::goal::GoalStatus,
+) -> String {
+    match sessions.set_goal_status(session_id, status).await {
+        Ok(goal) => format!(
+            "Goal status set to `{}`.\n\n{}",
+            status.as_str(),
+            crate::goal::render_goal_report(Some(&goal))
+        ),
+        Err(error) => format!("Could not update goal: {error}"),
+    }
+}
+
+fn goal_usage() -> String {
+    "Goal commands\n\n\
+     - `/goal` - Show the current goal.\n\
+     - `/goal create <objective>` - Create a new goal.\n\
+     - `/goal create budget <tokens> <objective>` - Create a goal with a token budget.\n\
+     - `/goal pause` - Pause the current goal.\n\
+     - `/goal resume` - Resume the current goal.\n\
+     - `/goal complete` - Mark the current goal complete.\n\
+     - `/goal blocked` - Mark the current goal blocked.\n\
+     - `/goal clear` - Clear the current goal."
+        .to_string()
+}
+
 async fn handle_permissions(
     sessions: &SessionStore,
     session_id: &str,
@@ -4868,6 +4992,7 @@ fn loop_target_runs_without_model(target: &str) -> bool {
         || is_slash_command(target, "mcp")
         || is_slash_command(target, "pr-create")
         || is_slash_command(target, "usage")
+        || is_slash_command(target, "goal")
 }
 
 fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
@@ -5897,6 +6022,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builtin_commands_include_goal() {
+        let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "goal"),
+            "builtin_commands() missing goal; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            builtin_command_names().contains("goal"),
+            "builtin_command_names() missing goal"
+        );
+        assert!(
+            loop_target_runs_without_model("/goal"),
+            "/goal must be runnable in a /loop without a configured model"
+        );
+    }
+
+    #[test]
+    fn is_slash_command_matches_goal_variants() {
+        assert!(is_slash_command("/goal", "goal"));
+        assert!(is_slash_command("  /goal  ", "goal"));
+        assert!(is_slash_command("/goal create ship it", "goal"));
+        assert!(is_slash_command("/GOAL", "goal"));
+        assert!(!is_slash_command("/goalpost", "goal"));
+    }
+
     /// `/compress` parses via the same slash-command dispatcher used
     /// by `/context` and `/setup`, including case-insensitive and
     /// args-tolerant forms.
@@ -5981,6 +6133,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let plan = plan_compress(&snap);
@@ -6007,6 +6160,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         assert!(plan_compress(&snap).uncompressed.is_empty());
@@ -6297,6 +6451,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let catalog = vec![ModelMetadata {
@@ -6333,6 +6488,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let report = render_context_report(&snap, PermissionMode::Default, &[]);
@@ -6353,6 +6509,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         }
     }
@@ -6628,6 +6785,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let catalog = vec![ModelMetadata {
@@ -6661,6 +6819,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let catalog = vec![ModelMetadata {
@@ -6693,6 +6852,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let catalog = vec![ModelMetadata {
@@ -6728,6 +6888,7 @@ mod tests {
             mode: None,
             model: None,
             brokk_mcp_servers: None,
+            brokk_goal: None,
         };
         let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
 
@@ -6755,6 +6916,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "follow up");
@@ -6804,6 +6966,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "now fix them");
@@ -6854,6 +7017,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "hi");
@@ -6874,6 +7038,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
 
@@ -6894,6 +7059,39 @@ mod tests {
         assert!(project_context.contains("<INSTRUCTIONS>\nUse the local style.\n</INSTRUCTIONS>"));
         assert_eq!(msgs[2].role, "user");
         assert_eq!(msgs[2].text_content(), Some("hi"));
+    }
+
+    #[test]
+    fn build_prompt_messages_injects_goal_context() {
+        use crate::session::SessionSnapshot;
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            goal: Some(crate::goal::Goal {
+                objective: "ship /goal support".into(),
+                status: crate::goal::GoalStatus::Active,
+                token_budget: Some(123),
+                tokens_used: 23,
+                created_at: 1,
+                updated_at: 2,
+            }),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        let msgs = build_prompt_messages(&snap, "continue");
+
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].role, "user");
+        let goal_context = msgs[1].text_content().expect("goal context");
+        assert!(goal_context.contains("<goal>"));
+        assert!(goal_context.contains("<objective>ship /goal support</objective>"));
+        assert!(goal_context.contains("<remaining_tokens>100</remaining_tokens>"));
+        assert_eq!(msgs[2].text_content(), Some("continue"));
     }
 
     /// A turn that ended without final assistant text (e.g. tool_loop hit
@@ -6927,6 +7125,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "next");
@@ -6990,6 +7189,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: make_registry(vec![
                 ("hello-world", "Greet the user with a single short line."),
                 ("pdf-processing", "Extract text from PDFs."),
@@ -7021,6 +7221,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "hi");
@@ -7054,6 +7255,7 @@ mod tests {
                 "mcp",
                 "pr-create",
                 "usage",
+                "goal",
                 "apple",
                 "zebra"
             ]
@@ -7735,6 +7937,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "next");
@@ -7781,6 +7984,7 @@ mod tests {
             reasoning_effort: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
+            goal: None,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
         };
         let msgs = build_prompt_messages(&snap, "next");

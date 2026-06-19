@@ -2167,6 +2167,45 @@ async fn execute_step_tool_calls(
             continue;
         }
 
+        if is_goal_tool(&tool_name) {
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+            );
+            let exec = execute_goal_tool(sessions, session_id, &tool_name, &parsed_input).await;
+            let update = if exec.failed {
+                announce::update_failed_with_input(
+                    &call.id,
+                    &tool_name,
+                    &parsed_input,
+                    &exec.output,
+                    Some(Value::String(exec.output.clone())),
+                )
+            } else {
+                announce::update_completed(&call.id, &tool_name, &parsed_input, &exec.output, None)
+            };
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(update),
+            );
+            messages.push(ChatMessage::tool_result(&call.id, &tool_name, &exec.output));
+            step_results.push(p2t::PrefixToolResult {
+                call_id: call.id.clone(),
+                content: exec.output.clone(),
+            });
+            tool_exchanges.push(ToolExchange {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: call.function.arguments.clone(),
+                result: exec.output,
+            });
+            continue;
+        }
+
         let consume_shell_sandbox_retry_state = shell_sandbox_escalation_requested(&parsed_input)
             .then(|| {
                 shell_sandbox_retry_state_index(
@@ -3249,6 +3288,87 @@ struct ToolExecRequest<'a> {
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
     cancel: &'a CancellationToken,
+}
+
+fn is_goal_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        crate::goal::GET_GOAL_TOOL_NAME
+            | crate::goal::CREATE_GOAL_TOOL_NAME
+            | crate::goal::UPDATE_GOAL_TOOL_NAME
+    )
+}
+
+async fn execute_goal_tool(
+    sessions: &SessionStore,
+    session_id: &str,
+    tool_name: &str,
+    args: &Value,
+) -> ToolExecution {
+    let result = match tool_name {
+        crate::goal::GET_GOAL_TOOL_NAME => match sessions.current_goal(session_id).await {
+            Some(goal) => Ok(crate::goal::GoalToolResponse::new(goal, false)),
+            None => Err("unknown session".to_string()),
+        },
+        crate::goal::CREATE_GOAL_TOOL_NAME => {
+            let objective = args
+                .get("objective")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "create_goal requires a string `objective`".to_string());
+            let token_budget = args.get("token_budget").map(|value| {
+                value
+                    .as_i64()
+                    .ok_or_else(|| "create_goal `token_budget` must be an integer".to_string())
+            });
+            match (objective, token_budget.transpose()) {
+                (Ok(objective), Ok(token_budget)) => sessions
+                    .create_goal(session_id, objective.to_string(), token_budget)
+                    .await
+                    .map(|goal| crate::goal::GoalToolResponse::new(Some(goal), false)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        crate::goal::UPDATE_GOAL_TOOL_NAME => {
+            let status = args
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "update_goal requires a string `status`".to_string())
+                .and_then(|status| match status {
+                    "complete" => Ok(crate::goal::GoalStatus::Complete),
+                    "blocked" => Ok(crate::goal::GoalStatus::Blocked),
+                    _ => {
+                        Err("update_goal status must be either `complete` or `blocked`".to_string())
+                    }
+                });
+            match status {
+                Ok(status) => sessions
+                    .set_goal_status(session_id, status)
+                    .await
+                    .map(|goal| {
+                        crate::goal::GoalToolResponse::new(
+                            Some(goal),
+                            status == crate::goal::GoalStatus::Complete,
+                        )
+                    }),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Err(format!("unknown goal tool `{tool_name}`")),
+    };
+
+    match result {
+        Ok(response) => ToolExecution {
+            output: serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|err| format!("Error: failed to serialize goal response: {err}")),
+            failed: false,
+            sandbox_retry_available: false,
+        },
+        Err(error) => ToolExecution {
+            output: format!("Error: {error}"),
+            failed: true,
+            sandbox_retry_available: false,
+        },
+    }
 }
 
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {

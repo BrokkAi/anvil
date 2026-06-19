@@ -77,6 +77,21 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Execute,
         display_name: "Running shell command",
     },
+    ToolMeta {
+        name: crate::goal::GET_GOAL_TOOL_NAME,
+        kind: ToolKind::Read,
+        display_name: "Getting goal",
+    },
+    ToolMeta {
+        name: crate::goal::CREATE_GOAL_TOOL_NAME,
+        kind: ToolKind::Read,
+        display_name: "Creating goal",
+    },
+    ToolMeta {
+        name: crate::goal::UPDATE_GOAL_TOOL_NAME,
+        kind: ToolKind::Read,
+        display_name: "Updating goal",
+    },
     // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
     // Listed here so the permission gate can classify them; their actual
     // execution is delegated to the configured MCP server. The cross-check
@@ -640,6 +655,48 @@ impl ToolRegistry {
                 }),
             ));
         }
+        defs.push(tool_def(
+            crate::goal::GET_GOAL_TOOL_NAME,
+            "Get the current goal for this session, including status, token budget, used tokens, and remaining token budget.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ));
+        defs.push(tool_def(
+            crate::goal::CREATE_GOAL_TOOL_NAME,
+            "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "Required. The concrete objective to start pursuing."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Positive token budget for the new goal. Omit unless explicitly requested."
+                    }
+                },
+                "required": ["objective"]
+            }),
+        ));
+        defs.push(tool_def(
+            crate::goal::UPDATE_GOAL_TOOL_NAME,
+            "Update the existing goal. Use this tool only to mark the goal achieved or genuinely blocked. Set status to complete only when the objective has actually been achieved and no required work remains. Set status to blocked only when the same blocking condition has repeated for at least three consecutive goal turns and the agent is at an impasse. You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["complete", "blocked"],
+                        "description": "Required. Set to complete only when done; set to blocked only after a genuine repeated blocking condition."
+                    }
+                },
+                "required": ["status"]
+            }),
+        ));
         let mut advertised_names: HashSet<String> =
             defs.iter().map(|def| def.function.name.clone()).collect();
         for client in &self.mcp_clients {

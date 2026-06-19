@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::goal::{Goal, GoalStatus};
 use crate::llm_client::ModelMetadata;
 use crate::mcp::{McpEnvVar, McpFraming, McpServerConfig};
 use crate::structured_output::StructuredOutputResult;
@@ -495,6 +496,9 @@ pub struct SessionManifest {
         rename = "brokkMcpServers"
     )]
     pub brokk_mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Brokk ACP-specific: persisted session goal state.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "brokkGoal")]
+    pub brokk_goal: Option<Goal>,
 }
 
 impl SessionManifest {
@@ -565,6 +569,10 @@ pub struct Session {
     /// Set via `/idle-timeout <secs>`, cleared via `/idle-timeout default`.
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
+    /// Session-scoped goal state. This mirrors Codex's thread goal concept
+    /// at Anvil's current abstraction level: tools and slash commands can
+    /// create/update/read it, and prompt construction injects it as context.
+    pub goal: Option<Goal>,
     /// Additional per-session MCP servers supplied by ACP `session/new`.
     /// These are additive to Anvil's canonical Bifrost setup from the
     /// install-level `/mcp` configuration or the built-in default.
@@ -672,6 +680,7 @@ impl Session {
                 Some(model.clone())
             },
             brokk_mcp_servers: None,
+            brokk_goal: None,
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
@@ -690,6 +699,7 @@ impl Session {
             always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
+            goal: None,
             mcp_servers: None,
             project_instructions,
             skills,
@@ -744,6 +754,7 @@ impl Session {
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
         let mcp_servers = manifest.brokk_mcp_servers.clone();
+        let goal = manifest.brokk_goal.clone();
         Ok(Self {
             id,
             cwd,
@@ -764,6 +775,7 @@ impl Session {
             selected_reasoning_effort: None,
             // Same rationale: idle timeout override is in-memory only.
             idle_timeout_secs: None,
+            goal,
             mcp_servers,
             project_instructions,
             skills,
@@ -831,6 +843,10 @@ pub struct SessionSnapshot {
     /// AGENTS.md / CLAUDE.md content discovered for this session,
     /// concatenated general -> specific. Empty when nothing is found.
     pub project_instructions: String,
+    /// Active/persisted goal for this session, when one exists.
+    /// Stored in memory only for now; the conversation zip remains
+    /// backward-compatible with clients that do not know about goals.
+    pub goal: Option<Goal>,
     /// Agent Skills (`SKILL.md`) discovered for this session. Wrapped
     /// in `Arc` so cloning the snapshot doesn't copy the registry.
     pub skills: Arc<crate::skills::SkillRegistry>,
@@ -2718,7 +2734,7 @@ impl SessionStore {
         // Holding both at once is unnecessary and would invite a lock
         // ordering hazard with set_model (which writes sessions then
         // reads available_models on auto-fallback).
-        let (snap_base, selected_effort, idle_timeout_secs, project_instructions, skills) = {
+        let (snap_base, selected_effort, idle_timeout_secs, project_instructions, goal, skills) = {
             let sessions = self.sessions.read().await;
             let s = sessions.get(id)?;
             (
@@ -2726,6 +2742,7 @@ impl SessionStore {
                 s.selected_reasoning_effort.clone(),
                 s.idle_timeout_secs,
                 s.project_instructions.clone(),
+                s.goal.clone(),
                 s.skills.clone(),
             )
         };
@@ -2756,6 +2773,7 @@ impl SessionStore {
             reasoning_effort,
             idle_timeout_secs,
             project_instructions,
+            goal,
             skills,
         })
     }
@@ -3467,6 +3485,183 @@ impl SessionStore {
         }
     }
 
+    pub async fn current_goal(&self, id: &str) -> Option<Option<Goal>> {
+        let sessions = self.sessions.read().await;
+        sessions.get(id).map(|session| session.goal.clone())
+    }
+
+    async fn persist_manifest_snapshot(
+        zip_path: PathBuf,
+        manifest: SessionManifest,
+    ) -> anyhow::Result<()> {
+        match tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
+            .await
+        {
+            Ok(result) => result,
+            Err(join_err) => Err(anyhow::anyhow!(
+                "session persistence task panicked: {join_err}"
+            )),
+        }
+    }
+
+    pub async fn create_goal(
+        &self,
+        id: &str,
+        objective: String,
+        token_budget: Option<i64>,
+    ) -> Result<Goal, String> {
+        crate::goal::validate_objective(&objective)?;
+        crate::goal::validate_token_budget(token_budget)?;
+        let objective = objective.trim().to_string();
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| "unknown session".to_string())?;
+            if session
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.is_unfinished())
+            {
+                return Err(
+                    "cannot create a new goal because this session has an unfinished goal; complete or clear the existing goal first"
+                        .to_string(),
+                );
+            }
+            let prev_goal = session.goal.clone();
+            let prev_manifest_goal = session.manifest.brokk_goal.clone();
+            let prev_modified = session.manifest.modified;
+            let goal = Goal::new(objective, token_budget, current_timestamp_millis());
+            session.goal = Some(goal.clone());
+            session.manifest.brokk_goal = Some(goal.clone());
+            session.manifest.modified = current_timestamp_millis();
+            (
+                session_zip_path(&session.cwd, &session.id),
+                session.manifest.clone(),
+                prev_goal,
+                prev_manifest_goal,
+                prev_modified,
+                goal,
+            )
+        };
+        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, goal) = snapshot;
+        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
+            if let Some(session) = self.sessions.write().await.get_mut(id) {
+                session.goal = prev_goal;
+                session.manifest.brokk_goal = prev_manifest_goal;
+                session.manifest.modified = prev_modified;
+            }
+            return Err(format!("failed to persist goal: {error:#}"));
+        }
+        Ok(goal)
+    }
+
+    pub async fn set_goal_status(&self, id: &str, status: GoalStatus) -> Result<Goal, String> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| "unknown session".to_string())?;
+            let prev_goal = session.goal.clone();
+            let prev_manifest_goal = session.manifest.brokk_goal.clone();
+            let prev_modified = session.manifest.modified;
+            let goal = session
+                .goal
+                .as_mut()
+                .ok_or_else(|| "cannot update goal because no goal exists".to_string())?;
+            goal.status = status;
+            goal.updated_at = current_timestamp_millis();
+            let goal = goal.clone();
+            session.manifest.brokk_goal = Some(goal.clone());
+            session.manifest.modified = current_timestamp_millis();
+            (
+                session_zip_path(&session.cwd, &session.id),
+                session.manifest.clone(),
+                prev_goal,
+                prev_manifest_goal,
+                prev_modified,
+                goal,
+            )
+        };
+        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, goal) = snapshot;
+        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
+            if let Some(session) = self.sessions.write().await.get_mut(id) {
+                session.goal = prev_goal;
+                session.manifest.brokk_goal = prev_manifest_goal;
+                session.manifest.modified = prev_modified;
+            }
+            return Err(format!("failed to persist goal: {error:#}"));
+        }
+        Ok(goal)
+    }
+
+    pub async fn clear_goal(&self, id: &str) -> Result<bool, String> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| "unknown session".to_string())?;
+            let prev_goal = session.goal.clone();
+            let prev_manifest_goal = session.manifest.brokk_goal.clone();
+            let prev_modified = session.manifest.modified;
+            let cleared = session.goal.take().is_some();
+            session.manifest.brokk_goal = None;
+            session.manifest.modified = current_timestamp_millis();
+            (
+                session_zip_path(&session.cwd, &session.id),
+                session.manifest.clone(),
+                prev_goal,
+                prev_manifest_goal,
+                prev_modified,
+                cleared,
+            )
+        };
+        let (zip_path, manifest, prev_goal, prev_manifest_goal, prev_modified, cleared) = snapshot;
+        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
+            if let Some(session) = self.sessions.write().await.get_mut(id) {
+                session.goal = prev_goal;
+                session.manifest.brokk_goal = prev_manifest_goal;
+                session.manifest.modified = prev_modified;
+            }
+            return Err(format!("failed to persist goal: {error:#}"));
+        }
+        Ok(cleared)
+    }
+
+    pub async fn record_goal_usage(
+        &self,
+        id: &str,
+        delta: crate::llm_client::TokenUsage,
+        count_this_turn: bool,
+    ) {
+        if delta.is_zero() {
+            return;
+        }
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(id) else {
+                return;
+            };
+            let Some(goal) = session.goal.as_mut() else {
+                return;
+            };
+            if !(count_this_turn || goal.status == GoalStatus::Active) {
+                return;
+            }
+            goal.record_usage(delta, current_timestamp_millis());
+            session.manifest.brokk_goal = Some(goal.clone());
+            session.manifest.modified = current_timestamp_millis();
+            (session_zip_path(&session.cwd, id), session.manifest.clone())
+        };
+        let (zip_path, manifest) = snapshot;
+        if let Err(error) = Self::persist_manifest_snapshot(zip_path, manifest).await {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist goal token usage: {error:#}"
+            );
+        }
+    }
+
     pub async fn set_default_model(&self, model: String) {
         *self.default_model.write().await = model;
     }
@@ -3766,6 +3961,7 @@ mod tests {
             mode: Some("CODE".into()),
             model: Some("m".into()),
             brokk_mcp_servers: None,
+            brokk_goal: None,
         };
         let history = vec![ConversationTurn {
             user_prompt: "u".into(),
@@ -3994,6 +4190,7 @@ mod tests {
             mode: None,
             model: None,
             brokk_mcp_servers: None,
+            brokk_goal: None,
         };
 
         let err = Session::from_persisted(
@@ -5622,6 +5819,7 @@ mod tests {
             mode: None,
             model: Some("m".to_string()),
             brokk_mcp_servers: None,
+            brokk_goal: None,
         };
         let legacy_path = legacy_session_zip_path(worktree.path(), &id);
         write_new_session_zip(&legacy_path, &manifest).expect("write legacy session zip");
@@ -5657,6 +5855,7 @@ mod tests {
             mode: None,
             model: Some("m".to_string()),
             brokk_mcp_servers: None,
+            brokk_goal: None,
         }
     }
 
