@@ -222,6 +222,14 @@ Built-in commands:
 - `/context`: show the current session context snapshot and token estimate.
 - `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or
   prompt on an interval until the session is cancelled.
+- `/goal [--max-turns N] <objective>`: work autonomously across turns until
+  the objective is verifiably met. Anvil re-prompts itself each turn with the
+  objective plus a completion audit; it stops only when the model verifies
+  every requirement against the actual worktree/command state and emits the
+  `GOAL_COMPLETE` sentinel, when the model reports the same blocker for three
+  consecutive turns, or when the `--max-turns` budget (default 25, max 200) is
+  spent. Cancel the session to stop early. Inspired by Codex's `/goal`; the
+  turn budget is the safety analog of Codex's token budget.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
