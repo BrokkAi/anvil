@@ -25,6 +25,24 @@ fn slopcop_shaped_acp_path_does_not_abort() {
     }
 }
 
+#[test]
+fn auto_permission_prompt_cancel_does_not_abort() {
+    let case = SmokeCase {
+        name: "auto_permission_prompt_cancel",
+        prompt: "Check the external cargo registry source if needed.".to_string(),
+    };
+    run_permission_cancel_case(&case, false);
+}
+
+#[test]
+fn auto_permission_prompt_session_cancel_does_not_abort() {
+    let case = SmokeCase {
+        name: "auto_permission_prompt_session_cancel",
+        prompt: "Check the external cargo registry source if needed.".to_string(),
+    };
+    run_permission_cancel_case(&case, true);
+}
+
 fn run_smoke_case(case: &SmokeCase) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
@@ -41,7 +59,10 @@ fn run_smoke_case(case: &SmokeCase) {
     write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
-    let provider = start_openai_smoke_server();
+    let provider = start_openai_smoke_server(vec![
+        tool_call_sse_body(),
+        text_sse_body(r#"{"answer":"Blocked write observed."}"#),
+    ]);
     let mut child = spawn_anvil(
         &home,
         &config_home,
@@ -253,6 +274,132 @@ fn run_smoke_case(case: &SmokeCase) {
     let _ = stderr_join.join();
 }
 
+fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_openai_smoke_server(vec![
+        tool_call_sse_body_for(
+            "call_shell",
+            "run_shell_command",
+            r#"{"command":"sed -n '1,5p' ~/.cargo/config.toml"}"#,
+        ),
+        text_sse_body(r#"{"allow":false,"rationale":"outside the user request"}"#),
+        text_sse_body("Permission prompt cancellation was handled."),
+    ]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path)
+        .with_permission_cancel_response(send_session_cancel);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(case, "initialize", &initialize, &client);
+
+    let new_session = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": []
+        }),
+    );
+    assert_response_ok(case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let config = client.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "permission_mode",
+            "value": "auto"
+        }),
+    );
+    assert_response_ok(case, "session/set_config_option", &config, &client);
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [
+                {
+                    "type": "text",
+                    "text": case.prompt
+                }
+            ]
+        }),
+    );
+    assert_response_ok(case, "session/prompt", &prompt, &client);
+    assert!(
+        !client.exited(),
+        "{}: anvil exited after cancelled permission prompt; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    if send_session_cancel {
+        assert_eq!(
+            provider.request_count(),
+            2,
+            "{}: expected provider to receive only tool and classifier requests after session/cancel",
+            case.name
+        );
+    } else {
+        assert_eq!(
+            provider.request_count(),
+            3,
+            "{}: expected provider to receive tool, classifier, and follow-up requests",
+            case.name
+        );
+        assert!(
+            provider
+                .request_bodies()
+                .get(2)
+                .is_some_and(|body| body.contains("prompt was cancelled before the user responded")),
+            "{}: follow-up request did not include cancelled permission result; requests: {:?}",
+            case.name,
+            provider.request_bodies()
+        );
+    }
+
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
 fn spawn_anvil(
     home: &Path,
     config_home: &Path,
@@ -308,7 +455,7 @@ impl OpenAiSmokeServer {
     }
 }
 
-fn start_openai_smoke_server() -> OpenAiSmokeServer {
+fn start_openai_smoke_server(response_bodies: Vec<String>) -> OpenAiSmokeServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind smoke provider");
     let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
     let request_bodies = Arc::new(Mutex::new(Vec::new()));
@@ -318,8 +465,11 @@ fn start_openai_smoke_server() -> OpenAiSmokeServer {
             let Ok(stream) = stream else {
                 break;
             };
-            handle_provider_connection(stream, idx, &bodies_for_thread);
-            if idx >= 1 {
+            let Some(response_body) = response_bodies.get(idx) else {
+                break;
+            };
+            handle_provider_connection(stream, response_body, &bodies_for_thread);
+            if idx + 1 == response_bodies.len() {
                 break;
             }
         }
@@ -332,7 +482,7 @@ fn start_openai_smoke_server() -> OpenAiSmokeServer {
 
 fn handle_provider_connection(
     mut stream: TcpStream,
-    request_index: usize,
+    response_body: &str,
     request_bodies: &Arc<Mutex<Vec<String>>>,
 ) {
     let mut raw = Vec::new();
@@ -376,11 +526,6 @@ fn handle_provider_connection(
     .to_string();
     request_bodies.lock().unwrap().push(body);
 
-    let response_body = if request_index == 0 {
-        tool_call_sse_body()
-    } else {
-        text_sse_body()
-    };
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         response_body.len(),
@@ -393,10 +538,17 @@ fn handle_provider_connection(
 }
 
 fn tool_call_sse_body() -> String {
-    let args = serde_json::to_string(r#"{"file_path":"blocked.txt","content":"blocked"}"#)
-        .expect("encode args");
+    tool_call_sse_body_for(
+        "call_write",
+        "write_file",
+        r#"{"file_path":"blocked.txt","content":"blocked"}"#,
+    )
+}
+
+fn tool_call_sse_body_for(call_id: &str, tool_name: &str, raw_args: &str) -> String {
+    let args = serde_json::to_string(raw_args).expect("encode args");
     format!(
-        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_write\",\"function\":{{\"name\":\"write_file\",\"arguments\":{args}}}}}]}}}}]}}\n\
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"{call_id}\",\"function\":{{\"name\":\"{tool_name}\",\"arguments\":{args}}}}}]}}}}]}}\n\
          \n\
          data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":4}}}}\n\
          \n\
@@ -404,13 +556,15 @@ fn tool_call_sse_body() -> String {
     )
 }
 
-fn text_sse_body() -> String {
-    "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"answer\\\":\\\"Blocked write observed.\\\"}\"}}]}\n\
+fn text_sse_body(text: &str) -> String {
+    let text = serde_json::to_string(text).expect("encode text");
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{text}}}}}]}}\n\
      \n\
-     data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5}}\n\
+     data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":20,\"completion_tokens\":5}}}}\n\
      \n\
      data: [DONE]\n\n"
-        .to_string()
+    )
 }
 
 fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
@@ -547,6 +701,8 @@ struct JsonRpcClient<'a> {
     trace_path: PathBuf,
     next_id: u64,
     stderr_lines: Vec<String>,
+    cancel_permission_requests: bool,
+    send_session_cancel_on_permission: bool,
 }
 
 impl<'a> JsonRpcClient<'a> {
@@ -565,7 +721,15 @@ impl<'a> JsonRpcClient<'a> {
             trace_path,
             next_id: 1,
             stderr_lines: Vec::new(),
+            cancel_permission_requests: false,
+            send_session_cancel_on_permission: false,
         }
+    }
+
+    fn with_permission_cancel_response(mut self, send_session_cancel: bool) -> Self {
+        self.cancel_permission_requests = true;
+        self.send_session_cancel_on_permission = send_session_cancel;
+        self
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -611,7 +775,14 @@ impl<'a> JsonRpcClient<'a> {
                         return value;
                     }
                     if value.get("id").is_some() && value.get("method").is_some() {
-                        self.respond_error(&value);
+                        if self.cancel_permission_requests
+                            && value.get("method").and_then(Value::as_str)
+                                == Some("session/request_permission")
+                        {
+                            self.respond_permission_cancelled(&value);
+                        } else {
+                            self.respond_error(&value);
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -637,6 +808,40 @@ impl<'a> JsonRpcClient<'a> {
         });
         writeln!(self.stdin, "{response}").expect("write client error response");
         self.stdin.flush().expect("flush client error response");
+    }
+
+    fn respond_permission_cancelled(&mut self, request: &Value) {
+        if self.send_session_cancel_on_permission
+            && let Some(session_id) = request
+                .get("params")
+                .and_then(|params| params.get("sessionId"))
+                .and_then(Value::as_str)
+        {
+            let cancel = json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {
+                    "sessionId": session_id
+                }
+            });
+            writeln!(self.stdin, "{cancel}").expect("write session cancel notification");
+            self.stdin
+                .flush()
+                .expect("flush session cancel notification");
+        }
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(Value::Null),
+            "result": {
+                "outcome": {
+                    "outcome": "cancelled"
+                }
+            }
+        });
+        writeln!(self.stdin, "{response}").expect("write permission cancel response");
+        self.stdin
+            .flush()
+            .expect("flush permission cancel response");
     }
 
     fn drain_stderr(&mut self) {
