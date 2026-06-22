@@ -415,6 +415,10 @@ pub(crate) fn snapshot_workspace(
         return Ok(());
     }
 
+    bail!("{}", rsync_failure_detail(step, &output));
+}
+
+fn rsync_failure_detail(step: usize, output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if !stderr.is_empty() {
@@ -424,13 +428,13 @@ pub(crate) fn snapshot_workspace(
     } else {
         "rsync produced no output".to_string()
     };
-    bail!(
+    format!(
         "rsync step {step} failed with status {}: {detail}",
         output
             .status
             .code()
             .map_or_else(|| "signal".to_string(), |code| code.to_string())
-    );
+    )
 }
 
 fn append_jsonl(path: &Path, record: &impl Serialize) {
