@@ -2913,7 +2913,7 @@ struct PermissionRequest<'a> {
 
 async fn request_user_permission(
     spawned_cx: &SpawnedCx<'_>,
-    cancel: &CancellationToken,
+    _cancel: &CancellationToken,
     request: PermissionRequest<'_>,
 ) -> Result<PermissionGrant, String> {
     let PermissionRequest {
@@ -2968,23 +2968,13 @@ async fn request_user_permission(
     emit_terminal_notification(TerminalNotificationEvent::Prompt);
 
     // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
-    // on `run` above. We deliberately do not apply a local timeout here: ACP
-    // has no per-request cancel API, and dropping an in-flight SentRequest can
-    // leave the client free to answer a request whose receiver no longer
-    // exists. A user-visible permission prompt is allowed to wait indefinitely
-    // until the user either chooses an option or cancels the prompt/session.
-    let response = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            tracing::warn!(
-                session_id,
-                tool_name,
-                "permission request abandoned due to session cancel; client should dismiss the modal"
-            );
-            return Err("Tool use denied: the prompt was cancelled before the user responded.".to_string());
-        }
-        r = spawned_cx.cx().send_request(request).block_task() => r,
-    };
+    // on `run` above. We deliberately do not race this with the prompt
+    // cancellation token: ACP requires clients to answer pending permission
+    // requests with `RequestPermissionOutcome::Cancelled` when they cancel a
+    // prompt. Dropping this in-flight request first leaves the client's
+    // required response with no receiver, which the ACP transport treats as an
+    // internal connection error.
+    let response = spawned_cx.cx().send_request(request).block_task().await;
 
     match response {
         Ok(resp) => match resp.outcome {
