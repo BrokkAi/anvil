@@ -153,14 +153,14 @@ pub struct FunctionDef {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub r#type: String,
     pub function: FunctionCall,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
@@ -227,10 +227,12 @@ impl TokenUsage {
 pub enum LlmResponse {
     Text {
         text: String,
+        reasoning_content: Option<String>,
         usage: TokenUsage,
     },
     ToolCalls {
         text: String,
+        reasoning_content: Option<String>,
         calls: Vec<ToolCall>,
         usage: TokenUsage,
     },
@@ -266,7 +268,7 @@ pub struct StreamChatRequest {
 // Chat message (extended for tool calling)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -277,6 +279,8 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -287,6 +291,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -297,6 +302,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -307,6 +313,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -317,16 +324,45 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+        }
+    }
+
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        reasoning_content: Option<String>,
+    ) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: vec![ChatContentPart::text(content)],
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content,
         }
     }
 
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self::assistant_tool_calls_with_content_and_reasoning("", calls, None)
+    }
+
+    pub fn assistant_tool_calls_with_content_and_reasoning(
+        content: impl Into<String>,
+        calls: Vec<ToolCall>,
+        reasoning_content: Option<String>,
+    ) -> Self {
+        let content = content.into();
         Self {
             role: "assistant".to_string(),
-            content: Vec::new(),
+            content: if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ChatContentPart::text(content)]
+            },
             tool_calls: Some(calls),
             tool_call_id: None,
             name: None,
+            reasoning_content,
         }
     }
 
@@ -341,6 +377,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
+            reasoning_content: None,
         }
     }
 
@@ -623,6 +660,9 @@ impl Serialize for ChatCompletionMessage<'_> {
         if message.name.is_some() {
             len += 1;
         }
+        if message.reasoning_content.is_some() {
+            len += 1;
+        }
 
         let mut state = serializer.serialize_struct("ChatCompletionMessage", len)?;
         state.serialize_field("role", &message.role)?;
@@ -645,6 +685,9 @@ impl Serialize for ChatCompletionMessage<'_> {
         }
         if let Some(name) = &message.name {
             state.serialize_field("name", name)?;
+        }
+        if let Some(reasoning_content) = &message.reasoning_content {
+            state.serialize_field("reasoning_content", reasoning_content)?;
         }
         state.end()
     }
@@ -921,6 +964,8 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCall>>,
 }
@@ -1297,7 +1342,7 @@ impl OpenAiClient {
             temperature,
             structured_output,
             on_token,
-            on_thought: _on_thought,
+            on_thought,
             cancel,
             idle_timeout,
         } = request;
@@ -1362,7 +1407,7 @@ impl OpenAiClient {
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
 
-        drive_sse_stream(stream, on_token, cancel, idle_timeout).await
+        drive_sse_stream(stream, on_token, on_thought, cancel, idle_timeout).await
     }
 }
 
@@ -1382,6 +1427,7 @@ fn supports_native_structured_output(base_url: &str) -> bool {
 async fn drive_sse_stream<S>(
     mut stream: S,
     mut on_token: TokenSink,
+    mut on_thought: TokenSink,
     cancel: CancellationToken,
     idle: Duration,
 ) -> Result<LlmResponse>
@@ -1389,6 +1435,7 @@ where
     S: Stream<Item = Result<Vec<u8>>> + Unpin,
 {
     let mut full_text = String::new();
+    let mut full_reasoning = String::new();
     let mut tool_acc = ToolCallAccumulator::default();
     let mut raw_buf: Vec<u8> = Vec::new();
     let mut deadline = tokio::time::Instant::now() + idle;
@@ -1442,11 +1489,17 @@ where
                     };
 
                     if data == "[DONE]" {
+                        let reasoning_content = (!full_reasoning.is_empty()).then_some(full_reasoning);
                         if tool_acc.is_empty() {
-                            return Ok(LlmResponse::Text { text: full_text, usage });
+                            return Ok(LlmResponse::Text {
+                                text: full_text,
+                                reasoning_content,
+                                usage,
+                            });
                         }
                         return Ok(LlmResponse::ToolCalls {
                             text: full_text,
+                            reasoning_content,
                             calls: tool_acc.into_tool_calls(),
                             usage,
                         });
@@ -1460,6 +1513,11 @@ where
                                     made_progress = true;
                                     on_token(content);
                                     full_text.push_str(content);
+                                }
+                                if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                                    made_progress = true;
+                                    on_thought(reasoning_content);
+                                    full_reasoning.push_str(reasoning_content);
                                 }
                                 // Accumulate tool call fragments
                                 if let Some(tc_chunks) = &choice.delta.tool_calls {
@@ -1501,6 +1559,7 @@ where
     if cancel.is_cancelled() {
         return Ok(LlmResponse::Text {
             text: full_text,
+            reasoning_content: (!full_reasoning.is_empty()).then_some(full_reasoning),
             usage,
         });
     }
@@ -1604,7 +1663,14 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         let err = result.expect_err("keepalive-only stream should bail");
         let msg = err.to_string();
@@ -1629,7 +1695,14 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "hello"),
@@ -1649,7 +1722,14 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "hi"),
@@ -1668,7 +1748,14 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("final buffered [DONE] should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "hi"),
@@ -1688,7 +1775,14 @@ mod tests {
         let s = stream::pending::<Result<Vec<u8>>>();
 
         let (on_token, _) = collect_tokens();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("should complete via cancel") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, ""),
@@ -1717,7 +1811,14 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("should complete") {
             LlmResponse::ToolCalls { text, calls, .. } => {
@@ -1745,7 +1846,14 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("should complete") {
             LlmResponse::Text { text: t, .. } => assert_eq!(t, "ok"),
@@ -1770,10 +1878,17 @@ mod tests {
 
         let (on_token, _) = collect_tokens();
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90)).await;
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await;
 
         match result.expect("should complete") {
-            LlmResponse::Text { text, usage } => {
+            LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "hi");
                 assert_eq!(usage.input_tokens, 80); // 120 - 40 cached
                 assert_eq!(usage.output_tokens, 20); // 30 - 10 reasoning
@@ -1784,6 +1899,41 @@ mod tests {
             }
             other => panic!("expected text response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_preserves_reasoning_content() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hard\",\"content\":\"ok\"}}]}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, tokens) = collect_tokens();
+        let thoughts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let thoughts_for_cb = Arc::clone(&thoughts);
+        let on_thought: TokenSink = Box::new(move |s: &str| {
+            thoughts_for_cb.lock().unwrap().push(s.to_string());
+        });
+        let cancel = CancellationToken::new();
+        let result = drive_sse_stream(s, on_token, on_thought, cancel, Duration::from_secs(90))
+            .await
+            .expect("should complete");
+
+        match result {
+            LlmResponse::Text {
+                text,
+                reasoning_content,
+                ..
+            } => {
+                assert_eq!(text, "ok");
+                assert_eq!(reasoning_content.as_deref(), Some("think hard"));
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(*tokens.lock().unwrap(), vec!["ok"]);
+        assert_eq!(*thoughts.lock().unwrap(), vec!["think ", "hard"]);
     }
 
     /// Stream EOF without `[DONE]` is incomplete, even if the server
@@ -1798,9 +1948,15 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let err = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90))
-            .await
-            .expect_err("EOF before [DONE] must be an incomplete stream");
+        let err = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await
+        .expect_err("EOF before [DONE] must be an incomplete stream");
 
         assert!(is_incomplete_stream_error(&err));
         assert_eq!(*collected.lock().unwrap(), vec!["partial"]);
@@ -1812,9 +1968,15 @@ mod tests {
 
         let (on_token, collected) = collect_tokens();
         let cancel = CancellationToken::new();
-        let err = drive_sse_stream(s, on_token, cancel, Duration::from_secs(90))
-            .await
-            .expect_err("empty EOF before [DONE] must be incomplete");
+        let err = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            cancel,
+            Duration::from_secs(90),
+        )
+        .await
+        .expect_err("empty EOF before [DONE] must be incomplete");
 
         assert!(is_incomplete_stream_error(&err));
         assert!(collected.lock().unwrap().is_empty());

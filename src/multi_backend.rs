@@ -640,6 +640,7 @@ mod tests {
             *self.last_reasoning_effort.lock().unwrap() = request.reasoning_effort;
             let response = LlmResponse::Text {
                 text: format!("hello from {}", self.name),
+                reasoning_content: None,
                 usage: crate::llm_client::TokenUsage::default(),
             };
             async move { Ok(response) }.boxed()

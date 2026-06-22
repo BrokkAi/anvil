@@ -458,6 +458,7 @@ impl BedrockClient {
         if body_text.is_empty() && cancel.is_cancelled() {
             return Ok(LlmResponse::Text {
                 text: String::new(),
+                reasoning_content: None,
                 usage: TokenUsage::default(),
             });
         }
@@ -491,9 +492,18 @@ impl BedrockClient {
         }
         let usage = parsed.usage.into_usage();
         if calls.is_empty() {
-            Ok(LlmResponse::Text { text, usage })
+            Ok(LlmResponse::Text {
+                text,
+                reasoning_content: (!thoughts.is_empty()).then_some(thoughts),
+                usage,
+            })
         } else {
-            Ok(LlmResponse::ToolCalls { text, calls, usage })
+            Ok(LlmResponse::ToolCalls {
+                text,
+                reasoning_content: (!thoughts.is_empty()).then_some(thoughts),
+                calls,
+                usage,
+            })
         }
     }
 
@@ -2117,7 +2127,7 @@ mod tests {
             .await
             .expect("responses request should succeed");
         match response {
-            LlmResponse::Text { text, usage } => {
+            LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "ok");
                 assert_eq!(usage.input_tokens, 3);
             }
@@ -2166,7 +2176,7 @@ mod tests {
             .await
             .expect("responses request should succeed");
         match response {
-            LlmResponse::Text { text, usage } => {
+            LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "ok");
                 assert_eq!(usage.input_tokens, 3);
             }
@@ -2211,7 +2221,7 @@ mod tests {
             .await
             .expect("native request should succeed");
         match response {
-            LlmResponse::Text { text, usage } => {
+            LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "native ok");
                 assert_eq!(usage.input_tokens, 2);
             }
@@ -2278,7 +2288,7 @@ mod tests {
             .await
             .expect("request should retry with inference profile");
         match response {
-            LlmResponse::Text { text, usage } => {
+            LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "profile ok");
                 assert_eq!(usage.input_tokens, 4);
             }
@@ -2338,7 +2348,7 @@ mod tests {
             .await
             .expect("request should resolve directly to prefixed profile");
         match response {
-            LlmResponse::Text { text, usage } => {
+            LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "resolved first");
                 assert_eq!(usage.input_tokens, 3);
             }

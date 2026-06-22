@@ -1428,6 +1428,22 @@ pub(crate) async fn run(
     } else {
         max_turns
     };
+    if let Some(config) = p2t_config.as_ref() {
+        p2t::append_debug_trace(
+            &config.step_trace_out,
+            "loop_start",
+            serde_json::json!({
+                "model": model,
+                "max_turns": max_turns,
+                "turn_limit": turn_limit,
+                "config_max_steps": config.max_steps,
+                "message_count": messages.len(),
+                "tool_count": tools.len(),
+                "cancelled": cancel.is_cancelled(),
+                "temperature": config.temperature,
+            }),
+        );
+    }
     if p2t_config
         .as_ref()
         .is_some_and(|config| config.max_steps == 0)
@@ -1436,9 +1452,30 @@ pub(crate) async fn run(
     }
     'outer: for turn in 0..turn_limit {
         if p2t_stop_reason.is_some() {
+            if let Some(config) = p2t_config.as_ref() {
+                p2t::append_debug_trace(
+                    &config.step_trace_out,
+                    "loop_break_stop_reason",
+                    serde_json::json!({
+                        "turn": turn,
+                        "steps_executed": p2t_steps_executed,
+                        "stop_reason": p2t_stop_reason.map(|reason| reason.as_str()),
+                    }),
+                );
+            }
             break;
         }
         if cancel.is_cancelled() {
+            if let Some(config) = p2t_config.as_ref() {
+                p2t::append_debug_trace(
+                    &config.step_trace_out,
+                    "loop_break_cancelled",
+                    serde_json::json!({
+                        "turn": turn,
+                        "steps_executed": p2t_steps_executed,
+                    }),
+                );
+            }
             break;
         }
         if let Some((config, forced_step)) = p2t_config
@@ -1451,7 +1488,8 @@ pub(crate) async fn run(
             if !forced_step.assistant_text.is_empty() {
                 full_response.push_str(&forced_step.assistant_text);
             }
-            messages.push(p2t::forced_step_to_message(forced_step));
+            let forced_message = p2t::forced_step_to_message(forced_step);
+            messages.push(forced_message.clone());
 
             let outcome = execute_step_tool_calls(
                 llm,
@@ -1501,6 +1539,11 @@ pub(crate) async fn run(
             .await;
 
             p2t_steps_executed += 1;
+            let result_messages =
+                p2t::tool_result_messages(&forced_step.tool_calls, &outcome.results);
+            let mut step_messages = Vec::with_capacity(1 + result_messages.len());
+            step_messages.push(forced_message);
+            step_messages.extend(result_messages);
             record_p2t_step(
                 config,
                 registry.cwd(),
@@ -1511,6 +1554,7 @@ pub(crate) async fn run(
                     assistant_text: forced_step.assistant_text.clone(),
                     tool_calls: forced_step.tool_calls.clone(),
                     results: outcome.results,
+                    messages: step_messages,
                 },
             );
             p2t_stop_reason =
@@ -1592,6 +1636,22 @@ pub(crate) async fn run(
         // override.
         let request_tools = turn_tools.clone();
         let advertised_this_request = advertised_tool_names(request_tools.as_ref());
+        if let Some(config) = p2t_config.as_ref() {
+            p2t::append_debug_trace(
+                &config.step_trace_out,
+                "before_llm_request",
+                serde_json::json!({
+                    "turn": turn,
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "message_count": messages.len(),
+                    "tool_count": request_tools.as_ref().map_or(0, Vec::len),
+                    "advertised_tools": advertised_this_request,
+                    "steps_executed": p2t_steps_executed,
+                    "cancelled": cancel.is_cancelled(),
+                }),
+            );
+        }
         trace_llm_request(
             turn,
             model,
@@ -1616,8 +1676,26 @@ pub(crate) async fn run(
         .await;
 
         match response {
-            Ok(LlmResponse::Text { text, usage }) => {
+            Ok(LlmResponse::Text {
+                text,
+                reasoning_content,
+                usage,
+            }) => {
                 trace_llm_text_response(turn, &text, usage);
+                let assistant_message =
+                    ChatMessage::assistant_with_reasoning(text.clone(), reasoning_content);
+                if let Some(config) = p2t_config.as_ref() {
+                    p2t::append_debug_trace(
+                        &config.step_trace_out,
+                        "after_llm_response",
+                        serde_json::json!({
+                            "turn": turn,
+                            "kind": "text",
+                            "text_len": text.len(),
+                            "usage": trace_usage(usage),
+                        }),
+                    );
+                }
                 turn_usage.add(usage);
                 if let Some(config) = p2t_config.as_ref() {
                     p2t_steps_executed += 1;
@@ -1631,6 +1709,7 @@ pub(crate) async fn run(
                             assistant_text: text.clone(),
                             tool_calls: Vec::new(),
                             results: Vec::new(),
+                            messages: vec![assistant_message.clone()],
                         },
                     );
                     p2t_stop_reason =
@@ -1667,7 +1746,7 @@ pub(crate) async fn run(
                                 "text": text,
                                 "message": nudge,
                             }));
-                            messages.push(ChatMessage::assistant(text));
+                            messages.push(assistant_message.clone());
                             messages.push(ChatMessage::user(nudge));
                             continue;
                         }
@@ -1714,7 +1793,7 @@ pub(crate) async fn run(
                                 "text": text,
                                 "message": nudge,
                             }));
-                            messages.push(ChatMessage::assistant(text));
+                            messages.push(assistant_message.clone());
                             messages.push(ChatMessage::user(nudge));
                             continue;
                         }
@@ -1734,16 +1813,45 @@ pub(crate) async fn run(
                 // Final text response -- we're done
                 break;
             }
-            Ok(LlmResponse::ToolCalls { text, calls, usage }) => {
+            Ok(LlmResponse::ToolCalls {
+                text,
+                reasoning_content,
+                calls,
+                usage,
+            }) => {
                 trace_llm_tool_response(turn, &text, &calls, usage);
+                if let Some(config) = p2t_config.as_ref() {
+                    p2t::append_debug_trace(
+                        &config.step_trace_out,
+                        "after_llm_response",
+                        serde_json::json!({
+                            "turn": turn,
+                            "kind": "tool_calls",
+                            "text_len": text.len(),
+                            "tool_calls": calls.iter().map(|call| serde_json::json!({
+                                "id": call.id,
+                                "name": call.function.name,
+                                "arguments_len": call.function.arguments.len(),
+                            })).collect::<Vec<_>>(),
+                            "usage": trace_usage(usage),
+                        }),
+                    );
+                }
                 turn_usage.add(usage);
                 // Any text emitted before tool calls
                 if !text.is_empty() {
                     full_response.push_str(&text);
                 }
 
-                // Record the assistant message with tool_calls
-                messages.push(ChatMessage::assistant_tool_calls(calls.clone()));
+                // Record the exact assistant message with tool_calls. DeepSeek
+                // requires reasoning_content to be replayed with the prefix.
+                let assistant_message =
+                    ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                        text.clone(),
+                        calls.clone(),
+                        reasoning_content,
+                    );
+                messages.push(assistant_message.clone());
 
                 let outcome = execute_step_tool_calls(
                     llm,
@@ -1796,6 +1904,19 @@ pub(crate) async fn run(
                 .await;
                 if let Some(config) = p2t_config.as_ref() {
                     p2t_steps_executed += 1;
+                    let step_tool_calls: Vec<p2t::PrefixToolCall> = calls
+                        .iter()
+                        .map(|call| p2t::PrefixToolCall {
+                            id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            arguments: call.function.arguments.clone(),
+                        })
+                        .collect();
+                    let result_messages =
+                        p2t::tool_result_messages(&step_tool_calls, &step_results);
+                    let mut step_messages = Vec::with_capacity(1 + result_messages.len());
+                    step_messages.push(assistant_message);
+                    step_messages.extend(result_messages);
                     record_p2t_step(
                         config,
                         registry.cwd(),
@@ -1804,15 +1925,9 @@ pub(crate) async fn run(
                             step: p2t_steps_executed,
                             forced: false,
                             assistant_text: text.clone(),
-                            tool_calls: calls
-                                .iter()
-                                .map(|call| p2t::PrefixToolCall {
-                                    id: call.id.clone(),
-                                    name: call.function.name.clone(),
-                                    arguments: call.function.arguments.clone(),
-                                })
-                                .collect(),
+                            tool_calls: step_tool_calls,
                             results: step_results,
+                            messages: step_messages,
                         },
                     );
                     p2t_stop_reason = p2t::stop_reason_after_step(
@@ -1875,6 +1990,18 @@ pub(crate) async fn run(
             }
             Err(e) => {
                 trace_llm_error(turn, &e);
+                if let Some(config) = p2t_config.as_ref() {
+                    p2t::append_debug_trace(
+                        &config.step_trace_out,
+                        "llm_error",
+                        serde_json::json!({
+                            "turn": turn,
+                            "error": format!("{e:#}"),
+                            "steps_executed": p2t_steps_executed,
+                            "cancelled": cancel.is_cancelled(),
+                        }),
+                    );
+                }
                 let friendly = messages_include_images(&messages)
                     .then(|| rewrite_image_prompt_provider_error(&e.to_string()))
                     .flatten();
@@ -1897,6 +2024,20 @@ pub(crate) async fn run(
             &config.step_trace_out,
             p2t_stop_reason.expect("checked above"),
             p2t_steps_executed,
+        );
+    }
+    if let Some(config) = p2t_config.as_ref() {
+        p2t::append_debug_trace(
+            &config.step_trace_out,
+            "loop_exit",
+            serde_json::json!({
+                "steps_executed": p2t_steps_executed,
+                "stop_reason": p2t_stop_reason.map(|reason| reason.as_str()),
+                "turn_usage": trace_usage(turn_usage),
+                "full_response_len": full_response.len(),
+                "tool_exchange_count": tool_exchanges.len(),
+                "cancelled": cancel.is_cancelled(),
+            }),
         );
     }
 
@@ -3718,6 +3859,7 @@ mod tests {
                 }
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
+                    reasoning_content: None,
                     usage: TokenUsage::default(),
                 })
             }
@@ -3754,6 +3896,7 @@ mod tests {
                 }
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
+                    reasoning_content: None,
                     usage: TokenUsage::default(),
                 })
             }
@@ -3796,6 +3939,7 @@ mod tests {
                 }
                 Ok(LlmResponse::Text {
                     text: response,
+                    reasoning_content: None,
                     usage: TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,

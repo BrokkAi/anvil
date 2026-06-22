@@ -842,6 +842,7 @@ mod tests {
             async move {
                 Ok(LlmResponse::Text {
                     text: response,
+                    reasoning_content: None,
                     usage: crate::llm_client::TokenUsage::default(),
                 })
             }
@@ -873,6 +874,7 @@ mod tests {
                 Ok(LlmResponse::Text {
                     text: "<conversation_summary>\n- recovered\n</conversation_summary>"
                         .to_string(),
+                    reasoning_content: None,
                     usage: crate::llm_client::TokenUsage::default(),
                 })
             }
@@ -1014,6 +1016,7 @@ mod tests {
                 async move {
                     Ok(LlmResponse::Text {
                         text: "- partial".into(),
+                        reasoning_content: None,
                         usage: crate::llm_client::TokenUsage::default(),
                     })
                 }
@@ -1106,6 +1109,7 @@ mod tests {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     Ok(LlmResponse::Text {
                         text: response,
+                        reasoning_content: None,
                         usage: crate::llm_client::TokenUsage::default(),
                     })
                 }

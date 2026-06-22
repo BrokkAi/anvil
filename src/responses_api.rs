@@ -452,6 +452,7 @@ where
     if cancel.is_cancelled() {
         return Ok(LlmResponse::Text {
             text: full_text,
+            reasoning_content: None,
             usage,
         });
     }
@@ -464,11 +465,13 @@ where
     if tool_calls.is_empty() {
         Ok(LlmResponse::Text {
             text: full_text,
+            reasoning_content: None,
             usage,
         })
     } else {
         Ok(LlmResponse::ToolCalls {
             text: full_text,
+            reasoning_content: None,
             calls: tool_calls,
             usage,
         })

@@ -767,6 +767,7 @@ mod tests {
                 *last_prompt.lock().unwrap() = Some(prompt);
                 Ok(LlmResponse::Text {
                     text: r#"{"hint":"Consider searching for account."}"#.to_string(),
+                    reasoning_content: None,
                     usage: TokenUsage::default(),
                 })
             }
@@ -800,6 +801,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                reasoning_content: None,
             }],
             &[],
             &packet,
@@ -839,6 +841,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                reasoning_content: None,
             }],
             &[],
             &packet,

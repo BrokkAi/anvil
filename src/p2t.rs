@@ -54,6 +54,8 @@ pub(crate) struct PrefixStep {
     pub tool_calls: Vec<PrefixToolCall>,
     #[serde(default)]
     pub results: Vec<PrefixToolResult>,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -62,6 +64,8 @@ pub(crate) struct ForcedStep {
     pub assistant_text: String,
     #[serde(default)]
     pub tool_calls: Vec<PrefixToolCall>,
+    #[serde(default)]
+    pub message: Option<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -101,6 +105,8 @@ pub(crate) struct StepTraceRecord {
     pub assistant_text: String,
     pub tool_calls: Vec<PrefixToolCall>,
     pub results: Vec<PrefixToolResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +186,10 @@ pub(crate) fn append_prefix_messages(messages: &mut Vec<ChatMessage>, steps: &[P
 pub(crate) fn prefix_steps_to_messages(steps: &[PrefixStep]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     for step in steps {
+        if !step.messages.is_empty() {
+            messages.extend(step.messages.clone());
+            continue;
+        }
         if !step.tool_calls.is_empty() {
             messages.push(assistant_message_with_tool_calls(
                 &step.assistant_text,
@@ -207,6 +217,9 @@ pub(crate) fn prefix_steps_to_messages(steps: &[PrefixStep]) -> Vec<ChatMessage>
 }
 
 pub(crate) fn forced_step_to_message(step: &ForcedStep) -> ChatMessage {
+    if let Some(message) = &step.message {
+        return message.clone();
+    }
     if step.tool_calls.is_empty() {
         ChatMessage::assistant(step.assistant_text.clone())
     } else {
@@ -232,7 +245,25 @@ fn assistant_message_with_tool_calls(
         tool_calls: Some(tool_calls_from_prefix(tool_calls)),
         tool_call_id: None,
         name: None,
+        reasoning_content: None,
     }
+}
+
+pub(crate) fn tool_result_messages(
+    tool_calls: &[PrefixToolCall],
+    results: &[PrefixToolResult],
+) -> Vec<ChatMessage> {
+    results
+        .iter()
+        .map(|result| {
+            let tool_name = tool_calls
+                .iter()
+                .find(|call| call.id == result.call_id)
+                .map(|call| call.name.clone())
+                .unwrap_or_default();
+            ChatMessage::tool_result(&result.call_id, tool_name, &result.content)
+        })
+        .collect()
 }
 
 fn tool_calls_from_prefix(tool_calls: &[PrefixToolCall]) -> Vec<ToolCall> {
@@ -313,6 +344,25 @@ pub(crate) fn append_snapshot_error_trace(path: &Path, step: usize, error: &str)
             record_type: "snapshot_error",
             step,
             error,
+        },
+    );
+}
+
+pub(crate) fn append_debug_trace(path: &Path, event: &str, details: serde_json::Value) {
+    #[derive(Serialize)]
+    struct DebugRecord<'a> {
+        #[serde(rename = "type")]
+        record_type: &'a str,
+        event: &'a str,
+        details: serde_json::Value,
+    }
+
+    append_jsonl(
+        path,
+        &DebugRecord {
+            record_type: "debug",
+            event,
+            details,
         },
     );
 }
@@ -501,6 +551,7 @@ mod tests {
                     name: "edit".to_string(),
                     arguments: "{}".to_string(),
                 }],
+                message: None,
             })
         );
         assert_eq!(config.snapshot_dir, Some(snapshot_dir));
@@ -592,6 +643,7 @@ mod tests {
                 call_id: "call-1".to_string(),
                 content: "Edited 'src/main.rs'".to_string(),
             }],
+            messages: Vec::new(),
         }];
 
         let messages = prefix_steps_to_messages(&steps);
@@ -608,6 +660,23 @@ mod tests {
     }
 
     #[test]
+    fn prefix_steps_prefer_exact_message_sequence() {
+        let exact = ChatMessage::assistant_with_reasoning(
+            "exact visible".to_string(),
+            Some("native reasoning".to_string()),
+        );
+        let steps = vec![PrefixStep {
+            assistant_text: "lossy fallback".to_string(),
+            tool_calls: Vec::new(),
+            results: Vec::new(),
+            messages: vec![exact.clone()],
+        }];
+
+        let messages = prefix_steps_to_messages(&steps);
+        assert_eq!(messages, vec![exact]);
+    }
+
+    #[test]
     fn forced_step_message_preserves_text_and_tool_calls() {
         let message = forced_step_to_message(&ForcedStep {
             assistant_text: "planning".to_string(),
@@ -616,6 +685,7 @@ mod tests {
                 name: "edit".to_string(),
                 arguments: "{\"file_path\":\"src/main.rs\"}".to_string(),
             }],
+            message: None,
         });
 
         assert_eq!(message.role, "assistant");
@@ -624,6 +694,30 @@ mod tests {
             message.tool_calls.as_ref().unwrap()[0].function.arguments,
             "{\"file_path\":\"src/main.rs\"}"
         );
+    }
+
+    #[test]
+    fn forced_step_prefers_exact_message_with_reasoning_content() {
+        let exact = ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+            "synthetic visible",
+            vec![ToolCall {
+                id: "call-1".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "get_summaries".to_string(),
+                    arguments: "{\"targets\":[\"src/main.rs\"]}".to_string(),
+                },
+            }],
+            Some("synthetic visible-prefix reasoning".to_string()),
+        );
+
+        let message = forced_step_to_message(&ForcedStep {
+            assistant_text: "fallback visible".to_string(),
+            tool_calls: Vec::new(),
+            message: Some(exact.clone()),
+        });
+
+        assert_eq!(message, exact);
     }
 
     #[test]
@@ -652,6 +746,7 @@ mod tests {
                 call_id: "call-1".to_string(),
                 content: "wrote file".to_string(),
             }],
+            messages: Vec::new(),
         }];
 
         assert!(prefix_unlocks_shell(&steps));
