@@ -469,6 +469,9 @@ fn start_openai_smoke_server(response_bodies: Vec<String>) -> OpenAiSmokeServer 
                 break;
             };
             handle_provider_connection(stream, response_body, &bodies_for_thread);
+            if idx + 1 == response_bodies.len() {
+                break;
+            }
         }
     });
     OpenAiSmokeServer {
