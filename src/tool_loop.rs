@@ -2645,13 +2645,11 @@ async fn consult_gate(
 
 fn should_run_permission_auto_classifier(
     mode: PermissionMode,
-    tool_name: &str,
-    shell_sandboxed: bool,
+    _tool_name: &str,
+    _shell_sandboxed: bool,
     escalation_requested: bool,
 ) -> bool {
-    matches!(mode, PermissionMode::Auto)
-        && !escalation_requested
-        && (tool_name != "run_shell_command" || shell_sandboxed)
+    matches!(mode, PermissionMode::Auto) && !escalation_requested
 }
 
 async fn request_user_permission_with_evaluation(
@@ -3976,7 +3974,7 @@ mod tests {
             true,
             false
         ));
-        assert!(!should_run_permission_auto_classifier(
+        assert!(should_run_permission_auto_classifier(
             PermissionMode::Auto,
             "run_shell_command",
             false,
