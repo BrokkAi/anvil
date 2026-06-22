@@ -854,6 +854,7 @@ fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
         ModelSource::Codex,
         ModelSource::Ollama,
         ModelSource::Ds4,
+        ModelSource::DeepSeek,
         ModelSource::OpenRouter,
     ]
     .into_iter()
@@ -880,8 +881,12 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
     let bedrock_count = source_count(catalog, ModelSource::Bedrock);
     let codex_count = source_count(catalog, ModelSource::Codex);
     let ollama_count = source_count(catalog, ModelSource::Ollama);
+    let deepseek_count = source_count(catalog, ModelSource::DeepSeek);
     let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
     let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
+    let deepseek_env_ready = std::env::var(crate::discovery::DEEPSEEK_API_KEY_ENV)
+        .ok()
+        .is_some_and(|raw| !raw.trim().is_empty());
     let ready = if model.is_empty() {
         "No model selected yet.".to_string()
     } else {
@@ -896,12 +901,14 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
          - `/setup bedrock` - Use AWS Bedrock.\n\
          - `/setup local` - Use free local models on this computer.\n\
+         - Set `DEEPSEEK_API_KEY` - Use hosted DeepSeek.\n\
          - `/setup openrouter` - Use OpenRouter.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
          Found now:\n\
          - Bedrock: {bedrock_status}\n\
          - Codex: {codex_status}\n\
          - Local models: {local_status}\n\
+         - DeepSeek: {deepseek_status}\n\
          - OpenRouter: {openrouter_status}\n\n\
          You can run `/setup` anytime.",
         bedrock_status = if bedrock_count > 0 {
@@ -918,6 +925,13 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
             "ready".to_string()
         } else {
             "not found".to_string()
+        },
+        deepseek_status = if deepseek_count > 0 {
+            "ready".to_string()
+        } else if deepseek_env_ready {
+            "connected, no models found yet".to_string()
+        } else {
+            "not connected".to_string()
         },
         openrouter_status = if openrouter_count > 0 {
             "ready".to_string()
@@ -4726,6 +4740,11 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
             "No ds4 models found. Start `ds4-server` (antirez/ds4), or set DS4_BASE_URL.",
         );
         write_group(
+            "DeepSeek",
+            source_model_ids(catalog, ModelSource::DeepSeek, 12),
+            "No hosted DeepSeek models found. Export DEEPSEEK_API_KEY and refresh.",
+        );
+        write_group(
             "OpenRouter",
             filtered_openrouter_models(catalog),
             "No OpenRouter coding candidates found. Run `/setup openrouter`.",
@@ -7223,7 +7242,7 @@ mod tests {
 
         let store = SessionStore::new("m".into());
         let llm = std::sync::Arc::new(crate::multi_backend::MultiBackend::new(
-            None, None, None, None,
+            None, None, None, None, None,
         ));
         let refresh = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 

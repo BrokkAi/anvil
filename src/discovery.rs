@@ -3,14 +3,15 @@
 //! (`http://localhost:11434/v1/models`), a local ds4-server
 //! (antirez/ds4, an OpenAI-compatible DeepSeek V4 inference engine), and
 //! OpenRouter (`https://openrouter.ai/api/v1/models`, gated on the
-//! `OPENROUTER_API_KEY` env var).
+//! `OPENROUTER_API_KEY` env var), and hosted DeepSeek
+//! (`https://api.deepseek.com/v1/models`, gated on `DEEPSEEK_API_KEY`).
 //!
 //! Zero-config by design: the Ollama URL is fixed at the daemon's default
 //! port. If your daemon listens elsewhere, the catalog will simply not
 //! include Ollama models -- run `ollama serve` on `:11434` to make them
-//! discoverable. OpenRouter is enabled only when `OPENROUTER_API_KEY` is
-//! set in the environment; absent the key, the catalog simply omits its
-//! models with no warning.
+//! discoverable. OpenRouter and hosted DeepSeek are enabled only when
+//! their API keys are set in the environment; absent the key, the catalog
+//! simply omits their models with no warning.
 //!
 //! ds4 is the one source whose port is *not* fixed: `ds4-server` has no
 //! standard port, so instead of probing a constant we detect a running
@@ -23,7 +24,7 @@
 //! Each discovered model carries a `ModelSource` tag so the routing backend
 //! (`MultiBackend`) can pick the right HTTP client at request time. The
 //! catalog is presented to ACP clients as `<source>::<id>` wire ids, e.g.
-//! `codex::gpt-5-codex`, `ollama::llama3:latest`, and
+//! `codex::gpt-5-codex`, `ollama::llama3:latest`, `deepseek::deepseek-v4-pro`, and
 //! `openrouter::anthropic/claude-3.5-sonnet`. The double-colon separator
 //! avoids collision with Ollama tags (`model:tag`) and with OpenRouter
 //! ids (`vendor/model`).
@@ -49,6 +50,7 @@ use crate::llm_client::{ModelMetadata, ReasoningLevelPreset};
 pub enum ModelSource {
     Bedrock,
     Codex,
+    DeepSeek,
     Ds4,
     Ollama,
     OpenRouter,
@@ -59,6 +61,7 @@ impl ModelSource {
         match self {
             Self::Bedrock => "bedrock",
             Self::Codex => "codex",
+            Self::DeepSeek => "deepseek",
             Self::Ds4 => "ds4",
             Self::Ollama => "ollama",
             Self::OpenRouter => "openrouter",
@@ -90,6 +93,7 @@ pub fn split_wire_id(wire: &str) -> Option<(ModelSource, &str)> {
     let source = match prefix {
         "bedrock" => ModelSource::Bedrock,
         "codex" => ModelSource::Codex,
+        "deepseek" => ModelSource::DeepSeek,
         "ds4" => ModelSource::Ds4,
         "ollama" => ModelSource::Ollama,
         "openrouter" => ModelSource::OpenRouter,
@@ -115,6 +119,13 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// alias so the same shell that already works with `openrouter` / OpenAI
 /// SDK / litellm works here too.
 pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Hosted DeepSeek cloud base URL. The API is OpenAI-compatible and uses
+/// this origin for both chat and model discovery.
+pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+
+/// Environment variable name carrying the hosted DeepSeek API key.
+pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 // ---------------------------------------------------------------------------
 // ds4 (antirez/ds4) discovery
@@ -454,31 +465,34 @@ pub async fn discover_ollama_model_metadata(
 /// always passes `OLLAMA_DEFAULT_URL`. There's no CLI flag for this; the
 /// zero-config posture means the user doesn't pick a port.
 ///
-/// Codex and OpenRouter discovery are delegated to caller-provided
+/// Codex, hosted DeepSeek, and OpenRouter discovery are delegated to caller-provided
 /// closures. For Codex, the `CodexClient` lives in a sibling module that
 /// already handles auth.json parsing, fallback slugs, and
-/// `chatgpt`/`apikey` mode branching. For OpenRouter, the closure lets
-/// the caller short-circuit cleanly when no `OPENROUTER_API_KEY` is set
-/// (returning `Err`) without `discovery.rs` having to know about env
-/// vars. Each closure keeps `discovery.rs` agnostic of those concerns
-/// while still running all sources in parallel.
+/// `chatgpt`/`apikey` mode branching. For the hosted providers, each
+/// closure lets the caller short-circuit cleanly when the matching API
+/// key is absent without `discovery.rs` having to know about env vars.
+/// Each closure keeps `discovery.rs` agnostic of those concerns while
+/// still running all sources in parallel.
 ///
 /// `ds4_url` is `Some` only when a local `ds4-server` was detected (or
 /// `DS4_BASE_URL` is set); `None` skips ds4 entirely. See [`ds4_base_url`].
 ///
-/// Output ordering is fixed: Bedrock, Codex, Ollama, ds4, then OpenRouter.
+/// Output ordering is fixed: Bedrock, Codex, Ollama, ds4, hosted DeepSeek,
+/// then OpenRouter.
 /// The first model in the merged list is auto-selected as the session
 /// default elsewhere -- keeping ordering deterministic stops users from
 /// seeing a different default just because one source happened to be
 /// slow on a given boot. ds4 sits after Ollama so an existing Ollama
-/// user's default is unchanged, and before OpenRouter because it is a
-/// free local source rather than the explicit paid/cloud choice.
-pub async fn discover_all<FB, FutB, FC, FutC, FOR, FutOR>(
+/// user's default is unchanged. Hosted DeepSeek sits before OpenRouter so
+/// a direct vendor backend wins over the aggregator when both expose the
+/// same family of models.
+pub async fn discover_all<FB, FutB, FC, FutC, FDS, FutDS, FOR, FutOR>(
     http: &reqwest::Client,
     ollama_url: &str,
     ds4_url: Option<&str>,
     bedrock_lookup: FB,
     codex_lookup: FC,
+    deepseek_lookup: FDS,
     openrouter_lookup: FOR,
 ) -> Vec<DiscoveredModel>
 where
@@ -486,6 +500,8 @@ where
     FutB: std::future::Future<Output = Result<Vec<String>>>,
     FC: FnOnce() -> FutC,
     FutC: std::future::Future<Output = Result<Vec<String>>>,
+    FDS: FnOnce() -> FutDS,
+    FutDS: std::future::Future<Output = Result<Vec<String>>>,
     FOR: FnOnce() -> FutOR,
     FutOR: std::future::Future<Output = Result<Vec<String>>>,
 {
@@ -516,6 +532,22 @@ where
                 .collect(),
             Err(e) => {
                 tracing::info!("codex model discovery skipped: {e:#}");
+                Vec::new()
+            }
+        }
+    };
+
+    let deepseek_fut = async {
+        match deepseek_lookup().await {
+            Ok(ids) => ids
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    source: ModelSource::DeepSeek,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::info!("deepseek model discovery skipped: {e:#}");
                 Vec::new()
             }
         }
@@ -560,15 +592,22 @@ where
         }
     };
 
-    let (bedrock, codex, openrouter, ollama, ds4) =
-        tokio::join!(bedrock_fut, codex_fut, openrouter_fut, ollama_fut, ds4_fut);
+    let (bedrock, codex, deepseek, openrouter, ollama, ds4) = tokio::join!(
+        bedrock_fut,
+        codex_fut,
+        deepseek_fut,
+        openrouter_fut,
+        ollama_fut,
+        ds4_fut
+    );
     let mut all = Vec::with_capacity(
-        bedrock.len() + codex.len() + ollama.len() + ds4.len() + openrouter.len(),
+        bedrock.len() + codex.len() + ollama.len() + ds4.len() + deepseek.len() + openrouter.len(),
     );
     all.extend(bedrock);
     all.extend(codex);
     all.extend(ollama);
     all.extend(ds4);
+    all.extend(deepseek);
     all.extend(openrouter);
     all
 }
@@ -695,6 +734,16 @@ mod tests {
         assert_eq!(src, ModelSource::Codex);
         assert_eq!(id, "gpt-5-codex");
 
+        let deepseek = DiscoveredModel {
+            id: "deepseek-v4-pro".into(),
+            source: ModelSource::DeepSeek,
+        };
+        let deepseek_wire = deepseek.wire_id();
+        assert_eq!(deepseek_wire, "deepseek::deepseek-v4-pro");
+        let (src, id) = split_wire_id(&deepseek_wire).expect("must parse");
+        assert_eq!(src, ModelSource::DeepSeek);
+        assert_eq!(id, "deepseek-v4-pro");
+
         let ollama = DiscoveredModel {
             id: "llama3:latest".into(),
             source: ModelSource::Ollama,
@@ -749,11 +798,12 @@ mod tests {
     /// happens to have a real Ollama running on the default port.
     const TEST_DEAD_OLLAMA_URL: &str = "http://127.0.0.1:1";
 
-    /// `discover_all` returns Bedrock first, then Codex, Ollama, then OpenRouter,
+    /// `discover_all` returns Bedrock first, then Codex, Ollama, ds4,
+    /// DeepSeek, then OpenRouter,
     /// regardless of which future resolves first. Stable ordering matters
     /// because the first model in the catalog is auto-selected as the
     /// session default; OpenRouter stays last because it is the explicit
-    /// paid/cloud choice rather than the "choose for me" default.
+    /// aggregator choice rather than the "choose for me" default.
     #[tokio::test]
     async fn discover_all_orders_codex_ollama_openrouter() {
         let server = MockServer::start().await;
@@ -777,6 +827,7 @@ mod tests {
             Some(&server.uri()),
             || async { Ok(vec!["us.anthropic.claude-sonnet-4-6".to_string()]) },
             || async { Ok(vec!["gpt-5-codex".to_string(), "gpt-4o".to_string()]) },
+            || async { Ok(vec!["deepseek-v4-pro".to_string()]) },
             || async {
                 Ok(vec![
                     "anthropic/claude-3.5-sonnet".to_string(),
@@ -785,8 +836,8 @@ mod tests {
             },
         )
         .await;
-        // Bedrock 1; Codex 2; Ollama 1; ds4 1; OpenRouter 2.
-        assert_eq!(models.len(), 7);
+        // Bedrock 1; Codex 2; Ollama 1; ds4 1; DeepSeek 1; OpenRouter 2.
+        assert_eq!(models.len(), 8);
         assert_eq!(models[0].source, ModelSource::Bedrock);
         assert_eq!(models[0].id, "us.anthropic.claude-sonnet-4-6");
         assert_eq!(models[1].source, ModelSource::Codex);
@@ -796,9 +847,11 @@ mod tests {
         assert_eq!(models[3].id, "llama3:latest");
         assert_eq!(models[4].source, ModelSource::Ds4);
         assert_eq!(models[4].id, "llama3:latest");
-        assert_eq!(models[5].source, ModelSource::OpenRouter);
-        assert_eq!(models[5].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[5].source, ModelSource::DeepSeek);
+        assert_eq!(models[5].id, "deepseek-v4-pro");
         assert_eq!(models[6].source, ModelSource::OpenRouter);
+        assert_eq!(models[6].id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[7].source, ModelSource::OpenRouter);
     }
 
     /// When every source fails, the merged vec is empty rather than an
@@ -814,6 +867,7 @@ mod tests {
             None,
             || async { anyhow::bail!("no Bedrock token") },
             || async { anyhow::bail!("no auth.json") },
+            || async { anyhow::bail!("no DEEPSEEK_API_KEY") },
             || async { anyhow::bail!("no OPENROUTER_API_KEY") },
         )
         .await;
@@ -834,6 +888,7 @@ mod tests {
             None,
             || async { anyhow::bail!("no Bedrock token") },
             || async { anyhow::bail!("no auth.json") },
+            || async { anyhow::bail!("no DEEPSEEK_API_KEY") },
             || async { Ok(vec!["anthropic/claude-3.5-sonnet".to_string()]) },
         )
         .await;

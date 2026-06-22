@@ -267,6 +267,45 @@ fn test_ollama_base_url() -> Option<String> {
         .filter(|url| !url.trim().is_empty())
 }
 
+/// Build a hosted DeepSeek chat backend from a raw API key. DeepSeek's API
+/// is OpenAI-compatible at `https://api.deepseek.com`, so the generic
+/// `OpenAiClient` is sufficient.
+pub fn deepseek_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some(Arc::new(llm_client::OpenAiClient::with_reasoning_support(
+        discovery::DEEPSEEK_BASE_URL.to_string(),
+        Some(key.to_string()),
+        reqwest::header::HeaderMap::new(),
+    )))
+}
+
+/// Build the hosted DeepSeek backend from `DEEPSEEK_API_KEY`. Unlike
+/// OpenRouter and Bedrock, there is no interactive login flow or on-disk
+/// credential store here yet, so env-only is the intended path.
+fn build_deepseek_backend() -> Option<Arc<dyn LlmBackend>> {
+    let Ok(raw) = std::env::var(discovery::DEEPSEEK_API_KEY_ENV) else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        tracing::info!(
+            "{} is set but empty; hosted DeepSeek backend skipped",
+            discovery::DEEPSEEK_API_KEY_ENV
+        );
+        return None;
+    }
+    tracing::info!(
+        "DeepSeek backend wired from {} at {} (chat + discovery); key length={}",
+        discovery::DEEPSEEK_API_KEY_ENV,
+        discovery::DEEPSEEK_BASE_URL,
+        trimmed.len()
+    );
+    deepseek_backend_from_key(trimmed)
+}
+
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks
 /// the OpenAI Chat Completions wire format verbatim, so we reuse
 /// `OpenAiClient` with the OpenRouter base URL and attach the optional
@@ -484,6 +523,7 @@ async fn main() -> Result<()> {
 
     let bedrock_backend = build_bedrock_backend();
     let codex_backend = build_codex_backend().await;
+    let deepseek_backend = build_deepseek_backend();
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
 
@@ -496,9 +536,15 @@ async fn main() -> Result<()> {
     if codex_backend.is_none() {
         tracing::info!(
             "Codex backend not available; the picker will fall back to Ollama \
-             and OpenRouter (if discovered). Run /setup codex from a session to add \
+             and hosted providers (if discovered). Run /setup codex from a session to add \
              Codex -- the new credentials are picked up on the next discovery \
              refresh, no restart required."
+        );
+    }
+    if deepseek_backend.is_none() {
+        tracing::info!(
+            "DeepSeek backend not available; set {} to enable hosted DeepSeek.",
+            discovery::DEEPSEEK_API_KEY_ENV
         );
     }
     if openrouter_backend.is_none() {
@@ -512,6 +558,7 @@ async fn main() -> Result<()> {
     let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(
         bedrock_backend,
         codex_backend,
+        deepseek_backend,
         openrouter_backend,
         ollama_backend,
     ));
@@ -551,4 +598,26 @@ async fn main() -> Result<()> {
             tracing::error!("agent error: {e}");
             anyhow::anyhow!("agent error: {e}")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "live network smoke test; requires DEEPSEEK_API_KEY"]
+    async fn deepseek_backend_lists_models_live() {
+        let key = std::env::var(discovery::DEEPSEEK_API_KEY_ENV)
+            .expect("DEEPSEEK_API_KEY must be set for the live smoke test");
+        let backend =
+            deepseek_backend_from_key(&key).expect("non-empty DEEPSEEK_API_KEY should build");
+        let models = backend
+            .list_models()
+            .await
+            .expect("hosted DeepSeek list_models should succeed");
+        assert!(
+            models.iter().any(|id| id.contains("deepseek")),
+            "expected at least one DeepSeek model id, got {models:?}"
+        );
+    }
 }
