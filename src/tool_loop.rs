@@ -1,10 +1,7 @@
 mod announce;
 
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
@@ -69,6 +66,17 @@ struct ExecutedStepOutcome {
     cancelled: bool,
 }
 
+/// Stream a model turn, retrying transient failures (network disconnect,
+/// truncated stream, server overload/5xx/429) up to [`LLM_MAX_ATTEMPTS`].
+///
+/// Unlike a pre-stream HTTP retry, a retry here replays the whole request and
+/// re-streams from scratch -- we cannot resume an interrupted SSE body. This
+/// matches Codex's HTTP retry behaviour: if the disconnect lands mid-response,
+/// any text already streamed to the client may be re-emitted on the retry.
+/// We accept that cosmetic seam in exchange for surviving the outage instead of
+/// ending the turn. (A future change can dedup the replayed prefix.)
+///
+/// [`LLM_MAX_ATTEMPTS`]: crate::http_retry::LLM_MAX_ATTEMPTS
 #[allow(clippy::too_many_arguments)]
 async fn stream_chat_with_transient_retry(
     llm: &Arc<dyn LlmBackend>,
@@ -86,25 +94,15 @@ async fn stream_chat_with_transient_retry(
 ) -> anyhow::Result<LlmResponse> {
     let mut attempt = 1u64;
     loop {
-        let emitted_output = Arc::new(AtomicBool::new(false));
-
         let token_sink = on_text.clone();
-        let token_emitted = emitted_output.clone();
         let on_token: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if !token.is_empty() {
-                token_emitted.store(true, Ordering::SeqCst);
-            }
             if let Ok(mut cb) = token_sink.lock() {
                 cb(token);
             }
         });
 
         let thought_sink = on_thought.clone();
-        let thought_emitted = emitted_output.clone();
         let on_thought_cb: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if !token.is_empty() {
-                thought_emitted.store(true, Ordering::SeqCst);
-            }
             if let Ok(mut cb) = thought_sink.lock() {
                 cb(token);
             }
@@ -130,7 +128,6 @@ async fn stream_chat_with_transient_retry(
             Err(error)
                 if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
                     && !cancel.is_cancelled()
-                    && !emitted_output.load(Ordering::SeqCst)
                     && is_retryable_llm_error(&error) =>
             {
                 let delay = crate::http_retry::retry_backoff(attempt);
@@ -147,7 +144,8 @@ async fn stream_chat_with_transient_retry(
                     turn,
                     attempt,
                     max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
-                    "retrying transient LLM stream failure before any output was emitted"
+                    "retrying transient LLM stream failure (replaying the request; \
+                     already-streamed text may be re-emitted)"
                 );
                 crate::http_retry::sleep_before_retry(
                     "streaming LLM response",
@@ -3661,11 +3659,9 @@ fn ordered_tool_call_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{
-        FunctionCall, FunctionDef, IncompleteStreamError, is_incomplete_stream_error,
-    };
+    use crate::llm_client::{FunctionCall, FunctionDef, IncompleteStreamError};
     use futures::future::{BoxFuture, FutureExt};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -4166,7 +4162,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_does_not_retry_after_partial_output() {
+    async fn stream_chat_retries_after_partial_output() {
+        // A mid-stream disconnect after some text was already streamed must now
+        // retry (surviving the outage) rather than ending the turn. The replay
+        // re-streams from scratch; the already-shown "partial" prefix stays in
+        // the client transcript and the recovered response follows.
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
@@ -4176,7 +4176,7 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
 
-        let error = stream_chat_with_transient_retry(
+        let response = stream_chat_with_transient_retry(
             &backend,
             0,
             "codex::test",
@@ -4191,15 +4191,15 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect_err("partial output makes retry unsafe");
+        .expect("a mid-stream disconnect should retry even after partial output");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(format!("{error:#}").contains("Codex stream read error"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
         assert_eq!(output.lock().unwrap().as_str(), "partial");
     }
 
     #[tokio::test]
-    async fn stream_chat_does_not_retry_incomplete_stream_after_partial_output() {
+    async fn stream_chat_retries_incomplete_stream_after_partial_output() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(IncompleteStreamRetryBackend {
             attempts: attempts.clone(),
@@ -4208,7 +4208,7 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
 
-        let error = stream_chat_with_transient_retry(
+        let response = stream_chat_with_transient_retry(
             &backend,
             0,
             "codex::test",
@@ -4223,10 +4223,10 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect_err("partial output makes retry unsafe");
+        .expect("an incomplete stream should retry even after partial output");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(is_incomplete_stream_error(&error));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
         assert_eq!(output.lock().unwrap().as_str(), "partial");
     }
 
