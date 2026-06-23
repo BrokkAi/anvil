@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -326,7 +326,10 @@ where
                     ),
                 };
                 let eof_after_buffer = if let Some(chunk) = chunk_opt {
-                    let chunk = chunk?;
+                    // Tag mid-stream transport failures so `is_retryable_llm_error`
+                    // classifies a dropped SSE body as retryable (matches the
+                    // codex_client path, which adds the same context).
+                    let chunk = chunk.context("Responses stream read error")?;
                     raw_buf.extend_from_slice(&chunk);
                     false
                 } else if raw_buf.is_empty() {
