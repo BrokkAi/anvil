@@ -56,16 +56,16 @@ const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// strip-trim selection ids still work.
 const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
 
-fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protocol::Error {
-    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
-        "reason": format!("{method} cwd must be absolute: {}", cwd.display()),
-    }))
-}
-
 fn parse_prompt_structured_output_request(
     req: &PromptRequest,
 ) -> Result<Option<StructuredOutputRequest>, String> {
     parse_structured_output_request(req.meta.as_ref()).map_err(|err| err.to_string())
+}
+
+fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!("{method} cwd must be absolute: {}", cwd.display()),
+    }))
 }
 
 fn prompt_response_meta(
