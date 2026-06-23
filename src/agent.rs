@@ -43,7 +43,7 @@ use crate::terminal_notifications::{
 /// does), so once we expose any configOption we have to expose all of them.
 const PERMISSION_CONFIG_ID: &str = "permission_mode";
 const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
-const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::LATEST;
+const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
 const MODEL_CONFIG_ID: &str = "model_selection";
@@ -6481,8 +6481,8 @@ mod tests {
     #[test]
     fn negotiate_protocol_version_accepts_supported_version() {
         assert_eq!(
-            negotiate_protocol_version(SUPPORTED_ACP_PROTOCOL_VERSION),
-            SUPPORTED_ACP_PROTOCOL_VERSION
+            negotiate_protocol_version(ProtocolVersion::V1),
+            ProtocolVersion::V1
         );
     }
 
@@ -6490,7 +6490,7 @@ mod tests {
     fn negotiate_protocol_version_downgrades_future_version() {
         assert_eq!(
             negotiate_protocol_version(ProtocolVersion::from(2_u16)),
-            SUPPORTED_ACP_PROTOCOL_VERSION
+            ProtocolVersion::V1
         );
     }
 
