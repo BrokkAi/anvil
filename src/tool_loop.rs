@@ -3746,6 +3746,7 @@ mod tests {
                     }
                     anyhow::bail!(first_error);
                 }
+                (request.on_token)("ok");
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
                     usage: TokenUsage::default(),
@@ -3782,6 +3783,7 @@ mod tests {
                         "response.completed",
                     )));
                 }
+                (request.on_token)("ok");
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
                     usage: TokenUsage::default(),
@@ -4126,7 +4128,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4158,7 +4160,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4195,7 +4197,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "partial");
+        assert_eq!(output.lock().unwrap().as_str(), "partialok");
     }
 
     #[tokio::test]
@@ -4227,7 +4229,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "partial");
+        assert_eq!(output.lock().unwrap().as_str(), "partialok");
     }
 
     #[test]
@@ -4275,7 +4277,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4308,7 +4310,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4341,7 +4343,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[test]
