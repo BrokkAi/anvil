@@ -89,6 +89,11 @@ fn run_smoke_case(case: &SmokeCase) {
         }),
     );
     assert_response_ok(case, "initialize", &initialize, &client);
+    assert_eq!(
+        initialize["result"]["protocolVersion"], 1,
+        "{}: initialize did not negotiate protocol version 1: {initialize}",
+        case.name
+    );
     assert!(
         initialize["result"]["agentCapabilities"]["promptCapabilities"].is_object(),
         "{}: initialize did not advertise promptCapabilities: {initialize}",

@@ -7,8 +7,8 @@ use agent_client_protocol::schema::{
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
     Cost, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
     SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
     SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
@@ -43,6 +43,7 @@ use crate::terminal_notifications::{
 /// does), so once we expose any configOption we have to expose all of them.
 const PERMISSION_CONFIG_ID: &str = "permission_mode";
 const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
+const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
 /// Mirrors the Java executor's wire id so cross-implementation clients
 /// (Zed, brokk-code) can drive model selection through one canonical name.
 const MODEL_CONFIG_ID: &str = "model_selection";
@@ -55,6 +56,14 @@ const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
 const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
+
+fn negotiate_protocol_version(requested: ProtocolVersion) -> ProtocolVersion {
+    if requested == SUPPORTED_ACP_PROTOCOL_VERSION {
+        requested
+    } else {
+        SUPPORTED_ACP_PROTOCOL_VERSION
+    }
+}
 
 fn parse_prompt_structured_output_request(
     req: &PromptRequest,
@@ -1026,8 +1035,9 @@ pub async fn run_agent(
                             .close(SessionCloseCapabilities::new()),
                     );
 
+                let protocol_version = negotiate_protocol_version(req.protocol_version);
                 responder.respond(
-                    InitializeResponse::new(req.protocol_version).agent_capabilities(capabilities),
+                    InitializeResponse::new(protocol_version).agent_capabilities(capabilities),
                 )
             },
             on_receive_request!(),
@@ -6467,6 +6477,22 @@ fn render_usage_report(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn negotiate_protocol_version_accepts_supported_version() {
+        assert_eq!(
+            negotiate_protocol_version(ProtocolVersion::V1),
+            ProtocolVersion::V1
+        );
+    }
+
+    #[test]
+    fn negotiate_protocol_version_downgrades_future_version() {
+        assert_eq!(
+            negotiate_protocol_version(ProtocolVersion::from(2_u16)),
+            ProtocolVersion::V1
+        );
+    }
 
     #[test]
     fn is_slash_command_matches_bare_and_with_args() {
