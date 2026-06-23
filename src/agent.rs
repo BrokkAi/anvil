@@ -71,6 +71,12 @@ fn parse_prompt_structured_output_request(
     parse_structured_output_request(req.meta.as_ref()).map_err(|err| err.to_string())
 }
 
+fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!("{method} cwd must be absolute: {}", cwd.display()),
+    }))
+}
+
 fn prompt_response_meta(
     result: Option<&StructuredOutputResult>,
     orchestration_model: Option<&ResolvedModelInfo>,
@@ -1049,6 +1055,13 @@ pub async fn run_agent(
                         cx: ConnectionTo<Client>| {
                 let cwd = req.cwd.clone();
                 tracing::info!("ACP session/new, cwd={}", cwd.display());
+                if !cwd.is_absolute() {
+                    tracing::warn!("session/new rejected relative cwd={}", cwd.display());
+                    return responder.respond_with_error(invalid_lifecycle_cwd_error(
+                        "session/new",
+                        &cwd,
+                    ));
+                }
                 let session_mcp_servers = acp_mcp_servers_to_configs(req.mcp_servers);
                 let session = sessions_new
                     .create_session_with_mcp_servers(cwd, Some(session_mcp_servers))
@@ -1146,6 +1159,16 @@ pub async fn run_agent(
                     "ACP session/load session={session_id}, cwd={}",
                     cwd.display()
                 );
+                if !cwd.is_absolute() {
+                    tracing::warn!(
+                        "session/load rejected relative cwd={} for session={session_id}",
+                        cwd.display()
+                    );
+                    return responder.respond_with_error(invalid_lifecycle_cwd_error(
+                        "session/load",
+                        &cwd,
+                    ));
+                }
 
                 // Look up the session from memory or disk
                 let session = match sessions_load.reopen_session(&session_id, &cwd).await {
@@ -1216,6 +1239,16 @@ pub async fn run_agent(
                     "ACP session/resume session={session_id}, cwd={}",
                     cwd.display()
                 );
+                if !cwd.is_absolute() {
+                    tracing::warn!(
+                        "session/resume rejected relative cwd={} for session={session_id}",
+                        cwd.display()
+                    );
+                    return responder.respond_with_error(invalid_lifecycle_cwd_error(
+                        "session/resume",
+                        &cwd,
+                    ));
+                }
 
                 match sessions_resume.reopen_session(&session_id, &cwd).await {
                     Some(session) => {

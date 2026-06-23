@@ -43,6 +43,119 @@ fn auto_permission_prompt_session_cancel_does_not_abort() {
     run_permission_cancel_case(&case, true);
 }
 
+#[test]
+fn relative_cwd_lifecycle_requests_return_invalid_params() {
+    let case = SmokeCase {
+        name: "relative_cwd_lifecycle_requests",
+        prompt: String::new(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let relative_new = client.request(
+        "session/new",
+        json!({
+            "cwd": "relative/repo",
+            "mcpServers": []
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new",
+        &relative_new,
+        "cwd must be absolute",
+        &client,
+    );
+
+    let new_session = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": []
+        }),
+    );
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let relative_load = client.request(
+        "session/load",
+        json!({
+            "sessionId": session_id.clone(),
+            "cwd": "relative/repo",
+            "mcpServers": []
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load",
+        &relative_load,
+        "cwd must be absolute",
+        &client,
+    );
+
+    let relative_resume = client.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": "relative/repo",
+            "mcpServers": []
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/resume",
+        &relative_resume,
+        "cwd must be absolute",
+        &client,
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited after relative cwd rejection; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
 fn run_smoke_case(case: &SmokeCase) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
@@ -902,6 +1015,24 @@ fn assert_response_error_contains(
     assert!(
         reason.contains(expected),
         "{}: {method} expected error reason containing '{expected}', got: {response}\nstderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+}
+
+fn assert_response_invalid_params_contains(
+    case: &SmokeCase,
+    method: &str,
+    response: &Value,
+    expected: &str,
+    client: &JsonRpcClient<'_>,
+) {
+    assert_response_error_contains(case, method, response, expected, client);
+    assert_eq!(
+        response["error"]["code"],
+        -32602,
+        "{}: {method} expected invalid params error, got: {response}\nstderr:\n{}\ntrace:\n{}",
         case.name,
         client.stderr_text(),
         client.trace_text()
