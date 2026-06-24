@@ -707,6 +707,133 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
 }
 
 #[test]
+fn mode_and_config_option_surfaces_stay_in_sync() {
+    let case = SmokeCase {
+        name: "mode_config_sync",
+        prompt: String::new(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+    // Discard any setup/usage updates from session/new before observing.
+    let _ = client.take_update_kinds();
+
+    // Changing the mode via config options also emits current_mode_update for
+    // the legacy modes surface (#157).
+    let set_behavior = client.request(
+        "session/set_config_option",
+        json!({ "sessionId": session_id, "configId": "behavior_mode", "value": "CODE" }),
+    );
+    assert_response_ok(
+        &case,
+        "session/set_config_option (behavior)",
+        &set_behavior,
+        &client,
+    );
+    let mode_update = client
+        .take_update_of_kind("current_mode_update")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: set_config_option(behavior_mode) did not emit current_mode_update",
+                case.name
+            )
+        });
+    assert_eq!(
+        mode_update["currentModeId"].as_str(),
+        Some("CODE"),
+        "{}: current_mode_update carried the wrong mode: {mode_update}",
+        case.name
+    );
+
+    // A non-mode config change must NOT emit a mode update (#157).
+    let set_perm = client.request(
+        "session/set_config_option",
+        json!({ "sessionId": session_id, "configId": "permission_mode", "value": "auto" }),
+    );
+    assert_response_ok(
+        &case,
+        "session/set_config_option (permission)",
+        &set_perm,
+        &client,
+    );
+    let kinds = client.take_update_kinds();
+    assert!(
+        !kinds.iter().any(|k| k == "current_mode_update"),
+        "{}: non-mode config change emitted an unnecessary current_mode_update: {kinds:?}",
+        case.name
+    );
+
+    // Changing the mode via the legacy modes API also emits config_option_update
+    // for the config-options surface (#156).
+    let set_mode = client.request(
+        "session/set_mode",
+        json!({ "sessionId": session_id, "modeId": "ASK" }),
+    );
+    assert_response_ok(&case, "session/set_mode", &set_mode, &client);
+    let config_update = client
+        .take_update_of_kind("config_option_update")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: set_mode did not emit config_option_update (#156)",
+                case.name
+            )
+        });
+    // The behavior-mode selector in the emitted set should reflect ASK.
+    let options_json = config_update.to_string();
+    assert!(
+        options_json.contains("ASK"),
+        "{}: config_option_update after set_mode did not reflect the new mode: {config_update}",
+        case.name
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during mode/config sync checks; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn invalid_prompt_requests_return_invalid_params() {
     let case = SmokeCase {
         name: "invalid_prompt_requests",
@@ -1473,6 +1600,9 @@ struct JsonRpcClient<'a> {
     stderr_lines: Vec<String>,
     cancel_permission_requests: bool,
     send_session_cancel_on_permission: bool,
+    /// `params` of every `session/update` notification observed while waiting
+    /// for responses, in arrival order.
+    session_updates: Vec<Value>,
 }
 
 impl<'a> JsonRpcClient<'a> {
@@ -1493,7 +1623,41 @@ impl<'a> JsonRpcClient<'a> {
             stderr_lines: Vec::new(),
             cancel_permission_requests: false,
             send_session_cancel_on_permission: false,
+            session_updates: Vec::new(),
         }
+    }
+
+    /// Drain the `session/update` notifications captured so far and return the
+    /// `update.sessionUpdate` discriminator of each, in order.
+    fn take_update_kinds(&mut self) -> Vec<String> {
+        self.session_updates
+            .drain(..)
+            .filter_map(|params| {
+                params
+                    .get("update")
+                    .and_then(|u| u.get("sessionUpdate"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Drain captured `session/update` notifications and return the full
+    /// `update` object of the first one matching `kind`, if any.
+    fn take_update_of_kind(&mut self, kind: &str) -> Option<Value> {
+        let found = self
+            .session_updates
+            .iter()
+            .find(|params| {
+                params
+                    .get("update")
+                    .and_then(|u| u.get("sessionUpdate"))
+                    .and_then(Value::as_str)
+                    == Some(kind)
+            })
+            .and_then(|params| params.get("update").cloned());
+        self.session_updates.clear();
+        found
     }
 
     fn with_permission_cancel_response(mut self, send_session_cancel: bool) -> Self {
@@ -1543,6 +1707,16 @@ impl<'a> JsonRpcClient<'a> {
                         .unwrap_or_else(|e| panic!("invalid json line from anvil: {e}: {line}"));
                     if value.get("id").and_then(Value::as_u64) == Some(id) {
                         return value;
+                    }
+                    // Capture session/update notifications (method, no id) so
+                    // tests can assert on emitted updates.
+                    if value.get("id").is_none()
+                        && value.get("method").and_then(Value::as_str) == Some("session/update")
+                    {
+                        if let Some(params) = value.get("params") {
+                            self.session_updates.push(params.clone());
+                        }
+                        continue;
                     }
                     if value.get("id").is_some() && value.get("method").is_some() {
                         if self.cancel_permission_requests

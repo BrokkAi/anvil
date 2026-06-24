@@ -5,14 +5,15 @@ use std::time::Duration;
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    Cost, EmbeddedResource, EmbeddedResourceResource, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
-    SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    Cost, CurrentModeUpdate, EmbeddedResource, EmbeddedResourceResource, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ResourceLink,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOption, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, Usage as AcpUsage, UsageUpdate,
 };
@@ -453,6 +454,27 @@ impl ConfigApplyError {
 /// value, mutates session state, and returns the full re-derived options
 /// list so the caller can emit a `ConfigOptionUpdate` notification with
 /// the spec-required complete state.
+/// Re-fetch the session and build the complete current `SessionConfigOption`
+/// list. ACP config-option responses and `config_option_update` notifications
+/// carry the full set (not just the changed selector), so both the
+/// `session/set_config_option` and `session/set_mode` paths use this. Returns
+/// `None` if the session is unknown.
+async fn current_config_options(
+    sessions: &SessionStore,
+    session_id: &str,
+) -> Option<Vec<SessionConfigOption>> {
+    let fallback_cwd = std::env::current_dir().unwrap_or_default();
+    let session = sessions.get_session(session_id, &fallback_cwd).await?;
+    let catalog = sessions.available_model_metadata().await;
+    Some(all_config_options(
+        session.mode,
+        session.permission_mode,
+        &session.model,
+        &catalog,
+        session.selected_reasoning_effort.as_deref(),
+    ))
+}
+
 async fn apply_config_option(
     sessions: &SessionStore,
     session_id: &str,
@@ -594,18 +616,9 @@ async fn apply_config_option(
     // Re-fetch the session so the returned options reflect the latest
     // values for *all* selectors. The spec says the response carries the
     // full updated set, not just the one we changed.
-    let fallback_cwd = std::env::current_dir().unwrap_or_default();
-    let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
-        return Err(ConfigApplyError::UnknownSession);
-    };
-    let catalog = sessions.available_model_metadata().await;
-    let updated_options = all_config_options(
-        session.mode,
-        session.permission_mode,
-        &session.model,
-        &catalog,
-        session.selected_reasoning_effort.as_deref(),
-    );
+    let updated_options = current_config_options(sessions, session_id)
+        .await
+        .ok_or(ConfigApplyError::UnknownSession)?;
 
     Ok(ConfigApplyOutcome {
         updated_options,
@@ -2458,7 +2471,7 @@ pub async fn run_agent(
         .on_receive_request(
             async move |req: SetSessionModeRequest,
                         responder: Responder<SetSessionModeResponse>,
-                        _cx: ConnectionTo<Client>| {
+                        cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.to_string();
                 let mode_id = req.mode_id.to_string();
                 tracing::info!("ACP set_mode session={session_id} mode={mode_id}");
@@ -2476,7 +2489,27 @@ pub async fn run_agent(
                 };
 
                 match sessions_mode.set_mode(&session_id, mode).await {
-                    Ok(true) => responder.respond(SetSessionModeResponse::new()),
+                    Ok(true) => {
+                        // Config options supersede legacy modes, but Anvil
+                        // exposes both. Keep clients on the config-options
+                        // surface in sync by emitting a config_option_update
+                        // with the complete current set after a mode change
+                        // through the legacy modes API (#156).
+                        if let Some(options) =
+                            current_config_options(&sessions_mode, &session_id).await
+                        {
+                            let notification = SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                            );
+                            if let Err(e) = cx.send_notification(notification) {
+                                tracing::warn!(
+                                    "failed to send config_option_update after set_mode: {e}"
+                                );
+                            }
+                        }
+                        responder.respond(SetSessionModeResponse::new())
+                    }
                     Ok(false) => responder.respond_with_error(
                         agent_client_protocol::Error::invalid_params().data(serde_json::json!({
                             "reason": format!("unknown session '{session_id}'"),
@@ -2584,6 +2617,23 @@ pub async fn run_agent(
                 if let Err(e) = cx.send_notification(notification) {
                     tracing::warn!("failed to send config_option_update: {e}");
                 }
+
+                // When the change was the behavior-mode selector, keep the
+                // legacy modes surface in sync by also emitting
+                // current_mode_update for clients reading modes.currentModeId
+                // (#157). Non-mode config changes do not emit a mode update.
+                if config_id == BEHAVIOR_CONFIG_ID
+                    && let Some(mode) = SessionMode::parse(&value)
+                {
+                    let mode_notification = SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.as_str())),
+                    );
+                    if let Err(e) = cx.send_notification(mode_notification) {
+                        tracing::warn!("failed to send current_mode_update: {e}");
+                    }
+                }
+
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
                 send_session_usage_update(&cx, &sessions_perm, &session_id, &fallback_cwd).await;
 
