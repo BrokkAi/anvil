@@ -707,6 +707,162 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
 }
 
 #[test]
+fn session_fork_creates_independent_session() {
+    let case = SmokeCase {
+        name: "session_fork",
+        prompt: "Summarize the repo.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+    let other_cwd = temp.path().join("other-repo");
+    std::fs::create_dir_all(&other_cwd).expect("create other cwd");
+    std::fs::create_dir_all(other_cwd.join(".git")).expect("create other git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    // One turn to name the source, one to exercise the fork.
+    let provider = start_openai_smoke_server(vec![
+        text_sse_body("Source summary."),
+        text_sse_body("Fork summary."),
+    ]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["fork"].is_object(),
+        "{}: initialize did not advertise sessionCapabilities.fork: {initialize}",
+        case.name
+    );
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let source_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": source_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt (source)", &prompt, &client);
+
+    // Fork the source into a new, independent session.
+    let fork = client.request(
+        "session/fork",
+        json!({ "sessionId": source_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_ok(&case, "session/fork", &fork, &client);
+    let fork_id = fork["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: fork missing sessionId: {fork}", case.name))
+        .to_string();
+    assert_ne!(
+        fork_id, source_id,
+        "{}: fork must have a fresh id",
+        case.name
+    );
+    assert!(
+        fork["result"]["modes"].is_object() && fork["result"]["configOptions"].is_array(),
+        "{}: fork response missing modes/configOptions: {fork}",
+        case.name
+    );
+
+    // Both the source and the fork are listed.
+    let listed: Vec<String> =
+        client.request("session/list", json!({ "cwd": cwd }))["result"]["sessions"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s["sessionId"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+    assert!(
+        listed.contains(&source_id) && listed.contains(&fork_id),
+        "{}: expected both source and fork listed: {listed:?}",
+        case.name
+    );
+
+    // The fork is independently promptable.
+    let fork_prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": fork_id,
+            "prompt": [ { "type": "text", "text": "continue" } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt (fork)", &fork_prompt, &client);
+
+    // Forking an unknown source errors; a mismatched cwd errors.
+    let fork_unknown = client.request(
+        "session/fork",
+        json!({ "sessionId": "never-existed", "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/fork (unknown)",
+        &fork_unknown,
+        "unknown session",
+        &client,
+    );
+    let fork_mismatch = client.request(
+        "session/fork",
+        json!({ "sessionId": source_id, "cwd": other_cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/fork (cwd mismatch)",
+        &fork_mismatch,
+        "does not match",
+        &client,
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during session/fork checks; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn session_delete_removes_session_and_is_idempotent() {
     let case = SmokeCase {
         name: "session_delete",
