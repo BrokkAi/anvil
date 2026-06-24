@@ -132,7 +132,14 @@ fn default_bifrost_args() -> Vec<String> {
         "--root".to_string(),
         "{cwd}".to_string(),
         "--server".to_string(),
-        "core".to_string(),
+        // `searchtools` is Bifrost's full read-only surface: the `core`
+        // symbol/nlp/workspace tools plus the extended/text search tools and
+        // the SlopCop code-quality reporters. SlopCop ACP read-only sessions
+        // need the reporters (and tools like find_filenames/get_file_contents)
+        // exposed; `core` advertised neither (#121). Every tool `searchtools`
+        // advertises has a read-classified `ToolMeta` row, which the
+        // Bifrost handshake/anti-drift test asserts.
+        "searchtools".to_string(),
         "--no-line-numbers".to_string(),
     ]
 }
@@ -810,10 +817,30 @@ mod tests {
             "usage_graph",
             "activate_workspace",
             "get_active_workspace",
+            // Extended/text search tools the SlopCop workflow relies on, now
+            // exposed by the default `searchtools` surface (#121).
+            "find_filenames",
+            "get_file_contents",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool {expected} in {names:?}"
+            );
+        }
+
+        // The SlopCop code-quality reporters must be advertised by the default
+        // surface AND known to Anvil's permission metadata, so read-only ACP
+        // sessions can call them instead of having them fall back to
+        // `ToolKind::Other` and be blocked (#121).
+        for reporter in crate::tools::SLOPCOP_BIFROST_READ_ONLY_TOOLS {
+            assert!(
+                names.contains(reporter),
+                "SlopCop reporter '{reporter}' not advertised by default Bifrost surface; \
+                 got {names:?}"
+            );
+            assert!(
+                crate::tools::is_known_tool(reporter),
+                "SlopCop reporter '{reporter}' is advertised but missing from the TOOLS table"
             );
         }
 
