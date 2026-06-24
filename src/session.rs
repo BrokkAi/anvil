@@ -2130,7 +2130,7 @@ fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
 /// (`.`/`..`, symlinks) reuse the same cached registry and Bifrost subprocess.
 /// If the path no longer exists, fall back to the lexical path so callers with
 /// a stale cwd still get a deterministic comparison.
-fn normalize_cwd(path: &Path) -> PathBuf {
+pub(crate) fn normalize_cwd(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 

@@ -28,7 +28,7 @@ use crate::multi_backend::MultiBackend;
 use crate::session::{
     CloseSessionResult, ConversationTurn, PermissionMode, PromptStartError,
     REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode, SessionSnapshot,
-    SessionStore, acp_mcp_servers_to_configs,
+    SessionStore, acp_mcp_servers_to_configs, normalize_cwd,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -78,12 +78,50 @@ fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protoco
     }))
 }
 
-/// Build the protocol error returned when a `session/prompt` request names a
-/// session Anvil does not know. Shared by the prompt-path sites (cold-miss,
-/// closed-mid-request, and registry rebuild) so the wording stays identical.
+/// Build the protocol error returned when a request names a session Anvil
+/// does not know. Shared by the `session/prompt` sites (cold-miss,
+/// closed-mid-request, registry rebuild) and the `session/load` /
+/// `session/resume` lifecycle handlers so the wording stays identical and
+/// unknown sessions surface as protocol errors rather than synthetic agent
+/// messages plus a successful response.
 fn unknown_session_error(session_id: &str) -> agent_client_protocol::Error {
     agent_client_protocol::Error::invalid_params().data(serde_json::json!({
         "reason": format!("unknown session '{session_id}'"),
+    }))
+}
+
+/// Build the protocol error returned when a lifecycle request's `cwd` does not
+/// match the cwd an existing in-memory session was created/loaded under. ACP
+/// treats `cwd` as the session working directory; silently moving a warm
+/// session to a different root would change project instructions, skills,
+/// permission scope, and sandbox assumptions, so Anvil rejects the move.
+fn lifecycle_cwd_mismatch_error(
+    method: &str,
+    session_cwd: &Path,
+    requested_cwd: &Path,
+) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!(
+            "{method} cwd '{}' does not match the session's cwd '{}'; moving a \
+             session between working directories is not supported",
+            requested_cwd.display(),
+            session_cwd.display(),
+        ),
+    }))
+}
+
+/// Build the protocol error returned for non-empty `additionalDirectories` on
+/// a lifecycle request. Anvil does not advertise
+/// `sessionCapabilities.additionalDirectories`, so rather than silently
+/// dropping requested roots -- a footgun where the session looks configured
+/// but tools cannot reach those roots -- it rejects them until multi-root
+/// support exists.
+fn unsupported_additional_directories_error(method: &str) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!(
+            "{method} additionalDirectories is not supported: Anvil does not advertise \
+             sessionCapabilities.additionalDirectories"
+        ),
     }))
 }
 
@@ -1114,6 +1152,14 @@ pub async fn run_agent(
                         &cwd,
                     ));
                 }
+                if !req.additional_directories.is_empty() {
+                    tracing::warn!(
+                        "session/new rejected {} additionalDirectories (unsupported)",
+                        req.additional_directories.len()
+                    );
+                    return responder
+                        .respond_with_error(unsupported_additional_directories_error("session/new"));
+                }
                 let session_mcp_servers = acp_mcp_servers_to_configs(req.mcp_servers);
                 let session = sessions_new
                     .create_session_with_mcp_servers(cwd, Some(session_mcp_servers))
@@ -1221,19 +1267,41 @@ pub async fn run_agent(
                         &cwd,
                     ));
                 }
+                if !req.additional_directories.is_empty() {
+                    tracing::warn!(
+                        "session/load rejected {} additionalDirectories (unsupported) for session={session_id}",
+                        req.additional_directories.len()
+                    );
+                    return responder.respond_with_error(
+                        unsupported_additional_directories_error("session/load"),
+                    );
+                }
 
-                // Look up the session from memory or disk
+                // Look up the session from memory or disk. Unknown ids are a
+                // protocol error, not a successful empty load (#154).
                 let session = match sessions_load.reopen_session(&session_id, &cwd).await {
-                    Some(s) => {
-                        sessions_load.update_cwd(&session_id, cwd).await;
-                        s
-                    }
+                    Some(s) => s,
                     None => {
                         tracing::warn!("session/load: unknown session {session_id}");
-                        send_message(&cx, &session_id, "Error: unknown session");
-                        return responder.respond(LoadSessionResponse::new());
+                        return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
+                // A warm session keeps the cwd it was created/loaded under;
+                // reject a request that would move it elsewhere (#147). Cold
+                // loads adopt the request cwd, so they compare equal here.
+                if normalize_cwd(&session.cwd) != normalize_cwd(&cwd) {
+                    tracing::warn!(
+                        "session/load cwd mismatch session={session_id}: session cwd={} request cwd={}",
+                        session.cwd.display(),
+                        cwd.display()
+                    );
+                    return responder.respond_with_error(lifecycle_cwd_mismatch_error(
+                        "session/load",
+                        &session.cwd,
+                        &cwd,
+                    ));
+                }
+                sessions_load.update_cwd(&session_id, cwd).await;
 
                 // Replay conversation history as session updates (both sides).
                 for turn in &session.history {
@@ -1301,49 +1369,72 @@ pub async fn run_agent(
                         &cwd,
                     ));
                 }
+                if !req.additional_directories.is_empty() {
+                    tracing::warn!(
+                        "session/resume rejected {} additionalDirectories (unsupported) for session={session_id}",
+                        req.additional_directories.len()
+                    );
+                    return responder.respond_with_error(
+                        unsupported_additional_directories_error("session/resume"),
+                    );
+                }
 
-                match sessions_resume.reopen_session(&session_id, &cwd).await {
-                    Some(session) => {
-                        sessions_resume.update_cwd(&session_id, cwd).await;
-                        let catalog = sessions_resume.available_model_metadata().await;
-                        let setup_session = session.clone();
-                        let setup_catalog = catalog.clone();
-                        let result = responder.respond(
-                            ResumeSessionResponse::new()
-                                .modes(mode_state(session.mode.as_str()))
-                                .config_options(all_config_options(
-                                    session.mode,
-                                    session.permission_mode,
-                                    &session.model,
-                                    &catalog,
-                                    session.selected_reasoning_effort.as_deref(),
-                                )),
-                        );
-                        spawn_delayed_available_commands_update(
-                            cx.clone(),
-                            session_id.clone(),
-                            session.skills.clone(),
-                        );
-                        spawn_delayed_session_usage_update(
-                            cx.clone(),
-                            sessions_resume.clone(),
-                            session_id.clone(),
-                            session.cwd.clone(),
-                        );
-                        spawn_delayed_setup_notice(
-                            cx.clone(),
-                            setup_session,
-                            setup_catalog,
-                            sessions_resume.clone(),
-                        );
-                        result
-                    }
+                // Unknown ids are a protocol error, not a successful empty
+                // resume (#154).
+                let session = match sessions_resume.reopen_session(&session_id, &cwd).await {
+                    Some(s) => s,
                     None => {
                         tracing::warn!("session/resume: unknown session {session_id}");
-                        send_message(&cx, &session_id, "Error: unknown session");
-                        responder.respond(ResumeSessionResponse::new())
+                        return responder.respond_with_error(unknown_session_error(&session_id));
                     }
+                };
+                // Reject a request that would move a warm session to a
+                // different cwd (#147).
+                if normalize_cwd(&session.cwd) != normalize_cwd(&cwd) {
+                    tracing::warn!(
+                        "session/resume cwd mismatch session={session_id}: session cwd={} request cwd={}",
+                        session.cwd.display(),
+                        cwd.display()
+                    );
+                    return responder.respond_with_error(lifecycle_cwd_mismatch_error(
+                        "session/resume",
+                        &session.cwd,
+                        &cwd,
+                    ));
                 }
+                sessions_resume.update_cwd(&session_id, cwd).await;
+                let catalog = sessions_resume.available_model_metadata().await;
+                let setup_session = session.clone();
+                let setup_catalog = catalog.clone();
+                let result = responder.respond(
+                    ResumeSessionResponse::new()
+                        .modes(mode_state(session.mode.as_str()))
+                        .config_options(all_config_options(
+                            session.mode,
+                            session.permission_mode,
+                            &session.model,
+                            &catalog,
+                            session.selected_reasoning_effort.as_deref(),
+                        )),
+                );
+                spawn_delayed_available_commands_update(
+                    cx.clone(),
+                    session_id.clone(),
+                    session.skills.clone(),
+                );
+                spawn_delayed_session_usage_update(
+                    cx.clone(),
+                    sessions_resume.clone(),
+                    session_id.clone(),
+                    session.cwd.clone(),
+                );
+                spawn_delayed_setup_notice(
+                    cx.clone(),
+                    setup_session,
+                    setup_catalog,
+                    sessions_resume.clone(),
+                );
+                result
             },
             on_receive_request!(),
         )

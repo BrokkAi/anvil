@@ -157,6 +157,159 @@ fn relative_cwd_lifecycle_requests_return_invalid_params() {
 }
 
 #[test]
+fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
+    let case = SmokeCase {
+        name: "lifecycle_validation",
+        prompt: String::new(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+    // A second, distinct repo root used to exercise cwd-mismatch rejection.
+    let other_cwd = temp.path().join("other-repo");
+    std::fs::create_dir_all(&other_cwd).expect("create other cwd");
+    std::fs::create_dir_all(other_cwd.join(".git")).expect("create other git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    // session/new with additionalDirectories is rejected: Anvil does not
+    // advertise the capability (#149).
+    let new_with_dirs = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [other_cwd]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new (additionalDirectories)",
+        &new_with_dirs,
+        "additionalDirectories is not supported",
+        &client,
+    );
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    // Unknown ids are protocol errors, not successful empty lifecycle
+    // responses (#154).
+    let unknown_load = client.request(
+        "session/load",
+        json!({ "sessionId": "does-not-exist", "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load (unknown)",
+        &unknown_load,
+        "unknown session",
+        &client,
+    );
+    let unknown_resume = client.request(
+        "session/resume",
+        json!({ "sessionId": "does-not-exist", "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/resume (unknown)",
+        &unknown_resume,
+        "unknown session",
+        &client,
+    );
+
+    // Loading a warm session under a different cwd is rejected (#147).
+    let mismatched_load = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": other_cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load (cwd mismatch)",
+        &mismatched_load,
+        "does not match",
+        &client,
+    );
+    let mismatched_resume = client.request(
+        "session/resume",
+        json!({ "sessionId": session_id, "cwd": other_cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/resume (cwd mismatch)",
+        &mismatched_resume,
+        "does not match",
+        &client,
+    );
+
+    // additionalDirectories on load/resume is also rejected (#149).
+    let load_with_dirs = client.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [other_cwd]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load (additionalDirectories)",
+        &load_with_dirs,
+        "additionalDirectories is not supported",
+        &client,
+    );
+
+    // The matching-cwd load still succeeds (#147 regression guard).
+    let ok_load = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_ok(&case, "session/load (matching cwd)", &ok_load, &client);
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during lifecycle validation; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn invalid_prompt_requests_return_invalid_params() {
     let case = SmokeCase {
         name: "invalid_prompt_requests",
