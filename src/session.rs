@@ -2191,9 +2191,13 @@ pub struct SessionStore {
     /// Serializes lifecycle transitions that must agree across close,
     /// prompt startup, cold-load, and registry creation.
     lifecycle_lock: Arc<Mutex<()>>,
-    /// Sessions this server process has created or loaded. Eviction drops
-    /// only resident state, so these IDs remain closeable after LRU eviction.
-    known_sessions: Arc<RwLock<HashSet<String>>>,
+    /// Sessions this server process has created or loaded, mapped to the cwd
+    /// their persisted zip lives under. Eviction drops only resident state, so
+    /// these entries remain after LRU eviction -- keeping a session closeable,
+    /// and letting `session/delete` (whose request carries no cwd) locate the
+    /// archive by id alone. Grows for the process lifetime like any
+    /// known-session registry; entries are removed only on delete.
+    known_sessions: Arc<RwLock<HashMap<String, PathBuf>>>,
     /// Sessions explicitly closed during this server process. Closing is
     /// intentionally non-destructive on disk, and explicit load/resume may
     /// reopen the persisted zip. Prompt startup and registry creation still
@@ -2204,11 +2208,6 @@ pub struct SessionStore {
     /// behind a sync `Mutex` because every touch is a fast in-memory bump
     /// and must not require holding a tokio lock across `.await` points.
     last_accessed: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// Working directory of every session this process has created or loaded,
-    /// retained across LRU eviction so `session/delete` (whose request carries
-    /// no cwd) can locate and remove the persisted zip by session id alone.
-    /// Removed only when a session is deleted.
-    session_cwds: Arc<RwLock<HashMap<String, PathBuf>>>,
     next_access: Arc<AtomicU64>,
     limits: SessionLimits,
 }
@@ -2267,10 +2266,9 @@ impl SessionStore {
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
             lifecycle_lock: Arc::new(Mutex::new(())),
-            known_sessions: Arc::new(RwLock::new(HashSet::new())),
+            known_sessions: Arc::new(RwLock::new(HashMap::new())),
             closed_sessions: Arc::new(RwLock::new(HashSet::new())),
             last_accessed: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            session_cwds: Arc::new(RwLock::new(HashMap::new())),
             next_access: Arc::new(AtomicU64::new(0)),
             limits,
         }
@@ -2625,8 +2623,7 @@ impl SessionStore {
             .insert(id.clone(), session.clone());
         {
             let _lifecycle = self.lifecycle_lock.lock().await;
-            self.known_sessions.write().await.insert(id.clone());
-            self.session_cwds
+            self.known_sessions
                 .write()
                 .await
                 .insert(id.clone(), cwd.clone());
@@ -2759,8 +2756,7 @@ impl SessionStore {
             let len_before = sessions.len();
             sessions.entry(id.to_string()).or_insert(session);
             let inserted = sessions.len() > len_before;
-            self.known_sessions.write().await.insert(id.to_string());
-            self.session_cwds
+            self.known_sessions
                 .write()
                 .await
                 .insert(id.to_string(), cwd.to_path_buf());
@@ -3631,6 +3627,8 @@ impl SessionStore {
         };
 
         let turn_for_zip = turn.clone();
+        // Keep a copy of the path so we can undo a write that raced a delete.
+        let zip_path_for_compensate = zip_path.clone();
         let join_result = tokio::task::spawn_blocking(move || {
             append_turn_to_zip(&zip_path, &manifest, &turn_for_zip)
         })
@@ -3657,6 +3655,24 @@ impl SessionStore {
                 return Err(e);
             }
         };
+
+        // Compensate for a concurrent `session/delete`: deletion forgets the id
+        // from `known_sessions` and erases the archive, but a turn that raced
+        // past that may have re-created the zip (`append_turn_to_zip` rebuilds a
+        // missing archive). If the session is no longer known, our write
+        // resurrected a deleted session -- remove the orphan archive so it stays
+        // gone and never reappears in `session/list`.
+        if !self.known_sessions.read().await.contains_key(id) {
+            tracing::info!(
+                session_id = %id,
+                "discarding turn persisted for a concurrently-deleted session"
+            );
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&zip_path_for_compensate);
+            })
+            .await;
+            return Ok(());
+        }
         // Stamp the persisted fragment id back onto the in-memory
         // turn so subsequent `set_turn_summary` calls can locate the
         // right `summaryContentId` to rewrite without re-reading the
@@ -3757,7 +3773,7 @@ impl SessionStore {
             if self.closed_sessions.read().await.contains(session_id) {
                 return CloseSessionResult::AlreadyClosed;
             }
-            let known = self.known_sessions.read().await.contains(session_id);
+            let known = self.known_sessions.read().await.contains_key(session_id);
             let resident = self.sessions.read().await.contains_key(session_id);
             if !known && !resident {
                 return CloseSessionResult::Unknown;
@@ -3784,6 +3800,11 @@ impl SessionStore {
     /// located via the remembered cwd (the `session/delete` request carries
     /// none); a session created in a previous process and never touched here
     /// has no remembered cwd and is treated as already-gone.
+    ///
+    /// The deleted id is tombstoned in `closed_sessions` so a turn from the
+    /// cancelled in-flight prompt that races past `remove_resident_session`
+    /// cannot persist (and thus re-create) the archive -- `add_turn` refuses to
+    /// persist a tombstoned session.
     pub async fn delete_session(&self, session_id: &str) -> bool {
         let cwd = {
             let _lifecycle = self.lifecycle_lock.lock().await;
@@ -3794,12 +3815,15 @@ impl SessionStore {
             // Resolve the cwd from resident state or the remembered map.
             let cwd = match self.sessions.read().await.get(session_id) {
                 Some(session) => Some(session.cwd.clone()),
-                None => self.session_cwds.read().await.get(session_id).cloned(),
+                None => self.known_sessions.read().await.get(session_id).cloned(),
             };
-            // Forget the session everywhere so it cannot be reopened or listed.
+            // Forget the session, and tombstone it so a racing add_turn from the
+            // cancelled prompt cannot resurrect the archive.
             self.known_sessions.write().await.remove(session_id);
-            self.session_cwds.write().await.remove(session_id);
-            self.closed_sessions.write().await.remove(session_id);
+            self.closed_sessions
+                .write()
+                .await
+                .insert(session_id.to_string());
             cwd
         };
         // Drop resident registry/MCP/history state (outside the lifecycle lock,
@@ -5261,12 +5285,8 @@ mod tests {
             "deleted session must not cold-load"
         );
         assert!(
-            !store.known_sessions.read().await.contains(&id),
-            "deleted session must be forgotten"
-        );
-        assert!(
-            !store.session_cwds.read().await.contains_key(&id),
-            "deleted session cwd must be forgotten"
+            !store.known_sessions.read().await.contains_key(&id),
+            "deleted session (and its remembered cwd) must be forgotten"
         );
         let listed = store.list_sessions_from_disk(cwd.path()).await;
         assert!(
@@ -5314,6 +5334,44 @@ mod tests {
         assert!(
             !store.cancel_tokens.read().await.contains_key(&session.id),
             "delete_session should remove the prompt token"
+        );
+    }
+
+    /// A turn from a cancelled in-flight prompt that races a `session/delete`
+    /// must not resurrect the archive: `add_turn` re-creates the zip but, on
+    /// finding the session forgotten, removes its own write (#141).
+    #[tokio::test]
+    async fn add_turn_compensates_for_concurrent_delete() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let id = session.id.clone();
+
+        // Simulate the race window: the session is still resident (a turn is
+        // in flight, so add_turn can read the existing zip and rewrite it) but
+        // `delete_session` has already forgotten it from `known_sessions`. The
+        // rewrite resurrects the archive; the compensate must remove it again.
+        store.known_sessions.write().await.remove(&id);
+        assert!(
+            session_zip_path(cwd.path(), &id).exists(),
+            "zip should still exist so the racing write can resurrect it"
+        );
+
+        store
+            .add_turn(
+                &id,
+                ConversationTurn {
+                    user_prompt: "racing".into(),
+                    agent_response: "turn".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("add_turn should succeed");
+
+        assert!(
+            !session_zip_path(cwd.path(), &id).exists(),
+            "add_turn must remove the archive it re-created for a deleted session"
         );
     }
 
