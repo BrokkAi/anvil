@@ -239,9 +239,11 @@ Built-in commands:
 - `/mcp`: list and configure stdio MCP servers.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
 
-Skill slash commands are discovered from `SKILL.md` files. If a skill name
-collides with a built-in command, the built-in command wins and the skill slash
-entry is hidden from autocomplete.
+Skill slash commands are discovered from `SKILL.md` files under
+`$CODEX_HOME/skills` (or `~/.codex/skills`), `~/.claude/skills`,
+`~/.agents/skills`, and project `.claude/skills` / `.agents/skills` roots. If a
+skill name collides with a built-in command, the built-in command wins and the
+skill slash entry is hidden from autocomplete.
 
 ## MCP Servers
 
