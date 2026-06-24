@@ -53,6 +53,7 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 const SKILL_FILE: &str = "SKILL.md";
 const AGENTS_DIR: &str = ".agents";
 const CLAUDE_DIR: &str = ".claude";
+const CODEX_DIR: &str = ".codex";
 const SKILLS_SUBDIR: &str = "skills";
 
 /// Discovered SKILL.md metadata. The body is loaded on demand by the
@@ -211,16 +212,24 @@ fn discover_with_backend(
     let mut reg = SkillRegistry::default();
     let mut candidates = Vec::new();
 
-    // 1+2. User scope: `~/.claude/skills/` then `~/.agents/skills/`.
-    //      `.agents/` is scanned last so it wins under last-wins.
+    // User scope: `$CODEX_HOME/skills` (or `~/.codex/skills`) first for
+    // Codex compatibility, then `~/.claude/skills/`, then
+    // `~/.agents/skills/`. `.agents/` remains last so explicit
+    // cross-client user skills win under last-wins.
     if let Some(h) = home {
-        scan_root(
+        scan_codex_root(
+            &codex_home_dir(h).join(SKILLS_SUBDIR),
+            SkillScope::User,
+            &mut candidates,
+            &mut reg,
+        );
+        scan_spec_root(
             &h.join(CLAUDE_DIR).join(SKILLS_SUBDIR),
             SkillScope::User,
             &mut candidates,
             &mut reg,
         );
-        scan_root(
+        scan_spec_root(
             &h.join(AGENTS_DIR).join(SKILLS_SUBDIR),
             SkillScope::User,
             &mut candidates,
@@ -233,13 +242,13 @@ fn discover_with_backend(
     //      deeper directory and the `.agents/` variant naturally win.
     let git_root = find_git_root(&cwd);
     for dir in build_dir_chain(&cwd, git_root.as_deref()) {
-        scan_root(
+        scan_spec_root(
             &dir.join(CLAUDE_DIR).join(SKILLS_SUBDIR),
             SkillScope::Project,
             &mut candidates,
             &mut reg,
         );
-        scan_root(
+        scan_spec_root(
             &dir.join(AGENTS_DIR).join(SKILLS_SUBDIR),
             SkillScope::Project,
             &mut candidates,
@@ -267,11 +276,37 @@ fn discover_with_backend(
     reg
 }
 
+fn codex_home_dir(home: &Path) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(CODEX_DIR))
+}
+
+fn scan_spec_root(
+    root: &Path,
+    scope: SkillScope,
+    candidates: &mut Vec<SkillCandidate>,
+    reg: &mut SkillRegistry,
+) {
+    scan_root(root, scope, candidates, reg, false);
+}
+
+fn scan_codex_root(
+    root: &Path,
+    scope: SkillScope,
+    candidates: &mut Vec<SkillCandidate>,
+    reg: &mut SkillRegistry,
+) {
+    scan_root(root, scope, candidates, reg, true);
+}
+
 fn scan_root(
     root: &Path,
     scope: SkillScope,
     candidates: &mut Vec<SkillCandidate>,
     reg: &mut SkillRegistry,
+    allow_hidden_dirs: bool,
 ) {
     // Empty/missing root is the common case (no `.agents/skills/`
     // anywhere). Distinguish from real errors so we don't spam warnings.
@@ -291,7 +326,7 @@ fn scan_root(
         .max_depth(MAX_DEPTH)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e));
+        .filter_entry(|e| !is_excluded_dir(e, allow_hidden_dirs));
 
     let mut scanned = 0usize;
     // Drop the bare `read_dir` handle now that we've decided to scan.
@@ -366,7 +401,7 @@ fn dedupe_candidates(
 /// Skip `.git/`, `node_modules/`, and any other hidden directory that
 /// doesn't itself name the skill root. The root entry (`skills/`) is the
 /// `WalkDir` starting point and always allowed.
-fn is_excluded_dir(entry: &walkdir::DirEntry) -> bool {
+fn is_excluded_dir(entry: &walkdir::DirEntry, allow_hidden_dirs: bool) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
@@ -380,8 +415,10 @@ fn is_excluded_dir(entry: &walkdir::DirEntry) -> bool {
     if name == ".git" || name == "node_modules" || name == "target" {
         return true;
     }
-    // Hidden directories under `skills/` are not part of the spec.
-    name.starts_with('.')
+    // Hidden directories under spec roots are not part of the
+    // cross-client layout. Codex uses hidden category directories such
+    // as `.system`, so allow them only for the Codex compatibility root.
+    !allow_hidden_dirs && name.starts_with('.')
 }
 
 fn load_skill(
@@ -641,6 +678,17 @@ mod tests {
         p
     }
 
+    fn codex_skill_at(home: &Path, category: &str, name: &str, body: &str) -> PathBuf {
+        let p = home
+            .join(CODEX_DIR)
+            .join(SKILLS_SUBDIR)
+            .join(category)
+            .join(name)
+            .join(SKILL_FILE);
+        write(&p, body);
+        p
+    }
+
     /// macOS canonicalizes `/var/folders/...` to `/private/var/folders/...`,
     /// so comparing the registry's resolved path against a raw `TempDir`
     /// path fails on darwin even when discovery is correct. Both sides go
@@ -678,6 +726,34 @@ mod tests {
         let meta = reg.get("hello").unwrap();
         assert_eq!(meta.description, "say hi");
         assert_eq!(meta.scope, SkillScope::Project);
+    }
+
+    #[test]
+    fn user_codex_system_skills_are_discovered() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.blocking_lock();
+        let _codex_home = EnvScope::remove("CODEX_HOME");
+
+        let project = TempDir::new().unwrap();
+        touch_git(project.path());
+        let home = TempDir::new().unwrap();
+        codex_skill_at(
+            home.path(),
+            ".system",
+            "openai-docs",
+            &minimal("openai-docs", "OpenAI docs"),
+        );
+
+        let reg = discover_inner(project.path(), Some(home.path()));
+        let meta = reg
+            .get("openai-docs")
+            .expect("Codex .system skill should be discovered");
+        assert_eq!(meta.scope, SkillScope::User);
+        assert!(
+            meta.location
+                .components()
+                .any(|c| c.as_os_str() == OsStr::new(".system"))
+        );
     }
 
     #[test]
@@ -977,6 +1053,23 @@ mod tests {
         let home = TempDir::new().unwrap();
         let reg = discover_inner(project.path(), Some(home.path()));
         assert!(reg.get("evil").is_none(), "symlink traversal must be off");
+    }
+
+    #[test]
+    fn spec_skill_roots_still_skip_hidden_directories() {
+        let project = TempDir::new().unwrap();
+        touch_git(project.path());
+        let hidden = project
+            .path()
+            .join(AGENTS_DIR)
+            .join(SKILLS_SUBDIR)
+            .join(".hidden")
+            .join("ignored");
+        write(&hidden.join(SKILL_FILE), &minimal("ignored", "hidden"));
+
+        let home = TempDir::new().unwrap();
+        let reg = discover_inner(project.path(), Some(home.path()));
+        assert!(reg.get("ignored").is_none());
     }
 
     #[test]
