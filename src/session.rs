@@ -5530,6 +5530,18 @@ mod tests {
             2,
             "fork accumulates its own turns"
         );
+
+        // On-disk isolation: the two archives are physically separate. The
+        // fork's zip holds the copied turn plus its own; the source's zip is
+        // untouched by edits to the fork.
+        let fork_disk = read_history_from_zip(&session_zip_path(cwd.path(), &fork_id));
+        assert_eq!(fork_disk.len(), 2, "fork zip should hold copied + new turn");
+        let source_disk = read_history_from_zip(&session_zip_path(cwd.path(), &src_id));
+        assert_eq!(
+            source_disk.len(),
+            1,
+            "source zip must be unchanged on disk by the fork"
+        );
     }
 
     /// Forking an unknown source, or with a mismatched cwd, is reported rather
