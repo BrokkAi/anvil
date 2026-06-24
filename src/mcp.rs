@@ -132,7 +132,14 @@ fn default_bifrost_args() -> Vec<String> {
         "--root".to_string(),
         "{cwd}".to_string(),
         "--server".to_string(),
-        "core".to_string(),
+        // `searchtools` is Bifrost's full read-only surface: the `core`
+        // symbol/nlp/workspace tools plus the extended/text search tools and
+        // the SlopCop code-quality reporters. SlopCop ACP read-only sessions
+        // need the reporters (and tools like find_filenames/get_file_contents)
+        // exposed; `core` advertised neither (#121). Every tool `searchtools`
+        // advertises has a read-classified `ToolMeta` row, which the
+        // Bifrost handshake/anti-drift test asserts.
+        "searchtools".to_string(),
         "--no-line-numbers".to_string(),
     ]
 }
@@ -176,9 +183,33 @@ fn is_default_or_managed_bifrost_command(command: &str) -> bool {
 /// framing override) is intentionally discarded — Bifrost's wire protocol
 /// requires line framing and the command must point to the pinned managed
 /// binary.
+/// Argument sets that earlier Anvil versions shipped as the managed Bifrost
+/// default. A persisted entry still carrying one of these (with the managed
+/// command) is an unmodified prior default, so it is upgraded to the current
+/// default on load. Without this, existing installs would keep their old
+/// `--server core` surface and never pick up the searchtools switch (#121)
+/// short of a manual `/mcp reset`.
+fn legacy_default_bifrost_arg_sets() -> Vec<Vec<String>> {
+    vec![vec![
+        "--root".to_string(),
+        "{cwd}".to_string(),
+        "--server".to_string(),
+        "core".to_string(),
+        "--no-line-numbers".to_string(),
+    ]]
+}
+
+/// True if `args` is the current managed default or a recognized prior default.
+fn is_managed_default_bifrost_args(args: &[String]) -> bool {
+    args == default_bifrost_args().as_slice()
+        || legacy_default_bifrost_arg_sets()
+            .iter()
+            .any(|legacy| args == legacy.as_slice())
+}
+
 pub fn normalize_preinstalled_bifrost_server(server: &mut McpServerConfig) {
     if server.name != "bifrost"
-        || server.args.as_slice() != default_bifrost_args().as_slice()
+        || !is_managed_default_bifrost_args(&server.args)
         || !is_default_or_managed_bifrost_command(&server.command)
     {
         return;
@@ -716,6 +747,63 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A persisted bifrost entry carrying the prior managed default
+    /// (`--server core`) is upgraded to the current default surface on load, so
+    /// existing installs pick up the searchtools switch without `/mcp reset`
+    /// (#121).
+    #[test]
+    fn legacy_default_bifrost_args_are_upgraded_to_current_default() {
+        let mut server = McpServerConfig {
+            name: "bifrost".to_string(),
+            command: "bifrost".to_string(),
+            args: vec![
+                "--root".to_string(),
+                "{cwd}".to_string(),
+                "--server".to_string(),
+                "core".to_string(),
+                "--no-line-numbers".to_string(),
+            ],
+            env: Vec::new(),
+            framing: McpFraming::Line,
+            enabled: false,
+        };
+        normalize_preinstalled_bifrost_server(&mut server);
+        assert_eq!(
+            server.args,
+            default_bifrost_args(),
+            "a stored prior-default bifrost entry should be upgraded to the current default"
+        );
+        assert!(
+            server.args.iter().any(|a| a == "searchtools"),
+            "upgraded entry should use the searchtools surface"
+        );
+        // Non-default fields are preserved.
+        assert!(!server.enabled, "the stored enabled flag must be preserved");
+    }
+
+    /// A user-customized bifrost surface (neither the current nor a prior
+    /// managed default) is left untouched.
+    #[test]
+    fn customized_bifrost_args_are_not_upgraded() {
+        let custom = vec![
+            "--root".to_string(),
+            "{cwd}".to_string(),
+            "--server".to_string(),
+            "symbol".to_string(),
+            "--no-line-numbers".to_string(),
+        ];
+        let mut server = McpServerConfig {
+            name: "bifrost".to_string(),
+            command: "bifrost".to_string(),
+            args: custom.clone(),
+            env: Vec::new(),
+            framing: McpFraming::Line,
+            enabled: true,
+        };
+        normalize_preinstalled_bifrost_server(&mut server);
+        assert_eq!(server.args, custom, "a custom surface must be left as-is");
+    }
+
     /// Resolve the bifrost binary used by the handshake test.
     ///
     /// Resolution order:
@@ -810,10 +898,30 @@ mod tests {
             "usage_graph",
             "activate_workspace",
             "get_active_workspace",
+            // Extended/text search tools the SlopCop workflow relies on, now
+            // exposed by the default `searchtools` surface (#121).
+            "find_filenames",
+            "get_file_contents",
         ] {
             assert!(
                 names.contains(&expected),
                 "missing tool {expected} in {names:?}"
+            );
+        }
+
+        // The SlopCop code-quality reporters must be advertised by the default
+        // surface AND known to Anvil's permission metadata, so read-only ACP
+        // sessions can call them instead of having them fall back to
+        // `ToolKind::Other` and be blocked (#121).
+        for reporter in crate::tools::SLOPCOP_BIFROST_READ_ONLY_TOOLS {
+            assert!(
+                names.contains(reporter),
+                "SlopCop reporter '{reporter}' not advertised by default Bifrost surface; \
+                 got {names:?}"
+            );
+            assert!(
+                crate::tools::is_known_tool(reporter),
+                "SlopCop reporter '{reporter}' is advertised but missing from the TOOLS table"
             );
         }
 
