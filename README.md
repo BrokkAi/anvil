@@ -450,6 +450,11 @@ Constraints:
   the parent conversation.
 - Cancelling the parent prompt cancels the active subagent.
 
+For the full concurrency contract that delegated/audit-lane workflows can rely
+on — sequential vs. parallel execution, ordering/isolation, cancellation and
+timeout scope, observability, and structured-result collection — see
+[`docs/concurrency.md`](docs/concurrency.md).
+
 ## CLI Reference
 
 ```text
