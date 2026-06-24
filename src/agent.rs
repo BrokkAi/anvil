@@ -78,6 +78,15 @@ fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protoco
     }))
 }
 
+/// Build the protocol error returned when a `session/prompt` request names a
+/// session Anvil does not know. Shared by the prompt-path sites (cold-miss,
+/// closed-mid-request, and registry rebuild) so the wording stays identical.
+fn unknown_session_error(session_id: &str) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!("unknown session '{session_id}'"),
+    }))
+}
+
 fn prompt_response_meta(
     result: Option<&StructuredOutputResult>,
     orchestration_model: Option<&ResolvedModelInfo>,
@@ -1408,13 +1417,7 @@ pub async fn run_agent(
                     None => {
                         // Unknown session is a protocol-level invalid request,
                         // not a successful end-turn.
-                        return responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params().data(
-                                serde_json::json!({
-                                    "reason": format!("unknown session '{session_id}'"),
-                                }),
-                            ),
-                        );
+                        return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
 
@@ -1666,13 +1669,7 @@ pub async fn run_agent(
                         );
                     }
                     Err(PromptStartError::UnknownSession) => {
-                        return responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params().data(
-                                serde_json::json!({
-                                    "reason": format!("unknown session '{session_id}'"),
-                                }),
-                            ),
-                        );
+                        return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
 
@@ -2041,11 +2038,7 @@ pub async fn run_agent(
                     .await
                 else {
                     sessions_prompt.finish_prompt(&session_id).await;
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
-                            "reason": format!("unknown session '{session_id}'"),
-                        })),
-                    );
+                    return responder.respond_with_error(unknown_session_error(&session_id));
                 };
 
                 // Capture everything the spawned task needs before we move into it.
