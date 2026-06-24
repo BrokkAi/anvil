@@ -475,6 +475,40 @@ async fn current_config_options(
     ))
 }
 
+/// Emit the ACP updates for a config-option change: a `config_option_update`
+/// with the full current set, plus -- when the change was the behavior-mode
+/// selector -- a `current_mode_update` so the legacy modes surface stays in
+/// sync (#157). Every path that mutates a config option (the
+/// `session/set_config_option` request and the `/setup` slash commands) routes
+/// through this, so the two surfaces cannot drift apart.
+fn send_config_option_change_updates(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    config_id: &str,
+    config_value: &str,
+    updated_options: Vec<SessionConfigOption>,
+) {
+    let notification = SessionNotification::new(
+        session_id.to_string(),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(updated_options)),
+    );
+    if let Err(e) = cx.send_notification(notification) {
+        tracing::warn!("failed to send config_option_update: {e}");
+    }
+
+    if config_id == BEHAVIOR_CONFIG_ID
+        && let Some(mode) = SessionMode::parse(config_value)
+    {
+        let mode_notification = SessionNotification::new(
+            session_id.to_string(),
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.as_str())),
+        );
+        if let Err(e) = cx.send_notification(mode_notification) {
+            tracing::warn!("failed to send current_mode_update: {e}");
+        }
+    }
+}
+
 async fn apply_config_option(
     sessions: &SessionStore,
     session_id: &str,
@@ -2608,31 +2642,13 @@ pub async fn run_agent(
                     );
                 }
 
-                let notification = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-                        outcome.updated_options.clone(),
-                    )),
+                send_config_option_change_updates(
+                    &cx,
+                    &session_id,
+                    &config_id,
+                    &value,
+                    outcome.updated_options.clone(),
                 );
-                if let Err(e) = cx.send_notification(notification) {
-                    tracing::warn!("failed to send config_option_update: {e}");
-                }
-
-                // When the change was the behavior-mode selector, keep the
-                // legacy modes surface in sync by also emitting
-                // current_mode_update for clients reading modes.currentModeId
-                // (#157). Non-mode config changes do not emit a mode update.
-                if config_id == BEHAVIOR_CONFIG_ID
-                    && let Some(mode) = SessionMode::parse(&value)
-                {
-                    let mode_notification = SessionNotification::new(
-                        session_id.clone(),
-                        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode.as_str())),
-                    );
-                    if let Err(e) = cx.send_notification(mode_notification) {
-                        tracing::warn!("failed to send current_mode_update: {e}");
-                    }
-                }
 
                 let fallback_cwd = std::env::current_dir().unwrap_or_default();
                 send_session_usage_update(&cx, &sessions_perm, &session_id, &fallback_cwd).await;
@@ -5624,13 +5640,10 @@ async fn apply_setup_config(
 ) -> String {
     match apply_config_option(sessions, session_id, key, value).await {
         Ok(outcome) => {
-            let notification = SessionNotification::new(
-                session_id.to_string(),
-                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(outcome.updated_options)),
-            );
-            if let Err(e) = cx.send_notification(notification) {
-                tracing::warn!("failed to send config_option_update from slash command: {e}");
-            }
+            // Route through the shared helper so a `/setup mode` change also
+            // emits current_mode_update for the legacy modes surface (#157),
+            // matching the session/set_config_option request path.
+            send_config_option_change_updates(cx, session_id, key, value, outcome.updated_options);
             let fallback_cwd = std::env::current_dir().unwrap_or_default();
             send_session_usage_update(cx, sessions, session_id, &fallback_cwd).await;
             let mut msg = match key {
