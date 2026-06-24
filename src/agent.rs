@@ -5,13 +5,14 @@ use std::time::Duration;
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    Cost, CurrentModeUpdate, EmbeddedResource, EmbeddedResourceResource, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ResourceLink,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOption, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
+    EmbeddedResourceResource, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+    SessionDeleteCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
     SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
@@ -1216,6 +1217,7 @@ pub async fn run_agent(
 
     let sessions_cancel = sessions.clone();
     let sessions_close = sessions.clone();
+    let sessions_delete = sessions.clone();
     let sessions_mode = sessions.clone();
     let sessions_perm = sessions.clone();
 
@@ -1258,7 +1260,8 @@ pub async fn run_agent(
                         SessionCapabilities::new()
                             .list(SessionListCapabilities::new())
                             .resume(SessionResumeCapabilities::new())
-                            .close(SessionCloseCapabilities::new()),
+                            .close(SessionCloseCapabilities::new())
+                            .delete(SessionDeleteCapabilities::new()),
                     );
 
                 let protocol_version = negotiate_protocol_version(req.protocol_version);
@@ -2498,6 +2501,24 @@ pub async fn run_agent(
                         })),
                     ),
                 }
+            },
+            on_receive_request!(),
+        )
+        // Handle session/delete
+        .on_receive_request(
+            async move |req: DeleteSessionRequest,
+                        responder: Responder<DeleteSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let session_id = req.session_id.to_string();
+                tracing::info!("ACP delete session={session_id}");
+
+                // ACP `session/delete` is idempotent: it cancels any in-flight
+                // prompt, drops per-session resources, removes the persisted
+                // session from `session/list`, and succeeds even for unknown or
+                // already-deleted sessions.
+                let removed = sessions_delete.delete_session(&session_id).await;
+                tracing::info!("ACP delete session={session_id} removed_archive={removed}");
+                responder.respond(DeleteSessionResponse::new())
             },
             on_receive_request!(),
         )

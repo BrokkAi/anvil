@@ -2204,6 +2204,11 @@ pub struct SessionStore {
     /// behind a sync `Mutex` because every touch is a fast in-memory bump
     /// and must not require holding a tokio lock across `.await` points.
     last_accessed: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Working directory of every session this process has created or loaded,
+    /// retained across LRU eviction so `session/delete` (whose request carries
+    /// no cwd) can locate and remove the persisted zip by session id alone.
+    /// Removed only when a session is deleted.
+    session_cwds: Arc<RwLock<HashMap<String, PathBuf>>>,
     next_access: Arc<AtomicU64>,
     limits: SessionLimits,
 }
@@ -2265,6 +2270,7 @@ impl SessionStore {
             known_sessions: Arc::new(RwLock::new(HashSet::new())),
             closed_sessions: Arc::new(RwLock::new(HashSet::new())),
             last_accessed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_cwds: Arc::new(RwLock::new(HashMap::new())),
             next_access: Arc::new(AtomicU64::new(0)),
             limits,
         }
@@ -2620,6 +2626,10 @@ impl SessionStore {
         {
             let _lifecycle = self.lifecycle_lock.lock().await;
             self.known_sessions.write().await.insert(id.clone());
+            self.session_cwds
+                .write()
+                .await
+                .insert(id.clone(), cwd.clone());
             self.closed_sessions.write().await.remove(&id);
         }
         self.touch(&id);
@@ -2750,6 +2760,10 @@ impl SessionStore {
             sessions.entry(id.to_string()).or_insert(session);
             let inserted = sessions.len() > len_before;
             self.known_sessions.write().await.insert(id.to_string());
+            self.session_cwds
+                .write()
+                .await
+                .insert(id.to_string(), cwd.to_path_buf());
             if reopen_closed {
                 self.closed_sessions.write().await.remove(id);
             }
@@ -3758,6 +3772,55 @@ impl SessionStore {
         }
         self.remove_resident_session(session_id).await;
         CloseSessionResult::Closed
+    }
+
+    /// Delete a session: cancel any in-flight prompt, drop all per-session
+    /// in-memory resources (registry, MCP subprocesses, history), remove the
+    /// session from `session/list` by erasing its persisted zip, and forget it.
+    ///
+    /// Idempotent per ACP: deleting an unknown or already-deleted session is a
+    /// success (returns `false` only to signal "nothing on disk was removed",
+    /// which the handler still reports as success). The persisted zip is
+    /// located via the remembered cwd (the `session/delete` request carries
+    /// none); a session created in a previous process and never touched here
+    /// has no remembered cwd and is treated as already-gone.
+    pub async fn delete_session(&self, session_id: &str) -> bool {
+        let cwd = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            // Cancel an in-flight prompt before tearing down resources.
+            if let Some(token) = self.cancel_tokens.write().await.remove(session_id) {
+                token.cancel();
+            }
+            // Resolve the cwd from resident state or the remembered map.
+            let cwd = match self.sessions.read().await.get(session_id) {
+                Some(session) => Some(session.cwd.clone()),
+                None => self.session_cwds.read().await.get(session_id).cloned(),
+            };
+            // Forget the session everywhere so it cannot be reopened or listed.
+            self.known_sessions.write().await.remove(session_id);
+            self.session_cwds.write().await.remove(session_id);
+            self.closed_sessions.write().await.remove(session_id);
+            cwd
+        };
+        // Drop resident registry/MCP/history state (outside the lifecycle lock,
+        // matching close_session).
+        self.remove_resident_session(session_id).await;
+
+        // Erase the persisted archive(s) so the session disappears from
+        // `session/list`. Without a known cwd there is nothing we can locate.
+        let Some(cwd) = cwd else {
+            return false;
+        };
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let primary = session_zip_path(&cwd, &id);
+            let removed_primary = std::fs::remove_file(&primary).is_ok();
+            let legacy = legacy_session_zip_path(&cwd, &id);
+            let removed_legacy = legacy != primary && std::fs::remove_file(&legacy).is_ok();
+            removed_primary || removed_legacy
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -5167,6 +5230,90 @@ mod tests {
         assert!(
             !store.cancel_tokens.read().await.contains_key(&session.id),
             "close_session should remove the prompt token"
+        );
+    }
+
+    /// `session/delete` erases the persisted archive and all in-memory state,
+    /// so the session can no longer be cold-loaded or listed (#141).
+    #[tokio::test]
+    async fn delete_session_removes_persisted_and_in_memory_state() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let id = session.id.clone();
+        store
+            .maybe_rename_from_prompt(&id, "Doomed session")
+            .await
+            .expect("rename");
+        assert!(
+            session_zip_path(cwd.path(), &id).exists(),
+            "zip should exist before delete"
+        );
+
+        let removed = store.delete_session(&id).await;
+        assert!(removed, "delete should remove the persisted archive");
+        assert!(
+            !session_zip_path(cwd.path(), &id).exists(),
+            "zip should be gone after delete"
+        );
+        assert!(
+            store.get_session(&id, cwd.path()).await.is_none(),
+            "deleted session must not cold-load"
+        );
+        assert!(
+            !store.known_sessions.read().await.contains(&id),
+            "deleted session must be forgotten"
+        );
+        assert!(
+            !store.session_cwds.read().await.contains_key(&id),
+            "deleted session cwd must be forgotten"
+        );
+        let listed = store.list_sessions_from_disk(cwd.path()).await;
+        assert!(
+            !listed.iter().any(|m| m.id == id),
+            "deleted session must not appear in session/list"
+        );
+    }
+
+    /// Deleting an unknown / already-deleted session is an idempotent no-op
+    /// success (ACP), reporting that no on-disk archive was removed (#141).
+    #[tokio::test]
+    async fn delete_session_unknown_is_idempotent() {
+        let store = SessionStore::new("m".to_string());
+        assert!(
+            !store.delete_session("never-existed").await,
+            "unknown delete removes no archive"
+        );
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(store.delete_session(&session.id).await, "first delete");
+        assert!(
+            !store.delete_session(&session.id).await,
+            "second delete is a no-op success"
+        );
+    }
+
+    /// Deleting an active session cancels its in-flight prompt (#141).
+    #[tokio::test]
+    async fn delete_session_cancels_in_flight_prompt() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let token = store
+            .start_prompt(&session.id)
+            .await
+            .expect("prompt should start");
+        assert!(!token.is_cancelled());
+
+        store.delete_session(&session.id).await;
+        assert!(
+            token.is_cancelled(),
+            "delete_session should cancel the in-flight prompt"
+        );
+        assert!(
+            !store.cancel_tokens.read().await.contains_key(&session.id),
+            "delete_session should remove the prompt token"
         );
     }
 

@@ -707,6 +707,138 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
 }
 
 #[test]
+fn session_delete_removes_session_and_is_idempotent() {
+    let case = SmokeCase {
+        name: "session_delete",
+        prompt: "Summarize the repo.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_openai_smoke_server(vec![text_sse_body("Summary.")]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["delete"].is_object(),
+        "{}: initialize did not advertise sessionCapabilities.delete: {initialize}",
+        case.name
+    );
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    // Name the session (prompt) so it appears in session/list.
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+
+    let list_before = client.request("session/list", json!({ "cwd": cwd }));
+    let listed_before: Vec<String> = list_before["result"]["sessions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s["sessionId"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        listed_before.contains(&session_id),
+        "{}: session not listed before delete: {listed_before:?}",
+        case.name
+    );
+
+    let delete = client.request("session/delete", json!({ "sessionId": session_id }));
+    assert_response_ok(&case, "session/delete", &delete, &client);
+
+    // Gone from session/list (#141).
+    let list_after = client.request("session/list", json!({ "cwd": cwd }));
+    let listed_after: Vec<String> = list_after["result"]["sessions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s["sessionId"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !listed_after.contains(&session_id),
+        "{}: session still listed after delete: {listed_after:?}",
+        case.name
+    );
+
+    // Persisted state is gone: a subsequent load is an unknown-session error.
+    let reload = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load after delete",
+        &reload,
+        "unknown session",
+        &client,
+    );
+
+    // Deleting an already-deleted or nonexistent session still succeeds (#141).
+    let delete_again = client.request("session/delete", json!({ "sessionId": session_id }));
+    assert_response_ok(&case, "session/delete (again)", &delete_again, &client);
+    let delete_missing = client.request("session/delete", json!({ "sessionId": "never-existed" }));
+    assert_response_ok(&case, "session/delete (missing)", &delete_missing, &client);
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during session/delete checks; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn mode_and_config_option_surfaces_stay_in_sync() {
     let case = SmokeCase {
         name: "mode_config_sync",
