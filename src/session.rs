@@ -495,6 +495,14 @@ pub struct SessionManifest {
         rename = "brokkMcpServers"
     )]
     pub brokk_mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Brokk ACP-specific: the working directory the session was created
+    /// under. Persisted so `session/load` and `session/resume` can reject a
+    /// request that would move the session to a different cwd, even on a cold
+    /// reload (where the in-memory cwd is otherwise seeded from the request).
+    /// Absent in manifests produced by the Java executor or by Anvil builds
+    /// predating cwd persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "brokkCwd")]
+    pub cwd: Option<String>,
 }
 
 impl SessionManifest {
@@ -672,6 +680,7 @@ impl Session {
                 Some(model.clone())
             },
             brokk_mcp_servers: None,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
@@ -2130,7 +2139,7 @@ fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
 /// (`.`/`..`, symlinks) reuse the same cached registry and Bifrost subprocess.
 /// If the path no longer exists, fall back to the lexical path so callers with
 /// a stale cwd still get a deterministic comparison.
-pub(crate) fn normalize_cwd(path: &Path) -> PathBuf {
+fn normalize_cwd(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -2188,6 +2197,19 @@ pub enum CloseSessionResult {
     Closed,
     Unknown,
     AlreadyClosed,
+}
+
+/// Outcome of a cwd-validated lifecycle reopen (`session/load`,
+/// `session/resume`). The session is boxed so the large success variant does
+/// not bloat the small mismatch/unknown variants.
+#[derive(Debug)]
+pub enum LifecycleReopen {
+    /// The session is available and its cwd matches the request.
+    Reopened(Box<Session>),
+    /// The session exists but was created/loaded under a different cwd.
+    CwdMismatch { session_cwd: PathBuf },
+    /// No such session.
+    Unknown,
 }
 
 impl SessionStore {
@@ -2694,15 +2716,38 @@ impl SessionStore {
     /// process. This is used by ACP session/load and session/resume; close
     /// remains non-destructive, while prompt/registry paths still avoid
     /// implicit cold-load resurrection.
-    pub async fn reopen_session(&self, id: &str, cwd: &Path) -> Option<Session> {
+    /// Reopen a persisted session for an ACP lifecycle request (`session/load`,
+    /// `session/resume`), validating that the request `cwd` matches the cwd the
+    /// session was created under.
+    ///
+    /// The authoritative cwd is the persisted manifest cwd when present -- so
+    /// the check survives a cold reload, where the in-memory cwd is seeded from
+    /// the request -- falling back to the in-memory cwd for sessions whose
+    /// manifest predates cwd persistence. Returns [`LifecycleReopen::CwdMismatch`]
+    /// rather than moving the session, since cwd governs project instructions,
+    /// skills, permission scope, and sandbox assumptions. The comparison and the
+    /// read happen here so callers can't observe a half-validated session.
+    pub async fn reopen_session_checked(&self, id: &str, cwd: &Path) -> LifecycleReopen {
         if !self.load_into_memory_if_cold(id, cwd, true).await {
-            return None;
+            return LifecycleReopen::Unknown;
         }
-        let cloned = self.sessions.read().await.get(id).cloned();
-        if cloned.is_some() {
-            self.touch(id);
+        let sessions = self.sessions.read().await;
+        let Some(session) = sessions.get(id) else {
+            return LifecycleReopen::Unknown;
+        };
+        let session_cwd = session
+            .manifest
+            .cwd
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| session.cwd.clone());
+        if normalize_cwd(&session_cwd) != normalize_cwd(cwd) {
+            return LifecycleReopen::CwdMismatch { session_cwd };
         }
-        cloned
+        let cloned = session.clone();
+        drop(sessions);
+        self.touch(id);
+        LifecycleReopen::Reopened(Box::new(cloned))
     }
 
     /// Snapshot the per-session data needed to start a prompt turn,
@@ -3766,6 +3811,7 @@ mod tests {
             mode: Some("CODE".into()),
             model: Some("m".into()),
             brokk_mcp_servers: None,
+            cwd: None,
         };
         let history = vec![ConversationTurn {
             user_prompt: "u".into(),
@@ -3994,6 +4040,7 @@ mod tests {
             mode: None,
             model: None,
             brokk_mcp_servers: None,
+            cwd: None,
         };
 
         let err = Session::from_persisted(
@@ -5036,10 +5083,10 @@ mod tests {
             "closed sessions should not be implicitly cold-loaded from disk"
         );
         assert!(
-            store
-                .reopen_session(&session.id, cwd.path())
-                .await
-                .is_some(),
+            matches!(
+                store.reopen_session_checked(&session.id, cwd.path()).await,
+                LifecycleReopen::Reopened(_)
+            ),
             "explicit load/resume should reopen persisted closed sessions"
         );
     }
@@ -5097,7 +5144,10 @@ mod tests {
             "closed evicted sessions should not implicitly cold-load"
         );
         assert!(
-            store.reopen_session(&first.id, cwd1.path()).await.is_some(),
+            matches!(
+                store.reopen_session_checked(&first.id, cwd1.path()).await,
+                LifecycleReopen::Reopened(_)
+            ),
             "explicit load/resume should reopen persisted evicted sessions"
         );
     }
@@ -5622,6 +5672,7 @@ mod tests {
             mode: None,
             model: Some("m".to_string()),
             brokk_mcp_servers: None,
+            cwd: None,
         };
         let legacy_path = legacy_session_zip_path(worktree.path(), &id);
         write_new_session_zip(&legacy_path, &manifest).expect("write legacy session zip");
@@ -5657,6 +5708,7 @@ mod tests {
             mode: None,
             model: Some("m".to_string()),
             brokk_mcp_servers: None,
+            cwd: None,
         }
     }
 

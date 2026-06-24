@@ -26,9 +26,9 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    CloseSessionResult, ConversationTurn, PermissionMode, PromptStartError,
+    CloseSessionResult, ConversationTurn, LifecycleReopen, PermissionMode, PromptStartError,
     REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode, SessionSnapshot,
-    SessionStore, acp_mcp_servers_to_configs, normalize_cwd,
+    SessionStore, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -1277,30 +1277,28 @@ pub async fn run_agent(
                     );
                 }
 
-                // Look up the session from memory or disk. Unknown ids are a
-                // protocol error, not a successful empty load (#154).
-                let session = match sessions_load.reopen_session(&session_id, &cwd).await {
-                    Some(s) => s,
-                    None => {
+                // Look up the session from memory or disk, validating that the
+                // request cwd matches the session's original cwd (#147). Unknown
+                // ids are a protocol error, not a successful empty load (#154).
+                let session = match sessions_load.reopen_session_checked(&session_id, &cwd).await {
+                    LifecycleReopen::Reopened(session) => *session,
+                    LifecycleReopen::CwdMismatch { session_cwd } => {
+                        tracing::warn!(
+                            "session/load cwd mismatch session={session_id}: session cwd={} request cwd={}",
+                            session_cwd.display(),
+                            cwd.display()
+                        );
+                        return responder.respond_with_error(lifecycle_cwd_mismatch_error(
+                            "session/load",
+                            &session_cwd,
+                            &cwd,
+                        ));
+                    }
+                    LifecycleReopen::Unknown => {
                         tracing::warn!("session/load: unknown session {session_id}");
                         return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
-                // A warm session keeps the cwd it was created/loaded under;
-                // reject a request that would move it elsewhere (#147). Cold
-                // loads adopt the request cwd, so they compare equal here.
-                if normalize_cwd(&session.cwd) != normalize_cwd(&cwd) {
-                    tracing::warn!(
-                        "session/load cwd mismatch session={session_id}: session cwd={} request cwd={}",
-                        session.cwd.display(),
-                        cwd.display()
-                    );
-                    return responder.respond_with_error(lifecycle_cwd_mismatch_error(
-                        "session/load",
-                        &session.cwd,
-                        &cwd,
-                    ));
-                }
                 sessions_load.update_cwd(&session_id, cwd).await;
 
                 // Replay conversation history as session updates (both sides).
@@ -1379,29 +1377,27 @@ pub async fn run_agent(
                     );
                 }
 
-                // Unknown ids are a protocol error, not a successful empty
-                // resume (#154).
-                let session = match sessions_resume.reopen_session(&session_id, &cwd).await {
-                    Some(s) => s,
-                    None => {
+                // Validate cwd consistency (#147); unknown ids are a protocol
+                // error, not a successful empty resume (#154).
+                let session = match sessions_resume.reopen_session_checked(&session_id, &cwd).await {
+                    LifecycleReopen::Reopened(session) => *session,
+                    LifecycleReopen::CwdMismatch { session_cwd } => {
+                        tracing::warn!(
+                            "session/resume cwd mismatch session={session_id}: session cwd={} request cwd={}",
+                            session_cwd.display(),
+                            cwd.display()
+                        );
+                        return responder.respond_with_error(lifecycle_cwd_mismatch_error(
+                            "session/resume",
+                            &session_cwd,
+                            &cwd,
+                        ));
+                    }
+                    LifecycleReopen::Unknown => {
                         tracing::warn!("session/resume: unknown session {session_id}");
                         return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
-                // Reject a request that would move a warm session to a
-                // different cwd (#147).
-                if normalize_cwd(&session.cwd) != normalize_cwd(&cwd) {
-                    tracing::warn!(
-                        "session/resume cwd mismatch session={session_id}: session cwd={} request cwd={}",
-                        session.cwd.display(),
-                        cwd.display()
-                    );
-                    return responder.respond_with_error(lifecycle_cwd_mismatch_error(
-                        "session/resume",
-                        &session.cwd,
-                        &cwd,
-                    ));
-                }
                 sessions_resume.update_cwd(&session_id, cwd).await;
                 let catalog = sessions_resume.available_model_metadata().await;
                 let setup_session = session.clone();
@@ -8224,6 +8220,7 @@ mod tests {
             mode: None,
             model: None,
             brokk_mcp_servers: None,
+            cwd: None,
         };
         let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
 

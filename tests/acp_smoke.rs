@@ -165,7 +165,11 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
     std::fs::create_dir_all(&cwd).expect("create cwd");
+    // A real-enough git marker (`.git/HEAD`) so the repo root is recognized and
+    // a nested subdir resolves to the same session storage root -- required to
+    // exercise the cold-reload cwd-mismatch path below.
     std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+    std::fs::write(cwd.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
     // A second, distinct repo root used to exercise cwd-mismatch rejection.
     let other_cwd = temp.path().join("other-repo");
     std::fs::create_dir_all(&other_cwd).expect("create other cwd");
@@ -290,12 +294,60 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
         &client,
     );
 
-    // The matching-cwd load still succeeds (#147 regression guard).
+    // additionalDirectories on resume is rejected too (#149).
+    let resume_with_dirs = client.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [other_cwd]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/resume (additionalDirectories)",
+        &resume_with_dirs,
+        "additionalDirectories is not supported",
+        &client,
+    );
+
+    // The matching-cwd load and resume still succeed (#147 regression guard).
     let ok_load = client.request(
         "session/load",
         json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
     );
     assert_response_ok(&case, "session/load (matching cwd)", &ok_load, &client);
+    let ok_resume = client.request(
+        "session/resume",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_ok(&case, "session/resume (matching cwd)", &ok_resume, &client);
+
+    // Cold path: close (evict) the session, then load it from disk under a
+    // nested cwd that shares the same repo storage root. The persisted manifest
+    // cwd must still drive the mismatch rejection (#147), proving the check
+    // survives a cold reload and isn't merely a warm in-memory comparison.
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    assert_response_ok(&case, "session/close", &close, &client);
+    let nested_cwd = cwd.join("nested");
+    std::fs::create_dir_all(&nested_cwd).expect("create nested cwd");
+    let cold_mismatch = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": nested_cwd, "mcpServers": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load (cold cwd mismatch)",
+        &cold_mismatch,
+        "does not match",
+        &client,
+    );
+    let cold_ok = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_ok(&case, "session/load (cold matching cwd)", &cold_ok, &client);
 
     assert!(
         !client.exited(),
