@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -743,6 +743,38 @@ fn session_info_from_manifest(manifest: &SessionManifest, cwd: &Path) -> Session
         .updated_at(manifest.updated_at())
 }
 
+/// Page size for ACP `session/list` cursor pagination.
+const SESSION_LIST_PAGE_SIZE: usize = 50;
+/// Prefix for our opaque `session/list` cursor token. Namespacing the token
+/// lets us reject foreign or hand-crafted cursors instead of silently treating
+/// them as offset 0, satisfying ACP's "invalid cursor SHOULD error" guidance.
+const SESSION_LIST_CURSOR_PREFIX: &str = "anvil-offset:";
+
+/// Encode a page offset into an opaque `session/list` cursor token.
+fn encode_session_list_cursor(offset: usize) -> String {
+    format!("{SESSION_LIST_CURSOR_PREFIX}{offset}")
+}
+
+/// Decode an opaque `session/list` cursor token back to its page offset.
+/// Returns `None` for any cursor Anvil did not issue (so the handler can
+/// surface an invalid-params error rather than silently restarting at 0).
+fn parse_session_list_cursor(cursor: &str) -> Option<usize> {
+    cursor
+        .strip_prefix(SESSION_LIST_CURSOR_PREFIX)
+        .and_then(|rest| rest.parse::<usize>().ok())
+}
+
+/// Compute the half-open page bounds `[start, end)` and the next-page cursor
+/// for a `session/list` response covering `total` ordered sessions starting at
+/// `offset`. An `offset` past the end yields an empty page and no next cursor
+/// (end-of-results), never an error.
+fn paginate_session_list(total: usize, offset: usize) -> (usize, usize, Option<String>) {
+    let start = offset.min(total);
+    let end = start.saturating_add(SESSION_LIST_PAGE_SIZE).min(total);
+    let next_cursor = (end < total).then(|| encode_session_list_cursor(end));
+    (start, end, next_cursor)
+}
+
 fn send_session_info_update(
     cx: &ConnectionTo<Client>,
     session_id: &str,
@@ -1439,20 +1471,53 @@ pub async fn run_agent(
             async move |req: ListSessionsRequest,
                         responder: Responder<ListSessionsResponse>,
                         _cx: ConnectionTo<Client>| {
-                tracing::info!("ACP session/list, cwd filter={:?}", req.cwd);
+                tracing::info!(
+                    "ACP session/list, cwd filter={:?}, cursor={:?}",
+                    req.cwd,
+                    req.cursor
+                );
 
-                let infos: Vec<SessionInfo> = if let Some(cwd) = &req.cwd {
+                // Resolve the page offset from the opaque cursor first; an
+                // unrecognized cursor is a protocol error, not a silent
+                // restart at the first page (#144).
+                let offset = match req.cursor.as_deref() {
+                    None => 0,
+                    Some(cursor) => match parse_session_list_cursor(cursor) {
+                        Some(offset) => offset,
+                        None => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(
+                                    serde_json::json!({
+                                        "reason": format!(
+                                            "invalid session/list cursor: '{cursor}'"
+                                        ),
+                                    }),
+                                ),
+                            );
+                        }
+                    },
+                };
+
+                // With a cwd, list that workspace's persisted sessions; without
+                // one, return the process's resident known sessions (#143).
+                let entries: Vec<(SessionManifest, PathBuf)> = if let Some(cwd) = &req.cwd {
                     sessions_list
                         .list_sessions_from_disk(cwd)
                         .await
                         .into_iter()
-                        .map(|m| session_info_from_manifest(&m, cwd))
+                        .map(|manifest| (manifest, cwd.clone()))
                         .collect()
                 } else {
-                    vec![]
+                    sessions_list.resident_session_manifests().await
                 };
 
-                responder.respond(ListSessionsResponse::new(infos))
+                let (start, end, next_cursor) = paginate_session_list(entries.len(), offset);
+                let infos: Vec<SessionInfo> = entries[start..end]
+                    .iter()
+                    .map(|(manifest, cwd)| session_info_from_manifest(manifest, cwd))
+                    .collect();
+
+                responder.respond(ListSessionsResponse::new(infos).next_cursor(next_cursor))
             },
             on_receive_request!(),
         )
@@ -8228,6 +8293,61 @@ mod tests {
         assert_eq!(info.cwd, PathBuf::from("/tmp/cwd"));
         assert_eq!(info.title.as_deref(), Some("Investigate session names"));
         assert_eq!(info.updated_at, manifest.updated_at());
+    }
+
+    /// An issued `session/list` cursor round-trips to its offset; foreign or
+    /// malformed cursors decode to `None` so the handler can reject them (#144).
+    #[test]
+    fn session_list_cursor_round_trips_and_rejects_foreign() {
+        assert_eq!(
+            parse_session_list_cursor(&encode_session_list_cursor(0)),
+            Some(0)
+        );
+        assert_eq!(
+            parse_session_list_cursor(&encode_session_list_cursor(137)),
+            Some(137)
+        );
+        // No namespace prefix -> not one of ours.
+        assert_eq!(parse_session_list_cursor("137"), None);
+        // Right prefix, non-numeric payload.
+        assert_eq!(parse_session_list_cursor("anvil-offset:abc"), None);
+        // Arbitrary garbage.
+        assert_eq!(parse_session_list_cursor("garbage"), None);
+    }
+
+    /// Pagination yields full pages with a follow-up cursor until the final
+    /// page, which omits the cursor (end-of-results). An offset past the end is
+    /// an empty page, not an error (#144).
+    #[test]
+    fn paginate_session_list_pages_and_terminates() {
+        let total = SESSION_LIST_PAGE_SIZE * 2 + 10;
+
+        let (start, end, next) = paginate_session_list(total, 0);
+        assert_eq!((start, end), (0, SESSION_LIST_PAGE_SIZE));
+        assert_eq!(
+            next.and_then(|c| parse_session_list_cursor(&c)),
+            Some(SESSION_LIST_PAGE_SIZE)
+        );
+
+        let (start, end, next) = paginate_session_list(total, SESSION_LIST_PAGE_SIZE);
+        assert_eq!(
+            (start, end),
+            (SESSION_LIST_PAGE_SIZE, SESSION_LIST_PAGE_SIZE * 2)
+        );
+        assert_eq!(
+            next.and_then(|c| parse_session_list_cursor(&c)),
+            Some(SESSION_LIST_PAGE_SIZE * 2)
+        );
+
+        // Final partial page: no next cursor.
+        let (start, end, next) = paginate_session_list(total, SESSION_LIST_PAGE_SIZE * 2);
+        assert_eq!((start, end), (SESSION_LIST_PAGE_SIZE * 2, total));
+        assert!(next.is_none(), "final page must omit nextCursor");
+
+        // Offset past the end: empty page, end-of-results.
+        let (start, end, next) = paginate_session_list(total, total + 100);
+        assert_eq!((start, end), (total, total));
+        assert!(next.is_none());
     }
 
     /// `build_prompt_messages` for a turn that used no tools must produce

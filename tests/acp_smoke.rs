@@ -157,6 +157,134 @@ fn relative_cwd_lifecycle_requests_return_invalid_params() {
 }
 
 #[test]
+fn session_list_without_cwd_and_cursor_semantics() {
+    let case = SmokeCase {
+        name: "session_list",
+        prompt: "Investigate the repository structure.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    // One plain text response: the prompt names the session (auto-rename) and
+    // completes without tool calls.
+    let provider = start_openai_smoke_server(vec![text_sse_body("Looked around.")]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+    // The list capability must be advertised for this to mean anything.
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_object(),
+        "{}: initialize did not advertise sessionCapabilities.list: {initialize}",
+        case.name
+    );
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    // Prompt the session so it is auto-named (unnamed sessions are filtered out
+    // of listings, mirroring the on-disk behavior).
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+
+    // session/list WITHOUT cwd returns the resident named session (#143).
+    let list_no_cwd = client.request("session/list", json!({}));
+    assert_response_ok(&case, "session/list (no cwd)", &list_no_cwd, &client);
+    let ids_no_cwd: Vec<String> = list_no_cwd["result"]["sessions"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|s| s["sessionId"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids_no_cwd.contains(&session_id),
+        "{}: session/list without cwd did not return the session: {list_no_cwd}",
+        case.name
+    );
+    assert!(
+        list_no_cwd["result"]["nextCursor"].is_null(),
+        "{}: single-page list should omit nextCursor: {list_no_cwd}",
+        case.name
+    );
+
+    // session/list WITH cwd still filters by cwd and finds it on disk.
+    let list_cwd = client.request("session/list", json!({ "cwd": cwd }));
+    assert_response_ok(&case, "session/list (cwd)", &list_cwd, &client);
+    let ids_cwd: Vec<String> = list_cwd["result"]["sessions"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|s| s["sessionId"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        ids_cwd.contains(&session_id),
+        "{}: session/list with cwd did not return the session: {list_cwd}",
+        case.name
+    );
+
+    // An unrecognized cursor is a protocol error, not a silent first page (#144).
+    let bad_cursor = client.request("session/list", json!({ "cursor": "not-a-real-cursor" }));
+    assert_response_invalid_params_contains(
+        &case,
+        "session/list (invalid cursor)",
+        &bad_cursor,
+        "invalid session/list cursor",
+        &client,
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during session/list checks; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
     let case = SmokeCase {
         name: "lifecycle_validation",
