@@ -106,6 +106,24 @@ impl SkillRegistry {
         self.by_name.get(name)
     }
 
+    /// Resolve a user-typed slash command to a skill. Slash command
+    /// parsing is case-insensitive, while `activate_skill` remains keyed
+    /// by exact catalog names for the LLM-facing tool schema.
+    pub fn get_for_slash_command(&self, name: &str) -> Option<&SkillMeta> {
+        if let Some(meta) = self.by_name.get(name) {
+            return Some(meta);
+        }
+        let mut matches = self
+            .by_name
+            .values()
+            .filter(|meta| meta.name.eq_ignore_ascii_case(name));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     /// Stable-ordered iterator over discovered skills (sorted by name)
     /// so the catalog and `available_commands` output is deterministic.
     pub fn iter_sorted(&self) -> impl Iterator<Item = &SkillMeta> {
@@ -660,6 +678,46 @@ mod tests {
         let meta = reg.get("hello").unwrap();
         assert_eq!(meta.description, "say hi");
         assert_eq!(meta.scope, SkillScope::Project);
+    }
+
+    #[test]
+    fn slash_lookup_is_case_insensitive() {
+        let project = TempDir::new().unwrap();
+        touch_git(project.path());
+        skill_at(
+            project.path(),
+            AGENTS_DIR,
+            "CaseSkill",
+            &minimal("CaseSkill", "case-sensitive frontmatter name"),
+        );
+
+        let home = TempDir::new().unwrap();
+        let reg = discover_inner(project.path(), Some(home.path()));
+        assert!(reg.get("caseskill").is_none());
+        assert_eq!(
+            reg.get_for_slash_command("caseskill")
+                .expect("slash lookup should match by case-insensitive name")
+                .name,
+            "CaseSkill"
+        );
+    }
+
+    #[test]
+    fn slash_lookup_rejects_ambiguous_case_only_matches() {
+        let mut reg = SkillRegistry::default();
+        for name in ["Review", "REVIEW"] {
+            let skill_dir = PathBuf::from(format!("/tmp/{name}"));
+            reg.insert_for_test(SkillMeta {
+                name: name.to_string(),
+                description: format!("{name} skill"),
+                location: skill_dir.join(SKILL_FILE),
+                skill_dir,
+                scope: SkillScope::Project,
+            });
+        }
+
+        assert!(reg.get("review").is_none());
+        assert!(reg.get_for_slash_command("review").is_none());
     }
 
     #[test]

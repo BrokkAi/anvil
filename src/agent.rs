@@ -597,13 +597,34 @@ fn available_commands(registry: &crate::skills::SkillRegistry) -> Vec<AvailableC
     }
     let builtins = builtin_command_names();
     for meta in registry.iter_sorted() {
-        if builtins.contains(meta.name.as_str()) {
+        let command_name = meta.name.to_ascii_lowercase();
+        if builtins.contains(command_name.as_str()) {
             tracing::warn!(
                 skill = %meta.name,
                 location = %meta.location.display(),
                 "skill name collides with a built-in slash command; hiding from autocomplete"
             );
             continue;
+        }
+        match registry.get_for_slash_command(&command_name) {
+            Some(resolved) if resolved.name == meta.name => {}
+            Some(resolved) => {
+                tracing::warn!(
+                    skill = %meta.name,
+                    resolved_skill = %resolved.name,
+                    location = %meta.location.display(),
+                    "skill name collides with another skill after slash-command case normalization; hiding from autocomplete"
+                );
+                continue;
+            }
+            None => {
+                tracing::warn!(
+                    skill = %meta.name,
+                    location = %meta.location.display(),
+                    "skill name is ambiguous after slash-command case normalization; hiding from autocomplete"
+                );
+                continue;
+            }
         }
         commands.push(AvailableCommand::new(
             meta.name.clone(),
@@ -1533,11 +1554,11 @@ pub async fn run_agent(
                 }
 
                 let prompt_text = if let Some((name, args)) = slash_command.as_ref()
-                    && let Some(meta) = snap.skills.get(name)
+                    && let Some(meta) = snap.skills.get_for_slash_command(name)
                 {
-                    tracing::info!(skill = %name, "slash-command activating skill");
+                    tracing::info!(skill = %meta.name, "slash-command activating skill");
                     sessions_prompt
-                        .mark_skill_activated(&session_id, name)
+                        .mark_skill_activated(&session_id, &meta.name)
                         .await;
                     let body = build_skill_payload(meta);
                     if args.is_empty() {
@@ -2541,12 +2562,12 @@ async fn run_loop_iteration(
     let raw_prompt_parts = vec![ChatContentPart::text(raw_prompt_text.clone())];
     let slash_command = parse_slash_command(&raw_prompt_text);
     let prompt_text = if let Some((name, args)) = slash_command.as_ref()
-        && let Some(meta) = snap.skills.get(name)
+        && let Some(meta) = snap.skills.get_for_slash_command(name)
     {
-        tracing::info!(skill = %name, "loop activating skill");
+        tracing::info!(skill = %meta.name, "loop activating skill");
         // `mark_skill_activated` writes into the session's HashSet of
         // activated skills, so repeated loop iterations are idempotent.
-        sessions.mark_skill_activated(session_id, name).await;
+        sessions.mark_skill_activated(session_id, &meta.name).await;
         let body = build_skill_payload(meta);
         if args.is_empty() {
             body
@@ -8225,6 +8246,25 @@ mod tests {
     }
 
     #[test]
+    fn available_commands_hide_case_ambiguous_skill_slashes() {
+        let mut reg = SkillRegistry::default();
+        for name in ["Review", "REVIEW"] {
+            reg.insert_for_test(SkillMeta {
+                name: name.to_string(),
+                description: format!("{name} skill"),
+                location: TestPathBuf::from(format!("/tmp/{name}/SKILL.md")),
+                skill_dir: TestPathBuf::from(format!("/tmp/{name}")),
+                scope: SkillScope::Project,
+            });
+        }
+
+        let cmds = available_commands(&reg);
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert!(!names.contains(&"Review"));
+        assert!(!names.contains(&"REVIEW"));
+    }
+
+    #[test]
     fn slash_collision_with_builtin_keeps_builtin_warns() {
         // A skill named `context` must NOT shadow the `/context` builtin
         // in autocomplete (the dispatcher checks built-ins first, so the
@@ -8239,6 +8279,20 @@ mod tests {
         // Built-in `context` exactly once; skill `context` dropped.
         assert_eq!(names.iter().filter(|n| **n == "context").count(), 1);
         // Non-colliding skill still appears.
+        assert!(names.contains(&"ok-skill"));
+    }
+
+    #[test]
+    fn slash_collision_with_builtin_is_case_insensitive() {
+        let registry = make_registry(vec![
+            ("Context", "this should be hidden"),
+            ("ok-skill", "this should show"),
+        ]);
+        let cmds = available_commands(&registry);
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+
+        assert_eq!(names.iter().filter(|n| **n == "context").count(), 1);
+        assert!(!names.contains(&"Context"));
         assert!(names.contains(&"ok-skill"));
     }
 
