@@ -2232,6 +2232,19 @@ pub enum LifecycleReopen {
     Unknown,
 }
 
+/// Outcome of an ACP `session/fork`.
+#[derive(Debug)]
+pub enum ForkOutcome {
+    /// The fork succeeded; carries the new, independent session.
+    Forked(Box<Session>),
+    /// The fork request's cwd did not match the source session's cwd.
+    CwdMismatch { session_cwd: PathBuf },
+    /// The source session is unknown.
+    Unknown,
+    /// Persisting the forked archive failed.
+    Failed(String),
+}
+
 impl SessionStore {
     /// Build a `SessionStore` with `SessionLimits::default()`. Test-only:
     /// production code goes through `with_limits` so CLI flags drive the
@@ -2808,6 +2821,81 @@ impl SessionStore {
         drop(sessions);
         self.touch(id);
         LifecycleReopen::Reopened(Box::new(cloned))
+    }
+
+    /// Fork an existing session into a new, independent session (ACP
+    /// `session/fork`): a fresh id whose persisted archive is a byte-copy of
+    /// the source's, so the fork carries the *full* conversation (not just the
+    /// in-memory window) and follow-up prompts on the fork never mutate the
+    /// source. The fork inherits the source's mode, model, and MCP config; the
+    /// caller may override the MCP servers afterwards. The request cwd must
+    /// match the source's cwd, mirroring `session/load`/`resume` (#147).
+    pub async fn fork_session(&self, source_id: &str, cwd: &Path) -> ForkOutcome {
+        let source = match self.reopen_session_checked(source_id, cwd).await {
+            LifecycleReopen::Reopened(session) => *session,
+            LifecycleReopen::CwdMismatch { session_cwd } => {
+                return ForkOutcome::CwdMismatch { session_cwd };
+            }
+            LifecycleReopen::Unknown => return ForkOutcome::Unknown,
+        };
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = current_timestamp_millis();
+        let mut new_manifest = source.manifest.clone();
+        new_manifest.id = new_id.clone();
+        new_manifest.created = now;
+        new_manifest.modified = now;
+        new_manifest.cwd = Some(cwd.to_string_lossy().into_owned());
+
+        // Copy the source archive to the new id, then stamp in the new
+        // manifest, so the fork preserves the source's full persisted history.
+        let source_zip = session_zip_path(&source.cwd, source_id);
+        let new_zip = session_zip_path(cwd, &new_id);
+        let manifest_for_disk = new_manifest.clone();
+        let write_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if let Some(parent) = new_zip.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_zip, &new_zip)?;
+            rewrite_manifest_in_zip(&new_zip, &manifest_for_disk)
+        })
+        .await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return ForkOutcome::Failed(format!("{e:#}")),
+            Err(e) => return ForkOutcome::Failed(format!("fork writer task panicked: {e}")),
+        }
+
+        // Build the in-memory forked session (history trimmed to the window;
+        // the on-disk copy retains the full conversation for cold reload).
+        let mut forked = match Session::from_persisted(
+            new_id.clone(),
+            cwd.to_path_buf(),
+            source.mode,
+            source.model.clone(),
+            source.history.clone(),
+            new_manifest,
+        ) {
+            Ok(s) => s,
+            Err(e) => return ForkOutcome::Failed(format!("{e}")),
+        };
+        forked.set_always_allow_keys(load_repo_always_allow_keys(&forked.permission_scope_root));
+
+        self.sessions
+            .write()
+            .await
+            .insert(new_id.clone(), forked.clone());
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            self.known_sessions
+                .write()
+                .await
+                .insert(new_id.clone(), cwd.to_path_buf());
+            self.closed_sessions.write().await.remove(&new_id);
+        }
+        self.touch(&new_id);
+        self.enforce_session_cap().await;
+        ForkOutcome::Forked(Box::new(forked))
     }
 
     /// Snapshot the per-session data needed to start a prompt turn,
@@ -5373,6 +5461,106 @@ mod tests {
             !session_zip_path(cwd.path(), &id).exists(),
             "add_turn must remove the archive it re-created for a deleted session"
         );
+    }
+
+    /// `session/fork` copies the source's history into a new, independent
+    /// session; edits to either side do not affect the other (#142).
+    #[tokio::test]
+    async fn fork_session_creates_independent_copy() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let source = store.create_session(cwd.path().to_path_buf()).await;
+        let src_id = source.id.clone();
+        store
+            .maybe_rename_from_prompt(&src_id, "Source session")
+            .await
+            .expect("rename");
+        store
+            .add_turn(
+                &src_id,
+                ConversationTurn {
+                    user_prompt: "u1".into(),
+                    agent_response: "a1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source turn");
+
+        let forked = match store.fork_session(&src_id, cwd.path()).await {
+            ForkOutcome::Forked(s) => *s,
+            other => panic!("expected fork, got {other:?}"),
+        };
+        let fork_id = forked.id.clone();
+        assert_ne!(fork_id, src_id, "fork must have a fresh id");
+        assert_eq!(forked.history.len(), 1, "fork copies the source history");
+        assert_eq!(forked.history[0].user_prompt, "u1");
+        assert!(
+            session_zip_path(cwd.path(), &fork_id).exists(),
+            "fork archive must be persisted"
+        );
+
+        // Independence: a new turn on the fork must not touch the source.
+        store
+            .add_turn(
+                &fork_id,
+                ConversationTurn {
+                    user_prompt: "u2".into(),
+                    agent_response: "a2".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fork turn");
+        let source_after = store
+            .get_session(&src_id, cwd.path())
+            .await
+            .expect("source still present");
+        assert_eq!(
+            source_after.history.len(),
+            1,
+            "source history must be unchanged by edits to the fork"
+        );
+        let fork_after = store
+            .get_session(&fork_id, cwd.path())
+            .await
+            .expect("fork present");
+        assert_eq!(
+            fork_after.history.len(),
+            2,
+            "fork accumulates its own turns"
+        );
+
+        // On-disk isolation: the two archives are physically separate. The
+        // fork's zip holds the copied turn plus its own; the source's zip is
+        // untouched by edits to the fork.
+        let fork_disk = read_history_from_zip(&session_zip_path(cwd.path(), &fork_id));
+        assert_eq!(fork_disk.len(), 2, "fork zip should hold copied + new turn");
+        let source_disk = read_history_from_zip(&session_zip_path(cwd.path(), &src_id));
+        assert_eq!(
+            source_disk.len(),
+            1,
+            "source zip must be unchanged on disk by the fork"
+        );
+    }
+
+    /// Forking an unknown source, or with a mismatched cwd, is reported rather
+    /// than silently succeeding (#142, #147).
+    #[tokio::test]
+    async fn fork_session_reports_unknown_and_cwd_mismatch() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        assert!(matches!(
+            store.fork_session("never-existed", cwd.path()).await,
+            ForkOutcome::Unknown
+        ));
+
+        let source = store.create_session(cwd.path().to_path_buf()).await;
+        let other = tempfile::tempdir().expect("other cwd");
+        assert!(matches!(
+            store.fork_session(&source.id, other.path()).await,
+            ForkOutcome::CwdMismatch { .. }
+        ));
     }
 
     #[tokio::test]

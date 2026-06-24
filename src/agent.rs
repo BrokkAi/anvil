@@ -6,15 +6,15 @@ use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
     Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
-    EmbeddedResourceResource, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionDeleteCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ResourceLink,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOption, SessionDeleteCapabilities, SessionForkCapabilities, SessionInfo,
+    SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, Usage as AcpUsage, UsageUpdate,
 };
@@ -28,9 +28,9 @@ use crate::discovery::{ModelSource, split_wire_id};
 use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
-    CloseSessionResult, ConversationTurn, LifecycleReopen, PermissionMode, PromptStartError,
-    REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode, SessionSnapshot,
-    SessionStore, UnsupportedMcpTransport, acp_mcp_servers_to_configs,
+    CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen, PermissionMode,
+    PromptStartError, REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode,
+    SessionSnapshot, SessionStore, UnsupportedMcpTransport, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -1208,6 +1208,7 @@ pub async fn run_agent(
 
     let sessions_load = sessions.clone();
     let sessions_resume = sessions.clone();
+    let sessions_fork = sessions.clone();
     let sessions_list = sessions.clone();
 
     let llm_prompt = llm.clone();
@@ -1261,7 +1262,8 @@ pub async fn run_agent(
                             .list(SessionListCapabilities::new())
                             .resume(SessionResumeCapabilities::new())
                             .close(SessionCloseCapabilities::new())
-                            .delete(SessionDeleteCapabilities::new()),
+                            .delete(SessionDeleteCapabilities::new())
+                            .fork(SessionForkCapabilities::new()),
                     );
 
                 let protocol_version = negotiate_protocol_version(req.protocol_version);
@@ -1618,6 +1620,105 @@ pub async fn run_agent(
                     setup_session,
                     setup_catalog,
                     sessions_resume.clone(),
+                );
+                result
+            },
+            on_receive_request!(),
+        )
+        // Handle session/fork
+        .on_receive_request(
+            async move |req: ForkSessionRequest,
+                        responder: Responder<ForkSessionResponse>,
+                        cx: ConnectionTo<Client>| {
+                let source_id = req.session_id.to_string();
+                let cwd = req.cwd.clone();
+                tracing::info!(
+                    "ACP session/fork source={source_id}, cwd={}",
+                    cwd.display()
+                );
+                if !cwd.is_absolute() {
+                    return responder
+                        .respond_with_error(invalid_lifecycle_cwd_error("session/fork", &cwd));
+                }
+                if !req.additional_directories.is_empty() {
+                    return responder.respond_with_error(
+                        unsupported_additional_directories_error("session/fork"),
+                    );
+                }
+                let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
+                    Ok(servers) => servers,
+                    Err(err) => {
+                        return responder
+                            .respond_with_error(unsupported_mcp_transport_error("session/fork", &err));
+                    }
+                };
+
+                // Fork copies the source's full persisted history into a new,
+                // independent session id; the request cwd must match the
+                // source's cwd (#147).
+                let forked = match sessions_fork.fork_session(&source_id, &cwd).await {
+                    ForkOutcome::Forked(session) => *session,
+                    ForkOutcome::CwdMismatch { session_cwd } => {
+                        return responder.respond_with_error(lifecycle_cwd_mismatch_error(
+                            "session/fork",
+                            &session_cwd,
+                            &cwd,
+                        ));
+                    }
+                    ForkOutcome::Unknown => {
+                        return responder.respond_with_error(unknown_session_error(&source_id));
+                    }
+                    ForkOutcome::Failed(reason) => {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error().data(
+                                serde_json::json!({
+                                    "reason": "failed to fork session",
+                                    "details": reason,
+                                }),
+                            ),
+                        );
+                    }
+                };
+                let new_id = forked.id.clone();
+                // Apply the request's MCP servers (replace) when supplied; an
+                // empty set inherits the source's copied MCP config (#145/#146
+                // semantics, but fork defaults to the source's config).
+                if !requested_mcp_servers.is_empty() {
+                    sessions_fork
+                        .apply_lifecycle_mcp_servers(&new_id, requested_mcp_servers)
+                        .await;
+                }
+
+                let catalog = sessions_fork.available_model_metadata().await;
+                let setup_session = forked.clone();
+                let setup_catalog = catalog.clone();
+                let result = responder.respond(
+                    ForkSessionResponse::new(new_id.clone())
+                        .modes(mode_state(forked.mode.as_str()))
+                        .config_options(all_config_options(
+                            forked.mode,
+                            forked.permission_mode,
+                            &forked.model,
+                            &catalog,
+                            forked.selected_reasoning_effort.as_deref(),
+                        )),
+                );
+                spawn_delayed_available_commands_update(
+                    cx.clone(),
+                    new_id.clone(),
+                    forked.skills.clone(),
+                );
+                spawn_delayed_session_usage_update(
+                    cx.clone(),
+                    sessions_fork.clone(),
+                    new_id.clone(),
+                    forked.cwd.clone(),
+                );
+                spawn_delayed_setup_notice(
+                    cx.clone(),
+                    setup_session,
+                    setup_catalog,
+                    sessions_fork.clone(),
                 );
                 result
             },
