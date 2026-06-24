@@ -272,6 +272,17 @@ fn session_list_without_cwd_and_cursor_semantics() {
         &client,
     );
 
+    // A supplied cwd filter must be absolute, matching the other lifecycle
+    // handlers (#143 keeps cwd optional, but a provided one is validated).
+    let relative_cwd = client.request("session/list", json!({ "cwd": "relative/repo" }));
+    assert_response_invalid_params_contains(
+        &case,
+        "session/list (relative cwd)",
+        &relative_cwd,
+        "cwd must be absolute",
+        &client,
+    );
+
     assert!(
         !client.exited(),
         "{}: anvil exited during session/list checks; stderr:\n{}\ntrace:\n{}",

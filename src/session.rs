@@ -3647,6 +3647,9 @@ impl SessionStore {
             .filter(|session| session.manifest.title().is_some())
             .map(|session| (session.manifest.clone(), session.cwd.clone()))
             .collect();
+        // Keep this predicate and comparator in lockstep with the on-disk
+        // listing's `filter_and_sort_listed_manifests` so cwd and no-cwd
+        // `session/list` results are ordered consistently.
         entries.sort_by(|a, b| {
             b.0.modified
                 .cmp(&a.0.modified)
