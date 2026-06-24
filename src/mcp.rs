@@ -183,9 +183,33 @@ fn is_default_or_managed_bifrost_command(command: &str) -> bool {
 /// framing override) is intentionally discarded — Bifrost's wire protocol
 /// requires line framing and the command must point to the pinned managed
 /// binary.
+/// Argument sets that earlier Anvil versions shipped as the managed Bifrost
+/// default. A persisted entry still carrying one of these (with the managed
+/// command) is an unmodified prior default, so it is upgraded to the current
+/// default on load. Without this, existing installs would keep their old
+/// `--server core` surface and never pick up the searchtools switch (#121)
+/// short of a manual `/mcp reset`.
+fn legacy_default_bifrost_arg_sets() -> Vec<Vec<String>> {
+    vec![vec![
+        "--root".to_string(),
+        "{cwd}".to_string(),
+        "--server".to_string(),
+        "core".to_string(),
+        "--no-line-numbers".to_string(),
+    ]]
+}
+
+/// True if `args` is the current managed default or a recognized prior default.
+fn is_managed_default_bifrost_args(args: &[String]) -> bool {
+    args == default_bifrost_args().as_slice()
+        || legacy_default_bifrost_arg_sets()
+            .iter()
+            .any(|legacy| args == legacy.as_slice())
+}
+
 pub fn normalize_preinstalled_bifrost_server(server: &mut McpServerConfig) {
     if server.name != "bifrost"
-        || server.args.as_slice() != default_bifrost_args().as_slice()
+        || !is_managed_default_bifrost_args(&server.args)
         || !is_default_or_managed_bifrost_command(&server.command)
     {
         return;
@@ -722,6 +746,63 @@ fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A persisted bifrost entry carrying the prior managed default
+    /// (`--server core`) is upgraded to the current default surface on load, so
+    /// existing installs pick up the searchtools switch without `/mcp reset`
+    /// (#121).
+    #[test]
+    fn legacy_default_bifrost_args_are_upgraded_to_current_default() {
+        let mut server = McpServerConfig {
+            name: "bifrost".to_string(),
+            command: "bifrost".to_string(),
+            args: vec![
+                "--root".to_string(),
+                "{cwd}".to_string(),
+                "--server".to_string(),
+                "core".to_string(),
+                "--no-line-numbers".to_string(),
+            ],
+            env: Vec::new(),
+            framing: McpFraming::Line,
+            enabled: false,
+        };
+        normalize_preinstalled_bifrost_server(&mut server);
+        assert_eq!(
+            server.args,
+            default_bifrost_args(),
+            "a stored prior-default bifrost entry should be upgraded to the current default"
+        );
+        assert!(
+            server.args.iter().any(|a| a == "searchtools"),
+            "upgraded entry should use the searchtools surface"
+        );
+        // Non-default fields are preserved.
+        assert!(!server.enabled, "the stored enabled flag must be preserved");
+    }
+
+    /// A user-customized bifrost surface (neither the current nor a prior
+    /// managed default) is left untouched.
+    #[test]
+    fn customized_bifrost_args_are_not_upgraded() {
+        let custom = vec![
+            "--root".to_string(),
+            "{cwd}".to_string(),
+            "--server".to_string(),
+            "symbol".to_string(),
+            "--no-line-numbers".to_string(),
+        ];
+        let mut server = McpServerConfig {
+            name: "bifrost".to_string(),
+            command: "bifrost".to_string(),
+            args: custom.clone(),
+            env: Vec::new(),
+            framing: McpFraming::Line,
+            enabled: true,
+        };
+        normalize_preinstalled_bifrost_server(&mut server);
+        assert_eq!(server.args, custom, "a custom surface must be left as-is");
+    }
 
     /// Resolve the bifrost binary used by the handshake test.
     ///
