@@ -2501,10 +2501,18 @@ impl SessionStore {
     /// prompt rebuilds with the new servers (the cache is reused when cwd is
     /// stable, so without this drop a changed server set would not take effect).
     ///
+    /// Replace semantics, per ACP (the request's `mcpServers` is the complete
+    /// additive set for the load): an empty set therefore clears the session's
+    /// previously-persisted additive servers. The global/setup MCP servers
+    /// (including Bifrost) are merged separately by [`effective_mcp_servers`]
+    /// and are unaffected.
+    ///
     /// In-memory only: the client re-supplies `mcpServers` on every lifecycle
     /// request, so this does not rewrite the persisted manifest -- `session/new`
-    /// remains the source of persisted MCP config. Returns false if the session
-    /// is unknown.
+    /// remains the source of persisted MCP config. Callers invoke this from the
+    /// lifecycle handlers, which are assumed not to race an in-flight prompt's
+    /// registry build (the same single-client assumption `update_cwd` relies
+    /// on). Returns false if the session is unknown.
     pub async fn apply_lifecycle_mcp_servers(
         &self,
         id: &str,
@@ -6159,6 +6167,19 @@ done
                 .await,
             "applying to an unknown session should report false"
         );
+
+        // Replace semantics: an empty set clears the additive servers (the
+        // client is expected to re-supply mcpServers on each lifecycle request;
+        // global/setup servers are merged separately and unaffected).
+        assert!(store.apply_lifecycle_mcp_servers(&session.id, vec![]).await);
+        {
+            let sessions = store.sessions.read().await;
+            assert_eq!(
+                sessions.get(&session.id).unwrap().mcp_servers.as_deref(),
+                Some([].as_slice()),
+                "an empty lifecycle set should replace, not preserve, the prior set"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

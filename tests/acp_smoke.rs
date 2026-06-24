@@ -183,9 +183,19 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
     std::fs::create_dir_all(&extra_dir).expect("create extra mcp dir");
     let extra_log = extra_dir.join("extra-mcp-spawn.log");
     let extra_server = make_fake_bifrost_binary(&extra_dir, &extra_log);
+    // A second fake stdio server used to prove session/resume also applies a
+    // newly-supplied server set, rebuilding the registry (#146).
+    let extra2_dir = temp.path().join("extra2-mcp");
+    std::fs::create_dir_all(&extra2_dir).expect("create extra2 mcp dir");
+    let extra2_log = extra2_dir.join("extra2-mcp-spawn.log");
+    let extra2_server = make_fake_bifrost_binary(&extra2_dir, &extra2_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
-    let provider = start_openai_smoke_server(vec![text_sse_body("Looked around.")]);
+    // Two text turns: one after the load-applied server, one after resume.
+    let provider = start_openai_smoke_server(vec![
+        text_sse_body("Looked around."),
+        text_sse_body("Looked again."),
+    ]);
     let mut child = spawn_anvil(
         &home,
         &config_home,
@@ -305,6 +315,37 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
     assert!(
         extra_log.exists(),
         "{}: load-applied stdio MCP server was not spawned on the next prompt (#145); stderr:\n{}",
+        case.name,
+        client.stderr_text()
+    );
+
+    // session/resume with a different stdio server replaces the set and drops
+    // the cached registry, so the next prompt spawns the new server (#146).
+    let resume_stdio = client.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [ {
+                "name": "extra2",
+                "command": extra2_server,
+                "args": [],
+                "env": []
+            } ]
+        }),
+    );
+    assert_response_ok(&case, "session/resume (stdio mcp)", &resume_stdio, &client);
+    let prompt2 = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": "again" } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt (after resume)", &prompt2, &client);
+    assert!(
+        extra2_log.exists(),
+        "{}: resume-applied stdio MCP server was not spawned on the next prompt (#146); stderr:\n{}",
         case.name,
         client.stderr_text()
     );
