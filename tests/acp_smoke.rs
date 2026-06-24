@@ -156,6 +156,92 @@ fn relative_cwd_lifecycle_requests_return_invalid_params() {
     let _ = stderr_join.join();
 }
 
+#[test]
+fn invalid_prompt_requests_return_invalid_params() {
+    let case = SmokeCase {
+        name: "invalid_prompt_requests",
+        prompt: String::new(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    // An empty prompt is an invalid request, not a completed end-turn (#155).
+    let empty_prompt = client.request(
+        "session/prompt",
+        json!({ "sessionId": session_id, "prompt": [] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/prompt (empty)",
+        &empty_prompt,
+        "at least one",
+        &client,
+    );
+
+    // An unknown session is a protocol error, not a successful end-turn (#155).
+    let unknown_prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": "does-not-exist",
+            "prompt": [ { "type": "text", "text": "hi" } ]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/prompt (unknown session)",
+        &unknown_prompt,
+        "unknown session",
+        &client,
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited after invalid prompt rejection; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
 fn run_smoke_case(case: &SmokeCase) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
@@ -489,6 +575,14 @@ fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
         client.trace_text()
     );
     if send_session_cancel {
+        // A turn aborted via `session/cancel` MUST resolve its prompt with the
+        // `cancelled` stop reason rather than a normal end-turn (#152).
+        assert_eq!(
+            prompt["result"]["stopReason"].as_str(),
+            Some("cancelled"),
+            "{}: cancelled prompt did not return stopReason=cancelled: {prompt}",
+            case.name
+        );
         assert_eq!(
             provider.request_count(),
             2,
@@ -496,6 +590,14 @@ fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
             case.name
         );
     } else {
+        // Declining a single permission (without session/cancel) is not a
+        // turn cancellation: the turn completes normally as end_turn (#152).
+        assert_eq!(
+            prompt["result"]["stopReason"].as_str(),
+            Some("end_turn"),
+            "{}: non-cancelled prompt did not return stopReason=end_turn: {prompt}",
+            case.name
+        );
         assert_eq!(
             provider.request_count(),
             3,

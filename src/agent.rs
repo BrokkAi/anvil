@@ -5,10 +5,11 @@ use std::time::Duration;
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    Cost, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    Cost, EmbeddedResource, EmbeddedResourceResource, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
     SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
     SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
@@ -77,6 +78,15 @@ fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protoco
     }))
 }
 
+/// Build the protocol error returned when a `session/prompt` request names a
+/// session Anvil does not know. Shared by the prompt-path sites (cold-miss,
+/// closed-mid-request, and registry rebuild) so the wording stays identical.
+fn unknown_session_error(session_id: &str) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!("unknown session '{session_id}'"),
+    }))
+}
+
 fn prompt_response_meta(
     result: Option<&StructuredOutputResult>,
     orchestration_model: Option<&ResolvedModelInfo>,
@@ -118,9 +128,30 @@ fn prompt_response_meta(
     if meta.is_empty() { None } else { Some(meta) }
 }
 
-fn prompt_end_turn_response() -> PromptResponse {
+/// Build the terminal `PromptResponse` for a finished turn, choosing the
+/// stop reason from whether the prompt's cancellation token fired.
+///
+/// ACP requires that a turn cancelled via `session/cancel` resolves its
+/// original `session/prompt` with `StopReason::Cancelled` -- even when the
+/// cancellation aborted underlying LLM/tool work -- so the client can
+/// distinguish a cancelled prompt from a normal completion. Callers pass
+/// `cancel.is_cancelled()` after the turn settles; the tool loop already
+/// catches cancellation internally and returns normally, so the token is
+/// the authoritative signal here.
+fn prompt_stop_response(cancelled: bool) -> PromptResponse {
     emit_terminal_notification(TerminalNotificationEvent::TurnEnded);
-    PromptResponse::new(StopReason::EndTurn)
+    let stop_reason = if cancelled {
+        StopReason::Cancelled
+    } else {
+        StopReason::EndTurn
+    };
+    PromptResponse::new(stop_reason)
+}
+
+/// Convenience wrapper for the non-cancellable, synchronous prompt paths
+/// (slash commands, validation short-circuits) that always end the turn.
+fn prompt_end_turn_response() -> PromptResponse {
+    prompt_stop_response(false)
 }
 
 /// Available session modes exposed to ACP clients.
@@ -1351,8 +1382,15 @@ pub async fn run_agent(
                 let raw_prompt_text = extract_prompt_text(&req.prompt);
                 let raw_prompt_parts = extract_prompt_parts(&req.prompt);
                 if raw_prompt_parts.is_empty() {
-                    send_message(&cx, &session_id, "Error: empty prompt");
-                    return responder.respond(prompt_end_turn_response());
+                    // An empty prompt is an invalid request, not a completed
+                    // turn: report it at the protocol layer so clients don't
+                    // mistake it for a normal end-turn.
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+                            "reason": "session/prompt requires at least one text, image, \
+                                       resource link, or embedded resource content block",
+                        })),
+                    );
                 }
                 let structured_output_request = match parse_prompt_structured_output_request(&req) {
                     Ok(request) => request,
@@ -1377,8 +1415,9 @@ pub async fn run_agent(
                 let mut snap = match sessions_prompt.snapshot(&session_id, &fallback_cwd).await {
                     Some(s) => s,
                     None => {
-                        send_message(&cx, &session_id, "Error: unknown session");
-                        return responder.respond(prompt_end_turn_response());
+                        // Unknown session is a protocol-level invalid request,
+                        // not a successful end-turn.
+                        return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
 
@@ -1630,13 +1669,7 @@ pub async fn run_agent(
                         );
                     }
                     Err(PromptStartError::UnknownSession) => {
-                        return responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params().data(
-                                serde_json::json!({
-                                    "reason": format!("unknown session '{session_id}'"),
-                                }),
-                            ),
-                        );
+                        return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
 
@@ -1682,7 +1715,9 @@ pub async fn run_agent(
                     send_message(&cx, &session_id, &report);
                     send_session_usage_update(&cx, &sessions_prompt, &session_id, &snap.cwd).await;
                     sessions_prompt.finish_prompt(&session_id).await;
-                    return responder.respond(prompt_end_turn_response());
+                    // `/compress` threads the cancel token into summarization;
+                    // a mid-compress `session/cancel` resolves as cancelled.
+                    return responder.respond(prompt_stop_response(cancel.is_cancelled()));
                 }
 
                 if let Some(loop_spec) = loop_spec {
@@ -1807,6 +1842,9 @@ pub async fn run_agent(
                         };
 
                         sessions_for_loop.finish_prompt(&session_id_for_loop).await;
+                        // `/loop` exits its iteration loop when the cancel
+                        // token fires; report that as a cancelled turn.
+                        let cancelled = cancel.is_cancelled();
                         let response = if let Some(cumulative_usage) = cumulative_usage {
                             let acp_usage = AcpUsage::new(
                                 cumulative_usage.total_tokens(),
@@ -1816,9 +1854,9 @@ pub async fn run_agent(
                             .thought_tokens(cumulative_usage.thought_tokens)
                             .cached_read_tokens(cumulative_usage.cached_read_tokens)
                             .cached_write_tokens(cumulative_usage.cached_write_tokens);
-                            prompt_end_turn_response().usage(Some(acp_usage))
+                            prompt_stop_response(cancelled).usage(Some(acp_usage))
                         } else {
-                            prompt_end_turn_response()
+                            prompt_stop_response(cancelled)
                         };
                         let response = response.meta(prompt_response_meta(
                             structured_output_result.as_ref(),
@@ -1892,6 +1930,9 @@ pub async fn run_agent(
                         };
 
                         sessions_for_goal.finish_prompt(&session_id_for_goal).await;
+                        // `run_goal_loop` returns when the goal is met, blocked,
+                        // or cancelled; the token distinguishes cancellation.
+                        let cancelled = cancel.is_cancelled();
                         let acp_usage = AcpUsage::new(
                             cumulative_usage.total_tokens(),
                             cumulative_usage.input_tokens,
@@ -1900,7 +1941,7 @@ pub async fn run_agent(
                         .thought_tokens(cumulative_usage.thought_tokens)
                         .cached_read_tokens(cumulative_usage.cached_read_tokens)
                         .cached_write_tokens(cumulative_usage.cached_write_tokens);
-                        let response = prompt_end_turn_response()
+                        let response = prompt_stop_response(cancelled)
                             .usage(Some(acp_usage))
                             .meta(prompt_response_meta(
                                 None,
@@ -1929,6 +1970,7 @@ pub async fn run_agent(
                     let cx_for_refresh = cx.clone();
                     let session_id_for_refresh = session_id.clone();
                     let refresh_lock_for_refresh = refresh_lock_login.clone();
+                    let cancel_for_refresh = cancel.clone();
 
                     let spawn_result = cx.spawn(async move {
                         let report = match refresh_model_catalog_now(
@@ -1958,7 +2000,8 @@ pub async fn run_agent(
                         };
                         send_message(&cx_for_refresh, &session_id_for_refresh, &report);
                         sessions_for_refresh.finish_prompt(&session_id_for_refresh).await;
-                        if let Err(e) = responder.respond(prompt_end_turn_response())
+                        if let Err(e) = responder
+                            .respond(prompt_stop_response(cancel_for_refresh.is_cancelled()))
                         {
                             tracing::warn!(
                                 session_id = %session_id_for_refresh,
@@ -1995,11 +2038,7 @@ pub async fn run_agent(
                     .await
                 else {
                     sessions_prompt.finish_prompt(&session_id).await;
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params().data(serde_json::json!({
-                            "reason": format!("unknown session '{session_id}'"),
-                        })),
-                    );
+                    return responder.respond_with_error(unknown_session_error(&session_id));
                 };
 
                 // Capture everything the spawned task needs before we move into it.
@@ -2029,6 +2068,9 @@ pub async fn run_agent(
                         .unwrap_or(default_idle_timeout_secs)
                         .max(1),
                 );
+                // `cancel` is moved into the tool loop below, so keep a clone to
+                // detect after the turn whether the prompt was cancelled.
+                let cancel_status = cancel.clone();
 
                 let spawn_result = cx.spawn(async move {
                     // The normal prompt path uses only the structured output and
@@ -2074,7 +2116,11 @@ pub async fn run_agent(
                     .thought_tokens(cumulative_usage.thought_tokens)
                     .cached_read_tokens(cumulative_usage.cached_read_tokens)
                     .cached_write_tokens(cumulative_usage.cached_write_tokens);
-                    let response = prompt_end_turn_response().usage(Some(acp_usage));
+                    // ACP: a turn aborted by `session/cancel` MUST resolve its
+                    // prompt with the cancelled stop reason, even though the
+                    // tool loop swallowed the cancellation and returned normally.
+                    let response =
+                        prompt_stop_response(cancel_status.is_cancelled()).usage(Some(acp_usage));
                     let response = response.meta(prompt_response_meta(
                         structured_output_result.as_ref(),
                         Some(&orchestration_model_for_response),
@@ -2306,9 +2352,14 @@ fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
 /// Convert ACP prompt blocks into the internal multimodal chat content
 /// representation. Baseline text is preserved verbatim; images are
 /// forwarded as either data URLs (for inline base64) or URLs (when the
-/// client supplied a URI without inline bytes). Other ACP content types
-/// are intentionally ignored here because the agent has not advertised
-/// audio support and resource links are handled through textual context.
+/// client supplied a URI without inline bytes).
+///
+/// ACP requires baseline agents to support resource links, and Anvil
+/// advertises `embeddedContext`, so both are handled here rather than
+/// silently dropped: resource links become explicit textual references and
+/// embedded resources become inline text (or an image part for image
+/// blobs). Audio is still ignored because the agent has not advertised
+/// audio support.
 fn extract_prompt_parts(blocks: &[ContentBlock]) -> Vec<ChatContentPart> {
     blocks
         .iter()
@@ -2321,9 +2372,67 @@ fn extract_prompt_parts(blocks: &[ContentBlock]) -> Vec<ChatContentPart> {
                 .uri
                 .as_ref()
                 .map(|uri| ChatContentPart::image_url(uri.clone())),
+            ContentBlock::ResourceLink(link) => {
+                Some(ChatContentPart::text(resource_link_to_text(link)))
+            }
+            ContentBlock::Resource(resource) => Some(embedded_resource_to_part(resource)),
             _ => None,
         })
         .collect()
+}
+
+/// Render an ACP `ResourceLink` as textual context for the model.
+///
+/// ACP baseline prompt support requires agents to accept resource links;
+/// Anvil does not resolve the referenced bytes (that would require client
+/// filesystem round-trips), so it surfaces the reference -- name, uri, and
+/// any human-readable hints -- as text. This keeps the link visible to the
+/// model and ensures a resource-link-only prompt is not mistaken for an
+/// empty prompt.
+fn resource_link_to_text(link: &ResourceLink) -> String {
+    let mut out = format!("[resource link: {}", link.name);
+    if let Some(title) = link.title.as_deref()
+        && title != link.name
+    {
+        out.push_str(&format!(" ({title})"));
+    }
+    out.push_str(&format!("; uri: {}", link.uri));
+    if let Some(mime) = link.mime_type.as_deref() {
+        out.push_str(&format!("; mimeType: {mime}"));
+    }
+    if let Some(desc) = link.description.as_deref() {
+        out.push_str(&format!("; {desc}"));
+    }
+    out.push(']');
+    out
+}
+
+/// Convert an ACP embedded `Resource` block into a chat content part.
+///
+/// Text resources are surfaced inline (tagged with their uri) so embedded
+/// context reaches the model, satisfying the advertised `embeddedContext`
+/// capability. Image blobs are forwarded as image parts for vision models;
+/// any other binary blob becomes a textual placeholder so the context is
+/// acknowledged rather than silently dropped.
+fn embedded_resource_to_part(resource: &EmbeddedResource) -> ChatContentPart {
+    match &resource.resource {
+        EmbeddedResourceResource::TextResourceContents(text) => {
+            ChatContentPart::text(format!("[embedded resource: {}]\n{}", text.uri, text.text))
+        }
+        EmbeddedResourceResource::BlobResourceContents(blob) => match blob.mime_type.as_deref() {
+            Some(mime) if mime.starts_with("image/") && !blob.blob.is_empty() => {
+                ChatContentPart::image_data(blob.blob.clone(), mime)
+            }
+            mime => ChatContentPart::text(format!(
+                "[embedded binary resource: {} ({})]",
+                blob.uri,
+                mime.unwrap_or("application/octet-stream")
+            )),
+        },
+        // `EmbeddedResourceResource` is `#[non_exhaustive]`; surface
+        // unrecognized future variants as text rather than dropping them.
+        _ => ChatContentPart::text("[unsupported embedded resource]".to_string()),
+    }
 }
 
 fn prompt_parts_include_images(parts: &[ChatContentPart]) -> bool {
@@ -7284,6 +7393,118 @@ mod tests {
             ContentBlock::Text(TextContent::new("after")),
         ];
         assert_eq!(extract_prompt_text(&blocks), "before\nafter");
+    }
+
+    /// ACP requires baseline agents to accept resource links. Anvil surfaces
+    /// them as textual references so a link is never silently dropped (#150).
+    #[test]
+    fn extract_prompt_parts_renders_resource_link_as_text() {
+        use agent_client_protocol::schema::ResourceLink;
+        let link = ResourceLink::new("notes.md", "file:///repo/notes.md")
+            .description("design notes")
+            .mime_type("text/markdown");
+        let parts = extract_prompt_parts(&[ContentBlock::ResourceLink(link)]);
+        assert_eq!(parts.len(), 1, "resource link must produce one part");
+        let ChatContentPart::Text { text } = &parts[0] else {
+            panic!("resource link should become a text part: {parts:?}");
+        };
+        assert!(text.contains("notes.md"), "missing name: {text}");
+        assert!(
+            text.contains("file:///repo/notes.md"),
+            "missing uri: {text}"
+        );
+        assert!(text.contains("design notes"), "missing description: {text}");
+    }
+
+    /// A resource-link-only prompt must not be mistaken for an empty prompt:
+    /// `extract_prompt_parts` yields a non-empty part list (#150).
+    #[test]
+    fn extract_prompt_parts_resource_link_only_is_not_empty() {
+        use agent_client_protocol::schema::ResourceLink;
+        let link = ResourceLink::new("a.rs", "file:///repo/a.rs");
+        let parts = extract_prompt_parts(&[ContentBlock::ResourceLink(link)]);
+        assert!(
+            !parts.is_empty(),
+            "resource-link-only prompt should not be empty"
+        );
+    }
+
+    /// Anvil advertises `embeddedContext`, so embedded text resources must
+    /// reach prompt construction rather than being dropped (#151).
+    #[test]
+    fn extract_prompt_parts_inlines_embedded_text_resource() {
+        use agent_client_protocol::schema::{
+            EmbeddedResource, EmbeddedResourceResource, TextResourceContents,
+        };
+        let resource = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+            TextResourceContents::new("fn main() {}", "file:///repo/main.rs"),
+        ));
+        let parts = extract_prompt_parts(&[ContentBlock::Resource(resource)]);
+        assert_eq!(parts.len(), 1);
+        let ChatContentPart::Text { text } = &parts[0] else {
+            panic!("embedded text resource should become a text part: {parts:?}");
+        };
+        assert!(text.contains("fn main() {}"), "missing body: {text}");
+        assert!(
+            text.contains("file:///repo/main.rs"),
+            "missing uri tag: {text}"
+        );
+    }
+
+    /// An embedded image blob is forwarded as an image part for vision
+    /// models (#151).
+    #[test]
+    fn extract_prompt_parts_forwards_embedded_image_blob() {
+        use agent_client_protocol::schema::{
+            BlobResourceContents, EmbeddedResource, EmbeddedResourceResource,
+        };
+        let resource = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
+            BlobResourceContents::new("AAAA", "file:///repo/pic.png").mime_type("image/png"),
+        ));
+        let parts = extract_prompt_parts(&[ContentBlock::Resource(resource)]);
+        assert_eq!(parts.len(), 1);
+        assert!(
+            matches!(&parts[0], ChatContentPart::Image { .. }),
+            "image blob should become an image part: {parts:?}"
+        );
+    }
+
+    /// A non-image embedded blob is surfaced as a textual placeholder rather
+    /// than silently dropped (#151).
+    #[test]
+    fn extract_prompt_parts_placeholders_embedded_binary_blob() {
+        use agent_client_protocol::schema::{
+            BlobResourceContents, EmbeddedResource, EmbeddedResourceResource,
+        };
+        let resource = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
+            BlobResourceContents::new("AAAA", "file:///repo/data.bin")
+                .mime_type("application/octet-stream"),
+        ));
+        let parts = extract_prompt_parts(&[ContentBlock::Resource(resource)]);
+        assert_eq!(parts.len(), 1);
+        let ChatContentPart::Text { text } = &parts[0] else {
+            panic!("binary blob should become a text placeholder: {parts:?}");
+        };
+        assert!(
+            text.contains("file:///repo/data.bin"),
+            "missing uri: {text}"
+        );
+    }
+
+    /// A cancelled turn resolves with `StopReason::Cancelled`; a normal turn
+    /// stays `EndTurn` (#152).
+    #[test]
+    fn prompt_stop_response_maps_cancellation_to_stop_reason() {
+        assert_eq!(
+            prompt_stop_response(true).stop_reason,
+            StopReason::Cancelled
+        );
+        assert_eq!(prompt_stop_response(false).stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            prompt_end_turn_response().stop_reason,
+            StopReason::EndTurn,
+            "the non-cancellable convenience wrapper always ends the turn"
+        );
     }
 
     #[test]
