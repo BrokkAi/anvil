@@ -3477,7 +3477,7 @@ fn tool_result_to_execution(
     }
 }
 
-const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command appears to be blocked by the sandbox boundary. Retry it with `sandbox_permissions: \"require_escalated\"` to run outside the sandbox.";
+const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command appears to be blocked by the sandbox boundary. The next `run_shell_command` schema now permits a one-time outside-sandbox retry for this same command and directory. Retry the same command with `sandbox_permissions: \"require_escalated\"` instead of asking the user to paste external content when blocked network/DNS access is the issue.";
 
 /// Strip the sandbox-escalation hint from output so client-facing
 /// tool-call cards show a clean message. The full hint still flows
