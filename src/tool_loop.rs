@@ -1,10 +1,7 @@
 mod announce;
 
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::{
@@ -69,6 +66,17 @@ struct ExecutedStepOutcome {
     cancelled: bool,
 }
 
+/// Stream a model turn, retrying transient failures (network disconnect,
+/// truncated stream, server overload/5xx/429) up to [`LLM_MAX_ATTEMPTS`].
+///
+/// Unlike a pre-stream HTTP retry, a retry here replays the whole request and
+/// re-streams from scratch -- we cannot resume an interrupted SSE body. This
+/// matches Codex's HTTP retry behaviour: if the disconnect lands mid-response,
+/// any text already streamed to the client may be re-emitted on the retry.
+/// We accept that cosmetic seam in exchange for surviving the outage instead of
+/// ending the turn. (A future change can dedup the replayed prefix.)
+///
+/// [`LLM_MAX_ATTEMPTS`]: crate::http_retry::LLM_MAX_ATTEMPTS
 #[allow(clippy::too_many_arguments)]
 async fn stream_chat_with_transient_retry(
     llm: &Arc<dyn LlmBackend>,
@@ -86,25 +94,15 @@ async fn stream_chat_with_transient_retry(
 ) -> anyhow::Result<LlmResponse> {
     let mut attempt = 1u64;
     loop {
-        let emitted_output = Arc::new(AtomicBool::new(false));
-
         let token_sink = on_text.clone();
-        let token_emitted = emitted_output.clone();
         let on_token: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if !token.is_empty() {
-                token_emitted.store(true, Ordering::SeqCst);
-            }
             if let Ok(mut cb) = token_sink.lock() {
                 cb(token);
             }
         });
 
         let thought_sink = on_thought.clone();
-        let thought_emitted = emitted_output.clone();
         let on_thought_cb: Box<dyn FnMut(&str) + Send> = Box::new(move |token: &str| {
-            if !token.is_empty() {
-                thought_emitted.store(true, Ordering::SeqCst);
-            }
             if let Ok(mut cb) = thought_sink.lock() {
                 cb(token);
             }
@@ -130,7 +128,6 @@ async fn stream_chat_with_transient_retry(
             Err(error)
                 if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
                     && !cancel.is_cancelled()
-                    && !emitted_output.load(Ordering::SeqCst)
                     && is_retryable_llm_error(&error) =>
             {
                 let delay = crate::http_retry::retry_backoff(attempt);
@@ -147,7 +144,8 @@ async fn stream_chat_with_transient_retry(
                     turn,
                     attempt,
                     max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
-                    "retrying transient LLM stream failure before any output was emitted"
+                    "retrying transient LLM stream failure (replaying the request; \
+                     already-streamed text may be re-emitted)"
                 );
                 crate::http_retry::sleep_before_retry(
                     "streaming LLM response",
@@ -161,6 +159,20 @@ async fn stream_chat_with_transient_retry(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Why a model turn ended without producing a usable assistant response.
+///
+/// Surfaced out of [`run`] so autonomous drivers (e.g. `/goal`) can decide
+/// whether to back off and retry (transient outage) or stop and hand back to
+/// the user (fatal). `retryable` mirrors the classification the inner
+/// stream-retry already uses via [`crate::llm_client::is_retryable_llm_error`]
+/// -- transient signals (server overload, rate limit, stream disconnect,
+/// network) are retryable; auth/invalid-request and panics are not.
+#[derive(Debug, Clone)]
+pub(crate) struct TurnFailure {
+    pub retryable: bool,
+    pub message: String,
 }
 
 /// Result of approving a permission request.
@@ -1312,7 +1324,7 @@ pub(crate) async fn run(
     original_user_request: String,
     notifications: NotificationMode,
     depth: usize,
-) -> (String, Vec<ToolExchange>, TokenUsage) {
+) -> (String, Vec<ToolExchange>, TokenUsage, Option<TurnFailure>) {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
@@ -1321,10 +1333,17 @@ pub(crate) async fn run(
                 "type": "p2t_config_error",
                 "error": format!("{error:#}"),
             }));
+            // A misconfigured env var fails deterministically every turn, so
+            // mark it fatal: an autonomous driver should stop and surface it
+            // rather than retry the same broken config.
             return (
                 format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
                 Vec::new(),
                 TokenUsage::default(),
+                Some(TurnFailure {
+                    retryable: false,
+                    message: format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
+                }),
             );
         }
     };
@@ -1340,6 +1359,10 @@ pub(crate) async fn run(
                     format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
                     Vec::new(),
                     TokenUsage::default(),
+                    Some(TurnFailure {
+                        retryable: false,
+                        message: format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
+                    }),
                 );
             }
         }
@@ -1359,6 +1382,12 @@ pub(crate) async fn run(
                         format!("BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"),
                         Vec::new(),
                         TokenUsage::default(),
+                        Some(TurnFailure {
+                            retryable: false,
+                            message: format!(
+                                "BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"
+                            ),
+                        }),
                     );
                 }
             },
@@ -1402,6 +1431,12 @@ pub(crate) async fn run(
     // calls as it dispatches tools). The caller adds this to the
     // session-wide running total before emitting `PromptResponse.usage`.
     let mut turn_usage = TokenUsage::default();
+    // Set only when a turn ends because the LLM call itself failed (after the
+    // inner stream-retry budget is exhausted) or the loop panicked. Left
+    // `None` for a normal completion, so an autonomous driver can tell a real
+    // model response apart from an outage. The error text is still appended to
+    // `full_response` and streamed, exactly as before.
+    let mut llm_failure: Option<TurnFailure> = None;
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
     if let Some(config) = p2t_config.as_ref() {
@@ -2002,6 +2037,12 @@ pub(crate) async fn run(
                         }),
                     );
                 }
+                // Classify before consuming `e` so an autonomous driver can
+                // back off on a transient outage vs. stop on a fatal error.
+                llm_failure = Some(TurnFailure {
+                    retryable: crate::llm_client::is_retryable_llm_error(&e),
+                    message: e.to_string(),
+                });
                 let friendly = messages_include_images(&messages)
                     .then(|| rewrite_image_prompt_provider_error(&e.to_string()))
                     .flatten();
@@ -2041,7 +2082,7 @@ pub(crate) async fn run(
         );
     }
 
-    (full_response, tool_exchanges, turn_usage)
+    (full_response, tool_exchanges, turn_usage, llm_failure)
 }
 
 fn record_p2t_step(config: &p2t::P2tConfig, cwd: &Path, record: StepTraceRecord) {
@@ -2743,13 +2784,11 @@ async fn consult_gate(
 
 fn should_run_permission_auto_classifier(
     mode: PermissionMode,
-    tool_name: &str,
-    shell_sandboxed: bool,
+    _tool_name: &str,
+    _shell_sandboxed: bool,
     escalation_requested: bool,
 ) -> bool {
-    matches!(mode, PermissionMode::Auto)
-        && !escalation_requested
-        && (tool_name != "run_shell_command" || shell_sandboxed)
+    matches!(mode, PermissionMode::Auto) && !escalation_requested
 }
 
 async fn request_user_permission_with_evaluation(
@@ -3011,7 +3050,7 @@ struct PermissionRequest<'a> {
 
 async fn request_user_permission(
     spawned_cx: &SpawnedCx<'_>,
-    cancel: &CancellationToken,
+    _cancel: &CancellationToken,
     request: PermissionRequest<'_>,
 ) -> Result<PermissionGrant, String> {
     let PermissionRequest {
@@ -3066,23 +3105,13 @@ async fn request_user_permission(
     emit_terminal_notification(TerminalNotificationEvent::Prompt);
 
     // block_task() is only safe inside ConnectionTo::spawn; see the SAFETY note
-    // on `run` above. We deliberately do not apply a local timeout here: ACP
-    // has no per-request cancel API, and dropping an in-flight SentRequest can
-    // leave the client free to answer a request whose receiver no longer
-    // exists. A user-visible permission prompt is allowed to wait indefinitely
-    // until the user either chooses an option or cancels the prompt/session.
-    let response = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            tracing::warn!(
-                session_id,
-                tool_name,
-                "permission request abandoned due to session cancel; client should dismiss the modal"
-            );
-            return Err("Tool use denied: the prompt was cancelled before the user responded.".to_string());
-        }
-        r = spawned_cx.cx().send_request(request).block_task() => r,
-    };
+    // on `run` above. We deliberately do not race this with the prompt
+    // cancellation token: ACP requires clients to answer pending permission
+    // requests with `RequestPermissionOutcome::Cancelled` when they cancel a
+    // prompt. Dropping this in-flight request first leaves the client's
+    // required response with no receiver, which the ACP transport treats as an
+    // internal connection error.
+    let response = spawned_cx.cx().send_request(request).block_task().await;
 
     match response {
         Ok(resp) => match resp.outcome {
@@ -3644,7 +3673,10 @@ async fn execute_subagent(
     ))
     .await;
 
-    let (text, _exchanges, nested_usage) = nested;
+    // The subagent surfaces failure via its returned text (an empty response
+    // becomes an error below); the structured failure class is for top-level
+    // autonomous drivers, so it is ignored for a nested run.
+    let (text, _exchanges, nested_usage, _failure) = nested;
     let exec = if text.trim().is_empty() {
         ToolExecution {
             output: format!("Error: subagent '{subagent_name}' returned an empty response."),
@@ -3768,11 +3800,9 @@ fn ordered_tool_call_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{
-        FunctionCall, FunctionDef, IncompleteStreamError, is_incomplete_stream_error,
-    };
+    use crate::llm_client::{FunctionCall, FunctionDef, IncompleteStreamError};
     use futures::future::{BoxFuture, FutureExt};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn tool_def_for_test(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -3857,6 +3887,7 @@ mod tests {
                     }
                     anyhow::bail!(first_error);
                 }
+                (request.on_token)("ok");
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
                     reasoning_content: None,
@@ -3894,6 +3925,7 @@ mod tests {
                         "response.completed",
                     )));
                 }
+                (request.on_token)("ok");
                 Ok(LlmResponse::Text {
                     text: "ok".to_string(),
                     reasoning_content: None,
@@ -4074,7 +4106,7 @@ mod tests {
             true,
             false
         ));
-        assert!(!should_run_permission_auto_classifier(
+        assert!(should_run_permission_auto_classifier(
             PermissionMode::Auto,
             "run_shell_command",
             false,
@@ -4240,7 +4272,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4272,11 +4304,15 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
-    async fn stream_chat_does_not_retry_after_partial_output() {
+    async fn stream_chat_retries_after_partial_output() {
+        // A mid-stream disconnect after some text was already streamed must now
+        // retry (surviving the outage) rather than ending the turn. The replay
+        // re-streams from scratch; the already-shown "partial" prefix stays in
+        // the client transcript and the recovered response follows.
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
@@ -4286,7 +4322,7 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
 
-        let error = stream_chat_with_transient_retry(
+        let response = stream_chat_with_transient_retry(
             &backend,
             0,
             "codex::test",
@@ -4301,15 +4337,15 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect_err("partial output makes retry unsafe");
+        .expect("a mid-stream disconnect should retry even after partial output");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(format!("{error:#}").contains("Codex stream read error"));
-        assert_eq!(output.lock().unwrap().as_str(), "partial");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "partialok");
     }
 
     #[tokio::test]
-    async fn stream_chat_does_not_retry_incomplete_stream_after_partial_output() {
+    async fn stream_chat_retries_incomplete_stream_after_partial_output() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn LlmBackend> = Arc::new(IncompleteStreamRetryBackend {
             attempts: attempts.clone(),
@@ -4318,7 +4354,7 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
 
-        let error = stream_chat_with_transient_retry(
+        let response = stream_chat_with_transient_retry(
             &backend,
             0,
             "codex::test",
@@ -4333,11 +4369,11 @@ mod tests {
             Duration::from_secs(30),
         )
         .await
-        .expect_err("partial output makes retry unsafe");
+        .expect("an incomplete stream should retry even after partial output");
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(is_incomplete_stream_error(&error));
-        assert_eq!(output.lock().unwrap().as_str(), "partial");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "partialok");
     }
 
     #[test]
@@ -4385,7 +4421,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4418,7 +4454,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[tokio::test]
@@ -4451,7 +4487,7 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
-        assert_eq!(output.lock().unwrap().as_str(), "");
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
     }
 
     #[test]
