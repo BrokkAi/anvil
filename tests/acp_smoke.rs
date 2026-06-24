@@ -157,6 +157,212 @@ fn relative_cwd_lifecycle_requests_return_invalid_params() {
 }
 
 #[test]
+fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
+    let case = SmokeCase {
+        name: "lifecycle_mcp_servers",
+        prompt: "Have a look around.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    // A fake stdio MCP server supplied via session/load; spawning it leaves a
+    // log line, proving the load-time mcpServers were applied (#145). It lives
+    // in its own dir because `make_fake_bifrost_binary` writes a fixed
+    // filename, which would otherwise clobber the bifrost script above.
+    let extra_dir = temp.path().join("extra-mcp");
+    std::fs::create_dir_all(&extra_dir).expect("create extra mcp dir");
+    let extra_log = extra_dir.join("extra-mcp-spawn.log");
+    let extra_server = make_fake_bifrost_binary(&extra_dir, &extra_log);
+    // A second fake stdio server used to prove session/resume also applies a
+    // newly-supplied server set, rebuilding the registry (#146).
+    let extra2_dir = temp.path().join("extra2-mcp");
+    std::fs::create_dir_all(&extra2_dir).expect("create extra2 mcp dir");
+    let extra2_log = extra2_dir.join("extra2-mcp-spawn.log");
+    let extra2_server = make_fake_bifrost_binary(&extra2_dir, &extra2_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    // Two text turns: one after the load-applied server, one after resume.
+    let provider = start_openai_smoke_server(vec![
+        text_sse_body("Looked around."),
+        text_sse_body("Looked again."),
+    ]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+    // Anvil advertises stdio-only MCP support (#159).
+    assert_eq!(
+        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["http"], false,
+        "{}: should advertise mcpCapabilities.http=false: {initialize}",
+        case.name
+    );
+    assert_eq!(
+        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["sse"], false,
+        "{}: should advertise mcpCapabilities.sse=false: {initialize}",
+        case.name
+    );
+
+    let http_server = json!({
+        "type": "http",
+        "name": "remote",
+        "url": "https://example.com/mcp",
+        "headers": []
+    });
+
+    // session/new with an HTTP transport is rejected, not silently dropped (#159).
+    let new_http = client.request(
+        "session/new",
+        json!({ "cwd": cwd, "mcpServers": [http_server] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new (http mcp)",
+        &new_http,
+        "unsupported 'http' transport",
+        &client,
+    );
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    // session/load and session/resume also reject unsupported transports (#159).
+    let load_http = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [http_server] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load (http mcp)",
+        &load_http,
+        "unsupported 'http' transport",
+        &client,
+    );
+    let resume_http = client.request(
+        "session/resume",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [http_server] }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/resume (http mcp)",
+        &resume_http,
+        "unsupported 'http' transport",
+        &client,
+    );
+
+    // session/load with a stdio MCP server applies it; the next prompt builds a
+    // registry that spawns the server, leaving a spawn-log entry (#145).
+    let load_stdio = client.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [ {
+                "name": "extra",
+                "command": extra_server,
+                "args": [],
+                "env": []
+            } ]
+        }),
+    );
+    assert_response_ok(&case, "session/load (stdio mcp)", &load_stdio, &client);
+    assert!(
+        !extra_log.exists(),
+        "{}: stdio MCP server must not spawn until the next prompt",
+        case.name
+    );
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+    assert!(
+        extra_log.exists(),
+        "{}: load-applied stdio MCP server was not spawned on the next prompt (#145); stderr:\n{}",
+        case.name,
+        client.stderr_text()
+    );
+
+    // session/resume with a different stdio server replaces the set and drops
+    // the cached registry, so the next prompt spawns the new server (#146).
+    let resume_stdio = client.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [ {
+                "name": "extra2",
+                "command": extra2_server,
+                "args": [],
+                "env": []
+            } ]
+        }),
+    );
+    assert_response_ok(&case, "session/resume (stdio mcp)", &resume_stdio, &client);
+    let prompt2 = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": "again" } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt (after resume)", &prompt2, &client);
+    assert!(
+        extra2_log.exists(),
+        "{}: resume-applied stdio MCP server was not spawned on the next prompt (#146); stderr:\n{}",
+        case.name,
+        client.stderr_text()
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during MCP lifecycle checks; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn session_list_without_cwd_and_cursor_semantics() {
     let case = SmokeCase {
         name: "session_list",

@@ -7,8 +7,8 @@ use agent_client_protocol::schema::{
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
     Cost, EmbeddedResource, EmbeddedResourceResource, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
+    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
     SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionInfo,
     SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
@@ -28,7 +28,7 @@ use crate::multi_backend::MultiBackend;
 use crate::session::{
     CloseSessionResult, ConversationTurn, LifecycleReopen, PermissionMode, PromptStartError,
     REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode, SessionSnapshot,
-    SessionStore, acp_mcp_servers_to_configs,
+    SessionStore, UnsupportedMcpTransport, acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -106,6 +106,24 @@ fn lifecycle_cwd_mismatch_error(
              session between working directories is not supported",
             requested_cwd.display(),
             session_cwd.display(),
+        ),
+    }))
+}
+
+/// Build the protocol error returned when a lifecycle request references an
+/// MCP server transport Anvil does not support. Anvil advertises
+/// `mcpCapabilities` with http/sse disabled, so an HTTP/SSE server is rejected
+/// rather than silently skipped (which would leave the session looking
+/// configured while the requested tools were missing).
+fn unsupported_mcp_transport_error(
+    method: &str,
+    err: &UnsupportedMcpTransport,
+) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::json!({
+        "reason": format!(
+            "{method} MCP server '{}' uses the unsupported '{}' transport; Anvil only \
+             supports stdio MCP servers",
+            err.server, err.transport
         ),
     }))
 }
@@ -1185,6 +1203,10 @@ pub async fn run_agent(
                     .prompt_capabilities(
                         PromptCapabilities::new().embedded_context(true).image(true),
                     )
+                    // Anvil only speaks to stdio MCP subprocesses, so advertise
+                    // http/sse as unsupported. Lifecycle requests carrying other
+                    // transports are rejected rather than silently dropped (#159).
+                    .mcp_capabilities(McpCapabilities::new())
                     .session_capabilities(
                         SessionCapabilities::new()
                             .list(SessionListCapabilities::new())
@@ -1221,7 +1243,18 @@ pub async fn run_agent(
                     return responder
                         .respond_with_error(unsupported_additional_directories_error("session/new"));
                 }
-                let session_mcp_servers = acp_mcp_servers_to_configs(req.mcp_servers);
+                let session_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
+                    Ok(servers) => servers,
+                    Err(err) => {
+                        tracing::warn!(
+                            "session/new rejected unsupported MCP transport '{}' for server '{}'",
+                            err.transport,
+                            err.server
+                        );
+                        return responder
+                            .respond_with_error(unsupported_mcp_transport_error("session/new", &err));
+                    }
+                };
                 let session = sessions_new
                     .create_session_with_mcp_servers(cwd, Some(session_mcp_servers))
                     .await;
@@ -1337,6 +1370,24 @@ pub async fn run_agent(
                         unsupported_additional_directories_error("session/load"),
                     );
                 }
+                // Convert (and validate) the requested MCP servers before any
+                // session work, so an unsupported transport is rejected early
+                // (#159). The converted set is applied after the session loads
+                // (#145).
+                let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
+                    Ok(servers) => servers,
+                    Err(err) => {
+                        tracing::warn!(
+                            "session/load rejected unsupported MCP transport '{}' for server '{}'",
+                            err.transport,
+                            err.server
+                        );
+                        return responder.respond_with_error(unsupported_mcp_transport_error(
+                            "session/load",
+                            &err,
+                        ));
+                    }
+                };
 
                 // Look up the session from memory or disk, validating that the
                 // request cwd matches the session's original cwd (#147). Unknown
@@ -1361,6 +1412,11 @@ pub async fn run_agent(
                     }
                 };
                 sessions_load.update_cwd(&session_id, cwd).await;
+                // Apply the client-supplied MCP servers for this load, dropping
+                // any cached registry so the next prompt rebuilds with them (#145).
+                sessions_load
+                    .apply_lifecycle_mcp_servers(&session_id, requested_mcp_servers)
+                    .await;
 
                 // Replay conversation history as session updates (both sides).
                 for turn in &session.history {
@@ -1437,6 +1493,22 @@ pub async fn run_agent(
                         unsupported_additional_directories_error("session/resume"),
                     );
                 }
+                // Reject unsupported MCP transports before any session work (#159);
+                // apply the converted set after the session loads (#146).
+                let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
+                    Ok(servers) => servers,
+                    Err(err) => {
+                        tracing::warn!(
+                            "session/resume rejected unsupported MCP transport '{}' for server '{}'",
+                            err.transport,
+                            err.server
+                        );
+                        return responder.respond_with_error(unsupported_mcp_transport_error(
+                            "session/resume",
+                            &err,
+                        ));
+                    }
+                };
 
                 // Validate cwd consistency (#147); unknown ids are a protocol
                 // error, not a successful empty resume (#154).
@@ -1460,6 +1532,12 @@ pub async fn run_agent(
                     }
                 };
                 sessions_resume.update_cwd(&session_id, cwd).await;
+                // Apply the client-supplied MCP servers for this resume,
+                // dropping any cached registry so the next prompt rebuilds with
+                // them (#146).
+                sessions_resume
+                    .apply_lifecycle_mcp_servers(&session_id, requested_mcp_servers)
+                    .await;
                 let catalog = sessions_resume.available_model_metadata().await;
                 let setup_session = session.clone();
                 let setup_catalog = catalog.clone();

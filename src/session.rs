@@ -273,14 +273,29 @@ fn discover_session_context(
     (project_instructions, skills, agents)
 }
 
+/// An ACP lifecycle request referenced an MCP server transport Anvil does not
+/// support. Anvil only speaks to stdio MCP subprocesses, and it advertises
+/// `mcpCapabilities` (http=false, sse=false) accordingly, so a request that
+/// still carries an HTTP/SSE server is rejected rather than silently dropped --
+/// otherwise the session would look configured while the requested tools were
+/// missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedMcpTransport {
+    pub server: String,
+    pub transport: &'static str,
+}
+
+/// Convert ACP `mcpServers` into Anvil's internal MCP configs, rejecting any
+/// transport other than stdio. Returns the offending server on the first
+/// unsupported entry so the caller can surface a protocol error.
 pub(crate) fn acp_mcp_servers_to_configs(
     servers: Vec<agent_client_protocol::schema::McpServer>,
-) -> Vec<McpServerConfig> {
-    servers
-        .into_iter()
-        .filter_map(|server| match server {
+) -> Result<Vec<McpServerConfig>, UnsupportedMcpTransport> {
+    let mut configs = Vec::with_capacity(servers.len());
+    for server in servers {
+        match server {
             agent_client_protocol::schema::McpServer::Stdio(stdio) => {
-                Some(McpServerConfig {
+                configs.push(McpServerConfig {
                     name: stdio.name,
                     command: stdio.command.display().to_string(),
                     args: stdio.args,
@@ -294,30 +309,31 @@ pub(crate) fn acp_mcp_servers_to_configs(
                         .collect(),
                     framing: McpFraming::ContentLength,
                     enabled: true,
-                })
+                });
             }
             agent_client_protocol::schema::McpServer::Http(http) => {
-                tracing::warn!(
-                    server = %http.name,
-                    "ACP HTTP MCP server skipped; Anvil only supports stdio MCP subprocesses"
-                );
-                None
+                return Err(UnsupportedMcpTransport {
+                    server: http.name,
+                    transport: "http",
+                });
             }
             agent_client_protocol::schema::McpServer::Sse(sse) => {
-                tracing::warn!(
-                    server = %sse.name,
-                    "ACP SSE MCP server skipped; Anvil only supports stdio MCP subprocesses"
-                );
-                None
+                return Err(UnsupportedMcpTransport {
+                    server: sse.name,
+                    transport: "sse",
+                });
             }
+            // `McpServer` is `#[non_exhaustive]`; reject unknown future
+            // transports rather than dropping them.
             _ => {
-                tracing::warn!(
-                    "unsupported ACP MCP server transport skipped; Anvil only supports stdio MCP subprocesses"
-                );
-                None
+                return Err(UnsupportedMcpTransport {
+                    server: "<unknown>".to_string(),
+                    transport: "unsupported",
+                });
             }
-        })
-        .collect()
+        }
+    }
+    Ok(configs)
 }
 
 // ---------------------------------------------------------------------------
@@ -2477,6 +2493,40 @@ impl SessionStore {
 
     pub async fn invalidate_registry(&self, session_id: &str) {
         self.registries.write().await.remove(session_id);
+    }
+
+    /// Apply the MCP server set supplied by an ACP `session/load` or
+    /// `session/resume` request to an existing session, replacing the session's
+    /// additive MCP servers and dropping any cached tool registry so the next
+    /// prompt rebuilds with the new servers (the cache is reused when cwd is
+    /// stable, so without this drop a changed server set would not take effect).
+    ///
+    /// Replace semantics, per ACP (the request's `mcpServers` is the complete
+    /// additive set for the load): an empty set therefore clears the session's
+    /// previously-persisted additive servers. The global/setup MCP servers
+    /// (including Bifrost) are merged separately by [`effective_mcp_servers`]
+    /// and are unaffected.
+    ///
+    /// In-memory only: the client re-supplies `mcpServers` on every lifecycle
+    /// request, so this does not rewrite the persisted manifest -- `session/new`
+    /// remains the source of persisted MCP config. Callers invoke this from the
+    /// lifecycle handlers, which are assumed not to race an in-flight prompt's
+    /// registry build (the same single-client assumption `update_cwd` relies
+    /// on). Returns false if the session is unknown.
+    pub async fn apply_lifecycle_mcp_servers(
+        &self,
+        id: &str,
+        servers: Vec<McpServerConfig>,
+    ) -> bool {
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(id) else {
+                return false;
+            };
+            session.mcp_servers = Some(servers);
+        }
+        self.invalidate_registry(id).await;
+        true
     }
 
     pub async fn set_available_models(&self, models: Vec<ModelMetadata>) {
@@ -6042,7 +6092,8 @@ done
                     .env(vec![agent_client_protocol::schema::EnvVariable::new(
                         "TOKEN", "secret",
                     )]),
-            )]);
+            )])
+            .expect("stdio servers convert");
 
         assert_eq!(
             configs,
@@ -6058,6 +6109,79 @@ done
                 enabled: true,
             }]
         );
+    }
+
+    /// Unsupported transports (http/sse) are rejected, not silently dropped, so
+    /// the caller can return a protocol error rather than appear configured
+    /// while the requested tools are missing (#159).
+    #[test]
+    fn acp_http_mcp_server_is_rejected() {
+        let err = acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Http(
+            agent_client_protocol::schema::McpServerHttp::new("remote", "https://example.com/mcp"),
+        )])
+        .expect_err("http transport must be rejected");
+        assert_eq!(err.server, "remote");
+        assert_eq!(err.transport, "http");
+    }
+
+    /// `session/load` and `session/resume` apply the client-supplied MCP server
+    /// set to the session and drop any cached registry; an unknown session is
+    /// reported (#145, #146).
+    #[tokio::test]
+    async fn apply_lifecycle_mcp_servers_updates_session_and_reports_unknown() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = std::env::temp_dir().join(format!("brokk-acp-mcp-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd.clone()).await;
+
+        let servers = vec![crate::mcp::McpServerConfig {
+            name: "extra".to_string(),
+            command: "/usr/bin/extra-mcp".to_string(),
+            args: vec!["--flag".to_string()],
+            env: vec![],
+            framing: crate::mcp::McpFraming::ContentLength,
+            enabled: true,
+        }];
+        // Seed a fake cached registry entry so we can observe the invalidation.
+        assert!(
+            store
+                .apply_lifecycle_mcp_servers(&session.id, servers.clone())
+                .await,
+            "applying to a known session should succeed"
+        );
+        {
+            let sessions = store.sessions.read().await;
+            assert_eq!(
+                sessions.get(&session.id).unwrap().mcp_servers.as_deref(),
+                Some(servers.as_slice()),
+                "the session's additive MCP servers should be replaced"
+            );
+        }
+        assert!(
+            !store.registries.read().await.contains_key(&session.id),
+            "the cached registry (if any) must be dropped so the next prompt rebuilds"
+        );
+
+        assert!(
+            !store
+                .apply_lifecycle_mcp_servers("does-not-exist", vec![])
+                .await,
+            "applying to an unknown session should report false"
+        );
+
+        // Replace semantics: an empty set clears the additive servers (the
+        // client is expected to re-supply mcpServers on each lifecycle request;
+        // global/setup servers are merged separately and unaffected).
+        assert!(store.apply_lifecycle_mcp_servers(&session.id, vec![]).await);
+        {
+            let sessions = store.sessions.read().await;
+            assert_eq!(
+                sessions.get(&session.id).unwrap().mcp_servers.as_deref(),
+                Some([].as_slice()),
+                "an empty lifecycle set should replace, not preserve, the prior set"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     /// An explicit ACP `mcpServers: []` means "no extra MCP servers";
