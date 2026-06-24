@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -743,6 +743,67 @@ fn session_info_from_manifest(manifest: &SessionManifest, cwd: &Path) -> Session
         .updated_at(manifest.updated_at())
 }
 
+/// Page size for ACP `session/list` cursor pagination.
+const SESSION_LIST_PAGE_SIZE: usize = 50;
+/// Prefix for our opaque `session/list` cursor token. Namespacing the token
+/// lets us reject foreign or hand-crafted cursors instead of silently treating
+/// them as offset 0, satisfying ACP's "invalid cursor SHOULD error" guidance.
+const SESSION_LIST_CURSOR_PREFIX: &str = "anvil:";
+
+/// Fingerprint of the list context (the `cwd` filter) a `session/list` cursor
+/// was issued for. Cursors are offsets into a specific ordered list; binding
+/// them to the cwd context lets the handler reject a cursor replayed against a
+/// different filter (e.g. a cwd-list cursor resent without `cwd`), which would
+/// otherwise silently skip or duplicate entries. `DefaultHasher` is
+/// deterministic within a process, which is all cursor round-trips require.
+fn session_list_context_tag(cwd: Option<&Path>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match cwd {
+        Some(cwd) => {
+            true.hash(&mut hasher);
+            cwd.hash(&mut hasher);
+        }
+        None => false.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Encode a page offset (for the given list context) into an opaque
+/// `session/list` cursor token.
+fn encode_session_list_cursor(context_tag: u64, offset: usize) -> String {
+    format!("{SESSION_LIST_CURSOR_PREFIX}{context_tag:x}:{offset}")
+}
+
+/// Decode an opaque `session/list` cursor token back to its page offset.
+/// Returns `None` for any cursor Anvil did not issue for this same list
+/// context -- foreign, malformed, or minted against a different `cwd` filter --
+/// so the handler can surface an invalid-params error rather than silently
+/// restarting at 0 or paging the wrong list.
+fn parse_session_list_cursor(cursor: &str, context_tag: u64) -> Option<usize> {
+    let rest = cursor.strip_prefix(SESSION_LIST_CURSOR_PREFIX)?;
+    let (tag_hex, offset) = rest.split_once(':')?;
+    if u64::from_str_radix(tag_hex, 16).ok()? != context_tag {
+        return None;
+    }
+    offset.parse::<usize>().ok()
+}
+
+/// Compute the half-open page bounds `[start, end)` and the next-page cursor
+/// for a `session/list` response covering `total` ordered sessions starting at
+/// `offset`. An `offset` past the end yields an empty page and no next cursor
+/// (end-of-results), never an error.
+fn paginate_session_list(
+    total: usize,
+    offset: usize,
+    context_tag: u64,
+) -> (usize, usize, Option<String>) {
+    let start = offset.min(total);
+    let end = start.saturating_add(SESSION_LIST_PAGE_SIZE).min(total);
+    let next_cursor = (end < total).then(|| encode_session_list_cursor(context_tag, end));
+    (start, end, next_cursor)
+}
+
 fn send_session_info_update(
     cx: &ConnectionTo<Client>,
     session_id: &str,
@@ -1439,20 +1500,66 @@ pub async fn run_agent(
             async move |req: ListSessionsRequest,
                         responder: Responder<ListSessionsResponse>,
                         _cx: ConnectionTo<Client>| {
-                tracing::info!("ACP session/list, cwd filter={:?}", req.cwd);
+                tracing::info!(
+                    "ACP session/list, cwd filter={:?}, cursor={:?}",
+                    req.cwd,
+                    req.cursor
+                );
 
-                let infos: Vec<SessionInfo> = if let Some(cwd) = &req.cwd {
+                // A supplied cwd filter must be absolute, matching the other
+                // cwd-bearing lifecycle handlers (#143 keeps cwd optional).
+                if let Some(cwd) = &req.cwd
+                    && !cwd.is_absolute()
+                {
+                    tracing::warn!("session/list rejected relative cwd={}", cwd.display());
+                    return responder
+                        .respond_with_error(invalid_lifecycle_cwd_error("session/list", cwd));
+                }
+
+                // Resolve the page offset from the opaque cursor first; an
+                // unrecognized cursor -- including one minted for a different
+                // cwd context -- is a protocol error, not a silent restart at
+                // the first page (#144).
+                let context_tag = session_list_context_tag(req.cwd.as_deref());
+                let offset = match req.cursor.as_deref() {
+                    None => 0,
+                    Some(cursor) => match parse_session_list_cursor(cursor, context_tag) {
+                        Some(offset) => offset,
+                        None => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(
+                                    serde_json::json!({
+                                        "reason": format!(
+                                            "invalid session/list cursor: '{cursor}'"
+                                        ),
+                                    }),
+                                ),
+                            );
+                        }
+                    },
+                };
+
+                // With a cwd, list that workspace's persisted sessions; without
+                // one, return the process's resident known sessions (#143).
+                let entries: Vec<(SessionManifest, PathBuf)> = if let Some(cwd) = &req.cwd {
                     sessions_list
                         .list_sessions_from_disk(cwd)
                         .await
                         .into_iter()
-                        .map(|m| session_info_from_manifest(&m, cwd))
+                        .map(|manifest| (manifest, cwd.clone()))
                         .collect()
                 } else {
-                    vec![]
+                    sessions_list.resident_session_manifests().await
                 };
 
-                responder.respond(ListSessionsResponse::new(infos))
+                let (start, end, next_cursor) =
+                    paginate_session_list(entries.len(), offset, context_tag);
+                let infos: Vec<SessionInfo> = entries[start..end]
+                    .iter()
+                    .map(|(manifest, cwd)| session_info_from_manifest(manifest, cwd))
+                    .collect();
+
+                responder.respond(ListSessionsResponse::new(infos).next_cursor(next_cursor))
             },
             on_receive_request!(),
         )
@@ -8228,6 +8335,74 @@ mod tests {
         assert_eq!(info.cwd, PathBuf::from("/tmp/cwd"));
         assert_eq!(info.title.as_deref(), Some("Investigate session names"));
         assert_eq!(info.updated_at, manifest.updated_at());
+    }
+
+    /// An issued `session/list` cursor round-trips to its offset; foreign or
+    /// malformed cursors decode to `None` so the handler can reject them (#144).
+    #[test]
+    fn session_list_cursor_round_trips_and_rejects_foreign() {
+        let tag = session_list_context_tag(None);
+        assert_eq!(
+            parse_session_list_cursor(&encode_session_list_cursor(tag, 0), tag),
+            Some(0)
+        );
+        assert_eq!(
+            parse_session_list_cursor(&encode_session_list_cursor(tag, 137), tag),
+            Some(137)
+        );
+        // A cursor minted for a *different* cwd context must not validate here.
+        let other_tag = session_list_context_tag(Some(Path::new("/repo")));
+        assert_ne!(tag, other_tag, "cwd vs no-cwd contexts must differ");
+        assert_eq!(
+            parse_session_list_cursor(&encode_session_list_cursor(other_tag, 50), tag),
+            None
+        );
+        // No namespace prefix -> not one of ours.
+        assert_eq!(parse_session_list_cursor("137", tag), None);
+        // Right prefix, non-numeric tag/offset.
+        assert_eq!(parse_session_list_cursor("anvil:zz:5", tag), None);
+        assert_eq!(
+            parse_session_list_cursor(&format!("anvil:{tag:x}:abc"), tag),
+            None
+        );
+        // Arbitrary garbage.
+        assert_eq!(parse_session_list_cursor("garbage", tag), None);
+    }
+
+    /// Pagination yields full pages with a follow-up cursor until the final
+    /// page, which omits the cursor (end-of-results). An offset past the end is
+    /// an empty page, not an error (#144).
+    #[test]
+    fn paginate_session_list_pages_and_terminates() {
+        let tag = session_list_context_tag(Some(Path::new("/repo")));
+        let total = SESSION_LIST_PAGE_SIZE * 2 + 10;
+
+        let (start, end, next) = paginate_session_list(total, 0, tag);
+        assert_eq!((start, end), (0, SESSION_LIST_PAGE_SIZE));
+        assert_eq!(
+            next.and_then(|c| parse_session_list_cursor(&c, tag)),
+            Some(SESSION_LIST_PAGE_SIZE)
+        );
+
+        let (start, end, next) = paginate_session_list(total, SESSION_LIST_PAGE_SIZE, tag);
+        assert_eq!(
+            (start, end),
+            (SESSION_LIST_PAGE_SIZE, SESSION_LIST_PAGE_SIZE * 2)
+        );
+        assert_eq!(
+            next.and_then(|c| parse_session_list_cursor(&c, tag)),
+            Some(SESSION_LIST_PAGE_SIZE * 2)
+        );
+
+        // Final partial page: no next cursor.
+        let (start, end, next) = paginate_session_list(total, SESSION_LIST_PAGE_SIZE * 2, tag);
+        assert_eq!((start, end), (SESSION_LIST_PAGE_SIZE * 2, total));
+        assert!(next.is_none(), "final page must omit nextCursor");
+
+        // Offset past the end: empty page, end-of-results.
+        let (start, end, next) = paginate_session_list(total, total + 100, tag);
+        assert_eq!((start, end), (total, total));
+        assert!(next.is_none());
     }
 
     /// `build_prompt_messages` for a turn that used no tools must produce

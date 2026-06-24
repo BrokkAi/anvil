@@ -3631,6 +3631,33 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
+    /// Manifests (paired with their cwd) of the sessions currently resident in
+    /// memory, newest first, filtered and ordered exactly like the on-disk
+    /// listing.
+    ///
+    /// Backs ACP `session/list` when the request omits `cwd`: ACP requires an
+    /// unfiltered list to return the process's known sessions, and without a
+    /// cwd Anvil has no global on-disk index to scan, so it reports the
+    /// resident working set. Each entry carries the in-memory cwd so the
+    /// client receives an accurate `SessionInfo.cwd`.
+    pub async fn resident_session_manifests(&self) -> Vec<(SessionManifest, PathBuf)> {
+        let sessions = self.sessions.read().await;
+        let mut entries: Vec<(SessionManifest, PathBuf)> = sessions
+            .values()
+            .filter(|session| session.manifest.title().is_some())
+            .map(|session| (session.manifest.clone(), session.cwd.clone()))
+            .collect();
+        // Keep this predicate and comparator in lockstep with the on-disk
+        // listing's `filter_and_sort_listed_manifests` so cwd and no-cwd
+        // `session/list` results are ordered consistently.
+        entries.sort_by(|a, b| {
+            b.0.modified
+                .cmp(&a.0.modified)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        entries
+    }
+
     pub async fn start_prompt(
         &self,
         session_id: &str,
@@ -4217,6 +4244,39 @@ mod tests {
         assert!(manifest.updated_at().is_some());
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// `session/list` without a cwd surfaces the resident working set: named
+    /// sessions only. A freshly created (still unnamed) session is excluded,
+    /// matching the on-disk listing filter. (Ordering is covered separately by
+    /// `list_sessions_from_disk_sorts_by_last_update_descending`, which shares
+    /// the comparator; this avoids depending on millisecond-resolution clocks.)
+    #[tokio::test]
+    async fn resident_session_manifests_filters_unnamed_named_only() {
+        let store = SessionStore::new("m".to_string());
+        let base =
+            std::env::temp_dir().join(format!("brokk-acp-resident-{}", uuid::Uuid::new_v4()));
+
+        let named = store.create_session(base.join("named")).await;
+        store
+            .maybe_rename_from_prompt(&named.id, "A named session")
+            .await
+            .expect("rename named");
+        // A second, still-unnamed session must be filtered out of the listing.
+        let unnamed = store.create_session(base.join("unnamed")).await;
+
+        let listed = store.resident_session_manifests().await;
+        let ids: Vec<&str> = listed.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![named.id.as_str()],
+            "only the named session is listed; unnamed {} excluded",
+            unnamed.id
+        );
+        // Each entry carries the session's own cwd for SessionInfo.cwd.
+        assert_eq!(listed[0].1, base.join("named"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A persisted install-level preference should seed the next new session
