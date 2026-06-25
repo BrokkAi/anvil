@@ -31,7 +31,7 @@ use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 use crate::tools::sandbox::SandboxPolicy;
-use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write};
+use crate::tools::{ToolRegistry, ToolStatus, safe_resolve_for_write_in_roots};
 use crate::trace_logging::append_trace_record;
 use crate::train_bifrost::{self, TrainingPacket};
 
@@ -945,12 +945,12 @@ struct ShellSandboxRetryState {
 }
 
 impl ShellSandboxRetryState {
-    fn from_raw_input(raw_input: &Value, cwd: &Path) -> Option<Self> {
+    fn from_raw_input(raw_input: &Value, cwd: &Path, additional_roots: &[PathBuf]) -> Option<Self> {
         let command = raw_input.get("command")?.as_str()?.to_string();
         let cwd = cwd.canonicalize().ok()?;
         let effective_directory = match raw_input.get("directory").and_then(Value::as_str) {
             Some(directory) if !directory.trim().is_empty() => {
-                crate::tools::safe_resolve(&cwd, directory).ok()?
+                crate::tools::safe_resolve_in_roots(&cwd, additional_roots, directory).ok()?
             }
             _ => cwd.clone(),
         };
@@ -961,8 +961,14 @@ impl ShellSandboxRetryState {
         })
     }
 
-    fn matches_raw_input(&self, raw_input: &Value, cwd: &Path) -> bool {
-        Self::from_raw_input(raw_input, cwd).is_some_and(|candidate| candidate == *self)
+    fn matches_raw_input(
+        &self,
+        raw_input: &Value,
+        cwd: &Path,
+        additional_roots: &[PathBuf],
+    ) -> bool {
+        Self::from_raw_input(raw_input, cwd, additional_roots)
+            .is_some_and(|candidate| candidate == *self)
     }
 }
 
@@ -977,10 +983,11 @@ fn shell_sandbox_retry_state_index(
     states: &[ShellSandboxRetryState],
     raw_input: &Value,
     cwd: &Path,
+    additional_roots: &[PathBuf],
 ) -> Option<usize> {
     states
         .iter()
-        .position(|state| state.matches_raw_input(raw_input, cwd))
+        .position(|state| state.matches_raw_input(raw_input, cwd, additional_roots))
 }
 
 fn push_unique_shell_sandbox_retry_state(
@@ -1261,6 +1268,29 @@ fn shell_prefix_key(argv_prefix: &[String], shell_sandboxed: bool) -> String {
         "shellSandboxed": shell_sandboxed,
     })
     .to_string()
+}
+
+fn shell_directory_is_inside_primary_cwd(
+    raw_input: &Value,
+    workspace_roots: WorkspaceRoots<'_>,
+) -> bool {
+    let Ok(cwd) = workspace_roots.cwd.canonicalize() else {
+        return false;
+    };
+    let effective_directory = match raw_input.get("directory").and_then(Value::as_str) {
+        Some(directory) if !directory.trim().is_empty() => {
+            match crate::tools::safe_resolve_in_roots(
+                &cwd,
+                workspace_roots.additional_roots,
+                directory,
+            ) {
+                Ok(directory) => directory,
+                Err(_) => return false,
+            }
+        }
+        _ => cwd.clone(),
+    };
+    effective_directory.starts_with(cwd)
 }
 
 /// How a shell command relates to the always-allow list.
@@ -2365,7 +2395,7 @@ async fn execute_step_tool_calls(
             &tool_name,
             kind,
             &parsed_input,
-            registry.cwd(),
+            WorkspaceRoots::new(registry.cwd(), registry.additional_roots()),
             &available_shell_sandbox_retry_states,
         )
         .await
@@ -2454,6 +2484,7 @@ async fn execute_step_tool_calls(
                     &available_shell_sandbox_retry_states,
                     &parsed_input,
                     registry.cwd(),
+                    registry.additional_roots(),
                 )
             })
             .flatten();
@@ -2474,6 +2505,7 @@ async fn execute_step_tool_calls(
                 tool_call_id: &call.id,
                 raw_input: &parsed_input,
                 cwd: registry.cwd(),
+                additional_roots: registry.additional_roots(),
                 shell_sandbox_retry_states: &available_shell_sandbox_retry_states,
             },
         )
@@ -2513,7 +2545,11 @@ async fn execute_step_tool_calls(
 
                 let pre_write: Option<Option<String>> =
                     if matches!(tool_name.as_str(), "write_file" | "edit") {
-                        capture_pre_write_text(registry.cwd(), &parsed_input)
+                        capture_pre_write_text(
+                            registry.cwd(),
+                            registry.additional_roots(),
+                            &parsed_input,
+                        )
                     } else {
                         None
                     };
@@ -2600,8 +2636,11 @@ async fn execute_step_tool_calls(
                 };
 
                 if exec.sandbox_retry_available
-                    && let Some(state) =
-                        ShellSandboxRetryState::from_raw_input(&parsed_input, registry.cwd())
+                    && let Some(state) = ShellSandboxRetryState::from_raw_input(
+                        &parsed_input,
+                        registry.cwd(),
+                        registry.additional_roots(),
+                    )
                 {
                     push_unique_shell_sandbox_retry_state(
                         &mut next_shell_sandbox_retry_states,
@@ -2706,13 +2745,28 @@ struct PureGateEvaluation {
     safelist_credit: bool,
 }
 
+#[derive(Clone, Copy)]
+struct WorkspaceRoots<'a> {
+    cwd: &'a Path,
+    additional_roots: &'a [PathBuf],
+}
+
+impl<'a> WorkspaceRoots<'a> {
+    fn new(cwd: &'a Path, additional_roots: &'a [PathBuf]) -> Self {
+        Self {
+            cwd,
+            additional_roots,
+        }
+    }
+}
+
 async fn evaluate_pure_gate(
     sessions: &SessionStore,
     session_id: &str,
     tool_name: &str,
     kind: ToolKind,
     raw_input: &Value,
-    cwd: &Path,
+    workspace_roots: WorkspaceRoots<'_>,
     shell_sandbox_retry_states: &[ShellSandboxRetryState],
 ) -> Result<PureGateEvaluation, String> {
     let mode = match sessions.permission_mode(session_id).await {
@@ -2738,7 +2792,13 @@ async fn evaluate_pure_gate(
             .to_string());
     }
     if shell_sandbox_escalation_requested
-        && shell_sandbox_retry_state_index(shell_sandbox_retry_states, raw_input, cwd).is_none()
+        && shell_sandbox_retry_state_index(
+            shell_sandbox_retry_states,
+            raw_input,
+            workspace_roots.cwd,
+            workspace_roots.additional_roots,
+        )
+        .is_none()
     {
         return Err("Tool use denied: outside-sandbox permission can only be requested when retrying the same shell command that failed under the sandbox. Retry this command in the sandbox first."
             .to_string());
@@ -2759,14 +2819,18 @@ async fn evaluate_pure_gate(
         // Each sub-command must be either remembered or covered by the read-only
         // safelist; otherwise we prompt. A command we can't decompose into
         // prefixes (substitution, subshell, …) always prompts.
-        match shell_always_allow_plan(raw_input, shell_sandboxed, safelist_credit) {
-            Some(plan) => {
-                plan.required_keys.is_empty()
-                    || sessions
-                        .are_all_always_allowed(session_id, &plan.required_keys)
-                        .await
+        if !shell_directory_is_inside_primary_cwd(raw_input, workspace_roots) {
+            false
+        } else {
+            match shell_always_allow_plan(raw_input, shell_sandboxed, safelist_credit) {
+                Some(plan) => {
+                    plan.required_keys.is_empty()
+                        || sessions
+                            .are_all_always_allowed(session_id, &plan.required_keys)
+                            .await
+                }
+                None => false,
             }
-            None => false,
         }
     } else {
         sessions
@@ -2793,7 +2857,7 @@ async fn deterministic_gate_rejection(
     tool_name: &str,
     kind: ToolKind,
     raw_input: &Value,
-    cwd: &Path,
+    workspace_roots: WorkspaceRoots<'_>,
     shell_sandbox_retry_states: &[ShellSandboxRetryState],
 ) -> Option<String> {
     match evaluate_pure_gate(
@@ -2802,7 +2866,7 @@ async fn deterministic_gate_rejection(
         tool_name,
         kind,
         raw_input,
-        cwd,
+        workspace_roots,
         shell_sandbox_retry_states,
     )
     .await
@@ -2833,7 +2897,7 @@ async fn consult_gate(
         request.tool_name,
         request.kind,
         request.raw_input,
-        request.cwd,
+        WorkspaceRoots::new(request.cwd, request.additional_roots),
         request.shell_sandbox_retry_states,
     )
     .await
@@ -2937,17 +3001,21 @@ async fn request_user_permission_with_evaluation(
 ) -> Result<GateDecision, String> {
     // "Always allow" remembers the first sub-command that actually needs
     // remembering (safelist sub-commands like `tail` are skipped).
-    let shell_always_allow_prefix =
-        if request.tool_name == "run_shell_command" && !escalation_requested {
-            shell_always_allow_plan(
-                request.raw_input,
-                evaluation.shell_sandboxed,
-                evaluation.safelist_credit,
-            )
-            .and_then(|plan| plan.first_required_prefix)
-        } else {
-            None
-        };
+    let shell_always_allow_prefix = if request.tool_name == "run_shell_command"
+        && !escalation_requested
+        && shell_directory_is_inside_primary_cwd(
+            request.raw_input,
+            WorkspaceRoots::new(request.cwd, request.additional_roots),
+        ) {
+        shell_always_allow_plan(
+            request.raw_input,
+            evaluation.shell_sandboxed,
+            evaluation.safelist_credit,
+        )
+        .and_then(|plan| plan.first_required_prefix)
+    } else {
+        None
+    };
     // Offer it only when that prefix isn't already remembered: if it is,
     // a *different* sub-command is forcing the prompt, so remembering the
     // first prefix again wouldn't help.
@@ -3168,6 +3236,7 @@ struct GateCheck<'a> {
     tool_call_id: &'a str,
     raw_input: &'a Value,
     cwd: &'a Path,
+    additional_roots: &'a [PathBuf],
     shell_sandbox_retry_states: &'a [ShellSandboxRetryState],
 }
 
@@ -3872,12 +3941,16 @@ fn send_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: Sess
 /// unavailable -- e.g. binary file, unreadable, or path can't be resolved
 /// against cwd. The outer `None` tells the caller to fall back to text
 /// content for the card.
-fn capture_pre_write_text(cwd: &Path, parsed_input: &Value) -> Option<Option<String>> {
+fn capture_pre_write_text(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    parsed_input: &Value,
+) -> Option<Option<String>> {
     let path = parsed_input
         .get("file_path")
         .or_else(|| parsed_input.get("path"))
         .and_then(Value::as_str)?;
-    let resolved = safe_resolve_for_write(cwd, path).ok()?;
+    let resolved = safe_resolve_for_write_in_roots(cwd, additional_roots, path).ok()?;
     if !resolved.exists() {
         return Some(None);
     }
@@ -4195,6 +4268,7 @@ mod tests {
             tool_call_id: "call",
             raw_input: &raw_input,
             cwd: Path::new("/tmp/project"),
+            additional_roots: &[],
             shell_sandbox_retry_states: &[],
         };
 
@@ -4230,6 +4304,7 @@ mod tests {
             tool_call_id: "call",
             raw_input: &raw_input,
             cwd: Path::new("/tmp/project"),
+            additional_roots: &[],
             shell_sandbox_retry_states: &[],
         };
 
@@ -5133,7 +5208,7 @@ mod tests {
                 tool_name,
                 kind,
                 &input,
-                cwd.path(),
+                WorkspaceRoots::new(cwd.path(), &[]),
                 &[],
             )
             .await
@@ -5158,7 +5233,7 @@ mod tests {
             "write_file",
             ToolRegistry::tool_kind("write_file"),
             &serde_json::json!({"file_path": "app.js", "content": "x"}),
-            cwd.path(),
+            WorkspaceRoots::new(cwd.path(), &[]),
             &[],
         )
         .await;
@@ -5178,7 +5253,7 @@ mod tests {
             "read_file",
             ToolRegistry::tool_kind("read_file"),
             &serde_json::json!({"file_path": "app.js"}),
-            cwd.path(),
+            WorkspaceRoots::new(cwd.path(), &[]),
             &[],
         )
         .await;
@@ -5200,7 +5275,7 @@ mod tests {
                 "command": "echo ok",
                 "sandbox_permissions": "require_escalated",
             }),
-            cwd.path(),
+            WorkspaceRoots::new(cwd.path(), &[]),
             &[],
         )
         .await
@@ -5227,8 +5302,8 @@ mod tests {
                 .await
         );
         let original = serde_json::json!({"command": "cargo test", "directory": "crates/app"});
-        let retry_state =
-            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
+            .expect("retry state");
 
         let rejection = deterministic_gate_rejection(
             &store,
@@ -5240,7 +5315,7 @@ mod tests {
                 "directory": "crates/app",
                 "sandbox_permissions": "require_escalated",
             }),
-            cwd.path(),
+            WorkspaceRoots::new(cwd.path(), &[]),
             std::slice::from_ref(&retry_state),
         )
         .await;
@@ -5264,8 +5339,8 @@ mod tests {
                 .await
         );
         let original = serde_json::json!({"command": "cargo test"});
-        let retry_state =
-            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
+            .expect("retry state");
 
         let rejection = deterministic_gate_rejection(
             &store,
@@ -5276,7 +5351,7 @@ mod tests {
                 "command": "cargo check",
                 "sandbox_permissions": "require_escalated",
             }),
-            cwd.path(),
+            WorkspaceRoots::new(cwd.path(), &[]),
             std::slice::from_ref(&retry_state),
         )
         .await
@@ -5285,6 +5360,37 @@ mod tests {
         assert!(
             rejection.contains("retrying the same shell command"),
             "unexpected rejection: {rejection}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_always_allow_does_not_apply_in_additional_root_directory() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let additional = tempfile::tempdir().expect("temp additional root");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let key = shell_prefix_key(&["npm".to_string(), "test".to_string()], true);
+        store.add_always_allow(&session.id, &key).await;
+
+        let input = serde_json::json!({
+            "command": "npm test",
+            "directory": additional.path(),
+        });
+        let evaluation = evaluate_pure_gate(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &input,
+            WorkspaceRoots::new(cwd.path(), &[additional.path().to_path_buf()]),
+            &[],
+        )
+        .await
+        .expect("gate should evaluate");
+
+        assert!(
+            matches!(evaluation.decision, PureGateDecision::Prompt),
+            "remembered shell prefixes must not auto-allow execution in additional roots"
         );
     }
 
@@ -6072,8 +6178,8 @@ mod tests {
             "command": "cargo test",
             "directory": "crates/app",
         });
-        let retry_state =
-            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
+            .expect("retry state");
 
         assert!(retry_state.matches_raw_input(
             &serde_json::json!({
@@ -6081,6 +6187,7 @@ mod tests {
                 "directory": "./crates/app",
             }),
             cwd.path(),
+            &[],
         ));
     }
 
@@ -6088,8 +6195,8 @@ mod tests {
     fn shell_sandbox_retry_state_treats_dot_directory_as_cwd() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let original = serde_json::json!({"command": "cargo test"});
-        let retry_state =
-            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
+            .expect("retry state");
 
         assert!(retry_state.matches_raw_input(
             &serde_json::json!({
@@ -6097,6 +6204,7 @@ mod tests {
                 "directory": ".",
             }),
             cwd.path(),
+            &[],
         ));
     }
 
@@ -6108,8 +6216,8 @@ mod tests {
             "command": "cargo test",
             "directory": "crates/app",
         });
-        let retry_state =
-            ShellSandboxRetryState::from_raw_input(&original, cwd.path()).expect("retry state");
+        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
+            .expect("retry state");
         let states = vec![retry_state];
 
         assert_eq!(
@@ -6121,6 +6229,7 @@ mod tests {
                     "sandbox_permissions": "require_escalated",
                 }),
                 cwd.path(),
+                &[],
             ),
             Some(0)
         );
@@ -6133,6 +6242,7 @@ mod tests {
                     "sandbox_permissions": "require_escalated",
                 }),
                 cwd.path(),
+                &[],
             ),
             None
         );

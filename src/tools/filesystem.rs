@@ -1,4 +1,4 @@
-use super::{ToolResult, ToolStatus, safe_resolve, safe_resolve_for_write};
+use super::{ToolResult, ToolStatus};
 use std::path::Path;
 
 /// Hard cap for `read_file` and the existing file read by `edit_file`.
@@ -15,23 +15,42 @@ const SEARCH_MAX_FILE_BYTES: u64 = 1_048_576; // 1 MiB
 /// chew through for a single `grep_search` call.
 const SEARCH_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
+#[cfg(test)]
 pub fn read_file(
     cwd: &Path,
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> ToolResult {
-    read_file_with_backend(cwd, path, offset, limit, crate::sandbox_backend::global())
+    read_file_in_roots(cwd, &[], path, offset, limit)
+}
+
+pub fn read_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> ToolResult {
+    read_file_with_backend(
+        cwd,
+        additional_roots,
+        path,
+        offset,
+        limit,
+        crate::sandbox_backend::global(),
+    )
 }
 
 fn read_file_with_backend(
     cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
     backend: &crate::sandbox_backend::SandboxBackend,
 ) -> ToolResult {
-    let resolved = match safe_resolve(cwd, path) {
+    let resolved = match super::safe_resolve_in_roots(cwd, additional_roots, path) {
         Ok(p) => p,
         Err(e) => {
             return ToolResult {
@@ -77,8 +96,20 @@ fn read_bounded_text(
     backend.read_file_bounded(resolved, READ_MAX_BYTES)
 }
 
+#[cfg(test)]
 pub fn edit_file(
     cwd: &Path,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> ToolResult {
+    edit_file_in_roots(cwd, &[], path, old_string, new_string, replace_all)
+}
+
+pub fn edit_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
     path: &str,
     old_string: &str,
     new_string: &str,
@@ -91,7 +122,7 @@ pub fn edit_file(
         };
     }
 
-    let resolved = match safe_resolve_for_write(cwd, path) {
+    let resolved = match super::safe_resolve_for_write_in_roots(cwd, additional_roots, path) {
         Ok(p) => p,
         Err(e) => {
             return ToolResult {
@@ -161,11 +192,21 @@ pub fn edit_file(
     }
 }
 
+#[cfg(test)]
 pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
+    write_file_in_roots(cwd, &[], path, content)
+}
+
+pub fn write_file_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+    content: &str,
+) -> ToolResult {
     if content.len() > WRITE_MAX_BYTES {
         return oversized_write_payload_result(path, content.len());
     }
-    let resolved = match safe_resolve_for_write(cwd, path) {
+    let resolved = match super::safe_resolve_for_write_in_roots(cwd, additional_roots, path) {
         Ok(p) => p,
         Err(e) => {
             return ToolResult {
@@ -282,8 +323,17 @@ fn atomic_write(target: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn list_directory(cwd: &Path, path: &str) -> ToolResult {
-    let resolved = match safe_resolve(cwd, path) {
+    list_directory_in_roots(cwd, &[], path)
+}
+
+pub fn list_directory_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    path: &str,
+) -> ToolResult {
+    let resolved = match super::safe_resolve_in_roots(cwd, additional_roots, path) {
         Ok(p) => p,
         Err(e) => {
             return ToolResult {
@@ -333,6 +383,7 @@ pub fn list_directory(cwd: &Path, path: &str) -> ToolResult {
 /// engine bug or accidental enabling of a backtracking feature
 /// shouldn't be able to hang the agent -- the wasm fuel cap is the
 /// definitive backstop.
+#[cfg(test)]
 pub fn search_file_contents(
     cwd: &Path,
     pattern: &str,
@@ -340,8 +391,20 @@ pub fn search_file_contents(
     search_path: Option<&str>,
     max_results: usize,
 ) -> ToolResult {
+    search_file_contents_in_roots(cwd, &[], pattern, glob_filter, search_path, max_results)
+}
+
+pub fn search_file_contents_in_roots(
+    cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
+    pattern: &str,
+    glob_filter: Option<&str>,
+    search_path: Option<&str>,
+    max_results: usize,
+) -> ToolResult {
     search_file_contents_with_backend(
         cwd,
+        additional_roots,
         pattern,
         glob_filter,
         search_path,
@@ -352,6 +415,7 @@ pub fn search_file_contents(
 
 pub fn search_file_contents_with_sandbox_mode(
     cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
     pattern: &str,
     glob_filter: Option<&str>,
     search_path: Option<&str>,
@@ -359,7 +423,14 @@ pub fn search_file_contents_with_sandbox_mode(
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
 ) -> ToolResult {
     if sandbox_mode.is_none() {
-        return search_file_contents(cwd, pattern, glob_filter, search_path, max_results);
+        return search_file_contents_in_roots(
+            cwd,
+            additional_roots,
+            pattern,
+            glob_filter,
+            search_path,
+            max_results,
+        );
     }
     let backend = match crate::sandbox_backend::backend_for_mode(sandbox_mode) {
         Ok(backend) => backend,
@@ -372,6 +443,7 @@ pub fn search_file_contents_with_sandbox_mode(
     };
     search_file_contents_with_backend(
         cwd,
+        additional_roots,
         pattern,
         glob_filter,
         search_path,
@@ -382,6 +454,7 @@ pub fn search_file_contents_with_sandbox_mode(
 
 fn search_file_contents_with_backend(
     cwd: &Path,
+    additional_roots: &[std::path::PathBuf],
     pattern: &str,
     glob_filter: Option<&str>,
     search_path: Option<&str>,
@@ -389,15 +462,17 @@ fn search_file_contents_with_backend(
     backend: &crate::sandbox_backend::SandboxBackend,
 ) -> ToolResult {
     let root = match search_path {
-        Some(path) if !path.trim().is_empty() => match safe_resolve(cwd, path) {
-            Ok(p) => p,
-            Err(e) => {
-                return ToolResult {
-                    status: ToolStatus::RequestError,
-                    output: e,
-                };
+        Some(path) if !path.trim().is_empty() => {
+            match super::safe_resolve_in_roots(cwd, additional_roots, path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return ToolResult {
+                        status: ToolStatus::RequestError,
+                        output: e,
+                    };
+                }
             }
-        },
+        }
         _ => cwd.to_path_buf(),
     };
     if root.is_file() {
@@ -678,6 +753,34 @@ mod tests {
         std::fs::remove_dir_all(&cwd).ok();
     }
 
+    #[test]
+    fn read_and_write_accept_absolute_paths_inside_additional_root() {
+        let cwd = fresh_tmp_dir("additional-rw-cwd");
+        let additional = fresh_tmp_dir("additional-rw-root");
+        let path = additional.join("note.txt");
+
+        let w = write_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            path.to_str().unwrap(),
+            "zero\none\ntwo\n",
+        );
+        assert!(matches!(w.status, ToolStatus::Success), "{}", w.output);
+
+        let r = read_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            path.to_str().unwrap(),
+            Some(1),
+            Some(1),
+        );
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(r.output, "one");
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&additional).ok();
+    }
+
     /// Helper: count sibling temp files left behind by `atomic_write`. They
     /// are named `.{filename}.tmp.{uuid}` so we look for the prefix.
     fn count_tmp_siblings(dir: &Path, target_name: &str) -> usize {
@@ -882,6 +985,77 @@ mod tests {
         assert!(!outside.exists());
 
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn write_file_in_roots_rejects_absolute_path_outside_all_roots() {
+        let cwd = fresh_tmp_dir("abs-escape-write-cwd");
+        let additional = fresh_tmp_dir("abs-escape-write-root");
+        let outside = std::env::temp_dir().join(format!("outside-{}", uuid::Uuid::new_v4()));
+
+        let w = write_file_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            outside.to_str().unwrap(),
+            "secret",
+        );
+
+        assert!(matches!(w.status, ToolStatus::RequestError));
+        assert!(w.output.contains("escapes"));
+        assert!(!outside.exists());
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&additional).ok();
+    }
+
+    #[test]
+    fn filesystem_tools_in_roots_reject_absolute_paths_outside_all_roots() {
+        let cwd = fresh_tmp_dir("abs-escape-all-cwd");
+        let additional = fresh_tmp_dir("abs-escape-all-root");
+        let outside_dir = fresh_tmp_dir("abs-escape-all-outside");
+        let outside_file = outside_dir.join("outside.txt");
+        std::fs::write(&outside_file, "needle\n").unwrap();
+
+        let additional_roots = std::slice::from_ref(&additional);
+        let read = read_file_in_roots(
+            &cwd,
+            additional_roots,
+            outside_file.to_str().unwrap(),
+            None,
+            None,
+        );
+        assert!(matches!(read.status, ToolStatus::RequestError));
+        assert!(read.output.contains("escapes"), "{}", read.output);
+
+        let edit = edit_file_in_roots(
+            &cwd,
+            additional_roots,
+            outside_file.to_str().unwrap(),
+            "needle",
+            "changed",
+            false,
+        );
+        assert!(matches!(edit.status, ToolStatus::RequestError));
+        assert!(edit.output.contains("escapes"), "{}", edit.output);
+
+        let list = list_directory_in_roots(&cwd, additional_roots, outside_dir.to_str().unwrap());
+        assert!(matches!(list.status, ToolStatus::RequestError));
+        assert!(list.output.contains("escapes"), "{}", list.output);
+
+        let search = search_file_contents_in_roots(
+            &cwd,
+            additional_roots,
+            "needle",
+            None,
+            Some(outside_dir.to_str().unwrap()),
+            100,
+        );
+        assert!(matches!(search.status, ToolStatus::RequestError));
+        assert!(search.output.contains("escapes"), "{}", search.output);
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&additional).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
     }
 
     #[test]
@@ -1135,6 +1309,47 @@ mod tests {
     }
 
     #[test]
+    fn list_and_search_accept_absolute_paths_inside_additional_root() {
+        let cwd = fresh_tmp_dir("additional-list-search-cwd");
+        let additional = fresh_tmp_dir("additional-list-search-root");
+        let nested = additional.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("hit.txt"), "needle\n").unwrap();
+        std::fs::write(cwd.join("miss.txt"), "needle\n").unwrap();
+
+        let listed = list_directory_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            nested.to_str().unwrap(),
+        );
+        assert!(
+            matches!(listed.status, ToolStatus::Success),
+            "{}",
+            listed.output
+        );
+        assert_eq!(listed.output, "hit.txt");
+
+        let searched = search_file_contents_in_roots(
+            &cwd,
+            std::slice::from_ref(&additional),
+            "needle",
+            None,
+            Some(nested.to_str().unwrap()),
+            100,
+        );
+        assert!(
+            matches!(searched.status, ToolStatus::Success),
+            "{}",
+            searched.output
+        );
+        assert!(searched.output.contains("hit.txt:1: needle"));
+        assert!(!searched.output.contains("miss.txt"));
+
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&additional).ok();
+    }
+
+    #[test]
     fn search_file_contents_accepts_scoped_file_path() {
         let cwd = fresh_tmp_dir("search-file");
         std::fs::write(cwd.join("hit.txt"), "needle\n").unwrap();
@@ -1155,6 +1370,7 @@ mod tests {
 
         let r = search_file_contents_with_sandbox_mode(
             &cwd,
+            &[],
             "needle",
             None,
             Some("hit+one.txt"),

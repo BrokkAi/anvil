@@ -12,11 +12,12 @@ use agent_client_protocol::schema::{
     LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
     ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, ResourceLink,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOption, SessionDeleteCapabilities, SessionForkCapabilities, SessionInfo,
-    SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+    SessionDeleteCapabilities, SessionForkCapabilities, SessionInfo, SessionInfoUpdate,
+    SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     Usage as AcpUsage, UsageUpdate,
@@ -134,19 +135,59 @@ fn unsupported_mcp_transport_error(
     }))
 }
 
-/// Build the protocol error returned for non-empty `additionalDirectories` on
-/// a lifecycle request. Anvil does not advertise
-/// `sessionCapabilities.additionalDirectories`, so rather than silently
-/// dropping requested roots -- a footgun where the session looks configured
-/// but tools cannot reach those roots -- it rejects them until multi-root
-/// support exists.
-fn unsupported_additional_directories_error(method: &str) -> agent_client_protocol::Error {
+fn invalid_additional_directories_error(
+    method: &str,
+    index: usize,
+    path: &Path,
+    reason: &str,
+) -> agent_client_protocol::Error {
     agent_client_protocol::Error::invalid_params().data(serde_json::json!({
         "reason": format!(
-            "{method} additionalDirectories is not supported: Anvil does not advertise \
-             sessionCapabilities.additionalDirectories"
+            "{method} additionalDirectories[{index}] must be {reason}: {}",
+            path.display()
         ),
     }))
+}
+
+fn validate_additional_directories(
+    method: &str,
+    directories: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, agent_client_protocol::Error> {
+    for (index, path) in directories.iter().enumerate() {
+        if path.as_os_str().is_empty() {
+            return Err(invalid_additional_directories_error(
+                method,
+                index,
+                path,
+                "non-empty",
+            ));
+        }
+        if !path.is_absolute() {
+            return Err(invalid_additional_directories_error(
+                method, index, path, "absolute",
+            ));
+        }
+        match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(invalid_additional_directories_error(
+                    method,
+                    index,
+                    path,
+                    "a directory",
+                ));
+            }
+            Err(_) => {
+                return Err(invalid_additional_directories_error(
+                    method,
+                    index,
+                    path,
+                    "an existing directory",
+                ));
+            }
+        }
+    }
+    Ok(directories)
 }
 
 fn prompt_response_meta(
@@ -828,6 +869,15 @@ fn send_available_commands_update(
 
 fn session_info_from_manifest(manifest: &SessionManifest, cwd: &Path) -> SessionInfo {
     SessionInfo::new(manifest.id.clone(), cwd.to_path_buf())
+        .additional_directories(
+            manifest
+                .additional_directories
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        )
         .title(manifest.title())
         .updated_at(manifest.updated_at())
 }
@@ -1286,7 +1336,10 @@ pub async fn run_agent(
                             .resume(SessionResumeCapabilities::new())
                             .close(SessionCloseCapabilities::new())
                             .delete(SessionDeleteCapabilities::new())
-                            .fork(SessionForkCapabilities::new()),
+                            .fork(SessionForkCapabilities::new())
+                            .additional_directories(
+                                SessionAdditionalDirectoriesCapabilities::new(),
+                            ),
                     );
 
                 let protocol_version = negotiate_protocol_version(req.protocol_version);
@@ -1310,14 +1363,13 @@ pub async fn run_agent(
                         &cwd,
                     ));
                 }
-                if !req.additional_directories.is_empty() {
-                    tracing::warn!(
-                        "session/new rejected {} additionalDirectories (unsupported)",
-                        req.additional_directories.len()
-                    );
-                    return responder
-                        .respond_with_error(unsupported_additional_directories_error("session/new"));
-                }
+                let additional_directories = match validate_additional_directories(
+                    "session/new",
+                    req.additional_directories,
+                ) {
+                    Ok(directories) => directories,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 let session_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
                     Ok(servers) => servers,
                     Err(err) => {
@@ -1331,7 +1383,11 @@ pub async fn run_agent(
                     }
                 };
                 let session = sessions_new
-                    .create_session_with_mcp_servers(cwd, Some(session_mcp_servers))
+                    .create_session_with_mcp_servers_and_additional_directories(
+                        cwd,
+                        Some(session_mcp_servers),
+                        additional_directories,
+                    )
                     .await;
 
                 // Use the cached catalog populated at init; fall back to a
@@ -1436,15 +1492,13 @@ pub async fn run_agent(
                         &cwd,
                     ));
                 }
-                if !req.additional_directories.is_empty() {
-                    tracing::warn!(
-                        "session/load rejected {} additionalDirectories (unsupported) for session={session_id}",
-                        req.additional_directories.len()
-                    );
-                    return responder.respond_with_error(
-                        unsupported_additional_directories_error("session/load"),
-                    );
-                }
+                let additional_directories = match validate_additional_directories(
+                    "session/load",
+                    req.additional_directories,
+                ) {
+                    Ok(directories) => directories,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 // Convert (and validate) the requested MCP servers before any
                 // session work, so an unsupported transport is rejected early
                 // (#159). The converted set is applied after the session loads
@@ -1486,7 +1540,17 @@ pub async fn run_agent(
                         return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
-                sessions_load.update_cwd(&session_id, cwd).await;
+                if let Err(err) = sessions_load
+                    .update_workspace_roots(&session_id, cwd, additional_directories)
+                    .await
+                {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                            "reason": "failed to update session workspace roots",
+                            "details": format!("{err:#}"),
+                        })),
+                    );
+                }
                 // Apply the client-supplied MCP servers for this load, dropping
                 // any cached registry so the next prompt rebuilds with them (#145).
                 sessions_load
@@ -1554,15 +1618,13 @@ pub async fn run_agent(
                         &cwd,
                     ));
                 }
-                if !req.additional_directories.is_empty() {
-                    tracing::warn!(
-                        "session/resume rejected {} additionalDirectories (unsupported) for session={session_id}",
-                        req.additional_directories.len()
-                    );
-                    return responder.respond_with_error(
-                        unsupported_additional_directories_error("session/resume"),
-                    );
-                }
+                let additional_directories = match validate_additional_directories(
+                    "session/resume",
+                    req.additional_directories,
+                ) {
+                    Ok(directories) => directories,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 // Reject unsupported MCP transports before any session work (#159);
                 // apply the converted set after the session loads (#146).
                 let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
@@ -1601,7 +1663,17 @@ pub async fn run_agent(
                         return responder.respond_with_error(unknown_session_error(&session_id));
                     }
                 };
-                sessions_resume.update_cwd(&session_id, cwd).await;
+                if let Err(err) = sessions_resume
+                    .update_workspace_roots(&session_id, cwd, additional_directories)
+                    .await
+                {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                            "reason": "failed to update session workspace roots",
+                            "details": format!("{err:#}"),
+                        })),
+                    );
+                }
                 // Apply the client-supplied MCP servers for this resume,
                 // dropping any cached registry so the next prompt rebuilds with
                 // them (#146).
@@ -1658,11 +1730,13 @@ pub async fn run_agent(
                     return responder
                         .respond_with_error(invalid_lifecycle_cwd_error("session/fork", &cwd));
                 }
-                if !req.additional_directories.is_empty() {
-                    return responder.respond_with_error(
-                        unsupported_additional_directories_error("session/fork"),
-                    );
-                }
+                let additional_directories = match validate_additional_directories(
+                    "session/fork",
+                    req.additional_directories,
+                ) {
+                    Ok(directories) => directories,
+                    Err(err) => return responder.respond_with_error(err),
+                };
                 let requested_mcp_servers = match acp_mcp_servers_to_configs(req.mcp_servers) {
                     Ok(servers) => servers,
                     Err(err) => {
@@ -1698,6 +1772,17 @@ pub async fn run_agent(
                     }
                 };
                 let new_id = forked.id.clone();
+                if let Err(err) = sessions_fork
+                    .update_workspace_roots(&new_id, cwd, additional_directories)
+                    .await
+                {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                            "reason": "failed to update fork workspace roots",
+                            "details": format!("{err:#}"),
+                        })),
+                    );
+                }
                 // Apply the request's MCP servers (replace) when supplied; an
                 // empty set inherits the source's copied MCP config (#145/#146
                 // semantics, but fork defaults to the source's config).
@@ -4127,7 +4212,11 @@ fn build_prompt_messages_with_mode_and_parts(
     new_prompt_parts: &[ChatContentPart],
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
-    messages.push(ChatMessage::system(build_system_prompt(&mode, &snap.cwd)));
+    messages.push(ChatMessage::system(build_system_prompt(
+        &mode,
+        &snap.cwd,
+        &snap.additional_directories,
+    )));
     append_prompt_context_messages(&mut messages, snap);
     append_history_messages(&mut messages, &snap.history);
     if new_prompt_parts.is_empty() {
@@ -4597,12 +4686,26 @@ async fn run_prepared_model_turn(
     .await)
 }
 
-fn build_system_prompt(mode: &SessionMode, cwd: &Path) -> String {
-    let cwd_context = format!(
+fn build_system_prompt(
+    mode: &SessionMode,
+    cwd: &Path,
+    additional_directories: &[PathBuf],
+) -> String {
+    let mut cwd_context = format!(
         "The user's working directory is: {}\n\
-         All file paths should be interpreted relative to this directory.\n\n",
+         Relative file paths are interpreted relative to this directory.\n",
         cwd.display()
     );
+    if !additional_directories.is_empty() {
+        cwd_context
+            .push_str("Additional workspace directories are also available by absolute path:\n");
+        for directory in additional_directories {
+            cwd_context.push_str("- ");
+            cwd_context.push_str(&directory.display().to_string());
+            cwd_context.push('\n');
+        }
+    }
+    cwd_context.push('\n');
 
     // The identity line is intentionally general-purpose: Anvil is often
     // driven by hosts (e.g. `mj`) that mix coding and non-coding prompts,
@@ -8692,6 +8795,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![
@@ -8733,6 +8837,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -9106,7 +9211,7 @@ mod tests {
             (SessionMode::Ask, "Answer questions about code"),
             (SessionMode::Plan, "focus on planning"),
         ] {
-            let prompt = build_system_prompt(&mode, cwd);
+            let prompt = build_system_prompt(&mode, cwd, &[]);
             assert!(
                 prompt.contains("/tmp/some-cwd") || prompt.contains("\\tmp\\some-cwd"),
                 "system prompt for {mode:?} must embed the cwd, got: {prompt}"
@@ -9126,6 +9231,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_system_prompt_includes_additional_directories() {
+        let cwd = std::path::Path::new("/tmp/some-cwd");
+        let additional = vec![PathBuf::from("/tmp/other-root")];
+
+        let prompt = build_system_prompt(&SessionMode::Code, cwd, &additional);
+
+        assert!(
+            prompt.contains("/tmp/other-root") || prompt.contains("\\tmp\\other-root"),
+            "system prompt must embed additional workspace roots, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("absolute path"),
+            "system prompt should explain how to address additional roots, got: {prompt}"
+        );
+    }
+
     /// `render_context_report` is the body of the `/context` slash command.
     /// It should surface the mode, permission mode, model, conversation
     /// turn count, and token estimate -- enough that the user can debug
@@ -9136,6 +9258,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
@@ -9176,6 +9299,7 @@ mod tests {
         use crate::session::SessionSnapshot;
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Lutz,
             model: String::new(),
             history: vec![],
@@ -9196,6 +9320,7 @@ mod tests {
     fn usage_snapshot(model: &str) -> crate::session::SessionSnapshot {
         crate::session::SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: model.into(),
             history: vec![],
@@ -9467,6 +9592,7 @@ mod tests {
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
@@ -9504,6 +9630,7 @@ mod tests {
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Ask,
             model: "codex::gpt-5-codex".into(),
             history: vec![],
@@ -9536,6 +9663,7 @@ mod tests {
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Ask,
             model: "openrouter::openai/gpt-4o".into(),
             history: vec![],
@@ -9578,6 +9706,7 @@ mod tests {
             model: None,
             brokk_mcp_servers: None,
             cwd: None,
+            additional_directories: None,
         };
         let info = session_info_from_manifest(&manifest, &PathBuf::from("/tmp/cwd"));
 
@@ -9663,6 +9792,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -9696,6 +9826,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot, ToolExchange};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -9794,6 +9925,7 @@ mod tests {
         };
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -9862,6 +9994,7 @@ mod tests {
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -9917,6 +10050,7 @@ mod tests {
 
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -9966,6 +10100,7 @@ mod tests {
         use crate::session::SessionSnapshot;
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
@@ -9986,6 +10121,7 @@ mod tests {
         use crate::session::SessionSnapshot;
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![],
@@ -10026,6 +10162,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot, ToolExchange};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {
@@ -10104,6 +10241,7 @@ mod tests {
         use crate::session::SessionSnapshot;
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![],
@@ -10135,6 +10273,7 @@ mod tests {
         use crate::session::SessionSnapshot;
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![],
@@ -10903,6 +11042,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![
@@ -10956,6 +11096,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
             mode: SessionMode::Code,
             model: "m".into(),
             history: vec![ConversationTurn {

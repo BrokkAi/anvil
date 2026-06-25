@@ -271,6 +271,143 @@ fn session_load_replays_tool_updates_in_order() {
 }
 
 #[test]
+fn additional_directories_scope_builtin_file_tools() {
+    let case = SmokeCase {
+        name: "additional_directories_tools",
+        prompt: "Read files from the configured workspaces.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+    let additional = temp.path().join("additional");
+    std::fs::create_dir_all(&additional).expect("create additional root");
+    let allowed_file = additional.join("allowed.txt");
+    std::fs::write(&allowed_file, "from additional root\n").expect("write allowed file");
+    let outside = temp.path().join("outside.txt");
+    std::fs::write(&outside, "outside\n").expect("write outside file");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let allowed_args = format!(
+        r#"{{"file_path":{}}}"#,
+        serde_json::to_string(&allowed_file.to_string_lossy()).expect("encode path")
+    );
+    let outside_args = format!(
+        r#"{{"file_path":{}}}"#,
+        serde_json::to_string(&outside.to_string_lossy()).expect("encode path")
+    );
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_openai_smoke_server(vec![
+        tool_call_sse_body_for("call_allowed", "read_file", &allowed_args),
+        text_sse_body("Read the additional root file."),
+        tool_call_sse_body_for("call_outside", "read_file", &outside_args),
+        text_sse_body("Outside read was rejected."),
+    ]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        4,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request(
+        "session/new",
+        json!({ "cwd": cwd, "mcpServers": [], "additionalDirectories": [additional] }),
+    );
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": case.prompt }]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt (allowed)", &prompt, &client);
+    let allowed_update = client
+        .take_updates()
+        .into_iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == "call_allowed"
+                && update["status"] == "completed"
+        })
+        .unwrap_or_else(|| panic!("{}: missing allowed tool update", case.name));
+    assert_eq!(allowed_update["status"], "completed", "{allowed_update}");
+    assert!(
+        allowed_update["rawOutput"]
+            .as_str()
+            .is_some_and(|output| output.contains("from additional root")),
+        "{}: expected additional-root content in update: {allowed_update}",
+        case.name
+    );
+
+    let rejected = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "Try the outside file." }]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt (outside)", &rejected, &client);
+    let rejected_update = client
+        .take_updates()
+        .into_iter()
+        .find(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == "call_outside"
+                && update["status"] == "failed"
+        })
+        .unwrap_or_else(|| panic!("{}: missing rejected tool update", case.name));
+    assert_eq!(rejected_update["status"], "failed", "{rejected_update}");
+    assert!(
+        rejected_update["rawOutput"]
+            .as_str()
+            .is_some_and(|output| output.contains("escapes")),
+        "{}: expected outside-root rejection in update: {rejected_update}",
+        case.name
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during additionalDirectories tool checks; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn relative_cwd_lifecycle_requests_return_invalid_params() {
     let case = SmokeCase {
         name: "relative_cwd_lifecycle_requests",
@@ -599,6 +736,8 @@ fn session_list_without_cwd_and_cursor_semantics() {
     let cwd = temp.path().join("repo");
     std::fs::create_dir_all(&cwd).expect("create cwd");
     std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+    let additional_root = temp.path().join("additional-root");
+    std::fs::create_dir_all(&additional_root).expect("create additional root");
 
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
@@ -642,7 +781,14 @@ fn session_list_without_cwd_and_cursor_semantics() {
         case.name
     );
 
-    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    let new_session = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [additional_root],
+        }),
+    );
     assert_response_ok(&case, "session/new", &new_session, &client);
     let session_id = new_session["result"]["sessionId"]
         .as_str()
@@ -672,6 +818,19 @@ fn session_list_without_cwd_and_cursor_semantics() {
     assert!(
         ids_no_cwd.contains(&session_id),
         "{}: session/list without cwd did not return the session: {list_no_cwd}",
+        case.name
+    );
+    let listed_sessions_no_cwd = list_no_cwd["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}: missing sessions array: {list_no_cwd}", case.name));
+    let listed_no_cwd = listed_sessions_no_cwd
+        .iter()
+        .find(|session| session["sessionId"].as_str() == Some(&session_id))
+        .unwrap_or_else(|| panic!("{}: session missing from list: {list_no_cwd}", case.name));
+    assert_eq!(
+        listed_no_cwd["additionalDirectories"],
+        json!([additional_root]),
+        "{}: session/list did not include additionalDirectories: {list_no_cwd}",
         case.name
     );
     assert!(
@@ -773,9 +932,81 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
         }),
     );
     assert_response_ok(&case, "initialize", &initialize, &client);
+    assert!(
+        initialize["result"]["agentCapabilities"]["sessionCapabilities"]["additionalDirectories"]
+            .is_object(),
+        "{}: initialize did not advertise sessionCapabilities.additionalDirectories: {initialize}",
+        case.name
+    );
 
-    // session/new with additionalDirectories is rejected: Anvil does not
-    // advertise the capability (#149).
+    let new_with_relative_dir = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": ["relative/repo"]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new (relative additionalDirectories)",
+        &new_with_relative_dir,
+        "must be absolute",
+        &client,
+    );
+
+    let new_with_empty_dir = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [""]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new (empty additionalDirectories)",
+        &new_with_empty_dir,
+        "must be non-empty",
+        &client,
+    );
+
+    let missing_dir = temp.path().join("missing-additional-root");
+    let new_with_missing_dir = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [missing_dir]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new (missing additionalDirectories)",
+        &new_with_missing_dir,
+        "must be an existing directory",
+        &client,
+    );
+
+    let file_dir = temp.path().join("not-a-directory");
+    std::fs::write(&file_dir, "not a directory").expect("write file root");
+    let new_with_file_dir = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [file_dir]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/new (file additionalDirectories)",
+        &new_with_file_dir,
+        "must be a directory",
+        &client,
+    );
+
+    // session/new accepts additionalDirectories and stores them on the session.
     let new_with_dirs = client.request(
         "session/new",
         json!({
@@ -784,19 +1015,15 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
             "additionalDirectories": [other_cwd]
         }),
     );
-    assert_response_invalid_params_contains(
+    assert_response_ok(
         &case,
         "session/new (additionalDirectories)",
         &new_with_dirs,
-        "additionalDirectories is not supported",
         &client,
     );
-
-    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
-    assert_response_ok(&case, "session/new", &new_session, &client);
-    let session_id = new_session["result"]["sessionId"]
+    let session_id = new_with_dirs["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_with_dirs}", case.name))
         .to_string();
 
     // Unknown ids are protocol errors, not successful empty lifecycle
@@ -848,25 +1075,41 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
         &client,
     );
 
-    // additionalDirectories on load/resume is also rejected (#149).
+    let load_with_relative_dir = client.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": ["relative/repo"]
+        }),
+    );
+    assert_response_invalid_params_contains(
+        &case,
+        "session/load (relative additionalDirectories)",
+        &load_with_relative_dir,
+        "must be absolute",
+        &client,
+    );
+
+    // load replaces the session's additionalDirectories with the supplied list.
     let load_with_dirs = client.request(
         "session/load",
         json!({
             "sessionId": session_id,
             "cwd": cwd,
             "mcpServers": [],
-            "additionalDirectories": [other_cwd]
+            "additionalDirectories": []
         }),
     );
-    assert_response_invalid_params_contains(
+    assert_response_ok(
         &case,
         "session/load (additionalDirectories)",
         &load_with_dirs,
-        "additionalDirectories is not supported",
         &client,
     );
 
-    // additionalDirectories on resume is rejected too (#149).
+    // resume accepts a replacement additionalDirectories list too.
     let resume_with_dirs = client.request(
         "session/resume",
         json!({
@@ -876,11 +1119,10 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
             "additionalDirectories": [other_cwd]
         }),
     );
-    assert_response_invalid_params_contains(
+    assert_response_ok(
         &case,
         "session/resume (additionalDirectories)",
         &resume_with_dirs,
-        "additionalDirectories is not supported",
         &client,
     );
 
