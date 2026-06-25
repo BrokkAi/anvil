@@ -1,6 +1,12 @@
 use super::{ToolResult, ToolStatus, safe_resolve, safe_resolve_for_write};
 use std::path::Path;
 
+/// Hard cap for `read_file` and the existing file read by `edit_file`.
+pub(super) const READ_MAX_BYTES: u64 = 1_048_576; // 1 MiB
+/// Hard cap for model-provided write payloads and post-edit file contents.
+pub(super) const WRITE_MAX_BYTES: usize = 1_048_576; // 1 MiB
+/// Hard cap on directory entries returned by `list_directory`.
+pub(super) const LIST_MAX_ENTRIES: usize = 1_000;
 /// Hard cap on individual file size scanned by `search_file_contents`.
 /// Files larger than this are skipped to keep memory bounded on big repos.
 const SEARCH_MAX_FILE_BYTES: u64 = 1_048_576; // 1 MiB
@@ -15,6 +21,16 @@ pub fn read_file(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> ToolResult {
+    read_file_with_backend(cwd, path, offset, limit, crate::sandbox_backend::global())
+}
+
+fn read_file_with_backend(
+    cwd: &Path,
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) -> ToolResult {
     let resolved = match safe_resolve(cwd, path) {
         Ok(p) => p,
         Err(e) => {
@@ -24,8 +40,8 @@ pub fn read_file(
             };
         }
     };
-    match std::fs::read_to_string(&resolved) {
-        Ok(content) => {
+    match read_bounded_text(backend, &resolved) {
+        Ok(Some(content)) => {
             let output = match (offset, limit) {
                 (None, None) => content,
                 _ => {
@@ -43,11 +59,22 @@ pub fn read_file(
                 output,
             }
         }
+        Ok(None) => ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!("Failed to read '{path}': not a regular file"),
+        },
         Err(e) => ToolResult {
             status: ToolStatus::RequestError,
             output: format!("Failed to read '{}': {}", path, e),
         },
     }
+}
+
+fn read_bounded_text(
+    backend: &crate::sandbox_backend::SandboxBackend,
+    resolved: &Path,
+) -> std::io::Result<Option<String>> {
+    backend.read_file_bounded(resolved, READ_MAX_BYTES)
 }
 
 pub fn edit_file(
@@ -73,8 +100,14 @@ pub fn edit_file(
             };
         }
     };
-    let content = match std::fs::read_to_string(&resolved) {
-        Ok(content) => content,
+    let content = match read_bounded_text(crate::sandbox_backend::global(), &resolved) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: format!("Failed to read '{path}': not a regular file"),
+            };
+        }
         Err(e) => {
             return ToolResult {
                 status: ToolStatus::RequestError,
@@ -104,6 +137,15 @@ pub fn edit_file(
     } else {
         content.replacen(old_string, new_string, 1)
     };
+    if updated.len() > WRITE_MAX_BYTES {
+        return ToolResult {
+            status: ToolStatus::RequestError,
+            output: format!(
+                "Edited content for '{path}' is {} bytes, exceeds cap of {WRITE_MAX_BYTES}",
+                updated.len()
+            ),
+        };
+    }
     match atomic_write(&resolved, updated.as_bytes()) {
         Ok(()) => ToolResult {
             status: ToolStatus::Success,
@@ -120,6 +162,9 @@ pub fn edit_file(
 }
 
 pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
+    if content.len() > WRITE_MAX_BYTES {
+        return oversized_write_payload_result(path, content.len());
+    }
     let resolved = match safe_resolve_for_write(cwd, path) {
         Ok(p) => p,
         Err(e) => {
@@ -147,6 +192,15 @@ pub fn write_file(cwd: &Path, path: &str, content: &str) -> ToolResult {
             status: ToolStatus::RequestError,
             output: format!("Failed to write '{}': {}", path, e),
         },
+    }
+}
+
+pub(super) fn oversized_write_payload_result(path: &str, len: usize) -> ToolResult {
+    ToolResult {
+        status: ToolStatus::RequestError,
+        output: format!(
+            "Write payload for '{path}' is {len} bytes, exceeds cap of {WRITE_MAX_BYTES}"
+        ),
     }
 }
 
@@ -249,7 +303,12 @@ pub fn list_directory(cwd: &Path, path: &str) -> ToolResult {
     };
 
     let mut lines: Vec<String> = Vec::new();
+    let mut truncated = false;
     for entry in entries.flatten() {
+        if lines.len() >= LIST_MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
@@ -259,6 +318,9 @@ pub fn list_directory(cwd: &Path, path: &str) -> ToolResult {
         }
     }
     lines.sort();
+    if truncated {
+        lines.push(format!("... truncated at {LIST_MAX_ENTRIES} entries"));
+    }
     ToolResult {
         status: ToolStatus::Success,
         output: lines.join("\n"),
@@ -767,6 +829,22 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_oversized_file() {
+        let cwd = fresh_tmp_dir("oversize-read");
+        std::fs::write(
+            cwd.join("huge.txt"),
+            vec![b'x'; READ_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let r = read_file(&cwd, "huge.txt", None, None);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert!(r.output.contains("exceeds cap"), "{}", r.output);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
     fn write_file_rejects_escape_via_dotdot() {
         let cwd = fresh_tmp_dir("escape-write");
         let w = write_file(&cwd, "../escaped.txt", "x");
@@ -777,6 +855,19 @@ mod tests {
             "expected traversal error, got: {}",
             w.output
         );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn write_file_rejects_oversized_payload() {
+        let cwd = fresh_tmp_dir("oversize-write");
+        let content = "x".repeat(WRITE_MAX_BYTES + 1);
+
+        let w = write_file(&cwd, "huge.txt", &content);
+
+        assert!(matches!(w.status, ToolStatus::RequestError));
+        assert!(w.output.contains("exceeds cap"), "{}", w.output);
+        assert!(!cwd.join("huge.txt").exists());
         std::fs::remove_dir_all(&cwd).ok();
     }
 
@@ -850,6 +941,22 @@ mod tests {
         std::fs::remove_dir_all(&cwd).ok();
     }
 
+    #[test]
+    fn edit_file_rejects_oversized_result() {
+        let cwd = fresh_tmp_dir("edit-oversize");
+        std::fs::write(cwd.join("a.txt"), "a".repeat(WRITE_MAX_BYTES)).unwrap();
+
+        let r = edit_file(&cwd, "a.txt", "a", "aa", true);
+
+        assert!(matches!(r.status, ToolStatus::RequestError));
+        assert!(r.output.contains("exceeds cap"), "{}", r.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap().len(),
+            WRITE_MAX_BYTES
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
     /// `list_directory` sorts entries alphabetically and suffixes
     /// directories with `/` so the LLM can distinguish them without an
     /// extra round-trip.
@@ -873,6 +980,24 @@ mod tests {
         let cwd = fresh_tmp_dir("ls-missing");
         let r = list_directory(&cwd, "no-such-dir");
         assert!(matches!(r.status, ToolStatus::RequestError));
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn list_directory_truncates_large_directories() {
+        let cwd = fresh_tmp_dir("ls-truncate");
+        for idx in 0..(LIST_MAX_ENTRIES + 5) {
+            std::fs::write(cwd.join(format!("file-{idx:04}.txt")), "").unwrap();
+        }
+
+        let r = list_directory(&cwd, ".");
+
+        assert!(matches!(r.status, ToolStatus::Success), "{}", r.output);
+        assert_eq!(r.output.lines().count(), LIST_MAX_ENTRIES + 1);
+        assert!(
+            r.output
+                .contains(&format!("... truncated at {LIST_MAX_ENTRIES} entries"))
+        );
         std::fs::remove_dir_all(&cwd).ok();
     }
 
