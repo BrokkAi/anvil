@@ -269,18 +269,22 @@ fn test_ollama_base_url() -> Option<String> {
 }
 
 /// Build a hosted DeepSeek chat backend from a raw API key. DeepSeek's API
-/// is OpenAI-compatible at `https://api.deepseek.com`, so the generic
-/// `OpenAiClient` is sufficient.
+/// is OpenAI-compatible at `https://api.deepseek.com`, but its reasoning knob
+/// is spelled in DeepSeek's own dialect (`thinking` + a top-level
+/// `reasoning_effort` on the `high`/`max` scale), so we build the client with
+/// the DeepSeek reasoning wire rather than the unified one.
 pub fn deepseek_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
     let key = raw.trim();
     if key.is_empty() {
         return None;
     }
-    Some(Arc::new(llm_client::OpenAiClient::with_reasoning_support(
-        discovery::DEEPSEEK_BASE_URL.to_string(),
-        Some(key.to_string()),
-        reqwest::header::HeaderMap::new(),
-    )))
+    Some(Arc::new(
+        llm_client::OpenAiClient::with_deepseek_reasoning_support(
+            discovery::DEEPSEEK_BASE_URL.to_string(),
+            Some(key.to_string()),
+            reqwest::header::HeaderMap::new(),
+        ),
+    ))
 }
 
 /// Build the hosted DeepSeek backend from `DEEPSEEK_API_KEY`. Unlike

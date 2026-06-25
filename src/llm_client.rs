@@ -715,10 +715,17 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
-    /// Optional reasoning effort parameter for models that support it.
-    /// Serialized as OpenRouter/Ollama's unified `reasoning` object.
+    /// OpenRouter/Ollama's unified `reasoning: { effort }` object.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
+    /// DeepSeek's thinking toggle, e.g. `{"type": "enabled"}`, paired with
+    /// the top-level `reasoning_effort` below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+    /// DeepSeek's (OpenAI-compatible) top-level `reasoning_effort` string,
+    /// `"high"` or `"max"`. Distinct from the unified `reasoning.effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ChatCompletionResponseFormat>,
 }
@@ -731,6 +738,12 @@ struct StreamOptions {
 #[derive(Debug, Serialize)]
 struct ReasoningConfig {
     effort: String,
+}
+
+/// DeepSeek's `thinking` object. We only ever send the `type` toggle.
+#[derive(Debug, Serialize)]
+struct ThinkingConfig {
+    r#type: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -803,6 +816,54 @@ fn openrouter_reasoning_presets() -> Vec<ReasoningLevelPreset> {
             description: (*description).to_string(),
         })
         .collect()
+}
+
+/// How a client spells per-request reasoning effort on the wire. Different
+/// OpenAI-compatible servers differ here, so the client carries the dialect
+/// rather than sniffing the base URL at send time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningWire {
+    /// Don't forward reasoning effort (plain OpenAI / Codex / Ollama without
+    /// reasoning). `stream_chat` strips any incoming effort.
+    Off,
+    /// OpenRouter / Ollama unified `reasoning: { effort }` object.
+    Unified,
+    /// DeepSeek: `thinking: { type: "enabled" }` + a top-level
+    /// `reasoning_effort` on DeepSeek's `high`/`max` scale.
+    DeepSeek,
+}
+
+/// DeepSeek's two documented reasoning levels. DeepSeek's `/v1/models` is
+/// id-only (no capability fields), so -- like Bedrock and Ollama -- we
+/// declare the levels here and let the shared picker/selection code in
+/// `agent.rs` and `session.rs` map any requested effort onto them.
+const DEEPSEEK_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("high", "Deep reasoning (DeepSeek default)."),
+    ("max", "Maximum reasoning for the hardest problems."),
+];
+
+fn deepseek_reasoning_presets() -> Vec<ReasoningLevelPreset> {
+    DEEPSEEK_REASONING_PRESETS
+        .iter()
+        .map(|(effort, description)| ReasoningLevelPreset {
+            effort: (*effort).to_string(),
+            description: (*description).to_string(),
+        })
+        .collect()
+}
+
+/// Clamp an effort string to a value DeepSeek actually accepts. The picker
+/// and `select_session_reasoning_effort` already constrain selections to the
+/// declared presets, so this only guards the edge where an effort reaches
+/// the client before discovery has populated DeepSeek's metadata (e.g. a
+/// global `--reasoning-effort` default on the very first turn). Per
+/// DeepSeek's docs, `xhigh`/`max` -> `max`; everything else floors to
+/// `high`, DeepSeek's default.
+fn deepseek_reasoning_effort(effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "max" | "xhigh" => "max",
+        _ => "high",
+    }
 }
 
 fn reasoning_effort_from_default_parameters(
@@ -1039,10 +1100,9 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: Option<String>,
     http: reqwest::Client,
-    /// Whether this client should pass reasoning through to the API.
-    /// Enabled for OpenRouter and Ollama models that declare reasoning
-    /// support.
-    supports_reasoning_effort: bool,
+    /// How this client forwards reasoning effort on the wire (off, the
+    /// unified object, or DeepSeek's thinking + top-level reasoning_effort).
+    reasoning_wire: ReasoningWire,
     supports_native_structured_output: bool,
 }
 
@@ -1051,7 +1111,7 @@ impl std::fmt::Debug for OpenAiClient {
         f.debug_struct("OpenAiClient")
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("supports_reasoning_effort", &self.supports_reasoning_effort)
+            .field("reasoning_wire", &self.reasoning_wire)
             .field(
                 "supports_native_structured_output",
                 &self.supports_native_structured_output,
@@ -1149,20 +1209,34 @@ impl OpenAiClient {
             base_url,
             api_key,
             http,
-            supports_reasoning_effort: false,
+            reasoning_wire: ReasoningWire::Off,
             supports_native_structured_output,
         }
     }
 
-    /// Construct an `OpenAiClient` that supports reasoning effort.
-    /// Used for OpenRouter and Ollama models that expose reasoning presets.
+    /// Construct an `OpenAiClient` that forwards reasoning effort via the
+    /// OpenRouter/Ollama unified `reasoning: { effort }` object.
     pub fn with_reasoning_support(
         base_url: String,
         api_key: Option<String>,
         default_headers: reqwest::header::HeaderMap,
     ) -> Self {
         let mut client = Self::with_default_headers(base_url, api_key, default_headers);
-        client.supports_reasoning_effort = true;
+        client.reasoning_wire = ReasoningWire::Unified;
+        client
+    }
+
+    /// Construct an `OpenAiClient` for the hosted DeepSeek API: it advertises
+    /// DeepSeek's `high`/`max` reasoning levels (see
+    /// [`deepseek_reasoning_presets`]) and forwards effort in DeepSeek's
+    /// dialect (`thinking` + a top-level `reasoning_effort`).
+    pub fn with_deepseek_reasoning_support(
+        base_url: String,
+        api_key: Option<String>,
+        default_headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        let mut client = Self::with_default_headers(base_url, api_key, default_headers);
+        client.reasoning_wire = ReasoningWire::DeepSeek;
         client
     }
 
@@ -1185,13 +1259,13 @@ impl LlmBackend for OpenAiClient {
     }
 
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
-        let request = if self.supports_reasoning_effort {
-            request
-        } else {
+        let request = if self.reasoning_wire == ReasoningWire::Off {
             StreamChatRequest {
                 reasoning_effort: None,
                 ..request
             }
+        } else {
+            request
         };
         Box::pin(self.stream_chat_impl(request))
     }
@@ -1312,11 +1386,30 @@ impl OpenAiClient {
                 "OpenRouter list_model_metadata_impl: fetched models response",
             );
         }
-        if !self.supports_reasoning_effort {
+        if self.reasoning_wire == ReasoningWire::Off {
             return Ok(models
                 .data
                 .into_iter()
                 .map(|model| model.to_model_metadata())
+                .collect());
+        }
+        if self.reasoning_wire == ReasoningWire::DeepSeek {
+            // DeepSeek's `/models` is id-only, so `to_model_metadata` would
+            // yield no reasoning info. Declare DeepSeek's levels here (default
+            // `high`) so the shared picker/selection code can map requests to
+            // availability, exactly as it does for Bedrock/Ollama.
+            let presets = deepseek_reasoning_presets();
+            return Ok(models
+                .data
+                .into_iter()
+                .map(|model| ModelMetadata {
+                    id: model.id.clone(),
+                    default_reasoning_level: Some("high".to_string()),
+                    supported_reasoning_levels: presets.clone(),
+                    supports_images: model.supports_images(),
+                    context_length: model.context_length,
+                    pricing: model.pricing(),
+                })
                 .collect());
         }
         let metadata = models
@@ -1350,7 +1443,26 @@ impl OpenAiClient {
 
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
-        let reasoning = reasoning_effort.map(|effort| ReasoningConfig { effort });
+        // Spell reasoning effort in this client's dialect. `stream_chat` has
+        // already cleared the effort for `ReasoningWire::Off`.
+        let (reasoning, thinking, reasoning_effort_field) = match self.reasoning_wire {
+            ReasoningWire::Off => (None, None, None),
+            ReasoningWire::Unified => (
+                reasoning_effort.map(|effort| ReasoningConfig { effort }),
+                None,
+                None,
+            ),
+            ReasoningWire::DeepSeek => match reasoning_effort {
+                Some(effort) => (
+                    None,
+                    Some(ThinkingConfig { r#type: "enabled" }),
+                    Some(deepseek_reasoning_effort(&effort).to_string()),
+                ),
+                // No effort: send nothing; DeepSeek defaults to thinking
+                // enabled at `high`.
+                None => (None, None, None),
+            },
+        };
         let response_format = if self.supports_native_structured_output {
             structured_output
                 .as_ref()
@@ -1379,6 +1491,8 @@ impl OpenAiClient {
             tools,
             tool_choice,
             reasoning,
+            thinking,
+            reasoning_effort: reasoning_effort_field,
             response_format,
         };
         let resp = match crate::http_retry::send_with_retries(
@@ -1647,6 +1761,130 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(*tokens.lock().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn deepseek_reasoning_effort_clamps_to_high_or_max() {
+        // Only `high`/`max` are valid for DeepSeek. xhigh/max -> max;
+        // everything else (low/medium/minimal/unknown) floors to high.
+        assert_eq!(deepseek_reasoning_effort("low"), "high");
+        assert_eq!(deepseek_reasoning_effort("medium"), "high");
+        assert_eq!(deepseek_reasoning_effort("high"), "high");
+        assert_eq!(deepseek_reasoning_effort("xhigh"), "max");
+        assert_eq!(deepseek_reasoning_effort("max"), "max");
+        assert_eq!(deepseek_reasoning_effort("minimal"), "high");
+        assert_eq!(deepseek_reasoning_effort("  MAX "), "max");
+    }
+
+    /// DeepSeek `/models` is id-only, so the client declares the levels
+    /// itself: every model gets `[high, max]` with `high` as the default.
+    /// This is what lets the shared picker/selection map requests to
+    /// availability.
+    #[tokio::test]
+    async fn deepseek_wire_declares_high_max_reasoning_levels() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
+                    {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenAiClient::with_deepseek_reasoning_support(
+            server.uri(),
+            None,
+            reqwest::header::HeaderMap::new(),
+        );
+
+        let meta = client.list_model_metadata().await.expect("metadata");
+        assert_eq!(meta.len(), 2);
+        for m in &meta {
+            assert_eq!(m.default_reasoning_level.as_deref(), Some("high"), "{m:?}");
+            let levels: Vec<&str> = m
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect();
+            assert_eq!(levels, vec!["high", "max"], "{m:?}");
+        }
+    }
+
+    /// Capture the JSON body a client sends for one chat request via a mock
+    /// server returning an empty SSE stream.
+    async fn capture_request_body(wire: ReasoningWire, effort: Option<&str>) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: [DONE]\n"))
+            .mount(&server)
+            .await;
+        let client = match wire {
+            ReasoningWire::DeepSeek => OpenAiClient::with_deepseek_reasoning_support(
+                server.uri(),
+                None,
+                reqwest::header::HeaderMap::new(),
+            ),
+            ReasoningWire::Unified => OpenAiClient::with_reasoning_support(
+                server.uri(),
+                None,
+                reqwest::header::HeaderMap::new(),
+            ),
+            ReasoningWire::Off => OpenAiClient::new(server.uri(), None),
+        };
+        let (on_token, _) = collect_tokens();
+        client
+            .stream_chat(StreamChatRequest {
+                model: "deepseek-reasoner".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: effort.map(str::to_string),
+                temperature: None,
+                structured_output: None,
+                on_token,
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(30),
+            })
+            .await
+            .expect("mock stream completes");
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 1);
+        serde_json::from_slice(&requests[0].body).expect("body is JSON")
+    }
+
+    /// DeepSeek wire sends `thinking: {type: enabled}` + a top-level
+    /// `reasoning_effort` (clamped to DeepSeek's scale), and NOT the unified
+    /// `reasoning` object.
+    #[tokio::test]
+    async fn deepseek_wire_sends_thinking_and_top_level_effort() {
+        let body = capture_request_body(ReasoningWire::DeepSeek, Some("medium")).await;
+        assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+        assert_eq!(body["reasoning_effort"], "high", "{body}");
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    /// With no effort, the DeepSeek wire sends none of the reasoning fields
+    /// and lets DeepSeek apply its default.
+    #[tokio::test]
+    async fn deepseek_wire_omits_reasoning_when_no_effort() {
+        let body = capture_request_body(ReasoningWire::DeepSeek, None).await;
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    /// The unified wire still sends `reasoning: {effort}` verbatim and none
+    /// of DeepSeek's fields -- guards against dialect leakage.
+    #[tokio::test]
+    async fn unified_wire_sends_reasoning_object() {
+        let body = capture_request_body(ReasoningWire::Unified, Some("high")).await;
+        assert_eq!(body["reasoning"]["effort"], "high", "{body}");
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
     /// A stream that emits only SSE keepalive comments (`:\n`) must trip
@@ -2204,6 +2442,8 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning: None,
+            thinking: None,
+            reasoning_effort: None,
             response_format: Some(ChatCompletionResponseFormat {
                 r#type: "json_schema",
                 json_schema: NativeJsonSchemaFormat {
