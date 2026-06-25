@@ -426,6 +426,7 @@ File format:
 name: bug-hunter
 description: Review a diff for concrete correctness bugs.
 max_turns: 8
+tools: Read, Grep, Glob
 ---
 
 You are a meticulous code reviewer. Flag concrete bugs only.
@@ -435,6 +436,11 @@ Return findings as `<path>:<line> - <one-line description>`.
 `max_turns` is optional. When present, it caps that subagent's tool-calling
 turns below the global subagent ceiling. `maxTurns` is accepted as an alias for
 compatibility with camelCase frontmatter.
+
+`tools` is optional. When omitted, a subagent inherits the parent tool catalog.
+When present, it is an allowlist. Claude-style tool names such as `Read`,
+`Write`, `Edit`, `Bash`, `Grep`, `Glob`, and `LS` are mapped to Anvil's
+built-in tool names; Anvil and MCP tool names can also be listed directly.
 
 Discovery order:
 
@@ -452,6 +458,7 @@ Constraints:
 - Nested delegation is disabled.
 - Each subagent call is capped at 25 tool-calling turns unless the subagent
   frontmatter sets a lower `max_turns` value.
+- A subagent with `tools` frontmatter sees and can call only those tools.
 - Intermediate subagent updates are silent; only the final answer returns to
   the parent conversation.
 - Cancelling the parent prompt cancels the active subagent.

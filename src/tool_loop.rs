@@ -1,5 +1,6 @@
 mod announce;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,6 +66,12 @@ struct ExecutedStepOutcome {
     results: Vec<p2t::PrefixToolResult>,
     shell_sandbox_retry_states: Vec<ShellSandboxRetryState>,
     cancelled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ToolCatalogRestrictions<'a> {
+    depth: usize,
+    tool_allowlist: Option<&'a HashSet<String>>,
 }
 
 /// Stream a model turn, retrying transient failures (network disconnect,
@@ -1325,6 +1332,7 @@ pub(crate) async fn run(
     original_user_request: String,
     notifications: NotificationMode,
     depth: usize,
+    tool_allowlist: Option<Arc<HashSet<String>>>,
 ) -> (String, Vec<ToolExchange>, TokenUsage, Option<TurnFailure>) {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
@@ -1419,9 +1427,11 @@ pub(crate) async fn run(
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
     // catalog at deeper levels prevents an unbounded recursion of
     // subagents-spawning-subagents.
-    if depth >= MAX_SUBAGENT_DEPTH {
-        tools.retain(|t| t.function.name != "task");
-    }
+    let tool_restrictions = ToolCatalogRestrictions {
+        depth,
+        tool_allowlist: tool_allowlist.as_deref(),
+    };
+    apply_tool_catalog_restrictions(&mut tools, tool_restrictions);
     let mut full_response = String::new();
     // Captured per-call so the caller can persist them with the turn (#3409),
     // letting a `session/load` re-feed the LLM the same tool context the
@@ -1559,9 +1569,7 @@ pub(crate) async fn run(
                 tools = registry
                     .tool_definitions_with_shell_escalation(!shell_sandbox_retry_states.is_empty())
                     .await;
-                if depth >= MAX_SUBAGENT_DEPTH {
-                    tools.retain(|t| t.function.name != "task");
-                }
+                apply_tool_catalog_restrictions(&mut tools, tool_restrictions);
             }
             maybe_unlock_shell_after_file_change(
                 train_bifrost,
@@ -1570,7 +1578,7 @@ pub(crate) async fn run(
                 &tool_exchanges,
                 &mut tools,
                 &shell_sandbox_retry_states,
-                depth,
+                tool_restrictions,
             )
             .await;
 
@@ -1657,7 +1665,7 @@ pub(crate) async fn run(
         let force_text_response = p2t_config.is_none()
             && turn >= max_turns - 1
             && has_successful_file_change(&tool_exchanges);
-        let turn_tools = if !force_text_response {
+        let turn_tools = if !force_text_response && !tools.is_empty() {
             Some(tools.clone())
         } else {
             None
@@ -1923,9 +1931,7 @@ pub(crate) async fn run(
                             !shell_sandbox_retry_states.is_empty(),
                         )
                         .await;
-                    if depth >= MAX_SUBAGENT_DEPTH {
-                        tools.retain(|t| t.function.name != "task");
-                    }
+                    apply_tool_catalog_restrictions(&mut tools, tool_restrictions);
                 }
                 let step_results = outcome.results;
                 maybe_unlock_shell_after_file_change(
@@ -1935,7 +1941,7 @@ pub(crate) async fn run(
                     &tool_exchanges,
                     &mut tools,
                     &shell_sandbox_retry_states,
-                    depth,
+                    tool_restrictions,
                 )
                 .await;
                 if let Some(config) = p2t_config.as_ref() {
@@ -2122,7 +2128,7 @@ async fn maybe_unlock_shell_after_file_change(
     tool_exchanges: &[ToolExchange],
     tools: &mut Vec<ToolDefinition>,
     shell_sandbox_retry_states: &[ShellSandboxRetryState],
-    depth: usize,
+    restrictions: ToolCatalogRestrictions<'_>,
 ) {
     if !(train_bifrost || p2t_enabled)
         || !has_successful_file_change(tool_exchanges)
@@ -2139,8 +2145,18 @@ async fn maybe_unlock_shell_after_file_change(
     *tools = registry
         .tool_definitions_with_shell_escalation(!shell_sandbox_retry_states.is_empty())
         .await;
-    if depth >= MAX_SUBAGENT_DEPTH {
+    apply_tool_catalog_restrictions(tools, restrictions);
+}
+
+fn apply_tool_catalog_restrictions(
+    tools: &mut Vec<ToolDefinition>,
+    restrictions: ToolCatalogRestrictions<'_>,
+) {
+    if restrictions.depth >= MAX_SUBAGENT_DEPTH {
         tools.retain(|t| t.function.name != "task");
+    }
+    if let Some(allowed) = restrictions.tool_allowlist {
+        tools.retain(|tool| allowed.contains(tool.function.name.as_str()));
     }
 }
 
@@ -3554,8 +3570,8 @@ fn is_likely_sandbox_limitation(output: &str) -> bool {
 ///
 /// The nested call shares:
 ///   * `llm`, `registry`, `model`, `reasoning_effort`: same backend, same
-///     tool catalog (minus `task` itself at depth >= MAX_SUBAGENT_DEPTH),
-///     same model and effort as the parent.
+///     registry-backed tool catalog, optionally narrowed by the subagent's
+///     `tools` allowlist and always minus `task` at depth >= MAX_SUBAGENT_DEPTH.
 ///   * `cancel`: a parent cancellation propagates to the subagent.
 ///   * `session_id` and `sessions`: the permission gate stays active
 ///     against the parent session's mode and always-allow set, so a
@@ -3671,6 +3687,10 @@ async fn execute_subagent(
     // needs more, that's a sign the parent should have done the work
     // itself or split it differently.
     let nested_max_turns = subagent_max_turns(max_turns, meta.max_turns);
+    let nested_tool_allowlist = meta
+        .allowed_tools
+        .as_ref()
+        .map(|tools| Arc::new(tools.iter().cloned().collect::<HashSet<_>>()));
 
     // `Box::pin` is required because `run` is recursive via this
     // function and Rust async fns can't be directly recursive (the
@@ -3693,6 +3713,7 @@ async fn execute_subagent(
         prompt.to_string(),
         NotificationMode::Silent,
         depth,
+        nested_tool_allowlist,
     ))
     .await;
 
@@ -4239,6 +4260,48 @@ mod tests {
         assert!(names.contains("read_file"));
         assert!(names.contains("edit"));
         assert!(!names.contains("run_shell_command"));
+    }
+
+    #[test]
+    fn tool_allowlist_filters_catalog() {
+        let mut tools = vec![
+            tool_def_for_test("read_file"),
+            tool_def_for_test("edit"),
+            tool_def_for_test("grep_search"),
+        ];
+        let allowed = ["read_file".to_string(), "grep_search".to_string()]
+            .into_iter()
+            .collect();
+
+        apply_tool_catalog_restrictions(
+            &mut tools,
+            ToolCatalogRestrictions {
+                depth: 0,
+                tool_allowlist: Some(&allowed),
+            },
+        );
+
+        let names = advertised_tool_names(Some(&tools));
+        assert!(names.contains("read_file"));
+        assert!(names.contains("grep_search"));
+        assert!(!names.contains("edit"));
+    }
+
+    #[test]
+    fn omitted_tool_allowlist_preserves_catalog() {
+        let mut tools = vec![tool_def_for_test("read_file"), tool_def_for_test("edit")];
+
+        apply_tool_catalog_restrictions(
+            &mut tools,
+            ToolCatalogRestrictions {
+                depth: 0,
+                tool_allowlist: None,
+            },
+        );
+
+        let names = advertised_tool_names(Some(&tools));
+        assert!(names.contains("read_file"));
+        assert!(names.contains("edit"));
     }
 
     #[test]

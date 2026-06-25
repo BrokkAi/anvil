@@ -49,6 +49,7 @@ pub struct AgentMeta {
     pub name: String,
     pub description: String,
     pub max_turns: Option<usize>,
+    pub allowed_tools: Option<Vec<String>>,
     pub location: PathBuf,
     #[allow(dead_code)]
     pub scope: AgentScope,
@@ -371,18 +372,31 @@ fn load_agent(
         }
     };
 
+    let allowed_tools = match parse_allowed_tools(front) {
+        Ok(v) => v,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "subagent at '{}' has invalid `tools`: {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+
     reg.add(AgentMeta {
         name,
         description,
         max_turns,
+        allowed_tools,
         location: path.to_path_buf(),
         scope,
     });
 }
 
 fn parse_max_turns(frontmatter: &str) -> Result<Option<usize>, String> {
-    let Some(raw_value) = find_top_level_scalar(frontmatter, "max_turns")
-        .or_else(|| find_top_level_scalar(frontmatter, "maxTurns"))
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let Some((_, raw_value)) = find_top_level_scalar(&lines, "max_turns")
+        .or_else(|| find_top_level_scalar(&lines, "maxTurns"))
     else {
         return Ok(None);
     };
@@ -405,15 +419,128 @@ fn parse_max_turns(frontmatter: &str) -> Result<Option<usize>, String> {
     Ok(Some(turns))
 }
 
-fn find_top_level_scalar<'a>(frontmatter: &'a str, key: &str) -> Option<&'a str> {
+fn parse_allowed_tools(frontmatter: &str) -> Result<Option<Vec<String>>, String> {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let Some((line_index, raw_value)) = find_top_level_scalar(&lines, "tools") else {
+        return Ok(None);
+    };
+
+    let mut tools = if strip_inline_comment(raw_value).trim().is_empty() {
+        parse_block_tool_list(&lines[line_index + 1..])?
+    } else {
+        parse_inline_tool_list(raw_value)?
+    };
+    for tool in &mut tools {
+        *tool = normalize_tool_name(tool);
+    }
+    tools.sort();
+    tools.dedup();
+    Ok(Some(tools))
+}
+
+fn find_top_level_scalar<'a>(lines: &'a [&str], key: &str) -> Option<(usize, &'a str)> {
     let prefix = format!("{key}:");
-    frontmatter.lines().find_map(|line| {
+    lines.iter().enumerate().find_map(|(index, line)| {
         let trimmed = line.trim_start();
         if trimmed.len() != line.len() || trimmed.starts_with('#') {
             return None;
         }
-        trimmed.strip_prefix(&prefix)
+        trimmed.strip_prefix(&prefix).map(|value| (index, value))
     })
+}
+
+fn parse_block_tool_list(lines: &[&str]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for line in lines {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.len() == line.len() {
+            break;
+        }
+        let Some(item) = trimmed.strip_prefix("- ") else {
+            return Err("block list entries must start with `-`".to_string());
+        };
+        out.push(clean_tool_item(item)?);
+    }
+    if out.is_empty() {
+        return Err("must be a comma-separated string or non-empty list".to_string());
+    }
+    Ok(out)
+}
+
+fn parse_inline_tool_list(value: &str) -> Result<Vec<String>, String> {
+    let value = strip_inline_comment(value).trim();
+    if value.starts_with('[') || value.ends_with(']') {
+        let inner = value
+            .strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .ok_or_else(|| "inline list must be enclosed in `[` and `]`".to_string())?;
+        if inner.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        return split_tool_items(inner);
+    }
+    split_tool_items(unquote_tool_scalar(value))
+}
+
+fn split_tool_items(value: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_was_backslash = false;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single && !prev_was_backslash => in_double = !in_double,
+            ',' if !in_single && !in_double => {
+                out.push(clean_tool_item(&value[start..idx])?);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+        prev_was_backslash = ch == '\\' && !prev_was_backslash;
+        if ch != '\\' {
+            prev_was_backslash = false;
+        }
+    }
+    if in_single || in_double {
+        return Err("unterminated quoted tool name".to_string());
+    }
+    out.push(clean_tool_item(&value[start..])?);
+    Ok(out)
+}
+
+fn clean_tool_item(value: &str) -> Result<String, String> {
+    let value = strip_inline_comment(value).trim();
+    let value = unquote_tool_scalar(value).trim();
+    if value.is_empty() {
+        return Err("tool names must not be empty".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn unquote_tool_scalar(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
+fn normalize_tool_name(tool: &str) -> String {
+    match tool {
+        "Read" => "read_file",
+        "Write" => "write_file",
+        "Edit" | "MultiEdit" | "NotebookEdit" => "edit",
+        "Bash" => "run_shell_command",
+        "Grep" | "Glob" => "grep_search",
+        "LS" => "list_directory",
+        _ => tool,
+    }
+    .to_string()
 }
 
 fn strip_inline_comment(value: &str) -> &str {
@@ -544,6 +671,7 @@ mod tests {
         assert_eq!(meta.description, "Hunt for bugs");
         assert_eq!(meta.scope, AgentScope::User);
         assert_eq!(meta.max_turns, None);
+        assert_eq!(meta.allowed_tools, None);
     }
 
     #[test]
@@ -581,6 +709,77 @@ mod tests {
     }
 
     #[test]
+    fn tools_frontmatter_comma_list_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home.path().join(".claude").join("agents").join("reader.md"),
+            "---\nname: reader\ndescription: Read things\ntools: Read, Glob, Grep\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("reader").unwrap();
+        assert_eq!(
+            meta.allowed_tools.as_deref(),
+            Some(&["grep_search".to_string(), "read_file".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn tools_frontmatter_quoted_comma_list_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home.path().join(".claude").join("agents").join("reader.md"),
+            "---\nname: reader\ndescription: Read things\ntools: \"Read, Grep\"\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("reader").unwrap();
+        assert_eq!(
+            meta.allowed_tools.as_deref(),
+            Some(&["grep_search".to_string(), "read_file".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn tools_frontmatter_block_list_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home.path().join(".claude").join("agents").join("writer.md"),
+            "---\nname: writer\ndescription: Write things\ntools:\n  - Write\n  - Edit\n  - search_symbols\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("writer").unwrap();
+        assert_eq!(
+            meta.allowed_tools.as_deref(),
+            Some(
+                &[
+                    "edit".to_string(),
+                    "search_symbols".to_string(),
+                    "write_file".to_string()
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn tools_frontmatter_empty_inline_list_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home
+                .path()
+                .join(".claude")
+                .join("agents")
+                .join("text-only.md"),
+            "---\nname: text-only\ndescription: Text only\ntools: []\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("text-only").unwrap();
+        assert_eq!(meta.allowed_tools.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
     fn invalid_max_turns_is_skipped_with_diagnostic() {
         let tmp = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
@@ -599,6 +798,30 @@ mod tests {
             "{:?}",
             reg.diagnostics()
         );
+    }
+
+    #[test]
+    fn invalid_tools_frontmatter_is_skipped_with_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home.path().join(".claude").join("agents").join("bad.md"),
+            "---\nname: bad\ndescription: Bad tools\ntools:\n  Read\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        assert!(reg.is_empty());
+        assert!(
+            reg.diagnostics().iter().any(|d| d.contains("tools")),
+            "{:?}",
+            reg.diagnostics()
+        );
+    }
+
+    #[test]
+    fn unbalanced_quoted_tool_name_is_rejected() {
+        let err = parse_allowed_tools("name: bad\ndescription: Bad tools\ntools: [Read, \"Grep]\n")
+            .unwrap_err();
+        assert!(err.contains("unterminated quoted tool name"), "{err}");
     }
 
     #[test]

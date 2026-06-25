@@ -3755,6 +3755,7 @@ async fn run_model_turn_in_spawn(
         prompt_text_for_turn.clone(),
         crate::tool_loop::NotificationMode::Live,
         0,
+        None,
     ))
     .catch_unwind()
     .await;
