@@ -40,6 +40,31 @@ const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 
+#[derive(Debug, Deserialize)]
+struct TaskArgs {
+    description: String,
+    prompt: String,
+    subagent_type: String,
+}
+
+fn invalid_task_args(message: impl Into<String>) -> (ToolExecution, TokenUsage) {
+    (
+        ToolExecution {
+            output: message.into(),
+            failed: true,
+            sandbox_retry_available: false,
+        },
+        TokenUsage::default(),
+    )
+}
+
+fn parse_task_args(args: Value) -> Result<TaskArgs, String> {
+    let json = args.to_string();
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|err| format!("Error: invalid `task` arguments: {err}"))
+}
+
 fn train_bifrost_enabled() -> bool {
     p2t::env_var_truthy(TRAIN_BIFROST_ENV)
 }
@@ -3769,32 +3794,21 @@ async fn execute_subagent(
     sessions: &SessionStore,
     depth: usize,
 ) -> (ToolExecution, TokenUsage) {
-    let subagent_name = match args.get("subagent_type").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return (
-                ToolExecution {
-                    output: "Error: `task` requires a non-empty `subagent_type`.".to_string(),
-                    failed: true,
-                    sandbox_retry_available: false,
-                },
-                TokenUsage::default(),
-            );
-        }
+    let args: TaskArgs = match parse_task_args(args.clone()) {
+        Ok(args) => args,
+        Err(err) => return invalid_task_args(err),
     };
-    let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return (
-                ToolExecution {
-                    output: "Error: `task` requires a non-empty `prompt`.".to_string(),
-                    failed: true,
-                    sandbox_retry_available: false,
-                },
-                TokenUsage::default(),
-            );
-        }
-    };
+    if args.subagent_type.is_empty() {
+        return invalid_task_args("Error: `task` requires a non-empty `subagent_type`.");
+    }
+    if args.prompt.is_empty() {
+        return invalid_task_args("Error: `task` requires a non-empty `prompt`.");
+    }
+    if args.description.is_empty() {
+        return invalid_task_args("Error: `task` requires a non-empty `description`.");
+    }
+    let subagent_name = args.subagent_type.as_str();
+    let prompt = args.prompt.as_str();
 
     // Snapshot the agent metadata under the registry lock, then drop the
     // guard before recursing into `run()` -- the nested call also
@@ -4093,6 +4107,41 @@ mod tests {
         assert_eq!(subagent_max_turns(200, Some(9)), 9);
         assert_eq!(subagent_max_turns(7, Some(9)), 7);
         assert_eq!(subagent_max_turns(200, Some(50)), MAX_SUBAGENT_TURNS);
+    }
+
+    #[test]
+    fn task_args_reject_missing_or_wrong_typed_fields() {
+        let cases = [
+            (
+                serde_json::json!({"prompt": "review this", "subagent_type": "reviewer"}),
+                "description",
+            ),
+            (
+                serde_json::json!({
+                    "description": "review",
+                    "prompt": ["review this"],
+                    "subagent_type": "reviewer"
+                }),
+                "prompt",
+            ),
+            (
+                serde_json::json!({
+                    "description": "review",
+                    "prompt": "review this",
+                    "subagent_type": null
+                }),
+                "subagent_type",
+            ),
+        ];
+
+        for (args, field) in cases {
+            let err =
+                parse_task_args(args).expect_err("invalid task args should fail typed parsing");
+            assert!(
+                err.contains(field),
+                "error should mention {field:?}, got: {err}"
+            );
+        }
     }
 
     struct RetryBackend {
