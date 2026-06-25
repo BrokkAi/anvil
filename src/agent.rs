@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,15 +9,17 @@ use agent_client_protocol::schema::{
     Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
     EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, ResourceLink,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, ResourceLink,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
     SessionConfigSelectOption, SessionDeleteCapabilities, SessionForkCapabilities, SessionInfo,
     SessionInfoUpdate, SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState,
     SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, Usage as AcpUsage, UsageUpdate,
+    TextContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    Usage as AcpUsage, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
@@ -211,6 +214,17 @@ fn prompt_stop_response(cancelled: bool) -> PromptResponse {
 /// (slash commands, validation short-circuits) that always end the turn.
 fn prompt_end_turn_response() -> PromptResponse {
     prompt_stop_response(false)
+}
+
+fn acp_usage_from_token_usage(usage: crate::llm_client::TokenUsage) -> AcpUsage {
+    AcpUsage::new(
+        usage.total_tokens(),
+        usage.input_tokens,
+        usage.output_tokens,
+    )
+    .thought_tokens(usage.thought_tokens)
+    .cached_read_tokens(usage.cached_read_tokens)
+    .cached_write_tokens(usage.cached_write_tokens)
 }
 
 /// Available session modes exposed to ACP clients.
@@ -2290,14 +2304,7 @@ pub async fn run_agent(
                         // token fires; report that as a cancelled turn.
                         let cancelled = cancel.is_cancelled();
                         let response = if let Some(cumulative_usage) = cumulative_usage {
-                            let acp_usage = AcpUsage::new(
-                                cumulative_usage.total_tokens(),
-                                cumulative_usage.input_tokens,
-                                cumulative_usage.output_tokens,
-                            )
-                            .thought_tokens(cumulative_usage.thought_tokens)
-                            .cached_read_tokens(cumulative_usage.cached_read_tokens)
-                            .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                            let acp_usage = acp_usage_from_token_usage(cumulative_usage);
                             prompt_stop_response(cancelled).usage(Some(acp_usage))
                         } else {
                             prompt_stop_response(cancelled)
@@ -2377,14 +2384,7 @@ pub async fn run_agent(
                         // `run_goal_loop` returns when the goal is met, blocked,
                         // or cancelled; the token distinguishes cancellation.
                         let cancelled = cancel.is_cancelled();
-                        let acp_usage = AcpUsage::new(
-                            cumulative_usage.total_tokens(),
-                            cumulative_usage.input_tokens,
-                            cumulative_usage.output_tokens,
-                        )
-                        .thought_tokens(cumulative_usage.thought_tokens)
-                        .cached_read_tokens(cumulative_usage.cached_read_tokens)
-                        .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                        let acp_usage = acp_usage_from_token_usage(cumulative_usage);
                         let response = prompt_stop_response(cancelled)
                             .usage(Some(acp_usage))
                             .meta(prompt_response_meta(
@@ -2463,6 +2463,223 @@ pub async fn run_agent(
                     return Ok(());
                 }
 
+                // Build the tool registry up-front so we don't pay for it inside the spawn.
+                let Some(registry) = sessions_prompt
+                    .get_or_create_registry(&session_id, snap.cwd.clone())
+                    .await
+                else {
+                    sessions_prompt.finish_prompt(&session_id).await;
+                    return responder.respond_with_error(unknown_session_error(&session_id));
+                };
+
+                if let PlanningGateDecision::RequiresPlan { reason } =
+                    classify_prompt_for_planning(snap.mode, &prompt_text, &prompt_parts)
+                {
+                    let llm_for_gate: Arc<dyn crate::llm_client::LlmBackend> =
+                        llm_prompt.clone();
+                    let sessions_for_gate = sessions_prompt.clone();
+                    let cx_for_gate = cx.clone();
+                    let session_id_for_gate = session_id.clone();
+                    let fallback_cwd_for_gate = fallback_cwd.clone();
+                    let prompt_text_for_turn = prompt_text;
+                    let prompt_parts_for_turn = prompt_parts;
+                    let structured_output_request_for_turn = structured_output_request.clone();
+                    let model_for_gate = snap.model.clone();
+                    let orchestration_model_for_response =
+                        llm_for_gate.resolve_model_info(&model_for_gate);
+                    let reasoning_effort_for_gate = snap.reasoning_effort.clone();
+                    let idle_timeout_for_gate = Duration::from_secs(
+                        snap.idle_timeout_secs
+                            .unwrap_or(default_idle_timeout_secs)
+                            .max(1),
+                    );
+                    let cancel_status = cancel.clone();
+
+                    let spawn_result = cx.spawn(async move {
+                        let planning_parts =
+                            prompt_parts_for_planning(reason, &prompt_parts_for_turn);
+                        let planning_prompt = format!(
+                            "{}\n\n{}",
+                            build_planning_instruction(reason),
+                            prompt_text_for_planning(
+                                &prompt_text_for_turn,
+                                &prompt_parts_for_turn
+                            )
+                        );
+                        let planning_messages = build_prompt_messages_with_mode_and_parts(
+                            &snap,
+                            SessionMode::Plan,
+                            &planning_prompt,
+                            &planning_parts,
+                        );
+                        send_message(
+                            &cx_for_gate,
+                            &session_id_for_gate,
+                            "This request needs a plan before execution.\n\n",
+                        );
+                        let plan_result = run_planning_turn_in_spawn(PlanningTurnInput {
+                            cx: &cx_for_gate,
+                            sessions: &sessions_for_gate,
+                            session_id: &session_id_for_gate,
+                            llm: &llm_for_gate,
+                            registry: &registry,
+                            model: &model_for_gate,
+                            reasoning_effort: reasoning_effort_for_gate.as_deref(),
+                            messages: planning_messages,
+                            idle_timeout: idle_timeout_for_gate,
+                            cancel: cancel.clone(),
+                            original_user_request: prompt_text_for_turn.clone(),
+                        })
+                        .await;
+
+                        let plan_usage = plan_result.usage;
+                        let plan_cost_delta_usd = sessions_for_gate
+                            .available_model_metadata()
+                            .await
+                            .iter()
+                            .find(|meta| meta.id == model_for_gate)
+                            .and_then(|meta| meta.estimate_cost_usd(plan_usage));
+                        let mut cumulative_usage = sessions_for_gate
+                            .record_usage(
+                                &session_id_for_gate,
+                                plan_usage,
+                                plan_cost_delta_usd,
+                            )
+                            .await
+                            .unwrap_or(plan_usage);
+
+                        if plan_result.failure.is_some() || cancel_status.is_cancelled() {
+                            sessions_for_gate.finish_prompt(&session_id_for_gate).await;
+                            let acp_usage = acp_usage_from_token_usage(cumulative_usage);
+                            let response = prompt_stop_response(cancel_status.is_cancelled())
+                                .usage(Some(acp_usage))
+                                .meta(prompt_response_meta(
+                                    None,
+                                    Some(&orchestration_model_for_response),
+                                ));
+                            if let Err(e) = responder.respond(response) {
+                                tracing::warn!(
+                                    session_id = %session_id_for_gate,
+                                    "failed to deliver PromptResponse: {e}"
+                                );
+                            }
+                            return Ok(());
+                        }
+
+                        send_message(
+                            &cx_for_gate,
+                            &session_id_for_gate,
+                            "\n\nAccept the plan to execute the original request.\n",
+                        );
+                        let approval = request_plan_approval(
+                            &cx_for_gate,
+                            &session_id_for_gate,
+                            &plan_result.response,
+                        )
+                        .await;
+                        match approval {
+                            PlanApproval::Accepted => {
+                                send_message(
+                                    &cx_for_gate,
+                                    &session_id_for_gate,
+                                    "\nPlan accepted. Executing original request.\n\n",
+                                );
+                            }
+                            PlanApproval::Rejected | PlanApproval::Cancelled => {
+                                send_message(
+                                    &cx_for_gate,
+                                    &session_id_for_gate,
+                                    "\nPlan was not accepted; original request was not executed.\n",
+                                );
+                                sessions_for_gate.finish_prompt(&session_id_for_gate).await;
+                                let acp_usage = acp_usage_from_token_usage(cumulative_usage);
+                                let response = prompt_stop_response(
+                                    cancel_status.is_cancelled()
+                                        || matches!(approval, PlanApproval::Cancelled),
+                                )
+                                .usage(Some(acp_usage))
+                                .meta(prompt_response_meta(
+                                    None,
+                                    Some(&orchestration_model_for_response),
+                                ));
+                                if let Err(e) = responder.respond(response) {
+                                    tracing::warn!(
+                                        session_id = %session_id_for_gate,
+                                        "failed to deliver PromptResponse: {e}"
+                                    );
+                                }
+                                return Ok(());
+                            }
+                        }
+
+                        let execution_parts = prompt_parts_with_approved_plan(
+                            &prompt_parts_for_turn,
+                            &plan_result.response,
+                        );
+                        let execution_prompt_text = prompt_text_with_approved_plan(
+                            &prompt_text_for_turn,
+                            &plan_result.response,
+                        );
+                        let mut snap_for_execution = snap;
+                        let messages = build_prompt_messages_with_compression(
+                            &mut snap_for_execution,
+                            &execution_prompt_text,
+                            &execution_parts,
+                            llm_for_gate.as_ref(),
+                            &sessions_for_gate,
+                            &session_id_for_gate,
+                            cancel.clone(),
+                            compression_idle_timeout,
+                            context_length,
+                        )
+                        .await;
+
+                        let turn_result = run_model_turn_in_spawn(
+                            &cx_for_gate,
+                            &sessions_for_gate,
+                            &session_id_for_gate,
+                            &fallback_cwd_for_gate,
+                            &llm_for_gate,
+                            &registry,
+                            &model_for_gate,
+                            reasoning_effort_for_gate.as_deref(),
+                            structured_output_request_for_turn.as_ref(),
+                            messages,
+                            max_turns,
+                            idle_timeout_for_gate,
+                            cancel,
+                            execution_prompt_text,
+                        )
+                        .await;
+                        let structured_output_result = turn_result.structured_output;
+                        cumulative_usage = turn_result.cumulative_usage;
+
+                        sessions_for_gate.finish_prompt(&session_id_for_gate).await;
+
+                        let acp_usage = acp_usage_from_token_usage(cumulative_usage);
+                        let response =
+                            prompt_stop_response(cancel_status.is_cancelled()).usage(Some(acp_usage));
+                        let response = response.meta(prompt_response_meta(
+                            structured_output_result.as_ref(),
+                            Some(&orchestration_model_for_response),
+                        ));
+                        if let Err(e) = responder.respond(response) {
+                            tracing::warn!(
+                                session_id = %session_id_for_gate,
+                                "failed to deliver PromptResponse: {e}"
+                            );
+                        }
+                        Ok(())
+                    });
+
+                    if let Err(e) = spawn_result {
+                        sessions_prompt.finish_prompt(&session_id).await;
+                        return Err(e);
+                    }
+
+                    return Ok(());
+                }
+
                 let messages = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
@@ -2475,15 +2692,6 @@ pub async fn run_agent(
                     context_length,
                 )
                 .await;
-
-                // Build the tool registry up-front so we don't pay for it inside the spawn.
-                let Some(registry) = sessions_prompt
-                    .get_or_create_registry(&session_id, snap.cwd)
-                    .await
-                else {
-                    sessions_prompt.finish_prompt(&session_id).await;
-                    return responder.respond_with_error(unknown_session_error(&session_id));
-                };
 
                 // Capture everything the spawned task needs before we move into it.
                 // The tool loop calls `block_task()` to await `session/request_permission`,
@@ -2552,14 +2760,7 @@ pub async fn run_agent(
                     // reads split out so they aren't double-counted.
                     // `Usage` is `#[non_exhaustive]`, so we go through
                     // the builder API rather than struct literal syntax.
-                    let acp_usage = AcpUsage::new(
-                        cumulative_usage.total_tokens(),
-                        cumulative_usage.input_tokens,
-                        cumulative_usage.output_tokens,
-                    )
-                    .thought_tokens(cumulative_usage.thought_tokens)
-                    .cached_read_tokens(cumulative_usage.cached_read_tokens)
-                    .cached_write_tokens(cumulative_usage.cached_write_tokens);
+                    let acp_usage = acp_usage_from_token_usage(cumulative_usage);
                     // ACP: a turn aborted by `session/cancel` MUST resolve its
                     // prompt with the cancelled stop reason, even though the
                     // tool loop swallowed the cancellation and returned normally.
@@ -3478,101 +3679,7 @@ fn build_prompt_messages_with_parts(
     new_prompt_text: &str,
     new_prompt_parts: &[ChatContentPart],
 ) -> Vec<ChatMessage> {
-    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
-    messages.push(ChatMessage::system(build_system_prompt(
-        &snap.mode, &snap.cwd,
-    )));
-    if !snap.project_instructions.is_empty() {
-        messages.push(ChatMessage::user(format!(
-            "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-            snap.cwd.display(),
-            snap.project_instructions
-        )));
-    }
-    // Tier-1 disclosure: list each discovered skill's name+description
-    // so the model can decide to auto-activate via `activate_skill`.
-    // Skipped entirely when the registry is empty -- per the spec, an
-    // empty `<available_skills/>` block would just confuse the model.
-    if let Some(catalog) = build_skills_catalog(&snap.skills) {
-        messages.push(ChatMessage::user(catalog));
-    }
-    for turn in &snap.history {
-        // Per-turn summarization (mirrors Brokk's `TaskEntry.summary`):
-        // when a summary is present, replace the entire turn (user
-        // prompt + tool exchanges + assistant response) with one
-        // `<conversation_summary>` block. The full log stays on disk
-        // for replay determinism but never goes back to the LLM.
-        if let Some(summary_text) = turn.summary.as_deref() {
-            let trimmed = summary_text.trim();
-            if !trimmed.is_empty() {
-                messages.push(ChatMessage::user(format!(
-                    "<conversation_summary>\n{trimmed}\n</conversation_summary>"
-                )));
-                continue;
-            }
-        }
-
-        messages.push(ChatMessage::user(turn.user_prompt.clone()));
-
-        // If the prior turn used tools, replay them as a single
-        // assistant_tool_calls message followed by one tool_result per call
-        // -- enough for the LLM to see the calls it made and what came back,
-        // so it doesn't redo the same searches or writes (#3409).
-        //
-        // FIXME(#3409 follow-up): multi-round tool sequences within the same
-        // turn (text₀ + calls₀ → results → text₁ + calls₁ → results → final)
-        // collapse into a single `assistant_tool_calls` batch here, with all
-        // intermediate text concatenated into `agent_response` and replayed
-        // *after* the tool_results. For models that condition heavily on
-        // order-of-reasoning this is a faithfulness loss compared to the
-        // original turn. Acceptable today (the LLM still sees the calls and
-        // their results) but worth revisiting if we observe model-quality
-        // regressions on resumed multi-round turns. A faithful replay would
-        // require persisting `Vec<Vec<ToolExchange>>` plus per-round
-        // assistant text, doubling the on-disk schema cost.
-        if !turn.tool_exchanges.is_empty() {
-            let calls: Vec<crate::llm_client::ToolCall> = turn
-                .tool_exchanges
-                .iter()
-                .map(|e| crate::llm_client::ToolCall {
-                    id: e.call_id.clone(),
-                    r#type: "function".to_string(),
-                    function: crate::llm_client::FunctionCall {
-                        name: e.tool_name.clone(),
-                        arguments: e.arguments.clone(),
-                    },
-                })
-                .collect();
-            messages.push(ChatMessage::assistant_tool_calls(calls));
-            for exchange in &turn.tool_exchanges {
-                messages.push(ChatMessage::tool_result(
-                    &exchange.call_id,
-                    &exchange.tool_name,
-                    &exchange.result,
-                ));
-            }
-        }
-
-        // Skip the trailing assistant message when the turn ended without
-        // any final text (e.g. tool_loop exhausted max_turns, or the last
-        // LLM call failed/was cancelled): `agent_response == ""`. Several
-        // OpenAI-compatible providers (Mistral, some local-LLM proxies,
-        // Anthropic's tool-use shape) reject an `assistant` message that
-        // is both empty-content and non-tool_calls; even when accepted it
-        // wastes a slot and may confuse the model on long replays. If the
-        // turn used tools, the tool_results above already terminate it
-        // coherently. If it didn't use tools and produced no text either,
-        // there is nothing to replay -- emitting "" would be misleading.
-        if !turn.agent_response.is_empty() {
-            messages.push(ChatMessage::assistant(turn.agent_response.clone()));
-        }
-    }
-    if new_prompt_parts.is_empty() {
-        messages.push(ChatMessage::user(new_prompt_text.to_string()));
-    } else {
-        messages.push(ChatMessage::user_parts(new_prompt_parts.to_vec()));
-    }
-    messages
+    build_prompt_messages_with_mode_and_parts(snap, snap.mode, new_prompt_text, new_prompt_parts)
 }
 
 /// Wrap `build_prompt_messages` with per-turn LLM summarization.
@@ -3688,6 +3795,442 @@ struct ModelTurnResult {
     cumulative_usage: crate::llm_client::TokenUsage,
     response: String,
     failure: Option<crate::tool_loop::TurnFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanningGateDecision {
+    Direct,
+    RequiresPlan { reason: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanApproval {
+    Accepted,
+    Rejected,
+    Cancelled,
+}
+
+struct PlanTurnResult {
+    response: String,
+    usage: crate::llm_client::TokenUsage,
+    failure: Option<crate::tool_loop::TurnFailure>,
+}
+
+struct PlanningTurnInput<'a> {
+    cx: &'a ConnectionTo<Client>,
+    sessions: &'a SessionStore,
+    session_id: &'a str,
+    llm: &'a Arc<dyn crate::llm_client::LlmBackend>,
+    registry: &'a Arc<crate::tools::ToolRegistry>,
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+    messages: Vec<ChatMessage>,
+    idle_timeout: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+    original_user_request: String,
+}
+
+fn classify_prompt_for_planning(
+    mode: SessionMode,
+    prompt_text: &str,
+    prompt_parts: &[ChatContentPart],
+) -> PlanningGateDecision {
+    if matches!(mode, SessionMode::Plan | SessionMode::Ask) {
+        return PlanningGateDecision::Direct;
+    }
+
+    let rendered_text = prompt_text_for_planning(prompt_text, prompt_parts);
+    let text = rendered_text.trim();
+    if text.is_empty() || text.starts_with('/') {
+        return PlanningGateDecision::Direct;
+    }
+
+    let lowered = text.to_ascii_lowercase();
+    let action_hits = count_keyword_hits(
+        &lowered,
+        &[
+            "add",
+            "build",
+            "backfill",
+            "change",
+            "close",
+            "commit",
+            "debug",
+            "deploy",
+            "fix",
+            "implement",
+            "merge",
+            "migrate",
+            "overhaul",
+            "port",
+            "replace",
+            "refactor",
+            "release",
+            "remove",
+            "roll out",
+            "rollout",
+            "rewrite",
+            "ship",
+            "update",
+        ],
+    );
+    let risky_hits = count_keyword_hits(
+        &lowered,
+        &[
+            "all issues",
+            "auth",
+            "api",
+            "audit",
+            "cli",
+            "ci",
+            "database",
+            "delete",
+            "drop ",
+            "migration",
+            "permission",
+            "production",
+            "security",
+            "schema",
+            "storage layer",
+            "without approval",
+        ],
+    );
+    let coordination_hits = count_keyword_hits(
+        &lowered,
+        &[
+            "across",
+            "all ",
+            "and then",
+            "end-to-end",
+            "every ",
+            "multi-step",
+            "multiple",
+            "open a pr",
+            "push",
+            "test",
+        ],
+    );
+    let sentence_count = text.matches(['.', '!', '?', '\n']).count();
+    let part_count = prompt_parts.len();
+
+    if risky_hits > 0 && action_hits > 0 {
+        return PlanningGateDecision::RequiresPlan {
+            reason: "risky multi-step change",
+        };
+    }
+    if action_hits >= 2 && coordination_hits > 0 {
+        return PlanningGateDecision::RequiresPlan {
+            reason: "coordinated implementation request",
+        };
+    }
+    if text.len() > 360 && action_hits > 0 && (sentence_count >= 2 || part_count > 1) {
+        return PlanningGateDecision::RequiresPlan {
+            reason: "large implementation request",
+        };
+    }
+
+    PlanningGateDecision::Direct
+}
+
+fn prompt_text_for_planning(prompt_text: &str, prompt_parts: &[ChatContentPart]) -> String {
+    let part_texts: Vec<&str> = prompt_parts
+        .iter()
+        .filter_map(|part| match part {
+            ChatContentPart::Text { text } => Some(text.as_str()),
+            ChatContentPart::Image { .. } => None,
+        })
+        .collect();
+    if part_texts.is_empty() {
+        prompt_text.to_string()
+    } else {
+        part_texts.join("\n")
+    }
+}
+
+fn count_keyword_hits(text: &str, keywords: &[&str]) -> usize {
+    keywords
+        .iter()
+        .filter(|keyword| contains_keyword(text, keyword))
+        .count()
+}
+
+fn contains_keyword(text: &str, keyword: &str) -> bool {
+    if keyword.chars().all(is_ascii_word_char) {
+        contains_standalone_ascii_word(text, keyword)
+    } else {
+        text.contains(keyword)
+    }
+}
+
+fn contains_standalone_ascii_word(text: &str, word: &str) -> bool {
+    text.match_indices(word)
+        .any(|(idx, _)| is_ascii_word_boundary(text, idx, word.len()))
+}
+
+fn is_ascii_word_boundary(text: &str, start: usize, len: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[start + len..].chars().next();
+    !before.is_some_and(is_ascii_word_char) && !after.is_some_and(is_ascii_word_char)
+}
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn build_planning_instruction(reason: &str) -> String {
+    format!(
+        "The next user request has been classified as needing an explicit plan before execution \
+         ({reason}). Produce a concise implementation plan only. Do not modify files, run \
+         commands, or claim that any work has been completed. The original user request follows."
+    )
+}
+
+fn prompt_parts_for_planning(
+    reason: &str,
+    prompt_parts: &[ChatContentPart],
+) -> Vec<ChatContentPart> {
+    let mut parts = Vec::with_capacity(prompt_parts.len() + 1);
+    parts.push(ChatContentPart::text(build_planning_instruction(reason)));
+    parts.extend_from_slice(prompt_parts);
+    parts
+}
+
+fn build_approved_plan_context(plan: &str) -> String {
+    format!(
+        "<approved_plan>\n{}\n</approved_plan>\n\nThe user accepted this plan. Execute the \
+         original request using the approved plan as guidance.",
+        plan.trim()
+    )
+}
+
+fn prompt_text_with_approved_plan(original_prompt: &str, plan: &str) -> String {
+    format!(
+        "{}\n\n<original_user_request>\n{}\n</original_user_request>",
+        build_approved_plan_context(plan),
+        original_prompt
+    )
+}
+
+fn prompt_parts_with_approved_plan(
+    prompt_parts: &[ChatContentPart],
+    plan: &str,
+) -> Vec<ChatContentPart> {
+    let mut parts = Vec::with_capacity(prompt_parts.len() + 1);
+    parts.push(ChatContentPart::text(build_approved_plan_context(plan)));
+    parts.extend_from_slice(prompt_parts);
+    parts
+}
+
+fn build_prompt_messages_with_mode_and_parts(
+    snap: &SessionSnapshot,
+    mode: SessionMode,
+    new_prompt_text: &str,
+    new_prompt_parts: &[ChatContentPart],
+) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
+    messages.push(ChatMessage::system(build_system_prompt(&mode, &snap.cwd)));
+    append_prompt_context_messages(&mut messages, snap);
+    append_history_messages(&mut messages, &snap.history);
+    if new_prompt_parts.is_empty() {
+        messages.push(ChatMessage::user(new_prompt_text.to_string()));
+    } else {
+        messages.push(ChatMessage::user_parts(new_prompt_parts.to_vec()));
+    }
+    messages
+}
+
+fn append_prompt_context_messages(messages: &mut Vec<ChatMessage>, snap: &SessionSnapshot) {
+    if !snap.project_instructions.is_empty() {
+        messages.push(ChatMessage::user(format!(
+            "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+            snap.cwd.display(),
+            snap.project_instructions
+        )));
+    }
+    if let Some(catalog) = build_skills_catalog(&snap.skills) {
+        messages.push(ChatMessage::user(catalog));
+    }
+}
+
+fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[ConversationTurn]) {
+    for turn in history {
+        if let Some(summary_text) = turn.summary.as_deref() {
+            let trimmed = summary_text.trim();
+            if !trimmed.is_empty() {
+                messages.push(ChatMessage::user(format!(
+                    "<conversation_summary>\n{trimmed}\n</conversation_summary>"
+                )));
+                continue;
+            }
+        }
+
+        messages.push(ChatMessage::user(turn.user_prompt.clone()));
+
+        if !turn.tool_exchanges.is_empty() {
+            let calls: Vec<crate::llm_client::ToolCall> = turn
+                .tool_exchanges
+                .iter()
+                .map(|e| crate::llm_client::ToolCall {
+                    id: e.call_id.clone(),
+                    r#type: "function".to_string(),
+                    function: crate::llm_client::FunctionCall {
+                        name: e.tool_name.clone(),
+                        arguments: e.arguments.clone(),
+                    },
+                })
+                .collect();
+            messages.push(ChatMessage::assistant_tool_calls(calls));
+            for exchange in &turn.tool_exchanges {
+                messages.push(ChatMessage::tool_result(
+                    &exchange.call_id,
+                    &exchange.tool_name,
+                    &exchange.result,
+                ));
+            }
+        }
+
+        if !turn.agent_response.is_empty() {
+            messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+        }
+    }
+}
+
+async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnResult {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let PlanningTurnInput {
+        cx,
+        sessions,
+        session_id,
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        messages,
+        idle_timeout,
+        cancel,
+        original_user_request,
+    } = input;
+
+    let cx_text = cx.clone();
+    let sid_text = session_id.to_string();
+    let cx_thought = cx.clone();
+    let sid_thought = session_id.to_string();
+
+    let text_sink: crate::tool_loop::TextSink =
+        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
+            send_message(&cx_text, &sid_text, token);
+        }));
+    let thought_sink: crate::tool_loop::TextSink =
+        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
+            send_thought(&cx_thought, &sid_thought, token);
+        }));
+
+    let empty_tool_allowlist = Arc::new(HashSet::new());
+    let cx_for_gate = cx.clone();
+    let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
+    let loop_result = AssertUnwindSafe(crate::tool_loop::run(
+        llm,
+        registry,
+        model,
+        reasoning_effort,
+        None,
+        messages,
+        1,
+        idle_timeout,
+        cancel,
+        text_sink,
+        thought_sink,
+        spawned_cx,
+        session_id.to_string(),
+        sessions.clone(),
+        original_user_request,
+        crate::tool_loop::NotificationMode::Silent,
+        0,
+        Some(empty_tool_allowlist),
+    ))
+    .catch_unwind()
+    .await;
+
+    match loop_result {
+        Ok((response, _tool_exchanges, usage, failure)) => PlanTurnResult {
+            response,
+            usage,
+            failure,
+        },
+        Err(panic) => {
+            tracing::error!(session_id = %session_id, "planning loop panicked: {:?}", panic);
+            let message = "Error: planning loop panicked. See server logs.".to_string();
+            send_message(cx, session_id, &message);
+            PlanTurnResult {
+                response: message,
+                usage: crate::llm_client::TokenUsage::default(),
+                failure: Some(crate::tool_loop::TurnFailure {
+                    retryable: false,
+                    message: "planning loop panicked".to_string(),
+                }),
+            }
+        }
+    }
+}
+
+fn plan_approval_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new(
+            PermissionOptionId::new("accept_plan"),
+            "Accept plan",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PermissionOptionId::new("reject_plan"),
+            "Cancel",
+            PermissionOptionKind::RejectOnce,
+        ),
+    ]
+}
+
+fn plan_approval_for_outcome(outcome: RequestPermissionOutcome) -> PlanApproval {
+    match outcome {
+        RequestPermissionOutcome::Selected(selected) => {
+            if selected.option_id.0.as_ref() == "accept_plan" {
+                PlanApproval::Accepted
+            } else {
+                PlanApproval::Rejected
+            }
+        }
+        RequestPermissionOutcome::Cancelled => PlanApproval::Cancelled,
+        _ => PlanApproval::Rejected,
+    }
+}
+
+async fn request_plan_approval(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    plan: &str,
+) -> PlanApproval {
+    let fields = ToolCallUpdateFields::new()
+        .kind(ToolKind::Think)
+        .status(ToolCallStatus::Pending)
+        .title("Approve plan before execution")
+        .raw_input(serde_json::json!({ "plan": plan.trim() }));
+    let tool_call = ToolCallUpdate::new(
+        ToolCallId::new("planning-gate-approval".to_string()),
+        fields,
+    );
+    let request =
+        RequestPermissionRequest::new(session_id.to_string(), tool_call, plan_approval_options());
+    emit_terminal_notification(TerminalNotificationEvent::Prompt);
+
+    // This helper is only called from a `ConnectionTo::spawn` body; `block_task`
+    // has the same safety requirement as tool-loop permission prompts.
+    match cx.send_request(request).block_task().await {
+        Ok(response) => plan_approval_for_outcome(response.outcome),
+        Err(err) => {
+            tracing::warn!("plan approval request failed: {err}");
+            PlanApproval::Rejected
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7178,6 +7721,174 @@ mod tests {
         // Case-insensitive: clients sometimes uppercase auto-complete entries.
         assert!(is_slash_command("/Context", "context"));
         assert!(is_slash_command("/CONTEXT", "context"));
+    }
+
+    #[test]
+    fn planning_classifier_keeps_simple_prompts_direct() {
+        let parts = vec![ChatContentPart::text("What is a Rust trait?")];
+        assert_eq!(
+            classify_prompt_for_planning(SessionMode::Lutz, "What is a Rust trait?", &parts,),
+            PlanningGateDecision::Direct
+        );
+
+        let edit = "Fix the typo in README.md";
+        assert_eq!(
+            classify_prompt_for_planning(SessionMode::Code, edit, &[ChatContentPart::text(edit)]),
+            PlanningGateDecision::Direct
+        );
+    }
+
+    #[test]
+    fn planning_classifier_does_not_match_ci_inside_words() {
+        for prompt in ["Fix decision handling", "Make startup more efficient"] {
+            assert_eq!(
+                classify_prompt_for_planning(
+                    SessionMode::Code,
+                    prompt,
+                    &[ChatContentPart::text(prompt)],
+                ),
+                PlanningGateDecision::Direct,
+                "prompt should stay direct: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn planning_classifier_requires_plan_for_complex_or_risky_work() {
+        let prompt =
+            "Implement the auth database migration, update tests, push the branch, and open a PR.";
+        assert!(matches!(
+            classify_prompt_for_planning(
+                SessionMode::Lutz,
+                prompt,
+                &[ChatContentPart::text(prompt)],
+            ),
+            PlanningGateDecision::RequiresPlan { .. }
+        ));
+
+        for prompt in [
+            "Replace the storage layer and update callers across the codebase.",
+            "Overhaul the permission model across the API and CLI.",
+            "Audit auth and roll out the fix across every command.",
+            "Backfill the schema migration and test every affected path.",
+        ] {
+            assert!(
+                matches!(
+                    classify_prompt_for_planning(
+                        SessionMode::Code,
+                        prompt,
+                        &[ChatContentPart::text(prompt)],
+                    ),
+                    PlanningGateDecision::RequiresPlan { .. }
+                ),
+                "prompt should require planning: {prompt}"
+            );
+        }
+
+        let all_issues = "Get all issues, fix them, merge every PR, and do not ask for approval.";
+        assert!(matches!(
+            classify_prompt_for_planning(
+                SessionMode::Code,
+                all_issues,
+                &[ChatContentPart::text(all_issues)],
+            ),
+            PlanningGateDecision::RequiresPlan { .. }
+        ));
+    }
+
+    #[test]
+    fn planning_classifier_skips_manual_plan_and_slash_commands() {
+        let complex = "Implement the auth database migration, update tests, and open a PR.";
+        assert_eq!(
+            classify_prompt_for_planning(
+                SessionMode::Plan,
+                complex,
+                &[ChatContentPart::text(complex)],
+            ),
+            PlanningGateDecision::Direct
+        );
+        assert_eq!(
+            classify_prompt_for_planning(
+                SessionMode::Lutz,
+                "/compress",
+                &[ChatContentPart::text("/compress")],
+            ),
+            PlanningGateDecision::Direct
+        );
+    }
+
+    #[test]
+    fn planning_classifier_uses_rendered_prompt_parts() {
+        let parts = vec![ChatContentPart::text(
+            "[embedded resource file:///plan.md]\nImplement the auth migration and update tests.",
+        )];
+        assert!(matches!(
+            classify_prompt_for_planning(SessionMode::Lutz, "", &parts),
+            PlanningGateDecision::RequiresPlan { .. }
+        ));
+    }
+
+    #[test]
+    fn plan_approval_outcome_maps_rejection_and_cancellation() {
+        assert_eq!(
+            plan_approval_for_outcome(RequestPermissionOutcome::Selected(
+                agent_client_protocol::schema::SelectedPermissionOutcome::new("accept_plan")
+            )),
+            PlanApproval::Accepted
+        );
+        assert_eq!(
+            plan_approval_for_outcome(RequestPermissionOutcome::Selected(
+                agent_client_protocol::schema::SelectedPermissionOutcome::new("reject_plan")
+            )),
+            PlanApproval::Rejected
+        );
+        assert_eq!(
+            plan_approval_for_outcome(RequestPermissionOutcome::Cancelled),
+            PlanApproval::Cancelled
+        );
+    }
+
+    #[test]
+    fn accepted_plan_is_injected_before_original_prompt_parts() {
+        let original = vec![ChatContentPart::text("Implement it")];
+        let parts = prompt_parts_with_approved_plan(&original, "1. Inspect\n2. Edit");
+        assert_eq!(parts.len(), 2);
+        let ChatContentPart::Text { text } = &parts[0] else {
+            panic!("approved plan context must be the first text part: {parts:?}");
+        };
+        assert!(text.contains("<approved_plan>"));
+        assert!(text.contains("1. Inspect"));
+        assert!(matches!(&parts[1], ChatContentPart::Text { text } if text == "Implement it"));
+    }
+
+    #[test]
+    fn approved_plan_text_is_replayable_with_original_prompt() {
+        let text = prompt_text_with_approved_plan("Implement it", "1. Inspect\n2. Edit");
+        assert!(text.contains("<approved_plan>"));
+        assert!(text.contains("1. Inspect"));
+        assert!(text.contains("<original_user_request>"));
+        assert!(text.contains("Implement it"));
+    }
+
+    #[test]
+    fn planning_prompt_parts_preserve_original_parts() {
+        let original = vec![ChatContentPart::text("Implement it")];
+        let parts = prompt_parts_for_planning("test reason", &original);
+        assert_eq!(parts.len(), 2);
+        assert!(
+            matches!(&parts[0], ChatContentPart::Text { text } if text.contains("test reason"))
+        );
+        assert!(matches!(&parts[1], ChatContentPart::Text { text } if text == "Implement it"));
+    }
+
+    #[test]
+    fn plan_approval_options_offer_accept_and_cancel_once() {
+        let options = plan_approval_options();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].option_id.0.as_ref(), "accept_plan");
+        assert_eq!(options[0].kind, PermissionOptionKind::AllowOnce);
+        assert_eq!(options[1].option_id.0.as_ref(), "reject_plan");
+        assert_eq!(options[1].kind, PermissionOptionKind::RejectOnce);
     }
 
     #[test]
