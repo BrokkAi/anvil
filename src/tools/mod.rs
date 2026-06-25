@@ -8,6 +8,8 @@ use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::SkillRegistry;
 use agent_client_protocol::schema::ToolKind;
 use sandbox::SandboxPolicy;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -25,6 +27,174 @@ pub enum ToolStatus {
     Success,
     RequestError,
     InternalError,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadFileArgs {
+    file_path: String,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    offset: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteFileArgs {
+    file_path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditFileArgs {
+    file_path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListDirectoryArgs {
+    path: String,
+}
+
+fn default_grep_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+struct GrepSearchArgs {
+    pattern: String,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    glob: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    path: Option<String>,
+    #[serde(default = "default_grep_limit")]
+    limit: usize,
+}
+
+fn default_shell_timeout_ms() -> u64 {
+    60_000
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShellSandboxPermissionArg {
+    RequireEscalated,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunShellCommandArgs {
+    command: String,
+    #[serde(default = "default_shell_timeout_ms")]
+    timeout: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    directory: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        rename = "description"
+    )]
+    _description: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null",
+        rename = "sandbox_permissions"
+    )]
+    _sandbox_permissions: Option<ShellSandboxPermissionArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivateSkillArgs {
+    name: String,
+}
+
+#[cfg(test)]
+trait BuiltinArgsContract {
+    const REQUIRED_FIELDS: &'static [&'static str];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for ReadFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
+        ("file_path", "string"),
+        ("offset", "integer"),
+        ("limit", "integer"),
+    ];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for WriteFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "content"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
+        &[("file_path", "string"), ("content", "string")];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for EditFileArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["file_path", "old_string", "new_string"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
+        ("file_path", "string"),
+        ("old_string", "string"),
+        ("new_string", "string"),
+        ("replace_all", "boolean"),
+    ];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for ListDirectoryArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["path"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[("path", "string")];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for GrepSearchArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["pattern"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
+        ("pattern", "string"),
+        ("glob", "string"),
+        ("path", "string"),
+        ("limit", "integer"),
+    ];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for RunShellCommandArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["command"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
+        ("command", "string"),
+        ("timeout", "integer"),
+        ("description", "string"),
+        ("directory", "string"),
+    ];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for ActivateSkillArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["name"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[("name", "string")];
+}
+
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+fn parse_builtin_args<T: DeserializeOwned>(
+    tool_name: &str,
+    args: serde_json::Value,
+) -> Result<T, ToolResult> {
+    let json = args.to_string();
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|err| ToolResult {
+        status: ToolStatus::RequestError,
+        output: format!("Invalid arguments for `{tool_name}`: {err}"),
+    })
 }
 
 fn cancelled_tool_result(name: &str) -> ToolResult {
@@ -528,11 +698,11 @@ impl ToolRegistry {
                             "description": "Path to the file to read. Relative paths are resolved against the working directory; absolute paths must remain inside it."
                         },
                         "offset": {
-                            "type": "number",
+                            "type": "integer",
                             "description": "Optional 0-based line number to start reading from."
                         },
                         "limit": {
-                            "type": "number",
+                            "type": "integer",
                             "description": "Optional maximum number of lines to read."
                         }
                     },
@@ -632,7 +802,7 @@ impl ToolRegistry {
                             "description": "Optional file or directory to search in. Relative paths are resolved against the working directory; absolute paths must remain inside it. Defaults to the working directory."
                         },
                         "limit": {
-                            "type": "number",
+                            "type": "integer",
                             "description": "Optional limit on matching lines. Defaults to 50."
                         }
                     },
@@ -651,7 +821,7 @@ impl ToolRegistry {
                     "description": "The shell command to execute (passed to sh -c)."
                 },
                 "timeout": {
-                    "type": "number",
+                    "type": "integer",
                     "description": timeout_description
                 },
                 "description": {
@@ -936,103 +1106,92 @@ impl ToolRegistry {
     ) -> ToolResult {
         match name {
             "read_file" => {
-                let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-                let offset = args
-                    .get("offset")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
+                let args: ReadFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                let path = path.to_string();
+                let path = args.file_path;
+                let offset = args.offset;
+                let limit = args.limit;
                 run_blocking_filesystem_tool(move || {
                     filesystem::read_file_in_roots(&cwd, &additional_roots, &path, offset, limit)
                 })
                 .await
             }
             "write_file" => {
-                let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let args: WriteFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                let path = args.file_path;
+                let content = args.content;
                 if content.len() > filesystem::WRITE_MAX_BYTES {
-                    return filesystem::oversized_write_payload_result(path, content.len());
+                    return filesystem::oversized_write_payload_result(&path, content.len());
                 }
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                let path = path.to_string();
-                let content = content.to_string();
                 run_blocking_filesystem_tool(move || {
                     filesystem::write_file_in_roots(&cwd, &additional_roots, &path, &content)
                 })
                 .await
             }
             "edit" => {
-                let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-                let old = args
-                    .get("old_string")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let new = args
-                    .get("new_string")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let replace_all = args
-                    .get("replace_all")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let args: EditFileArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                let path = path.to_string();
-                let old = old.to_string();
-                let new = new.to_string();
                 run_blocking_filesystem_tool(move || {
                     filesystem::edit_file_in_roots(
                         &cwd,
                         &additional_roots,
-                        &path,
-                        &old,
-                        &new,
-                        replace_all,
+                        &args.file_path,
+                        &args.old_string,
+                        &args.new_string,
+                        args.replace_all,
                     )
                 })
                 .await
             }
             "list_directory" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let args: ListDirectoryArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                let path = path.to_string();
+                let path = args.path;
                 run_blocking_filesystem_tool(move || {
                     filesystem::list_directory_in_roots(&cwd, &additional_roots, &path)
                 })
                 .await
             }
             "grep_search" => {
-                let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                let glob = args.get("glob").and_then(|v| v.as_str());
-                let max_results = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-                let path = args.get("path").and_then(|v| v.as_str());
+                let args: GrepSearchArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
                 filesystem::search_file_contents_with_sandbox_mode(
                     &self.cwd,
                     &self.additional_roots,
-                    pattern,
-                    glob,
-                    path,
-                    max_results,
+                    &args.pattern,
+                    args.glob.as_deref(),
+                    args.path.as_deref(),
+                    args.limit,
                     sandbox_mode,
                 )
             }
             "run_shell_command" => {
-                let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                let timeout_seconds = args
-                    .get("timeout")
-                    .and_then(|v| v.as_u64())
-                    .map(|ms| ms.saturating_add(999) / 1000)
-                    .unwrap_or(60)
-                    .max(1);
-                let command_cwd = match args.get("directory").and_then(|v| v.as_str()) {
+                let args: RunShellCommandArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                let timeout_seconds = args.timeout.saturating_add(999) / 1000;
+                let timeout_seconds = timeout_seconds.max(1);
+                let command_cwd = match args.directory.as_deref() {
                     Some(directory) if !directory.trim().is_empty() => {
                         match safe_resolve_in_roots(&self.cwd, &self.additional_roots, directory) {
                             Ok(path) if path.is_dir() => path,
@@ -1054,7 +1213,7 @@ impl ToolRegistry {
                 };
                 shell::run_shell_command_cancellable(
                     &command_cwd,
-                    command,
+                    &args.command,
                     timeout_seconds,
                     policy,
                     outside_sandbox_once,
@@ -1076,15 +1235,11 @@ impl ToolRegistry {
     /// case as a request error rather than an internal error so the
     /// model gets a clear correction.
     async fn execute_activate_skill(&self, args: serde_json::Value) -> ToolResult {
-        let name = match args.get("name").and_then(|v| v.as_str()) {
-            Some(n) if !n.is_empty() => n.to_string(),
-            _ => {
-                return ToolResult {
-                    status: ToolStatus::RequestError,
-                    output: "activate_skill requires a non-empty `name` argument.".to_string(),
-                };
-            }
+        let args: ActivateSkillArgs = match parse_builtin_args("activate_skill", args) {
+            Ok(args) => args,
+            Err(result) => return result,
         };
+        let name = args.name;
         let skills = self.skills.read().await.clone();
         let Some(meta) = skills.get(&name) else {
             let available: Vec<&str> = skills.iter_sorted().map(|m| m.name.as_str()).collect();
@@ -1740,6 +1895,177 @@ mod tests {
         }
     }
 
+    fn schema_required_fields(defs: &[ToolDefinition], name: &str) -> Vec<String> {
+        defs.iter()
+            .find(|def| def.function.name == name)
+            .unwrap_or_else(|| panic!("{name} should be advertised"))
+            .function
+            .parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{name} should declare required fields"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("required field names are strings")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_schema_required_matches<T: BuiltinArgsContract>(defs: &[ToolDefinition], name: &str) {
+        assert_eq!(
+            schema_required_fields(defs, name),
+            T::REQUIRED_FIELDS,
+            "{name} schema required fields drifted from typed args contract"
+        );
+    }
+
+    fn assert_schema_property_types_match<T: BuiltinArgsContract>(
+        defs: &[ToolDefinition],
+        name: &str,
+    ) {
+        let def = defs
+            .iter()
+            .find(|def| def.function.name == name)
+            .unwrap_or_else(|| panic!("{name} should be advertised"));
+        for (property, expected_type) in T::PROPERTY_TYPES {
+            let actual_type = def.function.parameters["properties"][*property]["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}.{property} should declare a JSON schema type"));
+            assert_eq!(
+                actual_type, *expected_type,
+                "{name}.{property} schema type drifted from typed args contract"
+            );
+        }
+    }
+
+    fn assert_builtin_schema_matches<T: BuiltinArgsContract>(defs: &[ToolDefinition], name: &str) {
+        assert_schema_required_matches::<T>(defs, name);
+        assert_schema_property_types_match::<T>(defs, name);
+    }
+
+    #[tokio::test]
+    async fn builtin_tool_schemas_match_typed_arg_contracts() {
+        let (_t, meta) = write_skill_fixture("hello", "body");
+        let registry = registry_with_skills(vec![meta]);
+        let defs = registry.tool_definitions().await;
+
+        assert_builtin_schema_matches::<ReadFileArgs>(&defs, "read_file");
+        assert_builtin_schema_matches::<WriteFileArgs>(&defs, "write_file");
+        assert_builtin_schema_matches::<EditFileArgs>(&defs, "edit");
+        assert_builtin_schema_matches::<ListDirectoryArgs>(&defs, "list_directory");
+        assert_builtin_schema_matches::<GrepSearchArgs>(&defs, "grep_search");
+        assert_builtin_schema_matches::<RunShellCommandArgs>(&defs, "run_shell_command");
+        assert_builtin_schema_matches::<ActivateSkillArgs>(&defs, "activate_skill");
+    }
+
+    async fn assert_invalid_builtin_args(
+        registry: &ToolRegistry,
+        name: &str,
+        args: serde_json::Value,
+        expected: &str,
+    ) {
+        let result = registry
+            .execute(name, args, SandboxPolicy::WorkspaceWrite)
+            .await;
+        assert!(
+            matches!(result.status, ToolStatus::RequestError),
+            "{name} should reject invalid args, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Invalid arguments"),
+            "{name} should identify argument validation, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(expected),
+            "{name} should mention {expected:?}, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_tools_reject_missing_or_wrong_typed_args_before_execution() {
+        let (_t, meta) = write_skill_fixture("hello", "body");
+        let registry = registry_with_skills(vec![meta]);
+
+        assert_invalid_builtin_args(&registry, "read_file", json!({}), "file_path").await;
+        assert_invalid_builtin_args(
+            &registry,
+            "read_file",
+            json!({ "file_path": "x", "offset": null }),
+            "offset",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "read_file",
+            json!({ "file_path": "x", "limit": 1.5 }),
+            "limit",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "write_file",
+            json!({ "file_path": "x", "content": 123 }),
+            "content",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "edit",
+            json!({
+                "file_path": "x",
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": "yes"
+            }),
+            "replace_all",
+        )
+        .await;
+        assert_invalid_builtin_args(&registry, "list_directory", json!({ "path": 7 }), "path")
+            .await;
+        assert_invalid_builtin_args(&registry, "grep_search", json!({}), "pattern").await;
+        assert_invalid_builtin_args(
+            &registry,
+            "grep_search",
+            json!({ "pattern": "x", "path": null }),
+            "path",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "run_shell_command",
+            json!({ "timeout": 1000 }),
+            "command",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "run_shell_command",
+            json!({ "command": "echo ok", "timeout": 1000.5 }),
+            "timeout",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "run_shell_command",
+            json!({ "command": "echo ok", "directory": null }),
+            "directory",
+        )
+        .await;
+        assert_invalid_builtin_args(
+            &registry,
+            "activate_skill",
+            json!({ "name": ["hello"] }),
+            "name",
+        )
+        .await;
+    }
+
     #[test]
     fn slopcop_bifrost_reporters_are_read_safe() {
         for name in SLOPCOP_BIFROST_READ_ONLY_TOOLS {
@@ -1786,6 +2112,15 @@ mod tests {
                 .pointer("/properties/sandbox_permissions")
                 .is_some(),
             "retry shell schema must expose sandbox escalation"
+        );
+        assert_eq!(
+            shell.function.parameters["properties"]["sandbox_permissions"]["type"],
+            "string"
+        );
+        assert_eq!(
+            shell.function.parameters["properties"]["sandbox_permissions"]["enum"],
+            json!(["require_escalated"]),
+            "retry shell schema enum must match ShellSandboxPermissionArg"
         );
     }
 
@@ -1972,6 +2307,22 @@ mod tests {
             .iter()
             .find(|d| d.function.name == "task")
             .expect("task tool should be advertised");
+
+        assert_eq!(
+            schema_required_fields(&defs, "task"),
+            vec![
+                "description".to_string(),
+                "prompt".to_string(),
+                "subagent_type".to_string()
+            ],
+            "task schema required fields must match TaskArgs"
+        );
+        for property in ["description", "prompt", "subagent_type"] {
+            assert_eq!(
+                task_def.function.parameters["properties"][property]["type"], "string",
+                "task.{property} schema type must match TaskArgs"
+            );
+        }
 
         // Enum must contain the discovered names.
         let enum_vals = task_def.function.parameters["properties"]["subagent_type"]["enum"]
