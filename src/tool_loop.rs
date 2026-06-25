@@ -2462,7 +2462,8 @@ async fn execute_step_tool_calls(
                     .await;
                     turn_usage.add(nested_usage);
                     exec
-                } else if tool_name == "semantic_search" && registry.is_bifrost_tool("semantic_search")
+                } else if tool_name == "semantic_search"
+                    && registry.is_bifrost_tool("semantic_search")
                 {
                     // Transparently rerank bifrost's raw three-list result with a
                     // disposable LLM turn so the model sees a clean, relevance-ordered

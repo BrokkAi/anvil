@@ -4,8 +4,8 @@
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
 //! setup screen and the last selected
-//! model/reasoning effort/sandbox mode so configured installs get a short hint
-//! instead of the full welcome on every new session. It also stores
+//! model/reasoning effort/permission/sandbox mode so configured installs get a
+//! short hint instead of the full welcome on every new session. It also stores
 //! user-configured MCP servers; when that field is absent, Anvil seeds the
 //! config with its preinstalled servers.
 
@@ -22,6 +22,8 @@ pub struct SetupState {
     pub last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_permission_mode: Option<crate::session::PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     /// Legacy install-wide approvals from older builds. Current builds use
@@ -109,6 +111,10 @@ pub fn mark_first_run_seen() -> Result<()> {
 
 pub fn remember_last_reasoning_effort(reasoning_effort: Option<String>) -> Result<()> {
     update(|state| state.last_reasoning_effort = reasoning_effort)
+}
+
+pub fn remember_last_permission_mode(mode: crate::session::PermissionMode) -> Result<()> {
+    update(|state| state.last_permission_mode = Some(mode))
 }
 
 pub fn remember_sandbox_mode(mode: Option<crate::sandbox_backend::SandboxMode>) -> Result<()> {
