@@ -29,8 +29,9 @@ use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedMod
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen, PermissionMode,
-    PromptStartError, REASONING_EFFORT_OFF_VALUE, Session, SessionManifest, SessionMode,
-    SessionSnapshot, SessionStore, UnsupportedMcpTransport, acp_mcp_servers_to_configs,
+    PromptStartError, REASONING_EFFORT_OFF_VALUE, RewindOutcome, Session, SessionManifest,
+    SessionMode, SessionSnapshot, SessionStore, UnsupportedMcpTransport,
+    acp_mcp_servers_to_configs,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -694,6 +695,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "compress",
             "Summarize uncompressed turns to free up context window",
         ),
+        AvailableCommand::new("rewind", "Remove the latest completed conversation turn"),
         AvailableCommand::new("mcp", "List and configure MCP servers"),
         AvailableCommand::new(
             "pr-create",
@@ -718,6 +720,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
         "setup",
         "permissions",
         "compress",
+        "rewind",
         "mcp",
         "pr-create",
         "usage",
@@ -2060,6 +2063,7 @@ pub async fn run_agent(
                 if snap.model.is_empty()
                     && !stream_setup_openrouter_refresh
                     && loop_spec.is_none()
+                    && !is_slash_command(&prompt_text, "rewind")
                 {
                     let catalog = sessions_prompt.available_model_metadata().await;
                     send_message(
@@ -2147,6 +2151,17 @@ pub async fn run_agent(
                     // `/compress` threads the cancel token into summarization;
                     // a mid-compress `session/cancel` resolves as cancelled.
                     return responder.respond(prompt_stop_response(cancel.is_cancelled()));
+                }
+
+                if is_slash_command(&prompt_text, "rewind") {
+                    let report = handle_rewind(&sessions_prompt, &session_id).await;
+                    send_message(&cx, &session_id, &report);
+                    if let Some(metadata) = sessions_prompt.session_metadata(&session_id).await {
+                        send_session_info_update(&cx, &session_id, None, metadata.updated_at);
+                    }
+                    send_session_usage_update(&cx, &sessions_prompt, &session_id, &snap.cwd).await;
+                    sessions_prompt.finish_prompt(&session_id).await;
+                    return responder.respond(prompt_end_turn_response());
                 }
 
                 if let Some(loop_spec) = loop_spec {
@@ -3130,6 +3145,11 @@ async fn run_loop_iteration(
         )
         .await;
         send_message(cx, session_id, &report);
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "rewind") {
+        send_message(cx, session_id, &handle_rewind(sessions, session_id).await);
         return Ok(LoopIterationOutcome::without_usage());
     }
 
@@ -5945,6 +5965,7 @@ fn loop_target_runs_without_model(target: &str) -> bool {
         || is_slash_command(target, "mcp")
         || is_slash_command(target, "pr-create")
         || is_slash_command(target, "usage")
+        || is_slash_command(target, "rewind")
 }
 
 fn parse_loop_command(prompt_text: &str) -> Result<LoopSpec, String> {
@@ -6579,6 +6600,42 @@ fn plan_compress(snap: &SessionSnapshot) -> CompressPlan {
             .enumerate()
             .filter_map(|(i, t)| t.summary.is_none().then_some(i))
             .collect(),
+    }
+}
+
+fn rewind_turn_label(turn: &ConversationTurn) -> String {
+    let source = if turn.user_prompt.trim().is_empty() {
+        turn.agent_response.trim()
+    } else {
+        turn.user_prompt.trim()
+    };
+    if source.is_empty() {
+        return "completed turn".to_string();
+    }
+
+    const MAX_LABEL_CHARS: usize = 80;
+    let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_LABEL_CHARS {
+        return collapsed;
+    }
+
+    let mut end = collapsed.len();
+    for (idx, _) in collapsed.char_indices().take(MAX_LABEL_CHARS) {
+        end = idx;
+    }
+    format!("{}...", collapsed[..end].trim_end())
+}
+
+async fn handle_rewind(sessions: &SessionStore, session_id: &str) -> String {
+    match sessions.rewind_last_turn(session_id).await {
+        Ok(RewindOutcome::Rewound(turn)) => {
+            format!("Rewound latest turn: `{}`", rewind_turn_label(&turn))
+        }
+        Ok(RewindOutcome::Empty) => {
+            "Nothing to rewind: this session has no completed turns.".to_string()
+        }
+        Ok(RewindOutcome::Unknown) => "Error: unknown session".to_string(),
+        Err(e) => format!("Error: failed to rewind latest turn: {e:#}"),
     }
 }
 
@@ -7318,6 +7375,40 @@ mod tests {
             builtin_command_names().contains("compress"),
             "builtin_command_names() missing compress"
         );
+    }
+
+    #[test]
+    fn builtin_commands_include_rewind() {
+        let cmds = builtin_commands();
+        assert!(
+            cmds.iter().any(|c| c.name == "rewind"),
+            "builtin_commands() missing rewind; got: {:?}",
+            cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            builtin_command_names().contains("rewind"),
+            "builtin_command_names() missing rewind"
+        );
+        assert!(is_slash_command("/rewind", "rewind"));
+        assert!(is_slash_command("/REWIND now", "rewind"));
+        assert!(!is_slash_command("/rewind-more", "rewind"));
+    }
+
+    #[test]
+    fn rewind_turn_label_prefers_user_prompt_and_truncates() {
+        let label = rewind_turn_label(&ConversationTurn {
+            user_prompt: "  hello    from\nrewind  ".into(),
+            agent_response: "agent".into(),
+            ..Default::default()
+        });
+        assert_eq!(label, "hello from rewind");
+
+        let long = rewind_turn_label(&ConversationTurn {
+            user_prompt: "x ".repeat(100),
+            ..Default::default()
+        });
+        assert!(long.ends_with("..."), "got: {long}");
+        assert!(long.len() <= 83, "label should stay compact: {long}");
     }
 
     #[test]
@@ -9007,6 +9098,7 @@ mod tests {
                 "setup",
                 "permissions",
                 "compress",
+                "rewind",
                 "mcp",
                 "pr-create",
                 "usage",
