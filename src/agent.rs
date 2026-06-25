@@ -3397,56 +3397,19 @@ async fn run_goal_loop(
                 consecutive_failures = 0;
                 let signal = detect_goal_signal(&outcome.response);
                 match decide_after_goal_turn(signal, turn, spec.max_turns, consecutive_blocked) {
-                    GoalStep::Stop(GoalStop::Completed) => {
+                    GoalStep::Stop(stop) => {
                         send_message(
                             cx,
                             session_id,
-                            &format!(
-                                "\n✅ Goal achieved in {turn} turn(s): the agent reported the \
-                                 objective verifiably complete.\n"
-                            ),
-                        );
-                        break;
-                    }
-                    GoalStep::Stop(GoalStop::Blocked(reason)) => {
-                        send_message(
-                            cx,
-                            session_id,
-                            &format!(
-                                "\n⛔ Goal blocked after {turn} turn(s) \
-                                 ({GOAL_BLOCKED_THRESHOLD} consecutive blocked reports). \
-                                 Stopping for user input.\nReason: {reason}\n"
-                            ),
-                        );
-                        break;
-                    }
-                    GoalStep::Stop(GoalStop::CeilingReached) => {
-                        send_message(
-                            cx,
-                            session_id,
-                            &format!(
-                                "\n🛑 Goal stopped: reached the opt-in {}-turn ceiling without a \
-                                 completion signal. Review the progress above and re-run `/goal` \
-                                 (raise or drop `--max-turns`) to keep going.\n",
-                                spec.max_turns.unwrap_or(turn)
-                            ),
+                            &render_goal_stop(&stop, turn, spec.max_turns),
                         );
                         break;
                     }
                     GoalStep::Continue {
                         consecutive_blocked: updated,
                     } => {
-                        // A non-zero counter means this turn reported a blocker
-                        // that has not yet reached the threshold.
-                        if updated > 0 {
-                            send_thought(
-                                cx,
-                                session_id,
-                                &format!(
-                                    "[goal: blocked report {updated}/{GOAL_BLOCKED_THRESHOLD}; \
-                                     retrying]\n"
-                                ),
-                            );
+                        if let Some(progress) = render_blocked_progress(updated) {
+                            send_thought(cx, session_id, &progress);
                         }
                         consecutive_blocked = updated;
                     }
@@ -6246,6 +6209,35 @@ fn decide_after_goal_turn(
     }
 }
 
+fn render_goal_stop(stop: &GoalStop, turn: u32, max_turns: Option<u32>) -> String {
+    match stop {
+        GoalStop::Completed => format!(
+            "\n✅ Goal achieved in {turn} turn(s): the agent reported the \
+             objective verifiably complete.\n"
+        ),
+        GoalStop::Blocked(reason) => format!(
+            "\n⛔ Goal blocked after {turn} turn(s) \
+             ({GOAL_BLOCKED_THRESHOLD} consecutive blocked reports). \
+             Stopping for user input.\nReason: {reason}\n"
+        ),
+        GoalStop::CeilingReached => format!(
+            "\n🛑 Goal stopped: reached the opt-in {}-turn ceiling without a \
+             completion signal. Review the progress above and re-run `/goal` \
+             (raise or drop `--max-turns`) to keep going.\n",
+            max_turns.unwrap_or(turn)
+        ),
+    }
+}
+
+fn render_blocked_progress(consecutive_blocked: u32) -> Option<String> {
+    (consecutive_blocked > 0).then(|| {
+        format!(
+            "[goal: blocked report {consecutive_blocked}/{GOAL_BLOCKED_THRESHOLD}; \
+             retrying]\n"
+        )
+    })
+}
+
 /// What the goal loop should do about a turn that ended in an LLM failure
 /// (vs. a real model response). Kept side-effect-free so the
 /// transient-vs-fatal branch is unit-testable, like [`decide_after_goal_turn`].
@@ -7617,6 +7609,31 @@ mod tests {
         assert_eq!(
             decide_after_goal_turn(GoalSignal::Blocked("y".into()), 25, Some(25), 0),
             GoalStep::Stop(GoalStop::CeilingReached)
+        );
+    }
+
+    #[test]
+    fn render_goal_stop_messages_are_stable() {
+        assert_eq!(
+            render_goal_stop(&GoalStop::Completed, 4, None),
+            "\n✅ Goal achieved in 4 turn(s): the agent reported the objective verifiably complete.\n"
+        );
+        assert_eq!(
+            render_goal_stop(&GoalStop::Blocked("needs credentials".into()), 7, None),
+            "\n⛔ Goal blocked after 7 turn(s) (3 consecutive blocked reports). Stopping for user input.\nReason: needs credentials\n"
+        );
+        assert_eq!(
+            render_goal_stop(&GoalStop::CeilingReached, 10, Some(10)),
+            "\n🛑 Goal stopped: reached the opt-in 10-turn ceiling without a completion signal. Review the progress above and re-run `/goal` (raise or drop `--max-turns`) to keep going.\n"
+        );
+    }
+
+    #[test]
+    fn render_blocked_progress_only_reports_nonzero_counts() {
+        assert_eq!(render_blocked_progress(0), None);
+        assert_eq!(
+            render_blocked_progress(2),
+            Some("[goal: blocked report 2/3; retrying]\n".to_string())
         );
     }
 
