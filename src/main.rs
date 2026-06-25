@@ -25,6 +25,7 @@ mod openrouter_credits;
 mod p2t;
 mod responses_api;
 mod sandbox_backend;
+mod semantic_rerank;
 mod session;
 mod setup_state;
 mod skills;
