@@ -622,6 +622,10 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("run_shell_command") {
+            let timeout_description = format!(
+                "Optional timeout in milliseconds. Rounded up to seconds and clamped to a {} second server maximum.",
+                shell::MAX_TIMEOUT_SECONDS
+            );
             let mut shell_properties = json!({
                 "command": {
                     "type": "string",
@@ -629,7 +633,7 @@ impl ToolRegistry {
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Optional timeout in milliseconds."
+                    "description": timeout_description
                 },
                 "description": {
                     "type": "string",
@@ -1718,8 +1722,46 @@ mod tests {
             result.output
         );
         assert!(
+            result.output.contains("terminated the child process tree"),
+            "cancelled shell command should mention child-tree termination; output={}",
+            result.output
+        );
+        assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "cancelled shell command waited too long"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_is_clamped_and_reported() {
+        let registry = registry_with_skills(vec![]);
+        let result = registry
+            .execute_with_sandbox_mode_cancellable(
+                "run_shell_command",
+                json!({ "command": "echo ok", "timeout": 601_000 }),
+                SandboxPolicy::None,
+                false,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result.status, ToolStatus::Success),
+            "clamped timeout command should still run; output={}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains(&format!("clamped to {}s", shell::MAX_TIMEOUT_SECONDS)),
+            "clamped timeout should be reported; output={}",
+            result.output
+        );
+        assert!(
+            result.output.contains("ok"),
+            "command output should be preserved; output={}",
+            result.output
         );
     }
 

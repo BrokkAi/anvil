@@ -114,7 +114,7 @@ subagent**. Therefore:
 |---|---|---|---|
 | `--max-turns` | 25 | per prompt | Hard ceiling on agent turns; subagents get `min(parent_max_turns, 25)`. |
 | `--llm-idle-timeout-secs` | 300 | per LLM stream | Aborts a stream with no *meaningful* progress (content/tool-call deltas; keepalives don't count). Per-session override via `/setup timeout`. |
-| Shell command timeout | per-command | per `run_shell_command` | Requested timeouts are honored (and capped); see the shell tool. |
+| Shell command timeout | 60s | per `run_shell_command` | Optional `timeout` values are milliseconds, rounded up to seconds, and capped at 600s. Tool output reports when a request is clamped. |
 
 There is **no separate per-tool-call wall-clock timeout** beyond the LLM idle
 timeout and the turn ceiling. A long-running non-shell tool is bounded only by
