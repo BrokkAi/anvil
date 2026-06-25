@@ -3105,6 +3105,11 @@ impl SessionStore {
     /// Permission mode is intentionally not persisted to the workspace manifest;
     /// the last explicit user choice is saved in trusted setup state for future
     /// sessions and cold reloads.
+    ///
+    /// `BypassPermissions` is deliberately excluded from persistence: the
+    /// fully-trusting mode requires a fresh opt-in each session, so selecting it
+    /// updates the live session only and never seeds future sessions or cold
+    /// reloads (nor does it overwrite a previously saved non-bypass preference).
     pub async fn set_permission_mode(&self, id: &str, permission_mode: PermissionMode) -> bool {
         let updated = {
             let mut sessions = self.sessions.write().await;
@@ -3116,7 +3121,10 @@ impl SessionStore {
                 None => false,
             }
         };
-        if updated && let Err(e) = self.remember_last_permission_mode(permission_mode) {
+        if updated
+            && !matches!(permission_mode, PermissionMode::BypassPermissions)
+            && let Err(e) = self.remember_last_permission_mode(permission_mode)
+        {
             tracing::warn!(
                 session_id = %id,
                 "failed to persist last permission preference: {e:#}"
@@ -4883,7 +4891,7 @@ mod tests {
     /// `SessionStore`, but the on-disk setup file is neither read nor written
     /// for those preferences.
     #[tokio::test(flavor = "current_thread")]
-    async fn transient_setup_keeps_model_and_sandbox_preferences_in_memory_only() {
+    async fn transient_setup_keeps_model_sandbox_and_permission_preferences_in_memory_only() {
         use crate::llm_client::ReasoningLevelPreset;
         use crate::sandbox_backend::SandboxMode;
 
@@ -5120,6 +5128,72 @@ mod tests {
                 .await
         );
         assert_eq!(crate::setup_state::read().last_permission_mode, None);
+    }
+
+    /// Selecting `BypassPermissions` updates the live session but must never be
+    /// persisted as the install-level preference: the fully-trusting mode
+    /// requires a fresh opt-in each session. Other modes still persist, and a
+    /// bypass selection must not clobber an existing non-bypass preference.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_permission_mode_does_not_persist_bypass() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first = store.create_session(cwd.path().to_path_buf()).await;
+        let id = first.id.clone();
+
+        // Bypass with no prior preference: the live session changes, but the
+        // trusted setup state stays empty.
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::BypassPermissions)
+                .await
+        );
+        assert_eq!(
+            store.permission_mode(&id).await,
+            Some(PermissionMode::BypassPermissions)
+        );
+        assert_eq!(crate::setup_state::read().last_permission_mode, None);
+
+        // A fresh session falls back to the safe default, never bypass.
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.permission_mode, PermissionMode::Auto);
+
+        // A non-bypass mode still persists ...
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::AcceptEdits)
+                .await
+        );
+        assert_eq!(
+            crate::setup_state::read().last_permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
+
+        // ... and a later bypass must not overwrite it.
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::BypassPermissions)
+                .await
+        );
+        assert_eq!(
+            crate::setup_state::read().last_permission_mode,
+            Some(PermissionMode::AcceptEdits),
+            "bypass must not overwrite the persisted preference"
+        );
+
+        // A cold reload of the bypass session falls back to the last persisted
+        // non-bypass mode, never bypass.
+        store.sessions.write().await.remove(&id);
+        store.registries.write().await.remove(&id);
+        let reloaded = store
+            .get_session(&id, cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
     }
 
     /// Remembered approvals persist per repo and survive new sessions in that repo.
