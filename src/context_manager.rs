@@ -673,6 +673,7 @@ mod tests {
                 tool_name: tool.to_string(),
                 arguments: args.to_string(),
                 result: result.to_string(),
+                ..ToolExchange::default()
             }],
             structured_output: None,
             summary: None,
@@ -735,6 +736,7 @@ mod tests {
                 tool_name: "grep_search".into(),
                 arguments: r#"{"pattern":"TODO"}"#.into(),
                 result: "src/lib.rs:42".into(),
+                ..ToolExchange::default()
             }),
             TurnReplayEvent::AssistantText {
                 text: "Done.".into(),
@@ -827,6 +829,7 @@ mod tests {
                 tool_name: "noop".into(),
                 arguments: format!(r#"{{"i":{i}}}"#),
                 result: format!("result {i}"),
+                ..ToolExchange::default()
             });
         }
         let chunks = split_turn_to_chunks(&t, 8_000);

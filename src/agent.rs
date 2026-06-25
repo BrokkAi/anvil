@@ -6,7 +6,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
+    Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff, EmbeddedResource,
     EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
@@ -33,8 +33,8 @@ use crate::multi_backend::MultiBackend;
 use crate::session::{
     CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen, PermissionMode,
     PromptStartError, REASONING_EFFORT_OFF_VALUE, RewindOutcome, Session, SessionManifest,
-    SessionMode, SessionSnapshot, SessionStore, TurnReplayEvent, UnsupportedMcpTransport,
-    acp_mcp_servers_to_configs, sanitize_replay_events,
+    SessionMode, SessionSnapshot, SessionStore, ToolExchangeDiff, ToolExchangeStatus,
+    TurnReplayEvent, UnsupportedMcpTransport, acp_mcp_servers_to_configs, sanitize_replay_events,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -1495,12 +1495,7 @@ pub async fn run_agent(
 
                 // Replay conversation history as session updates (both sides).
                 for turn in &session.history {
-                    if !turn.user_prompt.is_empty() {
-                        send_user_message(&cx, &session_id, &turn.user_prompt);
-                    }
-                    if !turn.agent_response.is_empty() {
-                        send_message(&cx, &session_id, &turn.agent_response);
-                    }
+                    replay_turn_updates(&cx, &session_id, turn);
                 }
 
                 let catalog = sessions_load.available_model_metadata().await;
@@ -3165,6 +3160,109 @@ fn send_message(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     if let Err(e) = cx.send_notification(notification) {
         tracing::warn!("failed to send session update: {e}");
     }
+}
+
+fn replay_turn_updates(cx: &ConnectionTo<Client>, session_id: &str, turn: &ConversationTurn) {
+    if !turn.user_prompt.is_empty() {
+        send_user_message(cx, session_id, &turn.user_prompt);
+    }
+
+    // Current session persistence stores text/tool replay state, but not the
+    // live ACP thought/plan event stream. Keep load replay faithful for the
+    // persisted surface and avoid inventing plan/thought updates from prompts.
+    let replay_events = sanitize_replay_events(&turn.replay_events);
+    if replay_events.is_empty() {
+        for exchange in &turn.tool_exchanges {
+            replay_tool_exchange(cx, session_id, exchange);
+        }
+        if !turn.agent_response.is_empty() {
+            send_message(cx, session_id, &turn.agent_response);
+        }
+        return;
+    }
+
+    let mut replayed_assistant_text = String::new();
+    for event in &replay_events {
+        match event {
+            TurnReplayEvent::AssistantToolCalls { text, .. } => {
+                if !text.is_empty() {
+                    replayed_assistant_text.push_str(text);
+                    send_message(cx, session_id, text);
+                }
+            }
+            TurnReplayEvent::ToolResult(exchange) => {
+                replay_tool_exchange(cx, session_id, exchange);
+            }
+            TurnReplayEvent::AssistantText { text } => {
+                if !text.is_empty() {
+                    replayed_assistant_text.push_str(text);
+                    send_message(cx, session_id, text);
+                }
+            }
+        }
+    }
+
+    if !turn.agent_response.is_empty() && replayed_assistant_text != turn.agent_response {
+        let missing = turn
+            .agent_response
+            .strip_prefix(&replayed_assistant_text)
+            .unwrap_or(turn.agent_response.as_str());
+        if !missing.is_empty() {
+            send_message(cx, session_id, missing);
+        }
+    }
+}
+
+fn replay_tool_exchange(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    exchange: &crate::session::ToolExchange,
+) {
+    let raw_input = serde_json::from_str::<serde_json::Value>(&exchange.arguments)
+        .unwrap_or_else(|_| serde_json::Value::String(exchange.arguments.clone()));
+    let kind = crate::tools::ToolRegistry::tool_kind(&exchange.tool_name);
+    send_replay_update(
+        cx,
+        session_id,
+        SessionUpdate::ToolCall(crate::tool_loop::announce::replayed_tool_call(
+            &exchange.call_id,
+            &exchange.tool_name,
+            kind,
+            &raw_input,
+        )),
+    );
+    let update = match exchange.status {
+        ToolExchangeStatus::Completed => crate::tool_loop::announce::update_completed(
+            &exchange.call_id,
+            &exchange.tool_name,
+            &raw_input,
+            &exchange.result,
+            exchange.diff.as_ref().map(acp_diff_from_exchange_diff),
+        ),
+        ToolExchangeStatus::Failed => crate::tool_loop::announce::update_failed_with_input(
+            &exchange.call_id,
+            &exchange.tool_name,
+            &raw_input,
+            &exchange.result,
+            Some(serde_json::Value::String(exchange.result.clone())),
+        ),
+    };
+    send_replay_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+}
+
+fn send_replay_update(cx: &ConnectionTo<Client>, session_id: &str, update: SessionUpdate) {
+    let notification = SessionNotification::new(session_id.to_string(), update);
+    if let Err(e) = cx.send_notification(notification) {
+        tracing::warn!("failed to send replay session update: {e}");
+    }
+}
+
+fn acp_diff_from_exchange_diff(diff: &ToolExchangeDiff) -> Diff {
+    let mut acp_diff = Diff::new(diff.path.clone(), diff.new_text.clone());
+    if let Some(old_text) = &diff.old_text {
+        acp_diff = acp_diff.old_text(old_text.clone());
+    }
+    acp_diff
 }
 
 fn trace_openrouter_refresh(line: &str) {
@@ -8670,6 +8768,7 @@ mod tests {
                 tool_name: "search".into(),
                 arguments: r#"{"q":"x"}"#.into(),
                 result: "z".repeat(5_000),
+                ..ToolExchange::default()
             }],
             ..Default::default()
         };
@@ -9609,12 +9708,14 @@ mod tests {
                         tool_name: "grep_search".into(),
                         arguments: r#"{"pattern":"TODO"}"#.into(),
                         result: "src/lib.rs:42: // TODO".into(),
+                        ..ToolExchange::default()
                     },
                     ToolExchange {
                         call_id: "c2".into(),
                         tool_name: "read_file".into(),
                         arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                         result: "fn main() {}".into(),
+                        ..ToolExchange::default()
                     },
                 ],
                 structured_output: None,
@@ -9682,12 +9783,14 @@ mod tests {
             tool_name: "grep_search".into(),
             arguments: r#"{"pattern":"TODO"}"#.into(),
             result: "src/lib.rs:42: // TODO".into(),
+            ..ToolExchange::default()
         };
         let result_2 = ToolExchange {
             call_id: "c2".into(),
             tool_name: "read_file".into(),
             arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
             result: "fn main() {}".into(),
+            ..ToolExchange::default()
         };
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
@@ -9785,6 +9888,7 @@ mod tests {
                         tool_name: "grep_search".into(),
                         arguments: r#"{"pattern":"TODO"}"#.into(),
                         result: "hit".into(),
+                        ..ToolExchange::default()
                     }),
                 ],
                 tool_exchanges: Vec::new(),
@@ -9832,6 +9936,7 @@ mod tests {
                         tool_name: "grep_search".into(),
                         arguments: r#"{"pattern":"TODO"}"#.into(),
                         result: "hit".into(),
+                        ..ToolExchange::default()
                     }),
                 ],
                 tool_exchanges: Vec::new(),
@@ -9933,6 +10038,7 @@ mod tests {
                     tool_name: "grep_search".into(),
                     arguments: r#"{"pattern":"x"}"#.into(),
                     result: "no matches".into(),
+                    ..ToolExchange::default()
                 }],
                 structured_output: None,
                 summary: None,

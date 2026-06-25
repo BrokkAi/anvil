@@ -488,6 +488,41 @@ pub struct ToolExchange {
     /// Output the tool returned, post-truncation to `MAX_TOOL_RESULT_BYTES`,
     /// matching what was fed to the LLM during the original turn.
     pub result: String,
+    /// Terminal UI status for ACP replay. Old archives do not carry this and
+    /// are treated as completed to preserve backward compatibility.
+    pub status: ToolExchangeStatus,
+    /// ACP-neutral diff payload for successful write/edit cards.
+    pub diff: Option<ToolExchangeDiff>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolExchangeStatus {
+    #[default]
+    Completed,
+    Failed,
+}
+
+impl ToolExchangeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_str(value: Option<&str>) -> Self {
+        match value {
+            Some("failed") => Self::Failed,
+            _ => Self::Completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolExchangeDiff {
+    pub path: PathBuf,
+    pub old_text: Option<String>,
+    pub new_text: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1669,6 +1704,8 @@ fn read_replay_events_from_messages(
                         tool_name: call.tool_name.clone(),
                         arguments: call.arguments.clone(),
                         result: read_content_field(msg, "contentId", content_map),
+                        status: read_tool_exchange_status(msg),
+                        diff: read_tool_exchange_diff(msg, content_map),
                     }));
                 }
                 i += 1;
@@ -1726,7 +1763,7 @@ fn read_tool_exchanges_from_messages(
     // First pass: collect tool_results keyed by toolCallId so we can pair
     // them up regardless of the order calls and results appear in (the
     // OpenAI shape interleaves: call, call, result, result).
-    let mut results: HashMap<String, String> = HashMap::new();
+    let mut results: HashMap<String, PersistedToolResult> = HashMap::new();
     for msg in messages {
         if msg.get("role").and_then(|v| v.as_str()) != Some("tool_result") {
             continue;
@@ -1736,7 +1773,12 @@ fn read_tool_exchanges_from_messages(
         };
         let content_id = msg.get("contentId").and_then(|v| v.as_str()).unwrap_or("");
         let result = content_map.get(content_id).cloned().unwrap_or_default();
-        if let Some(prev) = results.insert(call_id.to_string(), result) {
+        let persisted = PersistedToolResult {
+            result,
+            status: read_tool_exchange_status(msg),
+            diff: read_tool_exchange_diff(msg, content_map),
+        };
+        if let Some(prev) = results.insert(call_id.to_string(), persisted) {
             // Two `tool_result` entries with the same `toolCallId` is not
             // something our write path produces (call_ids come from the
             // provider and are unique within a turn), but a corrupted or
@@ -1746,7 +1788,7 @@ fn read_tool_exchanges_from_messages(
             // result silently overwrote the first in this map.
             tracing::warn!(
                 call_id = %call_id,
-                prev_result_len = prev.len(),
+                prev_result_len = prev.result.len(),
                 "duplicate toolCallId in persisted messages; previous tool_result discarded on read"
             );
         }
@@ -1771,7 +1813,7 @@ fn read_tool_exchanges_from_messages(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let arguments = content_map.get(arguments_id).cloned().unwrap_or_default();
-        let Some(result) = results.remove(call_id) else {
+        let Some(persisted) = results.remove(call_id) else {
             // No result recorded for this call; skip rather than feed the
             // LLM a tool_call without a matching tool_result (the OpenAI
             // wire format requires the pair).
@@ -1781,10 +1823,42 @@ fn read_tool_exchanges_from_messages(
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
             arguments,
-            result,
+            result: persisted.result,
+            status: persisted.status,
+            diff: persisted.diff,
         });
     }
     exchanges
+}
+
+fn read_tool_exchange_status(msg: &serde_json::Value) -> ToolExchangeStatus {
+    ToolExchangeStatus::from_str(msg.get("status").and_then(|v| v.as_str()))
+}
+
+struct PersistedToolResult {
+    result: String,
+    status: ToolExchangeStatus,
+    diff: Option<ToolExchangeDiff>,
+}
+
+fn read_tool_exchange_diff(
+    msg: &serde_json::Value,
+    content_map: &HashMap<String, String>,
+) -> Option<ToolExchangeDiff> {
+    let diff = msg.get("diff")?;
+    let path = diff.get("path").and_then(|v| v.as_str())?;
+    let new_text_id = diff.get("newTextContentId").and_then(|v| v.as_str())?;
+    let new_text = content_map.get(new_text_id)?.clone();
+    let old_text = diff
+        .get("oldTextContentId")
+        .and_then(|v| v.as_str())
+        .and_then(|content_id| content_map.get(content_id))
+        .cloned();
+    Some(ToolExchangeDiff {
+        path: PathBuf::from(path),
+        old_text,
+        new_text,
+    })
 }
 
 /// Look up the first message in `task.messages` whose `role` matches and
@@ -1809,6 +1883,27 @@ fn read_first_role_text(
             })
         })
         .unwrap_or_default()
+}
+
+fn tool_exchange_diff_json(
+    exchange: &ToolExchange,
+) -> (Option<serde_json::Value>, Vec<(String, String)>) {
+    let Some(diff) = &exchange.diff else {
+        return (None, Vec::new());
+    };
+
+    let new_text_content_id = uuid::Uuid::new_v4().to_string();
+    let mut content = vec![(new_text_content_id.clone(), diff.new_text.clone())];
+    let mut diff_json = serde_json::json!({
+        "path": diff.path.display().to_string(),
+        "newTextContentId": new_text_content_id,
+    });
+    if let Some(old_text) = &diff.old_text {
+        let old_text_content_id = uuid::Uuid::new_v4().to_string();
+        diff_json["oldTextContentId"] = serde_json::Value::String(old_text_content_id.clone());
+        content.push((old_text_content_id, old_text.clone()));
+    }
+    (Some(diff_json), content)
 }
 
 /// Run `populate` against a fresh `<zip_path>.tmp`, finalize the writer, and atomically
@@ -2081,20 +2176,27 @@ fn append_turn_to_zip(
     for exchange in &turn.tool_exchanges {
         let arguments_content_id = uuid::Uuid::new_v4().to_string();
         let result_content_id = uuid::Uuid::new_v4().to_string();
+        let (diff_json, diff_content) = tool_exchange_diff_json(exchange);
         messages_json.push(serde_json::json!({
             "role": "tool_call",
             "toolCallId": exchange.call_id,
             "toolName": exchange.tool_name,
             "argumentsContentId": arguments_content_id,
         }));
-        messages_json.push(serde_json::json!({
+        let mut result_json = serde_json::json!({
             "role": "tool_result",
             "toolCallId": exchange.call_id,
             "toolName": exchange.tool_name,
             "contentId": result_content_id,
-        }));
+            "status": exchange.status.as_str(),
+        });
+        if let Some(diff_json) = diff_json {
+            result_json["diff"] = diff_json;
+        }
+        messages_json.push(result_json);
         message_content.push((arguments_content_id, exchange.arguments.clone()));
         message_content.push((result_content_id, exchange.result.clone()));
+        message_content.extend(diff_content);
     }
     messages_json.push(serde_json::json!(
         {"role": "ai", "contentId": response_content_id}
@@ -2125,13 +2227,20 @@ fn append_turn_to_zip(
                 }
                 TurnReplayEvent::ToolResult(exchange) => {
                     let result_content_id = uuid::Uuid::new_v4().to_string();
-                    replay_messages_json.push(serde_json::json!({
+                    let (diff_json, diff_content) = tool_exchange_diff_json(&exchange);
+                    let mut result_json = serde_json::json!({
                         "role": "tool_result",
                         "toolCallId": exchange.call_id,
                         "toolName": exchange.tool_name,
                         "contentId": result_content_id,
-                    }));
+                        "status": exchange.status.as_str(),
+                    });
+                    if let Some(diff_json) = diff_json {
+                        result_json["diff"] = diff_json;
+                    }
+                    replay_messages_json.push(result_json);
                     message_content.push((result_content_id, exchange.result.clone()));
+                    message_content.extend(diff_content);
                 }
                 TurnReplayEvent::AssistantText { text } => {
                     let text_content_id = uuid::Uuid::new_v4().to_string();
@@ -7645,6 +7754,7 @@ done
                             tool_name: "noop".into(),
                             arguments: format!(r#"{{"i":{i}}}"#),
                             result: format!("r-{i}"),
+                            ..ToolExchange::default()
                         }],
                         structured_output: None,
                         summary: None,
@@ -7700,12 +7810,15 @@ done
                 tool_name: "read_file".into(),
                 arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                 result: "fn main() {}\n".into(),
+                ..ToolExchange::default()
             },
             ToolExchange {
                 call_id: "call_xyz".into(),
                 tool_name: "grep_search".into(),
                 arguments: r#"{"pattern":"TODO"}"#.into(),
                 result: "no matches".into(),
+                status: ToolExchangeStatus::Failed,
+                ..ToolExchange::default()
             },
         ];
 
@@ -7748,11 +7861,13 @@ done
         assert_eq!(abc.tool_name, "read_file");
         assert_eq!(abc.arguments, r#"{"file_path":"src/lib.rs"}"#);
         assert_eq!(abc.result, "fn main() {}\n");
+        assert_eq!(abc.status, ToolExchangeStatus::Completed);
 
         let xyz = by_id.get("call_xyz").expect("search exchange present");
         assert_eq!(xyz.tool_name, "grep_search");
         assert_eq!(xyz.arguments, r#"{"pattern":"TODO"}"#);
         assert_eq!(xyz.result, "no matches");
+        assert_eq!(xyz.status, ToolExchangeStatus::Failed);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -7787,12 +7902,14 @@ done
             tool_name: c1.tool_name.clone(),
             arguments: c1.arguments.clone(),
             result: "src/lib.rs:42: // TODO".into(),
+            ..ToolExchange::default()
         };
         let r2 = ToolExchange {
             call_id: c2.call_id.clone(),
             tool_name: c2.tool_name.clone(),
             arguments: c2.arguments.clone(),
             result: "fn main() {}".into(),
+            ..ToolExchange::default()
         };
         let replay_events = vec![
             TurnReplayEvent::AssistantToolCalls {

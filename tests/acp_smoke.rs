@@ -135,6 +135,142 @@ fn planning_gate_direct_prompt_does_not_request_permission() {
 }
 
 #[test]
+fn session_load_replays_tool_updates_in_order() {
+    let case = SmokeCase {
+        name: "session_load_tool_replay",
+        prompt: "Read README.md and summarize it.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_openai_smoke_server(vec![
+        tool_call_sse_body_for("call_read", "read_file", r#"{"file_path":"README.md"}"#),
+        text_sse_body("README contains a smoke heading."),
+    ]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": case.prompt }]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+    let _ = client.take_update_kinds();
+
+    let load = client.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": []
+        }),
+    );
+    assert_response_ok(&case, "session/load", &load, &client);
+    let updates = client.take_updates();
+    let kinds: Vec<String> = updates
+        .iter()
+        .filter_map(|update| {
+            update
+                .get("sessionUpdate")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let position = |kind: &str| {
+        kinds
+            .iter()
+            .position(|observed| observed == kind)
+            .unwrap_or_else(|| panic!("{}: missing {kind} in replay updates: {kinds:?}", case.name))
+    };
+    let user = position("user_message_chunk");
+    let tool = position("tool_call");
+    let tool_update = position("tool_call_update");
+    let agent = position("agent_message_chunk");
+    assert!(
+        user < tool && tool < tool_update && tool_update < agent,
+        "{}: replay updates were out of order: {kinds:?}",
+        case.name
+    );
+    let tool_update_payload = updates
+        .iter()
+        .find(|update| {
+            update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update")
+        })
+        .unwrap_or_else(|| panic!("{}: missing tool_call_update payload", case.name));
+    assert_eq!(
+        tool_update_payload["toolCallId"], "call_read",
+        "{}: replayed update should keep the original tool call id: {tool_update_payload}",
+        case.name
+    );
+    assert_eq!(
+        tool_update_payload["status"], "completed",
+        "{}: replayed successful tool should remain completed: {tool_update_payload}",
+        case.name
+    );
+    assert!(
+        tool_update_payload["rawOutput"]
+            .as_str()
+            .is_some_and(|output| output.contains("# smoke")),
+        "{}: replayed update should include persisted raw output: {tool_update_payload}",
+        case.name
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during session/load replay smoke test; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+#[test]
 fn relative_cwd_lifecycle_requests_return_invalid_params() {
     let case = SmokeCase {
         name: "relative_cwd_lifecycle_requests",
@@ -2276,6 +2412,13 @@ impl<'a> JsonRpcClient<'a> {
             .and_then(|params| params.get("update").cloned());
         self.session_updates.clear();
         found
+    }
+
+    fn take_updates(&mut self) -> Vec<Value> {
+        self.session_updates
+            .drain(..)
+            .filter_map(|params| params.get("update").cloned())
+            .collect()
     }
 
     fn with_permission_cancel_response(mut self, send_session_cancel: bool) -> Self {
