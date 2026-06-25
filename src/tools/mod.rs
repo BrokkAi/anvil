@@ -506,9 +506,13 @@ impl ToolRegistry {
         let builtin_tools = self.active_builtin_tools().await;
         let mut defs = Vec::new();
         if builtin_tools.contains("read_file") {
+            let read_description = format!(
+                "Reads and returns the content of a specified text file, up to {} bytes. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
+                filesystem::READ_MAX_BYTES
+            );
             defs.push(tool_def(
                 "read_file",
-                "Reads and returns the content of a specified text file. Use after you have selected an exact file/range; for code definitions prefer get_symbol_sources, and for broad code orientation prefer get_summaries.",
+                &read_description,
                 json!({
                     "type": "object",
                     "properties": {
@@ -530,9 +534,13 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("write_file") {
+            let write_description = format!(
+                "Writes content to a specified file in the local filesystem, capped at {} bytes. Paths may be relative to the working directory or absolute paths inside it.",
+                filesystem::WRITE_MAX_BYTES
+            );
             defs.push(tool_def(
                 "write_file",
-                "Writes content to a specified file in the local filesystem. Paths may be relative to the working directory or absolute paths inside it.",
+                &write_description,
                 json!({
                     "type": "object",
                     "properties": {
@@ -578,9 +586,13 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("list_directory") {
+            let list_description = format!(
+                "Lists up to {} files and subdirectories directly within a specified directory path. Paths may be relative to the working directory or absolute paths inside it.",
+                filesystem::LIST_MAX_ENTRIES
+            );
             defs.push(tool_def(
                 "list_directory",
-                "Lists the names of files and subdirectories directly within a specified directory path. Paths may be relative to the working directory or absolute paths inside it.",
+                &list_description,
                 json!({
                     "type": "object",
                     "properties": {
@@ -904,12 +916,24 @@ impl ToolRegistry {
                     .get("limit")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize);
-                filesystem::read_file(&self.cwd, path, offset, limit)
+                let cwd = self.cwd.clone();
+                let path = path.to_string();
+                run_blocking_filesystem_tool(move || {
+                    filesystem::read_file(&cwd, &path, offset, limit)
+                })
+                .await
             }
             "write_file" => {
                 let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                filesystem::write_file(&self.cwd, path, content)
+                if content.len() > filesystem::WRITE_MAX_BYTES {
+                    return filesystem::oversized_write_payload_result(path, content.len());
+                }
+                let cwd = self.cwd.clone();
+                let path = path.to_string();
+                let content = content.to_string();
+                run_blocking_filesystem_tool(move || filesystem::write_file(&cwd, &path, &content))
+                    .await
             }
             "edit" => {
                 let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -925,11 +949,20 @@ impl ToolRegistry {
                     .get("replace_all")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                filesystem::edit_file(&self.cwd, path, old, new, replace_all)
+                let cwd = self.cwd.clone();
+                let path = path.to_string();
+                let old = old.to_string();
+                let new = new.to_string();
+                run_blocking_filesystem_tool(move || {
+                    filesystem::edit_file(&cwd, &path, &old, &new, replace_all)
+                })
+                .await
             }
             "list_directory" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                filesystem::list_directory(&self.cwd, path)
+                let cwd = self.cwd.clone();
+                let path = path.to_string();
+                run_blocking_filesystem_tool(move || filesystem::list_directory(&cwd, &path)).await
             }
             "grep_search" => {
                 let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -1089,6 +1122,18 @@ impl ToolRegistry {
         tool_meta(tool_name)
             .map(|t| t.display_name)
             .unwrap_or("Executing tool")
+    }
+}
+
+async fn run_blocking_filesystem_tool(
+    f: impl FnOnce() -> ToolResult + Send + 'static,
+) -> ToolResult {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(error) => ToolResult {
+            status: ToolStatus::InternalError,
+            output: format!("Filesystem tool task failed: {error}"),
+        },
     }
 }
 
