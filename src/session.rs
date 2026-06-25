@@ -2004,6 +2004,50 @@ fn append_turn_to_zip(
     Ok(task_fragment_id)
 }
 
+/// Rebuild a session archive from the supplied manifest and remaining turns.
+///
+/// The caller uses this for destructive history edits (`/rewind`). We write to
+/// a separate archive, append every retained turn there, and only rename over
+/// the real zip after the complete replacement is valid. Removed turns' content
+/// blobs are therefore omitted entirely, leaving no dangling summary/content
+/// references for reload.
+fn rewrite_history_zip(
+    zip_path: &Path,
+    manifest: &SessionManifest,
+    history: &[ConversationTurn],
+) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context;
+
+    let file_name = zip_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.zip");
+    let temp_zip = zip_path.with_file_name(format!("{file_name}.rewrite-{}", uuid::Uuid::new_v4()));
+
+    let result = (|| -> anyhow::Result<Vec<String>> {
+        write_new_session_zip(&temp_zip, manifest)
+            .with_context(|| format!("creating replacement session zip {}", temp_zip.display()))?;
+        let mut fragment_ids = Vec::with_capacity(history.len());
+        for turn in history {
+            fragment_ids.push(
+                append_turn_to_zip(&temp_zip, manifest, turn)
+                    .with_context(|| format!("rewriting turn into {}", temp_zip.display()))?,
+            );
+        }
+        std::fs::rename(&temp_zip, zip_path).with_context(|| {
+            format!("renaming {} to {}", temp_zip.display(), zip_path.display())
+        })?;
+        Ok(fragment_ids)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_zip);
+        let _ = std::fs::remove_file(temp_zip.with_extension("tmp"));
+    }
+
+    result
+}
+
 /// Mutate the `summaryContentId` of the task whose `logId == fragment_id`
 /// in `contexts.jsonl`, and write the new summary blob to
 /// `content/<new_content_id>.txt`. Used by `set_turn_summary` to land
@@ -2249,6 +2293,23 @@ pub enum ForkOutcome {
     Unknown,
     /// Persisting the forked archive failed.
     Failed(String),
+}
+
+/// Outcome of removing the latest completed turn from a session.
+#[derive(Debug)]
+pub enum RewindOutcome {
+    /// The last turn was removed from memory and persisted history.
+    Rewound(Box<ConversationTurn>),
+    /// The session exists, but there are no completed turns to remove.
+    Empty,
+    /// No live or persisted session with this id is available.
+    Unknown,
+}
+
+struct RewrittenHistory {
+    removed: ConversationTurn,
+    remaining: Vec<ConversationTurn>,
+    fragment_ids: Vec<String>,
 }
 
 impl SessionStore {
@@ -3571,6 +3632,99 @@ impl SessionStore {
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// Remove the latest completed turn from the session and rewrite the
+    /// persisted archive so a reload sees the truncated conversation.
+    ///
+    /// This intentionally rebuilds from the full on-disk history rather than
+    /// the resident history window. `max_history_turns` trims memory only, and
+    /// `/rewind` must not accidentally discard older persisted turns.
+    pub async fn rewind_last_turn(&self, id: &str) -> anyhow::Result<RewindOutcome> {
+        let cwd_hint = if let Some(cwd) = {
+            let sessions = self.sessions.read().await;
+            sessions.get(id).map(|session| session.cwd.clone())
+        } {
+            Some(cwd)
+        } else {
+            self.known_sessions.read().await.get(id).cloned()
+        };
+        let Some(cwd_hint) = cwd_hint else {
+            return Ok(RewindOutcome::Unknown);
+        };
+        if !self.load_into_memory_if_cold(id, &cwd_hint, false).await {
+            return Ok(RewindOutcome::Unknown);
+        }
+
+        let (zip_path, mut manifest) = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return Ok(RewindOutcome::Unknown);
+            };
+            (session_zip_path(&session.cwd, id), session.manifest.clone())
+        };
+        manifest.modified = current_timestamp_millis();
+
+        let zip_path_for_compensate = zip_path.clone();
+        let manifest_for_disk = manifest.clone();
+        let join_result =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RewrittenHistory>> {
+                let mut full_history = read_history_from_zip(&zip_path);
+                let Some(removed) = full_history.pop() else {
+                    return Ok(None);
+                };
+                let fragment_ids =
+                    rewrite_history_zip(&zip_path, &manifest_for_disk, &full_history)?;
+                Ok(Some(RewrittenHistory {
+                    removed,
+                    remaining: full_history,
+                    fragment_ids,
+                }))
+            })
+            .await;
+
+        let Some(rewritten) = (match join_result {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!(
+                "session persistence task panicked: {join_err}"
+            )),
+        })?
+        else {
+            return Ok(RewindOutcome::Empty);
+        };
+        let RewrittenHistory {
+            removed,
+            mut remaining,
+            fragment_ids,
+        } = rewritten;
+
+        for (turn, fragment_id) in remaining.iter_mut().zip(fragment_ids) {
+            turn.fragment_id = Some(fragment_id);
+        }
+
+        if !self.known_sessions.read().await.contains_key(id) {
+            tracing::info!(
+                session_id = %id,
+                "discarding rewind persisted for a concurrently-deleted session"
+            );
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&zip_path_for_compensate);
+            })
+            .await;
+            return Ok(RewindOutcome::Rewound(Box::new(removed)));
+        }
+
+        {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(id) else {
+                return Ok(RewindOutcome::Unknown);
+            };
+            session.manifest.modified = manifest.modified;
+            session.history = remaining;
+            trim_history(&mut session.history, self.limits.max_history_turns);
+        }
+        self.touch(id);
+        Ok(RewindOutcome::Rewound(Box::new(removed)))
     }
 
     /// Update the per-session LLM model and persist the new manifest.
@@ -7608,5 +7762,148 @@ done
         assert!(snap.history[1].summary.is_none());
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn rewind_last_turn_reports_empty_history() {
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        let outcome = store
+            .rewind_last_turn(&session.id)
+            .await
+            .expect("rewind should not fail");
+        assert!(matches!(outcome, RewindOutcome::Empty));
+        assert!(
+            read_history_from_zip(&session_zip_path(cwd.path(), &session.id)).is_empty(),
+            "empty rewind must not create history"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_last_turn_removes_latest_from_memory_and_disk() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        for i in 0..3 {
+            store
+                .add_turn(
+                    &session.id,
+                    ConversationTurn {
+                        user_prompt: format!("user-{i}"),
+                        agent_response: format!("agent-{i}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("turn persists");
+        }
+        store
+            .set_turn_summary(&session.id, 0, "- keep turn 0 summary".into())
+            .await
+            .expect("summary persists");
+        let before_modified = read_manifest_from_zip(&session_zip_path(cwd.path(), &session.id))
+            .expect("manifest before rewind")
+            .modified;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        let outcome = store
+            .rewind_last_turn(&session.id)
+            .await
+            .expect("rewind should persist");
+        match outcome {
+            RewindOutcome::Rewound(turn) => {
+                assert_eq!(turn.user_prompt, "user-2");
+                assert_eq!(turn.agent_response, "agent-2");
+            }
+            other => panic!("expected rewind, got {other:?}"),
+        }
+
+        let snap = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("session still available");
+        assert_eq!(snap.history.len(), 2);
+        assert_eq!(snap.history[0].user_prompt, "user-0");
+        assert_eq!(snap.history[1].user_prompt, "user-1");
+        assert_eq!(
+            snap.history[0].summary.as_deref(),
+            Some("- keep turn 0 summary"),
+            "retained summaries must survive archive rebuild"
+        );
+
+        let on_disk = read_history_from_zip(&session_zip_path(cwd.path(), &session.id));
+        assert_eq!(on_disk.len(), 2);
+        assert_eq!(on_disk[0].agent_response, "agent-0");
+        assert_eq!(on_disk[1].agent_response, "agent-1");
+        assert_eq!(on_disk[0].summary.as_deref(), Some("- keep turn 0 summary"));
+        let after_modified = read_manifest_from_zip(&session_zip_path(cwd.path(), &session.id))
+            .expect("manifest after rewind")
+            .modified;
+        assert!(
+            after_modified > before_modified,
+            "rewind should bump manifest.modified"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_last_turn_reload_sees_truncated_history() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        for i in 0..2 {
+            store
+                .add_turn(
+                    &session.id,
+                    ConversationTurn {
+                        user_prompt: format!("u{i}"),
+                        agent_response: format!("a{i}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("turn persists");
+        }
+
+        assert!(matches!(
+            store.rewind_last_turn(&session.id).await.expect("rewind"),
+            RewindOutcome::Rewound(_)
+        ));
+        store.sessions.write().await.remove(&session.id);
+        let snap = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("reload succeeds");
+        assert_eq!(snap.history.len(), 1);
+        assert_eq!(snap.history[0].user_prompt, "u0");
+        assert_eq!(snap.history[0].agent_response, "a0");
+
+        assert!(matches!(
+            store
+                .rewind_last_turn(&session.id)
+                .await
+                .expect("second rewind"),
+            RewindOutcome::Rewound(_)
+        ));
+        assert!(matches!(
+            store
+                .rewind_last_turn(&session.id)
+                .await
+                .expect("empty rewind"),
+            RewindOutcome::Empty
+        ));
     }
 }
