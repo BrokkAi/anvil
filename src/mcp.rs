@@ -5,16 +5,19 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 pub const BUNDLED_BIFROST_VERSION: &str = "0.6.5";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "macos")]
 const BIFROST_TARGET_TRIPLE: &str = "universal-apple-darwin";
@@ -61,6 +64,8 @@ pub enum McpError {
     Io(String),
     Protocol(String),
     JsonRpc { code: i64, message: String },
+    Timeout { tool: String, timeout: Duration },
+    Cancelled { tool: String },
 }
 
 impl fmt::Display for McpError {
@@ -72,6 +77,10 @@ impl fmt::Display for McpError {
             McpError::JsonRpc { code, message } => {
                 write!(f, "jsonrpc error {code}: {message}")
             }
+            McpError::Timeout { tool, timeout } => {
+                write!(f, "tool '{tool}' timed out after {}s", timeout.as_secs())
+            }
+            McpError::Cancelled { tool } => write!(f, "tool '{tool}' was cancelled"),
         }
     }
 }
@@ -419,10 +428,17 @@ pub struct McpToolAnnotations {
 /// tool loop dispatches tool calls sequentially within a session.
 pub struct McpClient {
     name: String,
-    _child: Mutex<Child>,
-    io: Mutex<McpIo>,
+    config: McpServerConfig,
+    cwd: PathBuf,
+    state: Mutex<McpClientState>,
     next_id: AtomicI64,
     tools: Vec<McpToolDef>,
+}
+
+struct McpClientState {
+    child: Child,
+    io: McpIo,
+    healthy: bool,
 }
 
 struct McpIo {
@@ -433,6 +449,24 @@ struct McpIo {
 
 impl McpClient {
     pub async fn spawn(config: &McpServerConfig, cwd: &Path) -> Result<Self, McpError> {
+        let next_id = AtomicI64::new(1);
+        let (state, tools) = Self::spawn_connected(config, cwd, &next_id).await?;
+
+        Ok(Self {
+            name: config.name.clone(),
+            config: config.clone(),
+            cwd: cwd.to_path_buf(),
+            state: Mutex::new(state),
+            next_id,
+            tools,
+        })
+    }
+
+    async fn spawn_connected(
+        config: &McpServerConfig,
+        cwd: &Path,
+        next_id: &AtomicI64,
+    ) -> Result<(McpClientState, Vec<McpToolDef>), McpError> {
         let rendered_args = config.rendered_args(cwd);
         let mut child = Command::new(&config.command)
             .args(&rendered_args)
@@ -460,7 +494,6 @@ impl McpClient {
             reader,
             framing: config.framing,
         };
-        let next_id = AtomicI64::new(1);
 
         let init_id = next_id.fetch_add(1, Ordering::SeqCst);
         write_request(
@@ -501,13 +534,14 @@ impl McpClient {
             "mcp server ready"
         );
 
-        Ok(Self {
-            name: config.name.clone(),
-            _child: Mutex::new(child),
-            io: Mutex::new(io),
-            next_id,
+        Ok((
+            McpClientState {
+                child,
+                io,
+                healthy: true,
+            },
             tools,
-        })
+        ))
     }
 
     pub fn name(&self) -> &str {
@@ -519,16 +553,89 @@ impl McpClient {
     }
 
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
+        self.call_tool_with_timeout(name, args, MCP_CALL_TIMEOUT, None)
+            .await
+    }
+
+    pub async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        args: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value, McpError> {
+        self.call_tool_with_timeout(name, args, MCP_CALL_TIMEOUT, cancel)
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        args: Value,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value, McpError> {
+        let mut state = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(McpError::Cancelled { tool: name.to_string() });
+                    }
+                    state = self.state.lock() => state,
+                }
+            }
+            None => self.state.lock().await,
+        };
+
+        if !state.healthy {
+            let (new_state, _) =
+                Self::spawn_connected(&self.config, &self.cwd, &self.next_id).await?;
+            *state = new_state;
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut io = self.io.lock().await;
-        write_request(
-            &mut io,
+        if let Err(err) = write_request(
+            &mut state.io,
             id,
             "tools/call",
             json!({ "name": name, "arguments": args }),
         )
-        .await?;
-        let result = read_response(&mut io, id).await?;
+        .await
+        {
+            mark_unhealthy(&mut state, &err).await;
+            return Err(err);
+        }
+
+        let read = read_response(&mut state.io, id);
+        let result = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(McpError::Cancelled { tool: name.to_string() }),
+                    result = tokio::time::timeout(timeout, read) => match result {
+                        Ok(result) => result,
+                        Err(_) => Err(McpError::Timeout {
+                            tool: name.to_string(),
+                            timeout,
+                        }),
+                    },
+                }
+            }
+            None => match tokio::time::timeout(timeout, read).await {
+                Ok(result) => result,
+                Err(_) => Err(McpError::Timeout {
+                    tool: name.to_string(),
+                    timeout,
+                }),
+            },
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                mark_unhealthy(&mut state, &err).await;
+                return Err(err);
+            }
+        };
 
         if result
             .get("isError")
@@ -556,6 +663,22 @@ impl McpClient {
             return Ok(text.clone());
         }
         Ok(result)
+    }
+}
+
+impl McpError {
+    fn leaves_client_unhealthy(&self) -> bool {
+        matches!(
+            self,
+            McpError::Io(_) | McpError::Timeout { .. } | McpError::Cancelled { .. }
+        )
+    }
+}
+
+async fn mark_unhealthy(state: &mut McpClientState, err: &McpError) {
+    if err.leaves_client_unhealthy() {
+        state.healthy = false;
+        let _ = state.child.kill().await;
     }
 }
 
@@ -1036,5 +1159,184 @@ done
             std::fs::read_to_string(&env_log).expect("read env log"),
             "expected-token\n"
         );
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &std::path::Path, script: &str) {
+        std::fs::write(path, script).expect("write fake MCP script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)
+            .expect("stat fake MCP script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("chmod fake MCP script");
+    }
+
+    #[cfg(unix)]
+    fn fake_mcp_config(script_path: &std::path::Path) -> McpServerConfig {
+        McpServerConfig {
+            name: "fake".to_string(),
+            command: script_path.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            framing: McpFraming::Line,
+            enabled: true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_mcp_script(call_arm: &str) -> String {
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'* )
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"capabilities\":{{}}}}}}"
+      ;;
+    *'"method":"tools/list"'* )
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"tools\":[{{\"name\":\"fake_tool\",\"description\":\"Fake\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}"
+      ;;
+    *'"method":"tools/call"'* )
+{call_arm}
+      ;;
+  esac
+done
+"#
+        )
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &std::path::Path) {
+        for _ in 0..50 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_call_marks_unhealthy_and_next_call_respawns() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let marker = tmp.path().join("first-call");
+        let script = fake_mcp_script(&format!(
+            r#"      if [ ! -f '{marker}' ]; then
+        : > '{marker}'
+        sleep 60
+      else
+        printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}"
+      fi"#,
+            marker = marker.display()
+        ));
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        let err = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_millis(100), None)
+            .await
+            .expect_err("first call should time out");
+        assert!(
+            matches!(err, McpError::Timeout { .. }),
+            "expected timeout, got {err}"
+        );
+        wait_for_path(&marker).await;
+
+        let value = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_secs(2), None)
+            .await
+            .expect("next call should respawn and succeed");
+        assert_eq!(value, json!("ok"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_subprocess_marks_unhealthy_and_next_call_respawns() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let marker = tmp.path().join("first-call");
+        let script = fake_mcp_script(&format!(
+            r#"      if [ ! -f '{marker}' ]; then
+        : > '{marker}'
+        exit 0
+      else
+        printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}"
+      fi"#,
+            marker = marker.display()
+        ));
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        let err = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_secs(2), None)
+            .await
+            .expect_err("first call should fail when subprocess closes stdout");
+        assert!(
+            matches!(err, McpError::Io(_)),
+            "expected io error, got {err}"
+        );
+
+        let value = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_secs(2), None)
+            .await
+            .expect("next call should respawn and succeed");
+        assert_eq!(value, json!("ok"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_call_marks_unhealthy_and_next_call_respawns() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let marker = tmp.path().join("first-call");
+        let script = fake_mcp_script(&format!(
+            r#"      if [ ! -f '{marker}' ]; then
+        : > '{marker}'
+        sleep 60
+      else
+        printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}"
+      fi"#,
+            marker = marker.display()
+        ));
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let err = client
+            .call_tool_with_timeout(
+                "fake_tool",
+                json!({}),
+                Duration::from_secs(30),
+                Some(&cancel),
+            )
+            .await
+            .expect_err("first call should be cancelled");
+        assert!(
+            matches!(err, McpError::Cancelled { .. }),
+            "expected cancellation, got {err}"
+        );
+
+        let value = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_secs(2), None)
+            .await
+            .expect("next call should respawn and succeed");
+        assert_eq!(value, json!("ok"));
     }
 }

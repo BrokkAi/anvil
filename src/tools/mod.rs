@@ -906,6 +906,7 @@ impl ToolRegistry {
         );
         if let Some(cancel) = cancel
             && name != "run_shell_command"
+            && !self.mcp_tool_servers.contains_key(name)
         {
             tokio::select! {
                 biased;
@@ -1041,7 +1042,7 @@ impl ToolRegistry {
             // Any name not handled above is delegated to a configured MCP
             // server. This avoids a hardcoded list of server tool names
             // drifting out of sync with what each server actually exposes.
-            _ => self.execute_mcp(name, args).await,
+            _ => self.execute_mcp(name, args, cancel).await,
         }
     }
 
@@ -1077,7 +1078,12 @@ impl ToolRegistry {
         }
     }
 
-    async fn execute_mcp(&self, name: &str, args: serde_json::Value) -> ToolResult {
+    async fn execute_mcp(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolResult {
         if is_harness_only_mcp_tool(name) {
             return ToolResult {
                 status: ToolStatus::RequestError,
@@ -1099,7 +1105,7 @@ impl ToolRegistry {
             Some(tool) => coerce_scalar_args_to_array(args, &tool.input_schema),
             None => args,
         };
-        match client.call_tool(name, args).await {
+        match client.call_tool_cancellable(name, args, cancel).await {
             Ok(value) => {
                 let output = if let Some(s) = value.as_str() {
                     s.to_string()
