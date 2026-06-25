@@ -33,8 +33,8 @@ use crate::multi_backend::MultiBackend;
 use crate::session::{
     CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen, PermissionMode,
     PromptStartError, REASONING_EFFORT_OFF_VALUE, RewindOutcome, Session, SessionManifest,
-    SessionMode, SessionSnapshot, SessionStore, UnsupportedMcpTransport,
-    acp_mcp_servers_to_configs,
+    SessionMode, SessionSnapshot, SessionStore, TurnReplayEvent, UnsupportedMcpTransport,
+    acp_mcp_servers_to_configs, sanitize_replay_events,
 };
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
@@ -3663,7 +3663,8 @@ async fn run_goal_loop(
 ///      original user prompt / tool exchanges / assistant text are
 ///      *not* re-emitted -- the summary replaces them in the prompt.
 ///    - Otherwise, replay the turn verbatim: user prompt, optional
-///      `assistant_tool_calls` + `tool_result` pairs, optional
+///      recorded replay events when available, otherwise the legacy
+///      collapsed `assistant_tool_calls` + `tool_result` pairs, optional
 ///      assistant text.
 /// 5. The user's new prompt.
 ///
@@ -4066,7 +4067,9 @@ fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[Conversat
 
         messages.push(ChatMessage::user(turn.user_prompt.clone()));
 
-        if !turn.tool_exchanges.is_empty() {
+        if !turn.replay_events.is_empty() {
+            append_turn_replay_events(messages, turn);
+        } else if !turn.tool_exchanges.is_empty() {
             let calls: Vec<crate::llm_client::ToolCall> = turn
                 .tool_exchanges
                 .iter()
@@ -4087,10 +4090,65 @@ fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[Conversat
                     &exchange.result,
                 ));
             }
-        }
-
-        if !turn.agent_response.is_empty() {
+            if !turn.agent_response.is_empty() {
+                messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+            }
+        } else if !turn.agent_response.is_empty() {
             messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+        }
+    }
+}
+
+fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &ConversationTurn) {
+    let replay_events = sanitize_replay_events(&turn.replay_events);
+    let mut replayed_assistant_text = String::new();
+    for event in &replay_events {
+        match event {
+            TurnReplayEvent::AssistantToolCalls { text, calls } => {
+                if !text.is_empty() {
+                    replayed_assistant_text.push_str(text);
+                }
+                let calls = calls
+                    .iter()
+                    .map(|call| crate::llm_client::ToolCall {
+                        id: call.call_id.clone(),
+                        r#type: "function".to_string(),
+                        function: crate::llm_client::FunctionCall {
+                            name: call.tool_name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .collect();
+                messages.push(
+                    ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                        text.clone(),
+                        calls,
+                        None,
+                    ),
+                );
+            }
+            TurnReplayEvent::ToolResult(exchange) => {
+                messages.push(ChatMessage::tool_result(
+                    &exchange.call_id,
+                    &exchange.tool_name,
+                    &exchange.result,
+                ));
+            }
+            TurnReplayEvent::AssistantText { text } => {
+                if !text.is_empty() {
+                    replayed_assistant_text.push_str(text);
+                    messages.push(ChatMessage::assistant(text.clone()));
+                }
+            }
+        }
+    }
+    if !turn.agent_response.is_empty() && replayed_assistant_text != turn.agent_response {
+        let missing = turn
+            .agent_response
+            .strip_prefix(&replayed_assistant_text)
+            .unwrap_or(turn.agent_response.as_str());
+        if !missing.is_empty() {
+            messages.push(ChatMessage::assistant(missing.to_string()));
         }
     }
 }
@@ -4154,7 +4212,7 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
     .await;
 
     match loop_result {
-        Ok((response, _tool_exchanges, usage, failure)) => PlanTurnResult {
+        Ok((response, _tool_exchanges, _replay_events, usage, failure)) => PlanTurnResult {
             response,
             usage,
             failure,
@@ -4292,8 +4350,10 @@ async fn run_model_turn_in_spawn(
     .catch_unwind()
     .await;
 
-    let (response_text, tool_exchanges, turn_usage, failure) = match loop_result {
-        Ok((text, exchanges, usage, failure)) => (text, exchanges, usage, failure),
+    let (response_text, tool_exchanges, replay_events, turn_usage, failure) = match loop_result {
+        Ok((text, exchanges, replay_events, usage, failure)) => {
+            (text, exchanges, replay_events, usage, failure)
+        }
         Err(panic) => {
             tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
             // A panic is treated as fatal (non-retryable): retrying a
@@ -4301,6 +4361,7 @@ async fn run_model_turn_in_spawn(
             // should stop and surface it rather than back off and retry.
             (
                 "Error: agent loop panicked. See server logs.".to_string(),
+                Vec::new(),
                 Vec::new(),
                 crate::llm_client::TokenUsage::default(),
                 Some(crate::tool_loop::TurnFailure {
@@ -4330,6 +4391,7 @@ async fn run_model_turn_in_spawn(
             ConversationTurn {
                 user_prompt: prompt_text_for_turn,
                 agent_response: response_text.clone(),
+                replay_events: sanitize_replay_events(&replay_events),
                 tool_exchanges,
                 structured_output: structured_output_result.clone(),
                 summary: None,
@@ -9540,6 +9602,7 @@ mod tests {
             history: vec![ConversationTurn {
                 user_prompt: "find TODOs".into(),
                 agent_response: "found 3 in src/lib.rs".into(),
+                replay_events: Vec::new(),
                 tool_exchanges: vec![
                     ToolExchange {
                         call_id: "c1".into(),
@@ -9596,6 +9659,199 @@ mod tests {
         assert_eq!(msgs[5].text_content(), Some("found 3 in src/lib.rs"));
         assert_eq!(msgs[6].role, "user");
         assert_eq!(msgs[6].text_content(), Some("now fix them"));
+    }
+
+    #[test]
+    fn build_prompt_messages_replays_ordered_turn_events() {
+        use crate::session::{
+            ConversationTurn, SessionSnapshot, ToolCallReplay, ToolExchange, TurnReplayEvent,
+        };
+
+        let call_1 = ToolCallReplay {
+            call_id: "c1".into(),
+            tool_name: "grep_search".into(),
+            arguments: r#"{"pattern":"TODO"}"#.into(),
+        };
+        let call_2 = ToolCallReplay {
+            call_id: "c2".into(),
+            tool_name: "read_file".into(),
+            arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+        };
+        let result_1 = ToolExchange {
+            call_id: "c1".into(),
+            tool_name: "grep_search".into(),
+            arguments: r#"{"pattern":"TODO"}"#.into(),
+            result: "src/lib.rs:42: // TODO".into(),
+        };
+        let result_2 = ToolExchange {
+            call_id: "c2".into(),
+            tool_name: "read_file".into(),
+            arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+            result: "fn main() {}".into(),
+        };
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "find TODOs".into(),
+                // Aggregate response differs from the final assistant message;
+                // faithful replay must not append this as an extra message.
+                agent_response: "I will search.Now I will inspect.Done.".into(),
+                replay_events: vec![
+                    TurnReplayEvent::AssistantToolCalls {
+                        text: "I will search.".into(),
+                        calls: vec![call_1],
+                    },
+                    TurnReplayEvent::ToolResult(result_1),
+                    TurnReplayEvent::AssistantToolCalls {
+                        text: "Now I will inspect.".into(),
+                        calls: vec![call_2],
+                    },
+                    TurnReplayEvent::ToolResult(result_2),
+                    TurnReplayEvent::AssistantText {
+                        text: "Done.".into(),
+                    },
+                ],
+                tool_exchanges: Vec::new(),
+                structured_output: None,
+                summary: None,
+                fragment_id: None,
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        let msgs = build_prompt_messages(&snap, "next");
+        assert_eq!(msgs.len(), 8);
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].text_content(), Some("find TODOs"));
+        assert_eq!(msgs[2].role, "assistant");
+        assert_eq!(msgs[2].text_content(), Some("I will search."));
+        assert_eq!(
+            msgs[2].tool_calls.as_ref().expect("first call batch")[0].id,
+            "c1"
+        );
+        assert_eq!(msgs[3].role, "tool");
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(msgs[4].role, "assistant");
+        assert_eq!(msgs[4].text_content(), Some("Now I will inspect."));
+        assert!(msgs[4].reasoning_content.is_none());
+        assert_eq!(
+            msgs[4].tool_calls.as_ref().expect("second call batch")[0].id,
+            "c2"
+        );
+        assert_eq!(msgs[5].role, "tool");
+        assert_eq!(msgs[5].tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(msgs[6].role, "assistant");
+        assert_eq!(msgs[6].text_content(), Some("Done."));
+        assert_eq!(msgs[7].role, "user");
+        assert_eq!(msgs[7].text_content(), Some("next"));
+    }
+
+    #[test]
+    fn build_prompt_messages_drops_incomplete_replay_tool_batches() {
+        use crate::session::{
+            ConversationTurn, SessionSnapshot, ToolCallReplay, ToolExchange, TurnReplayEvent,
+        };
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "search".into(),
+                agent_response: "I will search.".into(),
+                replay_events: vec![
+                    TurnReplayEvent::AssistantToolCalls {
+                        text: "I will search.".into(),
+                        calls: vec![
+                            ToolCallReplay {
+                                call_id: "c1".into(),
+                                tool_name: "grep_search".into(),
+                                arguments: r#"{"pattern":"TODO"}"#.into(),
+                            },
+                            ToolCallReplay {
+                                call_id: "c2".into(),
+                                tool_name: "read_file".into(),
+                                arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+                            },
+                        ],
+                    },
+                    TurnReplayEvent::ToolResult(ToolExchange {
+                        call_id: "c1".into(),
+                        tool_name: "grep_search".into(),
+                        arguments: r#"{"pattern":"TODO"}"#.into(),
+                        result: "hit".into(),
+                    }),
+                ],
+                tool_exchanges: Vec::new(),
+                structured_output: None,
+                summary: None,
+                fragment_id: None,
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        let msgs = build_prompt_messages(&snap, "next");
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2].role, "assistant");
+        assert!(msgs[2].tool_calls.is_none());
+        assert_eq!(msgs[2].text_content(), Some("I will search."));
+    }
+
+    #[test]
+    fn build_prompt_messages_preserves_unreplayed_agent_response_suffix() {
+        use crate::session::{
+            ConversationTurn, SessionSnapshot, ToolCallReplay, ToolExchange, TurnReplayEvent,
+        };
+
+        let snap = SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "search".into(),
+                agent_response: "I will search.Error: model failed.".into(),
+                replay_events: vec![
+                    TurnReplayEvent::AssistantToolCalls {
+                        text: "I will search.".into(),
+                        calls: vec![ToolCallReplay {
+                            call_id: "c1".into(),
+                            tool_name: "grep_search".into(),
+                            arguments: r#"{"pattern":"TODO"}"#.into(),
+                        }],
+                    },
+                    TurnReplayEvent::ToolResult(ToolExchange {
+                        call_id: "c1".into(),
+                        tool_name: "grep_search".into(),
+                        arguments: r#"{"pattern":"TODO"}"#.into(),
+                        result: "hit".into(),
+                    }),
+                ],
+                tool_exchanges: Vec::new(),
+                structured_output: None,
+                summary: None,
+                fragment_id: None,
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        let msgs = build_prompt_messages(&snap, "next");
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[2].role, "assistant");
+        assert!(msgs[2].tool_calls.is_some());
+        assert_eq!(msgs[4].role, "assistant");
+        assert_eq!(msgs[4].text_content(), Some("Error: model failed."));
+        assert_eq!(msgs[5].text_content(), Some("next"));
     }
 
     /// Empty history: just system + the new user prompt. Establishes the
@@ -9671,6 +9927,7 @@ mod tests {
                 user_prompt: "search".into(),
                 // Empty: turn ended without final assistant text.
                 agent_response: String::new(),
+                replay_events: Vec::new(),
                 tool_exchanges: vec![ToolExchange {
                     call_id: "c1".into(),
                     tool_name: "grep_search".into(),
