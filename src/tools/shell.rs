@@ -9,6 +9,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 100_000; // 100KB
+pub(super) const MAX_TIMEOUT_SECONDS: u64 = 600;
 #[cfg(not(target_os = "windows"))]
 const ANVIL_RTK_DISABLED_ENV: &str = "ANVIL_RTK_DISABLED";
 #[cfg(not(target_os = "windows"))]
@@ -335,8 +336,13 @@ fn format_shell_tool_result(
     success: bool,
     outside_sandbox_once: bool,
     bypass_warning: bool,
+    timeout_clamp_notice: Option<&str>,
 ) -> ToolResult {
     let mut combined = String::new();
+    if let Some(notice) = timeout_clamp_notice {
+        combined.push_str(notice);
+        combined.push_str("\n\n");
+    }
     if !stdout.is_empty() {
         combined.push_str(stdout);
     }
@@ -486,6 +492,13 @@ pub async fn run_shell_command_cancellable(
             output: "Command must not be empty".to_string(),
         };
     }
+    let requested_timeout_seconds = timeout_seconds.max(1);
+    let timeout_seconds = requested_timeout_seconds.min(MAX_TIMEOUT_SECONDS);
+    let timeout_clamp_notice = (requested_timeout_seconds != timeout_seconds).then(|| {
+        format!(
+            "Notice: requested timeout {requested_timeout_seconds}s exceeded the server maximum; clamped to {timeout_seconds}s."
+        )
+    });
 
     let command_to_run = rtk_rewritten_command(command);
 
@@ -618,14 +631,22 @@ pub async fn run_shell_command_cancellable(
                 status.success(),
                 outside_sandbox_once,
                 bypass_warning,
+                timeout_clamp_notice.as_deref(),
             )
         }
-        ShellRunResult::FailedToExecute(e) => ToolResult {
-            status: ToolStatus::InternalError,
-            output: format!("Failed to execute command: {e}"),
-        },
+        ShellRunResult::FailedToExecute(e) => {
+            let mut output = format!("Failed to execute command: {e}");
+            prepend_notice(&mut output, timeout_clamp_notice.as_deref());
+            ToolResult {
+                status: ToolStatus::InternalError,
+                output,
+            }
+        }
         ShellRunResult::TimedOut => {
-            let mut msg = format!("Command timed out after {timeout_seconds}s");
+            let mut msg = format!(
+                "Command timed out after {timeout_seconds}s; terminated the child process tree."
+            );
+            prepend_notice(&mut msg, timeout_clamp_notice.as_deref());
             if outside_sandbox_once {
                 msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
             }
@@ -639,7 +660,10 @@ pub async fn run_shell_command_cancellable(
             }
         }
         ShellRunResult::Cancelled => {
-            let mut msg = "Command was cancelled before it completed".to_string();
+            let mut msg =
+                "Command was cancelled before it completed; terminated the child process tree."
+                    .to_string();
+            prepend_notice(&mut msg, timeout_clamp_notice.as_deref());
             if outside_sandbox_once {
                 msg = format!("{EXPLICIT_OUTSIDE_SANDBOX_NOTICE}\n\n{msg}");
             }
@@ -652,6 +676,12 @@ pub async fn run_shell_command_cancellable(
                 output: msg,
             }
         }
+    }
+}
+
+fn prepend_notice(output: &mut String, notice: Option<&str>) {
+    if let Some(notice) = notice {
+        *output = format!("{notice}\n\n{output}");
     }
 }
 
