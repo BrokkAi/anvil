@@ -340,6 +340,23 @@ fn is_harness_only_mcp_tool(name: &str) -> bool {
     name == "refresh"
 }
 
+/// Description advertised to the model for an MCP tool. Overrides bifrost's own
+/// description where the harness changes a tool's observable behaviour.
+///
+/// `semantic_search` results are transparently reranked by the harness (see
+/// `crate::semantic_rerank`), so the model receives a single relevance-ordered
+/// list of hits with source/summaries -- not bifrost's three raw ranked lists.
+fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
+    const SEMANTIC_SEARCH: &str = "Semantic + lexical code search. Given a natural-language \
+        query, returns a single relevance-ordered list of the most relevant symbols and files, \
+        each with its source or a summary. Results are reranked for relevance to your query and \
+        the current task, so prefer the order given and start from the top.";
+    match name {
+        "semantic_search" => SEMANTIC_SEARCH,
+        _ => original,
+    }
+}
+
 /// Unified tool registry: filesystem tools + shell + configured
 /// MCP tools + Agent Skills activation.
 ///
@@ -657,7 +674,7 @@ impl ToolRegistry {
                 }
                 defs.push(tool_def(
                     &tool.name,
-                    &tool.description,
+                    mcp_tool_description(&tool.name, &tool.description),
                     tool.input_schema.clone(),
                 ));
             }
@@ -741,6 +758,34 @@ impl ToolRegistry {
         self.mcp_tool_servers
             .get(name)
             .is_some_and(|client| client.name() == "bifrost")
+    }
+
+    /// Invoke a bifrost MCP tool and return its raw structured `Value`,
+    /// bypassing the `ToolResult` string formatting used by the model-facing
+    /// dispatch path. This is for harness-internal orchestration (e.g. the
+    /// `semantic_search` reranker) that needs to read the structured payload
+    /// (`vector_ranked`, `sources`, `summaries`, ...) rather than a
+    /// pretty-printed blob. The tool runs without any permission gate, so only
+    /// call it for read-only bifrost tools on harness initiative.
+    pub(crate) async fn call_bifrost_tool_raw(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let client = self
+            .mcp_tool_servers
+            .get(name)
+            .filter(|client| client.name() == "bifrost")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("bifrost tool '{name}' is not available"))?;
+        let args = match client.tools().iter().find(|tool| tool.name == name) {
+            Some(tool) => coerce_scalar_args_to_array(args, &tool.input_schema),
+            None => args,
+        };
+        client
+            .call_tool(name, args)
+            .await
+            .map_err(|err| anyhow::anyhow!("bifrost tool '{name}' failed: {err}"))
     }
 
     /// Execute a tool by name with JSON arguments.
@@ -1475,6 +1520,18 @@ mod tests {
         assert!(result.output.contains("reserved for harness use"));
         assert!(is_harness_only_mcp_tool("refresh"));
         assert!(!is_harness_only_mcp_tool("search_symbols"));
+    }
+
+    #[test]
+    fn semantic_search_description_is_overridden() {
+        let overridden = mcp_tool_description("semantic_search", "bifrost's raw description");
+        assert!(overridden.contains("relevance-ordered"));
+        assert_ne!(overridden, "bifrost's raw description");
+        // Other tools keep bifrost's description unchanged.
+        assert_eq!(
+            mcp_tool_description("search_symbols", "bifrost's raw description"),
+            "bifrost's raw description"
+        );
     }
 
     #[tokio::test]

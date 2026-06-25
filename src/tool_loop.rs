@@ -20,6 +20,7 @@ use crate::llm_client::{
     stream_chat_no_visible_output_with_retry,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
+use crate::semantic_rerank;
 use crate::session::{PermissionMode, SessionStore, ToolExchange};
 use crate::structured_output::StructuredOutputRequest;
 use crate::terminal_notifications::{
@@ -2461,6 +2462,27 @@ async fn execute_step_tool_calls(
                     .await;
                     turn_usage.add(nested_usage);
                     exec
+                } else if tool_name == "semantic_search" && registry.is_bifrost_tool("semantic_search")
+                {
+                    // Transparently rerank bifrost's raw three-list result with a
+                    // disposable LLM turn so the model sees a clean, relevance-ordered
+                    // hit list instead. Falls back to the raw payload on any failure.
+                    let outcome = semantic_rerank::rerank_semantic_search(
+                        llm,
+                        model,
+                        registry,
+                        messages,
+                        &parsed_input,
+                        idle_timeout,
+                        &cancel,
+                    )
+                    .await;
+                    turn_usage.add(outcome.usage);
+                    ToolExecution {
+                        output: outcome.output,
+                        failed: outcome.failed,
+                        sandbox_retry_available: false,
+                    }
                 } else {
                     trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
                     execute_tool(
