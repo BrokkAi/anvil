@@ -48,6 +48,7 @@ const AGENTS_SUBDIR: &str = "agents";
 pub struct AgentMeta {
     pub name: String,
     pub description: String,
+    pub max_turns: Option<usize>,
     pub location: PathBuf,
     #[allow(dead_code)]
     pub scope: AgentScope,
@@ -286,9 +287,9 @@ fn load_agent(
         }
     };
 
-    // Reuse the skills frontmatter parser: it extracts `{name, description}`,
-    // which is exactly what we need. Anything beyond (tools, model) is ignored
-    // in this v1.
+    // Reuse the skills frontmatter parser for the required fields. Optional
+    // subagent-specific fields are parsed locally below so older sandbox
+    // parser releases remain compatible.
     let parsed = match backend.parse_skill_frontmatter(front) {
         Ok(p) => p,
         Err(e) => {
@@ -359,12 +360,79 @@ fn load_agent(
         }
     };
 
+    let max_turns = match parse_max_turns(front) {
+        Ok(v) => v,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "subagent at '{}' has invalid `max_turns`/`maxTurns`: {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+
     reg.add(AgentMeta {
         name,
         description,
+        max_turns,
         location: path.to_path_buf(),
         scope,
     });
+}
+
+fn parse_max_turns(frontmatter: &str) -> Result<Option<usize>, String> {
+    let Some(raw_value) = find_top_level_scalar(frontmatter, "max_turns")
+        .or_else(|| find_top_level_scalar(frontmatter, "maxTurns"))
+    else {
+        return Ok(None);
+    };
+    let value = strip_inline_comment(raw_value).trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value)
+        .trim();
+    if value.is_empty() {
+        return Err("must be a positive integer".to_string());
+    }
+    let turns = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_string())?;
+    if turns == 0 {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(Some(turns))
+}
+
+fn find_top_level_scalar<'a>(frontmatter: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}:");
+    frontmatter.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.len() != line.len() || trimmed.starts_with('#') {
+            return None;
+        }
+        trimmed.strip_prefix(&prefix)
+    })
+}
+
+fn strip_inline_comment(value: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_was_backslash = false;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single && !prev_was_backslash => in_double = !in_double,
+            '#' if !in_single && !in_double => return &value[..idx],
+            _ => {}
+        }
+        prev_was_backslash = ch == '\\' && !prev_was_backslash;
+        if ch != '\\' {
+            prev_was_backslash = false;
+        }
+    }
+    value
 }
 
 /// Read just the body of a subagent file (frontmatter stripped). On any
@@ -475,6 +543,62 @@ mod tests {
         let meta = reg.get("hunter").unwrap();
         assert_eq!(meta.description, "Hunt for bugs");
         assert_eq!(meta.scope, AgentScope::User);
+        assert_eq!(meta.max_turns, None);
+    }
+
+    #[test]
+    fn max_turns_frontmatter_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home
+                .path()
+                .join(".claude")
+                .join("agents")
+                .join("bounded.md"),
+            "---\nname: bounded\ndescription: Bounded agent\nmax_turns: 7 # tight cap\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("bounded").unwrap();
+        assert_eq!(meta.max_turns, Some(7));
+    }
+
+    #[test]
+    fn max_turns_camel_case_alias_is_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home
+                .path()
+                .join(".claude")
+                .join("agents")
+                .join("bounded.md"),
+            "---\nname: bounded\ndescription: Bounded agent\nmaxTurns: '6'\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("bounded").unwrap();
+        assert_eq!(meta.max_turns, Some(6));
+    }
+
+    #[test]
+    fn invalid_max_turns_is_skipped_with_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write(
+            &home
+                .path()
+                .join(".claude")
+                .join("agents")
+                .join("bad-cap.md"),
+            "---\nname: bad-cap\ndescription: Bad cap\nmax_turns: none\n---\n\nbody\n",
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        assert!(reg.is_empty());
+        assert!(
+            reg.diagnostics().iter().any(|d| d.contains("max_turns")),
+            "{:?}",
+            reg.diagnostics()
+        );
     }
 
     #[test]

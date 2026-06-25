@@ -3670,7 +3670,7 @@ async fn execute_subagent(
     // 25 is enough for a well-scoped focused task; if the subagent
     // needs more, that's a sign the parent should have done the work
     // itself or split it differently.
-    let nested_max_turns = max_turns.min(MAX_SUBAGENT_TURNS);
+    let nested_max_turns = subagent_max_turns(max_turns, meta.max_turns);
 
     // `Box::pin` is required because `run` is recursive via this
     // function and Rust async fns can't be directly recursive (the
@@ -3714,6 +3714,11 @@ async fn execute_subagent(
         }
     };
     (exec, nested_usage)
+}
+
+fn subagent_max_turns(parent_max_turns: usize, agent_max_turns: Option<usize>) -> usize {
+    let global_cap = parent_max_turns.min(MAX_SUBAGENT_TURNS);
+    agent_max_turns.map_or(global_cap, |cap| global_cap.min(cap))
 }
 
 /// Send a `SessionNotification` and log on failure -- there is nothing
@@ -3882,6 +3887,19 @@ mod tests {
             .into_iter()
             .map(|index| calls[index].function.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn subagent_turn_budget_uses_global_cap_by_default() {
+        assert_eq!(subagent_max_turns(200, None), MAX_SUBAGENT_TURNS);
+        assert_eq!(subagent_max_turns(5, None), 5);
+    }
+
+    #[test]
+    fn subagent_turn_budget_honors_agent_cap() {
+        assert_eq!(subagent_max_turns(200, Some(9)), 9);
+        assert_eq!(subagent_max_turns(7, Some(9)), 7);
+        assert_eq!(subagent_max_turns(200, Some(50)), MAX_SUBAGENT_TURNS);
     }
 
     struct RetryBackend {

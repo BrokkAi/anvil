@@ -425,11 +425,16 @@ File format:
 ---
 name: bug-hunter
 description: Review a diff for concrete correctness bugs.
+max_turns: 8
 ---
 
 You are a meticulous code reviewer. Flag concrete bugs only.
 Return findings as `<path>:<line> - <one-line description>`.
 ```
+
+`max_turns` is optional. When present, it caps that subagent's tool-calling
+turns below the global subagent ceiling. `maxTurns` is accepted as an alias for
+compatibility with camelCase frontmatter.
 
 Discovery order:
 
@@ -445,7 +450,8 @@ Constraints:
 
 - Subagents inherit the parent session permission gate.
 - Nested delegation is disabled.
-- Each subagent call is capped at 25 tool-calling turns.
+- Each subagent call is capped at 25 tool-calling turns unless the subagent
+  frontmatter sets a lower `max_turns` value.
 - Intermediate subagent updates are silent; only the final answer returns to
   the parent conversation.
 - Cancelling the parent prompt cancels the active subagent.
