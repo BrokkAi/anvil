@@ -747,9 +747,12 @@ struct ThinkingConfig {
 }
 
 #[derive(Debug, Serialize)]
-struct ChatCompletionResponseFormat {
-    r#type: &'static str,
-    json_schema: NativeJsonSchemaFormat,
+#[serde(tag = "type")]
+enum ChatCompletionResponseFormat {
+    #[serde(rename = "json_schema")]
+    JsonSchema { json_schema: NativeJsonSchemaFormat },
+    #[serde(rename = "json_object")]
+    JsonObject,
 }
 
 #[derive(Debug, Serialize)]
@@ -831,6 +834,12 @@ enum ReasoningWire {
     /// DeepSeek: `thinking: { type: "enabled" }` + a top-level
     /// `reasoning_effort` on DeepSeek's `high`/`max` scale.
     DeepSeek,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredOutputWire {
+    JsonSchema,
+    JsonObject,
 }
 
 /// DeepSeek's two documented reasoning levels. DeepSeek's `/v1/models` is
@@ -1103,7 +1112,7 @@ pub struct OpenAiClient {
     /// How this client forwards reasoning effort on the wire (off, the
     /// unified object, or DeepSeek's thinking + top-level reasoning_effort).
     reasoning_wire: ReasoningWire,
-    supports_native_structured_output: bool,
+    structured_output_wire: StructuredOutputWire,
 }
 
 impl std::fmt::Debug for OpenAiClient {
@@ -1112,10 +1121,7 @@ impl std::fmt::Debug for OpenAiClient {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("reasoning_wire", &self.reasoning_wire)
-            .field(
-                "supports_native_structured_output",
-                &self.supports_native_structured_output,
-            )
+            .field("structured_output_wire", &self.structured_output_wire)
             .finish()
     }
 }
@@ -1187,7 +1193,6 @@ impl OpenAiClient {
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let openrouter_mode = base_url.contains("openrouter.ai");
-        let supports_native_structured_output = supports_native_structured_output(&base_url);
         let mut builder = Self::apply_runtime_tls_workarounds(
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -1210,7 +1215,11 @@ impl OpenAiClient {
             api_key,
             http,
             reasoning_wire: ReasoningWire::Off,
-            supports_native_structured_output,
+            // Default to OpenAI's strict JSON Schema response_format for
+            // OpenAI-compatible servers. Known exceptions can override the
+            // dialect in their constructor; hosted DeepSeek currently supports
+            // JSON mode only.
+            structured_output_wire: StructuredOutputWire::JsonSchema,
         }
     }
 
@@ -1237,6 +1246,7 @@ impl OpenAiClient {
     ) -> Self {
         let mut client = Self::with_default_headers(base_url, api_key, default_headers);
         client.reasoning_wire = ReasoningWire::DeepSeek;
+        client.structured_output_wire = StructuredOutputWire::JsonObject;
         client
     }
 
@@ -1463,21 +1473,19 @@ impl OpenAiClient {
                 None => (None, None, None),
             },
         };
-        let response_format = if self.supports_native_structured_output {
-            structured_output
-                .as_ref()
-                .map(crate::structured_output::native_response_format)
-                .map(|format| ChatCompletionResponseFormat {
-                    r#type: "json_schema",
+        let response_format = structured_output.as_ref().map(|request| {
+            let format = crate::structured_output::native_response_format(request);
+            match self.structured_output_wire {
+                StructuredOutputWire::JsonSchema => ChatCompletionResponseFormat::JsonSchema {
                     json_schema: NativeJsonSchemaFormat {
                         name: format.name,
                         schema: format.schema,
                         strict: format.strict,
                     },
-                })
-        } else {
-            None
-        };
+                },
+                StructuredOutputWire::JsonObject => ChatCompletionResponseFormat::JsonObject,
+            }
+        });
 
         let body = ChatCompletionRequest {
             model,
@@ -1523,10 +1531,6 @@ impl OpenAiClient {
 
         drive_sse_stream(stream, on_token, on_thought, cancel, idle_timeout).await
     }
-}
-
-fn supports_native_structured_output(base_url: &str) -> bool {
-    base_url.contains("api.openai.com") || base_url.contains("openrouter.ai")
 }
 
 /// Drive an SSE byte stream until the LLM emits `[DONE]` or the
@@ -1816,6 +1820,14 @@ mod tests {
     /// Capture the JSON body a client sends for one chat request via a mock
     /// server returning an empty SSE stream.
     async fn capture_request_body(wire: ReasoningWire, effort: Option<&str>) -> serde_json::Value {
+        capture_request_body_with_structured_output(wire, effort, None).await
+    }
+
+    async fn capture_request_body_with_structured_output(
+        wire: ReasoningWire,
+        effort: Option<&str>,
+        structured_output: Option<StructuredOutputRequest>,
+    ) -> serde_json::Value {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -1843,7 +1855,7 @@ mod tests {
                 tools: None,
                 reasoning_effort: effort.map(str::to_string),
                 temperature: None,
-                structured_output: None,
+                structured_output,
                 on_token,
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
@@ -1854,6 +1866,18 @@ mod tests {
         let requests = server.received_requests().await.expect("recorded requests");
         assert_eq!(requests.len(), 1);
         serde_json::from_slice(&requests[0].body).expect("body is JSON")
+    }
+
+    fn test_structured_output_request() -> StructuredOutputRequest {
+        StructuredOutputRequest {
+            schema_name: "audit_result".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"]
+            }),
+            allow_coercion: false,
+        }
     }
 
     /// DeepSeek wire sends `thinking: {type: enabled}` + a top-level
@@ -1875,6 +1899,44 @@ mod tests {
         assert!(body.get("thinking").is_none(), "{body}");
         assert!(body.get("reasoning_effort").is_none(), "{body}");
         assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn generic_openai_compatible_wire_sends_strict_json_schema_response_format() {
+        let body = capture_request_body_with_structured_output(
+            ReasoningWire::Off,
+            None,
+            Some(test_structured_output_request()),
+        )
+        .await;
+        assert_eq!(body["response_format"]["type"], "json_schema", "{body}");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"], "audit_result",
+            "{body}"
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["type"], "object",
+            "{body}"
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["strict"], true,
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_wire_sends_json_object_response_format_for_structured_output() {
+        let body = capture_request_body_with_structured_output(
+            ReasoningWire::DeepSeek,
+            None,
+            Some(test_structured_output_request()),
+        )
+        .await;
+        assert_eq!(body["response_format"]["type"], "json_object", "{body}");
+        assert!(
+            body["response_format"].get("json_schema").is_none(),
+            "{body}"
+        );
     }
 
     /// The unified wire still sends `reasoning: {effort}` verbatim and none
@@ -2444,8 +2506,7 @@ mod tests {
             reasoning: None,
             thinking: None,
             reasoning_effort: None,
-            response_format: Some(ChatCompletionResponseFormat {
-                r#type: "json_schema",
+            response_format: Some(ChatCompletionResponseFormat::JsonSchema {
                 json_schema: NativeJsonSchemaFormat {
                     name: format.name,
                     schema: format.schema,
