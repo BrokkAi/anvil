@@ -732,11 +732,24 @@ impl ToolRegistry {
             let names: Vec<String> = agents.iter_sorted().map(|m| m.name.clone()).collect();
             let catalog: String = agents
                 .iter_sorted()
-                .map(|m| match m.max_turns {
-                    Some(max_turns) => {
-                        format!("- {}: {} (max_turns: {max_turns})", m.name, m.description)
+                .map(|m| {
+                    let mut restrictions = Vec::new();
+                    if let Some(max_turns) = m.max_turns {
+                        restrictions.push(format!("max_turns: {max_turns}"));
                     }
-                    None => format!("- {}: {}", m.name, m.description),
+                    if let Some(tools) = &m.allowed_tools {
+                        restrictions.push(if tools.is_empty() {
+                            "tools: none".to_string()
+                        } else {
+                            format!("tools: {}", tools.join(", "))
+                        });
+                    }
+                    let restrictions = if restrictions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", restrictions.join("; "))
+                    };
+                    format!("- {}: {}{}", m.name, m.description, restrictions)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -753,25 +766,24 @@ impl ToolRegistry {
                 json!({
                     "type": "object",
                     "properties": {
-                        "subagent_type": {
-                            "type": "string",
-                            "enum": names,
-                            "description": "Name of the subagent from the catalog."
-                        },
                         "description": {
                             "type": "string",
-                            "description": "Short (3-5 word) label describing the delegation."
+                            "description": "A short description of the delegated task."
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "Self-contained task prompt for the subagent."
+                            "description": "A complete, self-contained prompt for the subagent."
+                        },
+                        "subagent_type": {
+                            "type": "string",
+                            "enum": names,
+                            "description": "Exact subagent name from the catalog."
                         }
                     },
-                    "required": ["subagent_type", "description", "prompt"]
+                    "required": ["description", "prompt", "subagent_type"]
                 }),
             ));
         }
-
         defs
     }
 
@@ -1845,6 +1857,7 @@ mod tests {
                 name: "doc-writer".into(),
                 description: "Drafts docs from code".into(),
                 max_turns: Some(7),
+                allowed_tools: Some(vec!["grep_search".into(), "read_file".into()]),
                 location: PathBuf::from("/tmp/doc-writer.md"),
                 scope: AgentScope::Project,
             },
@@ -1852,6 +1865,7 @@ mod tests {
                 name: "bug-hunter".into(),
                 description: "Hunts for regressions".into(),
                 max_turns: None,
+                allowed_tools: None,
                 location: PathBuf::from("/tmp/bug-hunter.md"),
                 scope: AgentScope::User,
             },
@@ -1881,6 +1895,12 @@ mod tests {
         );
         assert!(task_def.function.description.contains("bug-hunter"));
         assert!(task_def.function.description.contains("max_turns: 7"));
+        assert!(
+            task_def
+                .function
+                .description
+                .contains("tools: grep_search, read_file")
+        );
     }
 
     /// MCP schemas often ask for arrays. The host must wrap scalar strings into
