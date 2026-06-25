@@ -378,17 +378,23 @@ impl SessionMode {
 /// plus Anvil's explicit model-classified approval mode.
 /// Surfaced to clients as a `SessionConfigOption` (its own dropdown), independent
 /// of `SessionMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionMode {
+    #[serde(rename = "default")]
     Default,
     /// Like Default, but promptable tool calls may be approved by the
     /// permission scope classifier when clearly inside the user's request.
+    #[serde(rename = "auto")]
+    #[default]
     Auto,
+    #[serde(rename = "acceptEdits")]
     AcceptEdits,
     /// Hard read-only: refuses every Edit / Delete / Move / Execute tool call.
     /// Renamed from the reference's "plan" to avoid colliding with Brokk's
     /// PLAN behavior mode (LUTZ/CODE/ASK/PLAN), which is a separate dropdown.
+    #[serde(rename = "readOnly")]
     ReadOnly,
+    #[serde(rename = "bypassPermissions")]
     BypassPermissions,
 }
 
@@ -682,7 +688,7 @@ impl Session {
     ) -> Self {
         let now = current_timestamp_millis();
         let mode = SessionMode::Lutz;
-        let permission_mode = PermissionMode::Default;
+        let permission_mode = PermissionMode::default();
         let manifest = SessionManifest {
             id: id.clone(),
             name,
@@ -777,7 +783,7 @@ impl Session {
             model,
             history,
             manifest,
-            permission_mode: PermissionMode::Default,
+            permission_mode: PermissionMode::default(),
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
@@ -2365,6 +2371,19 @@ impl SessionStore {
         }
     }
 
+    fn remember_last_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_permission_mode = Some(mode);
+                Ok(())
+            }
+            None => crate::setup_state::remember_last_permission_mode(mode),
+        }
+    }
+
     fn remember_sandbox_mode(
         &self,
         mode: Option<crate::sandbox_backend::SandboxMode>,
@@ -2593,6 +2612,7 @@ impl SessionStore {
             default_reasoning_effort.or(prefs.last_reasoning_effort),
             &catalog,
         );
+        let permission_mode = prefs.last_permission_mode.unwrap_or_default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let mut session = match sandbox_mode {
             Some(mode) => Session::new_with_sandbox_mode(
@@ -2612,6 +2632,7 @@ impl SessionStore {
         session.mcp_servers = mcp_servers.clone();
         session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
+        session.permission_mode = permission_mode;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
@@ -2726,6 +2747,7 @@ impl SessionStore {
         };
 
         let prefs = self.setup_state_snapshot();
+        let permission_mode = prefs.last_permission_mode.unwrap_or_default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let loaded_session = match sandbox_mode {
             Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
@@ -2753,6 +2775,7 @@ impl SessionStore {
                 return false;
             }
         };
+        session.permission_mode = permission_mode;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
             let _lifecycle = self.lifecycle_lock.lock().await;
@@ -3079,16 +3102,35 @@ impl SessionStore {
     }
 
     /// Update the session's permission mode. Returns false if the session is unknown.
-    /// Permission mode is intentionally session-only (not persisted to the manifest).
+    /// Permission mode is intentionally not persisted to the workspace manifest;
+    /// the last explicit user choice is saved in trusted setup state for future
+    /// sessions and cold reloads.
+    ///
+    /// `BypassPermissions` is deliberately excluded from persistence: the
+    /// fully-trusting mode requires a fresh opt-in each session, so selecting it
+    /// updates the live session only and never seeds future sessions or cold
+    /// reloads (nor does it overwrite a previously saved non-bypass preference).
     pub async fn set_permission_mode(&self, id: &str, permission_mode: PermissionMode) -> bool {
-        let mut sessions = self.sessions.write().await;
-        match sessions.get_mut(id) {
-            Some(session) => {
-                session.permission_mode = permission_mode;
-                true
+        let updated = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get_mut(id) {
+                Some(session) => {
+                    session.permission_mode = permission_mode;
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        if updated
+            && !matches!(permission_mode, PermissionMode::BypassPermissions)
+            && let Err(e) = self.remember_last_permission_mode(permission_mode)
+        {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist last permission preference: {e:#}"
+            );
         }
+        updated
     }
 
     /// Read the current permission_mode for a session. Returns None if unknown.
@@ -4081,7 +4123,7 @@ mod tests {
         )
         .expect("matching ids should succeed");
 
-        assert_eq!(session.permission_mode, PermissionMode::Default);
+        assert_eq!(session.permission_mode, PermissionMode::default());
         assert!(session.always_allow_tools.is_empty());
         assert!(session.always_allow_order.is_empty());
 
@@ -4705,6 +4747,27 @@ mod tests {
         );
     }
 
+    /// A persisted install-level permission preference should seed the next
+    /// new session, but still come from trusted setup state rather than the
+    /// workspace session zip.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_reuses_persisted_permission_mode() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_permission_mode(PermissionMode::ReadOnly)
+            .expect("persist permission preference");
+
+        let store = SessionStore::new("model-a".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        assert_eq!(session.permission_mode, PermissionMode::ReadOnly);
+        assert_eq!(
+            store.permission_mode(&session.id).await,
+            Some(PermissionMode::ReadOnly)
+        );
+    }
+
     /// `get_session` for an unknown id (with no on-disk zip either) must
     /// return None, not panic or allocate a session under the wrong id.
     #[tokio::test]
@@ -4746,7 +4809,7 @@ mod tests {
             .expect("session must reload from disk");
         assert_eq!(reloaded.id, id);
         assert_eq!(reloaded.mode, SessionMode::Plan);
-        assert_eq!(reloaded.permission_mode, PermissionMode::Default);
+        assert_eq!(reloaded.permission_mode, PermissionMode::default());
         assert!(reloaded.sandbox_mode.is_none());
         assert!(reloaded.always_allow_tools.is_empty());
         assert!(reloaded.always_allow_order.is_empty());
@@ -4823,11 +4886,12 @@ mod tests {
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
     }
 
-    /// Transient setup mode keeps model/reasoning/sandbox choices process-local:
-    /// they seed later sessions and cold reloads in this `SessionStore`, but the
-    /// on-disk setup file is neither read nor written for those preferences.
+    /// Transient setup mode keeps model/reasoning/permission/sandbox choices
+    /// process-local: they seed later sessions and cold reloads in this
+    /// `SessionStore`, but the on-disk setup file is neither read nor written
+    /// for those preferences.
     #[tokio::test(flavor = "current_thread")]
-    async fn transient_setup_keeps_model_and_sandbox_preferences_in_memory_only() {
+    async fn transient_setup_keeps_model_sandbox_and_permission_preferences_in_memory_only() {
         use crate::llm_client::ReasoningLevelPreset;
         use crate::sandbox_backend::SandboxMode;
 
@@ -4840,6 +4904,8 @@ mod tests {
         .expect("seed persistent model preference");
         crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Wasm))
             .expect("seed persistent sandbox preference");
+        crate::setup_state::remember_last_permission_mode(PermissionMode::ReadOnly)
+            .expect("seed persistent permission preference");
 
         let store = SessionStore::with_limits_and_transient_setup(
             "default-model".to_string(),
@@ -4890,10 +4956,20 @@ mod tests {
             first.sandbox_mode, None,
             "transient stores must ignore persisted sandbox preferences"
         );
+        assert_eq!(
+            first.permission_mode,
+            PermissionMode::Auto,
+            "transient stores must ignore persisted permission preferences"
+        );
 
         assert!(
             store
                 .set_sandbox_mode(&first.id, Some(SandboxMode::Off))
+                .await
+        );
+        assert!(
+            store
+                .set_permission_mode(&first.id, PermissionMode::AcceptEdits)
                 .await
         );
         let (ok, cleared) = store
@@ -4912,6 +4988,7 @@ mod tests {
         assert_eq!(next.model, "runtime-model");
         assert_eq!(next.selected_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(next.sandbox_mode, Some(SandboxMode::Off));
+        assert_eq!(next.permission_mode, PermissionMode::AcceptEdits);
 
         assert_eq!(
             crate::setup_state::read().last_model.as_deref(),
@@ -4923,6 +5000,11 @@ mod tests {
             Some(SandboxMode::Wasm),
             "transient choices must not overwrite setup.json sandbox preference"
         );
+        assert_eq!(
+            crate::setup_state::read().last_permission_mode,
+            Some(PermissionMode::ReadOnly),
+            "transient choices must not overwrite setup.json permission preference"
+        );
 
         store.sessions.write().await.remove(&first.id);
         store.registries.write().await.remove(&first.id);
@@ -4931,6 +5013,7 @@ mod tests {
             .await
             .expect("session must reload from disk");
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
+        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
     }
 
     /// Existing sessions should pick up sandbox changes written by another
@@ -4958,7 +5041,7 @@ mod tests {
         assert_eq!(store.sandbox_mode(&id).await, Some(None));
     }
 
-    /// Permission-mode setters/getters round-trip, default to `Default`,
+    /// Permission-mode setters/getters round-trip, default to `Auto`,
     /// and report `false` for unknown sessions instead of silently
     /// inserting an entry.
     #[tokio::test]
@@ -4970,10 +5053,7 @@ mod tests {
         let id = session.id.clone();
 
         // Defaults out of the box.
-        assert_eq!(
-            store.permission_mode(&id).await,
-            Some(PermissionMode::Default)
-        );
+        assert_eq!(store.permission_mode(&id).await, Some(PermissionMode::Auto));
 
         assert!(
             store
@@ -4994,6 +5074,126 @@ mod tests {
         assert_eq!(store.permission_mode("no-such").await, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Permission mode is not trusted from the workspace session zip, but the
+    /// last explicit user choice should seed future sessions and cold reloads
+    /// through trusted setup state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn permission_mode_setter_seeds_future_sessions_and_cold_reloads() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first = store.create_session(cwd.path().to_path_buf()).await;
+        let id = first.id.clone();
+        assert_eq!(store.permission_mode(&id).await, Some(PermissionMode::Auto));
+
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::AcceptEdits)
+                .await
+        );
+        assert_eq!(
+            crate::setup_state::read().last_permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
+
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.permission_mode, PermissionMode::AcceptEdits);
+
+        store.sessions.write().await.remove(&id);
+        store.registries.write().await.remove(&id);
+
+        let reloaded = store
+            .get_session(&id, cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
+    }
+
+    /// Unknown sessions should be a no-op and must not update the trusted
+    /// install-level permission preference.
+    #[tokio::test(flavor = "current_thread")]
+    async fn permission_mode_unknown_session_does_not_persist_preference() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+
+        assert!(
+            !store
+                .set_permission_mode("no-such", PermissionMode::ReadOnly)
+                .await
+        );
+        assert_eq!(crate::setup_state::read().last_permission_mode, None);
+    }
+
+    /// Selecting `BypassPermissions` updates the live session but must never be
+    /// persisted as the install-level preference: the fully-trusting mode
+    /// requires a fresh opt-in each session. Other modes still persist, and a
+    /// bypass selection must not clobber an existing non-bypass preference.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_permission_mode_does_not_persist_bypass() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first = store.create_session(cwd.path().to_path_buf()).await;
+        let id = first.id.clone();
+
+        // Bypass with no prior preference: the live session changes, but the
+        // trusted setup state stays empty.
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::BypassPermissions)
+                .await
+        );
+        assert_eq!(
+            store.permission_mode(&id).await,
+            Some(PermissionMode::BypassPermissions)
+        );
+        assert_eq!(crate::setup_state::read().last_permission_mode, None);
+
+        // A fresh session falls back to the safe default, never bypass.
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.permission_mode, PermissionMode::Auto);
+
+        // A non-bypass mode still persists ...
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::AcceptEdits)
+                .await
+        );
+        assert_eq!(
+            crate::setup_state::read().last_permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
+
+        // ... and a later bypass must not overwrite it.
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::BypassPermissions)
+                .await
+        );
+        assert_eq!(
+            crate::setup_state::read().last_permission_mode,
+            Some(PermissionMode::AcceptEdits),
+            "bypass must not overwrite the persisted preference"
+        );
+
+        // A cold reload of the bypass session falls back to the last persisted
+        // non-bypass mode, never bypass.
+        store.sessions.write().await.remove(&id);
+        store.registries.write().await.remove(&id);
+        let reloaded = store
+            .get_session(&id, cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
     }
 
     /// Remembered approvals persist per repo and survive new sessions in that repo.

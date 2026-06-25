@@ -439,8 +439,7 @@ fn render_candidate_for_prompt(candidate: &Candidate) -> String {
 /// Resolve the model's selected ids back to candidates, preserving the model's
 /// order and dropping unknown/duplicate ids.
 fn order_candidates<'a>(candidates: &'a [Candidate], selected: &[String]) -> Vec<&'a Candidate> {
-    let by_id: HashMap<&str, &Candidate> =
-        candidates.iter().map(|c| (c.id.as_str(), c)).collect();
+    let by_id: HashMap<&str, &Candidate> = candidates.iter().map(|c| (c.id.as_str(), c)).collect();
     let mut seen: HashMap<&str, ()> = HashMap::new();
     let mut ordered = Vec::new();
     for id in selected {
@@ -645,7 +644,10 @@ mod tests {
         );
         // Non-JSON / fenced output does not parse; the caller falls back to
         // raw passthrough.
-        assert_eq!(parse_selected_ids("```json\n{\"relevant\": [\"s3\"]}\n```"), None);
+        assert_eq!(
+            parse_selected_ids("```json\n{\"relevant\": [\"s3\"]}\n```"),
+            None
+        );
         assert_eq!(parse_selected_ids("no json here"), None);
     }
 

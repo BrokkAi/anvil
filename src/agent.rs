@@ -1853,7 +1853,7 @@ pub async fn run_agent(
                     let permission_mode = sessions_prompt
                         .permission_mode(&session_id)
                         .await
-                        .unwrap_or(PermissionMode::Default);
+                        .unwrap_or_default();
                     let available_models = sessions_prompt.available_model_metadata().await;
                     let report = render_context_report(&snap, permission_mode, &available_models);
                     send_message(&cx, &session_id, &report);
@@ -1943,7 +1943,7 @@ pub async fn run_agent(
                     let permission_mode = sessions_prompt
                         .permission_mode(&session_id)
                         .await
-                        .unwrap_or(PermissionMode::Default);
+                        .unwrap_or_default();
                     let sandbox_mode = sessions_prompt.sandbox_mode(&session_id).await.flatten();
                     // Reuse the per-session ToolRegistry so shell calls
                     // route through the same `run_shell_command` dispatch
@@ -3016,7 +3016,7 @@ async fn run_loop_iteration(
         let permission_mode = sessions
             .permission_mode(session_id)
             .await
-            .unwrap_or(PermissionMode::Default);
+            .unwrap_or_default();
         let available_models = sessions.available_model_metadata().await;
         send_message(
             cx,
@@ -3084,7 +3084,7 @@ async fn run_loop_iteration(
         let permission_mode = sessions
             .permission_mode(session_id)
             .await
-            .unwrap_or(PermissionMode::Default);
+            .unwrap_or_default();
         let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
         let Some(registry) = sessions
             .get_or_create_registry(session_id, snap.cwd.clone())
