@@ -579,11 +579,17 @@ async fn apply_config_option(
                     supported: known,
                 });
             }
-            let (ok, cleared) = sessions.set_model(session_id, value.to_string()).await;
-            if !ok {
-                return Err(ConfigApplyError::UnknownSession);
+            match sessions.set_model(session_id, value.to_string()).await {
+                Ok((true, cleared)) => {
+                    cleared_reasoning = cleared;
+                }
+                Ok((false, _)) => return Err(ConfigApplyError::UnknownSession),
+                Err(e) => {
+                    return Err(ConfigApplyError::PersistFailed {
+                        details: format!("{e:#}"),
+                    });
+                }
             }
-            cleared_reasoning = cleared;
         }
         REASONING_EFFORT_CONFIG_ID => {
             // Empty string or the "(default)" sentinel both mean "clear my
@@ -9314,11 +9320,18 @@ mod tests {
     /// Build a `SessionStore` with one session for the apply/render tests
     /// below. The cwd is randomized so concurrent test runs don't clobber.
     async fn make_store_with_session(default_model: &str) -> (SessionStore, String) {
+        let (store, id, _cwd) = make_store_with_session_and_cwd(default_model).await;
+        (store, id)
+    }
+
+    async fn make_store_with_session_and_cwd(
+        default_model: &str,
+    ) -> (SessionStore, String, PathBuf) {
         let store = SessionStore::new(default_model.to_string());
         let cwd =
             std::env::temp_dir().join(format!("brokk-acp-configure-{}", uuid::Uuid::new_v4()));
-        let session = store.create_session(cwd).await;
-        (store, session.id)
+        let session = store.create_session(cwd.clone()).await;
+        (store, session.id, cwd)
     }
 
     #[test]
@@ -9450,6 +9463,30 @@ mod tests {
             .await
             .expect("session present");
         assert_eq!(snap.model, "custom/model");
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_reports_model_persistence_failure() {
+        let (store, id, cwd) = make_store_with_session_and_cwd("initial").await;
+        std::fs::remove_dir_all(&cwd).expect("remove persisted session zip parent");
+
+        let err = apply_config_option(&store, &id, MODEL_CONFIG_ID, "custom/model")
+            .await
+            .expect_err("missing session zip should surface as persistence failure");
+
+        match err {
+            ConfigApplyError::PersistFailed { details } => {
+                let lower = details.to_lowercase();
+                assert!(
+                    lower.contains("cannot resolve")
+                        || lower.contains("failed")
+                        || lower.contains("no such file")
+                        || lower.contains("file not found"),
+                    "unexpected persistence details: {details}"
+                );
+            }
+            other => panic!("expected PersistFailed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
