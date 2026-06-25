@@ -22,9 +22,17 @@ pub struct SetupState {
     pub last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_optional"
+    )]
     pub last_permission_mode: Option<crate::session::PermissionMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_optional"
+    )]
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     /// Legacy install-wide approvals from older builds. Current builds use
     /// repo-local `.brokk/permissions.json` instead, but we still deserialize
@@ -33,6 +41,24 @@ pub struct SetupState {
     pub always_allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
+}
+
+/// Deserialize an optional enum field leniently: a value this build does not
+/// recognize degrades to `None` instead of failing the whole `SetupState`
+/// deserialization. Without this, `read_inner`'s `unwrap_or_default()` would
+/// reset every preference (model, sandbox, MCP servers, ...) to default on
+/// encountering a single unknown enum value -- e.g. after a downgrade that
+/// no longer knows a newer mode. Absent fields are handled by
+/// `#[serde(default)]` and never reach this function.
+fn deserialize_lenient_optional<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -199,6 +225,55 @@ fn write_inner(state: &SetupState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unrecognized value for one enum preference must degrade to `None`
+    /// without discarding the rest of the setup state. Before the lenient
+    /// deserializer, a single unknown enum value failed the whole-struct parse,
+    /// and `read_inner`'s `unwrap_or_default()` then wiped `last_model`,
+    /// the other enum preference, and the user's MCP server list.
+    #[test]
+    fn unknown_enum_value_degrades_to_none_and_preserves_siblings() {
+        use crate::sandbox_backend::SandboxMode;
+        use crate::session::PermissionMode;
+
+        let state = SetupState {
+            last_model: Some("keep-me".to_string()),
+            last_permission_mode: Some(PermissionMode::AcceptEdits),
+            last_sandbox_mode: Some(SandboxMode::Wasm),
+            mcp_servers: Some(vec![crate::mcp::McpServerConfig {
+                name: "bifrost".to_string(),
+                command: "bifrost".to_string(),
+                args: Vec::new(),
+                env: Vec::new(),
+                framing: crate::mcp::McpFraming::Line,
+                enabled: true,
+            }]),
+            ..SetupState::default()
+        };
+
+        // Corrupt only the permission mode with a value this build cannot parse.
+        let mut json = serde_json::to_value(&state).expect("serialize setup state");
+        json["last_permission_mode"] = serde_json::Value::String("plan".to_string());
+        let parsed: SetupState =
+            serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
+        assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
+        assert_eq!(parsed.last_permission_mode, None);
+        assert_eq!(parsed.last_sandbox_mode, Some(SandboxMode::Wasm));
+        assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
+
+        // The same tolerance applies to the sandbox-mode field.
+        let mut json = serde_json::to_value(&state).expect("serialize setup state");
+        json["last_sandbox_mode"] = serde_json::Value::String("quantum".to_string());
+        let parsed: SetupState =
+            serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
+        assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
+        assert_eq!(parsed.last_sandbox_mode, None);
+        assert_eq!(
+            parsed.last_permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
+        assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
+    }
 
     #[test]
     fn read_mcp_servers_migrates_default_bifrost_command_to_managed_binary() {
