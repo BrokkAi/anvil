@@ -429,6 +429,13 @@ impl PermissionMode {
 pub struct ConversationTurn {
     pub user_prompt: String,
     pub agent_response: String,
+    /// Faithful replay sequence for the assistant side of this turn.
+    ///
+    /// `tool_exchanges` is intentionally retained as the legacy flat
+    /// summary used by training heuristics and older zips. When this
+    /// sequence is present, prompt replay uses it instead so multi-round
+    /// assistant/tool ordering is preserved.
+    pub replay_events: Vec<TurnReplayEvent>,
     /// Tool calls executed during this turn, paired 1:1 with their results
     /// in chronological order. Empty for text-only turns.
     ///
@@ -468,7 +475,7 @@ pub struct ConversationTurn {
 /// Kept transport-agnostic (no `ChatMessage` dependency) so `session.rs`
 /// stays decoupled from the LLM client. Conversion to `ChatMessage`
 /// happens at the agent's prompt-replay call site.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolExchange {
     /// Provider-supplied id (`call.id` in the OpenAI tool-calling shape)
     /// used to pair the assistant's tool_call with its tool_result message
@@ -481,6 +488,75 @@ pub struct ToolExchange {
     /// Output the tool returned, post-truncation to `MAX_TOOL_RESULT_BYTES`,
     /// matching what was fed to the LLM during the original turn.
     pub result: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallReplay {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnReplayEvent {
+    AssistantToolCalls {
+        text: String,
+        calls: Vec<ToolCallReplay>,
+    },
+    ToolResult(ToolExchange),
+    AssistantText {
+        text: String,
+    },
+}
+
+pub fn sanitize_replay_events(events: &[TurnReplayEvent]) -> Vec<TurnReplayEvent> {
+    let mut sanitized = Vec::new();
+    let mut i = 0usize;
+    while i < events.len() {
+        match &events[i] {
+            TurnReplayEvent::AssistantText { text } => {
+                if !text.is_empty() {
+                    sanitized.push(TurnReplayEvent::AssistantText { text: text.clone() });
+                }
+                i += 1;
+            }
+            TurnReplayEvent::AssistantToolCalls { text, calls } => {
+                let mut j = i + 1;
+                let mut results = Vec::new();
+                while j < events.len() {
+                    match &events[j] {
+                        TurnReplayEvent::ToolResult(exchange) => {
+                            results.push(exchange.clone());
+                            j += 1;
+                        }
+                        TurnReplayEvent::AssistantToolCalls { .. }
+                        | TurnReplayEvent::AssistantText { .. } => break,
+                    }
+                }
+
+                let complete = calls.len() == results.len()
+                    && calls.iter().all(|call| {
+                        results
+                            .iter()
+                            .filter(|result| result.call_id == call.call_id)
+                            .count()
+                            == 1
+                    });
+                if complete {
+                    sanitized.push(TurnReplayEvent::AssistantToolCalls {
+                        text: text.clone(),
+                        calls: calls.clone(),
+                    });
+                    sanitized.extend(results.into_iter().map(TurnReplayEvent::ToolResult));
+                } else if !text.is_empty() {
+                    sanitized.push(TurnReplayEvent::AssistantText { text: text.clone() });
+                }
+                i = j;
+            }
+            TurnReplayEvent::ToolResult(_) => i += 1,
+        }
+    }
+    sanitized
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,11 +1397,17 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
         }
 
         for task in visit {
-            // Walk the messages array first to pick up any tool exchanges,
-            // even when markdownContentId is the source of agent_response.
-            // Tool exchanges are persisted in `messages` regardless of the
-            // markdown shortcut (which only stores the final text).
-            let exchanges = read_tool_exchanges_from_messages(task, &content_map);
+            // Walk the messages array first to pick up replay events and
+            // flat tool exchanges, even when markdownContentId is the source
+            // of agent_response. Newer zips preserve the full assistant /
+            // tool ordering; older zips degrade to the legacy flat exchange
+            // list.
+            let replay_events = read_replay_events_from_messages(task, &content_map);
+            let exchanges = if replay_events.is_empty() {
+                read_tool_exchanges_from_messages(task, &content_map)
+            } else {
+                tool_exchanges_from_replay_events(&replay_events)
+            };
 
             // Resolve this fragment's persisted summary, if any. The
             // fragment self-identifies via its `id` field (which equals
@@ -1364,6 +1446,7 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                 turns.push(ConversationTurn {
                     user_prompt,
                     agent_response: text.clone(),
+                    replay_events,
                     tool_exchanges: exchanges,
                     structured_output,
                     summary,
@@ -1398,6 +1481,7 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                     turns.push(ConversationTurn {
                         user_prompt: user_text,
                         agent_response: assistant_text,
+                        replay_events: replay_events.clone(),
                         tool_exchanges: exchanges,
                         structured_output: structured_output.clone(),
                         summary: summary.clone(),
@@ -1502,6 +1586,128 @@ fn read_summary_content_ids_from_zip(zip_path: &Path) -> HashMap<String, String>
         }
     }
     out
+}
+
+fn tool_exchanges_from_replay_events(events: &[TurnReplayEvent]) -> Vec<ToolExchange> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TurnReplayEvent::ToolResult(exchange) => Some(exchange.clone()),
+            TurnReplayEvent::AssistantToolCalls { .. } | TurnReplayEvent::AssistantText { .. } => {
+                None
+            }
+        })
+        .collect()
+}
+
+fn read_replay_events_from_messages(
+    task: &serde_json::Value,
+    content_map: &HashMap<String, String>,
+) -> Vec<TurnReplayEvent> {
+    let Some(messages) = task.get("brokkReplayMessages").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut calls_by_id: HashMap<String, ToolCallReplay> = HashMap::new();
+    let mut result_ids: HashSet<String> = HashSet::new();
+    for msg in messages {
+        match msg.get("role").and_then(|v| v.as_str()) {
+            Some("tool_call") => {
+                if let Some(call) = read_tool_call_replay(msg, content_map) {
+                    calls_by_id.insert(call.call_id.clone(), call);
+                }
+            }
+            Some("tool_result") => {
+                if let Some(call_id) = msg.get("toolCallId").and_then(|v| v.as_str()) {
+                    result_ids.insert(call_id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut i = 0usize;
+    while i < messages.len() {
+        let msg = &messages[i];
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        match role {
+            "ai" => {
+                let text = read_content_field(msg, "contentId", content_map);
+                let mut calls = Vec::new();
+                let mut j = i + 1;
+                while j < messages.len()
+                    && messages[j].get("role").and_then(|v| v.as_str()) == Some("tool_call")
+                {
+                    if let Some(call) = read_tool_call_replay(&messages[j], content_map) {
+                        if !result_ids.contains(&call.call_id) {
+                            return Vec::new();
+                        }
+                        calls.push(call);
+                    }
+                    j += 1;
+                }
+                if calls.is_empty() {
+                    if !text.is_empty() {
+                        events.push(TurnReplayEvent::AssistantText { text });
+                    }
+                    i += 1;
+                } else {
+                    events.push(TurnReplayEvent::AssistantToolCalls { text, calls });
+                    i = j;
+                }
+            }
+            "tool_call" => i += 1,
+            "tool_result" => {
+                let Some(call_id) = msg.get("toolCallId").and_then(|v| v.as_str()) else {
+                    i += 1;
+                    continue;
+                };
+                if let Some(call) = calls_by_id.get(call_id) {
+                    events.push(TurnReplayEvent::ToolResult(ToolExchange {
+                        call_id: call.call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        arguments: call.arguments.clone(),
+                        result: read_content_field(msg, "contentId", content_map),
+                    }));
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    sanitize_replay_events(&events)
+}
+
+fn read_tool_call_replay(
+    msg: &serde_json::Value,
+    content_map: &HashMap<String, String>,
+) -> Option<ToolCallReplay> {
+    let call_id = msg.get("toolCallId").and_then(|v| v.as_str())?;
+    let tool_name = msg
+        .get("toolName")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    Some(ToolCallReplay {
+        call_id: call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        arguments: read_content_field(msg, "argumentsContentId", content_map),
+    })
+}
+
+fn read_content_field(
+    msg: &serde_json::Value,
+    field: &str,
+    content_map: &HashMap<String, String>,
+) -> String {
+    msg.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|content_id| content_map.get(content_id))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Walk a task fragment's `messages` array and pair `tool_call` entries
@@ -1866,19 +2072,12 @@ fn append_turn_to_zip(
         .as_ref()
         .map(|_| uuid::Uuid::new_v4().to_string());
 
-    // Build the messages array: user message, then tool_call/tool_result
-    // pairs (one of each per exchange) interleaved per the OpenAI wire
-    // shape, then the final ai message. Each tool_call's argument string
-    // and each tool_result's output get their own content/*.txt entry so
-    // the messages JSON stays compact even for large outputs.
-    //
-    // `tool_exchange_content` collects (content_id, text) pairs to write
-    // after the manifest/fragments rewrite below; we accumulate now so
-    // we don't have to walk the exchanges twice.
+    // Keep the Brokk-compatible visible messages in the legacy flat shape,
+    // and store faithful model replay separately under `brokkReplayMessages`.
     let mut messages_json = vec![serde_json::json!(
         {"role": "user", "contentId": user_content_id}
     )];
-    let mut tool_exchange_content: Vec<(String, String)> = Vec::new();
+    let mut message_content: Vec<(String, String)> = Vec::new();
     for exchange in &turn.tool_exchanges {
         let arguments_content_id = uuid::Uuid::new_v4().to_string();
         let result_content_id = uuid::Uuid::new_v4().to_string();
@@ -1894,28 +2093,79 @@ fn append_turn_to_zip(
             "toolName": exchange.tool_name,
             "contentId": result_content_id,
         }));
-        tool_exchange_content.push((arguments_content_id, exchange.arguments.clone()));
-        tool_exchange_content.push((result_content_id, exchange.result.clone()));
+        message_content.push((arguments_content_id, exchange.arguments.clone()));
+        message_content.push((result_content_id, exchange.result.clone()));
     }
     messages_json.push(serde_json::json!(
         {"role": "ai", "contentId": response_content_id}
     ));
 
+    let replay_events = sanitize_replay_events(&turn.replay_events);
+    let mut replay_messages_json = Vec::new();
+    if !replay_events.is_empty() {
+        for event in replay_events {
+            match event {
+                TurnReplayEvent::AssistantToolCalls { text, calls } => {
+                    let text_content_id = uuid::Uuid::new_v4().to_string();
+                    message_content.push((text_content_id.clone(), text.clone()));
+                    replay_messages_json.push(serde_json::json!({
+                        "role": "ai",
+                        "contentId": text_content_id,
+                    }));
+                    for call in calls {
+                        let arguments_content_id = uuid::Uuid::new_v4().to_string();
+                        replay_messages_json.push(serde_json::json!({
+                            "role": "tool_call",
+                            "toolCallId": call.call_id,
+                            "toolName": call.tool_name,
+                            "argumentsContentId": arguments_content_id,
+                        }));
+                        message_content.push((arguments_content_id, call.arguments.clone()));
+                    }
+                }
+                TurnReplayEvent::ToolResult(exchange) => {
+                    let result_content_id = uuid::Uuid::new_v4().to_string();
+                    replay_messages_json.push(serde_json::json!({
+                        "role": "tool_result",
+                        "toolCallId": exchange.call_id,
+                        "toolName": exchange.tool_name,
+                        "contentId": result_content_id,
+                    }));
+                    message_content.push((result_content_id, exchange.result.clone()));
+                }
+                TurnReplayEvent::AssistantText { text } => {
+                    let text_content_id = uuid::Uuid::new_v4().to_string();
+                    message_content.push((text_content_id.clone(), text.clone()));
+                    replay_messages_json.push(serde_json::json!({
+                        "role": "ai",
+                        "contentId": text_content_id,
+                    }));
+                }
+            }
+        }
+    }
+
     if let Some(tasks) = existing_fragments
         .get_mut("task")
         .and_then(|t| t.as_object_mut())
     {
-        tasks.insert(
-            task_fragment_id.clone(),
-            serde_json::json!({
-                "id": task_fragment_id,
-                "messages": messages_json,
-                "taskDescription": null,
-                "markdownContentId": response_content_id,
-                "structuredOutputContentId": structured_output_content_id,
-                "escapeHtml": false
-            }),
-        );
+        let mut task_json = serde_json::json!({
+            "id": task_fragment_id,
+            "messages": messages_json,
+            "taskDescription": null,
+            "markdownContentId": response_content_id,
+            "structuredOutputContentId": structured_output_content_id,
+            "escapeHtml": false
+        });
+        if !replay_messages_json.is_empty()
+            && let Some(obj) = task_json.as_object_mut()
+        {
+            obj.insert(
+                "brokkReplayMessages".to_string(),
+                serde_json::Value::Array(replay_messages_json),
+            );
+        }
+        tasks.insert(task_fragment_id.clone(), task_json);
     }
 
     let new_context = serde_json::json!({
@@ -1974,10 +2224,10 @@ fn append_turn_to_zip(
         writer.start_file(format!("content/{response_content_id}.txt"), options)?;
         writer.write_all(turn.agent_response.as_bytes())?;
 
-        // Tool-exchange args + results: one content/*.txt file per blob,
+        // Message/replay args + results/text: one content/*.txt file per blob,
         // keyed by the ids we assigned in `messages_json` above. Failures
         // here propagate up and the half-written temp zip is discarded.
-        for (content_id, text) in &tool_exchange_content {
+        for (content_id, text) in &message_content {
             writer.start_file(format!("content/{content_id}.txt"), options)?;
             writer.write_all(text.as_bytes())?;
         }
@@ -7389,6 +7639,7 @@ done
                     ConversationTurn {
                         user_prompt: format!("u-{i}"),
                         agent_response: format!("a-{i}"),
+                        replay_events: Vec::new(),
                         tool_exchanges: vec![ToolExchange {
                             call_id: format!("call-{i}"),
                             tool_name: "noop".into(),
@@ -7464,6 +7715,7 @@ done
                 ConversationTurn {
                     user_prompt: "explore the repo".into(),
                     agent_response: "found one file".into(),
+                    replay_events: Vec::new(),
                     tool_exchanges: exchanges.clone(),
                     structured_output: None,
                     summary: None,
@@ -7477,6 +7729,10 @@ done
         assert_eq!(on_disk.len(), 1);
         let turn = &on_disk[0];
         assert_eq!(turn.agent_response, "found one file");
+        assert!(
+            turn.replay_events.is_empty(),
+            "flat legacy-shaped messages must use legacy replay"
+        );
         assert_eq!(turn.tool_exchanges.len(), 2);
 
         // Pair-up by call_id since the messages JSON ordering inside the
@@ -7502,6 +7758,122 @@ done
     }
 
     #[tokio::test]
+    async fn add_turn_round_trips_ordered_replay_events_through_zip() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-replay-events-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+
+        let c1 = ToolCallReplay {
+            call_id: "call_search".into(),
+            tool_name: "grep_search".into(),
+            arguments: r#"{"pattern":"TODO"}"#.into(),
+        };
+        let c2 = ToolCallReplay {
+            call_id: "call_read".into(),
+            tool_name: "read_file".into(),
+            arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
+        };
+        let r1 = ToolExchange {
+            call_id: c1.call_id.clone(),
+            tool_name: c1.tool_name.clone(),
+            arguments: c1.arguments.clone(),
+            result: "src/lib.rs:42: // TODO".into(),
+        };
+        let r2 = ToolExchange {
+            call_id: c2.call_id.clone(),
+            tool_name: c2.tool_name.clone(),
+            arguments: c2.arguments.clone(),
+            result: "fn main() {}".into(),
+        };
+        let replay_events = vec![
+            TurnReplayEvent::AssistantToolCalls {
+                text: "I will search first.".into(),
+                calls: vec![c1],
+            },
+            TurnReplayEvent::ToolResult(r1.clone()),
+            TurnReplayEvent::AssistantToolCalls {
+                text: "Now I will inspect the file.".into(),
+                calls: vec![c2],
+            },
+            TurnReplayEvent::ToolResult(r2.clone()),
+            TurnReplayEvent::AssistantText {
+                text: "Found the TODO.".into(),
+            },
+        ];
+
+        store
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "find TODOs".into(),
+                    agent_response:
+                        "I will search first.Now I will inspect the file.Found the TODO.".into(),
+                    replay_events: replay_events.clone(),
+                    tool_exchanges: vec![r1.clone(), r2.clone()],
+                    structured_output: None,
+                    summary: None,
+                    fragment_id: None,
+                },
+            )
+            .await
+            .expect("persist must succeed");
+
+        let on_disk = read_history_from_zip(&session_zip_path(&cwd, &s.id));
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].replay_events, replay_events);
+        assert_eq!(on_disk[0].tool_exchanges, vec![r1, r2]);
+        let fragments_json = crate::sandbox_backend::global()
+            .read_zip_entry_text(
+                &session_zip_path(&cwd, &s.id),
+                "fragments-v4.json",
+                MAX_SESSION_ARCHIVE_BYTES,
+                MAX_FRAGMENTS_BYTES,
+            )
+            .expect("read fragments")
+            .expect("fragments present");
+        let fragments: serde_json::Value =
+            serde_json::from_str(&fragments_json).expect("fragments json");
+        let task = fragments
+            .get("task")
+            .and_then(|tasks| tasks.as_object())
+            .and_then(|tasks| tasks.values().next())
+            .expect("one task");
+        let visible_roles: Vec<&str> = task
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .expect("visible messages")
+            .iter()
+            .filter_map(|message| message.get("role").and_then(|role| role.as_str()))
+            .collect();
+        assert_eq!(
+            visible_roles,
+            vec![
+                "user",
+                "tool_call",
+                "tool_result",
+                "tool_call",
+                "tool_result",
+                "ai"
+            ]
+        );
+        assert!(
+            task.get("brokkReplayMessages").is_some(),
+            "ordered model replay should use a dedicated task field"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
     async fn add_turn_round_trips_structured_output_through_zip() {
         let store = SessionStore::with_limits(
             "m".to_string(),
@@ -7522,6 +7894,7 @@ done
                 ConversationTurn {
                     user_prompt: "emit json".into(),
                     agent_response: r#"{"answer":"ok"}"#.into(),
+                    replay_events: Vec::new(),
                     tool_exchanges: Vec::new(),
                     structured_output: Some(StructuredOutputResult::CoercedSuccess(
                         crate::structured_output::StructuredOutputCoercedSuccess {

@@ -373,20 +373,9 @@ remarks.";
 
 /// Build the chat-message list for a single-call (whole-turn) summarization.
 pub fn build_turn_summarization_messages(turn: &ConversationTurn) -> Vec<ChatMessage> {
-    let mut body = String::new();
-    body.push_str("Turn to summarize:\n\n");
-    body.push_str("User: ");
-    body.push_str(turn.user_prompt.trim());
-    body.push('\n');
-    for exchange in &turn.tool_exchanges {
-        body.push_str(&format!(
-            "Tool `{}` args={} -> {}\n",
-            exchange.tool_name, exchange.arguments, exchange.result
-        ));
-    }
-    if !turn.agent_response.trim().is_empty() {
-        body.push_str("Assistant: ");
-        body.push_str(turn.agent_response.trim());
+    let mut body = String::from("Turn to summarize:\n\n");
+    for atom in turn_summary_atoms(turn) {
+        body.push_str(&atom);
         body.push('\n');
     }
     vec![
@@ -457,21 +446,58 @@ fn split_turn_to_chunks(turn: &ConversationTurn, budget: usize) -> Vec<String> {
     let per_chunk_budget = budget
         .saturating_sub(CHUNK_OVERHEAD_TOKENS)
         .max(MIN_CHUNK_TOKENS);
+    let atoms = turn_summary_atoms(turn);
+
+    pack_atoms_into_chunks(atoms, per_chunk_budget)
+}
+
+fn turn_summary_atoms(turn: &ConversationTurn) -> Vec<String> {
     let mut atoms: Vec<String> = Vec::new();
     if !turn.user_prompt.trim().is_empty() {
         atoms.push(format!("User: {}", turn.user_prompt.trim()));
     }
-    for exchange in &turn.tool_exchanges {
-        atoms.push(format!(
-            "Tool `{}` args={} -> {}",
-            exchange.tool_name, exchange.arguments, exchange.result
-        ));
-    }
-    if !turn.agent_response.trim().is_empty() {
-        atoms.push(format!("Assistant: {}", turn.agent_response.trim()));
+
+    let replay_events = crate::session::sanitize_replay_events(&turn.replay_events);
+    if !replay_events.is_empty() {
+        for event in &replay_events {
+            match event {
+                crate::session::TurnReplayEvent::AssistantToolCalls { text, calls } => {
+                    if !text.trim().is_empty() {
+                        atoms.push(format!("Assistant: {}", text.trim()));
+                    }
+                    for call in calls {
+                        atoms.push(format!(
+                            "Tool call `{}` args={}",
+                            call.tool_name, call.arguments
+                        ));
+                    }
+                }
+                crate::session::TurnReplayEvent::ToolResult(exchange) => {
+                    atoms.push(format!(
+                        "Tool result `{}` -> {}",
+                        exchange.tool_name, exchange.result
+                    ));
+                }
+                crate::session::TurnReplayEvent::AssistantText { text } => {
+                    if !text.trim().is_empty() {
+                        atoms.push(format!("Assistant: {}", text.trim()));
+                    }
+                }
+            }
+        }
+    } else {
+        for exchange in &turn.tool_exchanges {
+            atoms.push(format!(
+                "Tool `{}` args={} -> {}",
+                exchange.tool_name, exchange.arguments, exchange.result
+            ));
+        }
     }
 
-    pack_atoms_into_chunks(atoms, per_chunk_budget)
+    if replay_events.is_empty() && !turn.agent_response.trim().is_empty() {
+        atoms.push(format!("Assistant: {}", turn.agent_response.trim()));
+    }
+    atoms
 }
 
 /// Split a plain string into chunk-body strings. Used by the meta-pass
@@ -623,6 +649,7 @@ mod tests {
         ConversationTurn {
             user_prompt: user.to_string(),
             agent_response: agent.to_string(),
+            replay_events: Vec::new(),
             tool_exchanges: Vec::new(),
             structured_output: None,
             summary: None,
@@ -640,6 +667,7 @@ mod tests {
         ConversationTurn {
             user_prompt: user.to_string(),
             agent_response: agent.to_string(),
+            replay_events: Vec::new(),
             tool_exchanges: vec![ToolExchange {
                 call_id: "call_1".to_string(),
                 tool_name: tool.to_string(),
@@ -686,6 +714,43 @@ mod tests {
         assert!(body.contains("User: find TODOs"));
         assert!(body.contains("Tool `shell`"));
         assert!(body.contains("Assistant: found 3"));
+    }
+
+    #[test]
+    fn build_turn_summarization_messages_uses_ordered_replay_events() {
+        use crate::session::{ToolCallReplay, TurnReplayEvent};
+
+        let mut t = turn("find TODOs", "aggregate text should not be appended");
+        t.replay_events = vec![
+            TurnReplayEvent::AssistantToolCalls {
+                text: "I will search.".into(),
+                calls: vec![ToolCallReplay {
+                    call_id: "c1".into(),
+                    tool_name: "grep_search".into(),
+                    arguments: r#"{"pattern":"TODO"}"#.into(),
+                }],
+            },
+            TurnReplayEvent::ToolResult(ToolExchange {
+                call_id: "c1".into(),
+                tool_name: "grep_search".into(),
+                arguments: r#"{"pattern":"TODO"}"#.into(),
+                result: "src/lib.rs:42".into(),
+            }),
+            TurnReplayEvent::AssistantText {
+                text: "Done.".into(),
+            },
+        ];
+
+        let msgs = build_turn_summarization_messages(&t);
+        let body = msgs[1].text_content().unwrap();
+        let search_pos = body.find("Assistant: I will search.").unwrap();
+        let call_pos = body.find("Tool call `grep_search`").unwrap();
+        let result_pos = body.find("Tool result `grep_search`").unwrap();
+        let done_pos = body.find("Assistant: Done.").unwrap();
+        assert!(search_pos < call_pos);
+        assert!(call_pos < result_pos);
+        assert!(result_pos < done_pos);
+        assert!(!body.contains("aggregate text should not be appended"));
     }
 
     #[test]

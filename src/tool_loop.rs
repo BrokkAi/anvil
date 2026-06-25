@@ -22,7 +22,7 @@ use crate::llm_client::{
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::semantic_rerank;
-use crate::session::{PermissionMode, SessionStore, ToolExchange};
+use crate::session::{PermissionMode, SessionStore, ToolCallReplay, ToolExchange, TurnReplayEvent};
 use crate::structured_output::StructuredOutputRequest;
 use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
@@ -66,6 +66,23 @@ struct ExecutedStepOutcome {
     results: Vec<p2t::PrefixToolResult>,
     shell_sandbox_retry_states: Vec<ShellSandboxRetryState>,
     cancelled: bool,
+}
+
+fn tool_call_to_replay(call: &ToolCall) -> ToolCallReplay {
+    ToolCallReplay {
+        call_id: call.id.clone(),
+        tool_name: call.function.name.clone(),
+        arguments: call.function.arguments.clone(),
+    }
+}
+
+fn record_tool_result(
+    tool_exchanges: &mut Vec<ToolExchange>,
+    replay_events: &mut Vec<TurnReplayEvent>,
+    exchange: ToolExchange,
+) {
+    replay_events.push(TurnReplayEvent::ToolResult(exchange.clone()));
+    tool_exchanges.push(exchange);
 }
 
 #[derive(Clone, Copy)]
@@ -1333,7 +1350,13 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
     tool_allowlist: Option<Arc<HashSet<String>>>,
-) -> (String, Vec<ToolExchange>, TokenUsage, Option<TurnFailure>) {
+) -> (
+    String,
+    Vec<ToolExchange>,
+    Vec<TurnReplayEvent>,
+    TokenUsage,
+    Option<TurnFailure>,
+) {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
@@ -1347,6 +1370,7 @@ pub(crate) async fn run(
             // rather than retry the same broken config.
             return (
                 format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
+                Vec::new(),
                 Vec::new(),
                 TokenUsage::default(),
                 Some(TurnFailure {
@@ -1366,6 +1390,7 @@ pub(crate) async fn run(
                 }));
                 return (
                     format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
+                    Vec::new(),
                     Vec::new(),
                     TokenUsage::default(),
                     Some(TurnFailure {
@@ -1389,6 +1414,7 @@ pub(crate) async fn run(
                     }));
                     return (
                         format!("BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"),
+                        Vec::new(),
                         Vec::new(),
                         TokenUsage::default(),
                         Some(TurnFailure {
@@ -1437,6 +1463,7 @@ pub(crate) async fn run(
     // letting a `session/load` re-feed the LLM the same tool context the
     // model had when it produced `full_response`.
     let mut tool_exchanges: Vec<ToolExchange> = Vec::new();
+    let mut replay_events: Vec<TurnReplayEvent> = Vec::new();
     // Aggregate the per-call usage reported by the LLM across every
     // turn of this tool loop (one prompt may issue many `stream_chat`
     // calls as it dispatches tools). The caller adds this to the
@@ -1536,6 +1563,10 @@ pub(crate) async fn run(
             }
             let forced_message = p2t::forced_step_to_message(forced_step);
             messages.push(forced_message.clone());
+            replay_events.push(TurnReplayEvent::AssistantToolCalls {
+                text: forced_step.assistant_text.clone(),
+                calls: calls.iter().map(tool_call_to_replay).collect(),
+            });
 
             let outcome = execute_step_tool_calls(
                 llm,
@@ -1548,6 +1579,7 @@ pub(crate) async fn run(
                 &advertised_this_request,
                 &mut messages,
                 &mut tool_exchanges,
+                &mut replay_events,
                 &mut turn_usage,
                 max_turns,
                 idle_timeout,
@@ -1854,6 +1886,9 @@ pub(crate) async fn run(
                     }
                 }
                 full_response.push_str(&text);
+                if !text.is_empty() && !replay_events.is_empty() {
+                    replay_events.push(TurnReplayEvent::AssistantText { text });
+                }
                 // Final text response -- we're done
                 break;
             }
@@ -1896,6 +1931,10 @@ pub(crate) async fn run(
                         reasoning_content,
                     );
                 messages.push(assistant_message.clone());
+                replay_events.push(TurnReplayEvent::AssistantToolCalls {
+                    text: text.clone(),
+                    calls: calls.iter().map(tool_call_to_replay).collect(),
+                });
 
                 let outcome = execute_step_tool_calls(
                     llm,
@@ -1908,6 +1947,7 @@ pub(crate) async fn run(
                     &advertised_this_request,
                     &mut messages,
                     &mut tool_exchanges,
+                    &mut replay_events,
                     &mut turn_usage,
                     max_turns,
                     idle_timeout,
@@ -2089,7 +2129,13 @@ pub(crate) async fn run(
         );
     }
 
-    (full_response, tool_exchanges, turn_usage, llm_failure)
+    (
+        full_response,
+        tool_exchanges,
+        replay_events,
+        turn_usage,
+        llm_failure,
+    )
 }
 
 fn record_p2t_step(config: &p2t::P2tConfig, cwd: &Path, record: StepTraceRecord) {
@@ -2172,6 +2218,7 @@ async fn execute_step_tool_calls(
     advertised_this_request: &std::collections::HashSet<String>,
     messages: &mut Vec<ChatMessage>,
     tool_exchanges: &mut Vec<ToolExchange>,
+    replay_events: &mut Vec<TurnReplayEvent>,
     turn_usage: &mut TokenUsage,
     max_turns: usize,
     idle_timeout: Duration,
@@ -2233,12 +2280,16 @@ async fn execute_step_tool_calls(
                     call_id: call.id.clone(),
                     content: reason.clone(),
                 });
-                tool_exchanges.push(ToolExchange {
-                    call_id: call.id.clone(),
-                    tool_name: tool_name.clone(),
-                    arguments: call.function.arguments.clone(),
-                    result: reason,
-                });
+                record_tool_result(
+                    tool_exchanges,
+                    replay_events,
+                    ToolExchange {
+                        call_id: call.id.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments: call.function.arguments.clone(),
+                        result: reason,
+                    },
+                );
                 continue;
             }
         };
@@ -2280,12 +2331,16 @@ async fn execute_step_tool_calls(
                 call_id: call.id.clone(),
                 content: reason.clone(),
             });
-            tool_exchanges.push(ToolExchange {
-                call_id: call.id.clone(),
-                tool_name: tool_name.clone(),
-                arguments: call.function.arguments.clone(),
-                result: reason,
-            });
+            record_tool_result(
+                tool_exchanges,
+                replay_events,
+                ToolExchange {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    result: reason,
+                },
+            );
             continue;
         }
 
@@ -2319,12 +2374,16 @@ async fn execute_step_tool_calls(
                 call_id: call.id.clone(),
                 content: message.clone(),
             });
-            tool_exchanges.push(ToolExchange {
-                call_id: call.id.clone(),
-                tool_name: tool_name.clone(),
-                arguments: call.function.arguments.clone(),
-                result: message,
-            });
+            record_tool_result(
+                tool_exchanges,
+                replay_events,
+                ToolExchange {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    result: message,
+                },
+            );
             continue;
         }
 
@@ -2357,12 +2416,16 @@ async fn execute_step_tool_calls(
                 call_id: call.id.clone(),
                 content: message.clone(),
             });
-            tool_exchanges.push(ToolExchange {
-                call_id: call.id.clone(),
-                tool_name: tool_name.clone(),
-                arguments: call.function.arguments.clone(),
-                result: message,
-            });
+            record_tool_result(
+                tool_exchanges,
+                replay_events,
+                ToolExchange {
+                    call_id: call.id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: call.function.arguments.clone(),
+                    result: message,
+                },
+            );
             continue;
         }
 
@@ -2562,12 +2625,16 @@ async fn execute_step_tool_calls(
             call_id: call.id.clone(),
             content: output.clone(),
         });
-        tool_exchanges.push(ToolExchange {
-            call_id: call.id.clone(),
-            tool_name: tool_name.clone(),
-            arguments: call.function.arguments.clone(),
-            result: output,
-        });
+        record_tool_result(
+            tool_exchanges,
+            replay_events,
+            ToolExchange {
+                call_id: call.id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: call.function.arguments.clone(),
+                result: output,
+            },
+        );
     }
 
     for state in next_shell_sandbox_retry_states {
@@ -3720,7 +3787,7 @@ async fn execute_subagent(
     // The subagent surfaces failure via its returned text (an empty response
     // becomes an error below); the structured failure class is for top-level
     // autonomous drivers, so it is ignored for a nested run.
-    let (text, _exchanges, nested_usage, _failure) = nested;
+    let (text, _exchanges, _replay_events, nested_usage, _failure) = nested;
     let exec = if text.trim().is_empty() {
         ToolExecution {
             output: format!("Error: subagent '{subagent_name}' returned an empty response."),
