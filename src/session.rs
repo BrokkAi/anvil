@@ -3573,9 +3573,12 @@ impl SessionStore {
         Ok(true)
     }
 
-    /// Update the per-session LLM model. Returns false if the session is
-    /// unknown. Persists the new model into the session manifest so it
-    /// survives a reload, mirroring `set_mode`.
+    /// Update the per-session LLM model and persist the new manifest.
+    ///
+    /// Returns `Ok((true, cleared))` on success, `Ok((false, None))` if the
+    /// session is unknown (no-op), or `Err` if persistence failed -- in that
+    /// case the in-memory mutation is rolled back so `memory == disk`,
+    /// mirroring `set_mode`.
     ///
     /// When the previously-selected reasoning effort isn't in the new
     /// model's supported set, the selection is auto-cleared so the next
@@ -3585,7 +3588,11 @@ impl SessionStore {
     /// Returns the cleared value (if any) so the caller can notify the
     /// user, since silently dropping the pick would look like a bug
     /// next time they wonder why thoughts shortened.
-    pub async fn set_model(&self, id: &str, model: String) -> (bool, Option<String>) {
+    pub async fn set_model(
+        &self,
+        id: &str,
+        model: String,
+    ) -> anyhow::Result<(bool, Option<String>)> {
         // Pull the supported-effort set for the new model BEFORE
         // acquiring the sessions write lock -- the available_models
         // store and the sessions store are separate locks, and reading
@@ -3601,10 +3608,13 @@ impl SessionStore {
             })
         };
 
-        let (snapshot, cleared_effort) = {
+        let (snapshot, cleared_effort, remember_selection) = {
             let mut sessions = self.sessions.write().await;
             match sessions.get_mut(id) {
                 Some(session) => {
+                    let prev_model = session.model.clone();
+                    let prev_manifest_model = session.manifest.model.clone();
+                    let prev_reasoning_effort = session.selected_reasoning_effort.clone();
                     session.model = model.clone();
                     session.manifest.model = if model.is_empty() {
                         None
@@ -3629,37 +3639,67 @@ impl SessionStore {
                         // arbiter rather than dropping silently.
                         _ => None,
                     };
-                    if let Err(e) = self.remember_last_selection(
-                        if model.is_empty() {
-                            None
-                        } else {
-                            Some(model.clone())
-                        },
-                        session.selected_reasoning_effort.clone(),
-                    ) {
-                        tracing::warn!(
-                            session_id = %id,
-                            "failed to persist last model/reasoning preference: {e:#}"
-                        );
-                    }
+                    let remember_model = if model.is_empty() {
+                        None
+                    } else {
+                        Some(model.clone())
+                    };
+                    let remember_reasoning = session.selected_reasoning_effort.clone();
                     (
-                        Some((session.cwd.clone(), session.manifest.clone())),
+                        Some((
+                            session.cwd.clone(),
+                            session.manifest.clone(),
+                            prev_model,
+                            prev_manifest_model,
+                            prev_reasoning_effort,
+                        )),
                         cleared,
+                        Some((remember_model, remember_reasoning)),
                     )
                 }
-                None => (None, None),
+                None => (None, None, None),
             }
         };
         match snapshot {
-            Some((cwd, manifest)) => {
+            Some((cwd, manifest, prev_model, prev_manifest_model, prev_reasoning_effort)) => {
                 let zip_path = session_zip_path(&cwd, id);
-                let _ = tokio::task::spawn_blocking(move || {
+                let join_result = tokio::task::spawn_blocking(move || {
                     rewrite_manifest_in_zip(&zip_path, &manifest)
                 })
                 .await;
-                (true, cleared_effort)
+
+                let persist_result = match join_result {
+                    Ok(r) => r,
+                    Err(join_err) => Err(anyhow::anyhow!(
+                        "session persistence task panicked: {join_err}"
+                    )),
+                };
+
+                if let Err(e) = persist_result {
+                    tracing::error!(
+                        session_id = %id,
+                        "failed to persist session model; rolling back in-memory state: {e:#}"
+                    );
+                    if let Some(session) = self.sessions.write().await.get_mut(id) {
+                        session.model = prev_model;
+                        session.manifest.model = prev_manifest_model;
+                        session.selected_reasoning_effort = prev_reasoning_effort;
+                    }
+                    return Err(e);
+                }
+
+                if let Some((remember_model, remember_reasoning)) = remember_selection
+                    && let Err(e) = self.remember_last_selection(remember_model, remember_reasoning)
+                {
+                    tracing::warn!(
+                        session_id = %id,
+                        "failed to persist last model/reasoning preference: {e:#}"
+                    );
+                }
+
+                Ok((true, cleared_effort))
             }
-            None => (false, None),
+            None => Ok((false, None)),
         }
     }
 
@@ -4365,7 +4405,10 @@ mod tests {
         let session = store.create_session(cwd).await;
         let id = session.id.clone();
 
-        let (ok, cleared) = store.set_model(&id, "next-model".to_string()).await;
+        let (ok, cleared) = store
+            .set_model(&id, "next-model".to_string())
+            .await
+            .expect("set_model should persist");
         assert!(ok);
         assert!(
             cleared.is_none(),
@@ -4382,9 +4425,76 @@ mod tests {
         let store = SessionStore::new("initial-model".to_string());
         let (ok, cleared) = store
             .set_model("no-such-session", "next-model".into())
-            .await;
+            .await
+            .expect("unknown session should be a non-error no-op");
         assert!(!ok);
         assert!(cleared.is_none());
+    }
+
+    /// `set_model` must roll back all in-memory mutations when the manifest
+    /// rewrite fails: the selected model, manifest model, and any reasoning
+    /// effort auto-clear must all return to their pre-call values.
+    #[tokio::test]
+    async fn set_model_rolls_back_on_persistence_failure() {
+        use crate::llm_client::ReasoningLevelPreset;
+
+        let store = SessionStore::new("gpt-big".to_string());
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "gpt-big".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![ReasoningLevelPreset {
+                        effort: "xhigh".to_string(),
+                        description: "".to_string(),
+                    }],
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+                ModelMetadata {
+                    id: "gpt-mini".to_string(),
+                    default_reasoning_level: Some("medium".to_string()),
+                    supported_reasoning_levels: vec![ReasoningLevelPreset {
+                        effort: "high".to_string(),
+                        description: "".to_string(),
+                    }],
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+            ])
+            .await;
+
+        let id = "set-model-rollback".to_string();
+        let cwd = std::env::temp_dir().join(format!("brokk-acp-rust-set-model-{id}"));
+        let mut session = Session::new(id.clone(), cwd, "gpt-big".to_string(), "test".to_string());
+        session.selected_reasoning_effort = Some("xhigh".to_string());
+        let pre_model = session.model.clone();
+        let pre_manifest_model = session.manifest.model.clone();
+        let pre_reasoning_effort = session.selected_reasoning_effort.clone();
+        store.sessions.write().await.insert(id.clone(), session);
+
+        let result = store.set_model(&id, "gpt-mini".to_string()).await;
+        assert!(
+            result.is_err(),
+            "set_model should fail when the session zip doesn't exist on disk"
+        );
+
+        let sessions = store.sessions.read().await;
+        let s = sessions.get(&id).expect("session still in memory");
+        assert_eq!(
+            s.model, pre_model,
+            "rollback should restore the previous in-memory model"
+        );
+        assert_eq!(
+            s.manifest.model, pre_manifest_model,
+            "rollback should restore the previous manifest model"
+        );
+        assert_eq!(
+            s.selected_reasoning_effort, pre_reasoning_effort,
+            "rollback should undo reasoning-effort auto-clear"
+        );
     }
 
     /// `SessionMode::parse` round-trips every variant via its wire id, with
@@ -4974,7 +5084,8 @@ mod tests {
         );
         let (ok, cleared) = store
             .set_model(&first.id, "runtime-model".to_string())
-            .await;
+            .await
+            .expect("set_model should persist");
         assert!(ok);
         assert!(cleared.is_none());
         assert!(
@@ -6118,7 +6229,10 @@ mod tests {
         );
 
         // Switch to gpt-mini, which doesn't advertise xhigh.
-        let (ok, cleared) = store.set_model(&id, "gpt-mini".to_string()).await;
+        let (ok, cleared) = store
+            .set_model(&id, "gpt-mini".to_string())
+            .await
+            .expect("set_model should persist");
         assert!(ok);
         assert_eq!(cleared.as_deref(), Some("xhigh"));
 
@@ -6185,7 +6299,10 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared) = store.set_model(&id, "plain-model".to_string()).await;
+        let (ok, cleared) = store
+            .set_model(&id, "plain-model".to_string())
+            .await
+            .expect("set_model should persist");
         assert!(ok);
         assert!(cleared.is_none(), "off is not a provider effort to clear");
         let session = store
@@ -6262,7 +6379,10 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared) = store.set_model(&id, "gpt-b".to_string()).await;
+        let (ok, cleared) = store
+            .set_model(&id, "gpt-b".to_string())
+            .await
+            .expect("set_model should persist");
         assert!(ok);
         assert!(cleared.is_none(), "high is still supported by gpt-b");
         let snap = store
