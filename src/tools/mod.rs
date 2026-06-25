@@ -365,6 +365,7 @@ fn mcp_tool_description<'a>(name: &str, original: &'a str) -> &'a str {
 /// (which would re-spawn MCP subprocesses).
 pub struct ToolRegistry {
     cwd: PathBuf,
+    additional_roots: Vec<PathBuf>,
     mcp_clients: Vec<Arc<McpClient>>,
     mcp_tool_servers: HashMap<String, Arc<McpClient>>,
     advertised_builtin_tools: RwLock<HashSet<String>>,
@@ -376,6 +377,10 @@ impl ToolRegistry {
     /// Working directory this registry is rooted in.
     pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub(crate) fn additional_roots(&self) -> &[PathBuf] {
+        &self.additional_roots
     }
 
     /// Replace the cached SkillRegistry. Called by `update_cwd` so the
@@ -417,6 +422,7 @@ impl ToolRegistry {
 
     pub async fn new(
         cwd: PathBuf,
+        additional_roots: Vec<PathBuf>,
         mcp_servers: Vec<McpServerConfig>,
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
@@ -475,6 +481,7 @@ impl ToolRegistry {
         }
         Self {
             cwd,
+            additional_roots,
             mcp_clients,
             mcp_tool_servers,
             advertised_builtin_tools: RwLock::new(
@@ -939,9 +946,10 @@ impl ToolRegistry {
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize);
                 let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
                 let path = path.to_string();
                 run_blocking_filesystem_tool(move || {
-                    filesystem::read_file(&cwd, &path, offset, limit)
+                    filesystem::read_file_in_roots(&cwd, &additional_roots, &path, offset, limit)
                 })
                 .await
             }
@@ -952,10 +960,13 @@ impl ToolRegistry {
                     return filesystem::oversized_write_payload_result(path, content.len());
                 }
                 let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
                 let path = path.to_string();
                 let content = content.to_string();
-                run_blocking_filesystem_tool(move || filesystem::write_file(&cwd, &path, &content))
-                    .await
+                run_blocking_filesystem_tool(move || {
+                    filesystem::write_file_in_roots(&cwd, &additional_roots, &path, &content)
+                })
+                .await
             }
             "edit" => {
                 let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -972,19 +983,31 @@ impl ToolRegistry {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
                 let path = path.to_string();
                 let old = old.to_string();
                 let new = new.to_string();
                 run_blocking_filesystem_tool(move || {
-                    filesystem::edit_file(&cwd, &path, &old, &new, replace_all)
+                    filesystem::edit_file_in_roots(
+                        &cwd,
+                        &additional_roots,
+                        &path,
+                        &old,
+                        &new,
+                        replace_all,
+                    )
                 })
                 .await
             }
             "list_directory" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let cwd = self.cwd.clone();
+                let additional_roots = self.additional_roots.clone();
                 let path = path.to_string();
-                run_blocking_filesystem_tool(move || filesystem::list_directory(&cwd, &path)).await
+                run_blocking_filesystem_tool(move || {
+                    filesystem::list_directory_in_roots(&cwd, &additional_roots, &path)
+                })
+                .await
             }
             "grep_search" => {
                 let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -993,6 +1016,7 @@ impl ToolRegistry {
                 let path = args.get("path").and_then(|v| v.as_str());
                 filesystem::search_file_contents_with_sandbox_mode(
                     &self.cwd,
+                    &self.additional_roots,
                     pattern,
                     glob,
                     path,
@@ -1010,7 +1034,7 @@ impl ToolRegistry {
                     .max(1);
                 let command_cwd = match args.get("directory").and_then(|v| v.as_str()) {
                     Some(directory) if !directory.trim().is_empty() => {
-                        match safe_resolve(&self.cwd, directory) {
+                        match safe_resolve_in_roots(&self.cwd, &self.additional_roots, directory) {
                             Ok(path) if path.is_dir() => path,
                             Ok(_) => {
                                 return ToolResult {
@@ -1259,15 +1283,31 @@ fn tool_def(name: &str, description: &str, parameters: serde_json::Value) -> Too
 }
 
 /// Resolve a relative path against cwd and ensure it stays within cwd.
+#[cfg(test)]
 pub fn safe_resolve(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
-    let joined = cwd.join(requested);
+    safe_resolve_in_roots(cwd, &[], requested)
+}
+
+/// Resolve a path against cwd and ensure it stays within cwd or one of the
+/// ordered ACP additional workspace roots. Relative paths are intentionally
+/// resolved against cwd only; callers can address additional roots with
+/// absolute paths.
+pub fn safe_resolve_in_roots(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    requested: &str,
+) -> Result<PathBuf, String> {
+    let requested_path = Path::new(requested);
+    let joined = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        cwd.join(requested_path)
+    };
     let resolved = joined
         .canonicalize()
         .map_err(|e| format!("Cannot resolve path '{}': {}", requested, e))?;
-    let cwd_canonical = cwd
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve cwd: {}", e))?;
-    if !resolved.starts_with(&cwd_canonical) {
+    let roots = canonical_workspace_roots(cwd, additional_roots)?;
+    if !roots.iter().any(|root| resolved.starts_with(root)) {
         return Err(format!(
             "Path '{}' escapes the working directory",
             requested
@@ -1281,12 +1321,23 @@ pub fn safe_resolve(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
 /// under the canonical cwd. Returns the canonical cwd joined with the remaining tail,
 /// which guarantees the final path resolves under cwd without relying on canonicalize
 /// of the still-missing target.
+#[cfg(test)]
 pub fn safe_resolve_for_write(cwd: &Path, requested: &str) -> Result<PathBuf, String> {
-    let cwd_canonical = cwd
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve cwd: {}", e))?;
+    safe_resolve_for_write_in_roots(cwd, &[], requested)
+}
 
-    let joined = cwd.join(requested);
+pub fn safe_resolve_for_write_in_roots(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+    requested: &str,
+) -> Result<PathBuf, String> {
+    let roots = canonical_workspace_roots(cwd, additional_roots)?;
+    let requested_path = Path::new(requested);
+    let joined = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        cwd.join(requested_path)
+    };
 
     // Walk up to the first existing ancestor (including the target itself if it exists).
     // Use symlink_metadata rather than exists(): exists() follows symlinks, so a dangling
@@ -1317,7 +1368,10 @@ pub fn safe_resolve_for_write(cwd: &Path, requested: &str) -> Result<PathBuf, St
     let existing_canonical = existing
         .canonicalize()
         .map_err(|e| format!("Cannot resolve ancestor of '{}': {}", requested, e))?;
-    if !existing_canonical.starts_with(&cwd_canonical) {
+    if !roots
+        .iter()
+        .any(|root| existing_canonical.starts_with(root))
+    {
         return Err(format!(
             "Path '{}' escapes the working directory",
             requested
@@ -1340,6 +1394,27 @@ pub fn safe_resolve_for_write(cwd: &Path, requested: &str) -> Result<PathBuf, St
     Ok(resolved)
 }
 
+fn canonical_workspace_roots(
+    cwd: &Path,
+    additional_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::with_capacity(1 + additional_roots.len());
+    roots.push(
+        cwd.canonicalize()
+            .map_err(|e| format!("Cannot resolve cwd: {}", e))?,
+    );
+    for root in additional_roots {
+        roots.push(root.canonicalize().map_err(|e| {
+            format!(
+                "Cannot resolve additional workspace root '{}': {}",
+                root.display(),
+                e
+            )
+        })?);
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,6 +1426,19 @@ mod tests {
             std::env::temp_dir().join(format!("brokk-acp-rust-{}-{}", label, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create tmp dir");
         dir
+    }
+
+    /// Existing files inside cwd should resolve through the compatibility
+    /// wrapper used by unit tests for the single-root path.
+    #[test]
+    fn safe_resolve_allows_existing_file_inside_cwd() {
+        let cwd = fresh_tmp_dir("resolve-existing");
+        std::fs::write(cwd.join("note.txt"), "ok").expect("seed file");
+
+        let resolved = safe_resolve(&cwd, "note.txt").expect("resolve must succeed");
+        assert_eq!(resolved, cwd.join("note.txt").canonicalize().unwrap());
+
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     /// Regression: a dangling symlink at the leaf must be rejected, not silently
@@ -1462,6 +1550,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         ToolRegistry {
             cwd,
+            additional_roots: Vec::new(),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1483,6 +1572,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         ToolRegistry {
             cwd,
+            additional_roots: Vec::new(),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(
@@ -1610,6 +1700,7 @@ mod tests {
     async fn builtin_tools_have_metadata_and_are_advertised() {
         let registry = ToolRegistry {
             cwd: std::env::temp_dir(),
+            additional_roots: Vec::new(),
             mcp_clients: Vec::new(),
             mcp_tool_servers: HashMap::new(),
             advertised_builtin_tools: RwLock::new(

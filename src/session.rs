@@ -636,6 +636,14 @@ pub struct SessionManifest {
     /// predating cwd persistence.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "brokkCwd")]
     pub cwd: Option<String>,
+    /// Brokk ACP-specific: ordered additional workspace roots supplied via
+    /// ACP `additionalDirectories`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "brokkAdditionalDirectories"
+    )]
+    pub additional_directories: Option<Vec<String>>,
 }
 
 impl SessionManifest {
@@ -654,6 +662,22 @@ fn default_version() -> String {
     "4.0".to_string()
 }
 
+fn additional_directories_manifest(paths: &[PathBuf]) -> Option<Vec<String>> {
+    (!paths.is_empty()).then(|| {
+        paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    })
+}
+
+fn executable_additional_directories_from_manifest(_manifest: &SessionManifest) -> Vec<PathBuf> {
+    // Session zips are untrusted. Keep stored additionalDirectories as list
+    // metadata, but require a fresh lifecycle request to activate executable
+    // filesystem scope after cold reload.
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // Per-session state (in-memory)
 // ---------------------------------------------------------------------------
@@ -662,6 +686,7 @@ fn default_version() -> String {
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
+    pub additional_directories: Vec<PathBuf>,
     permission_scope_root: PathBuf,
     pub mode: SessionMode,
     pub model: String,
@@ -749,6 +774,20 @@ pub struct Session {
     usage_cost: SessionUsageCost,
 }
 
+struct WorkspaceRootsRollback {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    manifest_cwd: Option<String>,
+    manifest_additional_directories: Option<Vec<String>>,
+    permission_scope_root: PathBuf,
+    project_instructions: String,
+    skills: Arc<crate::skills::SkillRegistry>,
+    agents: Arc<crate::agents::AgentRegistry>,
+    always_allow_tools: HashSet<String>,
+    always_allow_order: Vec<String>,
+    activated_skills: HashSet<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SessionUsageCost {
     amount_usd: f64,
@@ -785,14 +824,26 @@ impl SessionUsageCost {
     }
 }
 
+struct PersistedSessionInput {
+    id: String,
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mode: SessionMode,
+    model: String,
+    history: Vec<ConversationTurn>,
+    manifest: SessionManifest,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+}
+
 impl Session {
     pub fn new(id: String, cwd: PathBuf, model: String, name: String) -> Self {
-        Self::new_with_sandbox_mode(id, cwd, model, name, None)
+        Self::new_with_sandbox_mode(id, cwd, Vec::new(), model, name, None)
     }
 
     fn new_with_sandbox_mode(
         id: String,
         cwd: PathBuf,
+        additional_directories: Vec<PathBuf>,
         model: String,
         name: String,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
@@ -814,12 +865,14 @@ impl Session {
             },
             brokk_mcp_servers: None,
             cwd: Some(cwd.to_string_lossy().into_owned()),
+            additional_directories: additional_directories_manifest(&additional_directories),
         };
         let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
         let permission_scope_root = permission_scope_root(&cwd);
         Self {
             id,
             cwd,
+            additional_directories,
             permission_scope_root,
             mode,
             model,
@@ -865,18 +918,32 @@ impl Session {
         history: Vec<ConversationTurn>,
         manifest: SessionManifest,
     ) -> Result<Self, SessionIdMismatch> {
-        Self::from_persisted_with_sandbox_mode(id, cwd, mode, model, history, manifest, None)
+        let additional_directories = executable_additional_directories_from_manifest(&manifest);
+        Self::from_persisted_with_sandbox_mode(PersistedSessionInput {
+            id,
+            cwd,
+            additional_directories,
+            mode,
+            model,
+            history,
+            manifest,
+            sandbox_mode: None,
+        })
     }
 
     fn from_persisted_with_sandbox_mode(
-        id: String,
-        cwd: PathBuf,
-        mode: SessionMode,
-        model: String,
-        history: Vec<ConversationTurn>,
-        manifest: SessionManifest,
-        sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+        input: PersistedSessionInput,
     ) -> Result<Self, SessionIdMismatch> {
+        let PersistedSessionInput {
+            id,
+            cwd,
+            additional_directories,
+            mode,
+            model,
+            history,
+            manifest,
+            sandbox_mode,
+        } = input;
         if manifest.id != id {
             return Err(SessionIdMismatch {
                 requested: id,
@@ -889,6 +956,7 @@ impl Session {
         Ok(Self {
             id,
             cwd,
+            additional_directories,
             permission_scope_root,
             mode,
             model,
@@ -958,6 +1026,7 @@ impl std::error::Error for SessionIdMismatch {}
 #[derive(Debug)]
 pub struct SessionSnapshot {
     pub cwd: PathBuf,
+    pub additional_directories: Vec<PathBuf>,
     pub mode: SessionMode,
     pub model: String,
     pub history: Vec<ConversationTurn>,
@@ -2568,6 +2637,10 @@ fn normalize_cwd(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn normalize_additional_directories(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths.iter().map(|path| normalize_cwd(path)).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Thread-safe session store
 // ---------------------------------------------------------------------------
@@ -2903,7 +2976,7 @@ impl SessionStore {
         cwd: PathBuf,
     ) -> Option<Arc<ToolRegistry>> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let (skills, agents, mcp_servers) = {
+        let (skills, agents, mcp_servers, additional_directories) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.closed_sessions.read().await.contains(session_id) {
                 return None;
@@ -2914,11 +2987,15 @@ impl SessionStore {
                 session.skills.clone(),
                 session.agents.clone(),
                 effective_mcp_servers(session.mcp_servers.clone()),
+                session.additional_directories.clone(),
             )
         };
+        let normalized_additional_directories =
+            normalize_additional_directories(&additional_directories);
 
         if let Some(existing) = self.registries.read().await.get(session_id).cloned()
             && existing.cwd() == normalized_cwd.as_path()
+            && existing.additional_roots() == normalized_additional_directories.as_slice()
         {
             existing.set_skills(skills).await;
             existing.set_agents(agents).await;
@@ -2930,8 +3007,16 @@ impl SessionStore {
             }
             return Some(existing);
         };
-        let registry =
-            Arc::new(ToolRegistry::new(normalized_cwd, mcp_servers, skills, agents).await);
+        let registry = Arc::new(
+            ToolRegistry::new(
+                normalized_cwd,
+                normalized_additional_directories,
+                mcp_servers,
+                skills,
+                agents,
+            )
+            .await,
+        );
         {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.closed_sessions.read().await.contains(session_id)
@@ -3016,10 +3101,25 @@ impl SessionStore {
     }
 
     /// Create a new session and write it to disk as a zip.
+    #[cfg(test)]
     pub async fn create_session_with_mcp_servers(
         &self,
         cwd: PathBuf,
         mcp_servers: Option<Vec<McpServerConfig>>,
+    ) -> Session {
+        self.create_session_with_mcp_servers_and_additional_directories(
+            cwd,
+            mcp_servers,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn create_session_with_mcp_servers_and_additional_directories(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Option<Vec<McpServerConfig>>,
+        additional_directories: Vec<PathBuf>,
     ) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
         let prefs = self.setup_state_snapshot();
@@ -3038,6 +3138,7 @@ impl SessionStore {
             Some(mode) => Session::new_with_sandbox_mode(
                 id.clone(),
                 cwd.clone(),
+                additional_directories.clone(),
                 model,
                 DEFAULT_SESSION_NAME.to_string(),
                 Some(mode),
@@ -3049,6 +3150,9 @@ impl SessionStore {
                 DEFAULT_SESSION_NAME.to_string(),
             ),
         };
+        session.additional_directories = additional_directories.clone();
+        session.manifest.additional_directories =
+            additional_directories_manifest(&additional_directories);
         session.mcp_servers = mcp_servers.clone();
         session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
@@ -3169,16 +3273,21 @@ impl SessionStore {
         let prefs = self.setup_state_snapshot();
         let permission_mode = prefs.last_permission_mode.unwrap_or_default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
+        let manifest_additional_directories =
+            executable_additional_directories_from_manifest(&manifest);
         let loaded_session = match sandbox_mode {
-            Some(sandbox_mode) => Session::from_persisted_with_sandbox_mode(
-                id.to_string(),
-                cwd.to_path_buf(),
-                session_mode,
-                model,
-                history,
-                manifest,
-                Some(sandbox_mode),
-            ),
+            Some(sandbox_mode) => {
+                Session::from_persisted_with_sandbox_mode(PersistedSessionInput {
+                    id: id.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    additional_directories: manifest_additional_directories,
+                    mode: session_mode,
+                    model,
+                    history,
+                    manifest,
+                    sandbox_mode: Some(sandbox_mode),
+                })
+            }
             None => Session::from_persisted(
                 id.to_string(),
                 cwd.to_path_buf(),
@@ -3358,14 +3467,20 @@ impl SessionStore {
             let sessions = self.sessions.read().await;
             let s = sessions.get(id)?;
             (
-                (s.cwd.clone(), s.mode, s.model.clone(), s.history.clone()),
+                (
+                    s.cwd.clone(),
+                    s.additional_directories.clone(),
+                    s.mode,
+                    s.model.clone(),
+                    s.history.clone(),
+                ),
                 s.selected_reasoning_effort.clone(),
                 s.idle_timeout_secs,
                 s.project_instructions.clone(),
                 s.skills.clone(),
             )
         };
-        let (cwd, mode, model, history) = snap_base;
+        let (cwd, additional_directories, mode, model, history) = snap_base;
         // Resolve "user has no pick" to the model's
         // default_reasoning_level so the backend gets a concrete
         // intent. Models that publish no presets resolve to None and
@@ -3386,6 +3501,7 @@ impl SessionStore {
         self.touch(id);
         Some(SessionSnapshot {
             cwd,
+            additional_directories,
             mode,
             model,
             history,
@@ -3471,7 +3587,25 @@ impl SessionStore {
         Ok(Some(title))
     }
 
-    pub async fn update_cwd(&self, id: &str, cwd: PathBuf) {
+    #[cfg(test)]
+    pub async fn update_cwd(&self, id: &str, cwd: PathBuf) -> anyhow::Result<()> {
+        let additional_directories = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(id)
+                .map(|session| session.additional_directories.clone())
+                .unwrap_or_default()
+        };
+        self.update_workspace_roots(id, cwd, additional_directories)
+            .await
+    }
+
+    pub async fn update_workspace_roots(
+        &self,
+        id: &str,
+        cwd: PathBuf,
+        additional_directories: Vec<PathBuf>,
+    ) -> anyhow::Result<()> {
         // Re-discover AGENTS.md/CLAUDE.md, SKILL.md, and subagent `*.md`
         // files against the new cwd before taking the write lock: file
         // I/O off the lock keeps prompt turns and other session
@@ -3480,7 +3614,7 @@ impl SessionStore {
         let sandbox_mode = {
             let sessions = self.sessions.read().await;
             let Some(session) = sessions.get(id) else {
-                return;
+                return Ok(());
             };
             session.sandbox_mode
         };
@@ -3495,8 +3629,26 @@ impl SessionStore {
         ));
         let permission_scope_root = permission_scope_root(&cwd);
         let repo_always_allow = load_repo_always_allow_keys(&permission_scope_root);
-        if let Some(session) = self.sessions.write().await.get_mut(id) {
+        let persist = if let Some(session) = self.sessions.write().await.get_mut(id) {
+            let zip_path = session_zip_path(&session.cwd, id);
+            let previous = WorkspaceRootsRollback {
+                cwd: session.cwd.clone(),
+                additional_directories: session.additional_directories.clone(),
+                manifest_cwd: session.manifest.cwd.clone(),
+                manifest_additional_directories: session.manifest.additional_directories.clone(),
+                permission_scope_root: session.permission_scope_root.clone(),
+                project_instructions: session.project_instructions.clone(),
+                skills: session.skills.clone(),
+                agents: session.agents.clone(),
+                always_allow_tools: session.always_allow_tools.clone(),
+                always_allow_order: session.always_allow_order.clone(),
+                activated_skills: session.activated_skills.clone(),
+            };
             session.cwd = cwd;
+            session.additional_directories = additional_directories.clone();
+            session.manifest.cwd = Some(session.cwd.to_string_lossy().into_owned());
+            session.manifest.additional_directories =
+                additional_directories_manifest(&additional_directories);
             session.permission_scope_root = permission_scope_root;
             session.project_instructions = project_instructions;
             session.skills = skills;
@@ -3506,7 +3658,44 @@ impl SessionStore {
             // be relevant. Clear so the model can re-activate against
             // the new catalog without stale dedup entries.
             session.activated_skills.clear();
+            Some((zip_path, session.manifest.clone(), previous))
+        } else {
+            None
+        };
+        self.invalidate_registry(id).await;
+        if let Some((zip_path, manifest, previous)) = persist {
+            match tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.rollback_workspace_roots(id, previous).await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    self.rollback_workspace_roots(id, previous).await;
+                    return Err(anyhow::anyhow!("workspace root writer task panicked: {e}"));
+                }
+            }
         }
+        Ok(())
+    }
+
+    async fn rollback_workspace_roots(&self, id: &str, previous: WorkspaceRootsRollback) {
+        if let Some(session) = self.sessions.write().await.get_mut(id) {
+            session.cwd = previous.cwd;
+            session.additional_directories = previous.additional_directories;
+            session.manifest.cwd = previous.manifest_cwd;
+            session.manifest.additional_directories = previous.manifest_additional_directories;
+            session.permission_scope_root = previous.permission_scope_root;
+            session.project_instructions = previous.project_instructions;
+            session.skills = previous.skills;
+            session.agents = previous.agents;
+            session.always_allow_tools = previous.always_allow_tools;
+            session.always_allow_order = previous.always_allow_order;
+            session.activated_skills = previous.activated_skills;
+        }
+        self.invalidate_registry(id).await;
     }
 
     /// Mark a skill as activated for this session so the
@@ -4659,6 +4848,7 @@ mod tests {
             model: Some("m".into()),
             brokk_mcp_servers: None,
             cwd: None,
+            additional_directories: None,
         };
         let history = vec![ConversationTurn {
             user_prompt: "u".into(),
@@ -4888,6 +5078,7 @@ mod tests {
             model: None,
             brokk_mcp_servers: None,
             cwd: None,
+            additional_directories: None,
         };
 
         let err = Session::from_persisted(
@@ -5438,6 +5629,47 @@ mod tests {
         assert!(reloaded.always_allow_order.is_empty());
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn cold_load_does_not_trust_persisted_additional_directories_for_scope() {
+        let store = SessionStore::new("m".to_string());
+        let base = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-cold-roots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = base.join("repo");
+        let additional = base.join("additional");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&additional).unwrap();
+        let created = store
+            .create_session_with_mcp_servers_and_additional_directories(
+                cwd.clone(),
+                None,
+                vec![additional.clone()],
+            )
+            .await;
+        let id = created.id.clone();
+
+        let manifest = read_manifest_from_zip(&session_zip_path(&cwd, &id)).unwrap();
+        assert_eq!(
+            manifest.additional_directories,
+            Some(vec![additional.to_string_lossy().into_owned()])
+        );
+
+        store.sessions.write().await.remove(&id);
+        store.registries.write().await.remove(&id);
+
+        let reloaded = store
+            .get_session(&id, &cwd)
+            .await
+            .expect("session must reload from disk");
+        assert!(
+            reloaded.additional_directories.is_empty(),
+            "cold-loaded executable sessions must not trust zip-provided additional roots"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `sandbox_mode` round-trips through the setter, defaults to
@@ -7009,6 +7241,7 @@ mod tests {
             model: Some("m".to_string()),
             brokk_mcp_servers: None,
             cwd: None,
+            additional_directories: None,
         };
         let legacy_path = legacy_session_zip_path(worktree.path(), &id);
         write_new_session_zip(&legacy_path, &manifest).expect("write legacy session zip");
@@ -7045,6 +7278,7 @@ mod tests {
             model: Some("m".to_string()),
             brokk_mcp_servers: None,
             cwd: None,
+            additional_directories: None,
         }
     }
 
@@ -7184,7 +7418,7 @@ mod tests {
         let s = store.create_session(cwd1.clone()).await;
 
         let cwd2 = std::env::temp_dir().join("brokk-acp-rust-cwd2-replacement");
-        store.update_cwd(&s.id, cwd2.clone()).await;
+        store.update_cwd(&s.id, cwd2.clone()).await.unwrap();
         let after = store.sessions.read().await.get(&s.id).cloned().unwrap();
         assert_eq!(after.cwd, cwd2);
 
@@ -7221,7 +7455,10 @@ mod tests {
         )
         .expect("write agent");
 
-        store.update_cwd(&s.id, cwd2.path().to_path_buf()).await;
+        store
+            .update_cwd(&s.id, cwd2.path().to_path_buf())
+            .await
+            .unwrap();
 
         let after = store.sessions.read().await.get(&s.id).cloned().unwrap();
         assert!(
@@ -7650,7 +7887,8 @@ done
 
         store
             .update_cwd(&session.id, cwd2.path().to_path_buf())
-            .await;
+            .await
+            .unwrap();
 
         let registry2 = store
             .get_or_create_registry(&session.id, cwd2.path().to_path_buf())
