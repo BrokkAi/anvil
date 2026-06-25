@@ -87,6 +87,34 @@ pub(super) fn initial_tool_call(
          (tool={tool_name}, chars={})",
         title.chars().count()
     );
+    pending_tool_call(tool_call_id, tool_name, kind, raw_input, title)
+}
+
+/// Build a replayed `Pending` tool call from persisted history. Old archives
+/// may predate the live permission-gate title cap, so fall back to the static
+/// display name instead of tripping the live-path debug assertion.
+pub(crate) fn replayed_tool_call(
+    tool_call_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+) -> ToolCall {
+    let title = tool_title(tool_name, raw_input);
+    let title = if title.chars().count() > MAX_TOOL_TITLE_CHARS {
+        ToolRegistry::display_name(tool_name).to_string()
+    } else {
+        title
+    };
+    pending_tool_call(tool_call_id, tool_name, kind, raw_input, title)
+}
+
+fn pending_tool_call(
+    tool_call_id: &str,
+    tool_name: &str,
+    kind: ToolKind,
+    raw_input: &Value,
+    title: String,
+) -> ToolCall {
     ToolCall::new(ToolCallId::new(tool_call_id.to_string()), title)
         .kind(kind)
         .status(ToolCallStatus::Pending)
@@ -207,7 +235,7 @@ pub(super) fn update_failed(
     ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields)
 }
 
-pub(super) fn update_failed_with_input(
+pub(crate) fn update_failed_with_input(
     tool_call_id: &str,
     tool_name: &str,
     raw_input: &Value,
@@ -227,7 +255,7 @@ pub(super) fn update_failed_with_input(
 
 /// Terminal `Completed` update. Pass `Some(diff)` for `write_file` to
 /// render an inline diff; otherwise the `output` is shown as text.
-pub(super) fn update_completed(
+pub(crate) fn update_completed(
     tool_call_id: &str,
     tool_name: &str,
     raw_input: &Value,
@@ -750,6 +778,22 @@ mod tests {
         assert_eq!(card.title, "Running shell command");
         // raw_input is still attached so the user can inspect what was
         // attempted; it lives in a scrollable region client-side.
+        assert!(card.raw_input.is_some());
+    }
+
+    #[test]
+    fn replayed_card_uses_static_title_for_oversized_persisted_input() {
+        let huge = "x".repeat(MAX_TOOL_TITLE_CHARS * 2);
+        let card = replayed_tool_call(
+            "tc1",
+            "read_file",
+            ToolKind::Read,
+            &json!({"file_path": huge}),
+        );
+
+        assert_eq!(card.title, "Reading file");
+        assert_eq!(card.status, ToolCallStatus::Pending);
+        assert!(card.title.chars().count() <= MAX_TOOL_TITLE_CHARS);
         assert!(card.raw_input.is_some());
     }
 

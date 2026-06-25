@@ -1,4 +1,4 @@
-mod announce;
+pub(crate) mod announce;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,10 @@ use crate::llm_client::{
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::semantic_rerank;
-use crate::session::{PermissionMode, SessionStore, ToolCallReplay, ToolExchange, TurnReplayEvent};
+use crate::session::{
+    PermissionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
+    ToolExchangeStatus, TurnReplayEvent,
+};
 use crate::structured_output::StructuredOutputRequest;
 use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
@@ -83,6 +86,14 @@ fn record_tool_result(
 ) {
     replay_events.push(TurnReplayEvent::ToolResult(exchange.clone()));
     tool_exchanges.push(exchange);
+}
+
+fn tool_exchange_diff_from_acp(diff: &Diff) -> ToolExchangeDiff {
+    ToolExchangeDiff {
+        path: diff.path.clone(),
+        old_text: diff.old_text.clone(),
+        new_text: diff.new_text.clone(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2288,6 +2299,8 @@ async fn execute_step_tool_calls(
                         tool_name: tool_name.clone(),
                         arguments: call.function.arguments.clone(),
                         result: reason,
+                        status: ToolExchangeStatus::Failed,
+                        diff: None,
                     },
                 );
                 continue;
@@ -2339,6 +2352,8 @@ async fn execute_step_tool_calls(
                     tool_name: tool_name.clone(),
                     arguments: call.function.arguments.clone(),
                     result: reason,
+                    status: ToolExchangeStatus::Failed,
+                    diff: None,
                 },
             );
             continue;
@@ -2382,6 +2397,8 @@ async fn execute_step_tool_calls(
                     tool_name: tool_name.clone(),
                     arguments: call.function.arguments.clone(),
                     result: message,
+                    status: ToolExchangeStatus::Failed,
+                    diff: None,
                 },
             );
             continue;
@@ -2424,6 +2441,8 @@ async fn execute_step_tool_calls(
                     tool_name: tool_name.clone(),
                     arguments: call.function.arguments.clone(),
                     result: message,
+                    status: ToolExchangeStatus::Failed,
+                    diff: None,
                 },
             );
             continue;
@@ -2466,7 +2485,7 @@ async fn execute_step_tool_calls(
             available_shell_sandbox_retry_states.remove(index);
         }
 
-        let output = match decision {
+        let (output, status, replay_diff) = match decision {
             GateDecision::Reject(message) => {
                 maybe_send_session_update(
                     notifications,
@@ -2478,7 +2497,7 @@ async fn execute_step_tool_calls(
                         Some(Value::String(message.clone())),
                     )),
                 );
-                message
+                (message, ToolExchangeStatus::Failed, None)
             }
             GateDecision::Allow {
                 sandbox_policy_override,
@@ -2590,24 +2609,33 @@ async fn execute_step_tool_calls(
                     );
                 }
 
-                let update = if exec.failed {
+                let (update, status, replay_diff) = if exec.failed {
                     let clean = strip_sandbox_escalation_hint(&exec.output);
-                    announce::update_failed_with_input(
-                        &call.id,
-                        &tool_name,
-                        &parsed_input,
-                        clean,
-                        Some(Value::String(clean.to_string())),
+                    (
+                        announce::update_failed_with_input(
+                            &call.id,
+                            &tool_name,
+                            &parsed_input,
+                            clean,
+                            Some(Value::String(clean.to_string())),
+                        ),
+                        ToolExchangeStatus::Failed,
+                        None,
                     )
                 } else {
                     let diff = pre_write
                         .and_then(|prior| build_editing_diff(&tool_name, &parsed_input, prior));
-                    announce::update_completed(
-                        &call.id,
-                        &tool_name,
-                        &parsed_input,
-                        &exec.output,
-                        diff,
+                    let replay_diff = diff.as_ref().map(tool_exchange_diff_from_acp);
+                    (
+                        announce::update_completed(
+                            &call.id,
+                            &tool_name,
+                            &parsed_input,
+                            &exec.output,
+                            diff,
+                        ),
+                        ToolExchangeStatus::Completed,
+                        replay_diff,
                     )
                 };
                 maybe_send_session_update(
@@ -2616,7 +2644,7 @@ async fn execute_step_tool_calls(
                     session_id,
                     SessionUpdate::ToolCallUpdate(update),
                 );
-                exec.output
+                (exec.output, status, replay_diff)
             }
         };
 
@@ -2633,6 +2661,8 @@ async fn execute_step_tool_calls(
                 tool_name: tool_name.clone(),
                 arguments: call.function.arguments.clone(),
                 result: output,
+                status,
+                diff: replay_diff,
             },
         );
     }
@@ -3948,6 +3978,7 @@ mod tests {
             tool_name: tool_name.to_string(),
             arguments: "{}".to_string(),
             result: String::new(),
+            ..ToolExchange::default()
         }
     }
 
@@ -3967,6 +3998,7 @@ mod tests {
             tool_name: tool_name.to_string(),
             arguments: serde_json::json!({ "file_path": path }).to_string(),
             result: format!("Edited '{path}'"),
+            ..ToolExchange::default()
         }
     }
 

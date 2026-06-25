@@ -638,6 +638,7 @@ mod tests {
             tool_name: "read_file".to_string(),
             arguments: r#"{"file_path":"src/lib.rs"}"#.to_string(),
             result: "contents".to_string(),
+            ..ToolExchange::default()
         };
 
         assert_eq!(unread_files(&packet, &[read_file]).len(), 1);
@@ -647,6 +648,7 @@ mod tests {
             tool_name: "get_symbol_sources".to_string(),
             arguments: "{}".to_string(),
             result: "File: src/lib.rs\nfn main() {}".to_string(),
+            ..ToolExchange::default()
         };
 
         assert!(unread_files(&packet, &[source]).is_empty());
@@ -669,6 +671,7 @@ mod tests {
             tool_name: "get_symbol_sources".to_string(),
             arguments: "{}".to_string(),
             result: "File: src/Related.rs\nstruct Related;".to_string(),
+            ..ToolExchange::default()
         };
 
         let nudges = deterministic_summary_nudges(&packet, &[source]);
@@ -694,6 +697,7 @@ mod tests {
             tool_name: "list_directory".to_string(),
             arguments: r#"{"path":"src"}"#.to_string(),
             result: "lib.rs\nRelated.rs\n".to_string(),
+            ..ToolExchange::default()
         };
 
         let nudges = deterministic_summary_nudges(&packet, &[listing]);
@@ -719,6 +723,7 @@ mod tests {
             tool_name: "get_summaries".to_string(),
             arguments: r#"{"targets":["src/Related.rs"]}"#.to_string(),
             result: "Summary for src/Related.rs".to_string(),
+            ..ToolExchange::default()
         };
 
         assert!(deterministic_summary_nudges(&packet, &[summary]).is_empty());
@@ -906,6 +911,7 @@ mod tests {
             tool_name: "get_symbol_sources".to_string(),
             arguments: "{}".to_string(),
             result: "File: src/lib.rs\nfn main() {}".to_string(),
+            ..ToolExchange::default()
         };
 
         let nudge = compose_no_edit_nudge(
@@ -949,6 +955,7 @@ mod tests {
             tool_name: "list_directory".to_string(),
             arguments: r#"{"path":"src"}"#.to_string(),
             result: "lib.rs\nRelated.rs\n".to_string(),
+            ..ToolExchange::default()
         };
 
         let nudge = compose_no_edit_nudge(
