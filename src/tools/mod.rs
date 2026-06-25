@@ -716,7 +716,12 @@ impl ToolRegistry {
             let names: Vec<String> = agents.iter_sorted().map(|m| m.name.clone()).collect();
             let catalog: String = agents
                 .iter_sorted()
-                .map(|m| format!("- {}: {}", m.name, m.description))
+                .map(|m| match m.max_turns {
+                    Some(max_turns) => {
+                        format!("- {}: {} (max_turns: {max_turns})", m.name, m.description)
+                    }
+                    None => format!("- {}: {}", m.name, m.description),
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             defs.push(tool_def(
@@ -1752,12 +1757,14 @@ mod tests {
             AgentMeta {
                 name: "doc-writer".into(),
                 description: "Drafts docs from code".into(),
+                max_turns: Some(7),
                 location: PathBuf::from("/tmp/doc-writer.md"),
                 scope: AgentScope::Project,
             },
             AgentMeta {
                 name: "bug-hunter".into(),
                 description: "Hunts for regressions".into(),
+                max_turns: None,
                 location: PathBuf::from("/tmp/bug-hunter.md"),
                 scope: AgentScope::User,
             },
@@ -1786,6 +1793,7 @@ mod tests {
             task_def.function.description
         );
         assert!(task_def.function.description.contains("bug-hunter"));
+        assert!(task_def.function.description.contains("max_turns: 7"));
     }
 
     /// MCP schemas often ask for arrays. The host must wrap scalar strings into
