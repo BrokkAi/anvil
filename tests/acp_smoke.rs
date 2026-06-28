@@ -2463,7 +2463,7 @@ fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &
             {
                 "name": "bifrost",
                 "command": fake_bifrost,
-                "args": ["--root", "{cwd}", "--server", "searchtools", "--no-line-numbers"],
+                "args": ["--root", "{cwd}", "--mcp", "searchtools", "--no-line-numbers"],
                 "framing": "line",
                 "enabled": true
             }

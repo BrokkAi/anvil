@@ -7531,7 +7531,7 @@ done
         vec![
             "--root".to_string(),
             cwd.display().to_string(),
-            "--server".to_string(),
+            "--mcp".to_string(),
             // Mirrors the default Bifrost surface (#121).
             "searchtools".to_string(),
             "--no-line-numbers".to_string(),

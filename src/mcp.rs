@@ -140,7 +140,7 @@ fn default_bifrost_args() -> Vec<String> {
     vec![
         "--root".to_string(),
         "{cwd}".to_string(),
-        "--server".to_string(),
+        "--mcp".to_string(),
         // `searchtools` is Bifrost's full read-only surface: the `core`
         // symbol/nlp/workspace tools plus the extended/text search tools and
         // the SlopCop code-quality reporters. SlopCop ACP read-only sessions
@@ -196,16 +196,28 @@ fn is_default_or_managed_bifrost_command(command: &str) -> bool {
 /// default. A persisted entry still carrying one of these (with the managed
 /// command) is an unmodified prior default, so it is upgraded to the current
 /// default on load. Without this, existing installs would keep their old
-/// `--server core` surface and never pick up the searchtools switch (#121)
-/// short of a manual `/mcp reset`.
+/// surface and never pick up changes short of a manual `/mcp reset`: the
+/// `core` -> `searchtools` switch (#121), and the deprecated `--server` flag
+/// -> `--mcp`.
 fn legacy_default_bifrost_arg_sets() -> Vec<Vec<String>> {
-    vec![vec![
-        "--root".to_string(),
-        "{cwd}".to_string(),
-        "--server".to_string(),
-        "core".to_string(),
-        "--no-line-numbers".to_string(),
-    ]]
+    vec![
+        // `--server core` (pre-#121 surface).
+        vec![
+            "--root".to_string(),
+            "{cwd}".to_string(),
+            "--server".to_string(),
+            "core".to_string(),
+            "--no-line-numbers".to_string(),
+        ],
+        // `--server searchtools` (current surface, but on the deprecated flag).
+        vec![
+            "--root".to_string(),
+            "{cwd}".to_string(),
+            "--server".to_string(),
+            "searchtools".to_string(),
+            "--no-line-numbers".to_string(),
+        ],
+    ]
 }
 
 /// True if `args` is the current managed default or a recognized prior default.
