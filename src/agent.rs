@@ -2781,10 +2781,16 @@ pub async fn run_agent(
                         cumulative_usage = turn_result.cumulative_usage;
                         let cancelled = cancel_status.is_cancelled();
                         let acp_stop = acp_stop_reason(&turn_result.stop, cancelled);
+                        // Avoid a double closing line: if a cancel landed just as
+                        // the loop fell through to a turn-limit/empty-completion
+                        // notice, the loop already streamed a reason, so skip the
+                        // cancel line and let the transcript end with one reason.
+                        let loop_streamed_notice =
+                            crate::tool_loop::render_loop_stop(&turn_result.stop).is_some();
 
                         sessions_for_gate.finish_prompt(&session_id_for_gate).await;
 
-                        if cancelled {
+                        if cancelled && !loop_streamed_notice {
                             send_message(&cx_for_gate, &session_id_for_gate, TURN_CANCELLED_NOTICE);
                         }
                         let acp_usage = acp_usage_from_token_usage(cumulative_usage);
@@ -2881,11 +2887,16 @@ pub async fn run_agent(
                     let cumulative_usage = turn_result.cumulative_usage;
                     let cancelled = cancel_status.is_cancelled();
                     let acp_stop = acp_stop_reason(&turn_result.stop, cancelled);
+                    // Skip the cancel line if the loop already streamed a
+                    // turn-limit/empty notice (cancel racing the fall-through),
+                    // so the transcript ends with a single reason.
+                    let loop_streamed_notice =
+                        crate::tool_loop::render_loop_stop(&turn_result.stop).is_some();
 
                     // Clean up cancellation token even on panic / persistence failure.
                     sessions_for_loop.finish_prompt(&session_id_for_loop).await;
 
-                    if cancelled {
+                    if cancelled && !loop_streamed_notice {
                         send_message(&cx_for_loop, &session_id_for_loop, TURN_CANCELLED_NOTICE);
                     }
 
@@ -3709,7 +3720,9 @@ async fn run_goal_turn(
     Ok(GoalTurnOutcome {
         response: turn.response,
         cumulative_usage: turn.cumulative_usage,
-        failure: turn.failure,
+        // Derive the failure from the single source of truth (`stop`) at the one
+        // seam that needs it, rather than carrying a parallel `failure` field.
+        failure: turn.stop.failure().cloned(),
     })
 }
 
@@ -4028,18 +4041,16 @@ async fn build_prompt_messages_with_compression(
 /// Everything a single model turn produced, threaded back to the caller.
 ///
 /// `response` is the assistant's final text (returned directly so callers no
-/// longer have to re-read it from persisted history), and `failure` is set
-/// only when the turn ended in an LLM error or panic rather than a real
-/// completion. The normal-prompt and `/loop` callers use just
-/// `structured_output` + `cumulative_usage`; `/goal` additionally inspects
-/// `response` (for the sentinel) and `failure` (to back off or stop). `stop` is
-/// the exhaustive loop stop reason, used to pick the ACP `StopReason` so a
-/// turn-limit exhaustion isn't reported to the client as a normal `EndTurn`.
+/// longer have to re-read it from persisted history). `stop` is the exhaustive
+/// loop stop reason: the normal-prompt and `/loop` callers use it (with usage +
+/// structured output) to pick the ACP `StopReason` so a turn-limit exhaustion
+/// isn't reported as a normal `EndTurn`, and `/goal` additionally derives its
+/// back-off-vs-stop decision from `stop.failure()` (so there is one source of
+/// truth for the failure, not a parallel field that could drift).
 struct ModelTurnResult {
     structured_output: Option<StructuredOutputResult>,
     cumulative_usage: crate::llm_client::TokenUsage,
     response: String,
-    failure: Option<crate::tool_loop::TurnFailure>,
     stop: crate::tool_loop::LoopStop,
 }
 
@@ -4469,10 +4480,10 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
     .await;
 
     match loop_result {
-        Ok((response, _tool_exchanges, _replay_events, usage, stop)) => PlanTurnResult {
-            response,
-            usage,
-            failure: stop.failure().cloned(),
+        Ok(outcome) => PlanTurnResult {
+            failure: outcome.stop.failure().cloned(),
+            response: outcome.response,
+            usage: outcome.usage,
         },
         Err(panic) => {
             tracing::error!(session_id = %session_id, "planning loop panicked: {:?}", panic);
@@ -4607,28 +4618,31 @@ async fn run_model_turn_in_spawn(
     .catch_unwind()
     .await;
 
-    let (response_text, tool_exchanges, replay_events, turn_usage, stop) = match loop_result {
-        Ok((text, exchanges, replay_events, usage, stop)) => {
-            (text, exchanges, replay_events, usage, stop)
-        }
+    let crate::tool_loop::LoopOutcome {
+        response: response_text,
+        tool_exchanges,
+        replay_events,
+        usage: turn_usage,
+        stop,
+    } = match loop_result {
+        Ok(outcome) => outcome,
         Err(panic) => {
             tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
             // A panic is treated as fatal (non-retryable): retrying a
             // deterministic crash would just spin, so an autonomous driver
             // should stop and surface it rather than back off and retry.
-            (
-                "Error: agent loop panicked. See server logs.".to_string(),
-                Vec::new(),
-                Vec::new(),
-                crate::llm_client::TokenUsage::default(),
-                crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
+            crate::tool_loop::LoopOutcome {
+                response: "Error: agent loop panicked. See server logs.".to_string(),
+                tool_exchanges: Vec::new(),
+                replay_events: Vec::new(),
+                usage: crate::llm_client::TokenUsage::default(),
+                stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
                     retryable: false,
                     message: "agent loop panicked".to_string(),
                 }),
-            )
+            }
         }
     };
-    let failure = stop.failure().cloned();
 
     let cost_delta_usd = sessions
         .available_model_metadata()
@@ -4673,7 +4687,6 @@ async fn run_model_turn_in_spawn(
         structured_output: structured_output_result,
         cumulative_usage,
         response: response_text,
-        failure,
         stop,
     }
 }

@@ -1754,6 +1754,13 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     // Turn 0 returns a tool call (read_file is auto-allowed, so no permission
     // round-trip); with --max-turns 1 the loop then has no budget for a final
     // text turn and falls through to the turn-limit exit.
+    //
+    // Exactly one canned body == one LLM call: --max-turns 1 makes turn 0 the
+    // only request. If loop semantics ever insert a second LLM call (e.g. a
+    // retry/nudge), the mock runs out of bodies and the turn hangs until the
+    // 1s idle timeout (set by spawn_anvil), surfacing here as a timeout-`Failed`
+    // exit rather than the asserted max_turn_requests -- a signal to revisit
+    // this fixture, not a flake to paper over.
     let provider = start_openai_smoke_server(vec![tool_call_sse_body_for(
         "call_read",
         "read_file",
@@ -1842,6 +1849,115 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     assert!(
         !client.exited(),
         "{}: anvil exited during max-turns smoke test; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+/// A turn whose final assistant message is empty must say so rather than
+/// stopping silently, and the reason must survive a cold reload. This exercises
+/// the empty-completion notice and the Case-A reload branch (no tool calls, so
+/// `replay_events` is empty and reload replays `agent_response` directly) --
+/// distinct from the tool-call/turn-limit path the max-turns test covers.
+#[test]
+fn empty_completion_is_reported_in_transcript_and_survives_reload() {
+    let case = SmokeCase {
+        name: "empty_completion",
+        prompt: "Say nothing.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    // One canned response with empty text -> the model ends the turn without a
+    // final message (no tool calls), i.e. `Completed { had_text: false }`.
+    let provider = start_openai_smoke_server(vec![text_sse_body("")]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+    let _ = client.take_updates();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+    // An empty completion is still a finished turn, not a turn-limit exit.
+    assert_eq!(
+        prompt["result"]["stopReason"].as_str(),
+        Some("end_turn"),
+        "{}: empty completion should report stopReason=end_turn: {prompt}",
+        case.name
+    );
+    let agent_text = collect_agent_message_text(&mut client);
+    assert!(
+        agent_text.contains("ended the turn without a final message"),
+        "{}: empty-completion reason did not reach the transcript; agent text was: {agent_text:?}",
+        case.name
+    );
+
+    // Survives a cold reload through the no-tool-calls (Case A) replay branch.
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    assert_response_ok(&case, "session/close", &close, &client);
+    let _ = client.take_updates();
+    let load = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_ok(&case, "session/load", &load, &client);
+    let replayed_text = collect_agent_message_text(&mut client);
+    assert!(
+        replayed_text.contains("ended the turn without a final message"),
+        "{}: empty-completion reason did not survive a cold reload; replayed text was: {replayed_text:?}",
+        case.name
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during empty-completion smoke test; stderr:\n{}\ntrace:\n{}",
         case.name,
         client.stderr_text(),
         client.trace_text()

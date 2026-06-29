@@ -297,6 +297,38 @@ pub(crate) fn agent_response_without_stop_notice(agent_response: &str) -> &str {
     }
 }
 
+/// Everything a [`run`] invocation produces. A named struct rather than a
+/// positional tuple so call sites read by field (`outcome.stop`) instead of
+/// by position.
+pub(crate) struct LoopOutcome {
+    /// The assistant's visible text for the turn: model output plus, for the
+    /// silent terminations, the appended closing notice.
+    pub response: String,
+    pub tool_exchanges: Vec<ToolExchange>,
+    pub replay_events: Vec<TurnReplayEvent>,
+    pub usage: TokenUsage,
+    pub stop: LoopStop,
+}
+
+impl LoopOutcome {
+    /// A run that never reached the model because loop setup failed (a
+    /// misconfigured `BRK_*` env var). The fatal message is both the visible
+    /// response and the `Failed` reason, so an autonomous driver stops on it
+    /// rather than retrying the same broken config.
+    fn setup_failure(message: String) -> Self {
+        Self {
+            stop: LoopStop::Failed(TurnFailure {
+                retryable: false,
+                message: message.clone(),
+            }),
+            response: message,
+            tool_exchanges: Vec::new(),
+            replay_events: Vec::new(),
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
@@ -1477,13 +1509,7 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
     tool_allowlist: Option<Arc<HashSet<String>>>,
-) -> (
-    String,
-    Vec<ToolExchange>,
-    Vec<TurnReplayEvent>,
-    TokenUsage,
-    LoopStop,
-) {
+) -> LoopOutcome {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
@@ -1495,16 +1521,9 @@ pub(crate) async fn run(
             // A misconfigured env var fails deterministically every turn, so
             // mark it fatal: an autonomous driver should stop and surface it
             // rather than retry the same broken config.
-            return (
-                format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
-                Vec::new(),
-                Vec::new(),
-                TokenUsage::default(),
-                LoopStop::Failed(TurnFailure {
-                    retryable: false,
-                    message: format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
-                }),
-            );
+            return LoopOutcome::setup_failure(format!(
+                "BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"
+            ));
         }
     };
     let training_packet = if train_bifrost {
@@ -1515,16 +1534,9 @@ pub(crate) async fn run(
                     "type": "train_bifrost_config_error",
                     "error": format!("{error:#}"),
                 }));
-                return (
-                    format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
-                    Vec::new(),
-                    Vec::new(),
-                    TokenUsage::default(),
-                    LoopStop::Failed(TurnFailure {
-                        retryable: false,
-                        message: format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
-                    }),
-                );
+                return LoopOutcome::setup_failure(format!(
+                    "BRK_TRAIN_BIFROST is misconfigured: {error:#}"
+                ));
             }
         }
     } else {
@@ -1539,18 +1551,9 @@ pub(crate) async fn run(
                         "type": "p2t_prefix_error",
                         "error": format!("{error:#}"),
                     }));
-                    return (
-                        format!("BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"),
-                        Vec::new(),
-                        Vec::new(),
-                        TokenUsage::default(),
-                        LoopStop::Failed(TurnFailure {
-                            retryable: false,
-                            message: format!(
-                                "BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"
-                            ),
-                        }),
-                    );
+                    return LoopOutcome::setup_failure(format!(
+                        "BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"
+                    ));
                 }
             },
             None => Vec::new(),
@@ -2320,13 +2323,13 @@ pub(crate) async fn run(
         full_response.push_str(&notice);
     }
 
-    (
-        full_response,
+    LoopOutcome {
+        response: full_response,
         tool_exchanges,
         replay_events,
-        turn_usage,
+        usage: turn_usage,
         stop,
-    )
+    }
 }
 
 /// Resolve the exhaustive [`LoopStop`] from the loop's accumulated state. An
@@ -4068,35 +4071,14 @@ async fn execute_subagent(
 
     // Turn the subagent's stop reason into the `task` tool result. A nested run
     // streams to a no-op sink, so the parent never sees the subagent's own
-    // closing line -- the reason has to be reported here. A turn-limit or
-    // cancellation exit is named explicitly rather than collapsed into the
-    // generic "empty response" message it used to share with a model that
-    // simply said nothing.
-    //
-    // The empty-vs-real decision keys on `had_text` from the `LoopStop`, NOT on
-    // `text.trim().is_empty()`: `run` appends its closing notice to the returned
-    // text for the silent terminations, so an emptiness check would mistake that
-    // notice for a real answer. `had_text` is captured before the notice is
-    // appended, so it still reflects whether the model itself produced output.
-    let (text, _exchanges, _replay_events, nested_usage, stop) = nested;
-    let failed_output = match &stop {
-        LoopStop::Failed(failure) => Some(format!(
-            "Error: subagent '{subagent_name}' failed before returning a result: {}",
-            failure.message
-        )),
-        LoopStop::MaxTurns { max_turns } => Some(format!(
-            "Error: subagent '{subagent_name}' stopped after reaching its {max_turns}-turn \
-             limit without returning a result."
-        )),
-        LoopStop::Cancelled => Some(format!(
-            "Error: subagent '{subagent_name}' was cancelled before returning a result."
-        )),
-        LoopStop::Completed { had_text: false } => Some(format!(
-            "Error: subagent '{subagent_name}' returned an empty response."
-        )),
-        LoopStop::Completed { had_text: true } => None,
-    };
-    let exec = match failed_output {
+    // closing line -- the reason is reported here by `subagent_failure_message`.
+    let LoopOutcome {
+        response: text,
+        usage: nested_usage,
+        stop,
+        ..
+    } = nested;
+    let exec = match subagent_failure_message(subagent_name, &stop) {
         Some(output) => ToolExecution {
             output,
             failed: true,
@@ -4114,6 +4096,36 @@ async fn execute_subagent(
 fn subagent_max_turns(parent_max_turns: usize, agent_max_turns: Option<usize>) -> usize {
     let global_cap = parent_max_turns.min(MAX_SUBAGENT_TURNS);
     agent_max_turns.map_or(global_cap, |cap| global_cap.min(cap))
+}
+
+/// The `task`-tool error message for a subagent that did not return a usable
+/// answer, or `None` when it completed with real output (returned as-is).
+///
+/// Keyed on the subagent's [`LoopStop`], never on text emptiness: `run` appends
+/// its closing notice to the returned text for the silent terminations, so an
+/// emptiness check would mistake that notice for an answer (`had_text` is
+/// captured before the notice is appended). A turn-limit or cancellation exit is
+/// reported explicitly -- a maxed-out subagent surfaces an error rather than
+/// passing its partial, unfinished work back to the parent as if it were a
+/// complete result.
+fn subagent_failure_message(subagent_name: &str, stop: &LoopStop) -> Option<String> {
+    match stop {
+        LoopStop::Failed(failure) => Some(format!(
+            "Error: subagent '{subagent_name}' failed before returning a result: {}",
+            failure.message
+        )),
+        LoopStop::MaxTurns { max_turns } => Some(format!(
+            "Error: subagent '{subagent_name}' stopped after reaching its {max_turns}-turn \
+             limit without returning a result."
+        )),
+        LoopStop::Cancelled => Some(format!(
+            "Error: subagent '{subagent_name}' was cancelled before returning a result."
+        )),
+        LoopStop::Completed { had_text: false } => Some(format!(
+            "Error: subagent '{subagent_name}' returned an empty response."
+        )),
+        LoopStop::Completed { had_text: true } => None,
+    }
 }
 
 /// Send a `SessionNotification` and log on failure -- there is nothing
@@ -4386,6 +4398,41 @@ mod tests {
             agent_response_without_stop_notice("just a normal answer"),
             "just a normal answer"
         );
+    }
+
+    #[test]
+    fn subagent_failure_message_reports_every_non_answer_stop() {
+        // A real answer produces no failure (the text is returned as-is).
+        assert!(
+            subagent_failure_message("worker", &LoopStop::Completed { had_text: true }).is_none()
+        );
+
+        // An empty completion is reported as such.
+        let empty = subagent_failure_message("worker", &LoopStop::Completed { had_text: false })
+            .expect("empty completion is a failure");
+        assert!(empty.contains("worker"));
+        assert!(empty.contains("empty response"));
+
+        // A turn-limit exit is named explicitly -- a maxed-out subagent surfaces
+        // an error rather than passing partial work back as a complete result.
+        let maxed = subagent_failure_message("worker", &LoopStop::MaxTurns { max_turns: 25 })
+            .expect("turn-limit is a failure");
+        assert!(maxed.contains("25-turn limit"));
+        assert!(maxed.contains("without returning a result"));
+
+        let cancelled = subagent_failure_message("worker", &LoopStop::Cancelled)
+            .expect("cancellation is a failure");
+        assert!(cancelled.contains("cancelled"));
+
+        let failed = subagent_failure_message(
+            "worker",
+            &LoopStop::Failed(TurnFailure {
+                retryable: true,
+                message: "upstream 503".into(),
+            }),
+        )
+        .expect("failure is reported");
+        assert!(failed.contains("upstream 503"));
     }
 
     #[test]
