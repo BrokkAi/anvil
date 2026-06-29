@@ -1714,6 +1714,142 @@ fn invalid_prompt_requests_return_invalid_params() {
     let _ = stderr_join.join();
 }
 
+/// A turn that exhausts its `--max-turns` budget must NOT just stop silently:
+/// the reason has to reach the transcript (a streamed `agent_message_chunk`)
+/// AND the `PromptResponse.stopReason` must be `max_turn_requests`, not a
+/// normal `end_turn`. Driven model-free: a single canned tool-call response
+/// makes turn 0 a tool turn, so with `--max-turns 1` the loop runs out of its
+/// budget before the model produces a final message.
+#[test]
+fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
+    let case = SmokeCase {
+        name: "max_turns_exhaustion",
+        prompt: "Read the README and keep going.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    // Turn 0 returns a tool call (read_file is auto-allowed, so no permission
+    // round-trip); with --max-turns 1 the loop then has no budget for a final
+    // text turn and falls through to the turn-limit exit.
+    let provider = start_openai_smoke_server(vec![tool_call_sse_body_for(
+        "call_read",
+        "read_file",
+        r#"{"file_path":"README.md"}"#,
+    )]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        1,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+    let _ = client.take_updates();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+
+    // (1) The machine-readable stop reason distinguishes a turn-limit exit from
+    // a normal completion.
+    assert_eq!(
+        prompt["result"]["stopReason"].as_str(),
+        Some("max_turn_requests"),
+        "{}: exhausting --max-turns must report stopReason=max_turn_requests, not end_turn: {prompt}",
+        case.name
+    );
+
+    // (2) The human-readable reason reached the transcript as agent text. This
+    // is independent of the client rendering the stop reason -- it is ordinary
+    // streamed assistant output.
+    let agent_text: String = client
+        .take_updates()
+        .into_iter()
+        .filter(|update| update["sessionUpdate"].as_str() == Some("agent_message_chunk"))
+        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        agent_text.contains("reached the 1-turn limit"),
+        "{}: turn-limit reason did not reach the transcript; agent text was: {agent_text:?}",
+        case.name
+    );
+
+    // (3) The reason survives a cold reload. Evict the session from memory
+    // (session/close), then load it back from disk: the persisted turn's
+    // agent_response must still replay the closing notice. This proves the
+    // notice was written durably, not just streamed to the live transcript.
+    let close = client.request("session/close", json!({ "sessionId": session_id }));
+    assert_response_ok(&case, "session/close", &close, &client);
+    let _ = client.take_updates();
+
+    let load = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_response_ok(&case, "session/load", &load, &client);
+    let replayed_text: String = client
+        .take_updates()
+        .into_iter()
+        .filter(|update| update["sessionUpdate"].as_str() == Some("agent_message_chunk"))
+        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        replayed_text.contains("reached the 1-turn limit"),
+        "{}: turn-limit reason did not survive a cold reload; replayed text was: {replayed_text:?}",
+        case.name
+    );
+
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during max-turns smoke test; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
 fn run_smoke_case(case: &SmokeCase) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");

@@ -236,6 +236,44 @@ pub(crate) struct TurnFailure {
     pub message: String,
 }
 
+/// Why the agentic tool loop in [`run`] stopped.
+///
+/// Exhaustive and set on every exit path, so callers never have to infer the
+/// reason from an empty response string. [`TurnFailure`] (wrapped in `Failed`)
+/// is the LLM/setup-error case; the other variants are clean terminations that
+/// previously left no trace -- the loop just returned an empty `full_response`,
+/// which is the "anvil exits without saying why" symptom. Top-level callers map
+/// this to the ACP `StopReason`, and the loop itself streams a closing line for
+/// the otherwise-silent terminations (turn-limit exhaustion, empty completion).
+#[derive(Debug, Clone)]
+pub(crate) enum LoopStop {
+    /// The model ended the turn with a final assistant message. `had_text` is
+    /// false when that message carried no visible text -- the turn produced
+    /// nothing for the user to read, so callers surface it as a distinct reason.
+    Completed { had_text: bool },
+    /// The loop used its entire `max_turns` budget without the model ending the
+    /// turn -- the dominant "it just stopped" case for agentic work.
+    MaxTurns { max_turns: usize },
+    /// The session was cancelled (`session/cancel`) mid-turn.
+    Cancelled,
+    /// The turn ended because the LLM call or loop setup failed. Carries the
+    /// retryable classification autonomous drivers use to back off vs. stop.
+    Failed(TurnFailure),
+}
+
+impl LoopStop {
+    /// The classified failure, when the loop stopped because the LLM/setup
+    /// failed; `None` for every clean termination. Lets callers that only care
+    /// about the back-off-vs-stop decision keep treating the reason as an
+    /// `Option<TurnFailure>`.
+    pub(crate) fn failure(&self) -> Option<&TurnFailure> {
+        match self {
+            LoopStop::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
@@ -1421,7 +1459,7 @@ pub(crate) async fn run(
     Vec<ToolExchange>,
     Vec<TurnReplayEvent>,
     TokenUsage,
-    Option<TurnFailure>,
+    LoopStop,
 ) {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
@@ -1439,7 +1477,7 @@ pub(crate) async fn run(
                 Vec::new(),
                 Vec::new(),
                 TokenUsage::default(),
-                Some(TurnFailure {
+                LoopStop::Failed(TurnFailure {
                     retryable: false,
                     message: format!("BRK_PATCHES_TO_TRACES is misconfigured: {error:#}"),
                 }),
@@ -1459,7 +1497,7 @@ pub(crate) async fn run(
                     Vec::new(),
                     Vec::new(),
                     TokenUsage::default(),
-                    Some(TurnFailure {
+                    LoopStop::Failed(TurnFailure {
                         retryable: false,
                         message: format!("BRK_TRAIN_BIFROST is misconfigured: {error:#}"),
                     }),
@@ -1483,7 +1521,7 @@ pub(crate) async fn run(
                         Vec::new(),
                         Vec::new(),
                         TokenUsage::default(),
-                        Some(TurnFailure {
+                        LoopStop::Failed(TurnFailure {
                             retryable: false,
                             message: format!(
                                 "BRK_PATCHES_TO_TRACES prefix is misconfigured: {error:#}"
@@ -1541,6 +1579,11 @@ pub(crate) async fn run(
     // model response apart from an outage. The error text is still appended to
     // `full_response` and streamed, exactly as before.
     let mut llm_failure: Option<TurnFailure> = None;
+    // The clean (non-failure) exit reason, set by the cancel breaks and the
+    // final-text break. Left `None` when the `for` loop falls through its turn
+    // budget -- the turn-limit case -- and resolved into [`LoopStop`] after the
+    // loop. Kept separate from `llm_failure` so the two channels never collide.
+    let mut clean_exit: Option<LoopStop> = None;
     let mut no_edit_progress_nudge_count = 0usize;
     let mut no_edit_completion_retry_count = 0usize;
     if let Some(config) = p2t_config.as_ref() {
@@ -1615,6 +1658,7 @@ pub(crate) async fn run(
                     }),
                 );
             }
+            clean_exit = Some(LoopStop::Cancelled);
             break;
         }
         if let Some((config, forced_step)) = p2t_config
@@ -1955,7 +1999,13 @@ pub(crate) async fn run(
                 if !text.is_empty() && !replay_events.is_empty() {
                     replay_events.push(TurnReplayEvent::AssistantText { text });
                 }
-                // Final text response -- we're done
+                // Final text response -- we're done. `had_text` reflects the
+                // whole turn's visible output, not just this message, so a turn
+                // that streamed text before an earlier tool call isn't reported
+                // as a silent "empty completion".
+                clean_exit = Some(LoopStop::Completed {
+                    had_text: !full_response.trim().is_empty(),
+                });
                 break;
             }
             Ok(LlmResponse::ToolCalls {
@@ -2027,6 +2077,7 @@ pub(crate) async fn run(
                 )
                 .await;
                 if outcome.cancelled {
+                    clean_exit = Some(LoopStop::Cancelled);
                     break 'outer;
                 }
                 let previous_shell_sandbox_retry_states = shell_sandbox_retry_states.clone();
@@ -2195,12 +2246,68 @@ pub(crate) async fn run(
         );
     }
 
+    // Resolve the exhaustive stop reason. An LLM/setup failure wins (it already
+    // streamed its `**Error:**` line); otherwise use the clean exit recorded at
+    // a break, falling back to the turn-limit case when the `for` loop ran out
+    // of its budget without the model finishing.
+    //
+    // p2t/training runs short-circuit through their own stop machinery and have
+    // no user transcript to narrate, so they neither report `MaxTurns` for a
+    // window end nor emit a closing line.
+    let surface_reason = !train_bifrost && p2t_config.is_none();
+    let stop = if let Some(failure) = llm_failure {
+        LoopStop::Failed(failure)
+    } else if let Some(clean_exit) = clean_exit {
+        clean_exit
+    } else if surface_reason {
+        LoopStop::MaxTurns { max_turns }
+    } else {
+        LoopStop::Completed {
+            had_text: !full_response.trim().is_empty(),
+        }
+    };
+
+    // Make the otherwise-silent terminations obvious AND durable. The turn-limit
+    // and empty-completion cases previously returned an empty `full_response`, so
+    // the conversation just stopped with no explanation -- and since nothing was
+    // persisted, a later `session/load` replayed the same silence. The notice is
+    // both streamed live (`on_text`) and appended to `full_response`, so it lands
+    // in the turn's `agent_response`; the load/history reconciliation
+    // (`strip_prefix(replayed_assistant_text)`) then re-emits it as the trailing
+    // assistant text on reload. It is appended after all model text, so
+    // `replayed_assistant_text` stays a prefix of `agent_response` and the notice
+    // is not double-sent.
+    //
+    // Safety: the notice is appended only for `MaxTurns` and an empty `Completed`,
+    // never when the model produced a real final answer (`Completed { had_text:
+    // true }`). So a successful structured-output JSON is never polluted, and the
+    // subagent -- which keys its empty/turn-limit handling on the returned
+    // `LoopStop`, not on text emptiness -- cannot mistake the notice for a result.
+    if surface_reason {
+        let notice = match &stop {
+            LoopStop::MaxTurns { max_turns } => Some(format!(
+                "\n⏹ Stopped: reached the {max_turns}-turn limit before the model finished. \
+                 Send another message to continue, or restart with a higher `--max-turns`.\n"
+            )),
+            LoopStop::Completed { had_text: false } => {
+                Some("\n⏹ Stopped: the model ended the turn without a final message.\n".to_string())
+            }
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            if let Ok(mut cb) = on_text.lock() {
+                cb(&notice);
+            }
+            full_response.push_str(&notice);
+        }
+    }
+
     (
         full_response,
         tool_exchanges,
         replay_events,
         turn_usage,
-        llm_failure,
+        stop,
     )
 }
 
@@ -3897,22 +4004,47 @@ async fn execute_subagent(
     ))
     .await;
 
-    // The subagent surfaces failure via its returned text (an empty response
-    // becomes an error below); the structured failure class is for top-level
-    // autonomous drivers, so it is ignored for a nested run.
-    let (text, _exchanges, _replay_events, nested_usage, _failure) = nested;
-    let exec = if text.trim().is_empty() {
-        ToolExecution {
-            output: format!("Error: subagent '{subagent_name}' returned an empty response."),
+    // Turn the subagent's stop reason into the `task` tool result. A nested run
+    // streams to a no-op sink, so the parent never sees the subagent's own
+    // closing line -- the reason has to be reported here. A turn-limit or
+    // cancellation exit is named explicitly rather than collapsed into the
+    // generic "empty response" message it used to share with a model that
+    // simply said nothing.
+    //
+    // The empty-vs-real decision keys on `had_text` from the `LoopStop`, NOT on
+    // `text.trim().is_empty()`: `run` appends its closing notice to the returned
+    // text for the silent terminations, so an emptiness check would mistake that
+    // notice for a real answer. `had_text` is captured before the notice is
+    // appended, so it still reflects whether the model itself produced output.
+    let (text, _exchanges, _replay_events, nested_usage, stop) = nested;
+    let failed_output = match &stop {
+        LoopStop::Failed(failure) => Some(format!(
+            "Error: subagent '{subagent_name}' failed before returning a result: {}",
+            failure.message
+        )),
+        LoopStop::MaxTurns { max_turns } => Some(format!(
+            "Error: subagent '{subagent_name}' stopped after reaching its {max_turns}-turn \
+             limit without returning a result."
+        )),
+        LoopStop::Cancelled => Some(format!(
+            "Error: subagent '{subagent_name}' was cancelled before returning a result."
+        )),
+        LoopStop::Completed { had_text: false } => Some(format!(
+            "Error: subagent '{subagent_name}' returned an empty response."
+        )),
+        LoopStop::Completed { had_text: true } => None,
+    };
+    let exec = match failed_output {
+        Some(output) => ToolExecution {
+            output,
             failed: true,
             sandbox_retry_available: false,
-        }
-    } else {
-        ToolExecution {
+        },
+        None => ToolExecution {
             output: text,
             failed: false,
             sandbox_retry_available: false,
-        }
+        },
     };
     (exec, nested_usage)
 }
@@ -4100,6 +4232,22 @@ mod tests {
     fn subagent_turn_budget_uses_global_cap_by_default() {
         assert_eq!(subagent_max_turns(200, None), MAX_SUBAGENT_TURNS);
         assert_eq!(subagent_max_turns(5, None), 5);
+    }
+
+    #[test]
+    fn loop_stop_exposes_failure_only_for_failed() {
+        assert!(LoopStop::Completed { had_text: true }.failure().is_none());
+        assert!(LoopStop::Completed { had_text: false }.failure().is_none());
+        assert!(LoopStop::MaxTurns { max_turns: 5 }.failure().is_none());
+        assert!(LoopStop::Cancelled.failure().is_none());
+
+        let failed = LoopStop::Failed(TurnFailure {
+            retryable: true,
+            message: "overloaded".to_string(),
+        });
+        let failure = failed.failure().expect("Failed exposes its TurnFailure");
+        assert!(failure.retryable);
+        assert_eq!(failure.message, "overloaded");
     }
 
     #[test]
