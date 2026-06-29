@@ -2106,6 +2106,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_shell_command_args_accept_both_sandbox_permission_values() {
+        // Both advertised enum values must deserialize; the gate keys off the
+        // raw `require_escalated` string, but `use_default` must also parse
+        // (it was added so a model can state the default without an error).
+        for value in ["use_default", "require_escalated"] {
+            parse_builtin_args::<RunShellCommandArgs>(
+                "run_shell_command",
+                json!({ "command": "echo ok", "sandbox_permissions": value }),
+            )
+            .unwrap_or_else(|err| {
+                panic!("'{value}' should deserialize: {:?}", err.output);
+            });
+        }
+    }
+
+    #[test]
+    fn run_shell_command_args_reject_unknown_sandbox_permission_value() {
+        let err = parse_builtin_args::<RunShellCommandArgs>(
+            "run_shell_command",
+            json!({ "command": "echo ok", "sandbox_permissions": "yolo" }),
+        )
+        .expect_err("an unknown sandbox_permissions value must be rejected");
+        assert!(matches!(err.status, ToolStatus::RequestError));
+    }
+
     #[tokio::test]
     async fn tool_definitions_respect_filtered_builtin_set() {
         let registry = registry_with_skills(vec![]);

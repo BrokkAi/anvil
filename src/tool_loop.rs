@@ -2688,15 +2688,6 @@ async fn evaluate_pure_gate(
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
     let shell_sandbox_escalation_requested =
         tool_name == "run_shell_command" && shell_sandbox_escalation_requested(raw_input);
-    // Codex-style explicit escalation: the model may request an outside-sandbox
-    // run up front, with no prior failure required. We still reject it when
-    // there is no OS sandbox to escape -- otherwise "run outside the sandbox"
-    // is a meaningless prompt. (Read-only mode is rejected below by
-    // `pure_gate_decision`, which forbids shell execution outright.)
-    if shell_sandbox_escalation_requested && !shell_sandboxed {
-        return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
-            .to_string());
-    }
     let sandbox_escalation_requested = shell_sandboxed && shell_sandbox_escalation_requested;
     let shell_auto_allow = tool_name == "run_shell_command"
         && !sandbox_escalation_requested
@@ -2728,6 +2719,23 @@ async fn evaluate_pure_gate(
             .await
     };
     let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
+
+    // Codex-style explicit escalation: the model may request an outside-sandbox
+    // run up front, with no prior failure required. We still reject it when
+    // there is no OS sandbox to escape -- otherwise "run outside the sandbox" is
+    // a meaningless prompt. A mode that forbids shell execution outright
+    // (read-only) already produced a `Reject` above and takes precedence:
+    // surfacing that more fundamental reason avoids sending the model down a
+    // "retry without sandbox_permissions" path that would also be rejected, and
+    // keeps the message host-independent (the no-OS-sandbox branch otherwise
+    // fires on platforms without an OS sandbox, e.g. Windows).
+    if shell_sandbox_escalation_requested
+        && !shell_sandboxed
+        && !matches!(decision, PureGateDecision::Reject(_))
+    {
+        return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
+            .to_string());
+    }
 
     Ok(PureGateEvaluation {
         mode,
@@ -2801,7 +2809,11 @@ async fn consult_gate(
         }),
         PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
         PureGateDecision::Prompt => {
-            let escalation_requested = shell_sandbox_escalation_requested(request.raw_input);
+            // Mirror `evaluate_pure_gate`'s shell guard: a stray
+            // `sandbox_permissions` field on a non-shell tool must not be read
+            // as an escalation request.
+            let escalation_requested = request.tool_name == "run_shell_command"
+                && shell_sandbox_escalation_requested(request.raw_input);
             if should_run_permission_auto_classifier(
                 evaluation.mode,
                 request.tool_name,
@@ -3551,18 +3563,28 @@ fn tool_result_to_execution(
         && !outside_sandbox_once
         && shell_sandboxed
         && is_likely_sandbox_limitation(&output);
-    if sandbox_failure_hint {
-        output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
-    }
-    if output.len() > MAX_TOOL_RESULT_BYTES {
+    // Truncate the command output *before* appending the advisory hint, reserving
+    // room for it, so the hint stays the exact final suffix.
+    // `strip_sandbox_escalation_hint` removes it from the client card by suffix
+    // match; truncating after the append could slice through the hint and both
+    // leak it onto the card and defeat the strip.
+    let reserved = if sandbox_failure_hint {
+        SANDBOX_FAILURE_ESCALATION_HINT.len()
+    } else {
+        0
+    };
+    if output.len() > MAX_TOOL_RESULT_BYTES.saturating_sub(reserved) {
         // Truncate on a UTF-8 char boundary; otherwise an emoji or accented
         // byte sequence could leave the slice mid-codepoint.
-        let mut cut = MAX_TOOL_RESULT_BYTES;
+        let mut cut = MAX_TOOL_RESULT_BYTES.saturating_sub(reserved);
         while !output.is_char_boundary(cut) {
             cut -= 1;
         }
         output.truncate(cut);
         output.push_str("\n... output truncated");
+    }
+    if sandbox_failure_hint {
+        output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
     }
     ToolExecution { output, failed }
 }
@@ -5268,6 +5290,66 @@ mod tests {
         assert!(
             rejection.is_none(),
             "escalation under an active OS sandbox should reach the prompt without a prior failure; got: {rejection:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn escalation_request_forces_prompt_even_when_command_is_always_allowed() {
+        use crate::sandbox_backend::SandboxMode;
+
+        // The "escalation always prompts, never auto-allows / never persists"
+        // guarantee is load-bearing now that there is no retry-state gate. Even a
+        // command whose prefix is already remembered must re-prompt when it
+        // carries `require_escalated`, so the user explicitly approves leaving
+        // the sandbox. (`deterministic_gate_rejection` can't see this difference
+        // -- it returns None for both Allow and Prompt -- so assert on the
+        // `PureGateDecision` directly.)
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_sandbox_mode(&session.id, Some(SandboxMode::Os))
+                .await
+        );
+        // Remember the `cargo build` prefix so the bare command auto-allows.
+        let key = shell_prefix_key(&["cargo".to_string(), "build".to_string()], true);
+        store.add_always_allow(&session.id, &key).await;
+
+        let baseline = evaluate_pure_gate(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({"command": "cargo build"}),
+            WorkspaceRoots::new(cwd.path(), &[]),
+        )
+        .await
+        .expect("gate should evaluate");
+        assert!(
+            matches!(baseline.decision, PureGateDecision::Allow),
+            "remembered prefix should auto-allow without escalation; got {:?}",
+            baseline.decision
+        );
+
+        let escalated = evaluate_pure_gate(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({
+                "command": "cargo build",
+                "sandbox_permissions": "require_escalated",
+            }),
+            WorkspaceRoots::new(cwd.path(), &[]),
+        )
+        .await
+        .expect("gate should evaluate");
+        assert!(
+            matches!(escalated.decision, PureGateDecision::Prompt),
+            "escalation must force a prompt, never auto-allow; got {:?}",
+            escalated.decision
         );
     }
 
