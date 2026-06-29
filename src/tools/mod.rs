@@ -337,6 +337,19 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Building usage graph",
     },
     ToolMeta {
+        name: "get_definition_by_reference",
+        kind: ToolKind::Search,
+        display_name: "Finding definition",
+    },
+    ToolMeta {
+        // bifrost returns the non-mutating rename edit set (it never writes),
+        // so it ships in the read-only `searchtools` surface with
+        // readOnlyHint=true and is classified as a read tool here.
+        name: "rename_symbol",
+        kind: ToolKind::Read,
+        display_name: "Computing symbol rename",
+    },
+    ToolMeta {
         name: "semantic_search",
         kind: ToolKind::Search,
         display_name: "Searching semantically",
@@ -455,6 +468,11 @@ const TOOLS: &[ToolMeta] = &[
         name: "analyze_git_hotspots",
         kind: ToolKind::Read,
         display_name: "Analyzing git hotspots",
+    },
+    ToolMeta {
+        name: "analyze_commit",
+        kind: ToolKind::Read,
+        display_name: "Analyzing commit",
     },
     // `activate_workspace` and `refresh` mutate analyzer state, so they
     // stay `Other` rather than `Read`: prompted in `default`, refused in
