@@ -957,18 +957,17 @@ fn shell_command_will_run_sandboxed(
     crate::tools::sandbox::shell_command_will_run_sandboxed(permission_mode, sandbox_mode)
 }
 
-const SANDBOX_ESCALATION_COMMAND_FIELD: &str = "sandbox_permissions";
-const SANDBOX_ESCALATION_REQUEST_VALUE: &str = "require_escalated";
-
 /// Whether the model asked for a one-time outside-sandbox run by setting
 /// `sandbox_permissions: "require_escalated"` on a shell call. The gate reads
 /// this off the raw arguments; the typed `RunShellCommandArgs` value only
-/// validates the schema enum.
+/// validates the schema enum. The field name and value come from
+/// [`ShellSandboxPermissionArg`] so they cannot drift from the advertised
+/// schema or the deserializer.
 fn shell_sandbox_escalation_requested(raw_input: &Value) -> bool {
     raw_input
-        .get(SANDBOX_ESCALATION_COMMAND_FIELD)
+        .get(crate::tools::ShellSandboxPermissionArg::FIELD)
         .and_then(Value::as_str)
-        .is_some_and(|value| value == SANDBOX_ESCALATION_REQUEST_VALUE)
+        .is_some_and(|value| value == crate::tools::ShellSandboxPermissionArg::REQUIRE_ESCALATED)
 }
 
 /// Number of leading argv tokens kept as a shell "Always allow" prefix.
@@ -2275,6 +2274,12 @@ async fn execute_step_tool_calls(
             }
         };
 
+        // Whether this call asked to run outside the OS sandbox. Tracked so the
+        // server-side audit trail records both approvals and denials of a
+        // security-relevant boundary crossing.
+        let shell_escalation_requested =
+            tool_name == "run_shell_command" && shell_sandbox_escalation_requested(&parsed_input);
+
         if let Some(reason) = announce::rejection_for_oversized_title(&tool_name, &parsed_input)
             .or_else(|| announce::rejection_for_oversized_input_content(&tool_name, &parsed_input))
         {
@@ -2337,6 +2342,15 @@ async fn execute_step_tool_calls(
         )
         .await
         {
+            if shell_escalation_requested {
+                tracing::warn!(
+                    target: "audit",
+                    session_id = %session_id,
+                    tool_name = %tool_name,
+                    reason = %message,
+                    "denied outside-sandbox escalation request (preflight)"
+                );
+            }
             let (blocked_call, failed_update) =
                 blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
             maybe_send_session_update(
@@ -2440,6 +2454,15 @@ async fn execute_step_tool_calls(
 
         let (output, status, replay_diff) = match decision {
             GateDecision::Reject(message) => {
+                if shell_escalation_requested {
+                    tracing::warn!(
+                        target: "audit",
+                        session_id = %session_id,
+                        tool_name = %tool_name,
+                        reason = %message,
+                        "denied outside-sandbox escalation request"
+                    );
+                }
                 maybe_send_session_update(
                     notifications,
                     spawned_cx.cx(),
@@ -2497,6 +2520,25 @@ async fn execute_step_tool_calls(
                     policy,
                     outside_sandbox_once
                 );
+
+                // A command crossing the OS sandbox boundary is the most
+                // security-significant runtime event this server performs.
+                // Record it as a distinct, session-attributed, structured audit
+                // event (not just the generic INFO exec line above) so operators
+                // can review/alert on outside-sandbox executions after the fact.
+                if outside_sandbox_once {
+                    let command = parsed_input
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    tracing::warn!(
+                        target: "audit",
+                        session_id = %session_id,
+                        tool_name = %tool_name,
+                        command,
+                        "approved outside-sandbox shell execution"
+                    );
+                }
 
                 let exec = if tool_name == "task" {
                     let (exec, nested_usage) = execute_subagent(

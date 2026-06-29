@@ -79,7 +79,7 @@ fn default_shell_timeout_ms() -> u64 {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ShellSandboxPermissionArg {
+pub(crate) enum ShellSandboxPermissionArg {
     /// Run inside the active sandbox (the implicit behavior when the field is
     /// omitted). Accepted so a model can state the default explicitly without a
     /// deserialization error.
@@ -89,6 +89,22 @@ enum ShellSandboxPermissionArg {
     /// (`tool_loop::shell_sandbox_escalation_requested`); the parsed value here
     /// only validates the schema enum.
     RequireEscalated,
+}
+
+impl ShellSandboxPermissionArg {
+    /// Argument key carrying the per-command sandbox override. Single source of
+    /// truth shared by the advertised schema (below) and the gate's raw-JSON
+    /// matcher (`tool_loop::shell_sandbox_escalation_requested`), so the name the
+    /// model is told and the name the gate looks for cannot drift. Kept equal to
+    /// the serde `rename` on `RunShellCommandArgs::_sandbox_permissions`.
+    pub(crate) const FIELD: &'static str = "sandbox_permissions";
+    /// The only behavior-changing value: requests one-time outside-sandbox
+    /// approval. Equal to the serde name of [`Self::RequireEscalated`].
+    pub(crate) const REQUIRE_ESCALATED: &'static str = "require_escalated";
+    /// Advertised JSON-schema enum, in order. Each entry must deserialize into a
+    /// variant; `run_shell_command_args_accept_every_schema_value` enforces that
+    /// these stay in lockstep with the `snake_case` variant names.
+    pub(crate) const SCHEMA_VALUES: [&'static str; 2] = ["use_default", Self::REQUIRE_ESCALATED];
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +137,11 @@ struct ActivateSkillArgs {
 trait BuiltinArgsContract {
     const REQUIRED_FIELDS: &'static [&'static str];
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)];
+    /// `(property, advertised enum values)` pairs the schema must expose. Empty
+    /// for tools with no enum-constrained field; overridden where a field's
+    /// allowed values are pinned to a Rust enum, so the hand-written schema
+    /// can't silently drift from the deserializer.
+    const ENUM_VALUES: &'static [(&'static str, &'static [&'static str])] = &[];
 }
 
 #[cfg(test)]
@@ -176,8 +197,12 @@ impl BuiltinArgsContract for RunShellCommandArgs {
         ("timeout", "integer"),
         ("description", "string"),
         ("directory", "string"),
-        ("sandbox_permissions", "string"),
+        (ShellSandboxPermissionArg::FIELD, "string"),
     ];
+    const ENUM_VALUES: &'static [(&'static str, &'static [&'static str])] = &[(
+        ShellSandboxPermissionArg::FIELD,
+        &ShellSandboxPermissionArg::SCHEMA_VALUES,
+    )];
 }
 
 #[cfg(test)]
@@ -818,7 +843,7 @@ impl ToolRegistry {
                 "Optional timeout in milliseconds. Rounded up to seconds and clamped to a {} second server maximum.",
                 shell::MAX_TIMEOUT_SECONDS
             );
-            let shell_properties = json!({
+            let mut shell_properties = json!({
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute (passed to sh -c)."
@@ -834,12 +859,16 @@ impl ToolRegistry {
                 "directory": {
                     "type": "string",
                     "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
-                },
-                "sandbox_permissions": {
-                    "type": "string",
-                    "enum": ["use_default", "require_escalated"],
-                    "description": "Per-command sandbox override. Defaults to `use_default` (run inside the active sandbox). Use `require_escalated` only when the command needs access the sandbox blocks -- network/DNS, package downloads, `git push`, attaching to or debugging host processes, or writing outside the working directory when explicitly requested. Escalation prompts the user for one-time approval to run outside the sandbox; do not use it for ordinary reads, searches, builds, tests, or workspace writes that should already work inside the sandbox."
                 }
+            });
+            // Keyed off the shared `FIELD`/`SCHEMA_VALUES` constants so the
+            // advertised name + enum cannot drift from the deserializer or the
+            // gate's matcher (`json!` can't take a path expression as an object
+            // key, hence the index assignment).
+            shell_properties[ShellSandboxPermissionArg::FIELD] = json!({
+                "type": "string",
+                "enum": ShellSandboxPermissionArg::SCHEMA_VALUES,
+                "description": "Per-command sandbox override. Defaults to `use_default` (run inside the active sandbox). Use `require_escalated` only when the command needs access the sandbox blocks -- network/DNS, package downloads, `git push`, attaching to or debugging host processes, or writing outside the working directory when explicitly requested. Escalation prompts the user for one-time approval to run outside the sandbox; do not use it for ordinary reads, searches, builds, tests, or workspace writes that should already work inside the sandbox."
             });
             defs.push(tool_def(
                 "run_shell_command",
@@ -1942,9 +1971,28 @@ mod tests {
         }
     }
 
+    fn assert_schema_enum_values_match<T: BuiltinArgsContract>(
+        defs: &[ToolDefinition],
+        name: &str,
+    ) {
+        let def = defs
+            .iter()
+            .find(|def| def.function.name == name)
+            .unwrap_or_else(|| panic!("{name} should be advertised"));
+        for (property, expected_values) in T::ENUM_VALUES {
+            let actual = &def.function.parameters["properties"][*property]["enum"];
+            assert_eq!(
+                actual,
+                &json!(expected_values),
+                "{name}.{property} schema enum drifted from typed args contract"
+            );
+        }
+    }
+
     fn assert_builtin_schema_matches<T: BuiltinArgsContract>(defs: &[ToolDefinition], name: &str) {
         assert_schema_required_matches::<T>(defs, name);
         assert_schema_property_types_match::<T>(defs, name);
+        assert_schema_enum_values_match::<T>(defs, name);
     }
 
     #[tokio::test]
@@ -2087,31 +2135,33 @@ mod tests {
             .find(|def| def.function.name == "run_shell_command")
             .expect("run_shell_command should be advertised");
 
+        let field = ShellSandboxPermissionArg::FIELD;
         assert!(
             shell
                 .function
                 .parameters
-                .pointer("/properties/sandbox_permissions")
+                .pointer(&format!("/properties/{field}"))
                 .is_some(),
             "shell schema must expose sandbox escalation up front (Codex-style)"
         );
         assert_eq!(
-            shell.function.parameters["properties"]["sandbox_permissions"]["type"],
+            shell.function.parameters["properties"][field]["type"],
             "string"
         );
         assert_eq!(
-            shell.function.parameters["properties"]["sandbox_permissions"]["enum"],
-            json!(["use_default", "require_escalated"]),
+            shell.function.parameters["properties"][field]["enum"],
+            json!(ShellSandboxPermissionArg::SCHEMA_VALUES),
             "shell schema enum must match ShellSandboxPermissionArg"
         );
     }
 
     #[test]
-    fn run_shell_command_args_accept_both_sandbox_permission_values() {
-        // Both advertised enum values must deserialize; the gate keys off the
-        // raw `require_escalated` string, but `use_default` must also parse
-        // (it was added so a model can state the default without an error).
-        for value in ["use_default", "require_escalated"] {
+    fn run_shell_command_args_accept_every_schema_value() {
+        // Every advertised enum value must deserialize into a variant; iterating
+        // the same `SCHEMA_VALUES` the schema advertises keeps the enum, the
+        // deserializer, and the gate's matcher in lockstep (the gate keys off
+        // the raw `require_escalated` string, but `use_default` must also parse).
+        for value in ShellSandboxPermissionArg::SCHEMA_VALUES {
             parse_builtin_args::<RunShellCommandArgs>(
                 "run_shell_command",
                 json!({ "command": "echo ok", "sandbox_permissions": value }),
