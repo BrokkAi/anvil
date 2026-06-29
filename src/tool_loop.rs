@@ -52,7 +52,6 @@ fn invalid_task_args(message: impl Into<String>) -> (ToolExecution, TokenUsage) 
         ToolExecution {
             output: message.into(),
             failed: true,
-            sandbox_retry_available: false,
         },
         TokenUsage::default(),
     )
@@ -92,7 +91,6 @@ fn tool_unavailable_message(tool_name: &str) -> String {
 
 struct ExecutedStepOutcome {
     results: Vec<p2t::PrefixToolResult>,
-    shell_sandbox_retry_states: Vec<ShellSandboxRetryState>,
     cancelled: bool,
 }
 
@@ -1052,69 +1050,17 @@ fn shell_command_will_run_sandboxed(
     crate::tools::sandbox::shell_command_will_run_sandboxed(permission_mode, sandbox_mode)
 }
 
-const SANDBOX_ESCALATION_COMMAND_FIELD: &str = "sandbox_permissions";
-const SANDBOX_ESCALATION_REQUEST_VALUE: &str = "require_escalated";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ShellSandboxRetryState {
-    cwd: String,
-    command: String,
-    effective_directory: String,
-}
-
-impl ShellSandboxRetryState {
-    fn from_raw_input(raw_input: &Value, cwd: &Path, additional_roots: &[PathBuf]) -> Option<Self> {
-        let command = raw_input.get("command")?.as_str()?.to_string();
-        let cwd = cwd.canonicalize().ok()?;
-        let effective_directory = match raw_input.get("directory").and_then(Value::as_str) {
-            Some(directory) if !directory.trim().is_empty() => {
-                crate::tools::safe_resolve_in_roots(&cwd, additional_roots, directory).ok()?
-            }
-            _ => cwd.clone(),
-        };
-        Some(Self {
-            cwd: cwd.display().to_string(),
-            command,
-            effective_directory: effective_directory.display().to_string(),
-        })
-    }
-
-    fn matches_raw_input(
-        &self,
-        raw_input: &Value,
-        cwd: &Path,
-        additional_roots: &[PathBuf],
-    ) -> bool {
-        Self::from_raw_input(raw_input, cwd, additional_roots)
-            .is_some_and(|candidate| candidate == *self)
-    }
-}
-
+/// Whether the model asked for a one-time outside-sandbox run by setting
+/// `sandbox_permissions: "require_escalated"` on a shell call. The gate reads
+/// this off the raw arguments; the typed `RunShellCommandArgs` value only
+/// validates the schema enum. The field name and value come from
+/// [`ShellSandboxPermissionArg`] so they cannot drift from the advertised
+/// schema or the deserializer.
 fn shell_sandbox_escalation_requested(raw_input: &Value) -> bool {
     raw_input
-        .get(SANDBOX_ESCALATION_COMMAND_FIELD)
+        .get(crate::tools::ShellSandboxPermissionArg::FIELD)
         .and_then(Value::as_str)
-        .is_some_and(|value| value == SANDBOX_ESCALATION_REQUEST_VALUE)
-}
-
-fn shell_sandbox_retry_state_index(
-    states: &[ShellSandboxRetryState],
-    raw_input: &Value,
-    cwd: &Path,
-    additional_roots: &[PathBuf],
-) -> Option<usize> {
-    states
-        .iter()
-        .position(|state| state.matches_raw_input(raw_input, cwd, additional_roots))
-}
-
-fn push_unique_shell_sandbox_retry_state(
-    states: &mut Vec<ShellSandboxRetryState>,
-    state: ShellSandboxRetryState,
-) {
-    if !states.contains(&state) {
-        states.push(state);
-    }
+        .is_some_and(|value| value == crate::tools::ShellSandboxPermissionArg::REQUIRE_ESCALATED)
 }
 
 /// Number of leading argv tokens kept as a shell "Always allow" prefix.
@@ -1573,12 +1519,7 @@ pub(crate) async fn run(
         };
         registry.set_builtin_tools(builtin_tools).await;
     }
-    let mut shell_sandbox_retry_states: Vec<ShellSandboxRetryState> = Vec::new();
-    let mut tools: Vec<ToolDefinition> = if !shell_sandbox_retry_states.is_empty() {
-        registry.tool_definitions_with_shell_escalation(true).await
-    } else {
-        registry.tool_definitions().await
-    };
+    let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
     // catalog at deeper levels prevents an unbounded recursion of
@@ -1724,20 +1665,11 @@ pub(crate) async fn run(
                 &session_id,
                 &sessions,
                 notifications,
-                &shell_sandbox_retry_states,
                 depth,
             )
             .await;
             if outcome.cancelled {
                 break;
-            }
-            let previous_shell_sandbox_retry_states = shell_sandbox_retry_states.clone();
-            shell_sandbox_retry_states = outcome.shell_sandbox_retry_states;
-            if shell_sandbox_retry_states != previous_shell_sandbox_retry_states {
-                tools = registry
-                    .tool_definitions_with_shell_escalation(!shell_sandbox_retry_states.is_empty())
-                    .await;
-                apply_tool_catalog_restrictions(&mut tools, tool_restrictions);
             }
             maybe_unlock_shell_after_file_change(
                 train_bifrost,
@@ -1745,7 +1677,6 @@ pub(crate) async fn run(
                 registry,
                 &tool_exchanges,
                 &mut tools,
-                &shell_sandbox_retry_states,
                 tool_restrictions,
             )
             .await;
@@ -2098,23 +2029,12 @@ pub(crate) async fn run(
                     &session_id,
                     &sessions,
                     notifications,
-                    &shell_sandbox_retry_states,
                     depth,
                 )
                 .await;
                 if outcome.cancelled {
                     clean_exit = Some(LoopStop::Cancelled);
                     break 'outer;
-                }
-                let previous_shell_sandbox_retry_states = shell_sandbox_retry_states.clone();
-                shell_sandbox_retry_states = outcome.shell_sandbox_retry_states;
-                if shell_sandbox_retry_states != previous_shell_sandbox_retry_states {
-                    tools = registry
-                        .tool_definitions_with_shell_escalation(
-                            !shell_sandbox_retry_states.is_empty(),
-                        )
-                        .await;
-                    apply_tool_catalog_restrictions(&mut tools, tool_restrictions);
                 }
                 let step_results = outcome.results;
                 maybe_unlock_shell_after_file_change(
@@ -2123,7 +2043,6 @@ pub(crate) async fn run(
                     registry,
                     &tool_exchanges,
                     &mut tools,
-                    &shell_sandbox_retry_states,
                     tool_restrictions,
                 )
                 .await;
@@ -2411,7 +2330,6 @@ async fn maybe_unlock_shell_after_file_change(
     registry: &ToolRegistry,
     tool_exchanges: &[ToolExchange],
     tools: &mut Vec<ToolDefinition>,
-    shell_sandbox_retry_states: &[ShellSandboxRetryState],
     restrictions: ToolCatalogRestrictions<'_>,
 ) {
     if !(train_bifrost || p2t_enabled)
@@ -2426,9 +2344,7 @@ async fn maybe_unlock_shell_after_file_change(
     registry
         .set_builtin_tools(train_bifrost_post_edit_builtin_tools())
         .await;
-    *tools = registry
-        .tool_definitions_with_shell_escalation(!shell_sandbox_retry_states.is_empty())
-        .await;
+    *tools = registry.tool_definitions().await;
     apply_tool_catalog_restrictions(tools, restrictions);
 }
 
@@ -2465,19 +2381,15 @@ async fn execute_step_tool_calls(
     session_id: &str,
     sessions: &SessionStore,
     notifications: NotificationMode,
-    shell_sandbox_retry_states: &[ShellSandboxRetryState],
     depth: usize,
 ) -> ExecutedStepOutcome {
     let mut step_results = Vec::new();
-    let mut available_shell_sandbox_retry_states = shell_sandbox_retry_states.to_vec();
-    let mut next_shell_sandbox_retry_states = Vec::new();
 
     for call_index in ordered_tool_call_indices(calls, |name| registry.is_bifrost_tool(name)) {
         let call = &calls[call_index];
         if cancel.is_cancelled() {
             return ExecutedStepOutcome {
                 results: step_results,
-                shell_sandbox_retry_states: available_shell_sandbox_retry_states,
                 cancelled: true,
             };
         }
@@ -2533,6 +2445,12 @@ async fn execute_step_tool_calls(
                 continue;
             }
         };
+
+        // Whether this call asked to run outside the OS sandbox. Tracked so the
+        // server-side audit trail records both approvals and denials of a
+        // security-relevant boundary crossing.
+        let shell_escalation_requested =
+            tool_name == "run_shell_command" && shell_sandbox_escalation_requested(&parsed_input);
 
         if let Some(reason) = announce::rejection_for_oversized_title(&tool_name, &parsed_input)
             .or_else(|| announce::rejection_for_oversized_input_content(&tool_name, &parsed_input))
@@ -2593,10 +2511,18 @@ async fn execute_step_tool_calls(
             kind,
             &parsed_input,
             WorkspaceRoots::new(registry.cwd(), registry.additional_roots()),
-            &available_shell_sandbox_retry_states,
         )
         .await
         {
+            if shell_escalation_requested {
+                tracing::warn!(
+                    target: "audit",
+                    session_id = %session_id,
+                    tool_name = %tool_name,
+                    reason = %message,
+                    "denied outside-sandbox escalation request (preflight)"
+                );
+            }
             let (blocked_call, failed_update) =
                 blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
             maybe_send_session_update(
@@ -2675,17 +2601,6 @@ async fn execute_step_tool_calls(
             continue;
         }
 
-        let consume_shell_sandbox_retry_state = shell_sandbox_escalation_requested(&parsed_input)
-            .then(|| {
-                shell_sandbox_retry_state_index(
-                    &available_shell_sandbox_retry_states,
-                    &parsed_input,
-                    registry.cwd(),
-                    registry.additional_roots(),
-                )
-            })
-            .flatten();
-
         let decision = consult_gate(
             sessions,
             spawned_cx,
@@ -2703,19 +2618,23 @@ async fn execute_step_tool_calls(
                 raw_input: &parsed_input,
                 cwd: registry.cwd(),
                 additional_roots: registry.additional_roots(),
-                shell_sandbox_retry_states: &available_shell_sandbox_retry_states,
             },
         )
         .await;
         turn_usage.add(decision.usage);
         let decision = decision.decision;
 
-        if let Some(index) = consume_shell_sandbox_retry_state {
-            available_shell_sandbox_retry_states.remove(index);
-        }
-
         let (output, status, replay_diff) = match decision {
             GateDecision::Reject(message) => {
+                if shell_escalation_requested {
+                    tracing::warn!(
+                        target: "audit",
+                        session_id = %session_id,
+                        tool_name = %tool_name,
+                        reason = %message,
+                        "denied outside-sandbox escalation request"
+                    );
+                }
                 maybe_send_session_update(
                     notifications,
                     spawned_cx.cx(),
@@ -2774,6 +2693,25 @@ async fn execute_step_tool_calls(
                     outside_sandbox_once
                 );
 
+                // A command crossing the OS sandbox boundary is the most
+                // security-significant runtime event this server performs.
+                // Record it as a distinct, session-attributed, structured audit
+                // event (not just the generic INFO exec line above) so operators
+                // can review/alert on outside-sandbox executions after the fact.
+                if outside_sandbox_once {
+                    let command = parsed_input
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    tracing::warn!(
+                        target: "audit",
+                        session_id = %session_id,
+                        tool_name = %tool_name,
+                        command,
+                        "approved outside-sandbox shell execution"
+                    );
+                }
+
                 let exec = if tool_name == "task" {
                     let (exec, nested_usage) = execute_subagent(
                         llm,
@@ -2813,7 +2751,6 @@ async fn execute_step_tool_calls(
                     ToolExecution {
                         output: outcome.output,
                         failed: outcome.failed,
-                        sandbox_retry_available: false,
                     }
                 } else {
                     trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
@@ -2831,19 +2768,6 @@ async fn execute_step_tool_calls(
                     )
                     .await
                 };
-
-                if exec.sandbox_retry_available
-                    && let Some(state) = ShellSandboxRetryState::from_raw_input(
-                        &parsed_input,
-                        registry.cwd(),
-                        registry.additional_roots(),
-                    )
-                {
-                    push_unique_shell_sandbox_retry_state(
-                        &mut next_shell_sandbox_retry_states,
-                        state,
-                    );
-                }
 
                 let (update, status, replay_diff) = if exec.failed {
                     let clean = strip_sandbox_escalation_hint(&exec.output);
@@ -2903,13 +2827,8 @@ async fn execute_step_tool_calls(
         );
     }
 
-    for state in next_shell_sandbox_retry_states {
-        push_unique_shell_sandbox_retry_state(&mut available_shell_sandbox_retry_states, state);
-    }
-
     ExecutedStepOutcome {
         results: step_results,
-        shell_sandbox_retry_states: available_shell_sandbox_retry_states,
         cancelled: false,
     }
 }
@@ -2964,7 +2883,6 @@ async fn evaluate_pure_gate(
     kind: ToolKind,
     raw_input: &Value,
     workspace_roots: WorkspaceRoots<'_>,
-    shell_sandbox_retry_states: &[ShellSandboxRetryState],
 ) -> Result<PureGateEvaluation, String> {
     let mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
@@ -2984,26 +2902,6 @@ async fn evaluate_pure_gate(
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
     let shell_sandbox_escalation_requested =
         tool_name == "run_shell_command" && shell_sandbox_escalation_requested(raw_input);
-    if shell_sandbox_escalation_requested && shell_sandbox_retry_states.is_empty() {
-        return Err("Tool use denied: outside-sandbox permission can only be requested after a sandboxed shell command fails and reports that retry option. Retry the command in the sandbox first."
-            .to_string());
-    }
-    if shell_sandbox_escalation_requested
-        && shell_sandbox_retry_state_index(
-            shell_sandbox_retry_states,
-            raw_input,
-            workspace_roots.cwd,
-            workspace_roots.additional_roots,
-        )
-        .is_none()
-    {
-        return Err("Tool use denied: outside-sandbox permission can only be requested when retrying the same shell command that failed under the sandbox. Retry this command in the sandbox first."
-            .to_string());
-    }
-    if shell_sandbox_escalation_requested && !shell_sandboxed {
-        return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
-            .to_string());
-    }
     let sandbox_escalation_requested = shell_sandboxed && shell_sandbox_escalation_requested;
     let shell_auto_allow = tool_name == "run_shell_command"
         && !sandbox_escalation_requested
@@ -3036,6 +2934,23 @@ async fn evaluate_pure_gate(
     };
     let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
 
+    // Codex-style explicit escalation: the model may request an outside-sandbox
+    // run up front, with no prior failure required. We still reject it when
+    // there is no OS sandbox to escape -- otherwise "run outside the sandbox" is
+    // a meaningless prompt. A mode that forbids shell execution outright
+    // (read-only) already produced a `Reject` above and takes precedence:
+    // surfacing that more fundamental reason avoids sending the model down a
+    // "retry without sandbox_permissions" path that would also be rejected, and
+    // keeps the message host-independent (the no-OS-sandbox branch otherwise
+    // fires on platforms without an OS sandbox, e.g. Windows).
+    if shell_sandbox_escalation_requested
+        && !shell_sandboxed
+        && !matches!(decision, PureGateDecision::Reject(_))
+    {
+        return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
+            .to_string());
+    }
+
     Ok(PureGateEvaluation {
         mode,
         decision,
@@ -3055,7 +2970,6 @@ async fn deterministic_gate_rejection(
     kind: ToolKind,
     raw_input: &Value,
     workspace_roots: WorkspaceRoots<'_>,
-    shell_sandbox_retry_states: &[ShellSandboxRetryState],
 ) -> Option<String> {
     match evaluate_pure_gate(
         sessions,
@@ -3064,7 +2978,6 @@ async fn deterministic_gate_rejection(
         kind,
         raw_input,
         workspace_roots,
-        shell_sandbox_retry_states,
     )
     .await
     {
@@ -3095,7 +3008,6 @@ async fn consult_gate(
         request.kind,
         request.raw_input,
         WorkspaceRoots::new(request.cwd, request.additional_roots),
-        request.shell_sandbox_retry_states,
     )
     .await
     {
@@ -3111,7 +3023,11 @@ async fn consult_gate(
         }),
         PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
         PureGateDecision::Prompt => {
-            let escalation_requested = shell_sandbox_escalation_requested(request.raw_input);
+            // Mirror `evaluate_pure_gate`'s shell guard: a stray
+            // `sandbox_permissions` field on a non-shell tool must not be read
+            // as an escalation request.
+            let escalation_requested = request.tool_name == "run_shell_command"
+                && shell_sandbox_escalation_requested(request.raw_input);
             if should_run_permission_auto_classifier(
                 evaluation.mode,
                 request.tool_name,
@@ -3434,7 +3350,6 @@ struct GateCheck<'a> {
     raw_input: &'a Value,
     cwd: &'a Path,
     additional_roots: &'a [PathBuf],
-    shell_sandbox_retry_states: &'a [ShellSandboxRetryState],
 }
 
 struct PermissionRequest<'a> {
@@ -3548,7 +3463,6 @@ async fn request_user_permission(
 struct ToolExecution {
     output: String,
     failed: bool,
-    sandbox_retry_available: bool,
 }
 
 #[cfg(test)]
@@ -3854,32 +3768,42 @@ fn tool_result_to_execution(
         ToolStatus::InternalError => ("Internal error: ", true),
     };
     let mut output = format!("{}{}", status_prefix, result.output);
-    let sandbox_retry_available = tool_name == "run_shell_command"
+    // When a sandboxed shell command fails with a sandbox-looking error, nudge
+    // the model toward explicit escalation. The `sandbox_permissions` field is
+    // always advertised now, so this is a recommendation, not the only way to
+    // unlock escalation.
+    let sandbox_failure_hint = tool_name == "run_shell_command"
         && failed
         && !outside_sandbox_once
         && shell_sandboxed
         && is_likely_sandbox_limitation(&output);
-    if sandbox_retry_available {
-        output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
-    }
-    if output.len() > MAX_TOOL_RESULT_BYTES {
+    // Truncate the command output *before* appending the advisory hint, reserving
+    // room for it, so the hint stays the exact final suffix.
+    // `strip_sandbox_escalation_hint` removes it from the client card by suffix
+    // match; truncating after the append could slice through the hint and both
+    // leak it onto the card and defeat the strip.
+    let reserved = if sandbox_failure_hint {
+        SANDBOX_FAILURE_ESCALATION_HINT.len()
+    } else {
+        0
+    };
+    if output.len() > MAX_TOOL_RESULT_BYTES.saturating_sub(reserved) {
         // Truncate on a UTF-8 char boundary; otherwise an emoji or accented
         // byte sequence could leave the slice mid-codepoint.
-        let mut cut = MAX_TOOL_RESULT_BYTES;
+        let mut cut = MAX_TOOL_RESULT_BYTES.saturating_sub(reserved);
         while !output.is_char_boundary(cut) {
             cut -= 1;
         }
         output.truncate(cut);
         output.push_str("\n... output truncated");
     }
-    ToolExecution {
-        output,
-        failed,
-        sandbox_retry_available,
+    if sandbox_failure_hint {
+        output.push_str(SANDBOX_FAILURE_ESCALATION_HINT);
     }
+    ToolExecution { output, failed }
 }
 
-const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command appears to be blocked by the sandbox boundary. The next `run_shell_command` schema now permits a one-time outside-sandbox retry of this exact command, unchanged, in the same directory. Retry it with `sandbox_permissions: \"require_escalated\"` rather than asking the user to paste in external content when the sandbox is the blocker (for example blocked network, DNS, or filesystem access).";
+const SANDBOX_FAILURE_ESCALATION_HINT: &str = "\n\n⚠️  This command appears to be blocked by the sandbox boundary. If the sandbox is the actual cause (for example blocked network or DNS access, or a write outside the workspace), retry this command with `sandbox_permissions: \"require_escalated\"` to request one-time approval to run it outside the sandbox, rather than asking the user to paste in external content. Only escalate when the sandbox is the blocker; ordinary failures should be fixed inside the sandbox.";
 
 /// Strip the sandbox-escalation hint from output so client-facing
 /// tool-call cards show a clean message. The full hint still flows
@@ -3999,7 +3923,6 @@ async fn execute_subagent(
                             available.join(", ")
                         ),
                         failed: true,
-                        sandbox_retry_available: false,
                     },
                     TokenUsage::default(),
                 );
@@ -4014,7 +3937,6 @@ async fn execute_subagent(
                 ToolExecution {
                     output: format!("Error: failed to load subagent '{subagent_name}': {e}"),
                     failed: true,
-                    sandbox_retry_available: false,
                 },
                 TokenUsage::default(),
             );
@@ -4082,12 +4004,10 @@ async fn execute_subagent(
         Some(output) => ToolExecution {
             output,
             failed: true,
-            sandbox_retry_available: false,
         },
         None => ToolExecution {
             output: text,
             failed: false,
-            sandbox_retry_available: false,
         },
     };
     (exec, nested_usage)
@@ -4651,7 +4571,6 @@ mod tests {
             raw_input: &raw_input,
             cwd: Path::new("/tmp/project"),
             additional_roots: &[],
-            shell_sandbox_retry_states: &[],
         };
 
         let (classification, usage) =
@@ -4687,7 +4606,6 @@ mod tests {
             raw_input: &raw_input,
             cwd: Path::new("/tmp/project"),
             additional_roots: &[],
-            shell_sandbox_retry_states: &[],
         };
 
         let (classification, _) =
@@ -5591,7 +5509,6 @@ mod tests {
                 kind,
                 &input,
                 WorkspaceRoots::new(cwd.path(), &[]),
-                &[],
             )
             .await
             .unwrap_or_else(|| panic!("{tool_name} should be rejected before execution"));
@@ -5616,7 +5533,6 @@ mod tests {
             ToolRegistry::tool_kind("write_file"),
             &serde_json::json!({"file_path": "app.js", "content": "x"}),
             WorkspaceRoots::new(cwd.path(), &[]),
-            &[],
         )
         .await;
         assert!(
@@ -5636,17 +5552,26 @@ mod tests {
             ToolRegistry::tool_kind("read_file"),
             &serde_json::json!({"file_path": "app.js"}),
             WorkspaceRoots::new(cwd.path(), &[]),
-            &[],
         )
         .await;
         assert!(read.is_none(), "read-only should allow read tools");
     }
 
     #[tokio::test]
-    async fn preflight_rejects_shell_sandbox_escalation_before_retry_field_enabled() {
+    async fn preflight_rejects_shell_sandbox_escalation_when_os_sandbox_inactive() {
+        use crate::sandbox_backend::SandboxMode;
+
+        // With the OS sandbox turned off there is nothing to escape, so an
+        // explicit escalation request is a deterministic error -- regardless of
+        // whether a prior command failed.
         let cwd = tempfile::tempdir().expect("temp cwd");
         let store = SessionStore::new("m".to_string());
         let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_sandbox_mode(&session.id, Some(SandboxMode::Off))
+                .await
+        );
 
         let rejection = deterministic_gate_rejection(
             &store,
@@ -5658,24 +5583,64 @@ mod tests {
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
-            &[],
         )
         .await
-        .expect("premature outside-sandbox retry must be rejected before prompting");
+        .expect("escalation without an active OS sandbox must be rejected");
 
         assert!(
-            rejection.contains("outside-sandbox permission can only be requested"),
+            rejection.contains("not running under an active OS sandbox"),
+            "unexpected rejection: {rejection}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_shell_sandbox_escalation_in_read_only_mode() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let store = SessionStore::new("m".to_string());
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        assert!(
+            store
+                .set_sandbox_mode(&session.id, Some(SandboxMode::Os))
+                .await
+        );
+        assert!(
+            store
+                .set_permission_mode(&session.id, PermissionMode::ReadOnly)
+                .await
+        );
+
+        let rejection = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({
+                "command": "echo ok",
+                "sandbox_permissions": "require_escalated",
+            }),
+            WorkspaceRoots::new(cwd.path(), &[]),
+        )
+        .await
+        .expect("read-only mode must reject shell escalation");
+
+        assert!(
+            rejection.contains("read-only mode forbids"),
             "unexpected rejection: {rejection}"
         );
     }
 
     #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn preflight_allows_matching_shell_sandbox_retry() {
+    async fn preflight_allows_shell_sandbox_escalation_under_active_os_sandbox() {
         use crate::sandbox_backend::SandboxMode;
 
+        // The Codex-style change: escalation may be requested up front, with no
+        // prior matching failure. Under an active OS sandbox it is promptable
+        // (no deterministic rejection), so the user gets the outside-sandbox
+        // choice.
         let cwd = tempfile::tempdir().expect("temp cwd");
-        std::fs::create_dir_all(cwd.path().join("crates/app")).expect("test directory");
         let store = SessionStore::new("m".to_string());
         let session = store.create_session(cwd.path().to_path_buf()).await;
         assert!(
@@ -5683,9 +5648,6 @@ mod tests {
                 .set_sandbox_mode(&session.id, Some(SandboxMode::Os))
                 .await
         );
-        let original = serde_json::json!({"command": "cargo test", "directory": "crates/app"});
-        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
-            .expect("retry state");
 
         let rejection = deterministic_gate_rejection(
             &store,
@@ -5693,25 +5655,31 @@ mod tests {
             "run_shell_command",
             ToolRegistry::tool_kind("run_shell_command"),
             &serde_json::json!({
-                "command": "cargo test",
-                "directory": "crates/app",
+                "command": "curl https://example.com",
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
-            std::slice::from_ref(&retry_state),
         )
         .await;
 
         assert!(
             rejection.is_none(),
-            "matching retry should reach the prompt"
+            "escalation under an active OS sandbox should reach the prompt without a prior failure; got: {rejection:?}"
         );
     }
 
     #[tokio::test]
-    async fn preflight_rejects_shell_sandbox_retry_for_different_command() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn escalation_request_forces_prompt_even_when_command_is_always_allowed() {
         use crate::sandbox_backend::SandboxMode;
 
+        // The "escalation always prompts, never auto-allows / never persists"
+        // guarantee is load-bearing now that there is no retry-state gate. Even a
+        // command whose prefix is already remembered must re-prompt when it
+        // carries `require_escalated`, so the user explicitly approves leaving
+        // the sandbox. (`deterministic_gate_rejection` can't see this difference
+        // -- it returns None for both Allow and Prompt -- so assert on the
+        // `PureGateDecision` directly.)
         let cwd = tempfile::tempdir().expect("temp cwd");
         let store = SessionStore::new("m".to_string());
         let session = store.create_session(cwd.path().to_path_buf()).await;
@@ -5720,28 +5688,43 @@ mod tests {
                 .set_sandbox_mode(&session.id, Some(SandboxMode::Os))
                 .await
         );
-        let original = serde_json::json!({"command": "cargo test"});
-        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
-            .expect("retry state");
+        // Remember the `cargo build` prefix so the bare command auto-allows.
+        let key = shell_prefix_key(&["cargo".to_string(), "build".to_string()], true);
+        store.add_always_allow(&session.id, &key).await;
 
-        let rejection = deterministic_gate_rejection(
+        let baseline = evaluate_pure_gate(
+            &store,
+            &session.id,
+            "run_shell_command",
+            ToolRegistry::tool_kind("run_shell_command"),
+            &serde_json::json!({"command": "cargo build"}),
+            WorkspaceRoots::new(cwd.path(), &[]),
+        )
+        .await
+        .expect("gate should evaluate");
+        assert!(
+            matches!(baseline.decision, PureGateDecision::Allow),
+            "remembered prefix should auto-allow without escalation; got {:?}",
+            baseline.decision
+        );
+
+        let escalated = evaluate_pure_gate(
             &store,
             &session.id,
             "run_shell_command",
             ToolRegistry::tool_kind("run_shell_command"),
             &serde_json::json!({
-                "command": "cargo check",
+                "command": "cargo build",
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
-            std::slice::from_ref(&retry_state),
         )
         .await
-        .expect("different command should be rejected");
-
+        .expect("gate should evaluate");
         assert!(
-            rejection.contains("retrying the same shell command"),
-            "unexpected rejection: {rejection}"
+            matches!(escalated.decision, PureGateDecision::Prompt),
+            "escalation must force a prompt, never auto-allow; got {:?}",
+            escalated.decision
         );
     }
 
@@ -5765,7 +5748,6 @@ mod tests {
             ToolRegistry::tool_kind("run_shell_command"),
             &input,
             WorkspaceRoots::new(cwd.path(), &[additional.path().to_path_buf()]),
-            &[],
         )
         .await
         .expect("gate should evaluate");
@@ -6497,7 +6479,6 @@ mod tests {
         let exec = tool_result_to_execution("run_shell_command", false, false, result);
 
         assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
-        assert!(!exec.sandbox_retry_available);
     }
 
     #[test]
@@ -6510,7 +6491,6 @@ mod tests {
         let exec = tool_result_to_execution("run_shell_command", true, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
-        assert!(exec.sandbox_retry_available);
     }
 
     #[test]
@@ -6523,7 +6503,6 @@ mod tests {
         let exec = tool_result_to_execution("run_shell_command", true, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
-        assert!(exec.sandbox_retry_available);
     }
 
     #[test]
@@ -6536,98 +6515,34 @@ mod tests {
         let exec = tool_result_to_execution("run_shell_command", true, false, result);
 
         assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
-        assert!(exec.sandbox_retry_available);
     }
 
     #[test]
-    fn sandbox_retry_is_not_unlocked_by_spoofed_hint_text() {
+    fn sandbox_escalation_hint_is_skipped_for_non_sandbox_failures() {
+        // A failure that does not look like a sandbox boundary issue (e.g. a
+        // genuine command error) should not be nudged toward escalation.
         let result = crate::tools::ToolResult {
             status: ToolStatus::RequestError,
-            output: format!("script printed this text:{SANDBOX_FAILURE_ESCALATION_HINT}"),
+            output: "cargo: error[E0277]: the trait bound is not satisfied".to_string(),
         };
 
         let exec = tool_result_to_execution("run_shell_command", true, false, result);
 
-        assert!(exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
-        assert!(!exec.sandbox_retry_available);
+        assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
 
     #[test]
-    fn shell_sandbox_retry_state_normalizes_equivalent_directories() {
-        let cwd = tempfile::tempdir().expect("temp cwd");
-        std::fs::create_dir_all(cwd.path().join("crates/app")).expect("test directory");
-        let original = serde_json::json!({
-            "command": "cargo test",
-            "directory": "crates/app",
-        });
-        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
-            .expect("retry state");
+    fn sandbox_escalation_hint_is_skipped_once_running_outside_sandbox() {
+        // After the user approves an outside-sandbox run, a failure is the
+        // command's own, not the sandbox's: no escalation nudge.
+        let result = crate::tools::ToolResult {
+            status: ToolStatus::RequestError,
+            output: "permission denied".to_string(),
+        };
 
-        assert!(retry_state.matches_raw_input(
-            &serde_json::json!({
-                "command": "cargo test",
-                "directory": "./crates/app",
-            }),
-            cwd.path(),
-            &[],
-        ));
-    }
+        let exec = tool_result_to_execution("run_shell_command", true, true, result);
 
-    #[test]
-    fn shell_sandbox_retry_state_treats_dot_directory_as_cwd() {
-        let cwd = tempfile::tempdir().expect("temp cwd");
-        let original = serde_json::json!({"command": "cargo test"});
-        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
-            .expect("retry state");
-
-        assert!(retry_state.matches_raw_input(
-            &serde_json::json!({
-                "command": "cargo test",
-                "directory": ".",
-            }),
-            cwd.path(),
-            &[],
-        ));
-    }
-
-    #[test]
-    fn shell_sandbox_retry_state_index_matches_normalized_retry() {
-        let cwd = tempfile::tempdir().expect("temp cwd");
-        std::fs::create_dir_all(cwd.path().join("crates/app")).expect("test directory");
-        let original = serde_json::json!({
-            "command": "cargo test",
-            "directory": "crates/app",
-        });
-        let retry_state = ShellSandboxRetryState::from_raw_input(&original, cwd.path(), &[])
-            .expect("retry state");
-        let states = vec![retry_state];
-
-        assert_eq!(
-            shell_sandbox_retry_state_index(
-                &states,
-                &serde_json::json!({
-                    "command": "cargo test",
-                    "directory": "./crates/app",
-                    "sandbox_permissions": "require_escalated",
-                }),
-                cwd.path(),
-                &[],
-            ),
-            Some(0)
-        );
-        assert_eq!(
-            shell_sandbox_retry_state_index(
-                &states,
-                &serde_json::json!({
-                    "command": "cargo check",
-                    "directory": "./crates/app",
-                    "sandbox_permissions": "require_escalated",
-                }),
-                cwd.path(),
-                &[],
-            ),
-            None
-        );
+        assert!(!exec.output.contains(SANDBOX_FAILURE_ESCALATION_HINT));
     }
 
     #[test]

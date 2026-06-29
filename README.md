@@ -299,15 +299,22 @@ setup state on disk and can be inspected or revoked with:
 /permissions clear
 ```
 
-When a shell command fails with output that looks like a sandbox boundary issue
-(for example `permission denied`, `operation not permitted`, a read-only
-filesystem, process/namespace isolation, or blocked network/DNS access), Anvil
-appends guidance to the tool result telling the model to verify that the
-sandbox is likely the limiting factor. If unsandboxed execution is actually
-necessary, the model retries
-`run_shell_command` with `sandbox_permissions: "require_escalated"`; only then
-does the permission prompt include a **Run outside sandbox** choice.
-That approval is never remembered as an **Always allow** rule.
+`run_shell_command` always advertises a `sandbox_permissions` field
+(Codex-style explicit escalation). The model may set it to `require_escalated`
+up front when a command genuinely needs access the sandbox blocks — network or
+DNS access, package downloads, `git push`, attaching to or debugging host
+processes, or writes outside the working directory — without first triggering a
+sandbox failure. An escalation request always prompts the user with a **Run
+outside sandbox** choice (never auto-allowed and never remembered as an
+**Always allow** rule), and Anvil rejects it deterministically when there is no
+active OS sandbox to escape or when the session is in read-only mode.
+
+When a sandboxed shell command fails with output that looks like a sandbox
+boundary issue (for example `permission denied`, `operation not permitted`, a
+read-only filesystem, process/namespace isolation, or blocked network/DNS
+access), Anvil also appends guidance to the tool result reminding the model that
+it can retry with `sandbox_permissions: "require_escalated"` if — and only if —
+the sandbox is the actual blocker.
 
 Sandbox mode is a separate execution boundary. This matters because Anvil runs
 in more places than a single blessed desktop environment: macOS has the Seatbelt
