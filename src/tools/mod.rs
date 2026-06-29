@@ -80,6 +80,14 @@ fn default_shell_timeout_ms() -> u64 {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ShellSandboxPermissionArg {
+    /// Run inside the active sandbox (the implicit behavior when the field is
+    /// omitted). Accepted so a model can state the default explicitly without a
+    /// deserialization error.
+    UseDefault,
+    /// Ask the user for one-time approval to run this command outside the
+    /// sandbox. The tool loop reads this intent off the raw arguments
+    /// (`tool_loop::shell_sandbox_escalation_requested`); the parsed value here
+    /// only validates the schema enum.
     RequireEscalated,
 }
 
@@ -168,6 +176,7 @@ impl BuiltinArgsContract for RunShellCommandArgs {
         ("timeout", "integer"),
         ("description", "string"),
         ("directory", "string"),
+        ("sandbox_permissions", "string"),
     ];
 }
 
@@ -666,20 +675,14 @@ impl ToolRegistry {
     }
 
     /// All tool definitions for the OpenAI tools parameter.
-    pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tool_definitions_with_shell_escalation(false).await
-    }
-
-    /// Tool definitions for the OpenAI tools parameter.
     ///
-    /// The outside-sandbox retry field is intentionally hidden until a
-    /// sandboxed shell command fails with a sandbox-looking error. If the model
-    /// sees that field in the first schema, some providers eagerly choose it
-    /// even though the description says it is only for retries.
-    pub async fn tool_definitions_with_shell_escalation(
-        &self,
-        allow_shell_sandbox_escalation: bool,
-    ) -> Vec<ToolDefinition> {
+    /// `run_shell_command` always advertises the `sandbox_permissions` field
+    /// (Codex-style explicit escalation): the model may request a one-time
+    /// outside-sandbox run up front, and the permission gate
+    /// (`tool_loop::evaluate_pure_gate`) decides whether that request is valid
+    /// and prompts the user. The field is no longer hidden behind a prior
+    /// sandbox-looking failure.
+    pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let builtin_tools = self.active_builtin_tools().await;
         let mut defs = Vec::new();
         if builtin_tools.contains("read_file") {
@@ -815,7 +818,7 @@ impl ToolRegistry {
                 "Optional timeout in milliseconds. Rounded up to seconds and clamped to a {} second server maximum.",
                 shell::MAX_TIMEOUT_SECONDS
             );
-            let mut shell_properties = json!({
+            let shell_properties = json!({
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute (passed to sh -c)."
@@ -831,18 +834,16 @@ impl ToolRegistry {
                 "directory": {
                     "type": "string",
                     "description": "Optional directory to run the command in. Relative paths are resolved against the working directory; absolute paths must remain inside it."
+                },
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["use_default", "require_escalated"],
+                    "description": "Per-command sandbox override. Defaults to `use_default` (run inside the active sandbox). Use `require_escalated` only when the command needs access the sandbox blocks -- network/DNS, package downloads, `git push`, attaching to or debugging host processes, or writing outside the working directory when explicitly requested. Escalation prompts the user for one-time approval to run outside the sandbox; do not use it for ordinary reads, searches, builds, tests, or workspace writes that should already work inside the sandbox."
                 }
             });
-            if allow_shell_sandbox_escalation {
-                shell_properties["sandbox_permissions"] = json!({
-                    "type": "string",
-                    "enum": ["require_escalated"],
-                    "description": "Set to `require_escalated` only when retrying a command that already failed under the sandbox and your investigation indicates the sandbox boundary is the likely cause (for example EPERM from namespace/process isolation, writes outside the workspace, or sandbox-blocked network/DNS access). This asks the user for permission to run the command outside the sandbox once."
-                });
-            }
             defs.push(tool_def(
                 "run_shell_command",
-                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses sandboxing, commands run in that sandbox by default. If a sandboxed attempt fails because of the sandbox boundary, including blocked network or DNS access, the retry field for requesting one-time outside-sandbox permission will be exposed in the next tool schema.",
+                "Execute a shell command in the working directory. Returns stdout and stderr. Prefer built-in tools for ordinary file reads/search/list/edit/write operations and Bifrost tools for code symbols, definitions, usages, and source orientation. Use shell when CLI semantics matter, such as build, test, git, package-manager, project-specific commands, pipelines, or raw-byte/format inspection. When the session uses sandboxing, commands run in that sandbox by default. Set `sandbox_permissions` to `require_escalated` only when the command genuinely needs access the sandbox blocks -- such as network or DNS access, package downloads, `git push`, attaching to or debugging host processes, or writing outside the working directory when explicitly requested; this asks the user for one-time approval to run outside the sandbox. Do not escalate for ordinary reads, searches, builds, tests, or workspace writes that should already work inside the sandbox.",
                 json!({
                     "type": "object",
                     "properties": shell_properties,
@@ -2078,7 +2079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_tool_schema_hides_sandbox_escalation_by_default() {
+    async fn shell_tool_schema_always_exposes_sandbox_escalation() {
         let registry = registry_with_skills(vec![]);
         let defs = registry.tool_definitions().await;
         let shell = defs
@@ -2091,27 +2092,8 @@ mod tests {
                 .function
                 .parameters
                 .pointer("/properties/sandbox_permissions")
-                .is_none(),
-            "first-attempt shell schema must not expose sandbox escalation"
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_tool_schema_exposes_sandbox_escalation_when_enabled() {
-        let registry = registry_with_skills(vec![]);
-        let defs = registry.tool_definitions_with_shell_escalation(true).await;
-        let shell = defs
-            .iter()
-            .find(|def| def.function.name == "run_shell_command")
-            .expect("run_shell_command should be advertised");
-
-        assert!(
-            shell
-                .function
-                .parameters
-                .pointer("/properties/sandbox_permissions")
                 .is_some(),
-            "retry shell schema must expose sandbox escalation"
+            "shell schema must expose sandbox escalation up front (Codex-style)"
         );
         assert_eq!(
             shell.function.parameters["properties"]["sandbox_permissions"]["type"],
@@ -2119,8 +2101,8 @@ mod tests {
         );
         assert_eq!(
             shell.function.parameters["properties"]["sandbox_permissions"]["enum"],
-            json!(["require_escalated"]),
-            "retry shell schema enum must match ShellSandboxPermissionArg"
+            json!(["use_default", "require_escalated"]),
+            "shell schema enum must match ShellSandboxPermissionArg"
         );
     }
 
