@@ -260,7 +260,19 @@ fn prompt_end_turn_response() -> PromptResponse {
 /// tool loop swallows `session/cancel` and returns its partial work, so without
 /// this the transcript would just stop; the loop's other terminations
 /// (turn-limit, empty completion) stream their own line from inside `run`.
-const TURN_CANCELLED_NOTICE: &str = "\n⏹ Cancelled.\n";
+///
+/// Deliberately matches the bare `"Cancelled.\n"` the `/loop` and `/goal`
+/// drivers already emit, so the cancellation copy is identical everywhere
+/// regardless of which path observes the cancel.
+///
+/// Unlike the turn-limit / empty-completion notices, this is NOT persisted into
+/// `agent_response`: cancellation is user-initiated and already reported via the
+/// ACP `Cancelled` stop reason, so persisting a marker (and feeding it back to
+/// the model as history) would add noise without adding information. It is also
+/// emitted here at the responder rather than inside `run` so it does not
+/// double-print with the driver-level "Cancelled.\n" on the `/loop` and `/goal`
+/// paths, which run their inner turn with a live sink.
+const TURN_CANCELLED_NOTICE: &str = "Cancelled.\n";
 
 /// Map the tool loop's [`LoopStop`] to the ACP `StopReason`, so a turn that
 /// exhausted its turn budget is reported as `MaxTurnRequests` rather than a
@@ -4327,11 +4339,17 @@ fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[Conversat
                     &exchange.result,
                 ));
             }
-            if !turn.agent_response.is_empty() {
-                messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+            let history_response =
+                crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+            if !history_response.is_empty() {
+                messages.push(ChatMessage::assistant(history_response.to_string()));
             }
-        } else if !turn.agent_response.is_empty() {
-            messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+        } else {
+            let history_response =
+                crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+            if !history_response.is_empty() {
+                messages.push(ChatMessage::assistant(history_response.to_string()));
+            }
         }
     }
 }
@@ -4379,11 +4397,13 @@ fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &Conversatio
             }
         }
     }
-    if !turn.agent_response.is_empty() && replayed_assistant_text != turn.agent_response {
-        let missing = turn
-            .agent_response
+    // History excludes our injected closing notice (transcript replay keeps it).
+    let history_response =
+        crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+    if !history_response.is_empty() && replayed_assistant_text != history_response {
+        let missing = history_response
             .strip_prefix(&replayed_assistant_text)
-            .unwrap_or(turn.agent_response.as_str());
+            .unwrap_or(history_response);
         if !missing.is_empty() {
             messages.push(ChatMessage::assistant(missing.to_string()));
         }

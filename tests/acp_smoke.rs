@@ -1714,6 +1714,17 @@ fn invalid_prompt_requests_return_invalid_params() {
     let _ = stderr_join.join();
 }
 
+/// Drain captured `session/update` notifications and concatenate the text of
+/// every `agent_message_chunk` -- the assistant-visible transcript output.
+fn collect_agent_message_text(client: &mut JsonRpcClient) -> String {
+    client
+        .take_updates()
+        .into_iter()
+        .filter(|update| update["sessionUpdate"].as_str() == Some("agent_message_chunk"))
+        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// A turn that exhausts its `--max-turns` budget must NOT just stop silently:
 /// the reason has to reach the transcript (a streamed `agent_message_chunk`)
 /// AND the `PromptResponse.stopReason` must be `max_turn_requests`, not a
@@ -1801,12 +1812,7 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     // (2) The human-readable reason reached the transcript as agent text. This
     // is independent of the client rendering the stop reason -- it is ordinary
     // streamed assistant output.
-    let agent_text: String = client
-        .take_updates()
-        .into_iter()
-        .filter(|update| update["sessionUpdate"].as_str() == Some("agent_message_chunk"))
-        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
-        .collect();
+    let agent_text = collect_agent_message_text(&mut client);
     assert!(
         agent_text.contains("reached the 1-turn limit"),
         "{}: turn-limit reason did not reach the transcript; agent text was: {agent_text:?}",
@@ -1826,12 +1832,7 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
         json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
     );
     assert_response_ok(&case, "session/load", &load, &client);
-    let replayed_text: String = client
-        .take_updates()
-        .into_iter()
-        .filter(|update| update["sessionUpdate"].as_str() == Some("agent_message_chunk"))
-        .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
-        .collect();
+    let replayed_text = collect_agent_message_text(&mut client);
     assert!(
         replayed_text.contains("reached the 1-turn limit"),
         "{}: turn-limit reason did not survive a cold reload; replayed text was: {replayed_text:?}",

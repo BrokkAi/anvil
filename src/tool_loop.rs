@@ -274,6 +274,29 @@ impl LoopStop {
     }
 }
 
+/// Prefix on every loop-stop closing notice (see [`render_loop_stop`]). It is
+/// our own marker, never model output, so the LLM-history builder can split a
+/// persisted `agent_response` back into "what the model produced" + "our closing
+/// notice" and replay only the former to the model. The transcript replay path
+/// keeps the whole string.
+pub(crate) const STOP_NOTICE_SENTINEL: &str = "\n⏹ ";
+
+/// The portion of a persisted `agent_response` the model actually produced, with
+/// any trailing loop-stop notice removed.
+///
+/// The notice is appended to `agent_response` so it survives `session/load` in
+/// the transcript, but it must not be fed back to the model as its own prior
+/// words. History reconstruction calls this; transcript replay does not. The
+/// notice is always the trailing segment (appended last, after all model text),
+/// so the split is at the last [`STOP_NOTICE_SENTINEL`]; a model that never emits
+/// that marker is returned unchanged.
+pub(crate) fn agent_response_without_stop_notice(agent_response: &str) -> &str {
+    match agent_response.rfind(STOP_NOTICE_SENTINEL) {
+        Some(index) => &agent_response[..index],
+        None => agent_response,
+    }
+}
+
 /// Result of approving a permission request.
 ///
 /// Shell commands can be approved for the session when they run under the
@@ -2246,60 +2269,55 @@ pub(crate) async fn run(
         );
     }
 
-    // Resolve the exhaustive stop reason. An LLM/setup failure wins (it already
-    // streamed its `**Error:**` line); otherwise use the clean exit recorded at
-    // a break, falling back to the turn-limit case when the `for` loop ran out
-    // of its budget without the model finishing.
+    // `resolve_loop_stop` and `render_loop_stop` keep the stop-resolution and the
+    // user-facing notice as pure, unit-testable functions instead of inline logic
+    // at the tail of this very large function.
     //
-    // p2t/training runs short-circuit through their own stop machinery and have
-    // no user transcript to narrate, so they neither report `MaxTurns` for a
-    // window end nor emit a closing line.
-    let surface_reason = !train_bifrost && p2t_config.is_none();
-    let stop = if let Some(failure) = llm_failure {
-        LoopStop::Failed(failure)
-    } else if let Some(clean_exit) = clean_exit {
-        clean_exit
-    } else if surface_reason {
-        LoopStop::MaxTurns { max_turns }
-    } else {
-        LoopStop::Completed {
-            had_text: !full_response.trim().is_empty(),
-        }
-    };
+    // Two distinct gates:
+    // - `resolve_max_turns`: report a turn-budget fall-through as `MaxTurns`
+    //   (vs. `Completed`). True for every real run -- including silent subagents,
+    //   which must report the turn limit to the `task` tool -- and false only for
+    //   p2t/training runs, which drive their own stop machinery.
+    // - `surface_notice`: stream + persist the closing line. Only top-level
+    //   (`Live`) turns do this; planning and subagent runs are `Silent` and must
+    //   not splice the notice into the plan/`task` result, so they suppress it.
+    let resolve_max_turns = !train_bifrost && p2t_config.is_none();
+    let surface_notice = resolve_max_turns && matches!(notifications, NotificationMode::Live);
+    let stop = resolve_loop_stop(
+        llm_failure,
+        clean_exit,
+        resolve_max_turns,
+        max_turns,
+        !full_response.trim().is_empty(),
+    );
+
+    // Trace the exit reason server-side so an operator can tell a turn-budget
+    // exhaustion from a clean completion or a quiet failure from the logs, not
+    // only from the connected client's transcript.
+    tracing::info!(session_id = %session_id, depth, stop = ?stop, "tool loop exit");
 
     // Make the otherwise-silent terminations obvious AND durable. The turn-limit
     // and empty-completion cases previously returned an empty `full_response`, so
     // the conversation just stopped with no explanation -- and since nothing was
     // persisted, a later `session/load` replayed the same silence. The notice is
     // both streamed live (`on_text`) and appended to `full_response`, so it lands
-    // in the turn's `agent_response`; the load/history reconciliation
-    // (`strip_prefix(replayed_assistant_text)`) then re-emits it as the trailing
-    // assistant text on reload. It is appended after all model text, so
+    // in the turn's `agent_response`; the reload reconciliation
+    // (`strip_prefix(replayed_assistant_text)`) re-emits it as the trailing
+    // assistant text on `session/load`. It is appended after all model text, so
     // `replayed_assistant_text` stays a prefix of `agent_response` and the notice
-    // is not double-sent.
+    // is not double-sent. The LLM-history builder strips it again via
+    // `agent_response_without_stop_notice` so it is never fed back to the model.
     //
     // Safety: the notice is appended only for `MaxTurns` and an empty `Completed`,
     // never when the model produced a real final answer (`Completed { had_text:
     // true }`). So a successful structured-output JSON is never polluted, and the
     // subagent -- which keys its empty/turn-limit handling on the returned
     // `LoopStop`, not on text emptiness -- cannot mistake the notice for a result.
-    if surface_reason {
-        let notice = match &stop {
-            LoopStop::MaxTurns { max_turns } => Some(format!(
-                "\n⏹ Stopped: reached the {max_turns}-turn limit before the model finished. \
-                 Send another message to continue, or restart with a higher `--max-turns`.\n"
-            )),
-            LoopStop::Completed { had_text: false } => {
-                Some("\n⏹ Stopped: the model ended the turn without a final message.\n".to_string())
-            }
-            _ => None,
-        };
-        if let Some(notice) = notice {
-            if let Ok(mut cb) = on_text.lock() {
-                cb(&notice);
-            }
-            full_response.push_str(&notice);
+    if surface_notice && let Some(notice) = render_loop_stop(&stop) {
+        if let Ok(mut cb) = on_text.lock() {
+            cb(&notice);
         }
+        full_response.push_str(&notice);
     }
 
     (
@@ -2309,6 +2327,50 @@ pub(crate) async fn run(
         turn_usage,
         stop,
     )
+}
+
+/// Resolve the exhaustive [`LoopStop`] from the loop's accumulated state. An
+/// LLM/setup failure wins (it already streamed its `**Error:**` line); otherwise
+/// the clean exit recorded at a `break` is used, falling back to the turn-limit
+/// case when the `for` loop ran out of its budget without the model finishing.
+/// `resolve_max_turns` is false for p2t/training runs, which report a budget
+/// fall-through as `Completed` because they drive their own stop machinery.
+fn resolve_loop_stop(
+    llm_failure: Option<TurnFailure>,
+    clean_exit: Option<LoopStop>,
+    resolve_max_turns: bool,
+    max_turns: usize,
+    full_response_has_text: bool,
+) -> LoopStop {
+    if let Some(failure) = llm_failure {
+        LoopStop::Failed(failure)
+    } else if let Some(clean_exit) = clean_exit {
+        clean_exit
+    } else if resolve_max_turns {
+        LoopStop::MaxTurns { max_turns }
+    } else {
+        LoopStop::Completed {
+            had_text: full_response_has_text,
+        }
+    }
+}
+
+/// The user-facing closing line for an otherwise-silent termination, or `None`
+/// when the stop reason needs no narration (a real final answer, an LLM failure
+/// that already streamed its error, or a cancellation -- which is surfaced at
+/// the responder instead). Every notice begins with [`STOP_NOTICE_SENTINEL`] so
+/// the LLM-history builder can split it back off the persisted `agent_response`.
+pub(crate) fn render_loop_stop(stop: &LoopStop) -> Option<String> {
+    match stop {
+        LoopStop::MaxTurns { max_turns } => Some(format!(
+            "{STOP_NOTICE_SENTINEL}Stopped: reached the {max_turns}-turn limit before the model \
+             finished. Send another message to continue, or restart with a higher `--max-turns`.\n"
+        )),
+        LoopStop::Completed { had_text: false } => Some(format!(
+            "{STOP_NOTICE_SENTINEL}Stopped: the model ended the turn without a final message.\n"
+        )),
+        LoopStop::Completed { had_text: true } | LoopStop::Cancelled | LoopStop::Failed(_) => None,
+    }
 }
 
 fn record_p2t_step(config: &p2t::P2tConfig, cwd: &Path, record: StepTraceRecord) {
@@ -4248,6 +4310,82 @@ mod tests {
         let failure = failed.failure().expect("Failed exposes its TurnFailure");
         assert!(failure.retryable);
         assert_eq!(failure.message, "overloaded");
+    }
+
+    #[test]
+    fn resolve_loop_stop_prefers_failure_then_clean_exit_then_fallthrough() {
+        // LLM/setup failure wins over everything.
+        let stop = resolve_loop_stop(
+            Some(TurnFailure {
+                retryable: false,
+                message: "boom".into(),
+            }),
+            Some(LoopStop::Cancelled),
+            true,
+            10,
+            true,
+        );
+        assert!(matches!(stop, LoopStop::Failed(_)));
+
+        // A recorded clean exit (e.g. cancellation) is used as-is.
+        let stop = resolve_loop_stop(None, Some(LoopStop::Cancelled), true, 10, true);
+        assert!(matches!(stop, LoopStop::Cancelled));
+
+        // Turn-budget fall-through becomes MaxTurns when resolution is enabled.
+        let stop = resolve_loop_stop(None, None, true, 10, false);
+        assert!(matches!(stop, LoopStop::MaxTurns { max_turns: 10 }));
+
+        // p2t/training (resolve disabled) reports the fall-through as Completed,
+        // carrying through whether any text was produced.
+        let stop = resolve_loop_stop(None, None, false, 10, true);
+        assert!(matches!(stop, LoopStop::Completed { had_text: true }));
+        let stop = resolve_loop_stop(None, None, false, 10, false);
+        assert!(matches!(stop, LoopStop::Completed { had_text: false }));
+    }
+
+    #[test]
+    fn render_loop_stop_only_narrates_silent_terminations() {
+        let max =
+            render_loop_stop(&LoopStop::MaxTurns { max_turns: 7 }).expect("MaxTurns is narrated");
+        assert!(max.starts_with(STOP_NOTICE_SENTINEL));
+        assert!(max.contains("reached the 7-turn limit"));
+
+        let empty = render_loop_stop(&LoopStop::Completed { had_text: false })
+            .expect("empty completion is narrated");
+        assert!(empty.starts_with(STOP_NOTICE_SENTINEL));
+
+        // A real answer, a cancellation, and a failure are NOT narrated here.
+        assert!(render_loop_stop(&LoopStop::Completed { had_text: true }).is_none());
+        assert!(render_loop_stop(&LoopStop::Cancelled).is_none());
+        assert!(
+            render_loop_stop(&LoopStop::Failed(TurnFailure {
+                retryable: true,
+                message: "x".into(),
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_response_strips_only_the_trailing_stop_notice() {
+        // Model text followed by an appended MaxTurns notice: history keeps only
+        // the model's words.
+        let notice = render_loop_stop(&LoopStop::MaxTurns { max_turns: 3 }).unwrap();
+        let persisted = format!("the model's real answer{notice}");
+        assert_eq!(
+            agent_response_without_stop_notice(&persisted),
+            "the model's real answer"
+        );
+
+        // An empty-completion turn persists only the notice -> nothing for history.
+        let only_notice = render_loop_stop(&LoopStop::Completed { had_text: false }).unwrap();
+        assert_eq!(agent_response_without_stop_notice(&only_notice), "");
+
+        // Plain model text with no notice is returned unchanged.
+        assert_eq!(
+            agent_response_without_stop_notice("just a normal answer"),
+            "just a normal answer"
+        );
     }
 
     #[test]
