@@ -242,19 +242,65 @@ fn prompt_response_meta(
 /// catches cancellation internally and returns normally, so the token is
 /// the authoritative signal here.
 fn prompt_stop_response(cancelled: bool) -> PromptResponse {
-    emit_terminal_notification(TerminalNotificationEvent::TurnEnded);
     let stop_reason = if cancelled {
         StopReason::Cancelled
     } else {
         StopReason::EndTurn
     };
-    PromptResponse::new(stop_reason)
+    prompt_stop_response_with(stop_reason)
 }
 
 /// Convenience wrapper for the non-cancellable, synchronous prompt paths
 /// (slash commands, validation short-circuits) that always end the turn.
 fn prompt_end_turn_response() -> PromptResponse {
     prompt_stop_response(false)
+}
+
+/// Closing line streamed when a turn settles because it was cancelled. The
+/// tool loop swallows `session/cancel` and returns its partial work, so without
+/// this the transcript would just stop; the loop's other terminations
+/// (turn-limit, empty completion) stream their own line from inside `run`.
+///
+/// Deliberately matches the bare `"Cancelled.\n"` the `/loop` and `/goal`
+/// drivers already emit, so the cancellation copy is identical everywhere
+/// regardless of which path observes the cancel.
+///
+/// Unlike the turn-limit / empty-completion notices, this is NOT persisted into
+/// `agent_response`: cancellation is user-initiated and already reported via the
+/// ACP `Cancelled` stop reason, so persisting a marker (and feeding it back to
+/// the model as history) would add noise without adding information. It is also
+/// emitted here at the responder rather than inside `run` so it does not
+/// double-print with the driver-level "Cancelled.\n" on the `/loop` and `/goal`
+/// paths, which run their inner turn with a live sink.
+const TURN_CANCELLED_NOTICE: &str = "Cancelled.\n";
+
+/// Map the tool loop's [`LoopStop`] to the ACP `StopReason`, so a turn that
+/// exhausted its turn budget is reported as `MaxTurnRequests` rather than a
+/// normal `EndTurn`. A cancellation observed on the token still wins: ACP
+/// requires a `session/cancel`ed turn to resolve as `Cancelled` regardless of
+/// what the loop returned (the loop swallows cancellation and may report
+/// `Completed` for the partial work it had already done).
+///
+/// [`LoopStop`]: crate::tool_loop::LoopStop
+fn acp_stop_reason(stop: &crate::tool_loop::LoopStop, cancelled: bool) -> StopReason {
+    use crate::tool_loop::LoopStop;
+    if cancelled || matches!(stop, LoopStop::Cancelled) {
+        return StopReason::Cancelled;
+    }
+    match stop {
+        LoopStop::MaxTurns { .. } => StopReason::MaxTurnRequests,
+        // A `Failed` turn already streamed its `**Error:**` line to the user, so
+        // `EndTurn` is the honest "the turn is over" signal; ACP has no generic
+        // "errored" stop reason.
+        LoopStop::Completed { .. } | LoopStop::Failed(_) => StopReason::EndTurn,
+        LoopStop::Cancelled => StopReason::Cancelled,
+    }
+}
+
+/// Build the terminal `PromptResponse` from an explicit ACP `StopReason`.
+fn prompt_stop_response_with(stop_reason: StopReason) -> PromptResponse {
+    emit_terminal_notification(TerminalNotificationEvent::TurnEnded);
+    PromptResponse::new(stop_reason)
 }
 
 fn acp_usage_from_token_usage(usage: crate::llm_client::TokenUsage) -> AcpUsage {
@@ -2733,12 +2779,22 @@ pub async fn run_agent(
                         .await;
                         let structured_output_result = turn_result.structured_output;
                         cumulative_usage = turn_result.cumulative_usage;
+                        let cancelled = cancel_status.is_cancelled();
+                        let acp_stop = acp_stop_reason(&turn_result.stop, cancelled);
+                        // Avoid a double closing line: if a cancel landed just as
+                        // the loop fell through to a turn-limit/empty-completion
+                        // notice, the loop already streamed a reason, so skip the
+                        // cancel line and let the transcript end with one reason.
+                        let loop_streamed_notice =
+                            crate::tool_loop::render_loop_stop(&turn_result.stop).is_some();
 
                         sessions_for_gate.finish_prompt(&session_id_for_gate).await;
 
+                        if cancelled && !loop_streamed_notice {
+                            send_message(&cx_for_gate, &session_id_for_gate, TURN_CANCELLED_NOTICE);
+                        }
                         let acp_usage = acp_usage_from_token_usage(cumulative_usage);
-                        let response =
-                            prompt_stop_response(cancel_status.is_cancelled()).usage(Some(acp_usage));
+                        let response = prompt_stop_response_with(acp_stop).usage(Some(acp_usage));
                         let response = response.meta(prompt_response_meta(
                             structured_output_result.as_ref(),
                             Some(&orchestration_model_for_response),
@@ -2805,9 +2861,11 @@ pub async fn run_agent(
                 let cancel_status = cancel.clone();
 
                 let spawn_result = cx.spawn(async move {
-                    // The normal prompt path uses only the structured output and
-                    // usage; `response`/`failure` are for autonomous drivers and
-                    // are ignored here (errors were already streamed to the user).
+                    // The normal prompt path uses the structured output, usage,
+                    // and stop reason; `response`/`failure` are for autonomous
+                    // drivers and are ignored here (errors were already streamed
+                    // to the user). `stop` is mapped to the ACP `StopReason` so a
+                    // turn-limit exhaustion isn't reported as a normal `EndTurn`.
                     let turn_result = run_model_turn_in_spawn(
                         &cx_for_loop,
                         &sessions_for_loop,
@@ -2827,9 +2885,20 @@ pub async fn run_agent(
                     .await;
                     let structured_output_result = turn_result.structured_output;
                     let cumulative_usage = turn_result.cumulative_usage;
+                    let cancelled = cancel_status.is_cancelled();
+                    let acp_stop = acp_stop_reason(&turn_result.stop, cancelled);
+                    // Skip the cancel line if the loop already streamed a
+                    // turn-limit/empty notice (cancel racing the fall-through),
+                    // so the transcript ends with a single reason.
+                    let loop_streamed_notice =
+                        crate::tool_loop::render_loop_stop(&turn_result.stop).is_some();
 
                     // Clean up cancellation token even on panic / persistence failure.
                     sessions_for_loop.finish_prompt(&session_id_for_loop).await;
+
+                    if cancelled && !loop_streamed_notice {
+                        send_message(&cx_for_loop, &session_id_for_loop, TURN_CANCELLED_NOTICE);
+                    }
 
                     // ACP `session/usage` RFD: PromptResponse.usage
                     // carries cumulative session totals. Field mapping:
@@ -2843,9 +2912,10 @@ pub async fn run_agent(
                     let acp_usage = acp_usage_from_token_usage(cumulative_usage);
                     // ACP: a turn aborted by `session/cancel` MUST resolve its
                     // prompt with the cancelled stop reason, even though the
-                    // tool loop swallowed the cancellation and returned normally.
-                    let response =
-                        prompt_stop_response(cancel_status.is_cancelled()).usage(Some(acp_usage));
+                    // tool loop swallowed the cancellation and returned normally
+                    // (`acp_stop_reason` enforces this); a turn that exhausted
+                    // its budget resolves as `MaxTurnRequests`.
+                    let response = prompt_stop_response_with(acp_stop).usage(Some(acp_usage));
                     let response = response.meta(prompt_response_meta(
                         structured_output_result.as_ref(),
                         Some(&orchestration_model_for_response),
@@ -3650,7 +3720,9 @@ async fn run_goal_turn(
     Ok(GoalTurnOutcome {
         response: turn.response,
         cumulative_usage: turn.cumulative_usage,
-        failure: turn.failure,
+        // Derive the failure from the single source of truth (`stop`) at the one
+        // seam that needs it, rather than carrying a parallel `failure` field.
+        failure: turn.stop.failure().cloned(),
     })
 }
 
@@ -3969,16 +4041,17 @@ async fn build_prompt_messages_with_compression(
 /// Everything a single model turn produced, threaded back to the caller.
 ///
 /// `response` is the assistant's final text (returned directly so callers no
-/// longer have to re-read it from persisted history), and `failure` is set
-/// only when the turn ended in an LLM error or panic rather than a real
-/// completion. The normal-prompt and `/loop` callers use just
-/// `structured_output` + `cumulative_usage`; `/goal` additionally inspects
-/// `response` (for the sentinel) and `failure` (to back off or stop).
+/// longer have to re-read it from persisted history). `stop` is the exhaustive
+/// loop stop reason: the normal-prompt and `/loop` callers use it (with usage +
+/// structured output) to pick the ACP `StopReason` so a turn-limit exhaustion
+/// isn't reported as a normal `EndTurn`, and `/goal` additionally derives its
+/// back-off-vs-stop decision from `stop.failure()` (so there is one source of
+/// truth for the failure, not a parallel field that could drift).
 struct ModelTurnResult {
     structured_output: Option<StructuredOutputResult>,
     cumulative_usage: crate::llm_client::TokenUsage,
     response: String,
-    failure: Option<crate::tool_loop::TurnFailure>,
+    stop: crate::tool_loop::LoopStop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4277,11 +4350,17 @@ fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[Conversat
                     &exchange.result,
                 ));
             }
-            if !turn.agent_response.is_empty() {
-                messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+            let history_response =
+                crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+            if !history_response.is_empty() {
+                messages.push(ChatMessage::assistant(history_response.to_string()));
             }
-        } else if !turn.agent_response.is_empty() {
-            messages.push(ChatMessage::assistant(turn.agent_response.clone()));
+        } else {
+            let history_response =
+                crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+            if !history_response.is_empty() {
+                messages.push(ChatMessage::assistant(history_response.to_string()));
+            }
         }
     }
 }
@@ -4329,11 +4408,13 @@ fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &Conversatio
             }
         }
     }
-    if !turn.agent_response.is_empty() && replayed_assistant_text != turn.agent_response {
-        let missing = turn
-            .agent_response
+    // History excludes our injected closing notice (transcript replay keeps it).
+    let history_response =
+        crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+    if !history_response.is_empty() && replayed_assistant_text != history_response {
+        let missing = history_response
             .strip_prefix(&replayed_assistant_text)
-            .unwrap_or(turn.agent_response.as_str());
+            .unwrap_or(history_response);
         if !missing.is_empty() {
             messages.push(ChatMessage::assistant(missing.to_string()));
         }
@@ -4399,10 +4480,10 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
     .await;
 
     match loop_result {
-        Ok((response, _tool_exchanges, _replay_events, usage, failure)) => PlanTurnResult {
-            response,
-            usage,
-            failure,
+        Ok(outcome) => PlanTurnResult {
+            failure: outcome.stop.failure().cloned(),
+            response: outcome.response,
+            usage: outcome.usage,
         },
         Err(panic) => {
             tracing::error!(session_id = %session_id, "planning loop panicked: {:?}", panic);
@@ -4537,25 +4618,29 @@ async fn run_model_turn_in_spawn(
     .catch_unwind()
     .await;
 
-    let (response_text, tool_exchanges, replay_events, turn_usage, failure) = match loop_result {
-        Ok((text, exchanges, replay_events, usage, failure)) => {
-            (text, exchanges, replay_events, usage, failure)
-        }
+    let crate::tool_loop::LoopOutcome {
+        response: response_text,
+        tool_exchanges,
+        replay_events,
+        usage: turn_usage,
+        stop,
+    } = match loop_result {
+        Ok(outcome) => outcome,
         Err(panic) => {
             tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
             // A panic is treated as fatal (non-retryable): retrying a
             // deterministic crash would just spin, so an autonomous driver
             // should stop and surface it rather than back off and retry.
-            (
-                "Error: agent loop panicked. See server logs.".to_string(),
-                Vec::new(),
-                Vec::new(),
-                crate::llm_client::TokenUsage::default(),
-                Some(crate::tool_loop::TurnFailure {
+            crate::tool_loop::LoopOutcome {
+                response: "Error: agent loop panicked. See server logs.".to_string(),
+                tool_exchanges: Vec::new(),
+                replay_events: Vec::new(),
+                usage: crate::llm_client::TokenUsage::default(),
+                stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
                     retryable: false,
                     message: "agent loop panicked".to_string(),
                 }),
-            )
+            }
         }
     };
 
@@ -4602,7 +4687,7 @@ async fn run_model_turn_in_spawn(
         structured_output: structured_output_result,
         cumulative_usage,
         response: response_text,
-        failure,
+        stop,
     }
 }
 
@@ -9053,6 +9138,51 @@ mod tests {
             prompt_end_turn_response().stop_reason,
             StopReason::EndTurn,
             "the non-cancellable convenience wrapper always ends the turn"
+        );
+    }
+
+    /// The tool loop's stop reason maps to a distinct ACP `StopReason` so the
+    /// client can tell a turn-limit exhaustion from a normal completion, and a
+    /// cancellation observed on the token always wins over the loop's reason.
+    #[test]
+    fn acp_stop_reason_maps_loop_stop() {
+        use crate::tool_loop::{LoopStop, TurnFailure};
+
+        assert_eq!(
+            acp_stop_reason(&LoopStop::Completed { had_text: true }, false),
+            StopReason::EndTurn,
+        );
+        assert_eq!(
+            acp_stop_reason(&LoopStop::Completed { had_text: false }, false),
+            StopReason::EndTurn,
+            "an empty completion is still a finished turn, not a max-turns stop",
+        );
+        assert_eq!(
+            acp_stop_reason(&LoopStop::MaxTurns { max_turns: 200 }, false),
+            StopReason::MaxTurnRequests,
+            "exhausting the turn budget must not look like a normal EndTurn",
+        );
+        assert_eq!(
+            acp_stop_reason(&LoopStop::Cancelled, false),
+            StopReason::Cancelled,
+        );
+        assert_eq!(
+            acp_stop_reason(
+                &LoopStop::Failed(TurnFailure {
+                    retryable: true,
+                    message: "boom".to_string(),
+                }),
+                false,
+            ),
+            StopReason::EndTurn,
+            "a failed turn already streamed its error; ACP has no errored reason",
+        );
+        // The cancellation token is authoritative: the loop swallows
+        // `session/cancel` and may report the partial work as `MaxTurns`, but
+        // ACP still requires the turn to resolve as `Cancelled`.
+        assert_eq!(
+            acp_stop_reason(&LoopStop::MaxTurns { max_turns: 200 }, true),
+            StopReason::Cancelled,
         );
     }
 
