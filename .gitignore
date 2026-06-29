@@ -31,6 +31,6 @@ desktop.ini
 brokk-acp-sandbox/target/
 
 .claude/
-
+.bifrost/
 # Mjolnir linked worktrees
 .mjolnir/worktrees/
