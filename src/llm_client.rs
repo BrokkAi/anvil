@@ -1109,7 +1109,7 @@ fn normalize_stream_tool_calls(
         match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
             Ok(normalized) => {
                 if normalized.repaired {
-                    tracing::debug!(
+                    tracing::warn!(
                         tool_call_id = %call.id,
                         tool_name = %call.function.name,
                         "repaired malformed streamed tool-call arguments"

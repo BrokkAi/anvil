@@ -1,3 +1,5 @@
+use crate::llm_client::IncompleteStreamError;
+use anyhow::Result;
 use serde_json::Value;
 use serde_json::error::Category;
 use std::error::Error;
@@ -56,15 +58,19 @@ pub(crate) fn normalize_tool_arguments(
                 push_candidate(&mut candidates, &fenced);
             }
 
+            // Only repair JSON that is structurally complete but syntactically
+            // sloppy (unquoted keys, single quotes, trailing commas, code
+            // fences). Deliberately do NOT fabricate missing structure: a buffer
+            // that is still open at finish is a truncated/length-stopped
+            // tool-call (issue #205, mechanism #3) and must be classified
+            // Incomplete so the stream is retried -- guessing the tail would
+            // dispatch a valid-but-wrong value (e.g. a truncated 30000 -> 30).
             let bases = candidates.clone();
             for base in bases {
                 let mut repaired = quote_unquoted_object_keys(&base);
                 repaired = convert_single_quoted_strings(&repaired);
                 repaired = remove_trailing_commas(&repaired);
                 push_candidate(&mut candidates, &repaired);
-                if let Some(completed) = complete_structural_tail(&repaired) {
-                    push_candidate(&mut candidates, &completed);
-                }
             }
 
             for candidate in candidates {
@@ -91,6 +97,76 @@ pub(crate) fn normalize_tool_arguments(
                 kind,
                 message: format!("parse tool arguments as JSON: {first_message}"),
             })
+        }
+    }
+}
+
+/// Repair an assistant tool-call's stored `arguments` before replaying it into
+/// a Responses-API request. Repairable JSON is rewritten; anything else passes
+/// through unchanged so the provider still receives the model's original text.
+pub(crate) fn normalize_request_tool_arguments(raw: &str, tool_name: &str) -> String {
+    match normalize_tool_arguments(raw) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::warn!(
+                    tool_name,
+                    "repaired malformed assistant tool-call arguments for Responses request"
+                );
+                normalized.arguments
+            } else {
+                raw.to_string()
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                tool_name,
+                error = %err,
+                "leaving unrepaired assistant tool-call arguments in Responses request"
+            );
+            raw.to_string()
+        }
+    }
+}
+
+/// Repair a streamed tool-call's assembled `arguments`. Repairable JSON is
+/// rewritten; an Incomplete (truncated) buffer is surfaced as a retryable
+/// [`IncompleteStreamError`] so the turn is replayed (issue #205, mechanism #3);
+/// any other malformed input is passed through for the dispatch layer to reject
+/// with a tool error. `protocol` names the wire shape for diagnostics.
+pub(crate) fn normalize_streamed_tool_arguments(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: String,
+    protocol: &'static str,
+) -> Result<String> {
+    match normalize_tool_arguments(&arguments) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::warn!(
+                    tool_call_id,
+                    tool_name,
+                    "repaired malformed streamed tool-call arguments"
+                );
+                Ok(normalized.arguments)
+            } else {
+                Ok(arguments)
+            }
+        }
+        Err(err) if err.kind() == ToolArgumentErrorKind::Incomplete => {
+            let error = anyhow::Error::new(IncompleteStreamError::new(
+                protocol,
+                "complete tool-call arguments",
+            ));
+            Err(error.context(format!("incomplete tool-call arguments for {tool_name}")))
+        }
+        Err(err) => {
+            tracing::debug!(
+                tool_call_id,
+                tool_name,
+                error = %err,
+                "leaving unrepaired malformed streamed tool-call arguments"
+            );
+            Ok(arguments)
         }
     }
 }
@@ -327,78 +403,6 @@ fn remove_trailing_commas(input: &str) -> String {
     out
 }
 
-fn complete_structural_tail(input: &str) -> Option<String> {
-    let tail = analyze_json_tail(input);
-    // Refuse to close a buffer that ends in a dangling bare number. Any prefix
-    // of a number is itself a valid number, so appending closers would fabricate
-    // a wrong value (e.g. a truncated `30000` becomes `30`) and dispatch it
-    // instead of letting the truncation be classified Incomplete and retried.
-    // Terminated values (strings, `true`/`false`/`null`, closed containers) are
-    // safe to complete and a truncated keyword fails to parse on its own, so
-    // only bare numbers need this guard.
-    if tail.in_string || tail.ends_in_number || tail.closers.is_empty() {
-        return None;
-    }
-
-    let mut completed = input.trim_end().to_string();
-    for closer in tail.closers.iter().rev() {
-        completed.push(*closer);
-    }
-    Some(completed)
-}
-
-#[derive(Default)]
-struct JsonTail {
-    closers: Vec<char>,
-    in_string: bool,
-    /// True when the buffer ends inside an unterminated bare number (the last
-    /// significant character is a digit or `.` with no delimiter after it).
-    ends_in_number: bool,
-}
-
-fn analyze_json_tail(input: &str) -> JsonTail {
-    let mut tail = JsonTail::default();
-    let mut escaped = false;
-
-    for ch in input.chars() {
-        if tail.in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                tail.in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => {
-                tail.in_string = true;
-                tail.ends_in_number = false;
-            }
-            '{' => {
-                tail.closers.push('}');
-                tail.ends_in_number = false;
-            }
-            '[' => {
-                tail.closers.push(']');
-                tail.ends_in_number = false;
-            }
-            '}' | ']' if tail.closers.last() == Some(&ch) => {
-                tail.closers.pop();
-                tail.ends_in_number = false;
-            }
-            // A digit or decimal point keeps (or starts) a trailing number run;
-            // any delimiter, whitespace, sign or exponent marker terminates it.
-            '0'..='9' | '.' => tail.ends_in_number = true,
-            _ => tail.ends_in_number = false,
-        }
-    }
-
-    tail
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,11 +426,12 @@ mod tests {
     }
 
     #[test]
-    fn repairs_missing_closing_object() {
-        let parsed = normalize_tool_arguments(r#"{"file_path":"README.md""#).unwrap();
+    fn reports_missing_closing_brace_as_incomplete() {
+        // A structurally open buffer is a truncated/length-stopped tool-call, not
+        // a repair target: it must be retried rather than completed and dispatched.
+        let err = normalize_tool_arguments(r#"{"file_path":"README.md""#).unwrap_err();
 
-        assert!(parsed.repaired);
-        assert_eq!(parsed.arguments, r#"{"file_path":"README.md"}"#);
+        assert_eq!(err.kind(), ToolArgumentErrorKind::Incomplete);
     }
 
     #[test]

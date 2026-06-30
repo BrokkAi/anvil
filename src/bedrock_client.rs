@@ -1364,7 +1364,7 @@ fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
     match crate::tool_arguments::normalize_tool_arguments(raw) {
         Ok(normalized) => {
             if normalized.repaired {
-                tracing::debug!("repaired malformed Bedrock tool-call arguments");
+                tracing::warn!("repaired malformed Bedrock tool-call arguments");
             }
             Ok(normalized.value)
         }
