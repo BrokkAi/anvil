@@ -108,10 +108,56 @@ pub async fn summarize_turn(
     idle_timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<String> {
+    summarize_turn_styled(
+        llm,
+        model,
+        turn,
+        context_length,
+        idle_timeout,
+        cancel,
+        SummaryStyle::Compression,
+    )
+    .await
+}
+
+/// Produce a short, user-facing recap summary of one turn -- "what the
+/// assistant did this turn", in prose, for the host's turn recap. Same
+/// hierarchical fallback as [`summarize_turn`]; only the framing prompts
+/// differ. The caller treats failure as non-fatal (the recap still shows
+/// its deterministic stats), so errors propagate for the caller to ignore.
+pub async fn summarize_turn_for_recap(
+    llm: &dyn LlmBackend,
+    model: &str,
+    turn: &ConversationTurn,
+    context_length: Option<u32>,
+    idle_timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<String> {
+    summarize_turn_styled(
+        llm,
+        model,
+        turn,
+        context_length,
+        idle_timeout,
+        cancel,
+        SummaryStyle::Recap,
+    )
+    .await
+}
+
+async fn summarize_turn_styled(
+    llm: &dyn LlmBackend,
+    model: &str,
+    turn: &ConversationTurn,
+    context_length: Option<u32>,
+    idle_timeout: Duration,
+    cancel: CancellationToken,
+    style: SummaryStyle,
+) -> Result<String> {
     let budget = summarizer_input_budget(context_length);
 
     // Fast path: the whole turn fits in one summarization call.
-    let single_call_messages = build_turn_summarization_messages(turn);
+    let single_call_messages = build_turn_summarization_messages_styled(turn, style);
     if approximate_tokens_messages(&single_call_messages) <= budget {
         return run_summarization_request(llm, model, single_call_messages, idle_timeout, cancel)
             .await;
@@ -123,7 +169,7 @@ pub async fn summarize_turn(
     // LLM calls: N (one per chunk) + 1 (meta) at the minimum, plus
     // any extra rounds the recursion needs if the combined chunk
     // summaries themselves overrun the meta budget.
-    summarize_turn_hierarchical(llm, model, turn, budget, idle_timeout, cancel).await
+    summarize_turn_hierarchical(llm, model, turn, budget, idle_timeout, cancel, style).await
 }
 
 async fn summarize_turn_hierarchical(
@@ -133,6 +179,7 @@ async fn summarize_turn_hierarchical(
     budget: usize,
     idle_timeout: Duration,
     cancel: CancellationToken,
+    style: SummaryStyle,
 ) -> Result<String> {
     let chunks = split_turn_to_chunks(turn, budget);
     if chunks.is_empty() {
@@ -147,7 +194,16 @@ async fn summarize_turn_hierarchical(
     // far below budget. The fallback recursion handles the case
     // where even the combined summaries overrun -- e.g. 100+ chunks
     // each producing several KB of bullets.
-    combine_chunk_summaries(llm, model, &chunk_summaries, budget, idle_timeout, cancel).await
+    combine_chunk_summaries(
+        llm,
+        model,
+        &chunk_summaries,
+        budget,
+        idle_timeout,
+        cancel,
+        style,
+    )
+    .await
 }
 
 /// Drive `MAX_CONCURRENT_CHUNK_REQUESTS` chunk summarizations
@@ -207,9 +263,10 @@ async fn combine_chunk_summaries(
     budget: usize,
     idle_timeout: Duration,
     cancel: CancellationToken,
+    style: SummaryStyle,
 ) -> Result<String> {
     let combined = format_chunk_summaries(chunk_summaries);
-    let messages = build_meta_summarization_messages(&combined);
+    let messages = build_meta_summarization_messages(&combined, style);
     if approximate_tokens_messages(&messages) <= budget {
         return run_summarization_request(llm, model, messages, idle_timeout, cancel).await;
     }
@@ -239,6 +296,7 @@ async fn combine_chunk_summaries(
         budget,
         idle_timeout,
         cancel,
+        style,
     ))
     .await
 }
@@ -371,15 +429,90 @@ Output format: a bulleted list wrapped in \
 <conversation_summary>...</conversation_summary>. No preamble, no closing \
 remarks.";
 
-/// Build the chat-message list for a single-call (whole-turn) summarization.
-pub fn build_turn_summarization_messages(turn: &ConversationTurn) -> Vec<ChatMessage> {
+/// System prompt for a user-facing turn *recap* summary. Unlike
+/// `SYSTEM_PROMPT_TURN` (whose output replaces a turn in the model's
+/// working context and is deliberately not prose), this output is shown
+/// to the human at the end of a turn, so it describes what the assistant
+/// just did in plain language.
+const SYSTEM_PROMPT_TURN_RECAP: &str = "You are writing a short recap for the user of an AI coding \
+assistant. You will receive one turn -- the user's last message, the \
+assistant's response, and any tool calls and results. Summarize, for the \
+user, what the assistant actually did this turn.\n\
+\n\
+Write a few concise Markdown bullet points (one line each), in plain past \
+tense. Cover:\n\
+- The concrete work performed: files created or edited, commands run, \
+  things investigated or decided.\n\
+- Notable results, conclusions, or answers produced.\n\
+- Any errors hit, tests run and their outcome, and anything left \
+  unfinished or still pending.\n\
+\n\
+Be specific -- name the key files, symbols, commands, and findings. Do not \
+restate the user's request, do not add preamble or a closing remark, and do \
+not wrap the output in any tags or headings. If essentially nothing of \
+substance happened, reply with a single bullet saying so.";
+
+/// Meta-join prompt for the recap style: combine per-part summaries of an
+/// oversized turn into one short user-facing recap.
+const SYSTEM_PROMPT_META_RECAP: &str = "You will receive several bulleted summaries, each covering \
+part of a single assistant turn that was too large to summarize at once. \
+Combine them into ONE short user-facing recap of what the assistant did \
+this turn.\n\
+\n\
+- Keep the concrete work, results, errors, and anything left unfinished.\n\
+- Deduplicate facts that appear in multiple parts.\n\
+- Preserve the order in which the work happened.\n\
+- Keep it short: a few Markdown bullet points, one line each.\n\
+\n\
+Output only the bullet points -- no preamble, no closing remark, no \
+heading, and no surrounding tags.";
+
+/// Which framing the turn and meta summarization prompts use. The chunk
+/// (extraction) prompt is shared across styles -- only the single-call
+/// turn prompt and the meta-join prompt differ between a context-
+/// compression summary (operational facts for the model) and a
+/// user-facing recap (prose for the human).
+#[derive(Clone, Copy)]
+enum SummaryStyle {
+    Compression,
+    Recap,
+}
+
+impl SummaryStyle {
+    fn turn_prompt(self) -> &'static str {
+        match self {
+            SummaryStyle::Compression => SYSTEM_PROMPT_TURN,
+            SummaryStyle::Recap => SYSTEM_PROMPT_TURN_RECAP,
+        }
+    }
+
+    fn meta_prompt(self) -> &'static str {
+        match self {
+            SummaryStyle::Compression => SYSTEM_PROMPT_META,
+            SummaryStyle::Recap => SYSTEM_PROMPT_META_RECAP,
+        }
+    }
+}
+
+/// Build the chat-message list for a single-call (whole-turn)
+/// compression summarization. Test-only convenience wrapper; production
+/// goes through the styled variant below.
+#[cfg(test)]
+fn build_turn_summarization_messages(turn: &ConversationTurn) -> Vec<ChatMessage> {
+    build_turn_summarization_messages_styled(turn, SummaryStyle::Compression)
+}
+
+fn build_turn_summarization_messages_styled(
+    turn: &ConversationTurn,
+    style: SummaryStyle,
+) -> Vec<ChatMessage> {
     let mut body = String::from("Turn to summarize:\n\n");
     for atom in turn_summary_atoms(turn) {
         body.push_str(&atom);
         body.push('\n');
     }
     vec![
-        ChatMessage::system(SYSTEM_PROMPT_TURN),
+        ChatMessage::system(style.turn_prompt()),
         ChatMessage::user(body),
     ]
 }
@@ -396,9 +529,9 @@ fn build_chunk_summarization_messages(chunk_text: &str, part_label: &str) -> Vec
 }
 
 /// Build the chat-message list for joining chunk summaries.
-fn build_meta_summarization_messages(combined: &str) -> Vec<ChatMessage> {
+fn build_meta_summarization_messages(combined: &str, style: SummaryStyle) -> Vec<ChatMessage> {
     vec![
-        ChatMessage::system(SYSTEM_PROMPT_META),
+        ChatMessage::system(style.meta_prompt()),
         ChatMessage::user(combined.to_string()),
     ]
 }
@@ -759,6 +892,7 @@ mod tests {
     #[test]
     fn build_turn_summarization_messages_strips_host_notices_from_text_only_turn() {
         let recap = crate::host_notice::render_turn_recap(
+            Some("- Investigated the foo path and edited `bar.rs`."),
             &[],
             &crate::tool_loop::LoopStop::Completed { had_text: true },
         );
@@ -768,6 +902,8 @@ mod tests {
         assert!(body.contains("Assistant: The model answer."));
         assert!(!body.contains("Anvil Recap"));
         assert!(!body.contains("Files changed"));
+        // The host-written work summary must not leak into the model's history.
+        assert!(!body.contains("Investigated the foo path"));
     }
 
     #[test]
@@ -997,6 +1133,38 @@ mod tests {
             "should use turn-level system prompt; got: {}",
             &prompts[0][..prompts[0].len().min(120)]
         );
+    }
+
+    /// The recap entry point reuses the same machinery but drives the
+    /// user-facing recap prompt rather than the compression prompt.
+    #[tokio::test]
+    async fn summarize_turn_for_recap_uses_recap_prompt() {
+        let (backend, call_count, seen) = ScriptedBackend::new(
+            "- Edited `lib.rs` and ran the tests.",
+            "- chunk (unexpected)",
+            "- meta (unexpected)",
+        );
+        let t = turn("fix the bug", "Done.");
+        let out = summarize_turn_for_recap(
+            &backend,
+            "mock",
+            &t,
+            Some(200_000),
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("succeeds");
+        assert_eq!(out, "- Edited `lib.rs` and ran the tests.");
+        assert_eq!(*call_count.lock().unwrap(), 1);
+        let prompts = seen.lock().unwrap();
+        assert!(
+            prompts[0].contains("writing a short recap for the user"),
+            "should use the recap system prompt; got: {}",
+            &prompts[0][..prompts[0].len().min(120)]
+        );
+        // And it must NOT be the compression prompt.
+        assert!(!prompts[0].contains("replaces a single past turn"));
     }
 
     #[tokio::test]

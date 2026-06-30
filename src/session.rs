@@ -2829,9 +2829,20 @@ impl SessionStore {
             default_model: Arc::new(RwLock::new(default_model)),
             default_reasoning_effort: Arc::new(RwLock::new(None)),
             transient_setup_state: transient_setup.then(|| {
-                Arc::new(std::sync::Mutex::new(
-                    crate::setup_state::SetupState::default(),
-                ))
+                let mut state = crate::setup_state::SetupState::default();
+                // Internal test hook (no CLI flag, mirrors `ANVIL_TEST_OLLAMA_BASE_URL`):
+                // integration smoke tests drive a deterministic mock provider that
+                // serves one canned body per request. A turn's trailing recap-summary
+                // LLM call would consume an extra body -- stealing a later turn's
+                // response in multi-turn fixtures -- so let the harness force recaps
+                // off. This never persists and leaves the transient contract intact.
+                if std::env::var("ANVIL_TEST_DISABLE_TURN_RECAP")
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+                {
+                    state.turn_recap_enabled = Some(false);
+                }
+                Arc::new(std::sync::Mutex::new(state))
             }),
             available_models: Arc::new(RwLock::new(Vec::new())),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),

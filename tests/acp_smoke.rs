@@ -2686,6 +2686,11 @@ fn spawn_anvil(
         .env("CODEX_HOME", home.join(".codex"))
         .env("BROKK_CONFIG_HOME", config_home)
         .env("ANVIL_TRACE_JSONL", trace_path)
+        // Recaps default on, but each enabled turn fires a recap-summary LLM
+        // call that would consume a canned body from the deterministic mock
+        // provider and desync multi-turn fixtures. No smoke test asserts recap
+        // content, so force them off; the recap path has its own unit coverage.
+        .env("ANVIL_TEST_DISABLE_TURN_RECAP", "1")
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("BEDROCK_API_KEY")
