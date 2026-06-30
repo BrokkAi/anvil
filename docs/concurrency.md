@@ -112,18 +112,20 @@ subagent**. Therefore:
 
 | Knob | Default | Scope | Notes |
 |---|---|---|---|
-| `--max-turns` | 25 | per prompt | Hard ceiling on agent turns; subagents get `min(parent_max_turns, 25)`. |
+| `--max-turns` | `0` (unbounded) | per prompt | Optional cap on agent turns. Default unbounded: the loop exits when the model answers without a tool call; idle-timeout + no-progress nudges catch stalls. Pass `N>0` to deliberately bound cost/time. Subagents inherit the parent budget unless their definition sets a lower `max_turns:`; recursion is bounded by depth (`MAX_SUBAGENT_DEPTH = 1`). |
 | `--llm-idle-timeout-secs` | 300 | per LLM stream | Aborts a stream with no *meaningful* progress (content/tool-call deltas; keepalives don't count). Per-session override via `/setup timeout`. |
 | Shell command timeout | 60s | per `run_shell_command` | Optional `timeout` values are milliseconds, rounded up to seconds, and capped at 600s. Tool output reports when a request is clamped. |
 
 There is **no separate per-tool-call wall-clock timeout** beyond the LLM idle
-timeout and the turn ceiling. A long-running non-shell tool is bounded only by
-cancellation and the turn budget.
+timeout and (when set) the turn ceiling. With the default unbounded
+`--max-turns`, a long-running non-shell tool is bounded only by cancellation and
+the LLM idle timeout; set a positive `--max-turns` to add a turn-count ceiling.
 
-> **Contract for consumers:** bound a delegated workflow with `--max-turns`
-> (total agent turns) and `--llm-idle-timeout-secs` (stall detection). Do not
-> rely on a per-lane deadline — model an overall budget instead, and cancel if
-> it is exceeded.
+> **Contract for consumers:** the turn loop terminates on the model's own
+> completion signal by default. To impose a hard cost ceiling on an unattended
+> or delegated workflow, set a positive `--max-turns` (total agent turns) and
+> `--llm-idle-timeout-secs` (stall detection). Do not rely on a per-lane
+> deadline — model an overall budget instead, and cancel if it is exceeded.
 
 ## 5. Observability
 

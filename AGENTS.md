@@ -42,7 +42,7 @@ On Linux, `bubblewrap` (`bwrap`) must be installed for `runShellCommand` OS-leve
 - Discovery lives in `src/agents.rs` (`discover` / `AgentRegistry`). Layout is flat: one `<name>.md` per file under `.claude/agents/` or `.agents/agents/`. Last-wins ordering mirrors skills.
 - The `task` tool is registered dynamically in `ToolRegistry::tool_definitions()` and only when the registry is non-empty; its `subagent_type` is enum-constrained to discovered names so the model cannot invent one.
 - Dispatch is in `execute_subagent` in `src/tool_loop.rs`, **not** `ToolRegistry::execute` — it needs `llm`, `spawned_cx`, and `sessions`. It calls `run()` recursively (boxed) with `NotificationMode::Silent`, a fresh transcript, and no-op text/thought sinks.
-- The nested run shares the parent's permission gate (same `session_id` + `sessions`), so `readOnly` and always-allow stickiness are inherited. Depth is capped by `MAX_SUBAGENT_DEPTH` (1) and per-call turns by `MAX_SUBAGENT_TURNS` (25).
+- The nested run shares the parent's permission gate (same `session_id` + `sessions`), so `readOnly` and always-allow stickiness are inherited. Depth is capped by `MAX_SUBAGENT_DEPTH` (1); turns are **not** blanket-capped — a subagent inherits the parent's `max_turns` budget (`subagent_max_turns`) unless its own definition opts into a lower `max_turns:`.
 - User-facing docs for authoring subagents live under "Subagents" in `README.md`. Keep them in sync when changing discovery roots, scope precedence, or limits.
 
 ## Adding a new LLM backend

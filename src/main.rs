@@ -65,8 +65,17 @@ struct Args {
     #[arg(long)]
     reasoning_effort: Option<String>,
 
-    /// Maximum number of tool-calling turns per prompt before the server forces a final text response.
-    #[arg(long, default_value_t = 25)]
+    /// Optional cap on tool-calling turns per prompt. Defaults to `0` =
+    /// unbounded: the loop runs until the model answers without a tool call
+    /// (normal completion), with stalls caught earlier by the LLM idle timeout
+    /// and the no-progress nudges -- the same model-driven termination Codex
+    /// uses and that `/goal` already uses here. A turn count is a poor work
+    /// budget (you can't know up front how many tool rounds a task needs), so
+    /// it is opt-in: pass a positive `--max-turns N` only to deliberately bound
+    /// cost/time, in which case hitting N forces a final text response. The
+    /// conversation context is preserved on that stop, so sending another
+    /// message (e.g. "continue") resumes the task from where it stopped.
+    #[arg(long, default_value_t = 0)]
     max_turns: usize,
 
     /// Maximum number of sessions to keep resident in memory before the
@@ -595,7 +604,14 @@ async fn main() -> Result<()> {
         .set_default_reasoning_effort(args.reasoning_effort)
         .await;
 
-    let max_turns = args.max_turns.max(1);
+    // `0` means "no turn cap" (matching `--max-sessions`/`--max-history-turns`):
+    // map it to the max so the `for turn in 0..turn_limit` loop is bounded only
+    // by the model's own completion signal, the idle timeout, and the nudges.
+    let max_turns = if args.max_turns == 0 {
+        usize::MAX
+    } else {
+        args.max_turns
+    };
     // Bounds on `llm_idle_timeout_secs` are enforced by the clap
     // `value_parser`, so the value reaches us already validated.
     agent::run_agent(llm, sessions, max_turns, args.llm_idle_timeout_secs)
