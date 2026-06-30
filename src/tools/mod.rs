@@ -6,7 +6,7 @@ use crate::agents::AgentRegistry;
 use crate::llm_client::{FunctionDef, ToolDefinition};
 use crate::mcp::{McpClient, McpServerConfig};
 use crate::skills::SkillRegistry;
-use agent_client_protocol::schema::ToolKind;
+use agent_client_protocol::schema::v1::ToolKind;
 use sandbox::SandboxPolicy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};

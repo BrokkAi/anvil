@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     Diff, PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
     RequestPermissionRequest, SessionNotification, SessionUpdate, ToolCallId, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -2839,7 +2839,7 @@ fn blocked_tool_call_updates(
     kind: ToolKind,
     raw_input: &Value,
     reason: &str,
-) -> (agent_client_protocol::schema::ToolCall, ToolCallUpdate) {
+) -> (agent_client_protocol::schema::v1::ToolCall, ToolCallUpdate) {
     (
         announce::blocked_tool_call(tool_call_id, tool_name, kind, raw_input, reason),
         announce::update_failed(

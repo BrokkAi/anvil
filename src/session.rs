@@ -289,12 +289,12 @@ pub struct UnsupportedMcpTransport {
 /// transport other than stdio. Returns the offending server on the first
 /// unsupported entry so the caller can surface a protocol error.
 pub(crate) fn acp_mcp_servers_to_configs(
-    servers: Vec<agent_client_protocol::schema::McpServer>,
+    servers: Vec<agent_client_protocol::schema::v1::McpServer>,
 ) -> Result<Vec<McpServerConfig>, UnsupportedMcpTransport> {
     let mut configs = Vec::with_capacity(servers.len());
     for server in servers {
         match server {
-            agent_client_protocol::schema::McpServer::Stdio(stdio) => {
+            agent_client_protocol::schema::v1::McpServer::Stdio(stdio) => {
                 configs.push(McpServerConfig {
                     name: stdio.name,
                     command: stdio.command.display().to_string(),
@@ -311,13 +311,13 @@ pub(crate) fn acp_mcp_servers_to_configs(
                     enabled: true,
                 });
             }
-            agent_client_protocol::schema::McpServer::Http(http) => {
+            agent_client_protocol::schema::v1::McpServer::Http(http) => {
                 return Err(UnsupportedMcpTransport {
                     server: http.name,
                     transport: "http",
                 });
             }
-            agent_client_protocol::schema::McpServer::Sse(sse) => {
+            agent_client_protocol::schema::v1::McpServer::Sse(sse) => {
                 return Err(UnsupportedMcpTransport {
                     server: sse.name,
                     transport: "sse",
@@ -7550,10 +7550,10 @@ done
     #[test]
     fn acp_stdio_mcp_servers_convert_to_anvil_configs() {
         let configs =
-            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Stdio(
-                agent_client_protocol::schema::McpServerStdio::new("local", "/usr/bin/mcp")
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Stdio(
+                agent_client_protocol::schema::v1::McpServerStdio::new("local", "/usr/bin/mcp")
                     .args(vec!["--flag".to_string(), "value".to_string()])
-                    .env(vec![agent_client_protocol::schema::EnvVariable::new(
+                    .env(vec![agent_client_protocol::schema::v1::EnvVariable::new(
                         "TOKEN", "secret",
                     )]),
             )])
@@ -7580,10 +7580,14 @@ done
     /// while the requested tools are missing (#159).
     #[test]
     fn acp_http_mcp_server_is_rejected() {
-        let err = acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Http(
-            agent_client_protocol::schema::McpServerHttp::new("remote", "https://example.com/mcp"),
-        )])
-        .expect_err("http transport must be rejected");
+        let err =
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Http(
+                agent_client_protocol::schema::v1::McpServerHttp::new(
+                    "remote",
+                    "https://example.com/mcp",
+                ),
+            )])
+            .expect_err("http transport must be rejected");
         assert_eq!(err.server, "remote");
         assert_eq!(err.transport, "http");
     }
