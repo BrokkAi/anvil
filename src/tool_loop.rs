@@ -624,7 +624,11 @@ impl<'a> SpawnedCx<'a> {
         Self { cx }
     }
 
-    fn cx(&self) -> &ConnectionTo<Client> {
+    /// Borrow the underlying connection. `pub(crate)` so the interactive
+    /// `/setup` elicitation flow in `agent.rs` can send agent->client requests
+    /// (`elicitation/create`) from inside its own `cx.spawn`, gated by the same
+    /// witness that guards `request_user_permission`.
+    pub(crate) fn cx(&self) -> &ConnectionTo<Client> {
         self.cx
     }
 }
