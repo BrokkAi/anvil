@@ -3490,14 +3490,20 @@ async fn classify_permission_scope_with_model(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
+            // Surface the underlying cause in the user-facing notice, not just
+            // the logs: a bare "request failed" can't be acted on, and the
+            // downstream rationale is sanitized + length-bounded
+            // (AUTO_PERMISSION_RATIONALE_MAX_CHARS), so the front of the anyhow
+            // chain (the most specific context) survives intact.
+            let detail = format!("{error:#}");
             tracing::warn!(
                 session_id = request.session_id,
                 tool_name = request.tool_name,
-                "permission auto-classifier failed; falling back to user prompt: {error:#}"
+                "permission auto-classifier failed; falling back to user prompt: {detail}"
             );
-            return PermissionScopeClassifierOutcome::Unavailable(
-                "the auto-classifier request failed.".to_string(),
-            );
+            return PermissionScopeClassifierOutcome::Unavailable(format!(
+                "the auto-classifier request failed: {detail}"
+            ));
         }
     };
     let usage = response.usage();
@@ -3527,9 +3533,9 @@ async fn classify_permission_scope_with_model(
                 output = %output,
                 "permission auto-classifier returned invalid JSON; falling back to user prompt"
             );
-            PermissionScopeClassifierOutcome::Unavailable(
-                "the auto-classifier returned invalid JSON.".to_string(),
-            )
+            PermissionScopeClassifierOutcome::Unavailable(format!(
+                "the auto-classifier returned invalid JSON: {output}"
+            ))
         }
     }
 }
@@ -3557,13 +3563,24 @@ did not ask for.\n\
 \n\
 When the only objection is that the user did not explicitly request this exact \
 step, allow it. Reserve denial for concrete, demonstrable risk, and make the \
-rationale name that risk rather than the vagueness of the request.";
+rationale name that risk rather than the vagueness of the request.\n\
+\n\
+Reply with ONLY a single JSON object of exactly this shape -- no prose, no \
+markdown fences:\n\
+{\"allow\": true, \"rationale\": \"<short reason naming the decisive factor>\"}";
 
 fn permission_classifier_schema() -> &'static StructuredOutputRequest {
     static SCHEMA: std::sync::OnceLock<StructuredOutputRequest> = std::sync::OnceLock::new();
     SCHEMA.get_or_init(|| StructuredOutputRequest {
         schema_name: "permission_scope_classification".to_string(),
         allow_coercion: false,
+        // Basic JSON mode, not strict json_schema: the classifier runs on
+        // whatever model the user picked, and on OpenRouter strict schema is
+        // rejected by a third of the providers it load-balances across. The
+        // response is still guaranteed valid JSON, which our strict parser
+        // needs; the {allow, rationale} shape is pinned by the prompt and
+        // verified by `parse_permission_scope_classification` (fail-closed).
+        prefer_json_object: true,
         schema: serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -4811,6 +4828,13 @@ mod tests {
     }
 
     #[test]
+    fn permission_classifier_requests_basic_json_mode() {
+        // The classifier must opt into json_object for broad provider
+        // compatibility (esp. OpenRouter's strict-schema-rejecting providers).
+        assert!(permission_classifier_schema().prefer_json_object);
+    }
+
+    #[test]
     fn permission_scope_classification_requires_valid_json_and_rationale() {
         assert!(parse_permission_scope_classification("not json").is_none());
         assert!(
@@ -4946,6 +4970,104 @@ mod tests {
 
         assert!(classification.allow);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct FailingClassifierBackend {
+        error: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for FailingClassifierBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            _request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let error = self.error;
+            let calls = self.calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!(error))
+            }
+            .boxed()
+        }
+    }
+
+    fn gate_check_for<'a>(llm: &'a Arc<dyn LlmBackend>, raw_input: &'a Value) -> GateCheck<'a> {
+        GateCheck {
+            llm,
+            model: "test-model",
+            reasoning_effort: None,
+            original_user_request: "fix the failing tests",
+            idle_timeout: Duration::from_secs(300),
+            session_id: "session",
+            tool_name: "run_shell_command",
+            kind: ToolKind::Execute,
+            tool_call_id: "call",
+            raw_input,
+            cwd: Path::new("/tmp/project"),
+            additional_roots: &[],
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_auto_classifier_surfaces_request_failure_detail() {
+        // A non-retryable transport error (e.g. provider rejecting the
+        // structured-output schema) must reach the user-facing notice, not
+        // just the logs. Otherwise "the auto-classifier request failed" is
+        // unactionable and indistinguishable from a transient blip.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(FailingClassifierBackend {
+            error: "provider rejected response_format: 400 unsupported",
+            calls: calls.clone(),
+        });
+        let raw_input = serde_json::json!({"command": "cargo test"});
+        let request = gate_check_for(&llm, &raw_input);
+
+        let PermissionScopeClassifierOutcome::Unavailable(rationale) =
+            classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+        else {
+            panic!("hard transport error should yield Unavailable");
+        };
+
+        assert!(
+            rationale.contains("provider rejected response_format"),
+            "rationale should surface the underlying error, got: {rationale}"
+        );
+        // Non-retryable error: classifier must not have burned retry attempts.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The notice the user actually sees carries the detail too, bounded.
+        let notice = auto_permission_notice(
+            "could not evaluate this tool call; manual approval is required",
+            &rationale,
+        );
+        assert!(notice.contains("400 unsupported"));
+    }
+
+    #[tokio::test]
+    async fn permission_auto_classifier_surfaces_invalid_json_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(StaticClassifierBackend {
+            response: "I cannot comply with that request.",
+            calls: calls.clone(),
+            fail_first_incomplete: false,
+        });
+        let raw_input = serde_json::json!({"command": "cargo test"});
+        let request = gate_check_for(&llm, &raw_input);
+
+        let PermissionScopeClassifierOutcome::Unavailable(rationale) =
+            classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+        else {
+            panic!("non-JSON model output should yield Unavailable");
+        };
+
+        assert!(
+            rationale.contains("I cannot comply"),
+            "rationale should echo the offending output, got: {rationale}"
+        );
     }
 
     #[test]

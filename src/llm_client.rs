@@ -1516,8 +1516,16 @@ impl OpenAiClient {
             },
         };
         let response_format = structured_output.as_ref().map(|request| {
+            // A request can opt down to basic JSON mode regardless of the
+            // client's default wire (e.g. the permission classifier, to stay
+            // compatible with OpenRouter providers that reject strict schema).
+            let wire = if request.prefer_json_object {
+                StructuredOutputWire::JsonObject
+            } else {
+                self.structured_output_wire
+            };
             let format = crate::structured_output::native_response_format(request);
-            match self.structured_output_wire {
+            match wire {
                 StructuredOutputWire::JsonSchema => ChatCompletionResponseFormat::JsonSchema {
                     json_schema: NativeJsonSchemaFormat {
                         name: format.name,
@@ -1922,6 +1930,7 @@ mod tests {
                 "required": ["answer"]
             }),
             allow_coercion: false,
+            prefer_json_object: false,
         }
     }
 
@@ -1975,6 +1984,27 @@ mod tests {
             ReasoningWire::DeepSeek,
             None,
             Some(test_structured_output_request()),
+        )
+        .await;
+        assert_eq!(body["response_format"]["type"], "json_object", "{body}");
+        assert!(
+            body["response_format"].get("json_schema").is_none(),
+            "{body}"
+        );
+    }
+
+    /// A request opting into `prefer_json_object` downgrades to basic JSON
+    /// mode even on a strict-json_schema client (the OpenRouter default), so
+    /// the permission classifier stays compatible with providers that reject
+    /// strict schema. The json_schema block must be absent.
+    #[tokio::test]
+    async fn prefer_json_object_downgrades_strict_schema_client_to_json_object() {
+        let mut request = test_structured_output_request();
+        request.prefer_json_object = true;
+        let body = capture_request_body_with_structured_output(
+            ReasoningWire::Unified, // strict json_schema wire by default
+            None,
+            Some(request),
         )
         .await;
         assert_eq!(body["response_format"]["type"], "json_object", "{body}");
@@ -2591,6 +2621,7 @@ mod tests {
                 "required": ["answer"]
             }),
             allow_coercion: false,
+            prefer_json_object: false,
         });
         let body = ChatCompletionRequest {
             model: "gpt-4.1".into(),

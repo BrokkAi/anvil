@@ -1398,6 +1398,7 @@ mod tests {
                 "required": ["answer"]
             }),
             allow_coercion: false,
+            prefer_json_object: false,
         };
         let req = build_responses_request(
             "gpt-5",

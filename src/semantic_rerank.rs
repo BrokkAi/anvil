@@ -139,6 +139,7 @@ pub(crate) async fn rerank_semantic_search(
         schema_name: "semantic_rerank".to_string(),
         schema: rerank_schema(),
         allow_coercion: true,
+        prefer_json_object: false,
     };
 
     let response = stream_chat_no_visible_output_with_retry(
@@ -739,6 +740,7 @@ mod tests {
             schema_name: "semantic_rerank".to_string(),
             schema: rerank_schema(),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let cancel = CancellationToken::new();
 

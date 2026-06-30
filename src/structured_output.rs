@@ -13,6 +13,16 @@ pub struct StructuredOutputRequest {
     pub schema_name: String,
     pub schema: Value,
     pub allow_coercion: bool,
+    /// Request basic JSON mode (`response_format: {type: json_object}`)
+    /// instead of strict `json_schema`. The schema is still used locally for
+    /// validation/coercion; it just isn't sent to the provider as a wire
+    /// constraint. Set by callers that value broad provider compatibility over
+    /// server-side schema enforcement -- notably the internal permission
+    /// classifier, which on OpenRouter is otherwise load-balanced onto
+    /// providers that reject strict `json_schema`. Defaults false, so ACP
+    /// client-driven requests keep strict schema enforcement.
+    #[serde(default)]
+    pub prefer_json_object: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +110,8 @@ pub fn parse_structured_output_request(
         schema_name,
         schema,
         allow_coercion,
+        // ACP client-driven requests keep strict json_schema enforcement.
+        prefer_json_object: false,
     }))
 }
 
@@ -527,6 +539,7 @@ mod tests {
                 schema_name: "audit_result".to_string(),
                 schema: sample_schema(),
                 allow_coercion: true,
+                prefer_json_object: false,
             })
         );
     }
@@ -548,6 +561,7 @@ mod tests {
                 schema_name: "audit_result".to_string(),
                 schema: sample_schema(),
                 allow_coercion: false,
+                prefer_json_object: false,
             })
         );
     }
@@ -619,6 +633,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: false,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":"ok"}"#);
         match result {
@@ -637,6 +652,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: false,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":"ok""#);
         match result {
@@ -657,6 +673,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: false,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":12}"#);
         match result {
@@ -677,6 +694,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: false,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":["one","two"]}"#);
         match result {
@@ -695,6 +713,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":["one",true]}"#);
         match result {
@@ -713,6 +732,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":12}"#);
         match result {
@@ -738,6 +758,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":["high"]}"#);
         match result {
@@ -755,6 +776,7 @@ mod tests {
             schema_name: "audit_result".to_string(),
             schema: sample_schema(),
             allow_coercion: true,
+            prefer_json_object: false,
         };
 
         for raw in [
@@ -788,6 +810,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":7,"count":"bad"}"#);
         match result {
@@ -817,6 +840,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"score":"1"}"#);
         match result {
@@ -841,6 +865,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"score":"1.5"}"#);
         match result {
@@ -865,6 +890,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"enabled":"true"}"#);
         match result {
@@ -894,6 +920,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(
             &request,
@@ -924,6 +951,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":["one","two"]}"#);
         match result {
@@ -950,6 +978,7 @@ mod tests {
                 "additionalProperties": false
             }),
             allow_coercion: true,
+            prefer_json_object: false,
         };
         let result = validate_response(&request, r#"{"answer":["one","two"]}"#);
         match result {
