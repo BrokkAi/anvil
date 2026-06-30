@@ -5943,6 +5943,10 @@ async fn handle_idle_timeout(
 /// client advertises the matching capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupElicitTarget {
+    /// Bare `/setup` -> single-select home menu. The one interactive entry
+    /// point: each choice routes into the relevant sub-flow below (or a text
+    /// handler), so users navigate setup from one prompt.
+    Home,
     /// `/setup sandbox` with no explicit value -> single-select form menu.
     Sandbox,
     /// `/setup codex` (or `/setup codex login`) -> URL-mode sign-in prompt.
@@ -5955,6 +5959,8 @@ impl SetupElicitTarget {
     /// Whether the connected client advertised the capability this target needs.
     fn is_supported(self, caps: crate::session::ClientElicitationCaps) -> bool {
         match self {
+            // The home menu is a form-mode (single-select) elicitation.
+            Self::Home => caps.form,
             // Sandbox is a form-mode (menu) elicitation.
             Self::Sandbox => caps.form,
             // Codex sign-in is a url-mode (open-this-link) elicitation.
@@ -5967,10 +5973,11 @@ impl SetupElicitTarget {
 
 /// Decide whether a `/setup` invocation should be handled via elicitation.
 ///
-/// Returns `None` for invocations that carry an explicit value (the user
-/// already chose, so there is nothing to prompt) or that have no elicitation
-/// equivalent yet -- those keep the existing Markdown text flow. Only the
-/// bare, value-less forms map to a menu.
+/// Bare `/setup` maps to the interactive home menu. Otherwise, returns `None`
+/// for invocations that carry an explicit value (the user already chose, so
+/// there is nothing to prompt) or that have no elicitation equivalent yet --
+/// those keep the existing Markdown text flow. Only the bare, value-less forms
+/// map to a menu.
 fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
     if !is_slash_command(prompt_text, "setup") {
         return None;
@@ -5980,6 +5987,8 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
     let sub = parts.next().unwrap_or("").to_ascii_lowercase();
     let rest = parts.next().unwrap_or("").trim();
     match sub.as_str() {
+        // Bare `/setup` (no sub-command) -> the single interactive entry point.
+        "" => Some(SetupElicitTarget::Home),
         "sandbox" if rest.is_empty() => Some(SetupElicitTarget::Sandbox),
         // Bare `/setup codex` / `/setup codex login` start interactive sign-in;
         // `status` / `disconnect` are not prompts and keep the text flow.
@@ -6003,6 +6012,9 @@ async fn run_setup_elicitation(
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) {
     match target {
+        SetupElicitTarget::Home => {
+            run_setup_home_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock).await;
+        }
         SetupElicitTarget::Sandbox => {
             run_setup_sandbox_elicitation(spawned_cx, sessions, session_id).await;
         }
@@ -6294,6 +6306,188 @@ async fn apply_sandbox_elicitation_outcome(
         }
         // `ElicitationAction` is `#[non_exhaustive]`.
         _ => "Sandbox setup did not complete; sandbox is unchanged.".to_string(),
+    }
+}
+
+/// A choice from the interactive `/setup` home menu, mapped to the sub-flow it
+/// dispatches into. The set mirrors the actionable links in the Markdown home
+/// (`render_setup_home_for_model`); the env-var-only DeepSeek hint has no
+/// menu action, so it is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupHomeRoute {
+    /// Pick a ready model automatically (`/setup choose`).
+    Choose,
+    /// Interactive Codex / ChatGPT sign-in (`/setup codex`).
+    Codex,
+    /// AWS Bedrock setup (`/setup bedrock`).
+    Bedrock,
+    /// Local Ollama models (`/setup local`).
+    Local,
+    /// Interactive OpenRouter key entry (`/setup openrouter`).
+    OpenRouter,
+    /// Advanced page: model ids, sandbox, behavior (`/setup advanced`).
+    Advanced,
+}
+
+impl SetupHomeRoute {
+    /// The stable `oneOf` value used on the wire for this route.
+    fn value(self) -> &'static str {
+        match self {
+            Self::Choose => "choose",
+            Self::Codex => "codex",
+            Self::Bedrock => "bedrock",
+            Self::Local => "local",
+            Self::OpenRouter => "openrouter",
+            Self::Advanced => "advanced",
+        }
+    }
+
+    /// Parse a wire value back into a route, ignoring anything unrecognized.
+    fn from_value(value: &str) -> Option<Self> {
+        [
+            Self::Choose,
+            Self::Codex,
+            Self::Bedrock,
+            Self::Local,
+            Self::OpenRouter,
+            Self::Advanced,
+        ]
+        .into_iter()
+        .find(|route| route.value() == value)
+    }
+
+    /// Human-readable option label shown in the menu.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Choose => "Choose a model for me",
+            Self::Codex => "Sign in to Codex / ChatGPT",
+            Self::Bedrock => "Use AWS Bedrock",
+            Self::Local => "Use free local models (Ollama)",
+            Self::OpenRouter => "Use OpenRouter",
+            Self::Advanced => "Advanced settings (model ids, sandbox, behavior)",
+        }
+    }
+
+    /// The menu in display order. `choose` leads because it is the fastest path
+    /// to a working model.
+    fn menu() -> [Self; 6] {
+        [
+            Self::Choose,
+            Self::Codex,
+            Self::Bedrock,
+            Self::Local,
+            Self::OpenRouter,
+            Self::Advanced,
+        ]
+    }
+}
+
+/// Classify a home-menu elicitation response into the route to take. Returns
+/// `None` for Decline/Cancel, an empty/non-string selection, or an
+/// unrecognized value -- all of which are treated as "closed, nothing chosen".
+fn parse_setup_home_choice(action: &ElicitationAction) -> Option<SetupHomeRoute> {
+    let ElicitationAction::Accept(accept) = action else {
+        return None;
+    };
+    accept
+        .content
+        .as_ref()
+        .and_then(|content| content.get("choice"))
+        .and_then(|value| match value {
+            ElicitationContentValue::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .and_then(SetupHomeRoute::from_value)
+}
+
+/// Build the single-select home-menu form, pre-selecting `choose`.
+fn build_setup_home_elicitation_request(session_id: &str) -> CreateElicitationRequest {
+    let options = SetupHomeRoute::menu()
+        .into_iter()
+        .map(|route| EnumOption::new(route.value(), route.label()))
+        .collect::<Vec<_>>();
+
+    let field = StringPropertySchema::new()
+        .title("Set up Anvil")
+        .description("Pick how to get a model ready, or open advanced settings.")
+        .one_of(options)
+        .default_value(SetupHomeRoute::Choose.value());
+
+    let schema = ElicitationSchema::new()
+        .title("Anvil setup")
+        .property("choice", field, true);
+
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "How do you want to set up Anvil?")
+}
+
+/// Bare `/setup` as the single interactive entry point. Presents the home menu
+/// and routes the choice into the existing sub-flow: the model picker, the
+/// interactive Codex/OpenRouter logins, the Bedrock/local text flows, or the
+/// advanced page. Decline/Cancel leave everything unchanged; a transport error
+/// falls back to the Markdown home so the user still sees the options.
+async fn run_setup_home_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+) {
+    let cx = spawned_cx.cx();
+    let request = build_setup_home_elicitation_request(session_id);
+    let action = match cx.send_request(request).block_task().await {
+        Ok(resp) => resp.action,
+        Err(e) => {
+            tracing::warn!("/setup home elicitation failed: {e}");
+            send_message(
+                cx,
+                session_id,
+                &render_current_setup(sessions, session_id).await,
+            );
+            return;
+        }
+    };
+
+    match parse_setup_home_choice(&action) {
+        // Text/streaming sub-flows: run the same handler the slash path uses and
+        // surface its Markdown result.
+        Some(SetupHomeRoute::Choose) => {
+            let message = handle_setup_choose(cx, sessions, session_id, llm, refresh_lock).await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::Bedrock) => {
+            let message =
+                handle_setup_bedrock(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::Local) => {
+            let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::Advanced) => {
+            let message = render_setup_advanced(sessions, session_id).await;
+            send_message(cx, session_id, &message);
+        }
+        // Interactive sub-flows: chain into the matching elicitation, which
+        // sends its own progress/result messages.
+        Some(SetupHomeRoute::Codex) => {
+            run_setup_codex_login_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock)
+                .await;
+        }
+        Some(SetupHomeRoute::OpenRouter) => {
+            run_setup_openrouter_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+            )
+            .await;
+        }
+        None => {
+            send_message(cx, session_id, "Setup closed; nothing changed.");
+        }
     }
 }
 
@@ -12086,9 +12280,9 @@ mod tests {
 
     // --- Interactive `/setup` elicitation (#207) ---
 
-    /// Only the bare, value-less `/setup sandbox` maps to a menu; an explicit
-    /// value, other sub-commands, and unrelated slash commands keep the text
-    /// flow (return `None`).
+    /// Only the bare, value-less `/setup sandbox` maps to the sandbox menu; an
+    /// explicit value, other sub-commands, and unrelated slash commands keep
+    /// the text flow (return `None`). Bare `/setup` maps to the home menu.
     #[test]
     fn setup_elicitation_target_only_for_value_less_sandbox() {
         assert_eq!(
@@ -12103,10 +12297,110 @@ mod tests {
         assert_eq!(setup_elicitation_target("/setup sandbox off"), None);
         assert_eq!(setup_elicitation_target("/setup sandbox wasm"), None);
         assert_eq!(setup_elicitation_target("/setup sandbox status"), None);
-        // No elicitation equivalent (yet) / not /setup at all.
-        assert_eq!(setup_elicitation_target("/setup"), None);
+        // Bare `/setup` (incl. trailing whitespace) is the interactive home menu.
+        assert_eq!(
+            setup_elicitation_target("/setup"),
+            Some(SetupElicitTarget::Home)
+        );
+        assert_eq!(
+            setup_elicitation_target("/setup   "),
+            Some(SetupElicitTarget::Home)
+        );
+        // A sub-command with no elicitation equivalent keeps the text flow, and
+        // an unknown sub-command is not the bare home menu.
         assert_eq!(setup_elicitation_target("/setup mode"), None);
+        assert_eq!(setup_elicitation_target("/setup nope"), None);
         assert_eq!(setup_elicitation_target("/permissions"), None);
+    }
+
+    /// The home menu is a form-mode elicitation, so it needs the client's
+    /// `form` capability; `url` alone is not enough.
+    #[test]
+    fn home_target_requires_form_capability() {
+        use crate::session::ClientElicitationCaps;
+        let t = SetupElicitTarget::Home;
+        assert!(!t.is_supported(ClientElicitationCaps::default()));
+        assert!(!t.is_supported(ClientElicitationCaps {
+            form: false,
+            url: true,
+        }));
+        assert!(t.is_supported(ClientElicitationCaps {
+            form: true,
+            url: false,
+        }));
+    }
+
+    /// The home request is a session-scoped single-select form listing every
+    /// actionable provider/action, pre-selecting `choose`.
+    #[test]
+    fn setup_home_elicitation_request_shape() {
+        let req = build_setup_home_elicitation_request("sess-home");
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-home"));
+        let choice = &json["requestedSchema"]["properties"]["choice"];
+        assert_eq!(choice["type"], "string");
+        assert_eq!(choice["default"], "choose");
+        let values: Vec<&str> = choice["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "choose",
+                "codex",
+                "bedrock",
+                "local",
+                "openrouter",
+                "advanced"
+            ]
+        );
+        assert_eq!(json["requestedSchema"]["required"][0], "choice");
+    }
+
+    /// An accepted choice maps to its route; Decline/Cancel, empty content, a
+    /// non-string value, and an unknown value all map to `None` (menu closed).
+    #[test]
+    fn parse_setup_home_choice_maps_values_and_dismissals() {
+        use agent_client_protocol::schema::v1::ElicitationAcceptAction;
+        use std::collections::BTreeMap;
+
+        let accept = |value: &str| {
+            ElicitationAction::Accept(ElicitationAcceptAction::new().content(BTreeMap::from([(
+                "choice".to_string(),
+                ElicitationContentValue::from(value),
+            )])))
+        };
+
+        assert_eq!(
+            parse_setup_home_choice(&accept("choose")),
+            Some(SetupHomeRoute::Choose)
+        );
+        assert_eq!(
+            parse_setup_home_choice(&accept("codex")),
+            Some(SetupHomeRoute::Codex)
+        );
+        assert_eq!(
+            parse_setup_home_choice(&accept("openrouter")),
+            Some(SetupHomeRoute::OpenRouter)
+        );
+        assert_eq!(
+            parse_setup_home_choice(&accept("advanced")),
+            Some(SetupHomeRoute::Advanced)
+        );
+
+        // Dismissals and malformed selections close the menu without a route.
+        assert_eq!(parse_setup_home_choice(&accept("bogus")), None);
+        assert_eq!(parse_setup_home_choice(&ElicitationAction::Decline), None);
+        assert_eq!(parse_setup_home_choice(&ElicitationAction::Cancel), None);
+        assert_eq!(
+            parse_setup_home_choice(&ElicitationAction::Accept(ElicitationAcceptAction::new())),
+            None
+        );
     }
 
     /// The sandbox menu is a form-mode elicitation, so it needs the client's
