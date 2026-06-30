@@ -127,7 +127,10 @@ pub(crate) fn build_responses_request(
                     for call in calls {
                         input.push(ResponsesInputItem::FunctionCall {
                             name: call.function.name.clone(),
-                            arguments: call.function.arguments.clone(),
+                            arguments: crate::tool_arguments::normalize_request_tool_arguments(
+                                &call.function.arguments,
+                                &call.function.name,
+                            ),
                             call_id: call.id.clone(),
                         });
                     }
@@ -389,6 +392,13 @@ where
                                         let resolved_id = call_id
                                             .or(id)
                                             .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+                                        let arguments =
+                                            crate::tool_arguments::normalize_streamed_tool_arguments(
+                                                &resolved_id,
+                                                &name,
+                                                arguments,
+                                                "Responses SSE",
+                                            )?;
                                         tool_calls.push(ToolCall {
                                             id: resolved_id,
                                             r#type: "function".to_string(),
@@ -613,6 +623,56 @@ mod tests {
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(collected.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_repairs_malformed_tool_call_arguments() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"read_file\",\"arguments\":\"{file_path:'a.txt',}\",\"call_id\":\"fc_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, _) = collect_tokens();
+
+        let resp = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("repairable tool-call arguments should complete");
+
+        match resp {
+            LlmResponse::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function.arguments, r#"{"file_path":"a.txt"}"#);
+            }
+            other => panic!("expected ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_treats_unterminated_tool_arguments_as_incomplete() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"unterminated\",\"call_id\":\"fc_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, _) = collect_tokens();
+
+        let err = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unterminated streamed arguments should be retryable truncation");
+
+        assert!(crate::llm_client::is_incomplete_stream_error(&err));
     }
 
     #[tokio::test]

@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     ClientCapabilities, ConfigOptionUpdate, ContentBlock, FileSystemCapabilities,
-    InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     StopReason, TextContent,
@@ -144,7 +145,7 @@ async fn initialize(connection: &ConnectionTo<Agent>) -> agent_client_protocol::
 
 async fn set_session_config(
     connection: &ConnectionTo<Agent>,
-    session_id: agent_client_protocol::schema::SessionId,
+    session_id: agent_client_protocol::schema::v1::SessionId,
     key: &'static str,
     value: &'static str,
 ) -> agent_client_protocol::Result<()> {

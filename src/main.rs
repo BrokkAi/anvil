@@ -32,6 +32,7 @@ mod skills;
 mod structured_output;
 mod terminal_notifications;
 mod tokens;
+mod tool_arguments;
 mod tool_loop;
 mod tools;
 mod trace_logging;
