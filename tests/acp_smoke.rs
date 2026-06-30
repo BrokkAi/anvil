@@ -1725,6 +1725,120 @@ fn collect_agent_message_text(client: &mut JsonRpcClient) -> String {
         .collect()
 }
 
+/// A user-initiated `session/cancel` while the LLM request is still in its
+/// pre-stream HTTP send phase MUST resolve as a clean cancellation, not an LLM
+/// failure. Regression: the loop's `Err` arm rendered the `http_retry`
+/// "cancelled while sending request" bail as a
+/// `**Error:** LLM request failed: ...` transcript line even though the user
+/// simply cancelled. Driven model-free with a provider that records the request
+/// then hangs, so the cancel lands squarely in `reqwest`'s `send().await`.
+#[test]
+fn llm_request_cancelled_mid_send_is_not_reported_as_error() {
+    let case = SmokeCase {
+        name: "llm_cancel_mid_send",
+        prompt: "Do something that needs the model.".to_string(),
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_hanging_smoke_server();
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+    let _ = client.take_updates();
+
+    // Fire the prompt without blocking; the provider hangs on the resulting
+    // chat-completion request, pinning anvil in `send().await`.
+    let prompt_id = client.send_request_no_wait(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [ { "type": "text", "text": case.prompt } ]
+        }),
+    );
+
+    // Cancel only once the provider has actually received the request, so the
+    // cancel is guaranteed to land while anvil is blocked sending it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while provider.request_count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{}: provider never received the LLM request before cancel",
+            case.name
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        provider.request_bodies()[0].contains("needs the model"),
+        "{}: hung request was not the prompt's chat-completion: {:?}",
+        case.name,
+        provider.request_bodies()
+    );
+    client.send_notification("session/cancel", json!({ "sessionId": session_id }));
+
+    let prompt = client.wait_for_response(prompt_id, "session/prompt");
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+
+    // A cancelled turn resolves as `cancelled`, never a normal end-turn...
+    assert_eq!(
+        prompt["result"]["stopReason"].as_str(),
+        Some("cancelled"),
+        "{}: cancel mid-send must report stopReason=cancelled: {prompt}",
+        case.name
+    );
+
+    // ...and crucially, must NOT surface the cancellation as an LLM error in the
+    // transcript. This is the regression under test.
+    let agent_text = collect_agent_message_text(&mut client);
+    assert!(
+        !agent_text.contains("**Error:**") && !agent_text.contains("LLM request failed"),
+        "{}: cancellation was rendered as an LLM error in the transcript: {agent_text:?}",
+        case.name
+    );
+
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
 /// A turn that exhausts its `--max-turns` budget must NOT just stop silently:
 /// the reason has to reach the transcript (a streamed `agent_message_chunk`)
 /// AND the `PromptResponse.stopReason` must be `max_turn_requests`, not a
@@ -2622,11 +2736,10 @@ fn start_openai_smoke_server(response_bodies: Vec<String>) -> OpenAiSmokeServer 
     }
 }
 
-fn handle_provider_connection(
-    mut stream: TcpStream,
-    response_body: &str,
-    request_bodies: &Arc<Mutex<Vec<String>>>,
-) {
+/// Read one HTTP request off `stream` and record its body in `request_bodies`,
+/// returning once the full body has arrived. Shared by the responding provider
+/// and the hanging provider (which records the request, then never replies).
+fn read_provider_request(stream: &mut TcpStream, request_bodies: &Arc<Mutex<Vec<String>>>) {
     let mut raw = Vec::new();
     let mut buf = [0_u8; 1024];
     loop {
@@ -2667,6 +2780,40 @@ fn handle_provider_connection(
     )
     .to_string();
     request_bodies.lock().unwrap().push(body);
+}
+
+/// A provider that accepts one connection, reads + records the chat-completion
+/// request, then holds the socket open without ever sending response headers.
+/// This pins the client in `reqwest`'s `send().await` (pre-stream phase), which
+/// is the exact window in which a `session/cancel` exercises the
+/// "cancelled while sending request" path in `http_retry`.
+fn start_hanging_smoke_server() -> OpenAiSmokeServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging provider");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let request_bodies = Arc::new(Mutex::new(Vec::new()));
+    let bodies_for_thread = request_bodies.clone();
+    std::thread::spawn(move || {
+        if let Some(Ok(mut stream)) = listener.incoming().next() {
+            read_provider_request(&mut stream, &bodies_for_thread);
+            // Never write a response: hold the connection open past any
+            // realistic test window so the client stays blocked in `send()`
+            // until the turn is cancelled. Dropping `stream` afterwards closes
+            // the socket; by then the test has already finished.
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+    OpenAiSmokeServer {
+        base_url,
+        request_bodies,
+    }
+}
+
+fn handle_provider_connection(
+    mut stream: TcpStream,
+    response_body: &str,
+    request_bodies: &Arc<Mutex<Vec<String>>>,
+) {
+    read_provider_request(&mut stream, request_bodies);
 
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -2928,6 +3075,15 @@ impl<'a> JsonRpcClient<'a> {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request_no_wait(method, params);
+        self.wait_for_response(id, method)
+    }
+
+    /// Write a request without blocking on its response, returning its id so the
+    /// caller can `wait_for_response` later. Lets a test interleave other
+    /// traffic (e.g. a `session/cancel`) while a long-running request is in
+    /// flight.
+    fn send_request_no_wait(&mut self, method: &str, params: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({
@@ -2938,7 +3094,17 @@ impl<'a> JsonRpcClient<'a> {
         });
         writeln!(self.stdin, "{request}").expect("write request");
         self.stdin.flush().expect("flush request");
-        self.wait_for_response(id, method)
+        id
+    }
+
+    fn send_notification(&mut self, method: &str, params: Value) {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        writeln!(self.stdin, "{notification}").expect("write notification");
+        self.stdin.flush().expect("flush notification");
     }
 
     fn wait_for_response(&mut self, id: u64, method: &str) -> Value {
