@@ -1,7 +1,7 @@
 mod filesystem;
 pub mod sandbox;
 mod shell;
-mod web;
+pub(crate) mod web;
 
 use crate::agents::AgentRegistry;
 use crate::llm_client::{FunctionDef, ToolDefinition};

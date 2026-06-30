@@ -18,8 +18,14 @@
 
 use super::{ToolResult, ToolStatus};
 use crate::http_retry::send_with_retries;
+use crate::llm_client::{
+    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
+    stream_chat_no_visible_output_with_retry,
+};
+use crate::structured_output::StructuredOutputRequest;
 use regex::Regex;
-use std::sync::LazyLock;
+use serde_json::{Value, json};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +39,14 @@ const SNIPPET_MAX_CHARS: usize = 500;
 const TITLE_MAX_CHARS: usize = 300;
 /// Final guard on the whole formatted blob handed back to the model.
 const OUTPUT_MAX_BYTES: usize = 16_000;
+/// Reasoning effort for the disposable URL-safety classifier turn. Kept low:
+/// it's a cheap yes/no-per-URL judgement, not deep reasoning.
+const SAFETY_REASONING_EFFORT: &str = "low";
+/// Fail-closed policy: when the URL-safety classifier cannot complete (network
+/// error, unparseable output), withhold the unvetted results rather than show
+/// them. Flip to `false` to fail open (show results with a "not safety-checked"
+/// note). This is the deliberate security default -- see the module docs.
+const WITHHOLD_RESULTS_ON_VET_FAILURE: bool = true;
 /// DuckDuckGo's keyless HTML results endpoint.
 const DUCKDUCKGO_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 /// Network timeout for a single search request.
@@ -86,33 +100,41 @@ impl SearchProvider {
     }
 }
 
-/// Entry point invoked by the tool dispatcher. Validates arguments, runs the
-/// selected backend, applies the optional domain filter, and formats the
-/// results. An empty result set is a successful (non-error) outcome.
-pub(super) async fn run_web_search(
+/// A completed search: which provider answered, the (trimmed) query, and the
+/// filtered, count-capped results.
+struct SearchExecution {
+    provider_label: &'static str,
+    query: String,
+    results: Vec<SearchResult>,
+}
+
+/// Validate arguments, run the selected backend, and apply the optional domain
+/// filter + count cap. Returns the structured results, or a ready-to-return
+/// `ToolResult` for a validation or network error.
+async fn execute_search(
     query: &str,
     count: Option<usize>,
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
     cancel: Option<&CancellationToken>,
-) -> ToolResult {
+) -> Result<SearchExecution, ToolResult> {
     let query = query.trim();
     if query.is_empty() {
-        return ToolResult {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
             output: "Invalid arguments for `web_search`: `query` must not be empty.".to_string(),
-        };
+        });
     }
 
     let allowed = non_empty_domains(allowed_domains);
     let blocked = non_empty_domains(blocked_domains);
     if allowed.is_some() && blocked.is_some() {
-        return ToolResult {
+        return Err(ToolResult {
             status: ToolStatus::RequestError,
             output: "Invalid arguments for `web_search`: provide `allowed_domains` or \
                      `blocked_domains`, but not both."
                 .to_string(),
-        };
+        });
     }
 
     let count = count.unwrap_or(DEFAULT_RESULTS).clamp(1, MAX_RESULTS);
@@ -121,27 +143,291 @@ pub(super) async fn run_web_search(
     let results = match provider.search(&SEARCH_CLIENT, query, cancel).await {
         Ok(results) => results,
         Err(err) => {
-            return ToolResult {
+            return Err(ToolResult {
                 status: ToolStatus::InternalError,
                 output: format!(
                     "web_search failed via {}: {err}. The keyless endpoint can rate-limit; \
                      retrying or rephrasing may help.",
                     provider.label()
                 ),
-            };
+            });
         }
     };
 
     let results = apply_domain_filter(results, allowed.as_deref(), blocked.as_deref());
     let results: Vec<SearchResult> = results.into_iter().take(count).collect();
+    Ok(SearchExecution {
+        provider_label: provider.label(),
+        query: query.to_string(),
+        results,
+    })
+}
 
-    ToolResult {
-        status: ToolStatus::Success,
-        output: truncate_bytes(
-            &format_results(query, provider.label(), &results),
-            OUTPUT_MAX_BYTES,
-        ),
+/// Render a completed search to the model-facing string (unvetted).
+fn render_execution(exec: &SearchExecution) -> String {
+    truncate_bytes(
+        &format_results(&exec.query, exec.provider_label, &exec.results),
+        OUTPUT_MAX_BYTES,
+    )
+}
+
+/// Registry entry point (LLM-free path). Runs the search and formats it
+/// **without** URL-safety vetting; the model-facing path goes through
+/// [`run_web_search_vetted`] in the tool loop instead. An empty result set is a
+/// successful (non-error) outcome.
+pub(super) async fn run_web_search(
+    query: &str,
+    count: Option<usize>,
+    allowed_domains: Option<Vec<String>>,
+    blocked_domains: Option<Vec<String>>,
+    cancel: Option<&CancellationToken>,
+) -> ToolResult {
+    match execute_search(query, count, allowed_domains, blocked_domains, cancel).await {
+        Ok(exec) => ToolResult {
+            status: ToolStatus::Success,
+            output: render_execution(&exec),
+        },
+        Err(result) => result,
     }
+}
+
+/// What the URL-safety wrapper hands back to the tool loop, mirroring the fields
+/// it needs from a `ToolExecution`.
+pub(crate) struct WebSearchOutcome {
+    pub output: String,
+    pub failed: bool,
+    pub usage: TokenUsage,
+}
+
+impl WebSearchOutcome {
+    fn success(output: String, usage: TokenUsage) -> Self {
+        Self {
+            output,
+            failed: false,
+            usage,
+        }
+    }
+
+    fn from_tool_result(result: ToolResult) -> Self {
+        Self {
+            failed: !matches!(result.status, ToolStatus::Success),
+            output: result.output,
+            usage: TokenUsage::default(),
+        }
+    }
+}
+
+/// Model-facing entry point: run the search, then vet the returned result URLs
+/// for danger with a disposable safety-classifier turn before the model sees
+/// them. The permission gate can only judge the query up front (the result URLs
+/// don't exist until the search runs), so this is where returned-URL safety is
+/// evaluated. Fails closed: on a classifier error the results are withheld
+/// rather than shown unvetted (see [`WITHHOLD_RESULTS_ON_VET_FAILURE`]).
+pub(crate) async fn run_web_search_vetted(
+    llm: &Arc<dyn LlmBackend>,
+    model: &str,
+    idle_timeout: Duration,
+    args: &Value,
+    cancel: &CancellationToken,
+) -> WebSearchOutcome {
+    let parsed: super::WebSearchArgs = match super::parse_builtin_args("web_search", args.clone()) {
+        Ok(parsed) => parsed,
+        Err(result) => return WebSearchOutcome::from_tool_result(result),
+    };
+
+    let exec = match execute_search(
+        &parsed.query,
+        parsed.count,
+        parsed.allowed_domains,
+        parsed.blocked_domains,
+        Some(cancel),
+    )
+    .await
+    {
+        Ok(exec) => exec,
+        Err(result) => return WebSearchOutcome::from_tool_result(result),
+    };
+
+    // No results -> nothing to vet; the empty-result note is already safe.
+    if exec.results.is_empty() {
+        return WebSearchOutcome::success(render_execution(&exec), TokenUsage::default());
+    }
+
+    match classify_dangerous_urls(llm, model, idle_timeout, &exec.query, &exec.results, cancel)
+        .await
+    {
+        Ok((flags, usage)) => {
+            let total = exec.results.len();
+            let (safe, removed) = partition_safe(exec.results, &flags);
+            WebSearchOutcome::success(
+                render_vetted(&exec.query, exec.provider_label, &safe, removed, total),
+                usage,
+            )
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = format!("{err:#}"),
+                "web_search URL-safety classifier failed"
+            );
+            if WITHHOLD_RESULTS_ON_VET_FAILURE {
+                WebSearchOutcome::success(
+                    withheld_message(&exec.query, exec.results.len()),
+                    TokenUsage::default(),
+                )
+            } else {
+                // Fail-open fallback: surface the unvetted results, clearly flagged.
+                let mut output = render_execution(&exec);
+                output.push_str(
+                    "\n[Note: the URL-safety check could not run, so these results were NOT \
+                     safety-checked.]\n",
+                );
+                WebSearchOutcome::success(output, TokenUsage::default())
+            }
+        }
+    }
+}
+
+/// Ask a disposable LLM turn which result indices are dangerous. Returns a
+/// per-result `dangerous` flag vector plus the turn's token usage. Any failure
+/// (network, unparseable output) is an `Err`, which the caller treats per the
+/// fail-closed policy.
+async fn classify_dangerous_urls(
+    llm: &Arc<dyn LlmBackend>,
+    model: &str,
+    idle_timeout: Duration,
+    query: &str,
+    results: &[SearchResult],
+    cancel: &CancellationToken,
+) -> anyhow::Result<(Vec<bool>, TokenUsage)> {
+    let messages = vec![ChatMessage::user(build_safety_prompt(query, results))];
+    let structured = StructuredOutputRequest {
+        schema_name: "web_search_url_safety".to_string(),
+        schema: safety_schema(),
+        allow_coercion: true,
+        // Use the load-balancer-safe `json_object` wire, like the permission
+        // classifier: strict `json_schema` gets routed onto providers that
+        // reject it.
+        prefer_json_object: true,
+    };
+
+    let response = stream_chat_no_visible_output_with_retry(
+        llm.as_ref(),
+        "web_search url safety",
+        cancel,
+        || StreamChatRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            tools: None,
+            reasoning_effort: Some(SAFETY_REASONING_EFFORT.to_string()),
+            temperature: None,
+            structured_output: Some(structured.clone()),
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel.clone(),
+            idle_timeout,
+        },
+    )
+    .await?;
+
+    let usage = response.usage();
+    let text = match response {
+        LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
+    };
+    let dangerous = parse_dangerous_indices(&text)
+        .ok_or_else(|| anyhow::anyhow!("URL-safety classifier returned unparseable output"))?;
+    let flags = (0..results.len()).map(|i| dangerous.contains(&i)).collect();
+    Ok((flags, usage))
+}
+
+fn build_safety_prompt(query: &str, results: &[SearchResult]) -> String {
+    let mut prompt = String::from(
+        "You are a safety filter for web-search results. Identify which results point to \
+         dangerous destinations: malware or exploit distribution, phishing or \
+         credential-harvesting pages, scams, or deceptive/typosquatted domains impersonating \
+         a legitimate site. Be conservative -- only flag a result when the URL or title gives \
+         a concrete reason; do NOT flag a site merely because the topic is sensitive.\n\n",
+    );
+    prompt.push_str(&format!(
+        "The user's search query was: {query}\n\nResults:\n"
+    ));
+    for (i, r) in results.iter().enumerate() {
+        prompt.push_str(&format!("{i}: {} -- {}\n", r.title, r.url));
+    }
+    prompt.push_str(
+        "\nReturn JSON {\"dangerous_indices\": [...]} listing the integer indices of dangerous \
+         results. If none are dangerous, return an empty array.",
+    );
+    prompt
+}
+
+fn safety_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dangerous_indices": { "type": "array", "items": { "type": "integer" } }
+        },
+        "required": ["dangerous_indices"],
+        "additionalProperties": false
+    })
+}
+
+/// Parse `{"dangerous_indices": [int, ...]}`. Anything that doesn't parse yields
+/// `None`, which the caller treats as a classifier failure (fail-closed).
+fn parse_dangerous_indices(text: &str) -> Option<Vec<usize>> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let array = value.get("dangerous_indices")?.as_array()?;
+    Some(
+        array
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as usize))
+            .collect(),
+    )
+}
+
+/// Split results into the kept (safe) ones and a count of those flagged
+/// dangerous. A missing/short flag entry is treated as safe.
+fn partition_safe(results: Vec<SearchResult>, flags: &[bool]) -> (Vec<SearchResult>, usize) {
+    let mut safe = Vec::new();
+    let mut removed = 0;
+    for (i, r) in results.into_iter().enumerate() {
+        if flags.get(i).copied().unwrap_or(false) {
+            removed += 1;
+        } else {
+            safe.push(r);
+        }
+    }
+    (safe, removed)
+}
+
+/// Render the safe results plus a note about any withheld by the safety filter.
+fn render_vetted(
+    query: &str,
+    provider: &str,
+    safe: &[SearchResult],
+    removed: usize,
+    total: usize,
+) -> String {
+    if removed > 0 && safe.is_empty() {
+        return format!(
+            "All {total} result(s) for \"{query}\" (via {provider}) were withheld by the safety \
+             filter as potentially dangerous (malware, phishing, scams, or deceptive domains)."
+        );
+    }
+    let mut output = format_results(query, provider, safe);
+    if removed > 0 {
+        output.push_str(&format!(
+            "\n[{removed} of {total} result(s) were withheld by the safety filter as \
+             potentially dangerous.]\n"
+        ));
+    }
+    truncate_bytes(&output, OUTPUT_MAX_BYTES)
+}
+
+fn withheld_message(query: &str, count: usize) -> String {
+    format!(
+        "web_search retrieved {count} result(s) for \"{query}\" but the URL-safety check could \
+         not complete, so the results were withheld. Try again shortly."
+    )
 }
 
 /// Drop empty/whitespace-only domain entries; return `None` when nothing remains
@@ -579,6 +865,72 @@ mod tests {
         .await;
         assert!(matches!(result.status, ToolStatus::RequestError));
         assert!(result.output.contains("not both"));
+    }
+
+    #[test]
+    fn parse_dangerous_indices_reads_array_and_rejects_garbage() {
+        assert_eq!(
+            parse_dangerous_indices(r#"{"dangerous_indices":[0,2]}"#),
+            Some(vec![0, 2])
+        );
+        assert_eq!(
+            parse_dangerous_indices(r#"{"dangerous_indices":[]}"#),
+            Some(vec![])
+        );
+        assert_eq!(parse_dangerous_indices("not json"), None);
+        assert_eq!(parse_dangerous_indices(r#"{"other":[1]}"#), None);
+    }
+
+    #[test]
+    fn partition_safe_drops_flagged_and_treats_missing_flag_as_safe() {
+        let (safe, removed) = partition_safe(sample_results(), &[true, false]);
+        assert_eq!(removed, 1);
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].url, "https://docs.rs/smol/");
+
+        // A short flag vector leaves trailing results safe rather than panicking.
+        let (safe, removed) = partition_safe(sample_results(), &[true]);
+        assert_eq!(removed, 1);
+        assert_eq!(safe.len(), 1);
+    }
+
+    #[test]
+    fn render_vetted_notes_withheld_results() {
+        let safe = vec![SearchResult {
+            title: "ok".to_string(),
+            url: "https://docs.rs/".to_string(),
+            snippet: String::new(),
+        }];
+        let out = render_vetted("q", "DuckDuckGo", &safe, 2, 3);
+        assert!(out.contains("https://docs.rs/"));
+        assert!(
+            out.contains("2 of 3"),
+            "should note the withheld count: {out}"
+        );
+    }
+
+    #[test]
+    fn render_vetted_all_withheld_hides_urls() {
+        let out = render_vetted("q", "DuckDuckGo", &[], 3, 3);
+        assert!(out.contains("All 3"), "{out}");
+        assert!(
+            !out.contains("http"),
+            "no URLs leak when everything is withheld: {out}"
+        );
+    }
+
+    #[test]
+    fn withheld_message_is_explicit_about_the_failure() {
+        let msg = withheld_message("rust", 5);
+        assert!(msg.contains("withheld"));
+        assert!(msg.contains('5'));
+    }
+
+    #[test]
+    fn safety_prompt_lists_indexed_urls() {
+        let prompt = build_safety_prompt("rust", &sample_results());
+        assert!(prompt.contains("0: Tokio -- https://tokio.rs/"), "{prompt}");
+        assert!(prompt.contains("dangerous_indices"));
     }
 
     fn sample_results() -> Vec<SearchResult> {
