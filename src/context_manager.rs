@@ -758,16 +758,16 @@ mod tests {
 
     #[test]
     fn build_turn_summarization_messages_strips_host_notices_from_text_only_turn() {
-        let recap = crate::host_notice::render_turn_recap(
-            &[],
-            &crate::tool_loop::LoopStop::Completed { had_text: true },
-        );
-        let t = turn("what happened?", &format!("The model answer.{recap}"));
+        let notice = crate::host_notice::render_loop_stop(&crate::tool_loop::LoopStop::MaxTurns {
+            max_turns: 3,
+        })
+        .expect("max-turns stop is narrated");
+        let t = turn("what happened?", &format!("The model answer.{notice}"));
         let msgs = build_turn_summarization_messages(&t);
         let body = msgs[1].text_content().unwrap();
         assert!(body.contains("Assistant: The model answer."));
-        assert!(!body.contains("Anvil Recap"));
-        assert!(!body.contains("Files changed"));
+        assert!(!body.contains("Stopped:"));
+        assert!(!body.contains("turn limit"));
     }
 
     #[test]

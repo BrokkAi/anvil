@@ -217,7 +217,7 @@ then ds4), with OpenRouter last. You can also select a specific model with
 Built-in commands:
 
 - `/setup`: model login, provider selection, behavior mode, sandbox mode,
-  turn recaps, timeout, and advanced settings.
+  timeout, and advanced settings.
 - `/permissions`: list or revoke remembered Always allow entries.
 - `/context`: show the current session context snapshot and token estimate.
 - `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or
