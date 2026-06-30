@@ -5,23 +5,84 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff, EmbeddedResource,
-    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, ResumeSessionRequest,
-    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelectOption, SessionDeleteCapabilities,
-    SessionForkCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    Usage as AcpUsage, UsageUpdate,
+    AgentCapabilities,
+    AvailableCommand,
+    AvailableCommandsUpdate,
+    CancelNotification,
+    CloseSessionRequest,
+    CloseSessionResponse,
+    ConfigOptionUpdate,
+    ContentBlock,
+    ContentChunk,
+    Cost,
+    // Elicitation (unstable_elicitation): drives interactive `/setup` menus and
+    // prompts when the client advertises the capability.
+    CreateElicitationRequest,
+    CurrentModeUpdate,
+    DeleteSessionRequest,
+    DeleteSessionResponse,
+    Diff,
+    ElicitationAction,
+    ElicitationContentValue,
+    ElicitationFormMode,
+    ElicitationSchema,
+    ElicitationSessionScope,
+    EmbeddedResource,
+    EmbeddedResourceResource,
+    EnumOption,
+    ForkSessionRequest,
+    ForkSessionResponse,
+    InitializeRequest,
+    InitializeResponse,
+    ListSessionsRequest,
+    ListSessionsResponse,
+    LoadSessionRequest,
+    LoadSessionResponse,
+    McpCapabilities,
+    NewSessionRequest,
+    NewSessionResponse,
+    PermissionOption,
+    PermissionOptionId,
+    PermissionOptionKind,
+    PromptCapabilities,
+    PromptRequest,
+    PromptResponse,
+    RequestPermissionOutcome,
+    RequestPermissionRequest,
+    ResourceLink,
+    ResumeSessionRequest,
+    ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities,
+    SessionCloseCapabilities,
+    SessionConfigOption,
+    SessionConfigOptionCategory,
+    SessionConfigOptionValue,
+    SessionConfigSelectOption,
+    SessionDeleteCapabilities,
+    SessionForkCapabilities,
+    SessionInfo,
+    SessionInfoUpdate,
+    SessionListCapabilities,
+    SessionMode as AcpSessionMode,
+    SessionModeState,
+    SessionNotification,
+    SessionResumeCapabilities,
+    SessionUpdate,
+    SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse,
+    SetSessionModeRequest,
+    SetSessionModeResponse,
+    StopReason,
+    StringPropertySchema,
+    TextContent,
+    ToolCallId,
+    ToolCallStatus,
+    ToolCallUpdate,
+    ToolCallUpdateFields,
+    ToolKind,
+    Usage as AcpUsage,
+    UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
@@ -1407,6 +1468,20 @@ pub async fn run_agent(
                         _cx: ConnectionTo<Client>| {
                 tracing::info!("ACP initialize");
 
+                // Record the client's elicitation capabilities so the `/setup`
+                // dispatch can drive interactive menus (form mode) and login
+                // prompts (url mode) instead of the Markdown text flow. A client
+                // that advertises neither keeps the text flow (defaults false).
+                let (elicit_form, elicit_url) = req
+                    .client_capabilities
+                    .elicitation
+                    .as_ref()
+                    .map(|e| (e.form.is_some(), e.url.is_some()))
+                    .unwrap_or((false, false));
+                sessions_init
+                    .set_client_elicitation_caps(elicit_form, elicit_url)
+                    .await;
+
                 // Try to discover models at startup and cache them for session/new.
                 let models = match llm_init.list_model_metadata_with_progress(None).await {
                     Ok(m) => m,
@@ -2121,6 +2196,47 @@ pub async fn run_agent(
                     is_streamed_setup_openrouter_refresh(&raw_prompt_text);
 
                 if is_slash_command(&raw_prompt_text, "setup") && !stream_setup_openrouter_refresh {
+                    // Interactive elicitation path: when the client advertises the
+                    // matching elicitation capability, drive eligible `/setup`
+                    // sub-flows as selectable menus instead of the Markdown reply.
+                    // `block_task()` (awaiting the client's elicitation response)
+                    // is only safe inside `cx.spawn`, so the flow runs in a
+                    // spawned task that owns the responder, mirroring the
+                    // model-turn dispatch below.
+                    if let Some(target) = setup_elicitation_target(&raw_prompt_text) {
+                        let caps = sessions_prompt.client_elicitation_caps().await;
+                        if target.is_supported(caps) {
+                            let cx_for_setup = cx.clone();
+                            let sessions_for_setup = sessions_prompt.clone();
+                            let session_id_for_setup = session_id.clone();
+                            let spawn_result = cx.spawn(async move {
+                                // SAFETY: we are inside `cx.spawn`, so `block_task`
+                                // (reached via the `SpawnedCx` witness) is safe.
+                                let spawned_cx =
+                                    crate::tool_loop::SpawnedCx::new(&cx_for_setup);
+                                run_setup_elicitation(
+                                    target,
+                                    &spawned_cx,
+                                    &sessions_for_setup,
+                                    &session_id_for_setup,
+                                )
+                                .await;
+                                if let Err(e) = responder.respond(prompt_end_turn_response()) {
+                                    tracing::warn!(
+                                        "failed to deliver /setup elicitation PromptResponse: {e}"
+                                    );
+                                }
+                                Ok(())
+                            });
+                            // Unlike the model-turn spawn, there is no
+                            // in-flight token to clear here, so a failed spawn
+                            // just propagates.
+                            spawn_result?;
+                            return Ok(());
+                        }
+                        // Capability not advertised: fall through to the text flow.
+                    }
+
                     let setup_ctx = SetupContext {
                         cx: &cx,
                         sessions: &sessions_prompt,
@@ -5749,6 +5865,165 @@ async fn handle_idle_timeout(
                 "Error: unknown session.".to_string()
             }
         }
+    }
+}
+
+/// A `/setup` sub-flow that can be driven through ACP elicitation (an
+/// interactive menu or prompt) instead of the Markdown text reply, when the
+/// client advertises the matching capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupElicitTarget {
+    /// `/setup sandbox` with no explicit value -> single-select form menu.
+    Sandbox,
+}
+
+impl SetupElicitTarget {
+    /// Whether the connected client advertised the capability this target needs.
+    fn is_supported(self, caps: crate::session::ClientElicitationCaps) -> bool {
+        match self {
+            // Sandbox is a form-mode (menu) elicitation.
+            Self::Sandbox => caps.form,
+        }
+    }
+}
+
+/// Decide whether a `/setup` invocation should be handled via elicitation.
+///
+/// Returns `None` for invocations that carry an explicit value (the user
+/// already chose, so there is nothing to prompt) or that have no elicitation
+/// equivalent yet -- those keep the existing Markdown text flow. Only the
+/// bare, value-less forms map to a menu.
+fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
+    if !is_slash_command(prompt_text, "setup") {
+        return None;
+    }
+    let args = slash_command_args(prompt_text);
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+    let rest = parts.next().unwrap_or("").trim();
+    match sub.as_str() {
+        "sandbox" if rest.is_empty() => Some(SetupElicitTarget::Sandbox),
+        _ => None,
+    }
+}
+
+/// Drive a `/setup` sub-flow via elicitation. Dispatches on the target; the
+/// caller guarantees this runs inside `cx.spawn` (the `SpawnedCx` witness) so
+/// `block_task` is safe.
+async fn run_setup_elicitation(
+    target: SetupElicitTarget,
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+) {
+    match target {
+        SetupElicitTarget::Sandbox => {
+            run_setup_sandbox_elicitation(spawned_cx, sessions, session_id).await;
+        }
+    }
+}
+
+/// `/setup sandbox` as a single-select menu. Sends an `elicitation/create`
+/// form request, then applies the chosen backend through the same
+/// `handle_setup_sandbox` writer the slash path uses. Decline/Cancel (and a
+/// transport error) leave the sandbox mode unchanged.
+async fn run_setup_sandbox_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+) {
+    let request = build_sandbox_elicitation_request(sessions, session_id).await;
+    let cx = spawned_cx.cx();
+    match cx.send_request(request).block_task().await {
+        Ok(resp) => {
+            let message =
+                apply_sandbox_elicitation_outcome(resp.action, sessions, session_id).await;
+            send_message(cx, session_id, &message);
+        }
+        Err(e) => {
+            tracing::warn!("/setup sandbox elicitation failed: {e}");
+            send_message(
+                cx,
+                session_id,
+                "Setup could not show the sandbox menu; sandbox is unchanged.",
+            );
+        }
+    }
+}
+
+/// Build the single-select sandbox-backend elicitation form, pre-selecting the
+/// session's current effective mode. `wasm` is offered only when compiled in,
+/// so the client never returns an option this build cannot honor.
+async fn build_sandbox_elicitation_request(
+    sessions: &SessionStore,
+    session_id: &str,
+) -> CreateElicitationRequest {
+    use crate::sandbox_backend::SandboxMode;
+
+    let current_value = match sessions.sandbox_mode(session_id).await {
+        Some(Some(SandboxMode::Os)) => "os",
+        Some(Some(SandboxMode::Wasm)) => "wasm",
+        Some(Some(SandboxMode::Off)) => "off",
+        // `Some(None)` (explicit default) or `None` (unknown session) both
+        // present as the default entry.
+        _ => "default",
+    };
+
+    let mut options = vec![
+        EnumOption::new("default", "Default (process default)"),
+        EnumOption::new("os", "OS sandbox + native parsing"),
+    ];
+    if crate::sandbox_backend::wasm_sandbox_compiled() {
+        options.push(EnumOption::new(
+            "wasm",
+            "WASM parsing, no OS sandbox for shell commands",
+        ));
+    }
+    options.push(EnumOption::new("off", "No sandbox at all"));
+
+    let field = StringPropertySchema::new()
+        .title("Sandbox backend")
+        .description("How shell commands and parsing are sandboxed. Applies to future sessions.")
+        .one_of(options)
+        .default_value(current_value);
+
+    let schema = ElicitationSchema::new()
+        .title("Sandbox")
+        .property("sandbox", field, true);
+
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "Choose a sandbox backend")
+}
+
+/// Map an elicitation response to a user-facing message, applying an accepted
+/// choice through `handle_setup_sandbox` (the same writer as the slash path).
+/// Decline/Cancel are no-ops on the stored config.
+async fn apply_sandbox_elicitation_outcome(
+    action: ElicitationAction,
+    sessions: &SessionStore,
+    session_id: &str,
+) -> String {
+    match action {
+        ElicitationAction::Accept(accept) => {
+            let choice = accept
+                .content
+                .as_ref()
+                .and_then(|content| content.get("sandbox"))
+                .and_then(|value| match value {
+                    ElicitationContentValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            match choice {
+                Some(choice) => handle_setup_sandbox(sessions, session_id, choice).await,
+                None => "Setup received an empty sandbox choice; sandbox is unchanged.".to_string(),
+            }
+        }
+        ElicitationAction::Decline | ElicitationAction::Cancel => {
+            "Sandbox setup cancelled; sandbox is unchanged.".to_string()
+        }
+        // `ElicitationAction` is `#[non_exhaustive]`.
+        _ => "Sandbox setup did not complete; sandbox is unchanged.".to_string(),
     }
 }
 
@@ -11534,6 +11809,168 @@ mod tests {
         assert!(bodies.iter().any(|b| b.contains("verbatim agent")));
         // No empty summary block leaked through.
         assert!(bodies.iter().all(|b| !b.contains("<conversation_summary>")));
+    }
+
+    // --- Interactive `/setup` elicitation (#207) ---
+
+    /// Only the bare, value-less `/setup sandbox` maps to a menu; an explicit
+    /// value, other sub-commands, and unrelated slash commands keep the text
+    /// flow (return `None`).
+    #[test]
+    fn setup_elicitation_target_only_for_value_less_sandbox() {
+        assert_eq!(
+            setup_elicitation_target("/setup sandbox"),
+            Some(SetupElicitTarget::Sandbox)
+        );
+        assert_eq!(
+            setup_elicitation_target("/setup sandbox   "),
+            Some(SetupElicitTarget::Sandbox)
+        );
+        // Explicit value: the user already chose -> nothing to prompt.
+        assert_eq!(setup_elicitation_target("/setup sandbox off"), None);
+        assert_eq!(setup_elicitation_target("/setup sandbox wasm"), None);
+        assert_eq!(setup_elicitation_target("/setup sandbox status"), None);
+        // No elicitation equivalent (yet) / not /setup at all.
+        assert_eq!(setup_elicitation_target("/setup"), None);
+        assert_eq!(setup_elicitation_target("/setup mode"), None);
+        assert_eq!(setup_elicitation_target("/permissions"), None);
+    }
+
+    /// The sandbox menu is a form-mode elicitation, so it needs the client's
+    /// `form` capability; `url` alone is not enough.
+    #[test]
+    fn sandbox_target_requires_form_capability() {
+        use crate::session::ClientElicitationCaps;
+        let t = SetupElicitTarget::Sandbox;
+        assert!(!t.is_supported(ClientElicitationCaps::default()));
+        assert!(!t.is_supported(ClientElicitationCaps {
+            form: false,
+            url: true,
+        }));
+        assert!(t.is_supported(ClientElicitationCaps {
+            form: true,
+            url: false,
+        }));
+    }
+
+    /// Capabilities default to all-false and round-trip through the store.
+    #[tokio::test]
+    async fn client_elicitation_caps_round_trip() {
+        use crate::session::ClientElicitationCaps;
+        let (store, _id) = make_store_with_session("m").await;
+        assert_eq!(
+            store.client_elicitation_caps().await,
+            ClientElicitationCaps::default()
+        );
+        store.set_client_elicitation_caps(true, false).await;
+        assert_eq!(
+            store.client_elicitation_caps().await,
+            ClientElicitationCaps {
+                form: true,
+                url: false,
+            }
+        );
+    }
+
+    /// The request is a session-scoped form whose `oneOf` lists the backends,
+    /// pre-selects the current mode, and offers `wasm` only when compiled in.
+    #[tokio::test]
+    async fn sandbox_elicitation_request_shape() {
+        let (store, id) = make_store_with_session("m").await;
+        let req = build_sandbox_elicitation_request(&store, &id).await;
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["message"], "Choose a sandbox backend");
+        assert_eq!(json["sessionId"].as_str(), Some(id.as_str()));
+
+        let sandbox = &json["requestedSchema"]["properties"]["sandbox"];
+        assert_eq!(sandbox["type"], "string");
+        // Default selection reflects the session's current effective mode
+        // (`Some(None)` -> "default").
+        assert_eq!(sandbox["default"], "default");
+        let values: Vec<&str> = sandbox["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["const"].as_str().unwrap())
+            .collect();
+        assert!(values.contains(&"default"));
+        assert!(values.contains(&"os"));
+        assert!(values.contains(&"off"));
+        assert_eq!(
+            values.contains(&"wasm"),
+            crate::sandbox_backend::wasm_sandbox_compiled(),
+            "wasm option must track compile support"
+        );
+    }
+
+    /// Accepting a choice applies it through the same writer as the slash
+    /// path: `off` and `os` set overrides, `default` clears back to the
+    /// process default.
+    #[tokio::test]
+    async fn sandbox_elicitation_accept_applies_choice() {
+        use crate::sandbox_backend::SandboxMode;
+        use agent_client_protocol::schema::v1::ElicitationAcceptAction;
+        use std::collections::BTreeMap;
+
+        let (store, id) = make_store_with_session("m").await;
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
+
+        let accept = |value: &str| {
+            ElicitationAction::Accept(ElicitationAcceptAction::new().content(BTreeMap::from([(
+                "sandbox".to_string(),
+                ElicitationContentValue::from(value),
+            )])))
+        };
+
+        let msg = apply_sandbox_elicitation_outcome(accept("off"), &store, &id).await;
+        assert!(
+            msg.contains("off") || msg.contains("No sandboxing"),
+            "got: {msg}"
+        );
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
+
+        apply_sandbox_elicitation_outcome(accept("os"), &store, &id).await;
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Os)));
+
+        apply_sandbox_elicitation_outcome(accept("default"), &store, &id).await;
+        assert_eq!(store.sandbox_mode(&id).await, Some(None));
+    }
+
+    /// Decline and Cancel leave the stored sandbox mode untouched.
+    #[tokio::test]
+    async fn sandbox_elicitation_decline_and_cancel_are_noops() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let (store, id) = make_store_with_session("m").await;
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
+
+        for action in [ElicitationAction::Decline, ElicitationAction::Cancel] {
+            let msg = apply_sandbox_elicitation_outcome(action, &store, &id).await;
+            assert!(msg.contains("unchanged"), "got: {msg}");
+            assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
+        }
+    }
+
+    /// An Accept with no/!string content is a no-op rather than a panic or a
+    /// spurious write.
+    #[tokio::test]
+    async fn sandbox_elicitation_empty_content_is_noop() {
+        use crate::sandbox_backend::SandboxMode;
+        use agent_client_protocol::schema::v1::ElicitationAcceptAction;
+
+        let (store, id) = make_store_with_session("m").await;
+        assert!(store.set_sandbox_mode(&id, Some(SandboxMode::Off)).await);
+
+        let msg = apply_sandbox_elicitation_outcome(
+            ElicitationAction::Accept(ElicitationAcceptAction::new()),
+            &store,
+            &id,
+        )
+        .await;
+        assert!(msg.contains("unchanged"), "got: {msg}");
+        assert_eq!(store.sandbox_mode(&id).await, Some(Some(SandboxMode::Off)));
     }
 
     /// `/setup sandbox` round-trip: bare reports current state, `off`

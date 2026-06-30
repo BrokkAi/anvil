@@ -2686,6 +2686,20 @@ fn normalize_additional_directories(paths: &[PathBuf]) -> Vec<PathBuf> {
 // Thread-safe session store
 // ---------------------------------------------------------------------------
 
+/// Client-advertised elicitation capabilities, read once from
+/// `InitializeRequest.client_capabilities.elicitation` and consulted by the
+/// `/setup` dispatch to decide whether to drive configuration through ACP
+/// elicitation (interactive menus / URL prompts) or fall back to the Markdown
+/// text flow. Defaults to all-false, so a client that advertises no
+/// elicitation keeps the existing text behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientElicitationCaps {
+    /// Client renders form-based elicitations (`elicitation/create` form mode).
+    pub form: bool,
+    /// Client opens URL-based elicitations (`elicitation/create` url mode).
+    pub url: bool,
+}
+
 #[derive(Clone)]
 pub struct SessionStore {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
@@ -2732,6 +2746,10 @@ pub struct SessionStore {
     /// and must not require holding a tokio lock across `.await` points.
     last_accessed: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     next_access: Arc<AtomicU64>,
+    /// Elicitation capabilities advertised by the connected client at
+    /// `initialize`. Process-global (a property of the client connection,
+    /// not of any one session), mirroring `available_models`.
+    client_elicitation_caps: Arc<RwLock<ClientElicitationCaps>>,
     limits: SessionLimits,
 }
 
@@ -2823,6 +2841,7 @@ impl SessionStore {
             closed_sessions: Arc::new(RwLock::new(HashSet::new())),
             last_accessed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_access: Arc::new(AtomicU64::new(0)),
+            client_elicitation_caps: Arc::new(RwLock::new(ClientElicitationCaps::default())),
             limits,
         }
     }
@@ -3126,6 +3145,20 @@ impl SessionStore {
 
     pub async fn set_available_models(&self, models: Vec<ModelMetadata>) {
         *self.available_models.write().await = models;
+    }
+
+    /// Record the client's advertised elicitation capabilities (read once from
+    /// `InitializeRequest.client_capabilities.elicitation`). Process-global,
+    /// like `set_available_models`: the capabilities describe the connected
+    /// client, not any one session.
+    pub async fn set_client_elicitation_caps(&self, form: bool, url: bool) {
+        *self.client_elicitation_caps.write().await = ClientElicitationCaps { form, url };
+    }
+
+    /// Current client elicitation capabilities. Defaults to all-false until
+    /// `initialize` populates them, so callers fall back to the text flow.
+    pub async fn client_elicitation_caps(&self) -> ClientElicitationCaps {
+        *self.client_elicitation_caps.read().await
     }
 
     /// Bare ids only, in display order. Existing callers (the picker

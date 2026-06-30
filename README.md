@@ -484,7 +484,7 @@ anvil [OPTIONS]
 | Flag | Env Var | Default | Description |
 | ---- | ------- | ------- | ----------- |
 | `--default-model` | - | - | Default model for new sessions. Accepts a wire id or bare provider id. |
-| `--max-turns` | - | `25` | Maximum tool-calling iterations per prompt. |
+| `--max-turns` | - | `0` (unbounded) | Optional cap on tool-calling iterations per prompt. Default unbounded: the loop exits when the model answers without a tool call. Pass `N>0` to bound cost/time; `0` disables. |
 | `--max-sessions` | - | `50` | Maximum resident sessions before LRU eviction. `0` disables the cap. |
 | `--max-history-turns` | - | `50` | Maximum in-memory history turns per session. `0` disables the cap. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | SSE inactivity timeout for LLM streaming. |

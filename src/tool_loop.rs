@@ -553,12 +553,6 @@ pub(crate) enum NotificationMode {
 /// from leaking into nested system prompts.
 pub(crate) const MAX_SUBAGENT_DEPTH: usize = 1;
 
-/// Per-subagent turn ceiling, applied as `parent_max_turns.min(...)` in
-/// `execute_subagent`. Bounds the cost of a single delegation so a
-/// parent run with `--max-turns 200` doesn't hand 200 turns to each
-/// `task` invocation.
-pub(crate) const MAX_SUBAGENT_TURNS: usize = 25;
-
 /// Outcome of consulting the permission gate before executing a tool.
 enum GateDecision {
     /// Run the tool without prompting.
@@ -607,7 +601,11 @@ impl<'a> SpawnedCx<'a> {
         Self { cx }
     }
 
-    fn cx(&self) -> &ConnectionTo<Client> {
+    /// Borrow the underlying connection. `pub(crate)` so the interactive
+    /// `/setup` elicitation flow in `agent.rs` can send agent->client requests
+    /// (`elicitation/create`) from inside its own `cx.spawn`, gated by the same
+    /// witness that guards `request_user_permission`.
+    pub(crate) fn cx(&self) -> &ConnectionTo<Client> {
         self.cx
     }
 }
@@ -4221,9 +4219,13 @@ async fn execute_subagent(
     (exec, nested_usage)
 }
 
+/// A subagent inherits the parent's turn budget (unbounded by default,
+/// matching Codex and the parent loop) unless its own definition opts into a
+/// tighter `max_turns:`. Runaway recursion is bounded by `MAX_SUBAGENT_DEPTH`,
+/// and a stuck subagent is caught by the LLM idle timeout -- neither needs a
+/// blanket turn ceiling.
 fn subagent_max_turns(parent_max_turns: usize, agent_max_turns: Option<usize>) -> usize {
-    let global_cap = parent_max_turns.min(MAX_SUBAGENT_TURNS);
-    agent_max_turns.map_or(global_cap, |cap| global_cap.min(cap))
+    agent_max_turns.map_or(parent_max_turns, |cap| parent_max_turns.min(cap))
 }
 
 /// The `task`-tool error message for a subagent that did not return a usable
@@ -4431,9 +4433,11 @@ mod tests {
     }
 
     #[test]
-    fn subagent_turn_budget_uses_global_cap_by_default() {
-        assert_eq!(subagent_max_turns(200, None), MAX_SUBAGENT_TURNS);
+    fn subagent_turn_budget_inherits_parent_by_default() {
+        assert_eq!(subagent_max_turns(200, None), 200);
         assert_eq!(subagent_max_turns(5, None), 5);
+        // An unbounded parent yields an unbounded subagent.
+        assert_eq!(subagent_max_turns(usize::MAX, None), usize::MAX);
     }
 
     #[test]
@@ -4522,7 +4526,8 @@ mod tests {
     fn subagent_turn_budget_honors_agent_cap() {
         assert_eq!(subagent_max_turns(200, Some(9)), 9);
         assert_eq!(subagent_max_turns(7, Some(9)), 7);
-        assert_eq!(subagent_max_turns(200, Some(50)), MAX_SUBAGENT_TURNS);
+        // The per-agent cap binds even when the parent is unbounded.
+        assert_eq!(subagent_max_turns(usize::MAX, Some(50)), 50);
     }
 
     #[test]
