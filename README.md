@@ -440,8 +440,8 @@ You are a meticulous code reviewer. Flag concrete bugs only.
 Return findings as `<path>:<line> - <one-line description>`.
 ```
 
-`max_turns` is optional. When present, it caps that subagent's tool-calling
-turns below the global subagent ceiling. `maxTurns` is accepted as an alias for
+`max_turns` is optional. When present, it lowers that subagent's tool-calling
+turns below the inherited parent budget. `maxTurns` is accepted as an alias for
 compatibility with camelCase frontmatter.
 
 `tools` is optional. When omitted, a subagent inherits the parent tool catalog.
@@ -463,7 +463,7 @@ Constraints:
 
 - Subagents inherit the parent session permission gate.
 - Nested delegation is disabled.
-- Each subagent call is capped at 25 tool-calling turns unless the subagent
+- Each subagent inherits the parent's turn budget unless the subagent
   frontmatter sets a lower `max_turns` value.
 - A subagent with `tools` frontmatter sees and can call only those tools.
 - Intermediate subagent updates are silent; only the final answer returns to
