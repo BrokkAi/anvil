@@ -3503,7 +3503,7 @@ fn permission_classifier_schema() -> &'static StructuredOutputRequest {
             "properties": {
                 "allow": {
                     "type": "boolean",
-                    "description": "True only when the tool call is clearly within the original user request."
+                    "description": "True when the tool call is reversible or low-impact; false only for genuinely high-risk actions (irreversible data loss, credential/secret changes, spending money, external publishing, or out-of-sandbox execution)."
                 },
                 "rationale": {
                     "type": "string",
