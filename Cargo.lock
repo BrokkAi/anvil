@@ -433,6 +433,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "oauth2",
+ "percent-encoding",
  "rand 0.10.1",
  "regex",
  "reqwest",
