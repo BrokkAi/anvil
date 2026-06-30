@@ -48,6 +48,7 @@ const MAX_CONTENT_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 /// collectively exceed this, even when each is below the per-entry
 /// cap.
 const MAX_CONTENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PERSISTED_PERMISSION_NOTICE_BYTES: usize = 1024;
 const DEFAULT_SESSION_NAME: &str = "New Session";
 
 // ---------------------------------------------------------------------------
@@ -289,12 +290,12 @@ pub struct UnsupportedMcpTransport {
 /// transport other than stdio. Returns the offending server on the first
 /// unsupported entry so the caller can surface a protocol error.
 pub(crate) fn acp_mcp_servers_to_configs(
-    servers: Vec<agent_client_protocol::schema::McpServer>,
+    servers: Vec<agent_client_protocol::schema::v1::McpServer>,
 ) -> Result<Vec<McpServerConfig>, UnsupportedMcpTransport> {
     let mut configs = Vec::with_capacity(servers.len());
     for server in servers {
         match server {
-            agent_client_protocol::schema::McpServer::Stdio(stdio) => {
+            agent_client_protocol::schema::v1::McpServer::Stdio(stdio) => {
                 configs.push(McpServerConfig {
                     name: stdio.name,
                     command: stdio.command.display().to_string(),
@@ -311,13 +312,13 @@ pub(crate) fn acp_mcp_servers_to_configs(
                     enabled: true,
                 });
             }
-            agent_client_protocol::schema::McpServer::Http(http) => {
+            agent_client_protocol::schema::v1::McpServer::Http(http) => {
                 return Err(UnsupportedMcpTransport {
                     server: http.name,
                     transport: "http",
                 });
             }
-            agent_client_protocol::schema::McpServer::Sse(sse) => {
+            agent_client_protocol::schema::v1::McpServer::Sse(sse) => {
                 return Err(UnsupportedMcpTransport {
                     server: sse.name,
                     transport: "sse",
@@ -493,6 +494,9 @@ pub struct ToolExchange {
     pub status: ToolExchangeStatus,
     /// ACP-neutral diff payload for successful write/edit cards.
     pub diff: Option<ToolExchangeDiff>,
+    /// Human-readable permission decision/rationale shown in the tool card.
+    /// This is replay UI metadata only; it is not fed back to the LLM.
+    pub permission_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1781,6 +1785,7 @@ fn read_replay_events_from_messages(
                         result: read_content_field(msg, "contentId", content_map),
                         status: read_tool_exchange_status(msg),
                         diff: read_tool_exchange_diff(msg, content_map),
+                        permission_notice: read_permission_notice(msg),
                     }));
                 }
                 i += 1;
@@ -1852,6 +1857,7 @@ fn read_tool_exchanges_from_messages(
             result,
             status: read_tool_exchange_status(msg),
             diff: read_tool_exchange_diff(msg, content_map),
+            permission_notice: read_permission_notice(msg),
         };
         if let Some(prev) = results.insert(call_id.to_string(), persisted) {
             // Two `tool_result` entries with the same `toolCallId` is not
@@ -1901,6 +1907,7 @@ fn read_tool_exchanges_from_messages(
             result: persisted.result,
             status: persisted.status,
             diff: persisted.diff,
+            permission_notice: persisted.permission_notice,
         });
     }
     exchanges
@@ -1914,6 +1921,27 @@ struct PersistedToolResult {
     result: String,
     status: ToolExchangeStatus,
     diff: Option<ToolExchangeDiff>,
+    permission_notice: Option<String>,
+}
+
+fn read_permission_notice(msg: &serde_json::Value) -> Option<String> {
+    let notice = msg.get("permissionNotice").and_then(|v| v.as_str())?;
+    let trimmed = notice.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(bound_persisted_permission_notice(trimmed))
+}
+
+fn bound_persisted_permission_notice(notice: &str) -> String {
+    if notice.len() <= MAX_PERSISTED_PERMISSION_NOTICE_BYTES {
+        return notice.to_string();
+    }
+    let mut end = MAX_PERSISTED_PERMISSION_NOTICE_BYTES;
+    while !notice.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", notice[..end].trim_end())
 }
 
 fn read_tool_exchange_diff(
@@ -2268,6 +2296,9 @@ fn append_turn_to_zip(
         if let Some(diff_json) = diff_json {
             result_json["diff"] = diff_json;
         }
+        if let Some(permission_notice) = &exchange.permission_notice {
+            result_json["permissionNotice"] = serde_json::Value::String(permission_notice.clone());
+        }
         messages_json.push(result_json);
         message_content.push((arguments_content_id, exchange.arguments.clone()));
         message_content.push((result_content_id, exchange.result.clone()));
@@ -2312,6 +2343,10 @@ fn append_turn_to_zip(
                     });
                     if let Some(diff_json) = diff_json {
                         result_json["diff"] = diff_json;
+                    }
+                    if let Some(permission_notice) = &exchange.permission_notice {
+                        result_json["permissionNotice"] =
+                            serde_json::Value::String(permission_notice.clone());
                     }
                     replay_messages_json.push(result_json);
                     message_content.push((result_content_id, exchange.result.clone()));
@@ -7612,10 +7647,10 @@ done
     #[test]
     fn acp_stdio_mcp_servers_convert_to_anvil_configs() {
         let configs =
-            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Stdio(
-                agent_client_protocol::schema::McpServerStdio::new("local", "/usr/bin/mcp")
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Stdio(
+                agent_client_protocol::schema::v1::McpServerStdio::new("local", "/usr/bin/mcp")
                     .args(vec!["--flag".to_string(), "value".to_string()])
-                    .env(vec![agent_client_protocol::schema::EnvVariable::new(
+                    .env(vec![agent_client_protocol::schema::v1::EnvVariable::new(
                         "TOKEN", "secret",
                     )]),
             )])
@@ -7642,10 +7677,14 @@ done
     /// while the requested tools are missing (#159).
     #[test]
     fn acp_http_mcp_server_is_rejected() {
-        let err = acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::McpServer::Http(
-            agent_client_protocol::schema::McpServerHttp::new("remote", "https://example.com/mcp"),
-        )])
-        .expect_err("http transport must be rejected");
+        let err =
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Http(
+                agent_client_protocol::schema::v1::McpServerHttp::new(
+                    "remote",
+                    "https://example.com/mcp",
+                ),
+            )])
+            .expect_err("http transport must be rejected");
         assert_eq!(err.server, "remote");
         assert_eq!(err.transport, "http");
     }
@@ -8110,6 +8149,9 @@ done
                 tool_name: "read_file".into(),
                 arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                 result: "fn main() {}\n".into(),
+                permission_notice: Some(
+                    "Auto permissions approved this tool call.\nReason: read-only tool.".into(),
+                ),
                 ..ToolExchange::default()
             },
             ToolExchange {
@@ -8162,6 +8204,10 @@ done
         assert_eq!(abc.arguments, r#"{"file_path":"src/lib.rs"}"#);
         assert_eq!(abc.result, "fn main() {}\n");
         assert_eq!(abc.status, ToolExchangeStatus::Completed);
+        assert_eq!(
+            abc.permission_notice.as_deref(),
+            Some("Auto permissions approved this tool call.\nReason: read-only tool.")
+        );
 
         let xyz = by_id.get("call_xyz").expect("search exchange present");
         assert_eq!(xyz.tool_name, "grep_search");
@@ -8202,6 +8248,9 @@ done
             tool_name: c1.tool_name.clone(),
             arguments: c1.arguments.clone(),
             result: "src/lib.rs:42: // TODO".into(),
+            permission_notice: Some(
+                "Auto permissions approved this tool call.\nReason: search tool.".into(),
+            ),
             ..ToolExchange::default()
         };
         let r2 = ToolExchange {

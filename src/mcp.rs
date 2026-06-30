@@ -1081,9 +1081,9 @@ mod tests {
             let kind = crate::tools::ToolRegistry::tool_kind(&tool.name);
             if matches!(
                 kind,
-                agent_client_protocol::schema::ToolKind::Read
-                    | agent_client_protocol::schema::ToolKind::Search
-                    | agent_client_protocol::schema::ToolKind::Fetch
+                agent_client_protocol::schema::v1::ToolKind::Read
+                    | agent_client_protocol::schema::v1::ToolKind::Search
+                    | agent_client_protocol::schema::v1::ToolKind::Fetch
             ) {
                 assert_eq!(
                     tool.annotations.read_only_hint,

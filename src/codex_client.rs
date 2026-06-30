@@ -764,7 +764,10 @@ pub(crate) fn build_responses_request(
                     for call in calls {
                         input.push(ResponsesInputItem::FunctionCall {
                             name: call.function.name.clone(),
-                            arguments: call.function.arguments.clone(),
+                            arguments: crate::tool_arguments::normalize_request_tool_arguments(
+                                &call.function.arguments,
+                                &call.function.name,
+                            ),
                             call_id: call.id.clone(),
                         });
                     }
@@ -1117,6 +1120,13 @@ where
                                         let resolved_id = call_id
                                             .or(id)
                                             .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+                                        let arguments =
+                                            crate::tool_arguments::normalize_streamed_tool_arguments(
+                                                &resolved_id,
+                                                &name,
+                                                arguments,
+                                                "Codex Responses SSE",
+                                            )?;
                                         tool_calls.push(ToolCall {
                                             id: resolved_id,
                                             r#type: "function".to_string(),

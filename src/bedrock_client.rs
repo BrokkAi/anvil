@@ -1361,7 +1361,16 @@ fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockT
 }
 
 fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
-    serde_json::from_str(raw).with_context(|| format!("parse tool arguments as JSON: {raw}"))
+    match crate::tool_arguments::normalize_tool_arguments(raw) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::warn!("repaired malformed Bedrock tool-call arguments");
+            }
+            Ok(normalized.value)
+        }
+        Err(err) => Err(anyhow::Error::new(err))
+            .with_context(|| format!("parse tool arguments as JSON: {raw}")),
+    }
 }
 
 async fn discover_model_metadata_with_http(

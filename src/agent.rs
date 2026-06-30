@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, ContentBlock, ContentChunk,
     Cost, CurrentModeUpdate, DeleteSessionRequest, DeleteSessionResponse, Diff, EmbeddedResource,
@@ -11,12 +12,12 @@ use agent_client_protocol::schema::{
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, ResourceLink,
-    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionDeleteCapabilities, SessionForkCapabilities, SessionInfo, SessionInfoUpdate,
-    SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
+    RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionDeleteCapabilities,
+    SessionForkCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -3462,12 +3463,14 @@ fn replay_tool_exchange(
             &raw_input,
             &exchange.result,
             exchange.diff.as_ref().map(acp_diff_from_exchange_diff),
+            exchange.permission_notice.as_deref(),
         ),
         ToolExchangeStatus::Failed => crate::tool_loop::announce::update_failed_with_input(
             &exchange.call_id,
             &exchange.tool_name,
             &raw_input,
             &exchange.result,
+            exchange.permission_notice.as_deref(),
             Some(serde_json::Value::String(exchange.result.clone())),
         ),
     };
@@ -8310,13 +8313,13 @@ mod tests {
     fn plan_approval_outcome_maps_rejection_and_cancellation() {
         assert_eq!(
             plan_approval_for_outcome(RequestPermissionOutcome::Selected(
-                agent_client_protocol::schema::SelectedPermissionOutcome::new("accept_plan")
+                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new("accept_plan")
             )),
             PlanApproval::Accepted
         );
         assert_eq!(
             plan_approval_for_outcome(RequestPermissionOutcome::Selected(
-                agent_client_protocol::schema::SelectedPermissionOutcome::new("reject_plan")
+                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new("reject_plan")
             )),
             PlanApproval::Rejected
         );
@@ -9175,7 +9178,7 @@ mod tests {
     /// when speaking to multiple agents through a single session.
     #[test]
     fn extract_prompt_text_filters_non_text_blocks() {
-        use agent_client_protocol::schema::ImageContent;
+        use agent_client_protocol::schema::v1::ImageContent;
         let blocks = vec![
             ContentBlock::Text(TextContent::new("before")),
             ContentBlock::Image(ImageContent::new("base64data", "image/png")),
@@ -9188,7 +9191,7 @@ mod tests {
     /// them as textual references so a link is never silently dropped (#150).
     #[test]
     fn extract_prompt_parts_renders_resource_link_as_text() {
-        use agent_client_protocol::schema::ResourceLink;
+        use agent_client_protocol::schema::v1::ResourceLink;
         let link = ResourceLink::new("notes.md", "file:///repo/notes.md")
             .description("design notes")
             .mime_type("text/markdown");
@@ -9209,7 +9212,7 @@ mod tests {
     /// `extract_prompt_parts` yields a non-empty part list (#150).
     #[test]
     fn extract_prompt_parts_resource_link_only_is_not_empty() {
-        use agent_client_protocol::schema::ResourceLink;
+        use agent_client_protocol::schema::v1::ResourceLink;
         let link = ResourceLink::new("a.rs", "file:///repo/a.rs");
         let parts = extract_prompt_parts(&[ContentBlock::ResourceLink(link)]);
         assert!(
@@ -9222,7 +9225,7 @@ mod tests {
     /// reach prompt construction rather than being dropped (#151).
     #[test]
     fn extract_prompt_parts_inlines_embedded_text_resource() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             EmbeddedResource, EmbeddedResourceResource, TextResourceContents,
         };
         let resource = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
@@ -9244,7 +9247,7 @@ mod tests {
     /// models (#151).
     #[test]
     fn extract_prompt_parts_forwards_embedded_image_blob() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             BlobResourceContents, EmbeddedResource, EmbeddedResourceResource,
         };
         let resource = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
@@ -9262,7 +9265,7 @@ mod tests {
     /// than silently dropped (#151).
     #[test]
     fn extract_prompt_parts_placeholders_embedded_binary_blob() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             BlobResourceContents, EmbeddedResource, EmbeddedResourceResource,
         };
         let resource = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(

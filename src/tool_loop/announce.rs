@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     Content, ContentBlock, Diff, TextContent, ToolCall, ToolCallContent, ToolCallId,
     ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
@@ -61,6 +61,14 @@ fn title_too_long_reason() -> String {
 fn input_content_too_long_reason() -> String {
     format!(
         "Tool use denied: the rendered tool-call content would exceed {MAX_INLINE_OUTPUT_BYTES} \
+         bytes, which would hide part of the command from the approval dialog. Retry with a \
+         shorter command or split it into smaller steps."
+    )
+}
+
+fn permission_content_too_long_reason() -> String {
+    format!(
+        "Tool use denied: the rendered permission prompt would exceed {MAX_INLINE_OUTPUT_BYTES} \
          bytes, which would hide part of the command from the approval dialog. Retry with a \
          shorter command or split it into smaller steps."
     )
@@ -168,6 +176,32 @@ pub(super) fn rejection_for_oversized_input_content(
     }
 }
 
+pub(super) fn rejection_for_oversized_permission_content(
+    tool_name: &str,
+    raw_input: &Value,
+    permission_notice: Option<&str>,
+) -> Option<String> {
+    let notice = permission_notice
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty())?;
+    let command_len = if tool_name == "run_shell_command" {
+        raw_input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(command_input_text)
+            .map(|text| text.len())
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    let separator_len = usize::from(command_len > 0) * 2;
+    if command_len + separator_len + notice.len() > MAX_INLINE_OUTPUT_BYTES {
+        Some(permission_content_too_long_reason())
+    } else {
+        None
+    }
+}
+
 /// Pending card for a call we're about to refuse because its full title
 /// would be too long. Uses only the static display name as the title --
 /// no user-controlled input -- so the rejection card itself can't trigger
@@ -226,9 +260,21 @@ pub(super) fn update_failed(
     reason: &str,
     raw_output: Option<Value>,
 ) -> ToolCallUpdate {
+    update_failed_with_notice(tool_call_id, reason, None, raw_output)
+}
+
+pub(super) fn update_failed_with_notice(
+    tool_call_id: &str,
+    reason: &str,
+    permission_notice: Option<&str>,
+    raw_output: Option<Value>,
+) -> ToolCallUpdate {
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::Failed)
-        .content(vec![text_content(reason)]);
+        .content(vec![text_content(&text_with_permission_notice(
+            reason,
+            permission_notice,
+        ))]);
     if let Some(raw) = raw_output {
         fields = fields.raw_output(raw);
     }
@@ -240,12 +286,16 @@ pub(crate) fn update_failed_with_input(
     tool_name: &str,
     raw_input: &Value,
     reason: &str,
+    permission_notice: Option<&str>,
     raw_output: Option<Value>,
 ) -> ToolCallUpdate {
     let mut fields = ToolCallUpdateFields::new()
         .status(ToolCallStatus::Failed)
-        .content(vec![text_content(&output_text_for_tool(
-            tool_name, raw_input, reason,
+        .content(vec![text_content(&output_text_with_permission_notice(
+            tool_name,
+            raw_input,
+            reason,
+            permission_notice,
         ))]);
     if let Some(raw) = raw_output {
         fields = fields.raw_output(raw);
@@ -261,11 +311,20 @@ pub(crate) fn update_completed(
     raw_input: &Value,
     output: &str,
     diff: Option<Diff>,
+    permission_notice: Option<&str>,
 ) -> ToolCallUpdate {
     let content = match diff {
-        Some(diff) => vec![ToolCallContent::Diff(diff)],
-        None => vec![text_content(&output_text_for_tool(
-            tool_name, raw_input, output,
+        Some(diff) => {
+            let mut content = Vec::new();
+            push_permission_notice_content(&mut content, permission_notice);
+            content.push(ToolCallContent::Diff(diff));
+            content
+        }
+        None => vec![text_content(&output_text_with_permission_notice(
+            tool_name,
+            raw_input,
+            output,
+            permission_notice,
         ))],
     };
     let fields = ToolCallUpdateFields::new()
@@ -282,6 +341,30 @@ pub(super) fn tool_input_content(tool_name: &str, raw_input: &Value) -> Vec<Tool
     match multiline_shell_command(tool_name, raw_input) {
         Some(command) => vec![text_content(&truncate(&command_input_text(command)))],
         None => Vec::new(),
+    }
+}
+
+/// Content attached to a permission modal. The optional notice explains why the
+/// permission gate auto-approved, declined, or fell back to a manual prompt.
+pub(super) fn permission_request_content(
+    tool_name: &str,
+    raw_input: &Value,
+    permission_notice: Option<&str>,
+) -> Vec<ToolCallContent> {
+    let mut content = tool_input_content(tool_name, raw_input);
+    push_permission_notice_content(&mut content, permission_notice);
+    content
+}
+
+fn push_permission_notice_content(
+    content: &mut Vec<ToolCallContent>,
+    permission_notice: Option<&str>,
+) {
+    if let Some(notice) = permission_notice
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty())
+    {
+        content.push(text_content(&truncate(notice)));
     }
 }
 
@@ -407,6 +490,23 @@ fn output_text_for_tool(tool_name: &str, raw_input: &Value, output: &str) -> Str
         ))
     } else {
         truncate(output)
+    }
+}
+
+fn output_text_with_permission_notice(
+    tool_name: &str,
+    raw_input: &Value,
+    output: &str,
+    permission_notice: Option<&str>,
+) -> String {
+    let output = output_text_for_tool(tool_name, raw_input, output);
+    text_with_permission_notice(&output, permission_notice)
+}
+
+fn text_with_permission_notice(text: &str, permission_notice: Option<&str>) -> String {
+    match permission_notice {
+        Some(notice) => truncate(&format!("{}\n\n{}", notice.trim_end(), text)),
+        None => truncate(text),
     }
 }
 
@@ -545,6 +645,7 @@ mod tests {
             &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
             "Command completed with exit code 0",
             None,
+            None,
         );
 
         let content = update.fields.content.expect("content");
@@ -562,6 +663,7 @@ mod tests {
             "run_shell_command",
             &json!({"command": "python3 - <<'PY'\nraise SystemExit(2)\nPY"}),
             "Exit code: 2",
+            None,
             Some(Value::String("Exit code: 2".to_string())),
         );
 
@@ -570,6 +672,60 @@ mod tests {
         assert_eq!(
             tool_text(&content[0]),
             "Command:\npython3 - <<'PY'\nraise SystemExit(2)\nPY\n\nOutput:\nExit code: 2"
+        );
+    }
+
+    #[test]
+    fn permission_request_content_includes_auto_permission_notice() {
+        let content = permission_request_content(
+            "run_shell_command",
+            &json!({"command": "python3 - <<'PY'\nprint('hello')\nPY"}),
+            Some("Auto permissions did not approve this tool call.\nReason: too broad."),
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            tool_text(&content[0]),
+            "Command:\npython3 - <<'PY'\nprint('hello')\nPY"
+        );
+        assert_eq!(
+            tool_text(&content[1]),
+            "Auto permissions did not approve this tool call.\nReason: too broad."
+        );
+    }
+
+    #[test]
+    fn permission_content_guard_counts_notice_and_command_together() {
+        let command = "a".repeat(MAX_INLINE_OUTPUT_BYTES - "Command:\n".len());
+        let reason = rejection_for_oversized_permission_content(
+            "run_shell_command",
+            &json!({"command": command}),
+            Some("Auto permissions did not approve this tool call.\nReason: too broad."),
+        );
+
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn completed_output_keeps_auto_permission_notice_visible() {
+        let update = update_completed(
+            "tc1",
+            "run_shell_command",
+            &json!({"command": "cargo test"}),
+            "ok",
+            None,
+            Some("Auto permissions approved this tool call.\nReason: focused test command."),
+        );
+
+        let content = update.fields.content.expect("content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            tool_text(&content[0]),
+            "Auto permissions approved this tool call.\nReason: focused test command.\n\nok"
+        );
+        assert_eq!(
+            update.fields.raw_output,
+            Some(Value::String("ok".to_string()))
         );
     }
 
