@@ -269,7 +269,12 @@ fn quote_unquoted_object_keys(input: &str) -> String {
 
 fn copy_string_literal(chars: &[char], start: usize, out: &mut String) -> usize {
     let quote = chars[start];
-    let mut i = start;
+    // Emit the opening quote, then scan the body. Starting the loop at the
+    // opening quote would let it match itself as the closing quote and bail
+    // after a single character, leaving the string body exposed to the
+    // structural scanners (which would then mangle commas/keys inside values).
+    out.push(quote);
+    let mut i = start + 1;
     let mut escaped = false;
     while i < chars.len() {
         let ch = chars[i];
@@ -324,7 +329,14 @@ fn remove_trailing_commas(input: &str) -> String {
 
 fn complete_structural_tail(input: &str) -> Option<String> {
     let tail = analyze_json_tail(input);
-    if tail.in_string || tail.closers.is_empty() {
+    // Refuse to close a buffer that ends in a dangling bare number. Any prefix
+    // of a number is itself a valid number, so appending closers would fabricate
+    // a wrong value (e.g. a truncated `30000` becomes `30`) and dispatch it
+    // instead of letting the truncation be classified Incomplete and retried.
+    // Terminated values (strings, `true`/`false`/`null`, closed containers) are
+    // safe to complete and a truncated keyword fails to parse on its own, so
+    // only bare numbers need this guard.
+    if tail.in_string || tail.ends_in_number || tail.closers.is_empty() {
         return None;
     }
 
@@ -339,6 +351,9 @@ fn complete_structural_tail(input: &str) -> Option<String> {
 struct JsonTail {
     closers: Vec<char>,
     in_string: bool,
+    /// True when the buffer ends inside an unterminated bare number (the last
+    /// significant character is a digit or `.` with no delimiter after it).
+    ends_in_number: bool,
 }
 
 fn analyze_json_tail(input: &str) -> JsonTail {
@@ -358,13 +373,26 @@ fn analyze_json_tail(input: &str) -> JsonTail {
         }
 
         match ch {
-            '"' => tail.in_string = true,
-            '{' => tail.closers.push('}'),
-            '[' => tail.closers.push(']'),
+            '"' => {
+                tail.in_string = true;
+                tail.ends_in_number = false;
+            }
+            '{' => {
+                tail.closers.push('}');
+                tail.ends_in_number = false;
+            }
+            '[' => {
+                tail.closers.push(']');
+                tail.ends_in_number = false;
+            }
             '}' | ']' if tail.closers.last() == Some(&ch) => {
                 tail.closers.pop();
+                tail.ends_in_number = false;
             }
-            _ => {}
+            // A digit or decimal point keeps (or starts) a trailing number run;
+            // any delimiter, whitespace, sign or exponent marker terminates it.
+            '0'..='9' | '.' => tail.ends_in_number = true,
+            _ => tail.ends_in_number = false,
         }
     }
 
@@ -413,6 +441,53 @@ mod tests {
     #[test]
     fn reports_unterminated_string_as_incomplete() {
         let err = normalize_tool_arguments(r#"{"file_path":"README"#).unwrap_err();
+
+        assert_eq!(err.kind(), ToolArgumentErrorKind::Incomplete);
+    }
+
+    #[test]
+    fn preserves_comma_inside_string_value_during_repair() {
+        // The unquoted key forces the repair path; the comma lives INSIDE the
+        // value and must not be deleted as if it were a trailing comma.
+        let parsed = normalize_tool_arguments(r#"{cmd:"a,}"}"#).unwrap();
+
+        assert!(parsed.repaired);
+        assert_eq!(parsed.value["cmd"], "a,}");
+    }
+
+    #[test]
+    fn does_not_inject_quotes_into_string_values_during_repair() {
+        // Structural-looking characters (commas, colons) inside a quoted value
+        // must survive key-quoting untouched.
+        let parsed = normalize_tool_arguments(r#"{msg:"a, b: c"}"#).unwrap();
+
+        assert!(parsed.repaired);
+        assert_eq!(parsed.value["msg"], "a, b: c");
+    }
+
+    #[test]
+    fn repairs_object_with_numeric_value() {
+        // A number that is followed by structure is fully known and must still
+        // repair (the truncation guard only fires on a dangling trailing number).
+        let parsed = normalize_tool_arguments("{count:5,enabled:true}").unwrap();
+
+        assert!(parsed.repaired);
+        assert_eq!(parsed.value["count"], 5);
+        assert_eq!(parsed.value["enabled"], true);
+    }
+
+    #[test]
+    fn reports_truncated_number_as_incomplete() {
+        // A stream cut mid-number must be retried, not silently completed into a
+        // smaller valid value (30 here could be a truncated 30000).
+        let err = normalize_tool_arguments(r#"{"timeout_ms":30"#).unwrap_err();
+
+        assert_eq!(err.kind(), ToolArgumentErrorKind::Incomplete);
+    }
+
+    #[test]
+    fn reports_truncated_number_in_array_as_incomplete() {
+        let err = normalize_tool_arguments(r#"{"lines":[1,2,3"#).unwrap_err();
 
         assert_eq!(err.kind(), ToolArgumentErrorKind::Incomplete);
     }
