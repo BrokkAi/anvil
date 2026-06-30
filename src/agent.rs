@@ -3394,12 +3394,14 @@ fn replay_tool_exchange(
             &raw_input,
             &exchange.result,
             exchange.diff.as_ref().map(acp_diff_from_exchange_diff),
+            exchange.permission_notice.as_deref(),
         ),
         ToolExchangeStatus::Failed => crate::tool_loop::announce::update_failed_with_input(
             &exchange.call_id,
             &exchange.tool_name,
             &raw_input,
             &exchange.result,
+            exchange.permission_notice.as_deref(),
             Some(serde_json::Value::String(exchange.result.clone())),
         ),
     };
