@@ -301,21 +301,36 @@ async fn post_token_form(
         .context("parsing token endpoint response")
 }
 
-/// Run the full ChatGPT login flow: PKCE in the browser, capture the
-/// callback locally, exchange the `id_token` for an API key, and persist.
+/// Run the full ChatGPT login flow using the default presenter (open the
+/// system browser): PKCE in the browser, capture the callback locally,
+/// exchange the `id_token` for an API key, and persist.
 pub async fn interactive_login() -> Result<AuthDotJson> {
+    interactive_login_with(|auth_url| async move {
+        if let Err(err) = webbrowser::open(&auth_url) {
+            eprintln!("Could not open a browser automatically ({err}). Visit:\n  {auth_url}");
+        } else {
+            eprintln!("Opened browser for ChatGPT sign-in. Waiting for callback...");
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Like [`interactive_login`], but the caller decides how to present the
+/// authorize URL to the user (open a browser, hand it to a client UI via ACP
+/// URL-mode elicitation, ...). `present` is awaited before the loopback
+/// listener begins; returning `Err` aborts the login (e.g. the user declined)
+/// and leaves stored credentials untouched.
+pub async fn interactive_login_with<F, Fut>(present: F) -> Result<AuthDotJson>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let csrf = CsrfToken::new_random();
     let auth_url = build_authorize_url(&challenge, csrf.secret());
 
-    if let Err(err) = webbrowser::open(&auth_url) {
-        eprintln!(
-            "Could not open a browser automatically ({err}). Visit:\n  {}",
-            auth_url
-        );
-    } else {
-        eprintln!("Opened browser for ChatGPT sign-in. Waiting for callback...");
-    }
+    present(auth_url).await?;
 
     let expected_state = csrf.secret().clone();
     let code = tokio::task::spawn_blocking(move || {
