@@ -1100,6 +1100,48 @@ impl ToolCallAccumulator {
     }
 }
 
+fn normalize_stream_tool_calls(
+    calls: Vec<ToolCall>,
+    protocol: &'static str,
+) -> Result<Vec<ToolCall>> {
+    let mut normalized_calls = Vec::with_capacity(calls.len());
+    for mut call in calls {
+        match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+            Ok(normalized) => {
+                if normalized.repaired {
+                    tracing::debug!(
+                        tool_call_id = %call.id,
+                        tool_name = %call.function.name,
+                        "repaired malformed streamed tool-call arguments"
+                    );
+                    call.function.arguments = normalized.arguments;
+                }
+                normalized_calls.push(call);
+            }
+            Err(err) if err.kind() == crate::tool_arguments::ToolArgumentErrorKind::Incomplete => {
+                let error = anyhow::Error::new(IncompleteStreamError::new(
+                    protocol,
+                    "complete tool-call arguments",
+                ));
+                return Err(error.context(format!(
+                    "incomplete tool-call arguments for {}",
+                    call.function.name
+                )));
+            }
+            Err(err) => {
+                tracing::debug!(
+                    tool_call_id = %call.id,
+                    tool_name = %call.function.name,
+                    error = %err,
+                    "leaving unrepaired malformed streamed tool-call arguments"
+                );
+                normalized_calls.push(call);
+            }
+        }
+    }
+    Ok(normalized_calls)
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI-compatible client
 // ---------------------------------------------------------------------------
@@ -1618,7 +1660,10 @@ where
                         return Ok(LlmResponse::ToolCalls {
                             text: full_text,
                             reasoning_content,
-                            calls: tool_acc.into_tool_calls(),
+                            calls: normalize_stream_tool_calls(
+                                tool_acc.into_tool_calls(),
+                                "chat completions SSE",
+                            )?,
                             usage,
                         });
                     }
@@ -2130,6 +2175,61 @@ mod tests {
             }
             other => panic!("expected tool calls, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_repairs_malformed_tool_call_arguments_on_done() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{file_path:'a.txt',}\"}}]}}]}\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, _) = collect_tokens();
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            Duration::from_secs(90),
+        )
+        .await;
+
+        match result.expect("repairable tool-call arguments should complete") {
+            LlmResponse::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function.arguments, r#"{"file_path":"a.txt"}"#);
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_treats_unterminated_tool_arguments_as_incomplete() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"unterminated\"}}]}}]}\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, _) = collect_tokens();
+        let err = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            Duration::from_secs(90),
+        )
+        .await
+        .expect_err("unterminated streamed arguments should be retryable truncation");
+
+        assert!(is_incomplete_stream_error(&err));
     }
 
     /// Unparseable SSE chunks are skipped (logged at debug). They must

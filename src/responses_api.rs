@@ -87,6 +87,30 @@ pub(crate) struct ResponsesToolDef {
     pub(crate) parameters: serde_json::Value,
 }
 
+fn normalize_responses_tool_arguments_for_request(raw: &str, tool_name: &str) -> String {
+    match crate::tool_arguments::normalize_tool_arguments(raw) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::debug!(
+                    tool_name,
+                    "repaired malformed assistant tool-call arguments for Responses request"
+                );
+                normalized.arguments
+            } else {
+                raw.to_string()
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                tool_name,
+                error = %err,
+                "leaving unrepaired assistant tool-call arguments in Responses request"
+            );
+            raw.to_string()
+        }
+    }
+}
+
 pub(crate) fn build_responses_request(
     model: &str,
     messages: &[ChatMessage],
@@ -127,7 +151,10 @@ pub(crate) fn build_responses_request(
                     for call in calls {
                         input.push(ResponsesInputItem::FunctionCall {
                             name: call.function.name.clone(),
-                            arguments: call.function.arguments.clone(),
+                            arguments: normalize_responses_tool_arguments_for_request(
+                                &call.function.arguments,
+                                &call.function.name,
+                            ),
                             call_id: call.id.clone(),
                         });
                     }
@@ -295,6 +322,44 @@ enum OutputItemContent {
     Other,
 }
 
+fn normalize_stream_tool_arguments(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: String,
+    protocol: &'static str,
+) -> Result<String> {
+    match crate::tool_arguments::normalize_tool_arguments(&arguments) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::debug!(
+                    tool_call_id,
+                    tool_name,
+                    "repaired malformed streamed Responses tool-call arguments"
+                );
+                Ok(normalized.arguments)
+            } else {
+                Ok(arguments)
+            }
+        }
+        Err(err) if err.kind() == crate::tool_arguments::ToolArgumentErrorKind::Incomplete => {
+            let error = anyhow::Error::new(IncompleteStreamError::new(
+                protocol,
+                "complete tool-call arguments",
+            ));
+            Err(error.context(format!("incomplete tool-call arguments for {tool_name}")))
+        }
+        Err(err) => {
+            tracing::debug!(
+                tool_call_id,
+                tool_name,
+                error = %err,
+                "leaving unrepaired malformed streamed Responses tool-call arguments"
+            );
+            Ok(arguments)
+        }
+    }
+}
+
 pub(crate) async fn drive_responses_sse_stream<S>(
     mut stream: S,
     mut on_token: TokenSink,
@@ -389,6 +454,12 @@ where
                                         let resolved_id = call_id
                                             .or(id)
                                             .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+                                        let arguments = normalize_stream_tool_arguments(
+                                            &resolved_id,
+                                            &name,
+                                            arguments,
+                                            "Responses SSE",
+                                        )?;
                                         tool_calls.push(ToolCall {
                                             id: resolved_id,
                                             r#type: "function".to_string(),
@@ -613,6 +684,56 @@ mod tests {
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(collected.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_repairs_malformed_tool_call_arguments() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"read_file\",\"arguments\":\"{file_path:'a.txt',}\",\"call_id\":\"fc_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, _) = collect_tokens();
+
+        let resp = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("repairable tool-call arguments should complete");
+
+        match resp {
+            LlmResponse::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function.arguments, r#"{"file_path":"a.txt"}"#);
+            }
+            other => panic!("expected ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_responses_stream_treats_unterminated_tool_arguments_as_incomplete() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"read_file\",\"arguments\":\"{\\\"file_path\\\":\\\"unterminated\",\"call_id\":\"fc_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let stream = stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let (on_token, _) = collect_tokens();
+
+        let err = drive_responses_sse_stream(
+            stream,
+            on_token,
+            noop_sink(),
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unterminated streamed arguments should be retryable truncation");
+
+        assert!(crate::llm_client::is_incomplete_stream_error(&err));
     }
 
     #[tokio::test]

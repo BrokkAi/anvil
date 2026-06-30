@@ -764,7 +764,10 @@ pub(crate) fn build_responses_request(
                     for call in calls {
                         input.push(ResponsesInputItem::FunctionCall {
                             name: call.function.name.clone(),
-                            arguments: call.function.arguments.clone(),
+                            arguments: normalize_responses_tool_arguments_for_request(
+                                &call.function.arguments,
+                                &call.function.name,
+                            ),
                             call_id: call.id.clone(),
                         });
                     }
@@ -980,6 +983,68 @@ enum OutputItemContent {
     Other,
 }
 
+fn normalize_responses_tool_arguments_for_request(raw: &str, tool_name: &str) -> String {
+    match crate::tool_arguments::normalize_tool_arguments(raw) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::debug!(
+                    tool_name,
+                    "repaired malformed assistant tool-call arguments for Responses request"
+                );
+                normalized.arguments
+            } else {
+                raw.to_string()
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                tool_name,
+                error = %err,
+                "leaving unrepaired assistant tool-call arguments in Responses request"
+            );
+            raw.to_string()
+        }
+    }
+}
+
+fn normalize_stream_tool_arguments(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: String,
+    protocol: &'static str,
+) -> Result<String> {
+    match crate::tool_arguments::normalize_tool_arguments(&arguments) {
+        Ok(normalized) => {
+            if normalized.repaired {
+                tracing::debug!(
+                    tool_call_id,
+                    tool_name,
+                    "repaired malformed streamed Responses tool-call arguments"
+                );
+                Ok(normalized.arguments)
+            } else {
+                Ok(arguments)
+            }
+        }
+        Err(err) if err.kind() == crate::tool_arguments::ToolArgumentErrorKind::Incomplete => {
+            let error = anyhow::Error::new(IncompleteStreamError::new(
+                protocol,
+                "complete tool-call arguments",
+            ));
+            Err(error.context(format!("incomplete tool-call arguments for {tool_name}")))
+        }
+        Err(err) => {
+            tracing::debug!(
+                tool_call_id,
+                tool_name,
+                error = %err,
+                "leaving unrepaired malformed streamed Responses tool-call arguments"
+            );
+            Ok(arguments)
+        }
+    }
+}
+
 /// Drive a Responses-API SSE byte stream until `response.completed`
 /// or the cancellation token fires. Emits text deltas
 /// to `on_token` as they arrive; collects function calls from
@@ -1117,6 +1182,12 @@ where
                                         let resolved_id = call_id
                                             .or(id)
                                             .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+                                        let arguments = normalize_stream_tool_arguments(
+                                            &resolved_id,
+                                            &name,
+                                            arguments,
+                                            "Codex Responses SSE",
+                                        )?;
                                         tool_calls.push(ToolCall {
                                             id: resolved_id,
                                             r#type: "function".to_string(),
