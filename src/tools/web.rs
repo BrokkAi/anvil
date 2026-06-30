@@ -117,22 +117,8 @@ pub(super) async fn run_web_search(
 
     let count = count.unwrap_or(DEFAULT_RESULTS).clamp(1, MAX_RESULTS);
 
-    let client = match reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => {
-            return ToolResult {
-                status: ToolStatus::InternalError,
-                output: format!("web_search could not build an HTTP client: {err}"),
-            };
-        }
-    };
-
     let provider = SearchProvider::selected();
-    let results = match provider.search(&client, query, cancel).await {
+    let results = match provider.search(&SEARCH_CLIENT, query, cancel).await {
         Ok(results) => results,
         Err(err) => {
             return ToolResult {
@@ -264,6 +250,21 @@ async fn duckduckgo_search(
     Ok(parse_duckduckgo_html(&body))
 }
 
+/// Shared HTTP client for web searches. Built once: each `reqwest::Client`
+/// owns a connection pool and TLS configuration, so rebuilding it per call
+/// would reload native certs and discard pooled connections. Cloning is cheap
+/// (an `Arc` internally), and `&SEARCH_CLIENT` derefs to `&reqwest::Client`.
+static SEARCH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        // Static, valid configuration: a failure here means the TLS backend
+        // itself is unavailable, which would equally break the LLM client, so
+        // failing fast is acceptable and consistent with the regex statics.
+        .expect("web_search HTTP client builds from a static configuration")
+});
+
 static RESULT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
     // Capture the opening-tag attributes (group 1) and inner HTML (group 2) of
     // each `result__a` link. Attribute order varies, so we match the class
@@ -281,29 +282,55 @@ static NUM_ENTITY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"&#(\d+);"#).
 static HEX_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"&#[xX]([0-9a-fA-F]+);"#).unwrap());
 
-/// Parse DuckDuckGo HTML into results. Titles and snippets are paired by
-/// document order. Entries without a recoverable destination URL (ads, internal
-/// `y.js` links) are skipped.
+/// Parse DuckDuckGo HTML into results. Each result anchor is paired with the
+/// first snippet block that falls between it and the next result anchor (by byte
+/// offset), so a result with no snippet -- or a skipped ad anchor -- cannot
+/// shift snippets onto the wrong results. Entries without a recoverable
+/// destination URL (ads, internal `y.js` links) are skipped.
 fn parse_duckduckgo_html(html: &str) -> Vec<SearchResult> {
-    let snippets: Vec<String> = SNIPPET_BLOCK
+    // (byte offset, cleaned snippet) for every snippet block, in document order.
+    let snippets: Vec<(usize, String)> = SNIPPET_BLOCK
         .captures_iter(html)
-        .map(|c| clean_text(&c[1], SNIPPET_MAX_CHARS))
+        .map(|c| {
+            let start = c.get(0).expect("match always has group 0").start();
+            (start, clean_text(&c[1], SNIPPET_MAX_CHARS))
+        })
+        .collect();
+
+    // (byte offset, attrs, inner HTML) for every result anchor, in document order.
+    let anchors: Vec<(usize, &str, &str)> = RESULT_ANCHOR
+        .captures_iter(html)
+        .map(|c| {
+            let whole = c.get(0).expect("match always has group 0");
+            (
+                whole.start(),
+                c.get(1).expect("result__a attrs group").as_str(),
+                c.get(2).expect("result__a inner group").as_str(),
+            )
+        })
         .collect();
 
     let mut results = Vec::new();
-    for (i, caps) in RESULT_ANCHOR.captures_iter(html).enumerate() {
-        let attrs = &caps[1];
+    for (idx, &(anchor_start, attrs, inner)) in anchors.iter().enumerate() {
         let Some(href) = HREF_ATTR.captures(attrs).map(|c| c[1].to_string()) else {
             continue;
         };
         let Some(url) = resolve_result_url(&href) else {
             continue;
         };
-        let title = clean_text(&caps[2], TITLE_MAX_CHARS);
+        let title = clean_text(inner, TITLE_MAX_CHARS);
         if title.is_empty() {
             continue;
         }
-        let snippet = snippets.get(i).cloned().unwrap_or_default();
+        // A result's snippet lives between its anchor and the next result
+        // anchor; bound the lookup so a snippetless result claims no snippet
+        // rather than the following result's.
+        let next_anchor_start = anchors.get(idx + 1).map_or(usize::MAX, |a| a.0);
+        let snippet = snippets
+            .iter()
+            .find(|(pos, _)| *pos > anchor_start && *pos < next_anchor_start)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
         results.push(SearchResult {
             title,
             url,
@@ -434,6 +461,32 @@ mod tests {
         assert_eq!(results[1].title, "smol — a small async runtime");
         assert_eq!(results[1].url, "https://docs.rs/smol/");
         assert_eq!(results[1].snippet, "A \"small and fast\" async runtime.");
+    }
+
+    #[test]
+    fn snippet_pairing_survives_snippetless_result() {
+        // Site 2 has no snippet between its anchor and Site 3's; the old
+        // index-based pairing would have handed Site 2 the "Snippet three"
+        // text and left Site 3 empty. Position-bounded pairing keeps each
+        // snippet with its own result.
+        let html = r#"
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fsite1.com%2F">Site 1</a>
+        <a class="result__snippet" href="x">Snippet one.</a>
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fsite2.com%2F">Site 2</a>
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fsite3.com%2F">Site 3</a>
+        <a class="result__snippet" href="x">Snippet three.</a>
+        "#;
+        let results = parse_duckduckgo_html(html);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].url, "https://site1.com/");
+        assert_eq!(results[0].snippet, "Snippet one.");
+        assert_eq!(results[1].url, "https://site2.com/");
+        assert_eq!(
+            results[1].snippet, "",
+            "a snippetless result must not borrow the next result's snippet"
+        );
+        assert_eq!(results[2].url, "https://site3.com/");
+        assert_eq!(results[2].snippet, "Snippet three.");
     }
 
     #[tokio::test]

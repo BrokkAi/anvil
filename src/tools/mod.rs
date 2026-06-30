@@ -304,13 +304,18 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Execute,
         display_name: "Running shell command",
     },
-    // Network read: classified `Fetch`, which the gate treats like Read/Search
-    // (auto-approved in every mode, allowed in read-only). It reaches the
-    // public web in-process, bypassing the shell sandbox's network block, so it
-    // is intentionally limited to search snippets -- no arbitrary URL fetch.
+    // Outbound network read. Deliberately classified `Other` (NOT `Fetch`) so
+    // the permission gate does not silently auto-approve it: the call is routed
+    // through approval -- prompted in `default`, evaluated by the permission
+    // auto-classifier in `auto`, refused in `readOnly` -- so a search request
+    // can be judged for danger before it leaves the machine. (The classifier
+    // sees the query and domain filters, not the result URLs, which do not
+    // exist until after the search runs.) It reaches the web in-process,
+    // bypassing the shell sandbox's network block, and is limited to search
+    // snippets -- no arbitrary URL fetch.
     ToolMeta {
         name: "web_search",
-        kind: ToolKind::Fetch,
+        kind: ToolKind::Other,
         display_name: "Searching the web",
     },
     // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
