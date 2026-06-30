@@ -10976,6 +10976,98 @@ mod tests {
         (store, session.id, cwd)
     }
 
+    fn config_option_json(option: &SessionConfigOption) -> serde_json::Value {
+        serde_json::to_value(option).expect("session config option serializes")
+    }
+
+    fn find_json_field<'a>(
+        value: &'a serde_json::Value,
+        field_name: &str,
+    ) -> Option<&'a serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map.get(field_name).or_else(|| {
+                map.values()
+                    .find_map(|child| find_json_field(child, field_name))
+            }),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .find_map(|child| find_json_field(child, field_name)),
+            _ => None,
+        }
+    }
+
+    fn find_json_string_field<'a>(
+        value: &'a serde_json::Value,
+        field_names: &[&str],
+    ) -> Option<&'a str> {
+        match value {
+            serde_json::Value::Object(map) => field_names
+                .iter()
+                .find_map(|field_name| map.get(*field_name).and_then(serde_json::Value::as_str))
+                .or_else(|| {
+                    map.values()
+                        .find_map(|child| find_json_string_field(child, field_names))
+                }),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .find_map(|child| find_json_string_field(child, field_names)),
+            _ => None,
+        }
+    }
+
+    fn collect_json_string_field_values(
+        value: &serde_json::Value,
+        field_name: &str,
+        values: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serialized_value) =
+                    map.get(field_name).and_then(serde_json::Value::as_str)
+                {
+                    values.push(serialized_value.to_string());
+                }
+                for child in map.values() {
+                    collect_json_string_field_values(child, field_name, values);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    collect_json_string_field_values(child, field_name, values);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn select_current_value(option: &SessionConfigOption) -> String {
+        let option_json = config_option_json(option);
+        find_json_string_field(&option_json, &["currentValue", "current_value"])
+            .expect("select option advertises current value")
+            .to_string()
+    }
+
+    fn select_option_values(option: &SessionConfigOption) -> Vec<String> {
+        let option_json = config_option_json(option);
+        let options_json =
+            find_json_field(&option_json, "options").expect("select option advertises options");
+        let mut values = Vec::new();
+        collect_json_string_field_values(options_json, "value", &mut values);
+        values
+    }
+
+    fn assert_select_option_values(option: &SessionConfigOption, expected_values: &[&str]) {
+        let option_values = select_option_values(option);
+        for expected in expected_values {
+            assert!(
+                option_values
+                    .iter()
+                    .any(|actual| actual.as_str() == *expected),
+                "expected select option value {expected:?}; got {option_values:?}"
+            );
+        }
+    }
+
     #[test]
     fn describe_always_allow_key_formats_shell_keys() {
         let repo_prefix_key = serde_json::json!({
@@ -11050,8 +11142,6 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_option_sets_permission_mode() {
-        use agent_client_protocol::schema::{SessionConfigKind, SessionConfigSelectOptions};
-
         let (store, id) = make_store_with_session("m").await;
         let outcome = apply_config_option(&store, &id, PERMISSION_CONFIG_ID, "auto")
             .await
@@ -11065,24 +11155,12 @@ mod tests {
             .iter()
             .find(|opt| opt.id.to_string() == PERMISSION_CONFIG_ID)
             .expect("permission option advertised");
-        match &permission_option.kind {
-            SessionConfigKind::Select(select) => {
-                assert_eq!(select.current_value.to_string(), "auto");
-                match &select.options {
-                    SessionConfigSelectOptions::Ungrouped(options) => {
-                        assert!(options.iter().any(|opt| opt.value.to_string() == "auto"));
-                    }
-                    other => panic!("expected ungrouped permission options, got {other:?}"),
-                }
-            }
-            other => panic!("expected select permission option, got {other:?}"),
-        }
+        assert_eq!(select_current_value(permission_option), "auto");
+        assert_select_option_values(permission_option, &["auto"]);
     }
 
     #[tokio::test]
     async fn apply_config_option_sets_turn_recap_mode() {
-        use agent_client_protocol::schema::{SessionConfigKind, SessionConfigSelectOptions};
-
         let (store, id) = make_store_with_session("m").await;
         assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
 
@@ -11096,27 +11174,14 @@ mod tests {
             .iter()
             .find(|opt| opt.id.to_string() == TURN_RECAP_CONFIG_ID)
             .expect("recap option advertised");
-        match &recap_option.kind {
-            SessionConfigKind::Select(select) => {
-                assert_eq!(select.current_value.to_string(), TURN_RECAP_DISABLED_VALUE);
-                match &select.options {
-                    SessionConfigSelectOptions::Ungrouped(options) => {
-                        assert!(
-                            options
-                                .iter()
-                                .any(|opt| opt.value.to_string() == TURN_RECAP_ENABLED_VALUE)
-                        );
-                        assert!(
-                            options
-                                .iter()
-                                .any(|opt| opt.value.to_string() == TURN_RECAP_DISABLED_VALUE)
-                        );
-                    }
-                    other => panic!("expected ungrouped recap options, got {other:?}"),
-                }
-            }
-            other => panic!("expected select recap option, got {other:?}"),
-        }
+        assert_eq!(
+            select_current_value(recap_option),
+            TURN_RECAP_DISABLED_VALUE
+        );
+        assert_select_option_values(
+            recap_option,
+            &[TURN_RECAP_ENABLED_VALUE, TURN_RECAP_DISABLED_VALUE],
+        );
 
         apply_config_option(&store, &id, TURN_RECAP_CONFIG_ID, "enable")
             .await
@@ -11233,7 +11298,6 @@ mod tests {
     #[tokio::test]
     async fn apply_config_option_sets_reasoning_off_and_omits_default() {
         use crate::llm_client::ReasoningLevelPreset;
-        use agent_client_protocol::schema::{SessionConfigKind, SessionConfigSelectOptions};
 
         let (store, id) = make_store_with_session("model-a").await;
         store
@@ -11285,24 +11349,11 @@ mod tests {
             .iter()
             .find(|opt| opt.id.to_string() == REASONING_EFFORT_CONFIG_ID)
             .expect("reasoning option still advertised");
-        match &reasoning_option.kind {
-            SessionConfigKind::Select(select) => {
-                assert_eq!(select.current_value.to_string(), REASONING_EFFORT_OFF_VALUE);
-                match &select.options {
-                    SessionConfigSelectOptions::Ungrouped(options) => {
-                        assert!(
-                            options
-                                .iter()
-                                .any(|opt| opt.value.to_string() == "(default)")
-                        );
-                        assert!(options.iter().any(|opt| opt.value.to_string() == "off"));
-                        assert!(options.iter().any(|opt| opt.value.to_string() == "high"));
-                    }
-                    other => panic!("expected ungrouped reasoning options, got {other:?}"),
-                }
-            }
-            other => panic!("expected select reasoning option, got {other:?}"),
-        }
+        assert_eq!(
+            select_current_value(reasoning_option),
+            REASONING_EFFORT_OFF_VALUE
+        );
+        assert_select_option_values(reasoning_option, &["(default)", "off", "high"]);
     }
 
     #[tokio::test]
