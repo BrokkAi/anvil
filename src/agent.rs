@@ -534,9 +534,11 @@ fn reasoning_effort_config_option(
     )
 }
 
-/// Build the host-generated turn recap selector. This is deliberately a
-/// session config option instead of a model prompt instruction: recaps are
-/// deterministic server text, not model output.
+/// Build the host-generated turn recap selector. This is a session config
+/// option rather than a model prompt instruction because the *host* decides
+/// whether a recap is appended and renders its deterministic stat lines; the
+/// work summary it now carries is a separate, host-orchestrated summarization
+/// call, never something the turn's own model can choose to skip.
 fn turn_recap_config_option(current: bool) -> SessionConfigOption {
     let current_value = if current {
         TURN_RECAP_ENABLED_VALUE
@@ -544,8 +546,9 @@ fn turn_recap_config_option(current: bool) -> SessionConfigOption {
         TURN_RECAP_DISABLED_VALUE
     };
     let options = vec![
-        SessionConfigSelectOption::new(TURN_RECAP_ENABLED_VALUE, "On")
-            .description("Append a compact recap after normal model turns."),
+        SessionConfigSelectOption::new(TURN_RECAP_ENABLED_VALUE, "On").description(
+            "Append a recap (summary of the work done plus stats) after normal turns.",
+        ),
         SessionConfigSelectOption::new(TURN_RECAP_DISABLED_VALUE, "Off")
             .description("Do not append the automatic turn recap."),
     ];
@@ -4759,6 +4762,47 @@ async fn request_plan_approval(
     }
 }
 
+/// Below this many characters of visible answer, a turn with no tool calls
+/// is treated as trivial chat and skips the extra recap-summary LLM call --
+/// the short answer already speaks for itself right above the recap.
+const RECAP_SUMMARY_MIN_CHARS: usize = 280;
+
+/// Best-effort, user-facing summary of the work done this turn, for the
+/// recap. Returns `None` when there is nothing worth summarizing or the
+/// summarizer call fails or is cancelled; the recap then renders only its
+/// deterministic stat lines. Failures are intentionally swallowed -- a recap
+/// is a convenience, never a reason to fail the turn.
+async fn recap_work_summary(
+    llm: &dyn crate::llm_client::LlmBackend,
+    model: &str,
+    turn: &ConversationTurn,
+    context_length: Option<u32>,
+    idle_timeout: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    let visible = crate::host_notice::model_visible_assistant_text(&turn.agent_response);
+    if turn.tool_exchanges.is_empty() && visible.trim().chars().count() < RECAP_SUMMARY_MIN_CHARS {
+        return None;
+    }
+    match crate::context_manager::summarize_turn_for_recap(
+        llm,
+        model,
+        turn,
+        context_length,
+        idle_timeout,
+        cancel,
+    )
+    .await
+    {
+        Ok(summary) if !summary.trim().is_empty() => Some(summary),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!(model, "turn recap summary failed: {e:#}");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn_in_spawn(
     cx: &ConnectionTo<Client>,
@@ -4846,41 +4890,51 @@ async fn run_model_turn_in_spawn(
         }
     };
 
-    let cost_delta_usd = sessions
-        .available_model_metadata()
-        .await
-        .iter()
-        .find(|meta| meta.id == model)
-        .and_then(|meta| meta.estimate_cost_usd(turn_usage));
+    let model_metadata = sessions.available_model_metadata().await;
+    let model_meta = model_metadata.iter().find(|meta| meta.id == model);
+    let cost_delta_usd = model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage));
+    let context_length = model_meta.and_then(|meta| meta.context_length);
     let cumulative_usage = sessions
         .record_usage(session_id, turn_usage, cost_delta_usd)
         .await
         .unwrap_or(turn_usage);
     let structured_output_result =
         structured_output_request.map(|request| validate_response(request, &response_text));
+
+    // Build the turn up front so the recap summarizer can read it without
+    // cloning the tool exchanges. `agent_response` holds the raw model text for
+    // now (the summarizer strips host notices itself) and is replaced with the
+    // recap-augmented text below before the turn is persisted.
+    let mut turn = ConversationTurn {
+        user_prompt: prompt_text_for_turn,
+        agent_response: response_text.clone(),
+        replay_events: sanitize_replay_events(&replay_events),
+        tool_exchanges,
+        structured_output: structured_output_result.clone(),
+        summary: None,
+        fragment_id: None,
+    };
+
     let visible_response = if turn_recap_enabled && !cancel_status.is_cancelled() {
-        let recap = crate::host_notice::render_turn_recap(&tool_exchanges, &stop);
+        let summary = recap_work_summary(
+            llm.as_ref(),
+            model,
+            &turn,
+            context_length,
+            idle_timeout,
+            cancel_status.clone(),
+        )
+        .await;
+        let recap =
+            crate::host_notice::render_turn_recap(summary.as_deref(), &turn.tool_exchanges, &stop);
         send_message(cx, session_id, &recap);
         format!("{response_text}{recap}")
     } else {
         response_text.clone()
     };
+    turn.agent_response = visible_response;
 
-    if let Err(e) = sessions
-        .add_turn(
-            session_id,
-            ConversationTurn {
-                user_prompt: prompt_text_for_turn,
-                agent_response: visible_response,
-                replay_events: sanitize_replay_events(&replay_events),
-                tool_exchanges,
-                structured_output: structured_output_result.clone(),
-                summary: None,
-                fragment_id: None,
-            },
-        )
-        .await
-    {
+    if let Err(e) = sessions.add_turn(session_id, turn).await {
         send_message(
             cx,
             session_id,
@@ -7229,8 +7283,9 @@ async fn handle_setup_recap(
             .unwrap_or("unknown");
         return format!(
             "Turn recap is `{state}`.\n\n\
-             Use `/setup recap on` to append automatic recaps after normal turns, \
-             or `/setup recap off` to disable them."
+             When on, each normal turn ends with a recap: a short summary of the work \
+             done since your last message, plus the stop/tools/files stats. \
+             Use `/setup recap on` to enable it, or `/setup recap off` to disable it."
         );
     }
     let Some(enabled) = parse_turn_recap_enabled(rest) else {
@@ -9594,6 +9649,7 @@ mod tests {
         use crate::session::ConversationTurn;
 
         let recap = crate::host_notice::render_turn_recap(
+            None,
             &[],
             &crate::tool_loop::LoopStop::Completed { had_text: true },
         );
@@ -10076,6 +10132,7 @@ mod tests {
         use crate::session::{ConversationTurn, SessionSnapshot};
 
         let recap = crate::host_notice::render_turn_recap(
+            None,
             &[],
             &crate::tool_loop::LoopStop::Completed { had_text: true },
         );

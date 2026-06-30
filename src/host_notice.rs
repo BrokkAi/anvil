@@ -12,6 +12,11 @@ use crate::tool_loop::LoopStop;
 pub(crate) const STOP_NOTICE_SENTINEL: &str = "\n⏹ ";
 pub(crate) const TURN_RECAP_NOTICE_SENTINEL: &str = "\n\n**Anvil Recap**\n";
 
+/// Upper bound on the rendered work-summary, as a safety valve against a
+/// model that ignores the "a few bullets" instruction. Truncated on a char
+/// boundary with an ellipsis; the deterministic stat lines are unaffected.
+const MAX_RECAP_SUMMARY_CHARS: usize = 4000;
+
 pub(crate) fn render_loop_stop(stop: &LoopStop) -> Option<String> {
     match stop {
         LoopStop::MaxTurns { max_turns } => Some(format!(
@@ -122,26 +127,59 @@ fn render_changed_files(tool_exchanges: &[ToolExchange]) -> String {
     listed.join(", ")
 }
 
-pub(crate) fn render_turn_recap(tool_exchanges: &[ToolExchange], stop: &LoopStop) -> String {
-    format!(
-        "{}- Stop: {}.\n- Tools: {}.\n- Files changed: {}.\n",
-        TURN_RECAP_NOTICE_SENTINEL,
+/// Neutralize the recap header in the model-written summary, then bound its
+/// length. Stripping anchors on the `**Anvil Recap**` sentinel via `rfind`,
+/// so a summary that echoed that header could otherwise create a second
+/// match and confuse the stripper.
+fn sanitize_recap_summary(summary: &str) -> String {
+    let mut cleaned = summary.trim().replace("**Anvil Recap**", "Anvil Recap");
+    if cleaned.chars().count() > MAX_RECAP_SUMMARY_CHARS {
+        let truncated: String = cleaned.chars().take(MAX_RECAP_SUMMARY_CHARS).collect();
+        cleaned = format!("{}…", truncated.trim_end());
+    }
+    cleaned
+}
+
+/// Render the turn recap: an optional work summary (what the assistant did
+/// this turn) above the deterministic Stop / Tools / Files-changed stats.
+/// The three stat lines stay last so the model-history stripper can detach
+/// the whole block (summary included) by validating them as the tail.
+pub(crate) fn render_turn_recap(
+    summary: Option<&str>,
+    tool_exchanges: &[ToolExchange],
+    stop: &LoopStop,
+) -> String {
+    let mut out = String::from(TURN_RECAP_NOTICE_SENTINEL);
+    if let Some(summary) = summary {
+        let summary = sanitize_recap_summary(summary);
+        if !summary.is_empty() {
+            out.push_str(&summary);
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str(&format!(
+        "- Stop: {}.\n- Tools: {}.\n- Files changed: {}.\n",
         describe_loop_stop_for_recap(stop),
         render_tool_counts(tool_exchanges),
         render_changed_files(tool_exchanges)
-    )
+    ));
+    out
 }
 
 fn strip_trailing_turn_recap(text: &str) -> Option<&str> {
     let index = text.rfind(TURN_RECAP_NOTICE_SENTINEL)?;
-    let suffix = &text[index..];
-    let mut lines = suffix[TURN_RECAP_NOTICE_SENTINEL.len()..].lines();
-    let stop = lines.next()?;
-    let tools = lines.next()?;
-    let files = lines.next()?;
-    if lines.next().is_some() {
+    let body = &text[index + TURN_RECAP_NOTICE_SENTINEL.len()..];
+
+    // The recap may carry a variable-length work summary above its three fixed
+    // Stop / Tools / Files lines, which are always last. Validating the final
+    // three lines lets the whole block strip while leaving model-authored text
+    // that merely contains "**Anvil Recap**" untouched. If a later notice were
+    // appended after the recap, these would not be the tail and the strip loop
+    // in `model_visible_assistant_text` peels that off first.
+    let lines: Vec<&str> = body.lines().collect();
+    let [.., stop, tools, files] = lines.as_slice() else {
         return None;
-    }
+    };
     if stop.starts_with("- Stop: ")
         && stop.ends_with('.')
         && tools.starts_with("- Tools: ")
@@ -222,6 +260,7 @@ mod tests {
     #[test]
     fn render_turn_recap_reports_stop_tools_and_changed_files() {
         let recap = render_turn_recap(
+            None,
             &[
                 ToolExchange {
                     call_id: "c1".into(),
@@ -250,11 +289,53 @@ mod tests {
             recap.contains("- Tools: 2 calls (1 succeeded, 1 failed): edit, run_shell_command.")
         );
         assert!(recap.contains("- Files changed: src/lib.rs."));
+        // The three stat lines are the tail of the block (the strip anchor).
+        assert!(recap.trim_end().ends_with("- Files changed: src/lib.rs."));
+    }
+
+    #[test]
+    fn render_turn_recap_includes_work_summary_above_stats() {
+        let recap = render_turn_recap(
+            Some("- Edited `src/lib.rs` to add a guard.\n- Ran the tests; all passed."),
+            &[ToolExchange {
+                call_id: "c1".into(),
+                tool_name: "edit".into(),
+                status: ToolExchangeStatus::Completed,
+                ..ToolExchange::default()
+            }],
+            &LoopStop::Completed { had_text: true },
+        );
+
+        let summary_at = recap
+            .find("Edited `src/lib.rs`")
+            .expect("summary present in recap");
+        let stop_at = recap.find("- Stop: completed.").expect("stats present");
+        assert!(summary_at < stop_at, "summary renders above the stat lines");
+        assert!(recap.contains("- Ran the tests; all passed."));
+
+        // The whole block -- summary included -- strips back out of model history.
+        let persisted = format!("the answer{recap}");
+        assert_eq!(model_visible_assistant_text(&persisted), "the answer");
+    }
+
+    #[test]
+    fn render_turn_recap_neutralizes_sentinel_lookalikes_in_summary() {
+        // A summary that echoes the recap's own start sentinel must not create a
+        // second match that `rfind` latches onto, which would strip mid-summary.
+        let evil_summary = format!("- Quoting a marker: {TURN_RECAP_NOTICE_SENTINEL} oops.");
+        let recap = render_turn_recap(
+            Some(&evil_summary),
+            &[],
+            &LoopStop::Completed { had_text: true },
+        );
+        let persisted = format!("answer{recap}");
+        assert_eq!(model_visible_assistant_text(&persisted), "answer");
     }
 
     #[test]
     fn render_turn_recap_keeps_control_char_fields_single_line() {
         let recap = render_turn_recap(
+            None,
             &[ToolExchange {
                 call_id: "c1".into(),
                 tool_name: "edit\nname".into(),
@@ -274,6 +355,8 @@ mod tests {
         let body = recap
             .strip_prefix(TURN_RECAP_NOTICE_SENTINEL)
             .expect("recap starts with sentinel");
+        // Exactly the three escaped stat lines; the control chars in the fields
+        // must not spill onto extra lines.
         assert_eq!(
             body.lines().count(),
             3,
@@ -293,11 +376,21 @@ mod tests {
             "the model's real answer"
         );
 
-        let recap = render_turn_recap(&[], &LoopStop::Completed { had_text: true });
+        let recap = render_turn_recap(None, &[], &LoopStop::Completed { had_text: true });
         let persisted = format!("answer{recap}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
 
         let persisted = format!("answer{notice}{recap}");
+        assert_eq!(model_visible_assistant_text(&persisted), "answer");
+
+        // A summary-bearing recap preceded by a stop notice strips both, in
+        // either peel order the loop encounters.
+        let recap_with_summary = render_turn_recap(
+            Some("- Looked at `a.rs`.\n- Edited `b.rs`."),
+            &[],
+            &LoopStop::MaxTurns { max_turns: 3 },
+        );
+        let persisted = format!("answer{notice}{recap_with_summary}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
 
         let only_notice = render_loop_stop(&LoopStop::Completed { had_text: false }).unwrap();
