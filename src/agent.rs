@@ -122,6 +122,11 @@ const MODEL_CONFIG_ID: &str = "model_selection";
 /// model's `default_reasoning_level`). The `off` option explicitly omits
 /// reasoning controls even when the model advertises a default.
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+/// Session config selector for the host-generated recap appended after normal
+/// model turns.
+const TURN_RECAP_CONFIG_ID: &str = "turn_recap";
+const TURN_RECAP_ENABLED_VALUE: &str = "enabled";
+const TURN_RECAP_DISABLED_VALUE: &str = "disabled";
 /// Sentinel value the client sends to clear the user's pick. We accept
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
@@ -526,6 +531,26 @@ fn reasoning_effort_config_option(
     )
 }
 
+/// Build the host-generated turn recap selector. This is deliberately a
+/// session config option instead of a model prompt instruction: recaps are
+/// deterministic server text, not model output.
+fn turn_recap_config_option(current: bool) -> SessionConfigOption {
+    let current_value = if current {
+        TURN_RECAP_ENABLED_VALUE
+    } else {
+        TURN_RECAP_DISABLED_VALUE
+    };
+    let options = vec![
+        SessionConfigSelectOption::new(TURN_RECAP_ENABLED_VALUE, "On")
+            .description("Append a compact recap after normal model turns."),
+        SessionConfigSelectOption::new(TURN_RECAP_DISABLED_VALUE, "Off")
+            .description("Do not append the automatic turn recap."),
+    ];
+    SessionConfigOption::select(TURN_RECAP_CONFIG_ID, "Recap", current_value, options)
+        .description("Controls the automatic recap appended after each non-goal turn.")
+        .category(SessionConfigOptionCategory::Mode)
+}
+
 /// All configOption selectors we expose, in display order. The model
 /// selector is appended only when the LLM catalog is known; clients that
 /// drive model selection through the meta extension still see the current
@@ -534,6 +559,7 @@ fn reasoning_effort_config_option(
 fn all_config_options(
     behavior: SessionMode,
     permission: PermissionMode,
+    turn_recap_enabled: bool,
     current_model: &str,
     available_models: &[ModelMetadata],
     current_reasoning_effort: Option<&str>,
@@ -542,6 +568,7 @@ fn all_config_options(
     let mut opts = vec![
         behavior_config_option(behavior),
         permission_config_option(permission),
+        turn_recap_config_option(turn_recap_enabled),
     ];
     if let Some(model_opt) = model_config_option(current_model, &model_ids) {
         opts.push(model_opt);
@@ -560,6 +587,7 @@ fn all_config_options(
 const CONFIGURE_KNOWN_KEYS: &[&str] = &[
     BEHAVIOR_CONFIG_ID,
     PERMISSION_CONFIG_ID,
+    TURN_RECAP_CONFIG_ID,
     MODEL_CONFIG_ID,
     REASONING_EFFORT_CONFIG_ID,
 ];
@@ -634,6 +662,7 @@ async fn current_config_options(
     Some(all_config_options(
         session.mode,
         session.permission_mode,
+        session.turn_recap_enabled,
         &session.model,
         &catalog,
         session.selected_reasoning_effort.as_deref(),
@@ -672,6 +701,18 @@ fn send_config_option_change_updates(
             tracing::warn!("failed to send current_mode_update: {e}");
         }
     }
+}
+
+fn parse_setup_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "enable" | "enabled" | "true" | "yes" => Some(true),
+        "off" | "disable" | "disabled" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_turn_recap_enabled(value: &str) -> Option<bool> {
+    parse_setup_bool(value)
 }
 
 async fn apply_config_option(
@@ -723,6 +764,20 @@ async fn apply_config_option(
                         details: format!("{e:#}"),
                     });
                 }
+            }
+        }
+        TURN_RECAP_CONFIG_ID => {
+            let Some(enabled) = parse_turn_recap_enabled(value) else {
+                return Err(ConfigApplyError::InvalidValue {
+                    reason: format!("unknown recap mode '{value}'"),
+                    supported: vec![
+                        TURN_RECAP_ENABLED_VALUE.to_string(),
+                        TURN_RECAP_DISABLED_VALUE.to_string(),
+                    ],
+                });
+            };
+            if !sessions.set_turn_recap_enabled(session_id, enabled).await {
+                return Err(ConfigApplyError::UnknownSession);
             }
         }
         MODEL_CONFIG_ID => {
@@ -1558,6 +1613,7 @@ pub async fn run_agent(
                     .config_options(all_config_options(
                         session.mode,
                         session.permission_mode,
+                        session.turn_recap_enabled,
                         &session.model,
                         &catalog,
                         session.selected_reasoning_effort.as_deref(),
@@ -1693,6 +1749,7 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             session.mode,
                             session.permission_mode,
+                            session.turn_recap_enabled,
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
@@ -1811,6 +1868,7 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             session.mode,
                             session.permission_mode,
+                            session.turn_recap_enabled,
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
@@ -1923,6 +1981,7 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             forked.mode,
                             forked.permission_mode,
+                            forked.turn_recap_enabled,
                             &forked.model,
                             &catalog,
                             forked.selected_reasoning_effort.as_deref(),
@@ -2736,6 +2795,10 @@ pub async fn run_agent(
                             .unwrap_or(default_idle_timeout_secs)
                             .max(1),
                     );
+                    let turn_recap_enabled_for_gate = sessions_prompt
+                        .turn_recap_enabled(&session_id)
+                        .await
+                        .unwrap_or(true);
                     let cancel_status = cancel.clone();
 
                     let spawn_result = cx.spawn(async move {
@@ -2891,6 +2954,7 @@ pub async fn run_agent(
                             max_turns,
                             idle_timeout_for_gate,
                             cancel,
+                            turn_recap_enabled_for_gate,
                             execution_prompt_text,
                         )
                         .await;
@@ -2903,7 +2967,7 @@ pub async fn run_agent(
                         // notice, the loop already streamed a reason, so skip the
                         // cancel line and let the transcript end with one reason.
                         let loop_streamed_notice =
-                            crate::tool_loop::render_loop_stop(&turn_result.stop).is_some();
+                            crate::host_notice::render_loop_stop(&turn_result.stop).is_some();
 
                         sessions_for_gate.finish_prompt(&session_id_for_gate).await;
 
@@ -2973,6 +3037,10 @@ pub async fn run_agent(
                         .unwrap_or(default_idle_timeout_secs)
                         .max(1),
                 );
+                let turn_recap_enabled_for_loop = sessions_prompt
+                    .turn_recap_enabled(&session_id)
+                    .await
+                    .unwrap_or(true);
                 // `cancel` is moved into the tool loop below, so keep a clone to
                 // detect after the turn whether the prompt was cancelled.
                 let cancel_status = cancel.clone();
@@ -2997,6 +3065,7 @@ pub async fn run_agent(
                         max_turns,
                         idle_timeout_for_loop,
                         cancel,
+                        turn_recap_enabled_for_loop,
                         prompt_text_for_turn,
                     )
                     .await;
@@ -3008,7 +3077,7 @@ pub async fn run_agent(
                     // turn-limit/empty notice (cancel racing the fall-through),
                     // so the transcript ends with a single reason.
                     let loop_streamed_notice =
-                        crate::tool_loop::render_loop_stop(&turn_result.stop).is_some();
+                        crate::host_notice::render_loop_stop(&turn_result.stop).is_some();
 
                     // Clean up cancellation token even on panic / persistence failure.
                     sessions_for_loop.finish_prompt(&session_id_for_loop).await;
@@ -3763,6 +3832,10 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
+    let turn_recap_enabled = sessions
+        .turn_recap_enabled(session_id)
+        .await
+        .unwrap_or(true);
     let turn = run_prepared_model_turn(
         cx,
         sessions,
@@ -3776,6 +3849,7 @@ async fn run_loop_iteration(
         default_idle_timeout_secs,
         max_turns,
         cancel,
+        turn_recap_enabled,
     )
     .await?;
     Ok(LoopIterationOutcome {
@@ -3833,6 +3907,7 @@ async fn run_goal_turn(
         default_idle_timeout_secs,
         max_turns,
         cancel,
+        false,
     )
     .await?;
 
@@ -4470,13 +4545,13 @@ fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[Conversat
                 ));
             }
             let history_response =
-                crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+                crate::host_notice::model_visible_assistant_text(&turn.agent_response);
             if !history_response.is_empty() {
                 messages.push(ChatMessage::assistant(history_response.to_string()));
             }
         } else {
             let history_response =
-                crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+                crate::host_notice::model_visible_assistant_text(&turn.agent_response);
             if !history_response.is_empty() {
                 messages.push(ChatMessage::assistant(history_response.to_string()));
             }
@@ -4527,9 +4602,8 @@ fn append_turn_replay_events(messages: &mut Vec<ChatMessage>, turn: &Conversatio
             }
         }
     }
-    // History excludes our injected closing notice (transcript replay keeps it).
-    let history_response =
-        crate::tool_loop::agent_response_without_stop_notice(&turn.agent_response);
+    // History excludes host-injected notices (transcript replay keeps them).
+    let history_response = crate::host_notice::model_visible_assistant_text(&turn.agent_response);
     if !history_response.is_empty() && replayed_assistant_text != history_response {
         let missing = history_response
             .strip_prefix(&replayed_assistant_text)
@@ -4693,6 +4767,7 @@ async fn run_model_turn_in_spawn(
     max_turns: usize,
     idle_timeout: Duration,
     cancel: tokio_util::sync::CancellationToken,
+    turn_recap_enabled: bool,
     prompt_text_for_turn: String,
 ) -> ModelTurnResult {
     use futures::FutureExt;
@@ -4712,6 +4787,7 @@ async fn run_model_turn_in_spawn(
             send_thought(&cx_thought, &sid_thought, token);
         }));
 
+    let cancel_status = cancel.clone();
     let cx_for_gate = cx.clone();
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
     let loop_result = AssertUnwindSafe(crate::tool_loop::run(
@@ -4775,13 +4851,20 @@ async fn run_model_turn_in_spawn(
         .unwrap_or(turn_usage);
     let structured_output_result =
         structured_output_request.map(|request| validate_response(request, &response_text));
+    let visible_response = if turn_recap_enabled && !cancel_status.is_cancelled() {
+        let recap = crate::host_notice::render_turn_recap(&tool_exchanges, &stop);
+        send_message(cx, session_id, &recap);
+        format!("{response_text}{recap}")
+    } else {
+        response_text.clone()
+    };
 
     if let Err(e) = sessions
         .add_turn(
             session_id,
             ConversationTurn {
                 user_prompt: prompt_text_for_turn,
-                agent_response: response_text.clone(),
+                agent_response: visible_response,
                 replay_events: sanitize_replay_events(&replay_events),
                 tool_exchanges,
                 structured_output: structured_output_result.clone(),
@@ -4832,6 +4915,7 @@ async fn run_prepared_model_turn(
     default_idle_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
+    turn_recap_enabled: bool,
 ) -> Result<ModelTurnResult, LoopIterationError> {
     if snap.model.is_empty() {
         return Err(LoopIterationError::Terminal(
@@ -4885,6 +4969,7 @@ async fn run_prepared_model_turn(
         max_turns,
         idle_timeout,
         cancel,
+        turn_recap_enabled,
         prompt_text.to_string(),
     )
     .await)
@@ -6042,6 +6127,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
+        "recap" => handle_setup_recap(ctx.cx, ctx.sessions, session_id, rest).await,
         "timeout" => {
             let prompt = if rest.is_empty() {
                 "/idle-timeout".to_string()
@@ -6829,12 +6915,9 @@ async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &
         );
     }
     let mode = match rest.to_ascii_lowercase().as_str() {
-        "default" | "on" | "enable" | "enabled" | "true" | "yes" => {
-            None // clear override -> use global default
-        }
+        "default" => None,
         "os" => Some(SandboxMode::Os),
         "wasm" => Some(SandboxMode::Wasm),
-        "off" | "disable" | "disabled" | "false" | "no" => Some(SandboxMode::Off),
         "status" => {
             let current = sessions.sandbox_mode(session_id).await;
             let Some(mode) = current else {
@@ -6845,9 +6928,13 @@ async fn handle_setup_sandbox(sessions: &SessionStore, session_id: &str, rest: &
                 mode.is_none(),
             );
         }
-        _ => {
-            return "Unknown choice. Try `/setup sandbox`, `/setup sandbox default`, `/setup sandbox os`, `/setup sandbox wasm`, `/setup sandbox off`, or `/setup sandbox status`.".to_string();
-        }
+        other => match parse_setup_bool(other) {
+            Some(true) => None,
+            Some(false) => Some(SandboxMode::Off),
+            None => {
+                return "Unknown choice. Try `/setup sandbox`, `/setup sandbox default`, `/setup sandbox os`, `/setup sandbox wasm`, `/setup sandbox off`, or `/setup sandbox status`.".to_string();
+            }
+        },
     };
     if let Err(e) = crate::sandbox_backend::backend_for_mode(mode) {
         return format!("Error: failed to initialize requested sandbox backend: {e}");
@@ -6912,6 +6999,35 @@ async fn handle_setup_mode(
     apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
 }
 
+async fn handle_setup_recap(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    rest: &str,
+) -> String {
+    if rest.is_empty() {
+        let state = sessions
+            .turn_recap_enabled(session_id)
+            .await
+            .map(|enabled| if enabled { "on" } else { "off" })
+            .unwrap_or("unknown");
+        return format!(
+            "Turn recap is `{state}`.\n\n\
+             Use `/setup recap on` to append automatic recaps after normal turns, \
+             or `/setup recap off` to disable them."
+        );
+    }
+    let Some(enabled) = parse_turn_recap_enabled(rest) else {
+        return "Unknown recap mode. Try `/setup recap on` or `/setup recap off`.".to_string();
+    };
+    let value = if enabled {
+        TURN_RECAP_ENABLED_VALUE
+    } else {
+        TURN_RECAP_DISABLED_VALUE
+    };
+    apply_setup_config(cx, sessions, session_id, TURN_RECAP_CONFIG_ID, value).await
+}
+
 async fn apply_setup_config(
     cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
@@ -6931,6 +7047,7 @@ async fn apply_setup_config(
                 MODEL_CONFIG_ID => "Model setup updated.".to_string(),
                 PERMISSION_CONFIG_ID => "Permission mode updated.".to_string(),
                 BEHAVIOR_CONFIG_ID => "Behavior setup updated.".to_string(),
+                TURN_RECAP_CONFIG_ID => "Turn recap setup updated.".to_string(),
                 REASONING_EFFORT_CONFIG_ID => "Advanced reasoning setup updated.".to_string(),
                 _ => "Setup updated.".to_string(),
             };
@@ -7083,6 +7200,14 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
             .unwrap_or(REASONING_EFFORT_DEFAULT_VALUE)
     ));
     out.push_str(&format!(
+        "- Turn recap: `{}`\n",
+        if session.turn_recap_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    out.push_str(&format!(
         "- LLM idle timeout: `{}`\n\n",
         session
             .idle_timeout_secs
@@ -7098,6 +7223,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
     );
     out.push_str("- `/setup mode` - change assistant behavior.\n");
+    out.push_str("- `/setup recap on|off` - toggle automatic turn recaps.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
     out.push_str("- `/setup reasoning default|off|<level>` - advanced reasoning setting.\n");
     if !openrouter_picks.is_empty() {
@@ -7942,7 +8068,9 @@ async fn handle_compress(
 /// `handle_compress` to report "before vs. after" savings.
 fn approximate_turn_tokens(turn: &crate::session::ConversationTurn) -> usize {
     let mut sum = crate::tokens::approximate_tokens(&turn.user_prompt);
-    sum += crate::tokens::approximate_tokens(&turn.agent_response);
+    sum += crate::tokens::approximate_tokens(crate::host_notice::model_visible_assistant_text(
+        &turn.agent_response,
+    ));
     for exchange in &turn.tool_exchanges {
         sum += crate::tokens::approximate_tokens(&exchange.tool_name);
         sum += crate::tokens::approximate_tokens(&exchange.arguments);
@@ -7971,7 +8099,9 @@ fn render_context_report(
     let mut tool_tokens = 0usize;
     for turn in &snap.history {
         user_tokens += crate::tokens::approximate_tokens(&turn.user_prompt);
-        agent_tokens += crate::tokens::approximate_tokens(&turn.agent_response);
+        agent_tokens += crate::tokens::approximate_tokens(
+            crate::host_notice::model_visible_assistant_text(&turn.agent_response),
+        );
         for exchange in &turn.tool_exchanges {
             tool_tokens += crate::tokens::approximate_tokens(&exchange.tool_name);
             tool_tokens += crate::tokens::approximate_tokens(&exchange.arguments);
@@ -9244,6 +9374,31 @@ mod tests {
     }
 
     #[test]
+    fn approximate_turn_tokens_excludes_host_notices_from_agent_response() {
+        use crate::session::ConversationTurn;
+
+        let recap = crate::host_notice::render_turn_recap(
+            &[],
+            &crate::tool_loop::LoopStop::Completed { had_text: true },
+        );
+        let plain = ConversationTurn {
+            user_prompt: "u".into(),
+            agent_response: "answer".into(),
+            ..Default::default()
+        };
+        let with_recap = ConversationTurn {
+            user_prompt: "u".into(),
+            agent_response: format!("answer{recap}"),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            approximate_turn_tokens(&with_recap),
+            approximate_turn_tokens(&plain)
+        );
+    }
+
+    #[test]
     fn shell_single_quote_escapes_embedded_quote() {
         assert_eq!(shell_single_quote("hello"), "'hello'");
         assert_eq!(shell_single_quote(""), "''");
@@ -9698,6 +9853,40 @@ mod tests {
         // when the catalog publishes one.
         assert!(report.contains("/ 200000 tokens"));
         assert!(report.contains("% used"));
+    }
+
+    #[test]
+    fn render_context_report_excludes_host_notices_from_agent_tokens() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+
+        let recap = crate::host_notice::render_turn_recap(
+            &[],
+            &crate::tool_loop::LoopStop::Completed { had_text: true },
+        );
+        let snapshot = |agent_response: String| SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "hi".into(),
+                agent_response,
+                ..Default::default()
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        let plain = render_context_report(&snapshot("answer".into()), PermissionMode::Default, &[]);
+        let with_recap = render_context_report(
+            &snapshot(format!("answer{recap}")),
+            PermissionMode::Default,
+            &[],
+        );
+
+        assert_eq!(with_recap, plain);
     }
 
     /// When no model is set, `/context` shows `(none)` rather than the
@@ -11065,6 +11254,98 @@ mod tests {
         (store, session.id, cwd)
     }
 
+    fn config_option_json(option: &SessionConfigOption) -> serde_json::Value {
+        serde_json::to_value(option).expect("session config option serializes")
+    }
+
+    fn find_json_field<'a>(
+        value: &'a serde_json::Value,
+        field_name: &str,
+    ) -> Option<&'a serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map.get(field_name).or_else(|| {
+                map.values()
+                    .find_map(|child| find_json_field(child, field_name))
+            }),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .find_map(|child| find_json_field(child, field_name)),
+            _ => None,
+        }
+    }
+
+    fn find_json_string_field<'a>(
+        value: &'a serde_json::Value,
+        field_names: &[&str],
+    ) -> Option<&'a str> {
+        match value {
+            serde_json::Value::Object(map) => field_names
+                .iter()
+                .find_map(|field_name| map.get(*field_name).and_then(serde_json::Value::as_str))
+                .or_else(|| {
+                    map.values()
+                        .find_map(|child| find_json_string_field(child, field_names))
+                }),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .find_map(|child| find_json_string_field(child, field_names)),
+            _ => None,
+        }
+    }
+
+    fn collect_json_string_field_values(
+        value: &serde_json::Value,
+        field_name: &str,
+        values: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serialized_value) =
+                    map.get(field_name).and_then(serde_json::Value::as_str)
+                {
+                    values.push(serialized_value.to_string());
+                }
+                for child in map.values() {
+                    collect_json_string_field_values(child, field_name, values);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    collect_json_string_field_values(child, field_name, values);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn select_current_value(option: &SessionConfigOption) -> String {
+        let option_json = config_option_json(option);
+        find_json_string_field(&option_json, &["currentValue", "current_value"])
+            .expect("select option advertises current value")
+            .to_string()
+    }
+
+    fn select_option_values(option: &SessionConfigOption) -> Vec<String> {
+        let option_json = config_option_json(option);
+        let options_json =
+            find_json_field(&option_json, "options").expect("select option advertises options");
+        let mut values = Vec::new();
+        collect_json_string_field_values(options_json, "value", &mut values);
+        values
+    }
+
+    fn assert_select_option_values(option: &SessionConfigOption, expected_values: &[&str]) {
+        let option_values = select_option_values(option);
+        for expected in expected_values {
+            assert!(
+                option_values
+                    .iter()
+                    .any(|actual| actual.as_str() == *expected),
+                "expected select option value {expected:?}; got {option_values:?}"
+            );
+        }
+    }
+
     #[test]
     fn describe_always_allow_key_formats_shell_keys() {
         let repo_prefix_key = serde_json::json!({
@@ -11139,8 +11420,6 @@ mod tests {
 
     #[tokio::test]
     async fn apply_config_option_sets_permission_mode() {
-        use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
-
         let (store, id) = make_store_with_session("m").await;
         let outcome = apply_config_option(&store, &id, PERMISSION_CONFIG_ID, "auto")
             .await
@@ -11154,18 +11433,38 @@ mod tests {
             .iter()
             .find(|opt| opt.id.to_string() == PERMISSION_CONFIG_ID)
             .expect("permission option advertised");
-        match &permission_option.kind {
-            SessionConfigKind::Select(select) => {
-                assert_eq!(select.current_value.to_string(), "auto");
-                match &select.options {
-                    SessionConfigSelectOptions::Ungrouped(options) => {
-                        assert!(options.iter().any(|opt| opt.value.to_string() == "auto"));
-                    }
-                    other => panic!("expected ungrouped permission options, got {other:?}"),
-                }
-            }
-            other => panic!("expected select permission option, got {other:?}"),
-        }
+        assert_eq!(select_current_value(permission_option), "auto");
+        assert_select_option_values(permission_option, &["auto"]);
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_sets_turn_recap_mode() {
+        let (store, id) = make_store_with_session("m").await;
+        assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
+
+        let outcome = apply_config_option(&store, &id, TURN_RECAP_CONFIG_ID, "disabled")
+            .await
+            .expect("turn recap update");
+        assert_eq!(store.turn_recap_enabled(&id).await, Some(false));
+
+        let recap_option = outcome
+            .updated_options
+            .iter()
+            .find(|opt| opt.id.to_string() == TURN_RECAP_CONFIG_ID)
+            .expect("recap option advertised");
+        assert_eq!(
+            select_current_value(recap_option),
+            TURN_RECAP_DISABLED_VALUE
+        );
+        assert_select_option_values(
+            recap_option,
+            &[TURN_RECAP_ENABLED_VALUE, TURN_RECAP_DISABLED_VALUE],
+        );
+
+        apply_config_option(&store, &id, TURN_RECAP_CONFIG_ID, "enable")
+            .await
+            .expect("turn recap enable alias");
+        assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
     }
 
     #[tokio::test]
@@ -11277,7 +11576,6 @@ mod tests {
     #[tokio::test]
     async fn apply_config_option_sets_reasoning_off_and_omits_default() {
         use crate::llm_client::ReasoningLevelPreset;
-        use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
 
         let (store, id) = make_store_with_session("model-a").await;
         store
@@ -11329,24 +11627,11 @@ mod tests {
             .iter()
             .find(|opt| opt.id.to_string() == REASONING_EFFORT_CONFIG_ID)
             .expect("reasoning option still advertised");
-        match &reasoning_option.kind {
-            SessionConfigKind::Select(select) => {
-                assert_eq!(select.current_value.to_string(), REASONING_EFFORT_OFF_VALUE);
-                match &select.options {
-                    SessionConfigSelectOptions::Ungrouped(options) => {
-                        assert!(
-                            options
-                                .iter()
-                                .any(|opt| opt.value.to_string() == "(default)")
-                        );
-                        assert!(options.iter().any(|opt| opt.value.to_string() == "off"));
-                        assert!(options.iter().any(|opt| opt.value.to_string() == "high"));
-                    }
-                    other => panic!("expected ungrouped reasoning options, got {other:?}"),
-                }
-            }
-            other => panic!("expected select reasoning option, got {other:?}"),
-        }
+        assert_eq!(
+            select_current_value(reasoning_option),
+            REASONING_EFFORT_OFF_VALUE
+        );
+        assert_select_option_values(reasoning_option, &["(default)", "off", "high"]);
     }
 
     #[tokio::test]

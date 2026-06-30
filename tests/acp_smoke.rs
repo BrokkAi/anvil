@@ -1821,7 +1821,7 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     // streamed assistant output.
     let agent_text = collect_agent_message_text(&mut client);
     assert!(
-        agent_text.contains("reached the 1-turn cap"),
+        agent_text.contains("reached the 1-turn limit"),
         "{}: turn-limit reason did not reach the transcript; agent text was: {agent_text:?}",
         case.name
     );
@@ -1841,7 +1841,7 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     assert_response_ok(&case, "session/load", &load, &client);
     let replayed_text = collect_agent_message_text(&mut client);
     assert!(
-        replayed_text.contains("reached the 1-turn cap"),
+        replayed_text.contains("reached the 1-turn limit"),
         "{}: turn-limit reason did not survive a cold reload; replayed text was: {replayed_text:?}",
         case.name
     );

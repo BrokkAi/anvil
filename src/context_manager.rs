@@ -494,8 +494,9 @@ fn turn_summary_atoms(turn: &ConversationTurn) -> Vec<String> {
         }
     }
 
-    if replay_events.is_empty() && !turn.agent_response.trim().is_empty() {
-        atoms.push(format!("Assistant: {}", turn.agent_response.trim()));
+    let assistant_text = crate::host_notice::model_visible_assistant_text(&turn.agent_response);
+    if replay_events.is_empty() && !assistant_text.trim().is_empty() {
+        atoms.push(format!("Assistant: {}", assistant_text.trim()));
     }
     atoms
 }
@@ -753,6 +754,20 @@ mod tests {
         assert!(call_pos < result_pos);
         assert!(result_pos < done_pos);
         assert!(!body.contains("aggregate text should not be appended"));
+    }
+
+    #[test]
+    fn build_turn_summarization_messages_strips_host_notices_from_text_only_turn() {
+        let recap = crate::host_notice::render_turn_recap(
+            &[],
+            &crate::tool_loop::LoopStop::Completed { had_text: true },
+        );
+        let t = turn("what happened?", &format!("The model answer.{recap}"));
+        let msgs = build_turn_summarization_messages(&t);
+        let body = msgs[1].text_content().unwrap();
+        assert!(body.contains("Assistant: The model answer."));
+        assert!(!body.contains("Anvil Recap"));
+        assert!(!body.contains("Files changed"));
     }
 
     #[test]
