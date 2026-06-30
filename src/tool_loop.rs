@@ -2199,6 +2199,30 @@ pub(crate) async fn run(
                 }
             }
             Err(e) => {
+                // A user-initiated cancellation surfaces here only when the
+                // cancel token fired during the pre-stream HTTP send/retry phase:
+                // `send_with_retries` bails with "... was cancelled while sending
+                // request" rather than returning a response. (The streaming phase
+                // breaks cleanly with whatever partial text it has, and the
+                // tool-exec path already maps `outcome.cancelled` to a clean exit.)
+                // That is not an LLM failure -- don't stream an `**Error:**` line
+                // or set `llm_failure` (which would make an autonomous driver back
+                // off and retry). Treat it like every other cancellation: a clean
+                // `LoopStop::Cancelled`, mirroring the pre-turn check above.
+                if cancel.is_cancelled() {
+                    if let Some(config) = p2t_config.as_ref() {
+                        p2t::append_debug_trace(
+                            &config.step_trace_out,
+                            "loop_break_cancelled",
+                            serde_json::json!({
+                                "turn": turn,
+                                "steps_executed": p2t_steps_executed,
+                            }),
+                        );
+                    }
+                    clean_exit = Some(LoopStop::Cancelled);
+                    break;
+                }
                 trace_llm_error(turn, &e);
                 if let Some(config) = p2t_config.as_ref() {
                     p2t::append_debug_trace(
