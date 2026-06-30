@@ -102,6 +102,35 @@ fn tool_call_to_replay(call: &ToolCall) -> ToolCallReplay {
     }
 }
 
+fn normalize_llm_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .map(|mut call| {
+            match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+                Ok(normalized) => {
+                    if normalized.repaired {
+                        tracing::warn!(
+                            tool_call_id = %call.id,
+                            tool_name = %call.function.name,
+                            "repaired malformed LLM tool-call arguments before dispatch"
+                        );
+                        call.function.arguments = normalized.arguments;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        tool_call_id = %call.id,
+                        tool_name = %call.function.name,
+                        error = %err,
+                        "leaving unrepaired LLM tool-call arguments before dispatch"
+                    );
+                }
+            }
+            call
+        })
+        .collect()
+}
+
 fn record_tool_result(
     tool_exchanges: &mut Vec<ToolExchange>,
     replay_events: &mut Vec<TurnReplayEvent>,
@@ -1971,6 +2000,7 @@ pub(crate) async fn run(
                 calls,
                 usage,
             }) => {
+                let calls = normalize_llm_tool_calls(calls);
                 trace_llm_tool_response(turn, &text, &calls, usage);
                 if let Some(config) = p2t_config.as_ref() {
                     p2t::append_debug_trace(
@@ -2397,54 +2427,67 @@ async fn execute_step_tool_calls(
         let tool_name = call.function.name.clone();
         let kind = ToolRegistry::tool_kind(&tool_name);
 
-        let parsed_input = match serde_json::from_str::<Value>(&call.function.arguments) {
-            Ok(v) => v,
-            Err(e) => {
-                let reason = format!(
-                    "Error: tool arguments are not valid JSON ({e}). \
+        let normalized_arguments =
+            match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+                Ok(normalized) => {
+                    if normalized.repaired {
+                        tracing::warn!(
+                            session_id,
+                            tool_call_id = %call.id,
+                            tool_name = %tool_name,
+                            "repaired malformed tool-call arguments at dispatch"
+                        );
+                    }
+                    normalized
+                }
+                Err(e) => {
+                    let reason = format!(
+                        "Error: tool arguments are not valid JSON ({e}). \
                      Please retry with a valid JSON object matching the tool schema."
-                );
-                maybe_send_session_update(
-                    notifications,
-                    spawned_cx.cx(),
-                    session_id,
-                    SessionUpdate::ToolCall(announce::initial_tool_call(
-                        &call.id,
-                        &tool_name,
-                        kind,
-                        &Value::String(call.function.arguments.clone()),
-                    )),
-                );
-                maybe_send_session_update(
-                    notifications,
-                    spawned_cx.cx(),
-                    session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_failed(
-                        &call.id,
-                        &reason,
-                        Some(Value::String(reason.clone())),
-                    )),
-                );
-                messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
-                step_results.push(p2t::PrefixToolResult {
-                    call_id: call.id.clone(),
-                    content: reason.clone(),
-                });
-                record_tool_result(
-                    tool_exchanges,
-                    replay_events,
-                    ToolExchange {
+                    );
+                    maybe_send_session_update(
+                        notifications,
+                        spawned_cx.cx(),
+                        session_id,
+                        SessionUpdate::ToolCall(announce::initial_tool_call(
+                            &call.id,
+                            &tool_name,
+                            kind,
+                            &Value::String(call.function.arguments.clone()),
+                        )),
+                    );
+                    maybe_send_session_update(
+                        notifications,
+                        spawned_cx.cx(),
+                        session_id,
+                        SessionUpdate::ToolCallUpdate(announce::update_failed(
+                            &call.id,
+                            &reason,
+                            Some(Value::String(reason.clone())),
+                        )),
+                    );
+                    messages.push(ChatMessage::tool_result(&call.id, &tool_name, &reason));
+                    step_results.push(p2t::PrefixToolResult {
                         call_id: call.id.clone(),
-                        tool_name: tool_name.clone(),
-                        arguments: call.function.arguments.clone(),
-                        result: reason,
-                        status: ToolExchangeStatus::Failed,
-                        diff: None,
-                    },
-                );
-                continue;
-            }
-        };
+                        content: reason.clone(),
+                    });
+                    record_tool_result(
+                        tool_exchanges,
+                        replay_events,
+                        ToolExchange {
+                            call_id: call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            result: reason,
+                            status: ToolExchangeStatus::Failed,
+                            diff: None,
+                        },
+                    );
+                    continue;
+                }
+            };
+        let parsed_input = normalized_arguments.value;
+        let normalized_arguments = normalized_arguments.arguments;
 
         // Whether this call asked to run outside the OS sandbox. Tracked so the
         // server-side audit trail records both approvals and denials of a
@@ -2548,7 +2591,7 @@ async fn execute_step_tool_calls(
                 ToolExchange {
                     call_id: call.id.clone(),
                     tool_name: tool_name.clone(),
-                    arguments: call.function.arguments.clone(),
+                    arguments: normalized_arguments.clone(),
                     result: message,
                     status: ToolExchangeStatus::Failed,
                     diff: None,
@@ -2592,7 +2635,7 @@ async fn execute_step_tool_calls(
                 ToolExchange {
                     call_id: call.id.clone(),
                     tool_name: tool_name.clone(),
-                    arguments: call.function.arguments.clone(),
+                    arguments: normalized_arguments.clone(),
                     result: message,
                     status: ToolExchangeStatus::Failed,
                     diff: None,
@@ -2688,7 +2731,7 @@ async fn execute_step_tool_calls(
                 tracing::info!(
                     "executing tool {} with args: {} (sandbox={:?}, outside_sandbox_once={})",
                     tool_name,
-                    call.function.arguments,
+                    normalized_arguments,
                     policy,
                     outside_sandbox_once
                 );
@@ -2819,7 +2862,7 @@ async fn execute_step_tool_calls(
             ToolExchange {
                 call_id: call.id.clone(),
                 tool_name: tool_name.clone(),
-                arguments: call.function.arguments.clone(),
+                arguments: normalized_arguments.clone(),
                 result: output,
                 status,
                 diff: replay_diff,
