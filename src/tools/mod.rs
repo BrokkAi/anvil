@@ -1,6 +1,7 @@
 mod filesystem;
 pub mod sandbox;
 mod shell;
+pub(crate) mod web;
 
 use crate::agents::AgentRegistry;
 use crate::llm_client::{FunctionDef, ToolDefinition};
@@ -133,6 +134,17 @@ struct ActivateSkillArgs {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    count: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    allowed_domains: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    blocked_domains: Option<Vec<String>>,
+}
+
 #[cfg(test)]
 trait BuiltinArgsContract {
     const REQUIRED_FIELDS: &'static [&'static str];
@@ -211,6 +223,17 @@ impl BuiltinArgsContract for ActivateSkillArgs {
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[("name", "string")];
 }
 
+#[cfg(test)]
+impl BuiltinArgsContract for WebSearchArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["query"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
+        ("query", "string"),
+        ("count", "integer"),
+        ("allowed_domains", "array"),
+        ("blocked_domains", "array"),
+    ];
+}
+
 fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -280,6 +303,20 @@ const TOOLS: &[ToolMeta] = &[
         name: "run_shell_command",
         kind: ToolKind::Execute,
         display_name: "Running shell command",
+    },
+    // Outbound network read. Deliberately classified `Other` (NOT `Fetch`) so
+    // the permission gate does not silently auto-approve it: the call is routed
+    // through approval -- prompted in `default`, evaluated by the permission
+    // auto-classifier in `auto`, refused in `readOnly` -- so a search request
+    // can be judged for danger before it leaves the machine. (The classifier
+    // sees the query and domain filters, not the result URLs, which do not
+    // exist until after the search runs.) It reaches the web in-process,
+    // bypassing the shell sandbox's network block, and is limited to search
+    // snippets -- no arbitrary URL fetch.
+    ToolMeta {
+        name: "web_search",
+        kind: ToolKind::Other,
+        display_name: "Searching the web",
     },
     // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
     // Listed here so the permission gate can classify them; their actual
@@ -552,6 +589,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_directory",
     "grep_search",
     "run_shell_command",
+    "web_search",
 ];
 
 fn is_builtin_tool(name: &str) -> bool {
@@ -895,6 +933,42 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": shell_properties,
                     "required": ["command"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("web_search") {
+            defs.push(tool_def(
+                "web_search",
+                "Search the public web and return ranked results (title, URL, and a short \
+                 snippet) for a natural-language or keyword query. Use it to find current \
+                 information, library/API documentation, error messages, or anything outside \
+                 the local workspace and your own knowledge. Returns snippets only, not full \
+                 page contents; if you need a result's full text, read its URL with another \
+                 tool. Backed by a keyless DuckDuckGo backend that can rate-limit or omit \
+                 results intermittently, so an empty result set is normal -- rephrase or retry.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query. Use natural language or keywords as you would in a search engine."
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (1-20). Defaults to 10."
+                        },
+                        "allowed_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Only include results whose host is (or is a subdomain of) one of these domains, e.g. \"docs.rs\". Mutually exclusive with blocked_domains."
+                        },
+                        "blocked_domains": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exclude results whose host is (or is a subdomain of) one of these domains. Mutually exclusive with allowed_domains."
+                        }
+                    },
+                    "required": ["query"]
                 }),
             ));
         }
@@ -1265,6 +1339,20 @@ impl ToolRegistry {
                     timeout_seconds,
                     policy,
                     outside_sandbox_once,
+                    cancel,
+                )
+                .await
+            }
+            "web_search" => {
+                let args: WebSearchArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                web::run_web_search(
+                    &args.query,
+                    args.count,
+                    args.allowed_domains,
+                    args.blocked_domains,
                     cancel,
                 )
                 .await
@@ -2025,6 +2113,7 @@ mod tests {
         assert_builtin_schema_matches::<ListDirectoryArgs>(&defs, "list_directory");
         assert_builtin_schema_matches::<GrepSearchArgs>(&defs, "grep_search");
         assert_builtin_schema_matches::<RunShellCommandArgs>(&defs, "run_shell_command");
+        assert_builtin_schema_matches::<WebSearchArgs>(&defs, "web_search");
         assert_builtin_schema_matches::<ActivateSkillArgs>(&defs, "activate_skill");
     }
 

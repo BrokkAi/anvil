@@ -2890,6 +2890,24 @@ async fn execute_step_tool_calls(
                         output: outcome.output,
                         failed: outcome.failed,
                     }
+                } else if tool_name == "web_search" {
+                    // Vet the returned result URLs for danger with a disposable
+                    // safety-classifier turn before the model sees them: the
+                    // permission gate can only judge the query up front, not the
+                    // URLs the search returns. Fails closed (withholds) on error.
+                    let outcome = crate::tools::web::run_web_search_vetted(
+                        llm,
+                        model,
+                        idle_timeout,
+                        &parsed_input,
+                        &cancel,
+                    )
+                    .await;
+                    turn_usage.add(outcome.usage);
+                    ToolExecution {
+                        output: outcome.output,
+                        failed: outcome.failed,
+                    }
                 } else {
                     trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
                     execute_tool(

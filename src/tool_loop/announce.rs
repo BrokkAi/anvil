@@ -377,6 +377,7 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     let file_path = raw_input.get("file_path").and_then(Value::as_str);
     let pattern = raw_input.get("pattern").and_then(Value::as_str);
     let command = raw_input.get("command").and_then(Value::as_str);
+    let query = raw_input.get("query").and_then(Value::as_str);
 
     match tool_name {
         "read_file" => file_path
@@ -396,6 +397,9 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
             .unwrap_or_else(|| display.to_string()),
         "run_shell_command" => command
             .map(|c| format!("Run `{}`", first_line(c)))
+            .unwrap_or_else(|| display.to_string()),
+        "web_search" => query
+            .map(|q| format!("Search the web for `{}`", first_line(q)))
             .unwrap_or_else(|| display.to_string()),
         "task" => {
             // Prefer the human-readable `description` (short label) over
