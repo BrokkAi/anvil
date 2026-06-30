@@ -731,6 +731,10 @@ pub struct Session {
     /// Set via `/idle-timeout <secs>`, cleared via `/idle-timeout default`.
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
+    /// Whether Anvil appends its host-generated recap after normal model turns.
+    /// Seeded from install-level setup state for new and reloaded sessions, but
+    /// not stored in workspace session zips.
+    pub turn_recap_enabled: bool,
     /// Additional per-session MCP servers supplied by ACP `session/new`.
     /// These are additive to Anvil's canonical Bifrost setup from the
     /// install-level `/mcp` configuration or the built-in default.
@@ -885,6 +889,7 @@ impl Session {
             always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
             idle_timeout_secs: None,
+            turn_recap_enabled: true,
             mcp_servers: None,
             project_instructions,
             skills,
@@ -974,6 +979,7 @@ impl Session {
             selected_reasoning_effort: None,
             // Same rationale: idle timeout override is in-memory only.
             idle_timeout_secs: None,
+            turn_recap_enabled: true,
             mcp_servers,
             project_instructions,
             skills,
@@ -2893,6 +2899,19 @@ impl SessionStore {
         }
     }
 
+    fn remember_turn_recap_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .turn_recap_enabled = Some(enabled);
+                Ok(())
+            }
+            None => crate::setup_state::remember_turn_recap_enabled(enabled),
+        }
+    }
+
     async fn remove_resident_sessions(&self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -3134,6 +3153,7 @@ impl SessionStore {
         );
         let permission_mode = prefs.last_permission_mode.unwrap_or_default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
+        let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let mut session = match sandbox_mode {
             Some(mode) => Session::new_with_sandbox_mode(
                 id.clone(),
@@ -3157,6 +3177,7 @@ impl SessionStore {
         session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
         session.permission_mode = permission_mode;
+        session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
 
         // Write to disk on a blocking worker so we don't stall the tokio runtime.
@@ -3273,6 +3294,7 @@ impl SessionStore {
         let prefs = self.setup_state_snapshot();
         let permission_mode = prefs.last_permission_mode.unwrap_or_default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
+        let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let manifest_additional_directories =
             executable_additional_directories_from_manifest(&manifest);
         let loaded_session = match sandbox_mode {
@@ -3305,6 +3327,7 @@ impl SessionStore {
             }
         };
         session.permission_mode = permission_mode;
+        session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
             let _lifecycle = self.lifecycle_lock.lock().await;
@@ -3431,6 +3454,7 @@ impl SessionStore {
             Ok(s) => s,
             Err(e) => return ForkOutcome::Failed(format!("{e}")),
         };
+        forked.turn_recap_enabled = source.turn_recap_enabled;
         forked.set_always_allow_keys(load_repo_always_allow_keys(&forked.permission_scope_root));
 
         self.sessions
@@ -3749,6 +3773,38 @@ impl SessionStore {
             .await
             .get(id)
             .map(|s| s.permission_mode)
+    }
+
+    /// Enable or disable host-generated turn recaps for this session, and
+    /// remember the choice for future new/reloaded sessions.
+    pub async fn set_turn_recap_enabled(&self, id: &str, enabled: bool) -> bool {
+        let updated = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get_mut(id) {
+                Some(session) => {
+                    session.turn_recap_enabled = enabled;
+                    true
+                }
+                None => false,
+            }
+        };
+        if updated && let Err(e) = self.remember_turn_recap_enabled(enabled) {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist turn recap preference: {e:#}"
+            );
+        }
+        updated
+    }
+
+    /// Read whether host-generated turn recaps are enabled for this session.
+    /// Returns None if the session is unknown.
+    pub async fn turn_recap_enabled(&self, id: &str) -> Option<bool> {
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .map(|s| s.turn_recap_enabled)
     }
 
     /// Update the session's sandbox mode override. Returns false if the
@@ -6527,6 +6583,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd");
         let source = store.create_session(cwd.path().to_path_buf()).await;
         let src_id = source.id.clone();
+        assert!(store.set_turn_recap_enabled(&src_id, false).await);
         store
             .maybe_rename_from_prompt(&src_id, "Source session")
             .await
@@ -6551,6 +6608,7 @@ mod tests {
         assert_ne!(fork_id, src_id, "fork must have a fresh id");
         assert_eq!(forked.history.len(), 1, "fork copies the source history");
         assert_eq!(forked.history[0].user_prompt, "u1");
+        assert!(!forked.turn_recap_enabled, "fork inherits recap preference");
         assert!(
             session_zip_path(cwd.path(), &fork_id).exists(),
             "fork archive must be persisted"
@@ -6581,6 +6639,10 @@ mod tests {
             .get_session(&fork_id, cwd.path())
             .await
             .expect("fork present");
+        assert!(
+            !fork_after.turn_recap_enabled,
+            "fork keeps inherited recap preference"
+        );
         assert_eq!(
             fork_after.history.len(),
             2,

@@ -272,29 +272,6 @@ impl LoopStop {
     }
 }
 
-/// Prefix on every loop-stop closing notice (see [`render_loop_stop`]). It is
-/// our own marker, never model output, so the LLM-history builder can split a
-/// persisted `agent_response` back into "what the model produced" + "our closing
-/// notice" and replay only the former to the model. The transcript replay path
-/// keeps the whole string.
-pub(crate) const STOP_NOTICE_SENTINEL: &str = "\n⏹ ";
-
-/// The portion of a persisted `agent_response` the model actually produced, with
-/// any trailing loop-stop notice removed.
-///
-/// The notice is appended to `agent_response` so it survives `session/load` in
-/// the transcript, but it must not be fed back to the model as its own prior
-/// words. History reconstruction calls this; transcript replay does not. The
-/// notice is always the trailing segment (appended last, after all model text),
-/// so the split is at the last [`STOP_NOTICE_SENTINEL`]; a model that never emits
-/// that marker is returned unchanged.
-pub(crate) fn agent_response_without_stop_notice(agent_response: &str) -> &str {
-    match agent_response.rfind(STOP_NOTICE_SENTINEL) {
-        Some(index) => &agent_response[..index],
-        None => agent_response,
-    }
-}
-
 /// Everything a [`run`] invocation produces. A named struct rather than a
 /// positional tuple so call sites read by field (`outcome.stop`) instead of
 /// by position.
@@ -2228,14 +2205,14 @@ pub(crate) async fn run(
     // assistant text on `session/load`. It is appended after all model text, so
     // `replayed_assistant_text` stays a prefix of `agent_response` and the notice
     // is not double-sent. The LLM-history builder strips it again via
-    // `agent_response_without_stop_notice` so it is never fed back to the model.
+    // `host_notice::model_visible_assistant_text` so it is never fed back to the model.
     //
     // Safety: the notice is appended only for `MaxTurns` and an empty `Completed`,
     // never when the model produced a real final answer (`Completed { had_text:
     // true }`). So a successful structured-output JSON is never polluted, and the
     // subagent -- which keys its empty/turn-limit handling on the returned
     // `LoopStop`, not on text emptiness -- cannot mistake the notice for a result.
-    if surface_notice && let Some(notice) = render_loop_stop(&stop) {
+    if surface_notice && let Some(notice) = crate::host_notice::render_loop_stop(&stop) {
         if let Ok(mut cb) = on_text.lock() {
             cb(&notice);
         }
@@ -2274,24 +2251,6 @@ fn resolve_loop_stop(
         LoopStop::Completed {
             had_text: full_response_has_text,
         }
-    }
-}
-
-/// The user-facing closing line for an otherwise-silent termination, or `None`
-/// when the stop reason needs no narration (a real final answer, an LLM failure
-/// that already streamed its error, or a cancellation -- which is surfaced at
-/// the responder instead). Every notice begins with [`STOP_NOTICE_SENTINEL`] so
-/// the LLM-history builder can split it back off the persisted `agent_response`.
-pub(crate) fn render_loop_stop(stop: &LoopStop) -> Option<String> {
-    match stop {
-        LoopStop::MaxTurns { max_turns } => Some(format!(
-            "{STOP_NOTICE_SENTINEL}Stopped: reached the {max_turns}-turn limit before the model \
-             finished. Send another message to continue, or restart with a higher `--max-turns`.\n"
-        )),
-        LoopStop::Completed { had_text: false } => Some(format!(
-            "{STOP_NOTICE_SENTINEL}Stopped: the model ended the turn without a final message.\n"
-        )),
-        LoopStop::Completed { had_text: true } | LoopStop::Cancelled | LoopStop::Failed(_) => None,
     }
 }
 
@@ -4273,51 +4232,6 @@ mod tests {
         assert!(matches!(stop, LoopStop::Completed { had_text: true }));
         let stop = resolve_loop_stop(None, None, false, 10, false);
         assert!(matches!(stop, LoopStop::Completed { had_text: false }));
-    }
-
-    #[test]
-    fn render_loop_stop_only_narrates_silent_terminations() {
-        let max =
-            render_loop_stop(&LoopStop::MaxTurns { max_turns: 7 }).expect("MaxTurns is narrated");
-        assert!(max.starts_with(STOP_NOTICE_SENTINEL));
-        assert!(max.contains("reached the 7-turn limit"));
-
-        let empty = render_loop_stop(&LoopStop::Completed { had_text: false })
-            .expect("empty completion is narrated");
-        assert!(empty.starts_with(STOP_NOTICE_SENTINEL));
-
-        // A real answer, a cancellation, and a failure are NOT narrated here.
-        assert!(render_loop_stop(&LoopStop::Completed { had_text: true }).is_none());
-        assert!(render_loop_stop(&LoopStop::Cancelled).is_none());
-        assert!(
-            render_loop_stop(&LoopStop::Failed(TurnFailure {
-                retryable: true,
-                message: "x".into(),
-            }))
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn agent_response_strips_only_the_trailing_stop_notice() {
-        // Model text followed by an appended MaxTurns notice: history keeps only
-        // the model's words.
-        let notice = render_loop_stop(&LoopStop::MaxTurns { max_turns: 3 }).unwrap();
-        let persisted = format!("the model's real answer{notice}");
-        assert_eq!(
-            agent_response_without_stop_notice(&persisted),
-            "the model's real answer"
-        );
-
-        // An empty-completion turn persists only the notice -> nothing for history.
-        let only_notice = render_loop_stop(&LoopStop::Completed { had_text: false }).unwrap();
-        assert_eq!(agent_response_without_stop_notice(&only_notice), "");
-
-        // Plain model text with no notice is returned unchanged.
-        assert_eq!(
-            agent_response_without_stop_notice("just a normal answer"),
-            "just a normal answer"
-        );
     }
 
     #[test]
