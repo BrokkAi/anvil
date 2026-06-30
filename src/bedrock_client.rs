@@ -1347,17 +1347,63 @@ fn parse_bedrock_image_source(image_url: &str) -> Result<BedrockImageSource> {
 fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockTool> {
     let mut converted: Vec<BedrockTool> = tools
         .into_iter()
-        .map(|tool| BedrockTool {
-            name: tool.function.name,
-            description: tool.function.description,
-            input_schema: tool.function.parameters,
-            cache_control: None,
+        .map(|tool| {
+            let name = tool.function.name;
+            let input_schema = normalize_tool_schema_for_bedrock(&name, tool.function.parameters);
+            BedrockTool {
+                name,
+                description: tool.function.description,
+                input_schema,
+                cache_control: None,
+            }
         })
         .collect();
     if enable_cache && let Some(last) = converted.last_mut() {
         last.cache_control = Some(CACHE_CONTROL);
     }
     converted
+}
+
+/// Bedrock's Anthropic API rejects tool `input_schema` values that place a
+/// `oneOf`, `allOf`, or `anyOf` combiner at the **top level**, failing the
+/// whole request with HTTP 400 "input_schema does not support oneOf, allOf, or
+/// anyOf at the top level". Some advertised MCP tools express cross-field
+/// "exactly one of these argument groups is required" constraints exactly this
+/// way -- e.g. bifrost's `scan_usages` (top-level `anyOf`) and `rename_symbol`
+/// (top-level `oneOf`) -- so a single such tool makes every Bedrock request in
+/// the session fail before the model can answer (#212).
+///
+/// Strip only the top-level combiner keys so the request is accepted. The
+/// constraint is still conveyed to the model by the per-property descriptions
+/// and re-validated by the tool server when it runs, so dropping it from the
+/// advertised schema is a safe normalization rather than a behavior change.
+/// Nested combiners (which Bedrock *does* accept, e.g. `scan_usages`'
+/// `targets.items.anyOf`) are deliberately left intact.
+fn normalize_tool_schema_for_bedrock(
+    name: &str,
+    mut schema: serde_json::Value,
+) -> serde_json::Value {
+    let Some(obj) = schema.as_object_mut() else {
+        return schema;
+    };
+    let mut stripped: Vec<&str> = Vec::new();
+    for key in ["oneOf", "allOf", "anyOf"] {
+        if obj.remove(key).is_some() {
+            stripped.push(key);
+        }
+    }
+    if !stripped.is_empty() {
+        // Guarantee a Bedrock-valid object schema even when the combiner was the
+        // only thing describing the top-level shape.
+        obj.entry("type")
+            .or_insert_with(|| serde_json::Value::String("object".to_string()));
+        tracing::debug!(
+            tool = name,
+            combiners = ?stripped,
+            "stripped top-level JSON Schema combiner(s) unsupported by Bedrock tool input_schema"
+        );
+    }
+    schema
 }
 
 fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
@@ -1823,6 +1869,108 @@ mod tests {
         assert!(converted[1].cache_control.is_some());
         // First tool does NOT
         assert!(converted[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn strips_top_level_combiners_from_bedrock_tool_schemas() {
+        // Mirrors bifrost 0.7.0 `scan_usages` (top-level `anyOf`) and
+        // `rename_symbol` (top-level `oneOf`), which trip the Bedrock
+        // "input_schema does not support oneOf, allOf, or anyOf at the top
+        // level" HTTP 400 (#212).
+        let tools = vec![
+            ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDef {
+                    name: "scan_usages".to_string(),
+                    description: "scan".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "anyOf": [
+                            { "required": ["symbols"] },
+                            { "required": ["targets"] }
+                        ],
+                        "properties": {
+                            "symbols": { "type": "array", "items": { "type": "string" } },
+                            "targets": {
+                                "type": "array",
+                                // Nested combiner: Bedrock accepts these, so it
+                                // must survive normalization untouched.
+                                "items": {
+                                    "type": "object",
+                                    "anyOf": [
+                                        { "required": ["line"] },
+                                        { "required": ["start_byte"] }
+                                    ]
+                                }
+                            }
+                        }
+                    }),
+                },
+            },
+            ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDef {
+                    name: "rename_symbol".to_string(),
+                    description: "rename".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "oneOf": [
+                            { "required": ["line", "column"] },
+                            { "required": ["start_byte"] }
+                        ],
+                        "properties": { "new_name": { "type": "string" } },
+                        "required": ["path", "new_name"]
+                    }),
+                },
+            },
+        ];
+
+        let converted = convert_tools(tools, false);
+
+        let scan = &converted[0].input_schema;
+        assert!(
+            scan.get("anyOf").is_none(),
+            "top-level anyOf must be stripped"
+        );
+        assert_eq!(scan["type"], "object");
+        // Properties and the nested anyOf are preserved verbatim.
+        assert!(scan["properties"]["symbols"].is_object());
+        assert!(scan["properties"]["targets"]["items"]["anyOf"].is_array());
+
+        let rename = &converted[1].input_schema;
+        assert!(
+            rename.get("oneOf").is_none(),
+            "top-level oneOf must be stripped"
+        );
+        assert_eq!(rename["type"], "object");
+        // Unrelated keys (properties, required) are untouched.
+        assert_eq!(rename["required"], serde_json::json!(["path", "new_name"]));
+        assert!(rename["properties"]["new_name"].is_object());
+    }
+
+    #[test]
+    fn combiner_only_schema_becomes_object() {
+        // A schema whose top level is *only* a combiner still has to come out as
+        // a valid `{"type": "object", ...}` for Bedrock.
+        let normalized = normalize_tool_schema_for_bedrock(
+            "weird_tool",
+            serde_json::json!({
+                "allOf": [{ "properties": { "a": { "type": "string" } } }]
+            }),
+        );
+        assert!(normalized.get("allOf").is_none());
+        assert_eq!(normalized["type"], "object");
+    }
+
+    #[test]
+    fn leaves_combiner_free_schema_unchanged() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "file_path": { "type": "string" } },
+            "required": ["file_path"]
+        });
+        let normalized = normalize_tool_schema_for_bedrock("read_file", schema.clone());
+        assert_eq!(normalized, schema);
     }
 
     #[test]
