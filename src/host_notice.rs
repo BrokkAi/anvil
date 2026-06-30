@@ -10,8 +10,7 @@ use crate::session::{ToolExchange, ToolExchangeStatus};
 use crate::tool_loop::LoopStop;
 
 pub(crate) const STOP_NOTICE_SENTINEL: &str = "\n⏹ ";
-pub(crate) const TURN_RECAP_NOTICE_SENTINEL: &str =
-    "\n\n<!-- anvil:host-notice:turn-recap:v1 -->\n**Anvil Recap**\n";
+pub(crate) const TURN_RECAP_NOTICE_SENTINEL: &str = "\n\n**Anvil Recap**\n";
 
 pub(crate) fn render_loop_stop(stop: &LoopStop) -> Option<String> {
     match stop {
