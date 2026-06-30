@@ -5808,6 +5808,8 @@ enum SetupElicitTarget {
     Sandbox,
     /// `/setup codex` (or `/setup codex login`) -> URL-mode sign-in prompt.
     CodexLogin,
+    /// `/setup openrouter` with no explicit value -> form-mode key entry.
+    OpenRouterLogin,
 }
 
 impl SetupElicitTarget {
@@ -5818,6 +5820,8 @@ impl SetupElicitTarget {
             Self::Sandbox => caps.form,
             // Codex sign-in is a url-mode (open-this-link) elicitation.
             Self::CodexLogin => caps.url,
+            // OpenRouter key entry is a form-mode (text field) elicitation.
+            Self::OpenRouterLogin => caps.form,
         }
     }
 }
@@ -5841,6 +5845,9 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
         // Bare `/setup codex` / `/setup codex login` start interactive sign-in;
         // `status` / `disconnect` are not prompts and keep the text flow.
         "codex" if rest.is_empty() || rest == "login" => Some(SetupElicitTarget::CodexLogin),
+        // Bare `/setup openrouter` collects the API key via a form field;
+        // `key <k>` / `status` / `disconnect` keep the text flow.
+        "openrouter" if rest.is_empty() => Some(SetupElicitTarget::OpenRouterLogin),
         _ => None,
     }
 }
@@ -5863,6 +5870,16 @@ async fn run_setup_elicitation(
         SetupElicitTarget::CodexLogin => {
             run_setup_codex_login_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock)
                 .await;
+        }
+        SetupElicitTarget::OpenRouterLogin => {
+            run_setup_openrouter_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+            )
+            .await;
         }
     }
 }
@@ -5956,6 +5973,85 @@ fn notify_elicitation_complete(cx: &ConnectionTo<Client>, elicitation_id: &str) 
     if let Err(e) = cx.send_notification(notification) {
         tracing::warn!("failed to send elicitation/complete: {e}");
     }
+}
+
+/// `/setup openrouter` as a form-mode key entry. Collects the API key via an
+/// elicitation text field -- which keeps the key out of the prompt transcript,
+/// unlike `/setup openrouter key <k>` -- then saves it through the same
+/// `handle_openrouter_login` writer. Decline/Cancel (and a transport error)
+/// leave credentials unchanged. When the env var owns the credential there is
+/// nothing to enter, so it just reports that, matching the text handler.
+async fn run_setup_openrouter_login_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+) {
+    let cx = spawned_cx.cx();
+
+    if crate::openrouter_auth::CredentialState::snapshot().env_owns() {
+        send_message(cx, session_id, &openrouter_env_owned_explanation());
+        return;
+    }
+
+    let request = build_openrouter_key_elicitation_request(session_id);
+    let message = match cx.send_request(request).block_task().await {
+        Ok(resp) => match resp.action {
+            ElicitationAction::Accept(accept) => {
+                let key = accept
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get("key"))
+                    .and_then(|value| match value {
+                        ElicitationContentValue::String(s) => Some(s.trim()),
+                        _ => None,
+                    })
+                    .filter(|s| !s.is_empty());
+                match key {
+                    // Reuse the existing writer/installer via the slash form so
+                    // both entry points persist + install + refresh identically.
+                    Some(key) => {
+                        handle_openrouter_login(
+                            &format!("/openrouter-login {key}"),
+                            llm,
+                            sessions,
+                            refresh_lock,
+                            Some(cx),
+                            Some(session_id),
+                        )
+                        .await
+                    }
+                    None => "No OpenRouter key entered; credentials are unchanged.".to_string(),
+                }
+            }
+            ElicitationAction::Decline | ElicitationAction::Cancel => {
+                "OpenRouter setup cancelled; credentials are unchanged.".to_string()
+            }
+            // `ElicitationAction` is `#[non_exhaustive]`.
+            _ => "OpenRouter setup did not complete; credentials are unchanged.".to_string(),
+        },
+        Err(e) => {
+            tracing::warn!("/setup openrouter elicitation failed: {e}");
+            "Setup could not show the OpenRouter key prompt; credentials are unchanged.".to_string()
+        }
+    };
+    send_message(cx, session_id, &message);
+}
+
+/// Build the form-mode `elicitation/create` request with a single required
+/// text field for the OpenRouter API key.
+fn build_openrouter_key_elicitation_request(session_id: &str) -> CreateElicitationRequest {
+    let field = StringPropertySchema::new()
+        .title("OpenRouter API key")
+        .description("Paste your key from https://openrouter.ai/keys.")
+        .min_length(1u32);
+    let schema = ElicitationSchema::new()
+        .title("OpenRouter")
+        .property("key", field, true);
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "Enter your OpenRouter API key")
 }
 
 /// `/setup sandbox` as a single-select menu. Sends an `elicitation/create`
@@ -11740,6 +11836,57 @@ mod tests {
             "got: {}",
             json["message"]
         );
+    }
+
+    /// Bare `/setup openrouter` opens the key form; `key <k>` / `status` /
+    /// `disconnect` keep the text flow.
+    #[test]
+    fn setup_elicitation_target_recognizes_openrouter_login() {
+        assert_eq!(
+            setup_elicitation_target("/setup openrouter"),
+            Some(SetupElicitTarget::OpenRouterLogin)
+        );
+        assert_eq!(
+            setup_elicitation_target("/setup openrouter key sk-or-123"),
+            None
+        );
+        assert_eq!(setup_elicitation_target("/setup openrouter status"), None);
+        assert_eq!(
+            setup_elicitation_target("/setup openrouter disconnect"),
+            None
+        );
+    }
+
+    /// OpenRouter key entry is a form-mode elicitation, so it needs `form`.
+    #[test]
+    fn openrouter_login_target_requires_form_capability() {
+        use crate::session::ClientElicitationCaps;
+        let t = SetupElicitTarget::OpenRouterLogin;
+        assert!(!t.is_supported(ClientElicitationCaps::default()));
+        assert!(!t.is_supported(ClientElicitationCaps {
+            form: false,
+            url: true,
+        }));
+        assert!(t.is_supported(ClientElicitationCaps {
+            form: true,
+            url: false,
+        }));
+    }
+
+    /// The OpenRouter request is a session-scoped form with a single required
+    /// `key` text field (free text -- no `oneOf`).
+    #[test]
+    fn openrouter_key_elicitation_request_shape() {
+        let req = build_openrouter_key_elicitation_request("sess-2");
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-2"));
+        let key = &json["requestedSchema"]["properties"]["key"];
+        assert_eq!(key["type"], "string");
+        assert!(key.get("oneOf").is_none(), "key is free text, not a select");
+        assert_eq!(key["minLength"], 1);
+        assert_eq!(json["requestedSchema"]["required"][0], "key");
     }
 
     /// Capabilities default to all-false and round-trip through the store.
