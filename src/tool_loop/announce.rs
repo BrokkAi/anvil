@@ -66,6 +66,14 @@ fn input_content_too_long_reason() -> String {
     )
 }
 
+fn permission_content_too_long_reason() -> String {
+    format!(
+        "Tool use denied: the rendered permission prompt would exceed {MAX_INLINE_OUTPUT_BYTES} \
+         bytes, which would hide part of the command from the approval dialog. Retry with a \
+         shorter command or split it into smaller steps."
+    )
+}
+
 /// Build the initial `Pending` tool call -- the card the client renders
 /// before we run the permission gate.
 ///
@@ -163,6 +171,32 @@ pub(super) fn rejection_for_oversized_input_content(
     let command = raw_input.get("command").and_then(Value::as_str)?;
     if command_input_text(command).len() > MAX_INLINE_OUTPUT_BYTES {
         Some(input_content_too_long_reason())
+    } else {
+        None
+    }
+}
+
+pub(super) fn rejection_for_oversized_permission_content(
+    tool_name: &str,
+    raw_input: &Value,
+    permission_notice: Option<&str>,
+) -> Option<String> {
+    let notice = permission_notice
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty())?;
+    let command_len = if tool_name == "run_shell_command" {
+        raw_input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(command_input_text)
+            .map(|text| text.len())
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    let separator_len = usize::from(command_len > 0) * 2;
+    if command_len + separator_len + notice.len() > MAX_INLINE_OUTPUT_BYTES {
+        Some(permission_content_too_long_reason())
     } else {
         None
     }
@@ -282,9 +316,7 @@ pub(crate) fn update_completed(
     let content = match diff {
         Some(diff) => {
             let mut content = Vec::new();
-            if let Some(notice) = permission_notice {
-                content.push(text_content(&truncate(notice)));
-            }
+            push_permission_notice_content(&mut content, permission_notice);
             content.push(ToolCallContent::Diff(diff));
             content
         }
@@ -319,12 +351,21 @@ pub(super) fn permission_request_content(
     raw_input: &Value,
     permission_notice: Option<&str>,
 ) -> Vec<ToolCallContent> {
-    let mut content = Vec::new();
-    if let Some(notice) = permission_notice {
+    let mut content = tool_input_content(tool_name, raw_input);
+    push_permission_notice_content(&mut content, permission_notice);
+    content
+}
+
+fn push_permission_notice_content(
+    content: &mut Vec<ToolCallContent>,
+    permission_notice: Option<&str>,
+) {
+    if let Some(notice) = permission_notice
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty())
+    {
         content.push(text_content(&truncate(notice)));
     }
-    content.extend(tool_input_content(tool_name, raw_input));
-    content
 }
 
 /// Human-friendly card title that shows *what* the tool is doing,
@@ -645,12 +686,24 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(
             tool_text(&content[0]),
-            "Auto permissions did not approve this tool call.\nReason: too broad."
+            "Command:\npython3 - <<'PY'\nprint('hello')\nPY"
         );
         assert_eq!(
             tool_text(&content[1]),
-            "Command:\npython3 - <<'PY'\nprint('hello')\nPY"
+            "Auto permissions did not approve this tool call.\nReason: too broad."
         );
+    }
+
+    #[test]
+    fn permission_content_guard_counts_notice_and_command_together() {
+        let command = "a".repeat(MAX_INLINE_OUTPUT_BYTES - "Command:\n".len());
+        let reason = rejection_for_oversized_permission_content(
+            "run_shell_command",
+            &json!({"command": command}),
+            Some("Auto permissions did not approve this tool call.\nReason: too broad."),
+        );
+
+        assert!(reason.is_some());
     }
 
     #[test]

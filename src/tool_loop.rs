@@ -640,6 +640,8 @@ struct PermissionScopeClassification {
     rationale: String,
 }
 
+const AUTO_PERMISSION_RATIONALE_MAX_CHARS: usize = 240;
+
 enum PermissionScopeClassifierOutcome {
     Classified {
         classification: PermissionScopeClassification,
@@ -2499,6 +2501,7 @@ async fn execute_step_tool_calls(
                         result: reason,
                         status: ToolExchangeStatus::Failed,
                         diff: None,
+                        permission_notice: None,
                     },
                 );
                 continue;
@@ -2558,6 +2561,7 @@ async fn execute_step_tool_calls(
                     result: reason,
                     status: ToolExchangeStatus::Failed,
                     diff: None,
+                    permission_notice: None,
                 },
             );
             continue;
@@ -2611,6 +2615,7 @@ async fn execute_step_tool_calls(
                     result: message,
                     status: ToolExchangeStatus::Failed,
                     diff: None,
+                    permission_notice: None,
                 },
             );
             continue;
@@ -2655,6 +2660,7 @@ async fn execute_step_tool_calls(
                     result: message,
                     status: ToolExchangeStatus::Failed,
                     diff: None,
+                    permission_notice: None,
                 },
             );
             continue;
@@ -2683,7 +2689,7 @@ async fn execute_step_tool_calls(
         turn_usage.add(decision.usage);
         let decision = decision.decision;
 
-        let (output, status, replay_diff) = match decision {
+        let (output, status, replay_diff, permission_notice) = match decision {
             GateDecision::Reject {
                 message,
                 permission_notice,
@@ -2708,7 +2714,7 @@ async fn execute_step_tool_calls(
                         Some(Value::String(message.clone())),
                     )),
                 );
-                (message, ToolExchangeStatus::Failed, None)
+                (message, ToolExchangeStatus::Failed, None, permission_notice)
             }
             GateDecision::Allow {
                 sandbox_policy_override,
@@ -2870,7 +2876,7 @@ async fn execute_step_tool_calls(
                     session_id,
                     SessionUpdate::ToolCallUpdate(update),
                 );
-                (exec.output, status, replay_diff)
+                (exec.output, status, replay_diff, permission_notice)
             }
         };
 
@@ -2889,6 +2895,7 @@ async fn execute_step_tool_calls(
                 result: output,
                 status,
                 diff: replay_diff,
+                permission_notice,
             },
         );
     }
@@ -3154,10 +3161,9 @@ async fn consult_gate(
                             "did not approve this tool call; manual approval is required",
                             &classification.rationale,
                         ));
-                        let rejected_permission_notice = permission_notice.clone();
                         // Preserve token accounting while falling back to the human prompt.
                         return GateOutcome {
-                            decision: match request_user_permission_with_evaluation(
+                            decision: request_user_permission_or_reject(
                                 sessions,
                                 spawned_cx,
                                 cancel,
@@ -3166,14 +3172,7 @@ async fn consult_gate(
                                 escalation_requested,
                                 permission_notice,
                             )
-                            .await
-                            {
-                                Ok(decision) => decision,
-                                Err(reason) => GateDecision::Reject {
-                                    message: reason,
-                                    permission_notice: rejected_permission_notice,
-                                },
-                            },
+                            .await,
                             usage,
                         };
                     }
@@ -3191,9 +3190,8 @@ async fn consult_gate(
                     }
                 }
             }
-            let rejected_permission_notice = permission_notice.clone();
             GateOutcome::without_usage(
-                match request_user_permission_with_evaluation(
+                request_user_permission_or_reject(
                     sessions,
                     spawned_cx,
                     cancel,
@@ -3202,16 +3200,38 @@ async fn consult_gate(
                     escalation_requested,
                     permission_notice,
                 )
-                .await
-                {
-                    Ok(decision) => decision,
-                    Err(reason) => GateDecision::Reject {
-                        message: reason,
-                        permission_notice: rejected_permission_notice,
-                    },
-                },
+                .await,
             )
         }
+    }
+}
+
+async fn request_user_permission_or_reject(
+    sessions: &SessionStore,
+    spawned_cx: &SpawnedCx<'_>,
+    cancel: &CancellationToken,
+    request: GateCheck<'_>,
+    evaluation: PureGateEvaluation,
+    escalation_requested: bool,
+    permission_notice: Option<String>,
+) -> GateDecision {
+    let rejected_permission_notice = permission_notice.clone();
+    match request_user_permission_with_evaluation(
+        sessions,
+        spawned_cx,
+        cancel,
+        request,
+        evaluation,
+        escalation_requested,
+        permission_notice,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(message) => GateDecision::Reject {
+            message,
+            permission_notice: rejected_permission_notice,
+        },
     }
 }
 
@@ -3225,7 +3245,38 @@ fn should_run_permission_auto_classifier(
 }
 
 fn auto_permission_notice(action: &str, rationale: &str) -> String {
-    format!("Auto permissions {action}.\nReason: {}", rationale.trim())
+    let rationale = sanitize_permission_rationale(rationale);
+    let rationale = if rationale.is_empty() {
+        "no rationale provided".to_string()
+    } else {
+        rationale
+    };
+    format!("Auto permissions {action}.\nReason: {rationale}")
+}
+
+fn sanitize_permission_rationale(rationale: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_space = false;
+    for ch in rationale.chars() {
+        let normalized = if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if normalized == ' ' {
+            if out.is_empty() || last_was_space {
+                continue;
+            }
+            last_was_space = true;
+        } else {
+            last_was_space = false;
+        }
+        if out.chars().count() >= AUTO_PERMISSION_RATIONALE_MAX_CHARS {
+            break;
+        }
+        out.push(normalized);
+    }
+    out.trim().to_string()
 }
 
 async fn request_user_permission_with_evaluation(
@@ -3371,13 +3422,14 @@ async fn classify_permission_scope_with_model(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
-            let rationale = format!("the auto-classifier request failed: {error:#}.");
             tracing::warn!(
                 session_id = request.session_id,
                 tool_name = request.tool_name,
                 "permission auto-classifier failed; falling back to user prompt: {error:#}"
             );
-            return PermissionScopeClassifierOutcome::Unavailable(rationale);
+            return PermissionScopeClassifierOutcome::Unavailable(
+                "the auto-classifier request failed.".to_string(),
+            );
         }
     };
     let usage = response.usage();
@@ -3407,9 +3459,9 @@ async fn classify_permission_scope_with_model(
                 output = %output,
                 "permission auto-classifier returned invalid JSON; falling back to user prompt"
             );
-            PermissionScopeClassifierOutcome::Unavailable(format!(
-                "the auto-classifier returned invalid JSON: {output}"
-            ))
+            PermissionScopeClassifierOutcome::Unavailable(
+                "the auto-classifier returned invalid JSON.".to_string(),
+            )
         }
     }
 }
@@ -3446,6 +3498,7 @@ fn permission_classifier_schema() -> &'static StructuredOutputRequest {
                 },
                 "rationale": {
                     "type": "string",
+                    "maxLength": AUTO_PERMISSION_RATIONALE_MAX_CHARS,
                     "description": "A short reason for the decision."
                 }
             }
@@ -3454,8 +3507,10 @@ fn permission_classifier_schema() -> &'static StructuredOutputRequest {
 }
 
 fn parse_permission_scope_classification(text: &str) -> Option<PermissionScopeClassification> {
-    let classification: PermissionScopeClassification = serde_json::from_str(text.trim()).ok()?;
-    if classification.rationale.trim().is_empty() {
+    let mut classification: PermissionScopeClassification =
+        serde_json::from_str(text.trim()).ok()?;
+    classification.rationale = sanitize_permission_rationale(&classification.rationale);
+    if classification.rationale.is_empty() {
         return None;
     }
     Some(classification)
@@ -3543,6 +3598,13 @@ async fn request_user_permission(
          (tool={tool_name}, chars={})",
         title.chars().count()
     );
+    if let Some(reason) = announce::rejection_for_oversized_permission_content(
+        tool_name,
+        raw_input,
+        permission_notice.as_deref(),
+    ) {
+        return Err(reason);
+    }
     let fields = ToolCallUpdateFields::new()
         .kind(kind)
         .status(ToolCallStatus::Pending)
@@ -4686,6 +4748,24 @@ mod tests {
     }
 
     #[test]
+    fn permission_scope_classification_sanitizes_rationale() {
+        let json = serde_json::json!({
+            "allow": true,
+            "rationale": format!("first line\nsecond\tline\u{0007} {}", "x".repeat(400)),
+        })
+        .to_string();
+
+        let parsed = parse_permission_scope_classification(&json)
+            .expect("valid classifier JSON should parse");
+
+        assert!(parsed.allow);
+        assert!(!parsed.rationale.contains('\n'));
+        assert!(!parsed.rationale.contains('\t'));
+        assert!(!parsed.rationale.contains('\u{0007}'));
+        assert!(parsed.rationale.len() <= AUTO_PERMISSION_RATIONALE_MAX_CHARS);
+    }
+
+    #[test]
     fn permission_classifier_truncation_preserves_utf8_boundary() {
         let text = "é".repeat(AUTO_PERMISSION_CLASSIFIER_MAX_CHARS);
         let truncated = truncate_for_permission_classifier(&text);
@@ -4702,6 +4782,21 @@ mod tests {
             ),
             "Auto permissions did not approve this tool call; manual approval is required.\nReason: too broad"
         );
+    }
+
+    #[test]
+    fn auto_permission_notice_bounds_untrusted_rationale() {
+        let notice = auto_permission_notice(
+            "did not approve this tool call; manual approval is required",
+            &format!("line one\nline two {}", "x".repeat(400)),
+        );
+
+        let reason = notice.strip_prefix(
+            "Auto permissions did not approve this tool call; manual approval is required.\nReason: ",
+        )
+        .expect("notice prefix");
+        assert!(!reason.contains('\n'));
+        assert!(reason.len() <= AUTO_PERMISSION_RATIONALE_MAX_CHARS);
     }
 
     #[tokio::test]
