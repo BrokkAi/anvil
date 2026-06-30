@@ -16,10 +16,10 @@ not exist yet, that is stated explicitly along with the issue tracking it.
 - **One cancellation token per prompt** is shared by the parent turn, every tool
   call, and every subagent. `session/cancel` aborts all in-flight delegated
   work atomically.
-- **Bounded runtime** comes from three knobs: the per-turn ceiling
-  (`--max-turns`), the LLM idle timeout (`--llm-idle-timeout-secs`), and
-  per-shell-command timeouts. There is no separate per-tool-call wall-clock
-  timeout.
+- **Bounded runtime** comes by default from the model's own completion signal,
+  the LLM idle timeout (`--llm-idle-timeout-secs`), and per-shell-command
+  timeouts; an optional per-prompt turn ceiling (`--max-turns N`) can be set to
+  bound cost/time. There is no separate per-tool-call wall-clock timeout.
 - **Observability** for the parent's own tool calls is rich
   (`Pending → InProgress → Completed/Failed` via `session/update`), but a
   subagent's *internal* steps are intentionally **not** surfaced to the client.

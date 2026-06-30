@@ -4204,11 +4204,10 @@ async fn execute_subagent(
     let noop_text: TextSink = Arc::new(Mutex::new(|_: &str| {}));
     let noop_thought: TextSink = Arc::new(Mutex::new(|_: &str| {}));
 
-    // Cap the subagent's turn budget so a runaway delegation can't
-    // burn the parent's entire allowance (which can be 200+ turns).
-    // 25 is enough for a well-scoped focused task; if the subagent
-    // needs more, that's a sign the parent should have done the work
-    // itself or split it differently.
+    // The subagent inherits the parent's turn budget unless its own
+    // definition opts into a tighter `max_turns:` (see `subagent_max_turns`).
+    // Runaway recursion is bounded by `MAX_SUBAGENT_DEPTH` and a stuck
+    // subagent by the LLM idle timeout, not by a blanket turn cap.
     let nested_max_turns = subagent_max_turns(max_turns, meta.max_turns);
     let nested_tool_allowlist = meta
         .allowed_tools
