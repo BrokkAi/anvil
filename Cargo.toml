@@ -45,10 +45,6 @@ wasmtime-wasi = { version = "45", optional = true }
 zip = "8"
 futures = "0.3"
 regex = "1"
-# Decodes DuckDuckGo's percent-encoded redirect hrefs in the `web_search`
-# tool. Already in the dependency tree transitively (via reqwest/url); pinned
-# here so the web backend can use it directly.
-percent-encoding = "2"
 reqwest = { version = "0.13", features = ["stream", "json", "cookies", "form"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
