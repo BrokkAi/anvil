@@ -3388,8 +3388,8 @@ async fn classify_permission_scope_with_model(
          - cwd: {cwd}\n\
          - title: {action_title}\n\
          - input JSON:\n{raw_input}\n\n\
-         Decide whether the proposed tool call is clearly within the scope of \
-         the original user request.",
+         Decide whether the proposed tool call is safe to run automatically on \
+         the user's behalf, applying the rules above.",
         tool = request.tool_name,
         kind = request.kind,
         cwd = request.cwd.display(),
@@ -3467,20 +3467,29 @@ async fn classify_permission_scope_with_model(
 }
 
 const AUTO_PERMISSION_CLASSIFIER_SYSTEM_PROMPT: &str = "\
-You are a conservative permission scope classifier for a coding agent.\n\
+You are a permission gate for a coding agent working in the user's repository.\n\
+The user has delegated the task; your job is to catch only genuinely risky \
+actions, not to second-guess how the agent investigates or implements it.\n\
 Return JSON only.\n\
 \n\
-Set allow=true only when the proposed tool call is a direct, ordinary, and \
-reasonably necessary step toward the user's original request. Examples include \
-editing files the user asked to change, running focused tests, inspecting \
-nearby code, or using a helper tool whose purpose matches the task.\n\
+Default to allow=true. Approve any action that is reversible or low-impact, \
+including steps the user did not spell out: reading, listing, searching, or \
+inspecting files and directories (even outside the immediate target, even \
+speculative diagnostics), running builds, tests, linters, or formatters, and \
+ordinary edits consistent with the user's goal. A terse, vague, or open-ended \
+request is NOT a reason to deny: assume the user delegated the means, not just \
+the exact commands.\n\
 \n\
-Set allow=false when the action starts a new task, broadens the request, \
-changes credentials or secrets, performs unrelated destructive work, asks for \
-outside-sandbox execution, spends money, publishes externally, or is ambiguous.\n\
+Set allow=false only when the action is genuinely high-risk: irreversible or \
+destructive data loss (e.g. rm -rf, dropping a database, force-push, rewriting \
+history), changing credentials or secrets, spending money, publishing or \
+sending data to an external service, network or system mutations outside the \
+workspace, execution outside the sandbox, or a clear pivot to a goal the user \
+did not ask for.\n\
 \n\
-The classifier only grants one tool call. It must not approve based on what \
-would be convenient for the agent; it must be clearly covered by the user.";
+When the only objection is that the user did not explicitly request this exact \
+step, allow it. Reserve denial for concrete, demonstrable risk, and make the \
+rationale name that risk rather than the vagueness of the request.";
 
 fn permission_classifier_schema() -> &'static StructuredOutputRequest {
     static SCHEMA: std::sync::OnceLock<StructuredOutputRequest> = std::sync::OnceLock::new();
@@ -3494,7 +3503,7 @@ fn permission_classifier_schema() -> &'static StructuredOutputRequest {
             "properties": {
                 "allow": {
                     "type": "boolean",
-                    "description": "True only when the tool call is clearly within the original user request."
+                    "description": "True when the tool call is reversible or low-impact; false only for genuinely high-risk actions (irreversible data loss, credential/secret changes, spending money, external publishing, or out-of-sandbox execution)."
                 },
                 "rationale": {
                     "type": "string",
