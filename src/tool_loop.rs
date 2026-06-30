@@ -154,8 +154,19 @@ struct ToolCatalogRestrictions<'a> {
     tool_allowlist: Option<&'a HashSet<String>>,
 }
 
-/// Stream a model turn, retrying transient failures (network disconnect,
-/// truncated stream, server overload/5xx/429) up to [`LLM_MAX_ATTEMPTS`].
+/// A model turn that completed with neither visible text nor a tool call -- the
+/// "ended the turn without a final message" symptom. It is a transient model
+/// glitch, not an answer, so [`stream_chat_with_transient_retry`] re-rolls it on
+/// the same budget as a dropped stream.
+fn is_empty_completion(response: &LlmResponse) -> bool {
+    matches!(response, LlmResponse::Text { text, .. } if text.trim().is_empty())
+}
+
+/// Stream a model turn, retrying transient failures up to [`LLM_MAX_ATTEMPTS`].
+/// The retried conditions are a dropped/truncated stream or server
+/// overload/5xx/429 ([`is_retryable_llm_error`]) and an empty completion
+/// ([`is_empty_completion`]) -- a turn that produced nothing at all is just
+/// another transient failure to ride out rather than surface.
 ///
 /// Unlike a pre-stream HTTP retry, a retry here replays the whole request and
 /// re-streams from scratch -- we cannot resume an interrupted SSE body. This
@@ -163,6 +174,9 @@ struct ToolCatalogRestrictions<'a> {
 /// any text already streamed to the client may be re-emitted on the retry.
 /// We accept that cosmetic seam in exchange for surviving the outage instead of
 /// ending the turn. (A future change can dedup the replayed prefix.)
+///
+/// If the model stays empty through the final attempt, the empty response is
+/// returned as-is so the caller surfaces its end-of-turn notice.
 ///
 /// [`LLM_MAX_ATTEMPTS`]: crate::http_retry::LLM_MAX_ATTEMPTS
 #[allow(clippy::too_many_arguments)]
@@ -212,6 +226,36 @@ async fn stream_chat_with_transient_retry(
             .await;
 
         match response {
+            Ok(ref response)
+                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
+                    && !cancel.is_cancelled()
+                    && is_empty_completion(response) =>
+            {
+                let delay = crate::http_retry::retry_backoff(attempt);
+                append_trace_record(serde_json::json!({
+                    "type": "llm_retry",
+                    "turn": turn,
+                    "attempt": attempt,
+                    "max_attempts": crate::http_retry::LLM_MAX_ATTEMPTS,
+                    "phase": "stream",
+                    "reason": "empty completion (no text, no tool calls)",
+                    "delay_ms": delay.as_millis(),
+                }));
+                tracing::warn!(
+                    turn,
+                    attempt,
+                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
+                    "retrying empty model completion (the model ended the turn without a message)"
+                );
+                crate::http_retry::sleep_before_retry(
+                    "streaming LLM response",
+                    attempt,
+                    "empty completion".to_string(),
+                    Some(cancel),
+                )
+                .await?;
+                attempt += 1;
+            }
             Ok(response) => return Ok(response),
             Err(error)
                 if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
@@ -4672,6 +4716,45 @@ mod tests {
         }
     }
 
+    /// Returns an empty completion for the first `empty_attempts` calls, then a
+    /// non-empty `"ok"` response. With `empty_attempts >= LLM_MAX_ATTEMPTS` the
+    /// model never recovers, exercising the give-up path.
+    struct EmptyCompletionBackend {
+        attempts: Arc<AtomicUsize>,
+        empty_attempts: usize,
+    }
+
+    impl LlmBackend for EmptyCompletionBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            mut request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            let empty_attempts = self.empty_attempts;
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= empty_attempts {
+                    return Ok(LlmResponse::Text {
+                        text: String::new(),
+                        reasoning_content: None,
+                        usage: TokenUsage::default(),
+                    });
+                }
+                (request.on_token)("ok");
+                Ok(LlmResponse::Text {
+                    text: "ok".to_string(),
+                    reasoning_content: None,
+                    usage: TokenUsage::default(),
+                })
+            }
+            .boxed()
+        }
+    }
+
     struct StaticClassifierBackend {
         response: &'static str,
         calls: Arc<AtomicUsize>,
@@ -5099,6 +5182,78 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
         assert_eq!(output.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_empty_completion_until_recovered() {
+        // An empty model turn is re-rolled on the transient-failure budget; the
+        // second attempt answers, so the recovered text is returned.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(EmptyCompletionBackend {
+            attempts: attempts.clone(),
+            empty_attempts: 1,
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("an empty completion should retry and recover");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+        assert_eq!(output.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_returns_empty_completion_after_exhausting_attempts() {
+        // A model that stays silent through every attempt exhausts the budget;
+        // the empty response is returned as-is so the caller surfaces its
+        // end-of-turn notice instead of retrying forever.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(EmptyCompletionBackend {
+            attempts: attempts.clone(),
+            empty_attempts: usize::MAX,
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let response = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("an exhausted empty completion is returned, not an error");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            crate::http_retry::LLM_MAX_ATTEMPTS as usize
+        );
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text.is_empty()));
+        assert!(output.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

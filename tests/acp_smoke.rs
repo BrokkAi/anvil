@@ -1996,9 +1996,11 @@ fn empty_completion_is_reported_in_transcript_and_survives_reload() {
     write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
-    // One canned response with empty text -> the model ends the turn without a
-    // final message (no tool calls), i.e. `Completed { had_text: false }`.
-    let provider = start_openai_smoke_server(vec![text_sse_body("")]);
+    // An empty completion is retried on the transient-failure budget
+    // (`LLM_MAX_ATTEMPTS` = 4 total attempts), so the model must stay silent
+    // across all four attempts for the `Completed { had_text: false }` notice to
+    // surface. The retries happen inside a single turn, so `max_turns` stays 2.
+    let provider = start_openai_smoke_server(vec![text_sse_body(""); 4]);
     let mut child = spawn_anvil(
         &home,
         &config_home,
