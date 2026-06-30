@@ -11,12 +11,13 @@ use agent_client_protocol::schema::v1::{
     CancelNotification,
     CloseSessionRequest,
     CloseSessionResponse,
+    // Elicitation (unstable_elicitation): drives interactive `/setup` menus and
+    // prompts when the client advertises the capability.
+    CompleteElicitationNotification,
     ConfigOptionUpdate,
     ContentBlock,
     ContentChunk,
     Cost,
-    // Elicitation (unstable_elicitation): drives interactive `/setup` menus and
-    // prompts when the client advertises the capability.
     CreateElicitationRequest,
     CurrentModeUpdate,
     DeleteSessionRequest,
@@ -25,8 +26,10 @@ use agent_client_protocol::schema::v1::{
     ElicitationAction,
     ElicitationContentValue,
     ElicitationFormMode,
+    ElicitationId,
     ElicitationSchema,
     ElicitationSessionScope,
+    ElicitationUrlMode,
     EmbeddedResource,
     EmbeddedResourceResource,
     EnumOption,
@@ -2150,6 +2153,8 @@ pub async fn run_agent(
                             let cx_for_setup = cx.clone();
                             let sessions_for_setup = sessions_prompt.clone();
                             let session_id_for_setup = session_id.clone();
+                            let llm_for_setup = llm_login.clone();
+                            let refresh_lock_for_setup = refresh_lock_login.clone();
                             let spawn_result = cx.spawn(async move {
                                 // SAFETY: we are inside `cx.spawn`, so `block_task`
                                 // (reached via the `SpawnedCx` witness) is safe.
@@ -2160,6 +2165,8 @@ pub async fn run_agent(
                                     &spawned_cx,
                                     &sessions_for_setup,
                                     &session_id_for_setup,
+                                    &llm_for_setup,
+                                    &refresh_lock_for_setup,
                                 )
                                 .await;
                                 if let Err(e) = responder.respond(prompt_end_turn_response()) {
@@ -5080,6 +5087,66 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Post-login bookkeeping shared by the browser and elicitation Codex login
+/// paths: install the freshly-built backend, kick a background catalog
+/// refresh, and return the user-facing message. Pure aside from those two
+/// side effects, so both entry points stay byte-for-byte identical.
+fn finish_codex_login(
+    auth: crate::codex_auth::AuthDotJson,
+    llm: &Arc<MultiBackend>,
+    sessions: &SessionStore,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cx: Option<&ConnectionTo<Client>>,
+    session_id: Option<&str>,
+) -> String {
+    let acct = auth
+        .tokens
+        .as_ref()
+        .map(|t| t.account_id.as_str())
+        .unwrap_or("(unknown)");
+    // Install the new backend so this session (and any future ones) can route
+    // `codex::*` and bare model ids immediately. We only install when the auth
+    // payload resolves to a usable backend -- a malformed auth.json (e.g.
+    // apikey mode with no key) leaves the slot empty and the user-facing
+    // message stays honest about it.
+    match crate::codex_backend_from_auth(&auth) {
+        Some(backend) => {
+            llm.install_codex(backend);
+            // Refresh the cached model catalog in the background so the picker
+            // picks Codex up on the next `session/new`. Shares the same
+            // throttle as `session/new` so an immediate session creation right
+            // after login doesn't race a second probe.
+            spawn_background_refresh(
+                refresh_lock.clone(),
+                llm.clone(),
+                sessions.clone(),
+                cx.zip(session_id).map(|(cx, session_id)| {
+                    (
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Codex login...",
+                    )
+                }),
+                None,
+            );
+            format!(
+                "Codex login complete (account_id: {acct}). \
+                 Codex is now active -- create a new session \
+                 (or wait for the next discovery refresh) and \
+                 pick a `codex::*` model from the picker; \
+                 prompts route through your ChatGPT subscription \
+                 via https://chatgpt.com/backend-api/codex/responses."
+            )
+        }
+        None => format!(
+            "Codex login completed but the saved credentials are not usable \
+             (auth_mode={:?}, no OPENAI_API_KEY). Re-run `/setup codex` or \
+             inspect ~/.codex/auth.json.",
+            auth.auth_mode
+        ),
+    }
+}
+
 /// Handle the `/codex-login` slash command and its subcommands.
 /// Subcommands: bare = start interactive login, `status` = report what's
 /// stored, `disconnect` = wipe the local credentials.
@@ -5175,58 +5242,7 @@ async fn handle_codex_login(
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
         },
         "" => match crate::codex_auth::interactive_login().await {
-            Ok(auth) => {
-                let acct = auth
-                    .tokens
-                    .as_ref()
-                    .map(|t| t.account_id.as_str())
-                    .unwrap_or("(unknown)");
-                // Install the new backend so this session (and any
-                // future ones) can route `codex::*` and bare model ids
-                // immediately. We only install when the auth payload
-                // resolves to a usable backend -- a malformed auth.json
-                // (e.g. apikey mode with no key) leaves the slot empty
-                // and the user-facing message stays honest about it.
-                match crate::codex_backend_from_auth(&auth) {
-                    Some(backend) => {
-                        llm.install_codex(backend);
-                        // Refresh the cached model catalog in the
-                        // background so the picker picks Codex up on
-                        // the next `session/new` without waiting for
-                        // an unrelated discovery trigger. Shares the
-                        // same throttle as `session/new` so an
-                        // immediate session creation right after login
-                        // doesn't race a second probe.
-                        spawn_background_refresh(
-                            refresh_lock.clone(),
-                            llm.clone(),
-                            sessions.clone(),
-                            cx.zip(session_id).map(|(cx, session_id)| {
-                                (
-                                    cx.clone(),
-                                    session_id.to_string(),
-                                    "Refreshing model catalog after Codex login...",
-                                )
-                            }),
-                            None,
-                        );
-                        format!(
-                            "Codex login complete (account_id: {acct}). \
-                             Codex is now active -- create a new session \
-                             (or wait for the next discovery refresh) and \
-                             pick a `codex::*` model from the picker; \
-                             prompts route through your ChatGPT subscription \
-                             via https://chatgpt.com/backend-api/codex/responses."
-                        )
-                    }
-                    None => format!(
-                        "Codex login completed but the saved credentials are not usable \
-                         (auth_mode={:?}, no OPENAI_API_KEY). Re-run `/setup codex` or \
-                         inspect ~/.codex/auth.json.",
-                        auth.auth_mode
-                    ),
-                }
-            }
+            Ok(auth) => finish_codex_login(auth, llm, sessions, refresh_lock, cx, session_id),
             Err(e) => format!("Codex login failed: {e:#}"),
         },
         other => format!(
@@ -5790,6 +5806,8 @@ async fn handle_idle_timeout(
 enum SetupElicitTarget {
     /// `/setup sandbox` with no explicit value -> single-select form menu.
     Sandbox,
+    /// `/setup codex` (or `/setup codex login`) -> URL-mode sign-in prompt.
+    CodexLogin,
 }
 
 impl SetupElicitTarget {
@@ -5798,6 +5816,8 @@ impl SetupElicitTarget {
         match self {
             // Sandbox is a form-mode (menu) elicitation.
             Self::Sandbox => caps.form,
+            // Codex sign-in is a url-mode (open-this-link) elicitation.
+            Self::CodexLogin => caps.url,
         }
     }
 }
@@ -5818,6 +5838,9 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
     let rest = parts.next().unwrap_or("").trim();
     match sub.as_str() {
         "sandbox" if rest.is_empty() => Some(SetupElicitTarget::Sandbox),
+        // Bare `/setup codex` / `/setup codex login` start interactive sign-in;
+        // `status` / `disconnect` are not prompts and keep the text flow.
+        "codex" if rest.is_empty() || rest == "login" => Some(SetupElicitTarget::CodexLogin),
         _ => None,
     }
 }
@@ -5830,11 +5853,108 @@ async fn run_setup_elicitation(
     spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
     sessions: &SessionStore,
     session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
 ) {
     match target {
         SetupElicitTarget::Sandbox => {
             run_setup_sandbox_elicitation(spawned_cx, sessions, session_id).await;
         }
+        SetupElicitTarget::CodexLogin => {
+            run_setup_codex_login_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock)
+                .await;
+        }
+    }
+}
+
+/// Stable id for the in-flight Codex sign-in elicitation. Only one login runs
+/// at a time, so a constant id is enough to pair the `elicitation/create`
+/// request with its `elicitation/complete` notification.
+const CODEX_LOGIN_ELICITATION_ID: &str = "codex-login";
+
+/// `/setup codex` as a URL-mode sign-in prompt. Hands the ChatGPT authorize
+/// URL to the client (which opens it on the *user's* machine -- the whole
+/// point for remote/headless clients, where a server-side `webbrowser::open`
+/// would open on the wrong host), waits for the existing loopback callback to
+/// complete the OAuth exchange, then installs the backend via the shared
+/// `finish_codex_login`. Decline/Cancel (or a transport error) abort the login
+/// and leave credentials untouched.
+async fn run_setup_codex_login_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+) {
+    let cx = spawned_cx.cx();
+
+    // Present the authorize URL via url-mode elicitation instead of opening a
+    // browser on the server. `interactive_login_with` awaits this before it
+    // starts the loopback wait; returning `Err` aborts the login.
+    let result = crate::codex_auth::interactive_login_with(|auth_url| async move {
+        let request = build_codex_login_elicitation_request(session_id, auth_url);
+        match cx.send_request(request).block_task().await {
+            Ok(resp) => match resp.action {
+                ElicitationAction::Accept(_) => Ok(()),
+                ElicitationAction::Decline | ElicitationAction::Cancel => {
+                    Err(anyhow::anyhow!("sign-in was cancelled"))
+                }
+                // `ElicitationAction` is `#[non_exhaustive]`.
+                _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+            },
+            Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(auth) => {
+            // Tell the client the URL flow finished so it can dismiss any
+            // lingering prompt, then run the shared post-login bookkeeping.
+            notify_elicitation_complete(cx, CODEX_LOGIN_ELICITATION_ID);
+            let message = finish_codex_login(
+                auth,
+                llm,
+                sessions,
+                refresh_lock,
+                Some(cx),
+                Some(session_id),
+            );
+            send_message(cx, session_id, &message);
+        }
+        Err(e) => {
+            send_message(
+                cx,
+                session_id,
+                &format!("Codex login did not complete: {e:#}"),
+            );
+        }
+    }
+}
+
+/// Build the URL-mode `elicitation/create` request carrying the ChatGPT
+/// authorize URL for the client to open.
+fn build_codex_login_elicitation_request(
+    session_id: &str,
+    auth_url: String,
+) -> CreateElicitationRequest {
+    let mode = ElicitationUrlMode::new(
+        ElicitationSessionScope::new(session_id.to_string()),
+        CODEX_LOGIN_ELICITATION_ID,
+        auth_url,
+    );
+    CreateElicitationRequest::new(
+        mode,
+        "Open this link to sign in to ChatGPT, then return here.",
+    )
+}
+
+/// Notify the client that a URL-mode elicitation has completed so it can
+/// dismiss the prompt. Best-effort: a transport error is logged, not fatal.
+fn notify_elicitation_complete(cx: &ConnectionTo<Client>, elicitation_id: &str) {
+    let notification = CompleteElicitationNotification::new(ElicitationId::new(elicitation_id));
+    if let Err(e) = cx.send_notification(notification) {
+        tracing::warn!("failed to send elicitation/complete: {e}");
     }
 }
 
@@ -11566,6 +11686,60 @@ mod tests {
             form: true,
             url: false,
         }));
+    }
+
+    /// `/setup codex` and `/setup codex login` start an interactive sign-in;
+    /// `status` / `disconnect` are not prompts and keep the text flow.
+    #[test]
+    fn setup_elicitation_target_recognizes_codex_login() {
+        assert_eq!(
+            setup_elicitation_target("/setup codex"),
+            Some(SetupElicitTarget::CodexLogin)
+        );
+        assert_eq!(
+            setup_elicitation_target("/setup codex login"),
+            Some(SetupElicitTarget::CodexLogin)
+        );
+        assert_eq!(setup_elicitation_target("/setup codex status"), None);
+        assert_eq!(setup_elicitation_target("/setup codex disconnect"), None);
+    }
+
+    /// Codex sign-in is a url-mode elicitation, so it needs the client's `url`
+    /// capability; `form` alone is not enough.
+    #[test]
+    fn codex_login_target_requires_url_capability() {
+        use crate::session::ClientElicitationCaps;
+        let t = SetupElicitTarget::CodexLogin;
+        assert!(!t.is_supported(ClientElicitationCaps::default()));
+        assert!(!t.is_supported(ClientElicitationCaps {
+            form: true,
+            url: false,
+        }));
+        assert!(t.is_supported(ClientElicitationCaps {
+            form: false,
+            url: true,
+        }));
+    }
+
+    /// The Codex login request is a session-scoped url-mode elicitation
+    /// carrying the authorize URL and the stable completion id.
+    #[test]
+    fn codex_login_elicitation_request_shape() {
+        let url = "https://auth.openai.com/authorize?client_id=app&state=xyz";
+        let req = build_codex_login_elicitation_request("sess-1", url.to_string());
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "url");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-1"));
+        assert_eq!(json["elicitationId"], CODEX_LOGIN_ELICITATION_ID);
+        assert_eq!(json["url"], url);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("sign in")),
+            "got: {}",
+            json["message"]
+        );
     }
 
     /// Capabilities default to all-false and round-trip through the store.
