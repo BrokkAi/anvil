@@ -7790,7 +7790,9 @@ async fn handle_compress(
 /// `handle_compress` to report "before vs. after" savings.
 fn approximate_turn_tokens(turn: &crate::session::ConversationTurn) -> usize {
     let mut sum = crate::tokens::approximate_tokens(&turn.user_prompt);
-    sum += crate::tokens::approximate_tokens(&turn.agent_response);
+    sum += crate::tokens::approximate_tokens(crate::host_notice::model_visible_assistant_text(
+        &turn.agent_response,
+    ));
     for exchange in &turn.tool_exchanges {
         sum += crate::tokens::approximate_tokens(&exchange.tool_name);
         sum += crate::tokens::approximate_tokens(&exchange.arguments);
@@ -7819,7 +7821,9 @@ fn render_context_report(
     let mut tool_tokens = 0usize;
     for turn in &snap.history {
         user_tokens += crate::tokens::approximate_tokens(&turn.user_prompt);
-        agent_tokens += crate::tokens::approximate_tokens(&turn.agent_response);
+        agent_tokens += crate::tokens::approximate_tokens(
+            crate::host_notice::model_visible_assistant_text(&turn.agent_response),
+        );
         for exchange in &turn.tool_exchanges {
             tool_tokens += crate::tokens::approximate_tokens(&exchange.tool_name);
             tool_tokens += crate::tokens::approximate_tokens(&exchange.arguments);
@@ -9092,6 +9096,31 @@ mod tests {
     }
 
     #[test]
+    fn approximate_turn_tokens_excludes_host_notices_from_agent_response() {
+        use crate::session::ConversationTurn;
+
+        let recap = crate::host_notice::render_turn_recap(
+            &[],
+            &crate::tool_loop::LoopStop::Completed { had_text: true },
+        );
+        let plain = ConversationTurn {
+            user_prompt: "u".into(),
+            agent_response: "answer".into(),
+            ..Default::default()
+        };
+        let with_recap = ConversationTurn {
+            user_prompt: "u".into(),
+            agent_response: format!("answer{recap}"),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            approximate_turn_tokens(&with_recap),
+            approximate_turn_tokens(&plain)
+        );
+    }
+
+    #[test]
     fn shell_single_quote_escapes_embedded_quote() {
         assert_eq!(shell_single_quote("hello"), "'hello'");
         assert_eq!(shell_single_quote(""), "''");
@@ -9546,6 +9575,40 @@ mod tests {
         // when the catalog publishes one.
         assert!(report.contains("/ 200000 tokens"));
         assert!(report.contains("% used"));
+    }
+
+    #[test]
+    fn render_context_report_excludes_host_notices_from_agent_tokens() {
+        use crate::session::{ConversationTurn, SessionSnapshot};
+
+        let recap = crate::host_notice::render_turn_recap(
+            &[],
+            &crate::tool_loop::LoopStop::Completed { had_text: true },
+        );
+        let snapshot = |agent_response: String| SessionSnapshot {
+            cwd: std::path::PathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
+            mode: SessionMode::Code,
+            model: "m".into(),
+            history: vec![ConversationTurn {
+                user_prompt: "hi".into(),
+                agent_response,
+                ..Default::default()
+            }],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        };
+
+        let plain = render_context_report(&snapshot("answer".into()), PermissionMode::Default, &[]);
+        let with_recap = render_context_report(
+            &snapshot(format!("answer{recap}")),
+            PermissionMode::Default,
+            &[],
+        );
+
+        assert_eq!(with_recap, plain);
     }
 
     /// When no model is set, `/context` shows `(none)` rather than the

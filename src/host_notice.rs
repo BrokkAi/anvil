@@ -34,6 +34,18 @@ fn plural(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
+fn recap_field_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 fn describe_loop_stop_for_recap(stop: &LoopStop) -> String {
     match stop {
         LoopStop::Completed { had_text: true } => "completed".to_string(),
@@ -65,8 +77,9 @@ fn render_tool_counts(tool_exchanges: &[ToolExchange]) -> String {
     let mut names: Vec<String> = by_name
         .into_iter()
         .map(|(name, count)| {
+            let name = recap_field_text(name);
             if count == 1 {
-                name.to_string()
+                name
             } else {
                 format!("{name} x{count}")
             }
@@ -94,7 +107,7 @@ fn render_changed_files(tool_exchanges: &[ToolExchange]) -> String {
         if matches!(exchange.status, ToolExchangeStatus::Completed)
             && let Some(diff) = &exchange.diff
         {
-            paths.insert(diff.path.display().to_string());
+            paths.insert(recap_field_text(&diff.path.display().to_string()));
         }
     }
     if paths.is_empty() {
@@ -238,6 +251,38 @@ mod tests {
             recap.contains("- Tools: 2 calls (1 succeeded, 1 failed): edit, run_shell_command.")
         );
         assert!(recap.contains("- Files changed: src/lib.rs."));
+    }
+
+    #[test]
+    fn render_turn_recap_keeps_control_char_fields_single_line() {
+        let recap = render_turn_recap(
+            &[ToolExchange {
+                call_id: "c1".into(),
+                tool_name: "edit\nname".into(),
+                status: ToolExchangeStatus::Completed,
+                diff: Some(ToolExchangeDiff {
+                    path: PathBuf::from("dir/a\nb.rs"),
+                    old_text: Some("old".into()),
+                    new_text: "new".into(),
+                }),
+                ..ToolExchange::default()
+            }],
+            &LoopStop::Completed { had_text: true },
+        );
+
+        assert!(recap.contains("- Tools: 1 call (1 succeeded, 0 failed): edit\\nname."));
+        assert!(recap.contains("- Files changed: dir/a\\nb.rs."));
+        let body = recap
+            .strip_prefix(TURN_RECAP_NOTICE_SENTINEL)
+            .expect("recap starts with sentinel");
+        assert_eq!(
+            body.lines().count(),
+            3,
+            "recap body must remain line-parseable"
+        );
+
+        let persisted = format!("answer{recap}");
+        assert_eq!(model_visible_assistant_text(&persisted), "answer");
     }
 
     #[test]
