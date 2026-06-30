@@ -560,9 +560,22 @@ enum GateDecision {
         sandbox_policy_override: Option<SandboxPolicy>,
         sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
         shell_sandboxed: bool,
+        permission_notice: Option<String>,
     },
     /// Refuse the call; feed the LLM the given denial message instead.
-    Reject(String),
+    Reject {
+        message: String,
+        permission_notice: Option<String>,
+    },
+}
+
+impl GateDecision {
+    fn reject(message: impl Into<String>) -> Self {
+        Self::Reject {
+            message: message.into(),
+            permission_notice: None,
+        }
+    }
 }
 
 /// Witness type proving the holder is executing inside a `cx.spawn(...)` body.
@@ -602,6 +615,11 @@ enum PureGateDecision {
     Prompt,
 }
 
+struct PureGateDecisionWithRationale {
+    decision: PureGateDecision,
+    rationale: String,
+}
+
 struct GateOutcome {
     decision: GateDecision,
     usage: TokenUsage,
@@ -622,10 +640,19 @@ struct PermissionScopeClassification {
     rationale: String,
 }
 
+enum PermissionScopeClassifierOutcome {
+    Classified {
+        classification: PermissionScopeClassification,
+        usage: TokenUsage,
+    },
+    Unavailable(String),
+}
+
 /// Pure permission-gate logic. Given the snapshot of mode + kind + name +
 /// always-allow membership, decide whether to allow, reject, or escalate to
 /// the user. Kept separate from `consult_gate` so it can be tested in
 /// isolation.
+#[cfg(test)]
 fn pure_gate_decision(
     mode: PermissionMode,
     kind: ToolKind,
@@ -633,9 +660,23 @@ fn pure_gate_decision(
     is_always_allowed: bool,
     shell_auto_allow: bool,
 ) -> PureGateDecision {
+    pure_gate_decision_with_rationale(mode, kind, tool_name, is_always_allowed, shell_auto_allow)
+        .decision
+}
+
+fn pure_gate_decision_with_rationale(
+    mode: PermissionMode,
+    kind: ToolKind,
+    tool_name: &str,
+    is_always_allowed: bool,
+    shell_auto_allow: bool,
+) -> PureGateDecisionWithRationale {
     // bypassPermissions: trust everything. Explicit user opt-out of the gate.
     if matches!(mode, PermissionMode::BypassPermissions) {
-        return PureGateDecision::Allow;
+        return PureGateDecisionWithRationale {
+            decision: PureGateDecision::Allow,
+            rationale: "bypassPermissions mode allows tool calls without prompting.".to_string(),
+        };
     }
 
     // read-only: only allow strictly informational kinds, regardless of the
@@ -645,21 +686,29 @@ fn pure_gate_decision(
     if matches!(mode, PermissionMode::ReadOnly)
         && !matches!(kind, ToolKind::Read | ToolKind::Search | ToolKind::Fetch)
     {
-        return PureGateDecision::Reject(
-            "Tool use denied: read-only mode forbids edits, deletions, moves, shell execution, \
+        return PureGateDecisionWithRationale {
+            decision: PureGateDecision::Reject(
+                "Tool use denied: read-only mode forbids edits, deletions, moves, shell execution, \
              and any tool not classified as read/search/fetch. \
              Change the session Permission selector to a non-read-only mode to run this tool."
+                    .to_string(),
+            ),
+            rationale: "read-only mode only allows tools classified as read, search, or fetch."
                 .to_string(),
-        );
+        };
     }
 
     // Mode-independent auto-allow: pure-info kinds never mutate. In addition,
     // sandboxed shell commands that fit a conservative read-only safelist may
     // run without a prompt in the editable modes; the OS sandbox remains the
     // hard boundary for filesystem writes.
-    let auto_allow = match kind {
-        ToolKind::Read | ToolKind::Search | ToolKind::Fetch => true,
-        ToolKind::Edit if matches!(mode, PermissionMode::AcceptEdits) => true,
+    let auto_allow_rationale = match kind {
+        ToolKind::Read | ToolKind::Search | ToolKind::Fetch => {
+            Some("the tool is classified as read/search/fetch, which is auto-approved.")
+        }
+        ToolKind::Edit if matches!(mode, PermissionMode::AcceptEdits) => {
+            Some("acceptEdits mode auto-approves edit tools.")
+        }
         ToolKind::Execute
             if tool_name == "run_shell_command"
                 && matches!(
@@ -668,22 +717,32 @@ fn pure_gate_decision(
                 )
                 && shell_auto_allow =>
         {
-            true
+            Some("the sandboxed shell command matched the conservative read-only command safelist.")
         }
-        _ => false,
+        _ => None,
     };
-    if auto_allow {
-        return PureGateDecision::Allow;
+    if let Some(rationale) = auto_allow_rationale {
+        return PureGateDecisionWithRationale {
+            decision: PureGateDecision::Allow,
+            rationale: rationale.to_string(),
+        };
     }
 
     // Remembered "Always allow". `consult_gate` chooses the cache key; shell
     // commands use repo-scoped argv-prefix keys (one per sub-command), while
     // regular tools use the tool name.
     if is_always_allowed {
-        return PureGateDecision::Allow;
+        return PureGateDecisionWithRationale {
+            decision: PureGateDecision::Allow,
+            rationale: "a remembered Always allow approval matched this tool call.".to_string(),
+        };
     }
 
-    PureGateDecision::Prompt
+    PureGateDecisionWithRationale {
+        decision: PureGateDecision::Prompt,
+        rationale: "the tool call is not covered by read-only auto-approval, the shell safelist, acceptEdits mode, or a remembered Always allow approval."
+            .to_string(),
+    }
 }
 
 /// Whether the OS-sandbox read-only safelist applies in this context: an
@@ -2625,7 +2684,10 @@ async fn execute_step_tool_calls(
         let decision = decision.decision;
 
         let (output, status, replay_diff) = match decision {
-            GateDecision::Reject(message) => {
+            GateDecision::Reject {
+                message,
+                permission_notice,
+            } => {
                 if shell_escalation_requested {
                     tracing::warn!(
                         target: "audit",
@@ -2639,9 +2701,10 @@ async fn execute_step_tool_calls(
                     notifications,
                     spawned_cx.cx(),
                     session_id,
-                    SessionUpdate::ToolCallUpdate(announce::update_failed(
+                    SessionUpdate::ToolCallUpdate(announce::update_failed_with_notice(
                         &call.id,
                         &message,
+                        permission_notice.as_deref(),
                         Some(Value::String(message.clone())),
                     )),
                 );
@@ -2651,6 +2714,7 @@ async fn execute_step_tool_calls(
                 sandbox_policy_override,
                 sandbox_mode,
                 shell_sandboxed,
+                permission_notice,
             } => {
                 maybe_send_session_update(
                     notifications,
@@ -2777,6 +2841,7 @@ async fn execute_step_tool_calls(
                             &tool_name,
                             &parsed_input,
                             clean,
+                            permission_notice.as_deref(),
                             Some(Value::String(clean.to_string())),
                         ),
                         ToolExchangeStatus::Failed,
@@ -2793,6 +2858,7 @@ async fn execute_step_tool_calls(
                             &parsed_input,
                             &exec.output,
                             diff,
+                            permission_notice.as_deref(),
                         ),
                         ToolExchangeStatus::Completed,
                         replay_diff,
@@ -2853,6 +2919,7 @@ fn blocked_tool_call_updates(
 struct PureGateEvaluation {
     mode: PermissionMode,
     decision: PureGateDecision,
+    rationale: String,
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
     /// Whether read-only safelist sub-commands count as already-allowed in this
@@ -2932,7 +2999,13 @@ async fn evaluate_pure_gate(
             .is_any_always_allowed(session_id, &[tool_name.to_string()])
             .await
     };
-    let decision = pure_gate_decision(mode, kind, tool_name, is_always_allowed, shell_auto_allow);
+    let decision = pure_gate_decision_with_rationale(
+        mode,
+        kind,
+        tool_name,
+        is_always_allowed,
+        shell_auto_allow,
+    );
 
     // Codex-style explicit escalation: the model may request an outside-sandbox
     // run up front, with no prior failure required. We still reject it when
@@ -2945,7 +3018,7 @@ async fn evaluate_pure_gate(
     // fires on platforms without an OS sandbox, e.g. Windows).
     if shell_sandbox_escalation_requested
         && !shell_sandboxed
-        && !matches!(decision, PureGateDecision::Reject(_))
+        && !matches!(decision.decision, PureGateDecision::Reject(_))
     {
         return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
             .to_string());
@@ -2953,7 +3026,8 @@ async fn evaluate_pure_gate(
 
     Ok(PureGateEvaluation {
         mode,
-        decision,
+        decision: decision.decision,
+        rationale: decision.rationale,
         sandbox_mode,
         shell_sandboxed,
         safelist_credit,
@@ -2994,7 +3068,7 @@ async fn deterministic_gate_rejection(
 }
 
 /// Apply the per-call permission policy. Returns `Allow` if the tool should
-/// execute, or `Reject(msg)` to feed the LLM a denial message instead.
+/// execute, or `Reject` to feed the LLM a denial message instead.
 async fn consult_gate(
     sessions: &SessionStore,
     spawned_cx: &SpawnedCx<'_>,
@@ -3012,70 +3086,112 @@ async fn consult_gate(
     .await
     {
         Ok(evaluation) => evaluation,
-        Err(reason) => return GateOutcome::without_usage(GateDecision::Reject(reason)),
+        Err(reason) => return GateOutcome::without_usage(GateDecision::reject(reason)),
     };
 
     match evaluation.decision {
-        PureGateDecision::Allow => GateOutcome::without_usage(GateDecision::Allow {
-            sandbox_policy_override: None,
-            sandbox_mode: evaluation.sandbox_mode,
-            shell_sandboxed: evaluation.shell_sandboxed,
-        }),
-        PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::Reject(msg)),
+        PureGateDecision::Allow => {
+            let permission_notice = matches!(evaluation.mode, PermissionMode::Auto)
+                .then(|| auto_permission_notice("approved this tool call", &evaluation.rationale));
+            GateOutcome::without_usage(GateDecision::Allow {
+                sandbox_policy_override: None,
+                sandbox_mode: evaluation.sandbox_mode,
+                shell_sandboxed: evaluation.shell_sandboxed,
+                permission_notice,
+            })
+        }
+        PureGateDecision::Reject(msg) => GateOutcome::without_usage(GateDecision::reject(msg)),
         PureGateDecision::Prompt => {
             // Mirror `evaluate_pure_gate`'s shell guard: a stray
             // `sandbox_permissions` field on a non-shell tool must not be read
             // as an escalation request.
             let escalation_requested = request.tool_name == "run_shell_command"
                 && shell_sandbox_escalation_requested(request.raw_input);
-            if should_run_permission_auto_classifier(
+            let mut permission_notice = None;
+            if matches!(evaluation.mode, PermissionMode::Auto) && escalation_requested {
+                permission_notice = Some(auto_permission_notice(
+                    "cannot approve outside-sandbox shell execution; manual approval is required",
+                    "outside-sandbox execution explicitly crosses the OS sandbox boundary.",
+                ));
+            } else if should_run_permission_auto_classifier(
                 evaluation.mode,
                 request.tool_name,
                 evaluation.shell_sandboxed,
                 escalation_requested,
-            ) && let Some((classification, usage)) =
-                classify_permission_scope_with_model(&request, cancel).await
-            {
-                if classification.allow {
-                    tracing::info!(
-                        session_id = request.session_id,
-                        tool_name = request.tool_name,
-                        rationale = %classification.rationale,
-                        "permission gate: auto-classifier approved tool call for this turn"
-                    );
-                    return GateOutcome {
-                        decision: GateDecision::Allow {
-                            sandbox_policy_override: None,
-                            sandbox_mode: evaluation.sandbox_mode,
-                            shell_sandboxed: evaluation.shell_sandboxed,
-                        },
+            ) {
+                match classify_permission_scope_with_model(&request, cancel).await {
+                    PermissionScopeClassifierOutcome::Classified {
+                        classification,
                         usage,
-                    };
+                    } => {
+                        if classification.allow {
+                            tracing::info!(
+                                session_id = request.session_id,
+                                tool_name = request.tool_name,
+                                rationale = %classification.rationale,
+                                "permission gate: auto-classifier approved tool call for this turn"
+                            );
+                            return GateOutcome {
+                                decision: GateDecision::Allow {
+                                    sandbox_policy_override: None,
+                                    sandbox_mode: evaluation.sandbox_mode,
+                                    shell_sandboxed: evaluation.shell_sandboxed,
+                                    permission_notice: Some(auto_permission_notice(
+                                        "approved this tool call",
+                                        &classification.rationale,
+                                    )),
+                                },
+                                usage,
+                            };
+                        }
+                        tracing::info!(
+                            session_id = request.session_id,
+                            tool_name = request.tool_name,
+                            rationale = %classification.rationale,
+                            "permission gate: auto-classifier declined to approve tool call; prompting user"
+                        );
+                        permission_notice = Some(auto_permission_notice(
+                            "did not approve this tool call; manual approval is required",
+                            &classification.rationale,
+                        ));
+                        let rejected_permission_notice = permission_notice.clone();
+                        // Preserve token accounting while falling back to the human prompt.
+                        return GateOutcome {
+                            decision: match request_user_permission_with_evaluation(
+                                sessions,
+                                spawned_cx,
+                                cancel,
+                                request,
+                                evaluation,
+                                escalation_requested,
+                                permission_notice,
+                            )
+                            .await
+                            {
+                                Ok(decision) => decision,
+                                Err(reason) => GateDecision::Reject {
+                                    message: reason,
+                                    permission_notice: rejected_permission_notice,
+                                },
+                            },
+                            usage,
+                        };
+                    }
+                    PermissionScopeClassifierOutcome::Unavailable(rationale) => {
+                        tracing::info!(
+                            session_id = request.session_id,
+                            tool_name = request.tool_name,
+                            rationale = %rationale,
+                            "permission gate: auto-classifier unavailable; prompting user"
+                        );
+                        permission_notice = Some(auto_permission_notice(
+                            "could not evaluate this tool call; manual approval is required",
+                            &rationale,
+                        ));
+                    }
                 }
-                tracing::info!(
-                    session_id = request.session_id,
-                    tool_name = request.tool_name,
-                    rationale = %classification.rationale,
-                    "permission gate: auto-classifier declined to approve tool call; prompting user"
-                );
-                // Preserve token accounting while falling back to the human prompt.
-                return GateOutcome {
-                    decision: match request_user_permission_with_evaluation(
-                        sessions,
-                        spawned_cx,
-                        cancel,
-                        request,
-                        evaluation,
-                        escalation_requested,
-                    )
-                    .await
-                    {
-                        Ok(decision) => decision,
-                        Err(reason) => GateDecision::Reject(reason),
-                    },
-                    usage,
-                };
             }
+            let rejected_permission_notice = permission_notice.clone();
             GateOutcome::without_usage(
                 match request_user_permission_with_evaluation(
                     sessions,
@@ -3084,11 +3200,15 @@ async fn consult_gate(
                     request,
                     evaluation,
                     escalation_requested,
+                    permission_notice,
                 )
                 .await
                 {
                     Ok(decision) => decision,
-                    Err(reason) => GateDecision::Reject(reason),
+                    Err(reason) => GateDecision::Reject {
+                        message: reason,
+                        permission_notice: rejected_permission_notice,
+                    },
                 },
             )
         }
@@ -3104,6 +3224,10 @@ fn should_run_permission_auto_classifier(
     matches!(mode, PermissionMode::Auto) && !escalation_requested
 }
 
+fn auto_permission_notice(action: &str, rationale: &str) -> String {
+    format!("Auto permissions {action}.\nReason: {}", rationale.trim())
+}
+
 async fn request_user_permission_with_evaluation(
     sessions: &SessionStore,
     spawned_cx: &SpawnedCx<'_>,
@@ -3111,6 +3235,7 @@ async fn request_user_permission_with_evaluation(
     request: GateCheck<'_>,
     evaluation: PureGateEvaluation,
     escalation_requested: bool,
+    permission_notice: Option<String>,
 ) -> Result<GateDecision, String> {
     // "Always allow" remembers the first sub-command that actually needs
     // remembering (safelist sub-commands like `tail` are skipped).
@@ -3158,6 +3283,7 @@ async fn request_user_permission_with_evaluation(
             shell_sandboxed: evaluation.shell_sandboxed,
             sandbox_escalation_requested: escalation_requested,
             always_allow_label,
+            permission_notice: permission_notice.clone(),
         },
     )
     .await?;
@@ -3180,15 +3306,18 @@ async fn request_user_permission_with_evaluation(
         sandbox_policy_override: grant.sandbox_policy_override,
         sandbox_mode: evaluation.sandbox_mode,
         shell_sandboxed: evaluation.shell_sandboxed,
+        permission_notice,
     })
 }
 
 async fn classify_permission_scope_with_model(
     request: &GateCheck<'_>,
     cancel: &CancellationToken,
-) -> Option<(PermissionScopeClassification, TokenUsage)> {
+) -> PermissionScopeClassifierOutcome {
     if request.original_user_request.trim().is_empty() {
-        return None;
+        return PermissionScopeClassifierOutcome::Unavailable(
+            "the original user request is empty.".to_string(),
+        );
     }
 
     let raw_input = truncate_for_permission_classifier(
@@ -3242,12 +3371,13 @@ async fn classify_permission_scope_with_model(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
+            let rationale = format!("the auto-classifier request failed: {error:#}.");
             tracing::warn!(
                 session_id = request.session_id,
                 tool_name = request.tool_name,
                 "permission auto-classifier failed; falling back to user prompt: {error:#}"
             );
-            return None;
+            return PermissionScopeClassifierOutcome::Unavailable(rationale);
         }
     };
     let usage = response.usage();
@@ -3259,19 +3389,27 @@ async fn classify_permission_scope_with_model(
                 tool_name = request.tool_name,
                 "permission auto-classifier returned tool calls; falling back to user prompt"
             );
-            return None;
+            return PermissionScopeClassifierOutcome::Unavailable(
+                "the auto-classifier returned tool calls instead of a JSON decision.".to_string(),
+            );
         }
     };
     match parse_permission_scope_classification(&text) {
-        Some(classification) => Some((classification, usage)),
+        Some(classification) => PermissionScopeClassifierOutcome::Classified {
+            classification,
+            usage,
+        },
         None => {
+            let output = truncate_for_permission_classifier(&text);
             tracing::warn!(
                 session_id = request.session_id,
                 tool_name = request.tool_name,
-                output = %truncate_for_permission_classifier(&text),
+                output = %output,
                 "permission auto-classifier returned invalid JSON; falling back to user prompt"
             );
-            None
+            PermissionScopeClassifierOutcome::Unavailable(format!(
+                "the auto-classifier returned invalid JSON: {output}"
+            ))
         }
     }
 }
@@ -3363,6 +3501,7 @@ struct PermissionRequest<'a> {
     /// `Some(prefix)` offers a shell "Always allow <prefix>" choice; `None`
     /// withholds it (non-shell tools ignore this and always offer their own).
     always_allow_label: Option<String>,
+    permission_notice: Option<String>,
 }
 
 async fn request_user_permission(
@@ -3379,6 +3518,7 @@ async fn request_user_permission(
         shell_sandboxed,
         sandbox_escalation_requested,
         always_allow_label,
+        permission_notice,
     } = request;
 
     // The permission modal needs to show *what* is being approved, not just
@@ -3407,7 +3547,11 @@ async fn request_user_permission(
         .kind(kind)
         .status(ToolCallStatus::Pending)
         .title(title)
-        .content(announce::tool_input_content(tool_name, raw_input))
+        .content(announce::permission_request_content(
+            tool_name,
+            raw_input,
+            permission_notice.as_deref(),
+        ))
         .raw_input(raw_input.clone());
     let tool_call = ToolCallUpdate::new(ToolCallId::new(tool_call_id.to_string()), fields);
 
@@ -4549,6 +4693,17 @@ mod tests {
         assert!(truncated.is_char_boundary(truncated.len()));
     }
 
+    #[test]
+    fn auto_permission_notice_includes_decision_and_rationale() {
+        assert_eq!(
+            auto_permission_notice(
+                "did not approve this tool call; manual approval is required",
+                " too broad "
+            ),
+            "Auto permissions did not approve this tool call; manual approval is required.\nReason: too broad"
+        );
+    }
+
     #[tokio::test]
     async fn permission_auto_classifier_uses_model_and_returns_usage() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4573,10 +4728,13 @@ mod tests {
             additional_roots: &[],
         };
 
-        let (classification, usage) =
-            classify_permission_scope_with_model(&request, &CancellationToken::new())
-                .await
-                .expect("classifier should parse valid model output");
+        let PermissionScopeClassifierOutcome::Classified {
+            classification,
+            usage,
+        } = classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+        else {
+            panic!("classifier should parse valid model output");
+        };
 
         assert!(classification.allow);
         assert_eq!(classification.rationale, "focused test command");
@@ -4608,10 +4766,11 @@ mod tests {
             additional_roots: &[],
         };
 
-        let (classification, _) =
-            classify_permission_scope_with_model(&request, &CancellationToken::new())
-                .await
-                .expect("retry should recover classifier output");
+        let PermissionScopeClassifierOutcome::Classified { classification, .. } =
+            classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+        else {
+            panic!("retry should recover classifier output");
+        };
 
         assert!(classification.allow);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
