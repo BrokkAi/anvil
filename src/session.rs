@@ -2642,7 +2642,34 @@ fn filter_and_sort_listed_manifests(mut manifests: Vec<SessionManifest>) -> Vec<
     manifests
 }
 
-/// List all session manifests from the executor's sessions directory.
+fn manifest_matches_cwd_filter(manifest: &SessionManifest, normalized_cwd: &Path) -> bool {
+    match manifest.cwd.as_deref() {
+        // Manifests created before Anvil persisted `brokkCwd` cannot be
+        // attributed to a particular cwd. Keep surfacing them from the shared
+        // store so users can load and migrate old sessions instead of losing
+        // them after an upgrade.
+        None => true,
+        Some(raw_cwd) if raw_cwd.trim().is_empty() => false,
+        Some(raw_cwd) => {
+            let manifest_cwd = PathBuf::from(raw_cwd);
+            manifest_cwd.is_absolute() && normalize_cwd(&manifest_cwd) == normalized_cwd
+        }
+    }
+}
+
+fn filter_and_sort_listed_manifests_for_cwd(
+    manifests: Vec<SessionManifest>,
+    cwd: &Path,
+) -> Vec<SessionManifest> {
+    let normalized_cwd = normalize_cwd(cwd);
+    let matching = manifests
+        .into_iter()
+        .filter(|manifest| manifest_matches_cwd_filter(manifest, &normalized_cwd))
+        .collect();
+    filter_and_sort_listed_manifests(matching)
+}
+
+/// List session manifests matching the requested working directory.
 fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
     let primary_dir = sessions_dir(cwd);
     let legacy_dir = legacy_sessions_dir(cwd);
@@ -2665,7 +2692,7 @@ fn list_manifests_from_disk(cwd: &Path) -> Vec<SessionManifest> {
         }
     }
 
-    filter_and_sort_listed_manifests(manifests)
+    filter_and_sort_listed_manifests_for_cwd(manifests, cwd)
 }
 
 /// Normalize a cwd before comparing or rooting a per-session registry.
@@ -7405,6 +7432,89 @@ mod tests {
                 .join(format!("{}.zip", loaded.id))
                 .exists(),
             "legacy session should be migrated into the main repo"
+        );
+    }
+
+    /// Linked worktrees intentionally share the main repo's session store, but
+    /// `session/list { cwd }` must still only return sessions created for that
+    /// exact worktree. Otherwise a picker opened from the main checkout can
+    /// offer a sibling-worktree session and `session/resume` will reject it as
+    /// a cwd mismatch. Manifests without `brokkCwd` stay visible for the legacy
+    /// migration path covered above.
+    #[tokio::test]
+    async fn linked_worktree_list_filters_by_manifest_cwd() {
+        let (main, worktree) = make_fake_linked_worktree();
+        let store = SessionStore::new("m".to_string());
+
+        let main_session = store.create_session(main.path().to_path_buf()).await;
+        store
+            .maybe_rename_from_prompt(&main_session.id, "Main session")
+            .await
+            .expect("rename main session");
+        let worktree_session = store.create_session(worktree.path().to_path_buf()).await;
+        store
+            .maybe_rename_from_prompt(&worktree_session.id, "Worktree session")
+            .await
+            .expect("rename worktree session");
+
+        let main_list = store.list_sessions_from_disk(main.path()).await;
+        assert!(
+            main_list
+                .iter()
+                .any(|manifest| manifest.id == main_session.id),
+            "main checkout should list its own session"
+        );
+        assert!(
+            !main_list
+                .iter()
+                .any(|manifest| manifest.id == worktree_session.id),
+            "main checkout must not list sibling worktree sessions"
+        );
+
+        let worktree_list = store.list_sessions_from_disk(worktree.path()).await;
+        assert!(
+            worktree_list
+                .iter()
+                .any(|manifest| manifest.id == worktree_session.id),
+            "worktree should list its own session"
+        );
+        assert!(
+            !worktree_list
+                .iter()
+                .any(|manifest| manifest.id == main_session.id),
+            "worktree must not list main-checkout sessions"
+        );
+
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        let legacy_manifest = SessionManifest {
+            id: legacy_id.clone(),
+            name: "Legacy shared session".to_string(),
+            created: 1,
+            modified: 1,
+            version: "4.0".to_string(),
+            mode: None,
+            model: Some("m".to_string()),
+            brokk_mcp_servers: None,
+            cwd: None,
+            additional_directories: None,
+        };
+        write_new_session_zip(&session_zip_path(main.path(), &legacy_id), &legacy_manifest)
+            .expect("write legacy shared session");
+        assert!(
+            store
+                .list_sessions_from_disk(main.path())
+                .await
+                .iter()
+                .any(|manifest| manifest.id == legacy_id),
+            "pre-brokkCwd sessions should remain visible from the shared store"
+        );
+        assert!(
+            store
+                .list_sessions_from_disk(worktree.path())
+                .await
+                .iter()
+                .any(|manifest| manifest.id == legacy_id),
+            "pre-brokkCwd sessions should remain visible from linked worktrees"
         );
     }
 
