@@ -79,6 +79,7 @@ use agent_client_protocol::schema::v1::{
     StopReason,
     StringPropertySchema,
     TextContent,
+    ToolCallContent,
     ToolCallId,
     ToolCallStatus,
     ToolCallUpdate,
@@ -2885,7 +2886,10 @@ pub async fn run_agent(
                         send_message(
                             &cx_for_gate,
                             &session_id_for_gate,
-                            "\n\nAccept the plan to execute the original request.\n",
+                            &format!(
+                                "\n\n{}\n\nAccept the plan to execute the original request.\n",
+                                plan_result.response.trim()
+                            ),
                         );
                         let approval = request_plan_approval(
                             &cx_for_gate,
@@ -4642,15 +4646,16 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
         original_user_request,
     } = input;
 
-    let cx_text = cx.clone();
-    let sid_text = session_id.to_string();
     let cx_thought = cx.clone();
     let sid_thought = session_id.to_string();
 
+    // Keep the draft plan out of the normal assistant stream until the
+    // planning turn is complete. Some clients prioritize an in-flight
+    // `session/request_permission` modal over pending message chunks, so
+    // streaming the plan and then immediately blocking for approval can show
+    // the approval UI before the user has actually seen the whole plan.
     let text_sink: crate::tool_loop::TextSink =
-        std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
-            send_message(&cx_text, &sid_text, token);
-        }));
+        std::sync::Arc::new(std::sync::Mutex::new(|_token: &str| {}));
     let thought_sink: crate::tool_loop::TextSink =
         std::sync::Arc::new(std::sync::Mutex::new(move |token: &str| {
             send_thought(&cx_thought, &sid_thought, token);
@@ -4733,22 +4738,31 @@ fn plan_approval_for_outcome(outcome: RequestPermissionOutcome) -> PlanApproval 
     }
 }
 
+fn plan_approval_tool_call(plan: &str) -> ToolCallUpdate {
+    ToolCallUpdate::new(
+        ToolCallId::new("planning-gate-approval".to_string()),
+        ToolCallUpdateFields::new()
+            .kind(ToolKind::Think)
+            .status(ToolCallStatus::Pending)
+            .title("Approve plan before execution")
+            .content(vec![ToolCallContent::from(format!(
+                "Review the generated plan before deciding whether to execute it.\n\n{}",
+                plan.trim()
+            ))])
+            .raw_input(serde_json::json!({ "plan": plan.trim() })),
+    )
+}
+
 async fn request_plan_approval(
     cx: &ConnectionTo<Client>,
     session_id: &str,
     plan: &str,
 ) -> PlanApproval {
-    let fields = ToolCallUpdateFields::new()
-        .kind(ToolKind::Think)
-        .status(ToolCallStatus::Pending)
-        .title("Approve plan before execution")
-        .raw_input(serde_json::json!({ "plan": plan.trim() }));
-    let tool_call = ToolCallUpdate::new(
-        ToolCallId::new("planning-gate-approval".to_string()),
-        fields,
+    let request = RequestPermissionRequest::new(
+        session_id.to_string(),
+        plan_approval_tool_call(plan),
+        plan_approval_options(),
     );
-    let request =
-        RequestPermissionRequest::new(session_id.to_string(), tool_call, plan_approval_options());
     emit_terminal_notification(TerminalNotificationEvent::Prompt);
 
     // This helper is only called from a `ConnectionTo::spawn` body; `block_task`
@@ -9110,6 +9124,35 @@ mod tests {
         assert_eq!(options[0].kind, PermissionOptionKind::AllowOnce);
         assert_eq!(options[1].option_id.0.as_ref(), "reject_plan");
         assert_eq!(options[1].kind, PermissionOptionKind::RejectOnce);
+    }
+
+    #[test]
+    fn plan_approval_prompt_includes_visible_plan_content() {
+        let plan = "1. Inspect the planning gate\n2. Fix the approval order";
+        let tool_call = plan_approval_tool_call(plan);
+        assert_eq!(tool_call.fields.status, Some(ToolCallStatus::Pending));
+        assert_eq!(
+            tool_call.fields.title.as_deref(),
+            Some("Approve plan before execution")
+        );
+        assert_eq!(
+            tool_call.fields.raw_input,
+            Some(serde_json::json!({ "plan": plan }))
+        );
+        let content = tool_call
+            .fields
+            .content
+            .expect("approval prompt must carry visible content");
+        assert_eq!(content.len(), 1);
+        let ToolCallContent::Content(content) = &content[0] else {
+            panic!("approval content must be a text content block: {content:?}");
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            panic!("approval content must be text: {content:?}");
+        };
+        assert!(text.text.contains("Review the generated plan"));
+        assert!(text.text.contains("1. Inspect the planning gate"));
+        assert!(text.text.contains("2. Fix the approval order"));
     }
 
     #[test]
