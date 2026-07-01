@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1350,7 +1350,7 @@ fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockT
         .map(|tool| BedrockTool {
             name: tool.function.name,
             description: tool.function.description,
-            input_schema: tool.function.parameters,
+            input_schema: bedrock_tool_input_schema(tool.function.parameters),
             cache_control: None,
         })
         .collect();
@@ -1358,6 +1358,114 @@ fn convert_tools(tools: Vec<ToolDefinition>, enable_cache: bool) -> Vec<BedrockT
         last.cache_control = Some(CACHE_CONTROL);
     }
     converted
+}
+
+/// Bedrock's native Anthropic tools endpoint rejects schemas whose root object
+/// is a JSON Schema combiner (`oneOf`, `anyOf`, or `allOf`). Structured-output
+/// JSON schemas and strict tool use have their own broader compatibility rules;
+/// this adapter is intentionally narrower and only removes the top-level tool
+/// `input_schema` combiner rejected by Bedrock request validation. MCP servers
+/// are allowed to advertise such schemas, so normalize only the top-level
+/// wrapper before sending tools to Bedrock while preserving the usable object
+/// fields the model needs to call the tool.
+fn bedrock_tool_input_schema(schema: serde_json::Value) -> serde_json::Value {
+    let Some(map) = schema.as_object() else {
+        return schema;
+    };
+    let Some((combiner_key, variants)) = top_level_combiner_variants(map) else {
+        return schema;
+    };
+
+    let merged = merge_top_level_combiner_schema(map, combiner_key, variants);
+    tracing::debug!(
+        combiner = combiner_key,
+        "flattened top-level JSON Schema combiner for Bedrock tool input schema"
+    );
+    serde_json::Value::Object(merged)
+}
+
+fn top_level_combiner_variants(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(&'static str, &[serde_json::Value])> {
+    for key in ["oneOf", "anyOf", "allOf"] {
+        if let Some(values) = map.get(key).and_then(serde_json::Value::as_array) {
+            return Some((key, values.as_slice()));
+        }
+    }
+    None
+}
+
+fn merge_top_level_combiner_schema(
+    map: &serde_json::Map<String, serde_json::Value>,
+    combiner_key: &str,
+    variants: &[serde_json::Value],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut merged = map.clone();
+    merged.remove("oneOf");
+    merged.remove("anyOf");
+    merged.remove("allOf");
+    merged
+        .entry("type".to_string())
+        .or_insert_with(|| serde_json::Value::String("object".to_string()));
+
+    let mut properties = merged
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut required: Option<HashSet<String>> = merged
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        });
+
+    for variant in variants {
+        let Some(variant) = variant.as_object() else {
+            continue;
+        };
+        if let Some(variant_properties) = variant
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, schema) in variant_properties {
+                properties
+                    .entry(name.clone())
+                    .or_insert_with(|| schema.clone());
+            }
+        }
+        if combiner_key == "allOf"
+            && let Some(variant_required) = variant
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+        {
+            required.get_or_insert_with(HashSet::new).extend(
+                variant_required
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string)),
+            );
+        }
+    }
+
+    if !properties.is_empty() {
+        merged.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(properties),
+        );
+    }
+    if let Some(required) = required.filter(|required| !required.is_empty()) {
+        let mut required: Vec<serde_json::Value> = required
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        required.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        merged.insert("required".to_string(), serde_json::Value::Array(required));
+    }
+
+    merged
 }
 
 fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value> {
@@ -1795,6 +1903,189 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bedrock_tool_schema_flattens_top_level_oneof() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "symbols": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["symbols"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"}
+                                }
+                            }
+                        }
+                    },
+                    "required": ["targets"]
+                }
+            ]
+        });
+
+        let flattened = bedrock_tool_input_schema(schema);
+
+        assert!(flattened.get("oneOf").is_none());
+        assert!(flattened.get("anyOf").is_none());
+        assert!(flattened.get("allOf").is_none());
+        assert_eq!(flattened["type"], "object");
+        assert_eq!(flattened["properties"]["symbols"]["type"], "array");
+        assert_eq!(flattened["properties"]["targets"]["type"], "array");
+        assert!(flattened.get("required").is_none());
+    }
+
+    #[test]
+    fn bedrock_tool_schema_flattens_top_level_anyof() {
+        let schema = serde_json::json!({
+            "description": "Either a symbol lookup or a source-location lookup.",
+            "additionalProperties": false,
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {"symbols": {"type": "array"}},
+                    "required": ["symbols"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"targets": {"type": "array"}},
+                    "required": ["targets"]
+                }
+            ]
+        });
+
+        let flattened = bedrock_tool_input_schema(schema);
+
+        assert!(flattened.get("anyOf").is_none());
+        assert_eq!(flattened["type"], "object");
+        assert_eq!(
+            flattened["description"],
+            "Either a symbol lookup or a source-location lookup."
+        );
+        assert_eq!(flattened["additionalProperties"], false);
+        assert_eq!(flattened["properties"]["symbols"]["type"], "array");
+        assert_eq!(flattened["properties"]["targets"]["type"], "array");
+        assert!(flattened.get("required").is_none());
+    }
+
+    #[test]
+    fn bedrock_tool_schema_preserves_allof_required_fields() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"line": {"type": "integer"}},
+                    "required": ["line"]
+                }
+            ]
+        });
+
+        let flattened = bedrock_tool_input_schema(schema);
+
+        assert!(flattened.get("allOf").is_none());
+        assert_eq!(flattened["properties"]["path"]["type"], "string");
+        assert_eq!(flattened["properties"]["line"]["type"], "integer");
+        let required = flattened["required"].as_array().expect("required array");
+        assert!(required.contains(&serde_json::json!("path")));
+        assert!(required.contains(&serde_json::json!("line")));
+    }
+
+    #[test]
+    fn bedrock_tool_schema_leaves_nested_combiner_untouched() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "one_of_value": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "integer"}
+                    ]
+                },
+                "any_of_value": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "integer"}
+                    ]
+                },
+                "all_of_value": {
+                    "allOf": [
+                        {"type": "object", "properties": {"path": {"type": "string"}}},
+                        {"type": "object", "properties": {"line": {"type": "integer"}}}
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(bedrock_tool_input_schema(schema.clone()), schema);
+    }
+
+    #[test]
+    fn bedrock_tool_schema_anthropic_request_serializes_without_top_level_combiner() {
+        let tools = vec![ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "scan_usages".to_string(),
+                description: "Find references by symbol or source location".to_string(),
+                parameters: serde_json::json!({
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {"symbols": {"type": "array"}},
+                            "required": ["symbols"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"targets": {"type": "array"}},
+                            "required": ["targets"]
+                        }
+                    ]
+                }),
+            },
+        }];
+
+        let converted = convert_tools(tools, false);
+        let request = build_anthropic_request(
+            ANTHROPIC_VERSION,
+            None,
+            vec![BedrockMessage {
+                role: "user".to_string(),
+                content: vec![BedrockContentOut::Text {
+                    text: "find references".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            Some(converted),
+            None,
+            None,
+            ThinkingShape::Enabled,
+        );
+        let serialized = serde_json::to_value(&request).expect("serialize Bedrock request");
+        let input_schema = &serialized["tools"][0]["input_schema"];
+
+        assert!(input_schema.get("oneOf").is_none());
+        assert!(input_schema.get("anyOf").is_none());
+        assert!(input_schema.get("allOf").is_none());
+        assert_eq!(input_schema["type"], "object");
+        assert_eq!(input_schema["properties"]["symbols"]["type"], "array");
+        assert_eq!(input_schema["properties"]["targets"]["type"], "array");
     }
 
     #[test]
