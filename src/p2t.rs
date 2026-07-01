@@ -461,10 +461,22 @@ pub(crate) fn snapshot_workspace(
 
 fn snapshot_rsync_args(cwd: &Path, plan: &SnapshotPlan) -> Vec<String> {
     let mut args = vec!["-a".to_string(), "--delete".to_string()];
+    // Hard excludes FIRST (rsync applies rules in order, first match wins): these
+    // runtime caches never belong in a snapshot, regardless of any .gitignore.
     for exclude in ["/.git", "/.brokk", "/.bifrost"] {
         args.push("--exclude".to_string());
         args.push(exclude.to_string());
     }
+    // Then drop whatever the repo ITSELF declares regenerable via .gitignore
+    // (build output: target/, node_modules/, vendor/, __pycache__/, dist/, ...).
+    // `:- .gitignore` is a per-directory merge with git's own semantics -- no
+    // hardcoded per-language list. Snapshots are CoW copies used only for scoring
+    // and for the commit that re-materializes canonical; the testsome/build
+    // command regenerates these artifacts, so excluding them is safe. Crucially it
+    // stops per-step rebuilds (which rewrite build trees and so DEFEAT --link-dest
+    // hardlinking) from ballooning disk across steps x seeds.
+    args.push("--filter".to_string());
+    args.push(":- .gitignore".to_string());
     if let Some(link_dest) = plan.link_dest.as_ref() {
         args.push(format!("--link-dest={}", link_dest.display()));
     }
@@ -816,6 +828,25 @@ mod tests {
                 "missing rsync exclude for {excluded}: {args:?}"
             );
         }
+        // Build output is dropped via the repo's own .gitignore (per-dir merge),
+        // not a hardcoded list. This is what keeps per-step snapshots from
+        // capturing regenerated target/ | node_modules/ | vendor/ trees.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--filter", ":- .gitignore"]),
+            "missing gitignore dir-merge filter: {args:?}"
+        );
+        // ...and the hard excludes precede the .gitignore merge so a stray
+        // negation in a repo .gitignore can never re-include a runtime cache.
+        let filter_at = args.iter().position(|a| a == "--filter").unwrap();
+        let last_hard_exclude = args
+            .iter()
+            .rposition(|a| a == "/.bifrost" || a == "/.brokk" || a == "/.git")
+            .unwrap();
+        assert!(
+            last_hard_exclude < filter_at,
+            "hard excludes must precede .gitignore merge: {args:?}"
+        );
         assert!(args.contains(&"--link-dest=/tmp/canonical".to_string()));
         assert!(args.contains(&"/tmp/worktree/".to_string()));
         assert!(args.contains(&"/tmp/p2t-snapshots/step-0/".to_string()));
