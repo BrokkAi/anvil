@@ -157,8 +157,12 @@ pub(crate) fn render_turn_recap(
             out.push_str("\n\n");
         }
     }
+    // Wrap each stat line's content in `*…*` so markdown clients render the
+    // recap as an italic aside. The `- ` bullet and trailing `.` stay outside
+    // the emphasis so `strip_trailing_turn_recap` still matches on its prefix
+    // and `.` suffix anchors (and so the bullet renders as a list marker).
     out.push_str(&format!(
-        "- Stop: {}.\n- Tools: {}.\n- Files changed: {}.\n",
+        "- *Stop: {}*.\n- *Tools: {}*.\n- *Files changed: {}*.\n",
         describe_loop_stop_for_recap(stop),
         render_tool_counts(tool_exchanges),
         render_changed_files(tool_exchanges)
@@ -180,11 +184,11 @@ fn strip_trailing_turn_recap(text: &str) -> Option<&str> {
     let [.., stop, tools, files] = lines.as_slice() else {
         return None;
     };
-    if stop.starts_with("- Stop: ")
+    if stop.starts_with("- *Stop: ")
         && stop.ends_with('.')
-        && tools.starts_with("- Tools: ")
+        && tools.starts_with("- *Tools: ")
         && tools.ends_with('.')
-        && files.starts_with("- Files changed: ")
+        && files.starts_with("- *Files changed: ")
         && files.ends_with('.')
     {
         Some(&text[..index])
@@ -284,13 +288,13 @@ mod tests {
         );
 
         assert!(recap.starts_with(TURN_RECAP_NOTICE_SENTINEL));
-        assert!(recap.contains("- Stop: completed."));
+        assert!(recap.contains("- *Stop: completed*."));
         assert!(
-            recap.contains("- Tools: 2 calls (1 succeeded, 1 failed): edit, run_shell_command.")
+            recap.contains("- *Tools: 2 calls (1 succeeded, 1 failed): edit, run_shell_command*.")
         );
-        assert!(recap.contains("- Files changed: src/lib.rs."));
+        assert!(recap.contains("- *Files changed: src/lib.rs*."));
         // The three stat lines are the tail of the block (the strip anchor).
-        assert!(recap.trim_end().ends_with("- Files changed: src/lib.rs."));
+        assert!(recap.trim_end().ends_with("- *Files changed: src/lib.rs*."));
     }
 
     #[test]
@@ -309,8 +313,10 @@ mod tests {
         let summary_at = recap
             .find("Edited `src/lib.rs`")
             .expect("summary present in recap");
-        let stop_at = recap.find("- Stop: completed.").expect("stats present");
+        let stop_at = recap.find("- *Stop: completed*.").expect("stats present");
         assert!(summary_at < stop_at, "summary renders above the stat lines");
+        // The work summary is model prose passed through verbatim, so its own
+        // bullet stays plain (only the deterministic stat lines are italicized).
         assert!(recap.contains("- Ran the tests; all passed."));
 
         // The whole block -- summary included -- strips back out of model history.
@@ -350,8 +356,8 @@ mod tests {
             &LoopStop::Completed { had_text: true },
         );
 
-        assert!(recap.contains("- Tools: 1 call (1 succeeded, 0 failed): edit\\nname."));
-        assert!(recap.contains("- Files changed: dir/a\\nb.rs."));
+        assert!(recap.contains("- *Tools: 1 call (1 succeeded, 0 failed): edit\\nname*."));
+        assert!(recap.contains("- *Files changed: dir/a\\nb.rs*."));
         let body = recap
             .strip_prefix(TURN_RECAP_NOTICE_SENTINEL)
             .expect("recap starts with sentinel");
