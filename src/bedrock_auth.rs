@@ -48,12 +48,20 @@ pub struct BedrockAuth {
 pub struct CredentialState {
     pub env_set: bool,
     pub file_present: bool,
+    /// A token exists in the legacy `~/.secrets/` fallback the backend
+    /// still resolves. Tracked separately from `file_present` because the
+    /// managed setup commands (`key`/`region`/`model`/`disconnect`) only
+    /// touch `brokk/bedrock.json`, never the secrets files.
+    pub secrets_present: bool,
 }
 
 impl CredentialState {
-    /// Read the current env+file state. Cheap: a single env lookup and
-    /// (when needed) a small disk read; safe to call from
-    /// `available_commands_update` paths and per-request handlers.
+    /// Read the current env+file+secrets state. Cheap: a single env
+    /// lookup and (when needed) a couple of small disk reads; safe to
+    /// call from `available_commands_update` paths and per-request
+    /// handlers. Must enumerate every source
+    /// `bedrock_client::bearer_token_from_env_or_secrets` resolves, or
+    /// detection reports "not configured" for a working backend.
     pub fn snapshot() -> Self {
         let env_set = std::env::var(BEDROCK_API_KEY_ENV)
             .ok()
@@ -63,20 +71,28 @@ impl CredentialState {
             Ok(Some(auth)) => !auth.bearer_token.trim().is_empty(),
             _ => false,
         };
+        let secrets_present = matches!(
+            crate::bedrock_client::bearer_token_from_secrets(),
+            Ok(Some(_))
+        );
         Self {
             env_set,
             file_present,
+            secrets_present,
         }
     }
 
     /// Where the active credential, if any, is being read from.
-    /// Mirrors the precedence in `build_bedrock_backend`: env wins
-    /// over file, file wins over nothing.
+    /// Mirrors the precedence in `bearer_token_from_env_or_secrets`: env
+    /// wins over the managed file, the file wins over the legacy
+    /// `~/.secrets/` fallback, and that wins over nothing.
     pub fn active_source(&self) -> &'static str {
         if self.env_set {
             "env"
         } else if self.file_present {
             "file"
+        } else if self.secrets_present {
+            "secrets"
         } else {
             "none"
         }
@@ -207,6 +223,7 @@ mod tests {
 
     const TEST_VARS: &[&str] = &[
         "BROKK_CONFIG_HOME",
+        "BROKK_SECRETS_HOME",
         "AWS_BEARER_TOKEN_BEDROCK",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
@@ -233,6 +250,12 @@ mod tests {
                     std::env::remove_var(var);
                 }
                 std::env::set_var("BROKK_CONFIG_HOME", config_home);
+                // Redirect the legacy secrets dir into the temp config
+                // home too, so detection never reads the developer's real
+                // ~/.secrets/. It holds no secret-named files unless a
+                // test writes one, so `secrets_present` stays false by
+                // default.
+                std::env::set_var("BROKK_SECRETS_HOME", config_home);
             }
             env
         }
@@ -352,6 +375,7 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(state.file_present);
+        assert!(!state.secrets_present);
         assert!(!state.env_owns());
         assert_eq!(state.active_source(), "file");
     }
@@ -365,8 +389,47 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(!state.file_present);
+        assert!(!state.secrets_present);
         assert!(!state.env_owns());
         assert_eq!(state.active_source(), "none");
+    }
+
+    #[test]
+    fn credential_state_reports_secrets_when_only_secrets_file_set() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvScope::new(tmp.path());
+        // Legacy fallback: a token in ~/.secrets/ (redirected to tmp via
+        // BROKK_SECRETS_HOME) with no env var and no managed config file.
+        // This is the regression: the backend resolves this token (models
+        // load) but detection used to report "none".
+        std::fs::write(tmp.path().join("bedrock_api_key"), "secret-token\n").unwrap();
+
+        let state = CredentialState::snapshot();
+        assert!(!state.env_set);
+        assert!(!state.file_present);
+        assert!(state.secrets_present);
+        assert!(!state.env_owns());
+        assert_eq!(state.active_source(), "secrets");
+    }
+
+    #[test]
+    fn credential_state_file_wins_over_secrets() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvScope::new(tmp.path());
+        std::fs::write(tmp.path().join("bedrock_api_key"), "secret-token\n").unwrap();
+        write(&BedrockAuth {
+            bearer_token: "token-from-file".to_string(),
+            region: None,
+            default_model: None,
+        })
+        .unwrap();
+
+        let state = CredentialState::snapshot();
+        assert!(state.file_present);
+        assert!(state.secrets_present);
+        assert_eq!(state.active_source(), "file");
     }
 
     #[test]
