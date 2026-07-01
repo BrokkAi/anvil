@@ -110,10 +110,9 @@ use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 
-/// Stable ids for our `SessionConfigOption` selectors. We expose both
-/// dropdowns via configOptions because the ACP spec says clients SHOULD
-/// ignore the legacy `modes` channel when configOptions is present (Zed
-/// does), so once we expose any configOption we have to expose all of them.
+/// Stable ids for ACP `SessionConfigOption` selectors. Keep this surface
+/// limited to client-visible, session-scoped controls; install/setup
+/// preferences belong in `/setup` and `SetupState`, not ACP configOptions.
 const PERMISSION_CONFIG_ID: &str = "permission_mode";
 const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
@@ -125,11 +124,6 @@ const MODEL_CONFIG_ID: &str = "model_selection";
 /// model's `default_reasoning_level`). The `off` option explicitly omits
 /// reasoning controls even when the model advertises a default.
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
-/// Session config selector for the host-generated recap appended after normal
-/// model turns.
-const TURN_RECAP_CONFIG_ID: &str = "turn_recap";
-const TURN_RECAP_ENABLED_VALUE: &str = "enabled";
-const TURN_RECAP_DISABLED_VALUE: &str = "disabled";
 /// Sentinel value the client sends to clear the user's pick. We accept
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
@@ -534,29 +528,6 @@ fn reasoning_effort_config_option(
     )
 }
 
-/// Build the host-generated turn recap selector. This is a session config
-/// option rather than a model prompt instruction because the *host* decides
-/// whether a recap is appended and renders its deterministic stat lines; the
-/// work summary it now carries is a separate, host-orchestrated summarization
-/// call, never something the turn's own model can choose to skip.
-fn turn_recap_config_option(current: bool) -> SessionConfigOption {
-    let current_value = if current {
-        TURN_RECAP_ENABLED_VALUE
-    } else {
-        TURN_RECAP_DISABLED_VALUE
-    };
-    let options = vec![
-        SessionConfigSelectOption::new(TURN_RECAP_ENABLED_VALUE, "On").description(
-            "Append a recap (summary of the work done plus stats) after normal turns.",
-        ),
-        SessionConfigSelectOption::new(TURN_RECAP_DISABLED_VALUE, "Off")
-            .description("Do not append the automatic turn recap."),
-    ];
-    SessionConfigOption::select(TURN_RECAP_CONFIG_ID, "Recap", current_value, options)
-        .description("Controls the automatic recap appended after each non-goal turn.")
-        .category(SessionConfigOptionCategory::Mode)
-}
-
 /// All configOption selectors we expose, in display order. The model
 /// selector is appended only when the LLM catalog is known; clients that
 /// drive model selection through the meta extension still see the current
@@ -565,7 +536,6 @@ fn turn_recap_config_option(current: bool) -> SessionConfigOption {
 fn all_config_options(
     behavior: SessionMode,
     permission: PermissionMode,
-    turn_recap_enabled: bool,
     current_model: &str,
     available_models: &[ModelMetadata],
     current_reasoning_effort: Option<&str>,
@@ -574,7 +544,6 @@ fn all_config_options(
     let mut opts = vec![
         behavior_config_option(behavior),
         permission_config_option(permission),
-        turn_recap_config_option(turn_recap_enabled),
     ];
     if let Some(model_opt) = model_config_option(current_model, &model_ids) {
         opts.push(model_opt);
@@ -593,7 +562,6 @@ fn all_config_options(
 const CONFIGURE_KNOWN_KEYS: &[&str] = &[
     BEHAVIOR_CONFIG_ID,
     PERMISSION_CONFIG_ID,
-    TURN_RECAP_CONFIG_ID,
     MODEL_CONFIG_ID,
     REASONING_EFFORT_CONFIG_ID,
 ];
@@ -668,7 +636,6 @@ async fn current_config_options(
     Some(all_config_options(
         session.mode,
         session.permission_mode,
-        session.turn_recap_enabled,
         &session.model,
         &catalog,
         session.selected_reasoning_effort.as_deref(),
@@ -770,20 +737,6 @@ async fn apply_config_option(
                         details: format!("{e:#}"),
                     });
                 }
-            }
-        }
-        TURN_RECAP_CONFIG_ID => {
-            let Some(enabled) = parse_turn_recap_enabled(value) else {
-                return Err(ConfigApplyError::InvalidValue {
-                    reason: format!("unknown recap mode '{value}'"),
-                    supported: vec![
-                        TURN_RECAP_ENABLED_VALUE.to_string(),
-                        TURN_RECAP_DISABLED_VALUE.to_string(),
-                    ],
-                });
-            };
-            if !sessions.set_turn_recap_enabled(session_id, enabled).await {
-                return Err(ConfigApplyError::UnknownSession);
             }
         }
         MODEL_CONFIG_ID => {
@@ -1383,6 +1336,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          - `/setup local` - Use free local models on this computer.\n\
          - Set `DEEPSEEK_API_KEY` - Use hosted DeepSeek.\n\
          - `/setup openrouter` - Use OpenRouter.\n\
+         - `/setup recap` - Configure automatic turn recaps.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
          Found now:\n\
          - Bedrock: {bedrock_status}\n\
@@ -1619,7 +1573,6 @@ pub async fn run_agent(
                     .config_options(all_config_options(
                         session.mode,
                         session.permission_mode,
-                        session.turn_recap_enabled,
                         &session.model,
                         &catalog,
                         session.selected_reasoning_effort.as_deref(),
@@ -1755,7 +1708,6 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             session.mode,
                             session.permission_mode,
-                            session.turn_recap_enabled,
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
@@ -1874,7 +1826,6 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             session.mode,
                             session.permission_mode,
-                            session.turn_recap_enabled,
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
@@ -1987,7 +1938,6 @@ pub async fn run_agent(
                         .config_options(all_config_options(
                             forked.mode,
                             forked.permission_mode,
-                            forked.turn_recap_enabled,
                             &forked.model,
                             &catalog,
                             forked.selected_reasoning_effort.as_deref(),
@@ -6325,6 +6275,8 @@ enum SetupHomeRoute {
     Local,
     /// Interactive OpenRouter key entry (`/setup openrouter`).
     OpenRouter,
+    /// Turn recap preference (`/setup recap`).
+    Recap,
     /// Advanced page: model ids, sandbox, behavior (`/setup advanced`).
     Advanced,
 }
@@ -6338,6 +6290,7 @@ impl SetupHomeRoute {
             Self::Bedrock => "bedrock",
             Self::Local => "local",
             Self::OpenRouter => "openrouter",
+            Self::Recap => "recap",
             Self::Advanced => "advanced",
         }
     }
@@ -6350,6 +6303,7 @@ impl SetupHomeRoute {
             Self::Bedrock,
             Self::Local,
             Self::OpenRouter,
+            Self::Recap,
             Self::Advanced,
         ]
         .into_iter()
@@ -6364,19 +6318,21 @@ impl SetupHomeRoute {
             Self::Bedrock => "Use AWS Bedrock",
             Self::Local => "Use free local models (Ollama)",
             Self::OpenRouter => "Use OpenRouter",
+            Self::Recap => "Configure automatic turn recaps",
             Self::Advanced => "Advanced settings (model ids, sandbox, behavior)",
         }
     }
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 6] {
+    fn menu() -> [Self; 7] {
         [
             Self::Choose,
             Self::Codex,
             Self::Bedrock,
             Self::Local,
             Self::OpenRouter,
+            Self::Recap,
             Self::Advanced,
         ]
     }
@@ -6463,6 +6419,10 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::Recap) => {
+            let message = handle_setup_recap(sessions, session_id, "").await;
             send_message(cx, session_id, &message);
         }
         Some(SetupHomeRoute::Advanced) => {
@@ -6591,7 +6551,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
-        "recap" => handle_setup_recap(ctx.cx, ctx.sessions, session_id, rest).await,
+        "recap" => handle_setup_recap(ctx.sessions, session_id, rest).await,
         "timeout" => {
             let prompt = if rest.is_empty() {
                 "/idle-timeout".to_string()
@@ -7463,12 +7423,7 @@ async fn handle_setup_mode(
     apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
 }
 
-async fn handle_setup_recap(
-    cx: &ConnectionTo<Client>,
-    sessions: &SessionStore,
-    session_id: &str,
-    rest: &str,
-) -> String {
+async fn handle_setup_recap(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
     if rest.is_empty() {
         let state = sessions
             .turn_recap_enabled(session_id)
@@ -7485,12 +7440,11 @@ async fn handle_setup_recap(
     let Some(enabled) = parse_turn_recap_enabled(rest) else {
         return "Unknown recap mode. Try `/setup recap on` or `/setup recap off`.".to_string();
     };
-    let value = if enabled {
-        TURN_RECAP_ENABLED_VALUE
+    if sessions.set_turn_recap_enabled(session_id, enabled).await {
+        "Turn recap setup updated.".to_string()
     } else {
-        TURN_RECAP_DISABLED_VALUE
-    };
-    apply_setup_config(cx, sessions, session_id, TURN_RECAP_CONFIG_ID, value).await
+        "Error: unknown session".to_string()
+    }
 }
 
 async fn apply_setup_config(
@@ -7512,7 +7466,6 @@ async fn apply_setup_config(
                 MODEL_CONFIG_ID => "Model setup updated.".to_string(),
                 PERMISSION_CONFIG_ID => "Permission mode updated.".to_string(),
                 BEHAVIOR_CONFIG_ID => "Behavior setup updated.".to_string(),
-                TURN_RECAP_CONFIG_ID => "Turn recap setup updated.".to_string(),
                 REASONING_EFFORT_CONFIG_ID => "Advanced reasoning setup updated.".to_string(),
                 _ => "Setup updated.".to_string(),
             };
@@ -11905,33 +11858,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_config_option_sets_turn_recap_mode() {
+    async fn turn_recap_is_not_an_acp_config_option() {
         let (store, id) = make_store_with_session("m").await;
+        let options = current_config_options(&store, &id)
+            .await
+            .expect("session config options");
+        assert!(
+            options.iter().all(|opt| opt.id.to_string() != "turn_recap"),
+            "turn recap must stay in /setup, not ACP configOptions"
+        );
+
+        let err = apply_config_option(&store, &id, "turn_recap", "disabled")
+            .await
+            .expect_err("turn recap is not an ACP config option");
+        assert!(matches!(err, ConfigApplyError::UnknownConfigId));
+        assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn handle_setup_recap_toggles_turn_recap_preference() {
+        let store = SessionStore::with_limits_and_transient_setup(
+            "m".to_string(),
+            crate::session::SessionLimits::default(),
+            true,
+        );
+        let cwd = std::env::temp_dir().join(format!("brokk-acp-recap-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd).await;
+        let id = session.id;
         assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
 
-        let outcome = apply_config_option(&store, &id, TURN_RECAP_CONFIG_ID, "disabled")
-            .await
-            .expect("turn recap update");
+        let off = handle_setup_recap(&store, &id, "off").await;
+        assert_eq!(off, "Turn recap setup updated.");
         assert_eq!(store.turn_recap_enabled(&id).await, Some(false));
+        assert_eq!(store.setup_state_snapshot().turn_recap_enabled, Some(false));
 
-        let recap_option = outcome
-            .updated_options
-            .iter()
-            .find(|opt| opt.id.to_string() == TURN_RECAP_CONFIG_ID)
-            .expect("recap option advertised");
-        assert_eq!(
-            select_current_value(recap_option),
-            TURN_RECAP_DISABLED_VALUE
-        );
-        assert_select_option_values(
-            recap_option,
-            &[TURN_RECAP_ENABLED_VALUE, TURN_RECAP_DISABLED_VALUE],
-        );
+        let status = handle_setup_recap(&store, &id, "").await;
+        assert!(status.contains("Turn recap is `off`"));
 
-        apply_config_option(&store, &id, TURN_RECAP_CONFIG_ID, "enable")
-            .await
-            .expect("turn recap enable alias");
+        let on = handle_setup_recap(&store, &id, "on").await;
+        assert_eq!(on, "Turn recap setup updated.");
         assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
+        assert_eq!(store.setup_state_snapshot().turn_recap_enabled, Some(true));
     }
 
     #[tokio::test]
@@ -12356,6 +12323,7 @@ mod tests {
                 "bedrock",
                 "local",
                 "openrouter",
+                "recap",
                 "advanced"
             ]
         );
@@ -12387,6 +12355,10 @@ mod tests {
         assert_eq!(
             parse_setup_home_choice(&accept("openrouter")),
             Some(SetupHomeRoute::OpenRouter)
+        );
+        assert_eq!(
+            parse_setup_home_choice(&accept("recap")),
+            Some(SetupHomeRoute::Recap)
         );
         assert_eq!(
             parse_setup_home_choice(&accept("advanced")),

@@ -736,8 +736,8 @@ pub struct Session {
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
     /// Whether Anvil appends its host-generated recap after normal model turns.
-    /// Seeded from install-level setup state for new and reloaded sessions, but
-    /// not stored in workspace session zips.
+    /// This is a `/setup` / install-level preference seeded into live sessions,
+    /// not an ACP `SessionConfigOption`, and is not stored in workspace zips.
     pub turn_recap_enabled: bool,
     /// Additional per-session MCP servers supplied by ACP `session/new`.
     /// These are additive to Anvil's canonical Bifrost setup from the

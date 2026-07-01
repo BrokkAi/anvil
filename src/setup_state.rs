@@ -4,8 +4,9 @@
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
 //! setup screen and the last selected
-//! model/reasoning effort/permission/sandbox/recap mode so configured installs get a
-//! short hint instead of the full welcome on every new session. It also stores
+//! model/reasoning effort/permission/sandbox plus the `/setup recap` preference
+//! so configured installs get a short hint instead of the full welcome on every
+//! new session. It also stores
 //! user-configured MCP servers; when that field is absent, Anvil seeds the
 //! config with its preinstalled servers.
 
