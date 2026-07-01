@@ -898,7 +898,7 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
     std::fs::create_dir_all(&cwd).expect("create cwd");
     // A real-enough git marker (`.git/HEAD`) so the repo root is recognized and
     // a nested subdir resolves to the same session storage root -- required to
-    // exercise the cold-reload cwd-mismatch path below.
+    // exercise the cold-reload same-workspace path below.
     std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
     std::fs::write(cwd.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
     // A second, distinct repo root used to exercise cwd-mismatch rejection.
@@ -1139,22 +1139,40 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
     assert_response_ok(&case, "session/resume (matching cwd)", &ok_resume, &client);
 
     // Cold path: close (evict) the session, then load it from disk under a
-    // nested cwd that shares the same repo storage root. The persisted manifest
-    // cwd must still drive the mismatch rejection (#147), proving the check
-    // survives a cold reload and isn't merely a warm in-memory comparison.
+    // nested cwd that resolves to the same repo storage root. A nested checkout
+    // (like a linked worktree) is the *same* workspace, so a cold reload must
+    // reopen the session from there rather than reject it as a moved cwd --
+    // proving the cwd check keys off the persisted workspace root and survives a
+    // cold reload instead of being a mere warm in-memory comparison (#147, #241).
     let close = client.request("session/close", json!({ "sessionId": session_id }));
     assert_response_ok(&case, "session/close", &close, &client);
     let nested_cwd = cwd.join("nested");
     std::fs::create_dir_all(&nested_cwd).expect("create nested cwd");
-    let cold_mismatch = client.request(
+    let cold_same_workspace = client.request(
         "session/load",
         json!({ "sessionId": session_id, "cwd": nested_cwd, "mcpServers": [] }),
     );
+    assert_response_ok(
+        &case,
+        "session/load (cold same-workspace nested cwd)",
+        &cold_same_workspace,
+        &client,
+    );
+
+    // A genuinely different repo root is a different workspace. After eviction
+    // the foreign cwd has no session storage of its own, so a cold load there
+    // reports an unknown session rather than silently adopting it.
+    let close_again = client.request("session/close", json!({ "sessionId": session_id }));
+    assert_response_ok(&case, "session/close (again)", &close_again, &client);
+    let cold_foreign = client.request(
+        "session/load",
+        json!({ "sessionId": session_id, "cwd": other_cwd, "mcpServers": [] }),
+    );
     assert_response_invalid_params_contains(
         &case,
-        "session/load (cold cwd mismatch)",
-        &cold_mismatch,
-        "does not match",
+        "session/load (cold foreign workspace)",
+        &cold_foreign,
+        "unknown session",
         &client,
     );
     let cold_ok = client.request(
