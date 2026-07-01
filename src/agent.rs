@@ -7019,6 +7019,13 @@ async fn handle_setup_bedrock(
                                 auth.bearer_token.len()
                             )
                         }
+                        Ok(None) if state.secrets_present => format!(
+                            "Bedrock is configured from a legacy `~/.secrets` credential file.\n  \
+                             Region: {}\n  Model: {}\n\n\
+                             Tip: migrate to a managed credential file with `/setup bedrock key <token>`.",
+                            crate::bedrock_auth::region_from_any_source(),
+                            crate::bedrock_auth::model_from_any_source(),
+                        ),
                         Ok(None) => {
                             "No Bedrock credentials found. Run `/setup bedrock key <token>`."
                                 .to_string()
@@ -7069,6 +7076,7 @@ fn render_bedrock_setup_help() -> String {
             crate::bedrock_client::BEDROCK_API_KEY_ENV
         ),
         "file" => "Bedrock is connected from saved credentials.".to_string(),
+        "secrets" => "Bedrock is connected from a legacy `~/.secrets` credential file.".to_string(),
         _ => "Bedrock is not connected.".to_string(),
     };
     let key_help = if state.env_owns() {
@@ -11511,6 +11519,7 @@ mod tests {
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _secrets = EnvScope::set("BROKK_SECRETS_HOME", tmp_cfg.path());
         let _env = EnvScope::set("AWS_BEARER_TOKEN_BEDROCK", "bedrock-from-env");
 
         let dump = render_bedrock_setup_help();
@@ -11531,6 +11540,7 @@ mod tests {
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _secrets = EnvScope::set("BROKK_SECRETS_HOME", tmp_cfg.path());
         let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
         crate::bedrock_auth::write(&crate::bedrock_auth::BedrockAuth {
             bearer_token: "bedrock-on-disk".to_string(),
@@ -11554,12 +11564,39 @@ mod tests {
         let _lock = ENV_GUARD.lock().await;
         let tmp_cfg = tempfile::tempdir().unwrap();
         let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _secrets = EnvScope::set("BROKK_SECRETS_HOME", tmp_cfg.path());
         let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
 
         let dump = render_bedrock_setup_help();
 
         assert!(dump.contains("Bedrock is not connected"), "dump:\n{dump}");
         assert!(dump.contains("/setup bedrock key <token>"));
+    }
+
+    /// Regression: a token only in the legacy `~/.secrets/` fallback (the
+    /// backend resolves it, so models load) must be reported as connected
+    /// rather than "not connected" / missing-key.
+    #[tokio::test]
+    async fn bedrock_setup_reports_secrets_backed_credentials() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.lock().await;
+        let tmp_cfg = tempfile::tempdir().unwrap();
+        let tmp_secrets = tempfile::tempdir().unwrap();
+        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp_cfg.path());
+        let _secrets = EnvScope::set("BROKK_SECRETS_HOME", tmp_secrets.path());
+        let _env = EnvScope::remove("AWS_BEARER_TOKEN_BEDROCK");
+        std::fs::write(tmp_secrets.path().join("bedrock_api_key"), "secret-token\n").unwrap();
+
+        let dump = render_bedrock_setup_help();
+
+        assert!(
+            dump.contains("legacy `~/.secrets` credential file"),
+            "dump must report the secrets fallback as connected; got:\n{dump}"
+        );
+        assert!(
+            !dump.contains("Bedrock is not connected"),
+            "secrets-backed setup must not report disconnected; got:\n{dump}"
+        );
     }
 
     /// The handler short-circuits with the env-owned explanation for
