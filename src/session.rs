@@ -3439,21 +3439,26 @@ impl SessionStore {
         true
     }
 
-    /// Explicitly reopen a persisted session after it was closed in this
-    /// process. This is used by ACP session/load and session/resume; close
-    /// remains non-destructive, while prompt/registry paths still avoid
-    /// implicit cold-load resurrection.
     /// Reopen a persisted session for an ACP lifecycle request (`session/load`,
-    /// `session/resume`), validating that the request `cwd` matches the cwd the
-    /// session was created under.
+    /// `session/resume`), validating that the request `cwd` names the same
+    /// workspace the session was created under. Close stays non-destructive,
+    /// while prompt/registry paths still avoid implicit cold-load resurrection.
+    ///
+    /// Workspace identity is the repo root, not the literal path. A linked git
+    /// worktree and its main repository resolve to the same
+    /// [`session_storage_root`] -- which is exactly where the session's zip and
+    /// its permission store already live -- so resuming a worktree session from
+    /// the main checkout (or a sibling worktree, or after the disposable
+    /// worktree is gone) is the *same* cwd, not a move between directories. Only
+    /// a genuinely different workspace yields [`LifecycleReopen::CwdMismatch`],
+    /// since that would swap the project instructions, skills, permission scope,
+    /// and sandbox assumptions out from under the conversation.
     ///
     /// The authoritative cwd is the persisted manifest cwd when present -- so
     /// the check survives a cold reload, where the in-memory cwd is seeded from
     /// the request -- falling back to the in-memory cwd for sessions whose
-    /// manifest predates cwd persistence. Returns [`LifecycleReopen::CwdMismatch`]
-    /// rather than moving the session, since cwd governs project instructions,
-    /// skills, permission scope, and sandbox assumptions. The comparison and the
-    /// read happen here so callers can't observe a half-validated session.
+    /// manifest predates cwd persistence. The comparison and the read happen
+    /// here so callers can't observe a half-validated session.
     pub async fn reopen_session_checked(&self, id: &str, cwd: &Path) -> LifecycleReopen {
         if !self.load_into_memory_if_cold(id, cwd, true).await {
             return LifecycleReopen::Unknown;
@@ -3468,7 +3473,10 @@ impl SessionStore {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| session.cwd.clone());
-        if normalize_cwd(&session_cwd) != normalize_cwd(cwd) {
+        // Compare the workspace root, not the raw path: a worktree and its main
+        // repo collapse to the same session_storage_root, so this is the same
+        // cwd. Only a different workspace root is a real mismatch.
+        if session_storage_root(&session_cwd) != session_storage_root(cwd) {
             return LifecycleReopen::CwdMismatch { session_cwd };
         }
         let cloned = session.clone();
@@ -7361,6 +7369,61 @@ mod tests {
                 .is_any_always_allowed(&in_main.id, &["write_file".to_string()])
                 .await,
             "approval granted in a worktree should be honored from the main repo"
+        );
+    }
+
+    /// A linked worktree and its main repository are one workspace, so an ACP
+    /// lifecycle request must reopen a worktree session from the main checkout
+    /// (and vice versa): this is the *same* cwd, not a "move between working
+    /// directories". Regression test for the resume/load/fork guard rejecting a
+    /// worktree session once the disposable worktree path no longer matched the
+    /// launch cwd.
+    #[tokio::test]
+    async fn linked_worktree_and_main_repo_are_the_same_cwd_on_reopen() {
+        let (main, worktree) = make_fake_linked_worktree();
+        let store = SessionStore::new("m".to_string());
+
+        // Created inside the worktree; reopened and forked from the main repo.
+        let from_worktree = store.create_session(worktree.path().to_path_buf()).await;
+        assert!(
+            matches!(
+                store
+                    .reopen_session_checked(&from_worktree.id, main.path())
+                    .await,
+                LifecycleReopen::Reopened(_)
+            ),
+            "a worktree session must reopen from the main repo checkout"
+        );
+        assert!(
+            matches!(
+                store.fork_session(&from_worktree.id, main.path()).await,
+                ForkOutcome::Forked(_)
+            ),
+            "fork must accept the main repo cwd for a worktree session"
+        );
+
+        // Created in the main checkout; reopened from the linked worktree.
+        let from_main = store.create_session(main.path().to_path_buf()).await;
+        assert!(
+            matches!(
+                store
+                    .reopen_session_checked(&from_main.id, worktree.path())
+                    .await,
+                LifecycleReopen::Reopened(_)
+            ),
+            "a main-repo session must reopen from a linked worktree"
+        );
+
+        // A genuinely different workspace is still a mismatch.
+        let elsewhere = tempfile::tempdir().expect("unrelated cwd");
+        assert!(
+            matches!(
+                store
+                    .reopen_session_checked(&from_main.id, elsewhere.path())
+                    .await,
+                LifecycleReopen::CwdMismatch { .. } | LifecycleReopen::Unknown
+            ),
+            "an unrelated workspace must not silently adopt the session"
         );
     }
 
