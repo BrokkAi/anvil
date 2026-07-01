@@ -447,16 +447,7 @@ pub(crate) fn snapshot_workspace(
     let plan = snapshot_plan(snapshot_dir, step, previous_exists, link_base);
 
     let mut command = Command::new("rsync");
-    command
-        .arg("-a")
-        .arg("--delete")
-        .arg("--exclude")
-        .arg("/.git");
-    if let Some(link_dest) = plan.link_dest.as_ref() {
-        command.arg(format!("--link-dest={}", link_dest.display()));
-    }
-    command.arg(format!("{}/", cwd.display()));
-    command.arg(format!("{}/", plan.dest.display()));
+    command.args(snapshot_rsync_args(cwd, &plan));
 
     let output = command
         .output()
@@ -466,6 +457,20 @@ pub(crate) fn snapshot_workspace(
     }
 
     bail!("{}", rsync_failure_detail(step, &output));
+}
+
+fn snapshot_rsync_args(cwd: &Path, plan: &SnapshotPlan) -> Vec<String> {
+    let mut args = vec!["-a".to_string(), "--delete".to_string()];
+    for exclude in ["/.git", "/.brokk", "/.bifrost"] {
+        args.push("--exclude".to_string());
+        args.push(exclude.to_string());
+    }
+    if let Some(link_dest) = plan.link_dest.as_ref() {
+        args.push(format!("--link-dest={}", link_dest.display()));
+    }
+    args.push(format!("{}/", cwd.display()));
+    args.push(format!("{}/", plan.dest.display()));
+    args
 }
 
 fn rsync_failure_detail(step: usize, output: &std::process::Output) -> String {
@@ -795,5 +800,24 @@ mod tests {
                 link_dest: None,
             }
         );
+    }
+
+    #[test]
+    fn snapshot_rsync_args_exclude_runtime_artifact_dirs() {
+        let plan = SnapshotPlan {
+            dest: PathBuf::from("/tmp/p2t-snapshots/step-0"),
+            link_dest: Some(PathBuf::from("/tmp/canonical")),
+        };
+        let args = snapshot_rsync_args(Path::new("/tmp/worktree"), &plan);
+
+        for excluded in ["/.git", "/.brokk", "/.bifrost"] {
+            assert!(
+                args.windows(2).any(|pair| pair == ["--exclude", excluded]),
+                "missing rsync exclude for {excluded}: {args:?}"
+            );
+        }
+        assert!(args.contains(&"--link-dest=/tmp/canonical".to_string()));
+        assert!(args.contains(&"/tmp/worktree/".to_string()));
+        assert!(args.contains(&"/tmp/p2t-snapshots/step-0/".to_string()));
     }
 }
