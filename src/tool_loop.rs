@@ -3319,7 +3319,11 @@ fn auto_permission_notice(action: &str, rationale: &str) -> String {
     } else {
         rationale
     };
-    format!("Auto permissions {action}.\nReason: {rationale}")
+    if action == "approved this tool call" {
+        format!("_Auto permissions **approved** this tool call. Reason: {rationale}_")
+    } else {
+        format!("Auto permissions {action}.\nReason: {rationale}")
+    }
 }
 
 fn sanitize_permission_rationale(rationale: &str) -> String {
@@ -4872,6 +4876,20 @@ mod tests {
         let truncated = truncate_for_permission_classifier(&text);
         assert!(truncated.ends_with("\n... truncated"));
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn auto_permission_notice_formats_auto_approval_as_single_markdown_line() {
+        let notice = auto_permission_notice("approved this tool call", " focused test command ");
+
+        assert_eq!(
+            notice,
+            "_Auto permissions **approved** this tool call. Reason: focused test command_"
+        );
+        assert!(!notice.contains('\n'));
+        assert!(notice.starts_with('_'));
+        assert!(notice.ends_with('_'));
+        assert!(notice.contains("**approved**"));
     }
 
     #[test]

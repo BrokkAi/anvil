@@ -714,14 +714,14 @@ mod tests {
             &json!({"command": "cargo test"}),
             "ok",
             None,
-            Some("Auto permissions approved this tool call.\nReason: focused test command."),
+            Some("_Auto permissions **approved** this tool call. Reason: focused test command._"),
         );
 
         let content = update.fields.content.expect("content");
         assert_eq!(content.len(), 1);
         assert_eq!(
             tool_text(&content[0]),
-            "Auto permissions approved this tool call.\nReason: focused test command.\n\nok"
+            "_Auto permissions **approved** this tool call. Reason: focused test command._\n\nok"
         );
         assert_eq!(
             update.fields.raw_output,

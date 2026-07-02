@@ -8257,7 +8257,8 @@ done
                 arguments: r#"{"file_path":"src/lib.rs"}"#.into(),
                 result: "fn main() {}\n".into(),
                 permission_notice: Some(
-                    "Auto permissions approved this tool call.\nReason: read-only tool.".into(),
+                    "_Auto permissions **approved** this tool call. Reason: read-only tool._"
+                        .into(),
                 ),
                 ..ToolExchange::default()
             },
@@ -8313,7 +8314,7 @@ done
         assert_eq!(abc.status, ToolExchangeStatus::Completed);
         assert_eq!(
             abc.permission_notice.as_deref(),
-            Some("Auto permissions approved this tool call.\nReason: read-only tool.")
+            Some("_Auto permissions **approved** this tool call. Reason: read-only tool._")
         );
 
         let xyz = by_id.get("call_xyz").expect("search exchange present");
@@ -8356,7 +8357,7 @@ done
             arguments: c1.arguments.clone(),
             result: "src/lib.rs:42: // TODO".into(),
             permission_notice: Some(
-                "Auto permissions approved this tool call.\nReason: search tool.".into(),
+                "_Auto permissions **approved** this tool call. Reason: search tool._".into(),
             ),
             ..ToolExchange::default()
         };
