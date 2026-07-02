@@ -376,6 +376,7 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     let path = raw_input.get("path").and_then(Value::as_str);
     let file_path = raw_input.get("file_path").and_then(Value::as_str);
     let pattern = raw_input.get("pattern").and_then(Value::as_str);
+    let query = raw_input.get("query").and_then(Value::as_str);
     let command = raw_input.get("command").and_then(Value::as_str);
 
     match tool_name {
@@ -393,6 +394,9 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
             .unwrap_or_else(|| display.to_string()),
         "grep_search" => pattern
             .map(|p| format!("Search `{p}`"))
+            .unwrap_or_else(|| display.to_string()),
+        "web_search" => query
+            .map(|q| format!("Search web `{q}`"))
             .unwrap_or_else(|| display.to_string()),
         "run_shell_command" => command
             .map(|c| format!("Run `{}`", first_line(c)))
@@ -604,6 +608,12 @@ mod tests {
     }
 
     #[test]
+    fn web_search_title_shows_query() {
+        let title = tool_title("web_search", &json!({"query": "rust release notes"}));
+        assert_eq!(title, "Search web `rust release notes`");
+    }
+
+    #[test]
     fn run_shell_title_shows_first_line() {
         let title = tool_title(
             "run_shell_command",
@@ -801,6 +811,7 @@ mod tests {
     fn locations_empty_for_non_filesystem_tools() {
         assert!(tool_locations("run_shell_command", &json!({"command": "ls"})).is_empty());
         assert!(tool_locations("grep_search", &json!({"pattern": "x"})).is_empty());
+        assert!(tool_locations("web_search", &json!({"query": "x"})).is_empty());
         assert!(tool_locations("search_symbols", &json!({"patterns": ["x"]})).is_empty());
     }
 

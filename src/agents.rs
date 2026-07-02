@@ -537,6 +537,7 @@ fn normalize_tool_name(tool: &str) -> String {
         "Edit" | "MultiEdit" | "NotebookEdit" => "edit",
         "Bash" => "run_shell_command",
         "Grep" | "Glob" => "grep_search",
+        "WebSearch" | "WebFetch" => "web_search",
         "LS" => "list_directory",
         _ => tool,
     }
@@ -714,13 +715,19 @@ mod tests {
         let home = TempDir::new().unwrap();
         write(
             &home.path().join(".claude").join("agents").join("reader.md"),
-            "---\nname: reader\ndescription: Read things\ntools: Read, Glob, Grep\n---\n\nbody\n",
+            "---\nname: reader\ndescription: Read things\ntools: Read, Glob, Grep, WebSearch\n---\n\nbody\n",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
         let meta = reg.get("reader").unwrap();
         assert_eq!(
             meta.allowed_tools.as_deref(),
-            Some(&["grep_search".to_string(), "read_file".to_string()][..])
+            Some(
+                &[
+                    "grep_search".to_string(),
+                    "read_file".to_string(),
+                    "web_search".to_string()
+                ][..]
+            )
         );
     }
 
