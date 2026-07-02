@@ -4381,7 +4381,7 @@ async fn execute_subagent(
         }
     };
 
-    let body = match crate::agents::read_agent_body(&meta.location) {
+    let body = match crate::agents::read_agent_body(&meta) {
         Ok(b) => b,
         Err(e) => {
             return (

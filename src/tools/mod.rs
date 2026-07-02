@@ -1857,6 +1857,7 @@ mod tests {
             location,
             skill_dir,
             scope: SkillScope::Project,
+            bundled_body: None,
         };
         (tmp, meta)
     }
@@ -2430,6 +2431,7 @@ mod tests {
                 allowed_tools: Some(vec!["grep_search".into(), "read_file".into()]),
                 location: PathBuf::from("/tmp/doc-writer.md"),
                 scope: AgentScope::Project,
+                bundled_body: None,
             },
             AgentMeta {
                 name: "bug-hunter".into(),
@@ -2438,6 +2440,7 @@ mod tests {
                 allowed_tools: None,
                 location: PathBuf::from("/tmp/bug-hunter.md"),
                 scope: AgentScope::User,
+                bundled_body: None,
             },
         ]);
         let defs = registry.tool_definitions().await;
