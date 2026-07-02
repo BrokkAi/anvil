@@ -9,6 +9,7 @@ use std::fmt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::http_retry::LlmRetryTier;
 use crate::structured_output::StructuredOutputRequest;
 
 /// Default value for the `--llm-idle-timeout-secs` CLI flag (and the
@@ -77,19 +78,38 @@ pub(crate) fn is_incomplete_stream_error(error: &anyhow::Error) -> bool {
 }
 
 pub(crate) fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
+    llm_retry_tier(error).is_some()
+}
+
+pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
     if is_incomplete_stream_error(error) {
-        return true;
+        return Some(LlmRetryTier::Fast);
     }
 
     let error = format!("{error:#}");
-    error.contains("stream read error")
+    if crate::http_retry::contains_gateway_transient_marker(&error) {
+        return Some(LlmRetryTier::GatewayTransient);
+    }
+
+    (error.contains("stream read error")
         || error.contains("no meaningful progress")
         || error.contains("Responses stream failed: server_error")
         || error.contains("Responses stream failed: server_is_overloaded")
         || error.contains("Responses stream failed: rate_limit_exceeded")
         || error.contains("server_is_overloaded")
         || error.contains("server_error")
-        || error.contains("rate_limit_exceeded")
+        || error.contains("rate_limit_exceeded"))
+    .then_some(LlmRetryTier::Fast)
+}
+
+pub(crate) const EMPTY_COMPLETION_RETRY_REASON: &str =
+    "no meaningful progress: empty completion (no text, no tool calls)";
+
+pub(crate) fn is_degenerate_empty_completion(response: &LlmResponse) -> bool {
+    match response {
+        LlmResponse::Text { text, .. } => text.trim().is_empty(),
+        LlmResponse::ToolCalls { text, calls, .. } => text.trim().is_empty() && calls.is_empty(),
+    }
 }
 
 /// Retry a streamed LLM request when the caller guarantees streamed
@@ -107,20 +127,42 @@ where
     let mut attempt = 1u64;
     loop {
         match llm.stream_chat(build_request()).await {
-            Ok(response) => return Ok(response),
-            Err(error)
-                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
-                    && !cancel.is_cancelled()
-                    && is_retryable_llm_error(&error) =>
+            Ok(response)
+                if !cancel.is_cancelled()
+                    && is_degenerate_empty_completion(&response)
+                    && attempt < LlmRetryTier::Fast.max_attempts() =>
             {
                 tracing::warn!(
                     attempt,
-                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
+                    max_attempts = LlmRetryTier::Fast.max_attempts(),
+                    operation,
+                    "retrying empty LLM completion with no visible output"
+                );
+                crate::http_retry::sleep_before_retry_for_tier(
+                    operation,
+                    LlmRetryTier::Fast,
+                    attempt,
+                    EMPTY_COMPLETION_RETRY_REASON.to_string(),
+                    Some(cancel),
+                )
+                .await?;
+                attempt += 1;
+            }
+            Ok(response) => return Ok(response),
+            Err(error)
+                if !cancel.is_cancelled()
+                    && llm_retry_tier(&error).is_some_and(|tier| attempt < tier.max_attempts()) =>
+            {
+                let tier = llm_retry_tier(&error).expect("guard checked retry tier");
+                tracing::warn!(
+                    attempt,
+                    max_attempts = tier.max_attempts(),
                     operation,
                     "retrying transient LLM stream failure with no visible output"
                 );
-                crate::http_retry::sleep_before_retry(
+                crate::http_retry::sleep_before_retry_for_tier(
                     operation,
+                    tier,
                     attempt,
                     format!("{error:#}"),
                     Some(cancel),
@@ -1760,6 +1802,39 @@ mod tests {
         (cb, collected)
     }
 
+    struct EmptyThenOkBackend {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for EmptyThenOkBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn stream_chat(
+            &self,
+            mut request: StreamChatRequest,
+        ) -> BoxFuture<'_, Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            Box::pin(async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    return Ok(LlmResponse::Text {
+                        text: String::new(),
+                        reasoning_content: None,
+                        usage: TokenUsage::default(),
+                    });
+                }
+                (request.on_token)("ok");
+                Ok(LlmResponse::Text {
+                    text: "ok".to_string(),
+                    reasoning_content: None,
+                    usage: TokenUsage::default(),
+                })
+            })
+        }
+    }
+
     struct RetryThenSseResponder {
         calls: Arc<AtomicUsize>,
     }
@@ -1779,6 +1854,62 @@ mod tests {
                     )
             }
         }
+    }
+
+    #[test]
+    fn retryable_llm_error_classifies_gateway_markers_only_as_long_tier() {
+        let gateway = anyhow::anyhow!(
+            "chat completion failed (HTTP 400): JSON-RPC error -32602: Job registration failed"
+        )
+        .context("teacher rollout request failed");
+        assert_eq!(
+            llm_retry_tier(&gateway),
+            Some(crate::http_retry::LlmRetryTier::GatewayTransient)
+        );
+        assert!(is_retryable_llm_error(&gateway));
+
+        let standard = anyhow::anyhow!("Responses stream failed: server_error: overloaded");
+        assert_eq!(
+            llm_retry_tier(&standard),
+            Some(crate::http_retry::LlmRetryTier::Fast)
+        );
+
+        let validation =
+            anyhow::anyhow!("chat completion failed (HTTP 400): missing required field messages");
+        assert_eq!(llm_retry_tier(&validation), None);
+        assert!(!is_retryable_llm_error(&validation));
+    }
+
+    #[tokio::test]
+    async fn no_visible_output_retry_recovers_empty_completion() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend = EmptyThenOkBackend {
+            attempts: attempts.clone(),
+        };
+        let cancel = CancellationToken::new();
+
+        let response = stream_chat_no_visible_output_with_retry(
+            &backend,
+            "empty completion test",
+            &cancel,
+            || StreamChatRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage::user("hello")],
+                tools: None,
+                reasoning_effort: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .expect("empty completion should retry and recover");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
     }
 
     #[tokio::test]
@@ -1818,6 +1949,45 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(*tokens.lock().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn openai_client_non_success_error_includes_response_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("JSON-RPC error -32602: Task submission failed"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenAiClient::new(server.uri(), None);
+        let (on_token, _) = collect_tokens();
+        let err = client
+            .stream_chat(StreamChatRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage::user("hello")],
+                tools: None,
+                reasoning_effort: None,
+                temperature: None,
+                structured_output: None,
+                on_token,
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(30),
+            })
+            .await
+            .expect_err("HTTP 400 should fail");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("HTTP 400"), "{message}");
+        assert!(message.contains("Task submission failed"), "{message}");
+        assert_eq!(
+            llm_retry_tier(&err),
+            Some(crate::http_retry::LlmRetryTier::GatewayTransient)
+        );
     }
 
     #[test]

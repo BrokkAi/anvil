@@ -5,7 +5,36 @@ use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const LLM_MAX_ATTEMPTS: u64 = 4;
+pub(crate) const LLM_GATEWAY_TRANSIENT_MAX_ATTEMPTS: u64 = 12;
 const REQUEST_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const GATEWAY_TRANSIENT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const GATEWAY_TRANSIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(45);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmRetryTier {
+    Fast,
+    GatewayTransient,
+}
+
+impl LlmRetryTier {
+    pub(crate) fn max_attempts(self) -> u64 {
+        match self {
+            Self::Fast => LLM_MAX_ATTEMPTS,
+            Self::GatewayTransient => LLM_GATEWAY_TRANSIENT_MAX_ATTEMPTS,
+        }
+    }
+}
+
+pub(crate) fn contains_gateway_transient_marker(message: &str) -> bool {
+    [
+        "JSON-RPC error -32602",
+        "Job registration failed",
+        "Task submission failed",
+        "Engine not found",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
 
 /// Retry a request until it either succeeds, fails deterministically, or
 /// exhausts Codex-compatible retry budget. This is intentionally limited
@@ -62,9 +91,20 @@ pub(crate) async fn sleep_before_retry(
     reason: String,
     cancel: Option<&CancellationToken>,
 ) -> Result<()> {
-    let delay = retry_backoff(attempt);
+    sleep_before_retry_for_tier(operation, LlmRetryTier::Fast, attempt, reason, cancel).await
+}
+
+pub(crate) async fn sleep_before_retry_for_tier(
+    operation: &str,
+    tier: LlmRetryTier,
+    attempt: u64,
+    reason: String,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    let delay = retry_backoff_for_tier(tier, attempt);
+    let max_attempts = tier.max_attempts();
     tracing::warn!(
-        "{operation} failed ({reason}); retrying request ({attempt}/{LLM_MAX_ATTEMPTS}) in {delay:?}"
+        "{operation} failed ({reason}); retrying request ({attempt}/{max_attempts}) in {delay:?}"
     );
 
     if let Some(cancel) = cancel {
@@ -81,11 +121,28 @@ pub(crate) async fn sleep_before_retry(
     Ok(())
 }
 
+pub(crate) fn retry_backoff_for_tier(tier: LlmRetryTier, attempt: u64) -> Duration {
+    match tier {
+        LlmRetryTier::Fast => retry_backoff(attempt),
+        LlmRetryTier::GatewayTransient => gateway_transient_retry_backoff(attempt),
+    }
+}
+
 pub(crate) fn retry_backoff(attempt: u64) -> Duration {
     let exp = 2u64.saturating_pow(attempt.saturating_sub(1) as u32);
     let raw = REQUEST_RETRY_BASE_DELAY
         .as_millis()
         .saturating_mul(u128::from(exp));
+    let jitter = rand::rng().random_range(0.9..1.1);
+    Duration::from_millis((raw as f64 * jitter) as u64)
+}
+
+pub(crate) fn gateway_transient_retry_backoff(attempt: u64) -> Duration {
+    let exp = 2u64.saturating_pow(attempt.saturating_sub(1) as u32);
+    let raw = GATEWAY_TRANSIENT_RETRY_BASE_DELAY
+        .as_millis()
+        .saturating_mul(u128::from(exp))
+        .min(GATEWAY_TRANSIENT_RETRY_MAX_DELAY.as_millis());
     let jitter = rand::rng().random_range(0.9..1.1);
     Duration::from_millis((raw as f64 * jitter) as u64)
 }
@@ -109,6 +166,40 @@ mod tests {
             (360..=440).contains(&second.as_millis()),
             "second retry should jitter around 400ms, got {second:?}"
         );
+    }
+
+    #[test]
+    fn gateway_transient_backoff_uses_long_capped_schedule() {
+        assert_eq!(LlmRetryTier::Fast.max_attempts(), LLM_MAX_ATTEMPTS);
+        assert_eq!(
+            LlmRetryTier::GatewayTransient.max_attempts(),
+            LLM_GATEWAY_TRANSIENT_MAX_ATTEMPTS
+        );
+
+        let first = gateway_transient_retry_backoff(1);
+        assert!(
+            (900..=1100).contains(&first.as_millis()),
+            "first gateway retry should jitter around 1s, got {first:?}"
+        );
+
+        let capped = gateway_transient_retry_backoff(10);
+        assert!(
+            (40_500..=49_500).contains(&capped.as_millis()),
+            "gateway retry should cap around 45s with jitter, got {capped:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_transient_marker_detection_is_narrow() {
+        assert!(contains_gateway_transient_marker(
+            "chat completion failed (HTTP 400): JSON-RPC error -32602: Job registration failed"
+        ));
+        assert!(contains_gateway_transient_marker(
+            "chat completion failed (HTTP 400): Engine not found"
+        ));
+        assert!(!contains_gateway_transient_marker(
+            "chat completion failed (HTTP 400): invalid request: missing messages"
+        ));
     }
 
     #[test]

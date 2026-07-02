@@ -16,8 +16,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
-    is_retryable_llm_error, messages_include_images, rewrite_image_prompt_provider_error,
+    ChatMessage, EMPTY_COMPLETION_RETRY_REASON, LlmBackend, LlmResponse, StreamChatRequest,
+    TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion, is_retryable_llm_error,
+    llm_retry_tier, messages_include_images, rewrite_image_prompt_provider_error,
     stream_chat_no_visible_output_with_retry,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
@@ -154,19 +155,12 @@ struct ToolCatalogRestrictions<'a> {
     tool_allowlist: Option<&'a HashSet<String>>,
 }
 
-/// A model turn that completed with neither visible text nor a tool call -- the
-/// "ended the turn without a final message" symptom. It is a transient model
-/// glitch, not an answer, so [`stream_chat_with_transient_retry`] re-rolls it on
-/// the same budget as a dropped stream.
-fn is_empty_completion(response: &LlmResponse) -> bool {
-    matches!(response, LlmResponse::Text { text, .. } if text.trim().is_empty())
-}
-
-/// Stream a model turn, retrying transient failures up to [`LLM_MAX_ATTEMPTS`].
-/// The retried conditions are a dropped/truncated stream or server
-/// overload/5xx/429 ([`is_retryable_llm_error`]) and an empty completion
-/// ([`is_empty_completion`]) -- a turn that produced nothing at all is just
-/// another transient failure to ride out rather than surface.
+/// Stream a model turn, retrying transient failures on the retry tier selected
+/// by [`llm_retry_tier`]. The retried conditions are a dropped/truncated stream
+/// or server overload/5xx/429 ([`is_retryable_llm_error`]) and an empty
+/// completion ([`is_degenerate_empty_completion`]) -- a turn that produced
+/// nothing at all is just another transient failure to ride out rather than
+/// surface.
 ///
 /// Unlike a pre-stream HTTP retry, a retry here replays the whole request and
 /// re-streams from scratch -- we cannot resume an interrupted SSE body. This
@@ -178,7 +172,6 @@ fn is_empty_completion(response: &LlmResponse) -> bool {
 /// If the model stays empty through the final attempt, the empty response is
 /// returned as-is so the caller surfaces its end-of-turn notice.
 ///
-/// [`LLM_MAX_ATTEMPTS`]: crate::http_retry::LLM_MAX_ATTEMPTS
 #[allow(clippy::too_many_arguments)]
 async fn stream_chat_with_transient_retry(
     llm: &Arc<dyn LlmBackend>,
@@ -227,16 +220,17 @@ async fn stream_chat_with_transient_retry(
 
         match response {
             Ok(ref response)
-                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
-                    && !cancel.is_cancelled()
-                    && is_empty_completion(response) =>
+                if !cancel.is_cancelled()
+                    && is_degenerate_empty_completion(response)
+                    && attempt < crate::http_retry::LlmRetryTier::Fast.max_attempts() =>
             {
-                let delay = crate::http_retry::retry_backoff(attempt);
+                let tier = crate::http_retry::LlmRetryTier::Fast;
+                let delay = crate::http_retry::retry_backoff_for_tier(tier, attempt);
                 append_trace_record(serde_json::json!({
                     "type": "llm_retry",
                     "turn": turn,
                     "attempt": attempt,
-                    "max_attempts": crate::http_retry::LLM_MAX_ATTEMPTS,
+                    "max_attempts": tier.max_attempts(),
                     "phase": "stream",
                     "reason": "empty completion (no text, no tool calls)",
                     "delay_ms": delay.as_millis(),
@@ -244,13 +238,14 @@ async fn stream_chat_with_transient_retry(
                 tracing::warn!(
                     turn,
                     attempt,
-                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
+                    max_attempts = tier.max_attempts(),
                     "retrying empty model completion (the model ended the turn without a message)"
                 );
-                crate::http_retry::sleep_before_retry(
+                crate::http_retry::sleep_before_retry_for_tier(
                     "streaming LLM response",
+                    tier,
                     attempt,
-                    "empty completion".to_string(),
+                    EMPTY_COMPLETION_RETRY_REASON.to_string(),
                     Some(cancel),
                 )
                 .await?;
@@ -258,29 +253,31 @@ async fn stream_chat_with_transient_retry(
             }
             Ok(response) => return Ok(response),
             Err(error)
-                if attempt < crate::http_retry::LLM_MAX_ATTEMPTS
-                    && !cancel.is_cancelled()
-                    && is_retryable_llm_error(&error) =>
+                if !cancel.is_cancelled()
+                    && llm_retry_tier(&error).is_some_and(|tier| attempt < tier.max_attempts()) =>
             {
-                let delay = crate::http_retry::retry_backoff(attempt);
+                let tier = llm_retry_tier(&error).expect("guard checked retry tier");
+                let delay = crate::http_retry::retry_backoff_for_tier(tier, attempt);
                 append_trace_record(serde_json::json!({
                     "type": "llm_retry",
                     "turn": turn,
                     "attempt": attempt,
-                    "max_attempts": crate::http_retry::LLM_MAX_ATTEMPTS,
+                    "max_attempts": tier.max_attempts(),
                     "phase": "stream",
+                    "retry_tier": format!("{tier:?}"),
                     "reason": format!("{error:#}"),
                     "delay_ms": delay.as_millis(),
                 }));
                 tracing::warn!(
                     turn,
                     attempt,
-                    max_attempts = crate::http_retry::LLM_MAX_ATTEMPTS,
+                    max_attempts = tier.max_attempts(),
                     "retrying transient LLM stream failure (replaying the request; \
                      already-streamed text may be re-emitted)"
                 );
-                crate::http_retry::sleep_before_retry(
+                crate::http_retry::sleep_before_retry_for_tier(
                     "streaming LLM response",
+                    tier,
                     attempt,
                     format!("{error:#}"),
                     Some(cancel),
@@ -1705,16 +1702,7 @@ pub(crate) async fn run(
                     "type": "p2t_trace_rotation_error",
                     "error": &message,
                 }));
-                return (
-                    message,
-                    Vec::new(),
-                    Vec::new(),
-                    TokenUsage::default(),
-                    Some(TurnFailure {
-                        retryable: false,
-                        message: "failed to rotate stale P2T trace/snapshots".to_string(),
-                    }),
-                );
+                return LoopOutcome::setup_failure(message);
             }
         }
         // Self-contained trace contract: record the exact message context
@@ -2336,7 +2324,7 @@ pub(crate) async fn run(
                 // Classify before consuming `e` so an autonomous driver can
                 // back off on a transient outage vs. stop on a fatal error.
                 llm_failure = Some(TurnFailure {
-                    retryable: crate::llm_client::is_retryable_llm_error(&e),
+                    retryable: is_retryable_llm_error(&e),
                     message: e.to_string(),
                 });
                 let friendly = messages_include_images(&messages)
