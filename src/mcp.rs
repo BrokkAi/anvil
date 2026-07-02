@@ -1,5 +1,6 @@
 use anyhow::Context;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -529,7 +530,7 @@ impl McpClient {
         let list_id = next_id.fetch_add(1, Ordering::SeqCst);
         write_request(&mut io, list_id, "tools/list", json!({})).await?;
         let list = read_response(&mut io, list_id).await?;
-        let tools = parse_tool_list(list)?;
+        let tools = parse_tool_list(list, Some(config.name.as_str()))?;
         let read_only_hint_count = tools
             .iter()
             .filter(|tool| tool.annotations.read_only_hint == Some(true))
@@ -835,37 +836,122 @@ async fn read_line_message(io: &mut McpIo) -> Result<Value, McpError> {
         .map_err(|e| McpError::Protocol(format!("parse line: {e} (line: {trimmed})")))
 }
 
-fn parse_tool_list(result: Value) -> Result<Vec<McpToolDef>, McpError> {
+fn parse_tool_list(result: Value, server: Option<&str>) -> Result<Vec<McpToolDef>, McpError> {
     let tools_array = result
         .get("tools")
         .and_then(Value::as_array)
         .ok_or_else(|| McpError::Protocol("tools/list missing 'tools' array".into()))?;
-    tools_array
-        .iter()
-        .map(|tool| {
-            let name = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| McpError::Protocol("tool missing name".into()))?
-                .to_string();
-            let description = tool
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let input_schema = tool
-                .get("inputSchema")
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object" }));
-            let annotations = parse_tool_annotations(tool.get("annotations"));
-            Ok(McpToolDef {
-                name,
-                description,
-                input_schema,
-                annotations,
-            })
-        })
-        .collect()
+    let mut tools = Vec::new();
+    for tool in tools_array {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::Protocol("tool missing name".into()))?
+            .to_string();
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let input_schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object" }));
+        let input_schema = match normalize_tool_input_schema(input_schema) {
+            Ok(input_schema) => input_schema,
+            Err(reason) => {
+                tracing::warn!(
+                    server,
+                    tool = %name,
+                    reason = %reason,
+                    "skipping mcp tool with invalid input schema"
+                );
+                continue;
+            }
+        };
+        let annotations = parse_tool_annotations(tool.get("annotations"));
+        tools.push(McpToolDef {
+            name,
+            description,
+            input_schema,
+            annotations,
+        });
+    }
+    Ok(tools)
+}
+
+fn normalize_tool_input_schema(mut schema: Value) -> Result<Value, String> {
+    let Some(object) = schema.as_object_mut() else {
+        return Err("inputSchema must be a JSON object".to_string());
+    };
+
+    match object.get("type") {
+        Some(Value::String(schema_type)) if schema_type == "object" => {}
+        Some(_) => return Err("inputSchema top-level type must be \"object\"".to_string()),
+        None => {
+            object.insert("type".to_string(), Value::String("object".to_string()));
+        }
+    }
+
+    match object.get("properties") {
+        Some(Value::Object(_)) => {}
+        Some(Value::Null) | None => {
+            object.insert("properties".to_string(), json!({}));
+        }
+        Some(_) => return Err("inputSchema properties must be an object".to_string()),
+    }
+
+    let property_names: HashSet<String> = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("properties was normalized to an object")
+        .keys()
+        .cloned()
+        .collect();
+
+    let Some(required) = object.get_mut("required") else {
+        return Ok(schema);
+    };
+    let Some(required_array) = required.as_array() else {
+        object.remove("required");
+        tracing::warn!(
+            dropped_required = "non-array required",
+            "normalized mcp tool input schema required field"
+        );
+        return Ok(schema);
+    };
+
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    let mut dropped = Vec::new();
+    for entry in required_array {
+        let Some(name) = entry.as_str() else {
+            dropped.push(entry.to_string());
+            continue;
+        };
+        if name.is_empty() {
+            dropped.push(name.to_string());
+            continue;
+        }
+        if !property_names.contains(name) {
+            dropped.push(name.to_string());
+            continue;
+        }
+        if !seen.insert(name.to_string()) {
+            dropped.push(name.to_string());
+            continue;
+        }
+        normalized.push(Value::String(name.to_string()));
+    }
+
+    if !dropped.is_empty() {
+        *required = Value::Array(normalized);
+        tracing::warn!(
+            dropped_required = ?dropped,
+            "normalized mcp tool input schema required field"
+        );
+    }
+    Ok(schema)
 }
 
 fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
@@ -937,6 +1023,141 @@ mod tests {
         };
         normalize_preinstalled_bifrost_server(&mut server);
         assert_eq!(server.args, custom, "a custom surface must be left as-is");
+    }
+
+    #[test]
+    fn tool_schema_missing_type_and_properties_are_inserted() {
+        let tools = parse_tool_list(
+            json!({
+                "tools": [{
+                    "name": "needs_defaults",
+                    "inputSchema": {}
+                }]
+            }),
+            Some("test-server"),
+        )
+        .expect("tools/list should parse");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].input_schema,
+            json!({
+                "type": "object",
+                "properties": {}
+            })
+        );
+    }
+
+    #[test]
+    fn tool_schema_with_non_object_top_level_type_is_skipped() {
+        let tools = parse_tool_list(
+            json!({
+                "tools": [
+                    {
+                        "name": "bad",
+                        "inputSchema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "name": "good",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" }
+                            }
+                        }
+                    }
+                ]
+            }),
+            Some("test-server"),
+        )
+        .expect("tools/list should parse");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "good");
+    }
+
+    #[test]
+    fn tool_schema_required_entries_are_cleaned() {
+        let tools = parse_tool_list(
+            json!({
+                "tools": [{
+                    "name": "clean_required",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "limit": { "type": "number" }
+                        },
+                        "required": ["path", "path", 7, "missing", "", "limit"]
+                    }
+                }]
+            }),
+            Some("test-server"),
+        )
+        .expect("tools/list should parse");
+
+        assert_eq!(tools[0].input_schema["required"], json!(["path", "limit"]));
+    }
+
+    #[test]
+    fn tool_schema_required_non_array_is_removed() {
+        let tools = parse_tool_list(
+            json!({
+                "tools": [{
+                    "name": "bad_required",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": "path"
+                    }
+                }]
+            }),
+            Some("test-server"),
+        )
+        .expect("tools/list should parse");
+
+        assert!(tools[0].input_schema.get("required").is_none());
+    }
+
+    #[test]
+    fn tool_schema_json_string_is_skipped() {
+        let tools = parse_tool_list(
+            json!({
+                "tools": [{
+                    "name": "bad",
+                    "inputSchema": "not a schema"
+                }]
+            }),
+            Some("test-server"),
+        )
+        .expect("tools/list should parse");
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn absent_input_schema_uses_normalized_object_default() {
+        let tools = parse_tool_list(
+            json!({
+                "tools": [{
+                    "name": "defaulted"
+                }]
+            }),
+            Some("test-server"),
+        )
+        .expect("tools/list should parse");
+
+        assert_eq!(
+            tools[0].input_schema,
+            json!({
+                "type": "object",
+                "properties": {}
+            })
+        );
     }
 
     /// Resolve the bifrost binary used by the handshake test.
