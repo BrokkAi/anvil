@@ -41,6 +41,47 @@ const AGENTS_DIR: &str = ".agents";
 const CLAUDE_DIR: &str = ".claude";
 const AGENTS_SUBDIR: &str = "agents";
 
+#[derive(Clone, Copy)]
+struct BundledAgent {
+    path: &'static str,
+    content: &'static str,
+}
+
+const BUNDLED_AGENTS: &[BundledAgent] = &[
+    BundledAgent {
+        path: "architect-reviewer.md",
+        content: include_str!("../bundled/brokk-agents/architect-reviewer.md"),
+    },
+    BundledAgent {
+        path: "devops-reviewer.md",
+        content: include_str!("../bundled/brokk-agents/devops-reviewer.md"),
+    },
+    BundledAgent {
+        path: "dry-reviewer.md",
+        content: include_str!("../bundled/brokk-agents/dry-reviewer.md"),
+    },
+    BundledAgent {
+        path: "issue-diagnostician.md",
+        content: include_str!("../bundled/brokk-agents/issue-diagnostician.md"),
+    },
+    BundledAgent {
+        path: "issue-enhancer.md",
+        content: include_str!("../bundled/brokk-agents/issue-enhancer.md"),
+    },
+    BundledAgent {
+        path: "issue-planner.md",
+        content: include_str!("../bundled/brokk-agents/issue-planner.md"),
+    },
+    BundledAgent {
+        path: "security-reviewer.md",
+        content: include_str!("../bundled/brokk-agents/security-reviewer.md"),
+    },
+    BundledAgent {
+        path: "senior-dev-reviewer.md",
+        content: include_str!("../bundled/brokk-agents/senior-dev-reviewer.md"),
+    },
+];
+
 /// Discovered subagent metadata. The body is loaded on demand by the
 /// `task` dispatch path, not eagerly, so a session with 30 subagents
 /// doesn't pay the I/O cost upfront.
@@ -51,12 +92,13 @@ pub struct AgentMeta {
     pub max_turns: Option<usize>,
     pub allowed_tools: Option<Vec<String>>,
     pub location: PathBuf,
-    #[allow(dead_code)]
     pub scope: AgentScope,
+    pub bundled_body: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScope {
+    BuiltIn,
     User,
     Project,
 }
@@ -159,6 +201,8 @@ fn discover_with_backend(
     let cwd = normalize_path(cwd);
     let mut reg = AgentRegistry::default();
 
+    load_bundled_agents(&mut reg, backend);
+
     // 1+2. User scope.
     if let Some(h) = home {
         scan_root(
@@ -194,9 +238,102 @@ fn discover_with_backend(
 
     if !reg.is_empty() {
         let names: Vec<&str> = reg.by_name.keys().map(|s| s.as_str()).collect();
-        tracing::info!(subagents = ?names, "subagent discovery");
+        let built_in_count = reg
+            .by_name
+            .values()
+            .filter(|meta| meta.scope == AgentScope::BuiltIn)
+            .count();
+        tracing::info!(subagents = ?names, built_in_count, "subagent discovery");
     }
     reg
+}
+
+fn load_bundled_agents(reg: &mut AgentRegistry, backend: &crate::sandbox_backend::SandboxBackend) {
+    for agent in BUNDLED_AGENTS {
+        load_bundled_agent(*agent, reg, backend);
+    }
+}
+
+fn load_bundled_agent(
+    agent: BundledAgent,
+    reg: &mut AgentRegistry,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) {
+    let path = Path::new(agent.path);
+    let (front, body) = match split_frontmatter(agent.content) {
+        Ok(p) => p,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "bundled subagent at '{}' missing or unterminated frontmatter: {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let parsed = match backend.parse_skill_frontmatter(front) {
+        Ok(p) => p,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "bundled subagent at '{}' has invalid YAML frontmatter: {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
+        reg.push_diagnostic(format!(
+            "bundled subagent at '{}' has no usable `name`; skipping",
+            path.display()
+        ));
+        return;
+    };
+    if !file_stem.is_empty() && name != file_stem {
+        reg.push_diagnostic(format!(
+            "bundled subagent at '{}' has name '{name}' that does not match filename '{file_stem}'; loading anyway",
+            path.display()
+        ));
+    }
+    let description = match parsed.description {
+        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
+        _ => {
+            reg.push_diagnostic(format!(
+                "bundled subagent at '{}' is missing or has empty `description`; skipping",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let max_turns = match parse_max_turns(front) {
+        Ok(v) => v,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "bundled subagent at '{}' has invalid `max_turns`/`maxTurns`: {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let allowed_tools = match parse_allowed_tools(front) {
+        Ok(v) => v,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "bundled subagent at '{}' has invalid `tools`: {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let location = PathBuf::from("<anvil>").join("brokk-agents").join(path);
+    reg.add(AgentMeta {
+        name,
+        description,
+        max_turns,
+        allowed_tools,
+        location,
+        scope: AgentScope::BuiltIn,
+        bundled_body: Some(body.trim_start_matches('\n').trim_end()),
+    });
 }
 
 fn scan_root(
@@ -390,6 +527,7 @@ fn load_agent(
         allowed_tools,
         location: path.to_path_buf(),
         scope,
+        bundled_body: None,
     });
 }
 
@@ -566,9 +704,12 @@ fn strip_inline_comment(value: &str) -> &str {
 /// Read just the body of a subagent file (frontmatter stripped). On any
 /// I/O or parse error returns the raw file contents so the activation
 /// path always has something to feed the LLM.
-pub fn read_agent_body(path: &Path) -> Result<String, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read subagent '{}': {e}", path.display()))?;
+pub fn read_agent_body(meta: &AgentMeta) -> Result<String, String> {
+    if let Some(body) = meta.bundled_body {
+        return Ok(body.to_string());
+    }
+    let raw = std::fs::read_to_string(&meta.location)
+        .map_err(|e| format!("failed to read subagent '{}': {e}", meta.location.display()))?;
     let body = match split_frontmatter(&raw) {
         Ok((_, body)) => body.trim_start_matches('\n').trim_end().to_string(),
         Err(_) => raw.trim().to_string(),
@@ -650,11 +791,15 @@ mod tests {
     }
 
     #[test]
-    fn discover_empty_when_nothing_present() {
+    fn bundled_agents_are_discovered_when_nothing_present() {
         let tmp = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert!(reg.is_empty(), "expected empty registry, got {}", reg.len());
+        let meta = reg
+            .get("architect-reviewer")
+            .expect("bundled reviewer should be present");
+        assert_eq!(meta.scope, AgentScope::BuiltIn);
+        assert!(reg.get("security-reviewer").is_some());
         assert!(reg.diagnostics().is_empty(), "{:?}", reg.diagnostics());
     }
 
@@ -667,7 +812,6 @@ mod tests {
             &agent_md("hunter", "Hunt for bugs", "Be thorough."),
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert_eq!(reg.len(), 1);
         let meta = reg.get("hunter").unwrap();
         assert_eq!(meta.description, "Hunt for bugs");
         assert_eq!(meta.scope, AgentScope::User);
@@ -799,7 +943,6 @@ mod tests {
             "---\nname: bad-cap\ndescription: Bad cap\nmax_turns: none\n---\n\nbody\n",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert!(reg.is_empty());
         assert!(
             reg.diagnostics().iter().any(|d| d.contains("max_turns")),
             "{:?}",
@@ -816,7 +959,6 @@ mod tests {
             "---\nname: bad\ndescription: Bad tools\ntools:\n  Read\n---\n\nbody\n",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert!(reg.is_empty());
         assert!(
             reg.diagnostics().iter().any(|d| d.contains("tools")),
             "{:?}",
@@ -849,7 +991,6 @@ mod tests {
         );
 
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert_eq!(reg.len(), 1);
         let meta = reg.get("hunter").unwrap();
         assert_eq!(meta.description, "Project version");
         assert_eq!(meta.scope, AgentScope::Project);
@@ -886,7 +1027,6 @@ mod tests {
             "---\nname: noop\n---\n\nbody\n",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert!(reg.is_empty());
         assert!(
             reg.diagnostics().iter().any(|d| d.contains("description")),
             "{:?}",
@@ -903,7 +1043,6 @@ mod tests {
             "no frontmatter here\n",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert!(reg.is_empty());
         assert!(
             reg.diagnostics().iter().any(|d| d.contains("frontmatter")),
             "{:?}",
@@ -924,7 +1063,6 @@ mod tests {
             "---\ndescription: A subagent\n---\n\nbody\n",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert_eq!(reg.len(), 1);
         assert!(reg.get("from-file").is_some());
     }
 
@@ -961,7 +1099,6 @@ mod tests {
             "not a subagent",
         );
         let reg = discover_inner(tmp.path(), Some(home.path()));
-        assert!(reg.is_empty());
         assert!(reg.diagnostics().is_empty());
     }
 
@@ -974,7 +1111,16 @@ mod tests {
             "---\nname: x\ndescription: y\n---\n\nThe body lines.\nSecond line.\n",
         )
         .unwrap();
-        let body = read_agent_body(&path).unwrap();
+        let meta = AgentMeta {
+            name: "x".into(),
+            description: "y".into(),
+            max_turns: None,
+            allowed_tools: None,
+            location: path,
+            scope: AgentScope::Project,
+            bundled_body: None,
+        };
+        let body = read_agent_body(&meta).unwrap();
         assert_eq!(body, "The body lines.\nSecond line.");
     }
 }
