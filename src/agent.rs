@@ -7035,37 +7035,52 @@ async fn handle_setup_bedrock(
                     }
                 }
             }
-            "disconnect" if crate::bedrock_auth::CredentialState::snapshot().env_owns() => {
-                format!(
-                    "Bedrock credentials are managed by the {} environment variable. \
-                     Unset it and restart to disconnect Bedrock.",
-                    crate::bedrock_client::BEDROCK_API_KEY_ENV
-                )
-            }
-            "disconnect" => match crate::bedrock_auth::logout() {
-                Ok(()) => {
-                    llm.uninstall_bedrock();
-                    spawn_background_refresh(
-                        refresh_lock.clone(),
-                        llm.clone(),
-                        sessions.clone(),
-                        Some((
-                            cx.clone(),
-                            session_id.to_string(),
-                            "Refreshing model catalog after Bedrock disconnect...",
-                        )),
-                        None,
-                    );
-                    "Bedrock credentials cleared. Run `/setup bedrock key <token>` to reconnect."
-                        .to_string()
+            "disconnect" => {
+                let state = crate::bedrock_auth::CredentialState::snapshot();
+                match crate::bedrock_auth::logout() {
+                    Ok(()) => {
+                        llm.uninstall_bedrock();
+                        spawn_background_refresh(
+                            refresh_lock.clone(),
+                            llm.clone(),
+                            sessions.clone(),
+                            Some((
+                                cx.clone(),
+                                session_id.to_string(),
+                                "Refreshing model catalog after Bedrock disconnect...",
+                            )),
+                            None,
+                        );
+                        render_bedrock_disconnect_success(state)
+                    }
+                    Err(e) => format!("Failed to remove Bedrock credentials: {e:#}"),
                 }
-                Err(e) => format!("Failed to remove Bedrock credentials: {e:#}"),
-            },
+            }
             _ => format!(
                 "Unknown Bedrock setup option `{rest}`.\n\n{}",
                 render_bedrock_setup_help()
             ),
         }
+    }
+}
+
+fn render_bedrock_disconnect_success(state: crate::bedrock_auth::CredentialState) -> String {
+    if state.env_owns() {
+        let env = crate::bedrock_client::BEDROCK_API_KEY_ENV;
+        return format!(
+            "Bedrock local credential files cleared and the in-memory backend was unloaded, but \
+             {env} is still set.\n\
+             Unset it and restart Anvil to fully disconnect Bedrock:\n\n  unset {env}\n\n\
+             If it comes back after restart, remove it from your shell profile or secrets manager."
+        );
+    }
+
+    if state.active_source() == "secrets" {
+        "Bedrock legacy `~/.secrets` credentials cleared and the in-memory backend was unloaded. Run `/setup bedrock key <token>` to reconnect."
+            .to_string()
+    } else {
+        "Bedrock credentials cleared and the in-memory backend was unloaded. Run `/setup bedrock key <token>` to reconnect."
+            .to_string()
     }
 }
 
@@ -11597,6 +11612,32 @@ mod tests {
         assert!(
             !dump.contains("Bedrock is not connected"),
             "secrets-backed setup must not report disconnected; got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn bedrock_disconnect_success_shows_unset_command_when_env_remains() {
+        let msg = render_bedrock_disconnect_success(crate::bedrock_auth::CredentialState {
+            env_set: true,
+            file_present: true,
+            secrets_present: true,
+        });
+
+        assert!(
+            msg.contains("local credential files cleared"),
+            "message should confirm local file cleanup; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("in-memory backend was unloaded"),
+            "message should describe current runtime disconnect; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("unset AWS_BEARER_TOKEN_BEDROCK"),
+            "message should show the shell command to fully disconnect; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("restart Anvil"),
+            "message should explain restart is needed after unsetting env; got:\n{msg}"
         );
     }
 

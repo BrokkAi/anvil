@@ -840,8 +840,11 @@ pub fn bearer_token_from_env_or_secrets() -> Result<Option<String>> {
 /// (`CredentialState::snapshot`) reads the same files through this
 /// function so the setup/status UI never disagrees with the token the
 /// backend actually resolves.
+pub(crate) const BEDROCK_SECRET_FILE_NAMES: [&str; 2] =
+    ["aws_bearer_token_bedrock", "bedrock_api_key"];
+
 pub fn bearer_token_from_secrets() -> Result<Option<String>> {
-    for name in ["aws_bearer_token_bedrock", "bedrock_api_key"] {
+    for name in BEDROCK_SECRET_FILE_NAMES {
         if let Some(token) = read_secret_file(name)? {
             return Ok(Some(token));
         }
@@ -1040,7 +1043,7 @@ fn dedup_preserve_order(items: Vec<String>) -> Vec<String> {
 /// Resolve the path to a legacy secrets file. Honours `BROKK_SECRETS_HOME`
 /// (symmetric with `BROKK_CONFIG_HOME`) so tests and power users can
 /// redirect the directory; otherwise `~/.secrets/<name>`.
-fn secret_file_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn secret_file_path(name: &str) -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("BROKK_SECRETS_HOME") {
         let custom = custom.trim();
         if !custom.is_empty() {

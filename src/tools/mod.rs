@@ -1,6 +1,7 @@
 mod filesystem;
 pub mod sandbox;
 mod shell;
+mod web_search;
 
 use crate::agents::AgentRegistry;
 use crate::llm_client::{FunctionDef, ToolDefinition};
@@ -71,6 +72,17 @@ struct GrepSearchArgs {
     path: Option<String>,
     #[serde(default = "default_grep_limit")]
     limit: usize,
+}
+
+fn default_web_search_limit() -> usize {
+    5
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default = "default_web_search_limit")]
+    max_results: usize,
 }
 
 fn default_shell_timeout_ms() -> u64 {
@@ -190,6 +202,13 @@ impl BuiltinArgsContract for GrepSearchArgs {
 }
 
 #[cfg(test)]
+impl BuiltinArgsContract for WebSearchArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &["query"];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
+        &[("query", "string"), ("max_results", "integer")];
+}
+
+#[cfg(test)]
 impl BuiltinArgsContract for RunShellCommandArgs {
     const REQUIRED_FIELDS: &'static [&'static str] = &["command"];
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[
@@ -275,6 +294,11 @@ const TOOLS: &[ToolMeta] = &[
         name: "grep_search",
         kind: ToolKind::Search,
         display_name: "Searching file contents",
+    },
+    ToolMeta {
+        name: "web_search",
+        kind: ToolKind::Search,
+        display_name: "Searching the web",
     },
     ToolMeta {
         name: "run_shell_command",
@@ -551,6 +575,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "edit",
     "list_directory",
     "grep_search",
+    "web_search",
     "run_shell_command",
 ];
 
@@ -853,6 +878,26 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["pattern"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("web_search") {
+            defs.push(tool_def(
+                "web_search",
+                "Searches the public web using DuckDuckGo's no-key HTML search endpoint. No API key, account, or user setup is required. Use for current or external information that is not in the local workspace; returns titles, URLs, and snippets.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The web search query."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return. Defaults to 5 and is clamped to 1-10."
+                        }
+                    },
+                    "required": ["query"]
                 }),
             ));
         }
@@ -1231,6 +1276,13 @@ impl ToolRegistry {
                     args.limit,
                     sandbox_mode,
                 )
+            }
+            "web_search" => {
+                let args: WebSearchArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                web_search::web_search(&args.query, args.max_results).await
             }
             "run_shell_command" => {
                 let args: RunShellCommandArgs = match parse_builtin_args(name, args) {
@@ -2024,6 +2076,7 @@ mod tests {
         assert_builtin_schema_matches::<EditFileArgs>(&defs, "edit");
         assert_builtin_schema_matches::<ListDirectoryArgs>(&defs, "list_directory");
         assert_builtin_schema_matches::<GrepSearchArgs>(&defs, "grep_search");
+        assert_builtin_schema_matches::<WebSearchArgs>(&defs, "web_search");
         assert_builtin_schema_matches::<RunShellCommandArgs>(&defs, "run_shell_command");
         assert_builtin_schema_matches::<ActivateSkillArgs>(&defs, "activate_skill");
     }
@@ -2101,6 +2154,14 @@ mod tests {
             "grep_search",
             json!({ "pattern": "x", "path": null }),
             "path",
+        )
+        .await;
+        assert_invalid_builtin_args(&registry, "web_search", json!({}), "query").await;
+        assert_invalid_builtin_args(
+            &registry,
+            "web_search",
+            json!({ "query": "rust", "max_results": "five" }),
+            "max_results",
         )
         .await;
         assert_invalid_builtin_args(
@@ -2223,6 +2284,7 @@ mod tests {
         assert!(advertised.iter().any(|name| name == "list_directory"));
         assert!(!advertised.iter().any(|name| name == "read_file"));
         assert!(!advertised.iter().any(|name| name == "grep_search"));
+        assert!(!advertised.iter().any(|name| name == "web_search"));
         assert!(!advertised.iter().any(|name| name == "run_shell_command"));
     }
 
