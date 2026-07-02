@@ -33,21 +33,12 @@ fn slopcop_shaped_acp_path_does_not_abort() {
 }
 
 #[test]
-fn auto_permission_prompt_cancel_does_not_abort() {
+fn auto_permission_classifier_denial_does_not_prompt_or_abort() {
     let case = SmokeCase {
-        name: "auto_permission_prompt_cancel",
+        name: "auto_permission_classifier_denial",
         prompt: "Check the external cargo registry source if needed.".to_string(),
     };
-    run_permission_cancel_case(&case, false);
-}
-
-#[test]
-fn auto_permission_prompt_session_cancel_does_not_abort() {
-    let case = SmokeCase {
-        name: "auto_permission_prompt_session_cancel",
-        prompt: "Check the external cargo registry source if needed.".to_string(),
-    };
-    run_permission_cancel_case(&case, true);
+    run_auto_classifier_denial_case(&case);
 }
 
 #[test]
@@ -2534,7 +2525,7 @@ fn run_direct_prompt_case(case: &SmokeCase) -> (OpenAiSmokeServer, usize) {
     (provider, permission_requests)
 }
 
-fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
+fn run_auto_classifier_denial_case(case: &SmokeCase) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
     std::fs::create_dir_all(&cwd).expect("create cwd");
@@ -2556,7 +2547,9 @@ fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
             "run_shell_command",
             r#"{"command":"sed -n '1,5p' ~/.cargo/config.toml"}"#,
         ),
-        text_sse_body(r#"{"allow":false,"rationale":"outside the user request"}"#),
+        text_sse_body(
+            r#"{"allow":false,"sandbox":"normal","rationale":"outside the user request"}"#,
+        ),
         text_sse_body("Permission prompt cancellation was handled."),
     ]);
     let mut child = spawn_anvil(
@@ -2569,8 +2562,7 @@ fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
     let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
     let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
     let mut stdin = child.stdin.take().expect("stdin");
-    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path)
-        .with_permission_cancel_response(send_session_cancel);
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
 
     let initialize = client.request(
         "initialize",
@@ -2625,51 +2617,37 @@ fn run_permission_cancel_case(case: &SmokeCase, send_session_cancel: bool) {
     assert_response_ok(case, "session/prompt", &prompt, &client);
     assert!(
         !client.exited(),
-        "{}: anvil exited after cancelled permission prompt; stderr:\n{}\ntrace:\n{}",
+        "{}: anvil exited after auto-classifier denial; stderr:\n{}\ntrace:\n{}",
         case.name,
         client.stderr_text(),
         client.trace_text()
     );
-    if send_session_cancel {
-        // A turn aborted via `session/cancel` MUST resolve its prompt with the
-        // `cancelled` stop reason rather than a normal end-turn (#152).
-        assert_eq!(
-            prompt["result"]["stopReason"].as_str(),
-            Some("cancelled"),
-            "{}: cancelled prompt did not return stopReason=cancelled: {prompt}",
-            case.name
-        );
-        assert_eq!(
-            provider.request_count(),
-            2,
-            "{}: expected provider to receive only tool and classifier requests after session/cancel",
-            case.name
-        );
-    } else {
-        // Declining a single permission (without session/cancel) is not a
-        // turn cancellation: the turn completes normally as end_turn (#152).
-        assert_eq!(
-            prompt["result"]["stopReason"].as_str(),
-            Some("end_turn"),
-            "{}: non-cancelled prompt did not return stopReason=end_turn: {prompt}",
-            case.name
-        );
-        assert_eq!(
-            provider.request_count(),
-            3,
-            "{}: expected provider to receive tool, classifier, and follow-up requests",
-            case.name
-        );
-        assert!(
-            provider
-                .request_bodies()
-                .get(2)
-                .is_some_and(|body| body.contains("prompt was cancelled before the user responded")),
-            "{}: follow-up request did not include cancelled permission result; requests: {:?}",
-            case.name,
-            provider.request_bodies()
-        );
-    }
+    assert_eq!(
+        client.permission_request_count, 0,
+        "{}: auto mode must not send client permission prompts",
+        case.name
+    );
+    assert_eq!(
+        prompt["result"]["stopReason"].as_str(),
+        Some("end_turn"),
+        "{}: classifier denial should complete as a normal turn: {prompt}",
+        case.name
+    );
+    assert_eq!(
+        provider.request_count(),
+        3,
+        "{}: expected provider to receive tool, classifier, and follow-up requests",
+        case.name
+    );
+    assert!(
+        provider
+            .request_bodies()
+            .get(2)
+            .is_some_and(|body| body.contains("Tool use denied by auto permissions")),
+        "{}: follow-up request did not include classifier denial result; requests: {:?}",
+        case.name,
+        provider.request_bodies()
+    );
 
     client.shutdown();
     let _ = stdout_join.join();
@@ -3015,8 +2993,6 @@ struct JsonRpcClient<'a> {
     trace_path: PathBuf,
     next_id: u64,
     stderr_lines: Vec<String>,
-    cancel_permission_requests: bool,
-    send_session_cancel_on_permission: bool,
     plan_permission_response: Option<PlanPermissionResponse>,
     permission_request_count: usize,
     /// `params` of every `session/update` notification observed while waiting
@@ -3040,8 +3016,6 @@ impl<'a> JsonRpcClient<'a> {
             trace_path,
             next_id: 1,
             stderr_lines: Vec::new(),
-            cancel_permission_requests: false,
-            send_session_cancel_on_permission: false,
             plan_permission_response: None,
             permission_request_count: 0,
             session_updates: Vec::new(),
@@ -3086,12 +3060,6 @@ impl<'a> JsonRpcClient<'a> {
             .drain(..)
             .filter_map(|params| params.get("update").cloned())
             .collect()
-    }
-
-    fn with_permission_cancel_response(mut self, send_session_cancel: bool) -> Self {
-        self.cancel_permission_requests = true;
-        self.send_session_cancel_on_permission = send_session_cancel;
-        self
     }
 
     fn with_plan_permission_response(mut self, response: PlanPermissionResponse) -> Self {
@@ -3175,9 +3143,7 @@ impl<'a> JsonRpcClient<'a> {
                             == Some("session/request_permission")
                         {
                             self.permission_request_count += 1;
-                            if self.cancel_permission_requests {
-                                self.respond_permission_cancelled(&value);
-                            } else if let Some(response) = self.plan_permission_response {
+                            if let Some(response) = self.plan_permission_response {
                                 match response {
                                     PlanPermissionResponse::Accept => {
                                         self.respond_permission_selected(&value, "accept_plan");
@@ -3223,24 +3189,6 @@ impl<'a> JsonRpcClient<'a> {
     }
 
     fn respond_permission_cancelled(&mut self, request: &Value) {
-        if self.send_session_cancel_on_permission
-            && let Some(session_id) = request
-                .get("params")
-                .and_then(|params| params.get("sessionId"))
-                .and_then(Value::as_str)
-        {
-            let cancel = json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": {
-                    "sessionId": session_id
-                }
-            });
-            writeln!(self.stdin, "{cancel}").expect("write session cancel notification");
-            self.stdin
-                .flush()
-                .expect("flush session cancel notification");
-        }
         let response = json!({
             "jsonrpc": "2.0",
             "id": request.get("id").cloned().unwrap_or(Value::Null),
