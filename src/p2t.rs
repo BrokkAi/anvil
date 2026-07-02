@@ -329,6 +329,66 @@ pub(crate) fn append_step_trace(path: &Path, record: &StepTraceRecord) {
     append_jsonl(path, record);
 }
 
+pub(crate) fn reset_window_session_if_stale(
+    step_trace_out: &Path,
+    snapshot_dir: Option<&Path>,
+) -> Result<bool> {
+    if !step_trace_has_records(step_trace_out)? {
+        return Ok(false);
+    }
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(step_trace_out)
+        .with_context(|| format!("failed to truncate {}", step_trace_out.display()))?;
+
+    if let Some(snapshot_dir) = snapshot_dir {
+        clear_step_snapshots(snapshot_dir)?;
+    }
+
+    Ok(true)
+}
+
+fn step_trace_has_records(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+fn clear_step_snapshots(snapshot_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(snapshot_dir)
+        .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
+    for entry in std::fs::read_dir(snapshot_dir)
+        .with_context(|| format!("failed to read {}", snapshot_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", snapshot_dir.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("step-") {
+            continue;
+        }
+
+        let path = entry.path();
+        if entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .is_dir()
+        {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn append_snapshot_error_trace(path: &Path, step: usize, error: &str) {
     #[derive(Serialize)]
     struct SnapshotErrorRecord<'a> {
@@ -748,6 +808,55 @@ mod tests {
             Some(P2tStopReason::WindowEnd)
         );
         assert_eq!(stop_reason_after_step(2, 3, 1), None);
+    }
+
+    #[test]
+    fn stale_window_session_is_rotated_before_window_start() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let trace = tempdir.path().join("steps.jsonl");
+        let snapshot_dir = tempdir.path().join("snapshots");
+        std::fs::create_dir_all(snapshot_dir.join("step-0")).unwrap();
+        std::fs::create_dir_all(snapshot_dir.join("step-1")).unwrap();
+        std::fs::write(snapshot_dir.join("step-1").join("stale.txt"), "old").unwrap();
+        std::fs::write(snapshot_dir.join("step-note"), "old").unwrap();
+        std::fs::create_dir_all(snapshot_dir.join("keep")).unwrap();
+        std::fs::write(
+            &trace,
+            concat!(
+                "{\"type\":\"window_start\",\"messages\":[],\"tool_names\":[]}\n",
+                "{\"type\":\"step\",\"step\":1}\n",
+                "{\"type\":\"window_end\",\"reason\":\"p2t_window_end\",\"steps\":1}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(reset_window_session_if_stale(&trace, Some(&snapshot_dir)).unwrap());
+        append_window_start_trace(&trace, &[], &[]);
+
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["type"], "window_start");
+        assert!(snapshot_dir.exists());
+        assert!(!snapshot_dir.join("step-0").exists());
+        assert!(!snapshot_dir.join("step-1").exists());
+        assert!(!snapshot_dir.join("step-note").exists());
+        assert!(snapshot_dir.join("keep").exists());
+    }
+
+    #[test]
+    fn fresh_window_session_does_not_touch_snapshots() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let trace = tempdir.path().join("steps.jsonl");
+        let snapshot_dir = tempdir.path().join("snapshots");
+
+        assert!(!reset_window_session_if_stale(&trace, Some(&snapshot_dir)).unwrap());
+
+        assert!(!trace.exists());
+        assert!(!snapshot_dir.exists());
     }
 
     #[test]

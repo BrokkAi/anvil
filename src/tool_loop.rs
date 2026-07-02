@@ -1690,6 +1690,33 @@ pub(crate) async fn run(
     let mut no_edit_completion_retry_count = 0usize;
     if let Some(config) = p2t_config.as_ref() {
         p2t::append_prefix_messages(&mut messages, &prefix_steps);
+        match p2t::reset_window_session_if_stale(
+            &config.step_trace_out,
+            config.snapshot_dir.as_deref(),
+        ) {
+            Ok(true) => tracing::info!(
+                trace = %config.step_trace_out.display(),
+                "rotated stale P2T window trace before starting a new session"
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                let message = format!("failed to rotate stale P2T trace/snapshots: {error:#}");
+                append_trace_record(serde_json::json!({
+                    "type": "p2t_trace_rotation_error",
+                    "error": &message,
+                }));
+                return (
+                    message,
+                    Vec::new(),
+                    Vec::new(),
+                    TokenUsage::default(),
+                    Some(TurnFailure {
+                        retryable: false,
+                        message: "failed to rotate stale P2T trace/snapshots".to_string(),
+                    }),
+                );
+            }
+        }
         // Self-contained trace contract: record the exact message context
         // (system prompt, user prompt, injected prefix) and advertised tools
         // this window starts from, so trajectories can be exported to
