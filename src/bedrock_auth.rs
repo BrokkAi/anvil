@@ -50,8 +50,8 @@ pub struct CredentialState {
     pub file_present: bool,
     /// A token exists in the legacy `~/.secrets/` fallback the backend
     /// still resolves. Tracked separately from `file_present` because the
-    /// managed setup commands (`key`/`region`/`model`/`disconnect`) only
-    /// touch `brokk/bedrock.json`, never the secrets files.
+    /// setup commands (`key`/`region`/`model`) write the managed config,
+    /// while `disconnect` also has to clear these fallback files.
     pub secrets_present: bool,
 }
 
@@ -150,6 +150,23 @@ pub fn logout() -> Result<()> {
     let path = auth_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    logout_legacy_secrets()?;
+    Ok(())
+}
+
+/// Delete legacy `~/.secrets/` Bedrock token files. Missing files are
+/// not errors, matching `logout` idempotency.
+fn logout_legacy_secrets() -> Result<()> {
+    for name in crate::bedrock_client::BEDROCK_SECRET_FILE_NAMES {
+        let Some(path) = crate::bedrock_client::secret_file_path(name) else {
+            continue;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
+        }
     }
     Ok(())
 }
@@ -320,6 +337,56 @@ mod tests {
         logout().unwrap();
         assert!(!auth_path().unwrap().exists());
         logout().unwrap();
+    }
+
+    #[test]
+    fn logout_removes_legacy_secret_files_and_is_idempotent() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvScope::new(tmp.path());
+        let aws_secret = tmp.path().join("aws_bearer_token_bedrock");
+        let bedrock_secret = tmp.path().join("bedrock_api_key");
+        std::fs::write(&aws_secret, "aws-secret-token\n").unwrap();
+        std::fs::write(&bedrock_secret, "bedrock-secret-token\n").unwrap();
+
+        assert!(CredentialState::snapshot().secrets_present);
+        logout().unwrap();
+
+        assert!(!aws_secret.exists());
+        assert!(!bedrock_secret.exists());
+        assert!(!CredentialState::snapshot().secrets_present);
+        logout().unwrap();
+    }
+
+    #[test]
+    fn logout_removes_local_credentials_even_when_env_is_set() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = EnvScope::new(tmp.path());
+        env.set_env("AWS_BEARER_TOKEN_BEDROCK", "env-token");
+        let secret = tmp.path().join("bedrock_api_key");
+        std::fs::write(&secret, "secret-token\n").unwrap();
+        write(&BedrockAuth {
+            bearer_token: "file-token".to_string(),
+            region: None,
+            default_model: None,
+        })
+        .unwrap();
+
+        let before = CredentialState::snapshot();
+        assert!(before.env_set);
+        assert!(before.file_present);
+        assert!(before.secrets_present);
+
+        logout().unwrap();
+
+        let after = CredentialState::snapshot();
+        assert!(after.env_set);
+        assert!(!after.file_present);
+        assert!(!after.secrets_present);
+        assert_eq!(after.active_source(), "env");
+        assert!(!auth_path().unwrap().exists());
+        assert!(!secret.exists());
     }
 
     #[cfg(unix)]
