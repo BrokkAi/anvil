@@ -117,11 +117,6 @@ impl AgentRegistry {
         self.by_name.is_empty()
     }
 
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.by_name.len()
-    }
-
     pub fn get(&self, name: &str) -> Option<&AgentMeta> {
         self.by_name.get(name)
     }
