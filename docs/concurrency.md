@@ -17,7 +17,8 @@ not exist yet, that is stated explicitly along with the issue tracking it.
   call, and every subagent. `session/cancel` aborts all in-flight delegated
   work atomically.
 - **Bounded runtime** comes by default from the model's own completion signal,
-  the LLM idle timeout (`--llm-idle-timeout-secs`), and per-shell-command
+  the LLM stream timeouts (`--llm-idle-timeout-secs` and
+  `--llm-stall-timeout-secs`), and per-shell-command
   timeouts; an optional per-prompt turn ceiling (`--max-turns N`) can be set to
   bound cost/time. There is no separate per-tool-call wall-clock timeout.
 - **Observability** for the parent's own tool calls is rich
@@ -113,18 +114,23 @@ subagent**. Therefore:
 | Knob | Default | Scope | Notes |
 |---|---|---|---|
 | `--max-turns` | `0` (unbounded) | per prompt | Optional cap on agent turns. Default unbounded: the loop exits when the model answers without a tool call; idle-timeout + no-progress nudges catch stalls. Pass `N>0` to deliberately bound cost/time. Subagents inherit the parent budget unless their definition sets a lower `max_turns:`; recursion is bounded by depth (`MAX_SUBAGENT_DEPTH = 1`). |
-| `--llm-idle-timeout-secs` | 300 | per LLM stream | Aborts a stream with no *meaningful* progress (content/tool-call deltas; keepalives don't count). Per-session override via `/setup timeout`. |
+| `--llm-idle-timeout-secs` | 300 | per LLM stream | Aborts a stream when no first *meaningful* progress arrives before this timeout. Useful for reasoning models that may take a while before their first streamed chunk. |
+| `--llm-stall-timeout-secs` | 60 | per LLM stream | After first progress, aborts a stream when the gap between meaningful chunks exceeds this timeout. Keepalives do not count. |
 | Shell command timeout | 60s | per `run_shell_command` | Optional `timeout` values are milliseconds, rounded up to seconds, and capped at 600s. Tool output reports when a request is clamped. |
 
 There is **no separate per-tool-call wall-clock timeout** beyond the LLM idle
 timeout and (when set) the turn ceiling. With the default unbounded
 `--max-turns`, a long-running non-shell tool is bounded only by cancellation and
-the LLM idle timeout; set a positive `--max-turns` to add a turn-count ceiling.
+the LLM first-progress and stall timeouts; set a positive `--max-turns` to add
+a turn-count ceiling. The per-session `/idle-timeout N` override sets both LLM
+stream timeout phases to `N`, preserving its historical "tolerate gaps up to N"
+meaning.
 
 > **Contract for consumers:** the turn loop terminates on the model's own
 > completion signal by default. To impose a hard cost ceiling on an unattended
 > or delegated workflow, set a positive `--max-turns` (total agent turns) and
-> `--llm-idle-timeout-secs` (stall detection). Do not rely on a per-lane
+> `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs` (stream stall
+> detection). Do not rely on a per-lane
 > deadline — model an overall budget instead, and cancel if it is exceeded.
 
 ## 5. Observability

@@ -494,7 +494,8 @@ anvil [OPTIONS]
 | `--max-turns` | - | `0` (unbounded) | Optional cap on tool-calling iterations per prompt. Default unbounded: the loop exits when the model answers without a tool call. Pass `N>0` to bound cost/time; `0` disables. |
 | `--max-sessions` | - | `50` | Maximum resident sessions before LRU eviction. `0` disables the cap. |
 | `--max-history-turns` | - | `50` | Maximum in-memory history turns per session. `0` disables the cap. |
-| `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | SSE inactivity timeout for LLM streaming. |
+| `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | Seconds to wait for first meaningful LLM stream progress. |
+| `--llm-stall-timeout-secs` | `ANVIL_LLM_STALL_TIMEOUT_SECS` | `60` | Seconds to wait between meaningful chunks after streaming starts. |
 | `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep setup preferences process-local; model/reasoning/sandbox choices for this run do not read or update the global setup file. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 

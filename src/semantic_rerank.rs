@@ -19,16 +19,14 @@
 //! Every failure mode degrades to passing through bifrost's raw result, so the
 //! wrapper can only improve search, never break it.
 
+use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-
-use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
+    ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
     stream_chat_no_visible_output_with_retry,
 };
 use crate::structured_output::StructuredOutputRequest;
@@ -104,7 +102,7 @@ pub(crate) async fn rerank_semantic_search(
     registry: &ToolRegistry,
     prior_messages: &[ChatMessage],
     args: &Value,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: &CancellationToken,
 ) -> RerankOutcome {
     let query = args
@@ -156,7 +154,7 @@ pub(crate) async fn rerank_semantic_search(
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: cancel.clone(),
-            idle_timeout,
+            idle_timeouts: idle_timeout,
         },
     )
     .await;
@@ -758,7 +756,10 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: cancel.clone(),
-                idle_timeout: Duration::from_secs(60),
+                idle_timeouts: IdleTimeouts {
+                    first_progress: std::time::Duration::from_secs(60),
+                    inter_chunk: std::time::Duration::from_secs(60),
+                },
             },
         )
         .await

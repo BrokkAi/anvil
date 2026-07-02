@@ -34,10 +34,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_stale, urlencode};
+use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
-    ChatContentPart, ChatMessage, FunctionCall, IncompleteStreamError, LlmBackend, LlmResponse,
-    ModelMetadata, OpenAiClient, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
-    ToolDefinition,
+    ChatContentPart, ChatMessage, FunctionCall, IdleTimeouts, IncompleteStreamError, LlmBackend,
+    LlmResponse, ModelMetadata, OpenAiClient, OutputBudgetExhaustedError, ReasoningLevelPreset,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
@@ -234,7 +235,7 @@ impl CodexClient {
             on_token,
             on_thought,
             cancel,
-            idle_timeout,
+            idle_timeouts,
         } = request;
         let creds = self.load_credentials().await?;
         let body = build_responses_request(
@@ -255,7 +256,7 @@ impl CodexClient {
                 shared_sink_forwarder(shared_on_token.clone()),
                 shared_sink_forwarder(shared_on_thought.clone()),
                 cancel.clone(),
-                idle_timeout,
+                idle_timeouts,
             )
             .await
         {
@@ -269,7 +270,7 @@ impl CodexClient {
                     shared_sink_forwarder(shared_on_token),
                     shared_sink_forwarder(shared_on_thought),
                     cancel,
-                    idle_timeout,
+                    idle_timeouts,
                 )
                 .await
             }
@@ -284,7 +285,7 @@ impl CodexClient {
         on_token: Box<dyn FnMut(&str) + Send>,
         on_thought: Box<dyn FnMut(&str) + Send>,
         cancel: CancellationToken,
-        idle_timeout: Duration,
+        idle_timeouts: IdleTimeouts,
     ) -> Result<LlmResponse> {
         let resp = crate::http_retry::send_with_retries(
             "posting Responses API request",
@@ -303,17 +304,14 @@ impl CodexClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(ChatGptHttpError {
-                status,
-                body: body_text.trim().to_string(),
-            }));
+            return Err(chatgpt_http_error(status, body_text.trim().to_string()));
         }
 
         let stream = resp
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
 
-        drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeout).await
+        drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeouts).await
     }
 
     /// Discover usable models by hitting `chatgpt.com/backend-api/codex/models`.
@@ -595,6 +593,27 @@ impl std::fmt::Display for ChatGptHttpError {
 }
 
 impl std::error::Error for ChatGptHttpError {}
+
+fn chatgpt_http_error(status: reqwest::StatusCode, body: String) -> anyhow::Error {
+    let message = format!("ChatGPT Responses API returned HTTP {status}: {body}");
+    let error = anyhow::Error::new(ChatGptHttpError {
+        status,
+        body: body.clone(),
+    });
+    if crate::http_retry::contains_gateway_transient_marker(&body) {
+        return error
+            .context(RetryableLlmError::gateway_transient(
+                "gateway transient response body",
+            ))
+            .context(message);
+    }
+    if crate::http_retry::contains_standard_transient_marker(&body) {
+        return error
+            .context(RetryableLlmError::fast("standard transient response body"))
+            .context(message);
+    }
+    error
+}
 
 /// Detect 401 by walking the anyhow chain for our typed
 /// `ChatGptHttpError`. Returns false for transport errors or other
@@ -883,6 +902,14 @@ struct ResponseFinal {
     error: Option<ResponseError>,
     #[serde(default)]
     usage: Option<ResponseUsage>,
+    #[serde(default)]
+    incomplete_details: Option<ResponseIncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Responses API usage block. Field shape differs from chat
@@ -993,7 +1020,7 @@ async fn drive_responses_sse_stream<S>(
     mut on_token: Box<dyn FnMut(&str) + Send>,
     mut on_thought: Box<dyn FnMut(&str) + Send>,
     cancel: CancellationToken,
-    idle: Duration,
+    idle: IdleTimeouts,
 ) -> Result<LlmResponse>
 where
     S: Stream<Item = Result<Vec<u8>>> + Unpin,
@@ -1001,7 +1028,8 @@ where
     let mut full_text = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut deadline = tokio::time::Instant::now() + idle;
+    let mut deadline = tokio::time::Instant::now() + idle.first_progress;
+    let mut saw_progress = false;
     let mut completed = false;
     let mut failure: Option<anyhow::Error> = None;
     // Captured from `response.completed.usage`. Zeroed when the server
@@ -1023,13 +1051,33 @@ where
             chunk_or_timeout = tokio::time::timeout_at(deadline, stream.next()) => {
                 let chunk_opt = match chunk_or_timeout {
                     Ok(opt) => opt,
-                    Err(_elapsed) => anyhow::bail!(
-                        "Codex Responses stream made no meaningful progress for {}s; aborting",
-                        idle.as_secs()
-                    ),
+                    Err(_elapsed) => {
+                        if saw_progress {
+                            return Err(crate::http_retry::retryable_llm_error(
+                                format!(
+                                    "Codex Responses stream stalled mid-stream for {}s; aborting",
+                                    idle.inter_chunk.as_secs()
+                                ),
+                                RetryableLlmError::fast("Codex Responses stream stalled mid-stream"),
+                            ));
+                        }
+                        return Err(crate::http_retry::retryable_llm_error(
+                            format!(
+                                "Codex Responses stream made no first token for {}s; aborting",
+                                idle.first_progress.as_secs()
+                            ),
+                            RetryableLlmError::fast("Codex Responses stream made no first token"),
+                        ));
+                    }
                 };
                 let eof_after_buffer = if let Some(chunk) = chunk_opt {
-                    let chunk = chunk.context("Codex stream read error")?;
+                    let chunk = chunk.map_err(|err| {
+                        crate::http_retry::retryable_llm_context(
+                            err,
+                            "Codex stream read error",
+                            RetryableLlmError::fast("Codex stream read error"),
+                        )
+                    })?;
                     raw_buf.extend_from_slice(&chunk);
                     false
                 } else if raw_buf.is_empty() {
@@ -1157,9 +1205,46 @@ where
                                     format!("{code}: {body}")
                                 })
                                 .unwrap_or_else(|| "unknown error".to_string());
-                            failure = Some(anyhow!("Codex Responses stream failed: {msg}"));
+                            failure = Some(
+                                crate::http_retry::retryable_llm_error_for_responses_failure(
+                                    format!("Codex Responses stream failed: {msg}"),
+                                    &msg,
+                                ),
+                            );
                             completed = true;
                             break;
+                        }
+                        "response.incomplete" => {
+                            if let Some(final_body) = event.response {
+                                if let Some(u) = final_body.usage {
+                                    usage = u.into_usage();
+                                }
+                                let reason = final_body
+                                    .incomplete_details
+                                    .and_then(|details| details.reason)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                if reason == "max_output_tokens" {
+                                    if full_text.trim().is_empty() && tool_calls.is_empty() {
+                                        failure =
+                                            Some(anyhow::Error::new(OutputBudgetExhaustedError));
+                                    } else {
+                                        tracing::warn!(
+                                            reason,
+                                            "Codex Responses stream became incomplete after emitting output; returning truncated content"
+                                        );
+                                    }
+                                    completed = true;
+                                    break;
+                                }
+                                tracing::warn!(
+                                    reason,
+                                    "Codex Responses stream ended with incomplete response"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "Codex Responses stream ended with incomplete response without body"
+                                );
+                            }
                         }
                         // Chain-of-thought deltas: route to the
                         // dedicated `on_thought` sink (the agent layer
@@ -1193,7 +1278,8 @@ where
                     break;
                 }
                 if made_progress {
-                    deadline = tokio::time::Instant::now() + idle;
+                    saw_progress = true;
+                    deadline = tokio::time::Instant::now() + idle.inter_chunk;
                 }
                 if eof_after_buffer {
                     break;
@@ -1462,10 +1548,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let resp =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect("stream completes");
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("stream completes");
         match resp {
             LlmResponse::ToolCalls { text, calls, .. } => {
                 assert_eq!(text, "hello");
@@ -1491,10 +1582,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let resp =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect("stream completes");
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("stream completes");
         match resp {
             LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
             other => panic!("expected Text, got {other:?}"),
@@ -1519,10 +1615,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let resp =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect("stream completes");
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("stream completes");
         match resp {
             LlmResponse::Text { text, .. } => assert_eq!(text, "hello"),
             other => panic!("expected Text, got {other:?}"),
@@ -1537,13 +1638,79 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let err =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect_err("response.failed must surface as Err");
+        let err = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("response.failed must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("rate_limit_exceeded"), "got: {msg}");
         assert!(msg.contains("slow down"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn sse_parser_classifies_empty_max_output_tokens_incomplete() {
+        let raw = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"thinking\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let thoughts = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let thoughts_for_cb = std::sync::Arc::clone(&thoughts);
+        let cancel = CancellationToken::new();
+        let err = drive_responses_sse_stream(
+            stream,
+            sink_collecting(collected.clone()),
+            Box::new(move |text: &str| {
+                thoughts_for_cb.lock().unwrap().push_str(text);
+            }),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("max_output_tokens without output should be classified");
+
+        assert!(crate::llm_client::is_output_budget_exhausted_error(&err));
+        assert!(!crate::llm_client::is_retryable_llm_error(&err));
+        assert!(!crate::llm_client::is_incomplete_stream_error(&err));
+        assert_eq!(collected.lock().unwrap().as_str(), "");
+        assert_eq!(thoughts.lock().unwrap().as_str(), "thinking");
+    }
+
+    #[tokio::test]
+    async fn sse_parser_returns_text_on_max_output_tokens_after_delta() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2}},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok(raw.as_bytes().to_vec())]);
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cancel = CancellationToken::new();
+        let resp = drive_responses_sse_stream(
+            stream,
+            sink_collecting(collected.clone()),
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("max_output_tokens after text should return truncated content");
+
+        match resp {
+            LlmResponse::Text { text, usage, .. } => {
+                assert_eq!(text, "partial");
+                assert_eq!(usage.input_tokens, 3);
+                assert_eq!(usage.output_tokens, 3);
+                assert_eq!(usage.thought_tokens, 2);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(collected.lock().unwrap().as_str(), "partial");
     }
 
     #[tokio::test]
@@ -1553,10 +1720,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let err =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect_err("EOF before response.completed must be incomplete");
+        let err = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("EOF before response.completed must be incomplete");
 
         assert!(crate::llm_client::is_incomplete_stream_error(&err));
         assert_eq!(collected.lock().unwrap().as_str(), "partial");
@@ -1572,10 +1744,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let resp =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect("final buffered response.completed should complete");
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("final buffered response.completed should complete");
 
         match resp {
             LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
@@ -1594,10 +1771,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let err =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect_err("[DONE] is not the Responses completion marker");
+        let err = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("[DONE] is not the Responses completion marker");
 
         assert!(crate::llm_client::is_incomplete_stream_error(&err));
         assert_eq!(collected.lock().unwrap().as_str(), "partial");
@@ -1610,13 +1792,19 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected);
         let cancel = CancellationToken::new();
-        let err =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect_err("[DONE] should not keep a Responses stream alive");
+        let err = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("[DONE] should not keep a Responses stream alive");
         let msg = format!("{err:#}");
 
-        assert!(msg.contains("no meaningful progress"), "got: {msg}");
+        assert!(msg.contains("no first token for 5s"), "got: {msg}");
+        assert!(crate::llm_client::is_retryable_llm_error(&err));
     }
 
     #[tokio::test]
@@ -1626,10 +1814,15 @@ mod tests {
         let stream = futures::stream::pending::<Result<Vec<u8>>>();
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected);
-        let resp =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect("cancellation should not be incomplete EOF");
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("cancellation should not be incomplete EOF");
 
         match resp {
             LlmResponse::Text { text, .. } => assert_eq!(text, ""),
@@ -1656,10 +1849,15 @@ mod tests {
         let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let cb = sink_collecting(collected.clone());
         let cancel = CancellationToken::new();
-        let resp =
-            drive_responses_sse_stream(stream, cb, noop_sink(), cancel, Duration::from_secs(5))
-                .await
-                .expect("stream completes");
+        let resp = drive_responses_sse_stream(
+            stream,
+            cb,
+            noop_sink(),
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(5)),
+        )
+        .await
+        .expect("stream completes");
         match resp {
             LlmResponse::Text { text, .. } => assert_eq!(text, "hi"),
             other => panic!("expected Text, got {other:?}"),
@@ -1690,7 +1888,7 @@ mod tests {
             token_sink,
             thought_sink,
             cancel,
-            Duration::from_secs(5),
+            IdleTimeouts::uniform(Duration::from_secs(5)),
         )
         .await
         .expect("stream completes");

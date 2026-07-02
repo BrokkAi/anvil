@@ -9,35 +9,62 @@ use std::fmt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::http_retry::LlmRetryTier;
+use crate::http_retry::{LlmRetryTier, RetryableLlmError};
 use crate::structured_output::StructuredOutputRequest;
 
 /// Default value for the `--llm-idle-timeout-secs` CLI flag (and the
-/// env var `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS`). The actual value used
+/// env var `ANVIL_LLM_IDLE_TIMEOUT_SECS`). The actual value used
 /// per request is a required parameter on `LlmBackend::stream_chat` --
 /// callers cannot fall back to this implicitly.
 ///
-/// Idle timeout semantics: maximum gap between two pieces of
-/// *meaningful* SSE progress before we abort the request. "Meaningful
-/// progress" is a parsed `data:` event that contributed content,
-/// tool-call deltas, or `[DONE]`. Comments (`:keepalive\n`), blank
-/// lines, and partial bytes that don't advance the parser do NOT reset
-/// this timer -- otherwise a server or proxy could keep us alive
-/// forever by drip-feeding pings.
+/// Stream timeout semantics are split into two phases: a long
+/// first-progress timeout for models that spend time reasoning before
+/// emitting the first chunk, and a shorter inter-chunk timeout for
+/// detecting stalls after meaningful SSE progress has begun.
+/// "Meaningful progress" is a parsed `data:` event that contributed
+/// content, tool-call deltas, or a completion marker. Comments
+/// (`:keepalive\n`), blank lines, and partial bytes that don't advance
+/// the parser do NOT reset the inter-chunk timer -- otherwise a server
+/// or proxy could keep us alive forever by drip-feeding pings.
 ///
 /// Distinct from the reqwest client's overall `.timeout()` (wall-clock).
 pub const DEFAULT_IDLE_CHUNK_TIMEOUT_SECS: u64 = 300;
 
-/// Lower bound for both the `--llm-idle-timeout-secs` CLI flag and the
-/// `/idle-timeout` slash command. 0 would mean "abort instantly", which
-/// is never useful.
+/// Default value for `--llm-stall-timeout-secs`: the maximum gap between
+/// meaningful chunks after the first progress event has arrived.
+pub const DEFAULT_INTER_CHUNK_TIMEOUT_SECS: u64 = 60;
+
+/// Lower bound for the LLM stream timeout CLI flags and the `/idle-timeout`
+/// slash command. 0 would mean "abort instantly", which is never useful.
 pub const MIN_IDLE_CHUNK_TIMEOUT_SECS: u64 = 1;
 
-/// Upper bound for both the `--llm-idle-timeout-secs` CLI flag and the
-/// `/idle-timeout` slash command. 24h is well above any realistic local
+/// Upper bound for the LLM stream timeout CLI flags and the `/idle-timeout`
+/// slash command. 24h is well above any realistic local
 /// LLM prompt processing on consumer hardware and stops a typo'd huge
 /// number from effectively disabling the stall detector.
 pub const MAX_IDLE_CHUNK_TIMEOUT_SECS: u64 = 86_400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleTimeouts {
+    pub first_progress: Duration,
+    pub inter_chunk: Duration,
+}
+
+impl IdleTimeouts {
+    pub fn uniform(timeout: Duration) -> Self {
+        Self {
+            first_progress: timeout,
+            inter_chunk: timeout,
+        }
+    }
+
+    pub fn min(self, timeout: Duration) -> Self {
+        Self {
+            first_progress: self.first_progress.min(timeout),
+            inter_chunk: self.inter_chunk.min(timeout),
+        }
+    }
+}
 
 /// `/models` discovery should fail fast. Chat requests can legitimately
 /// run for minutes; setup refreshes should not inherit that wall-clock.
@@ -77,29 +104,43 @@ pub(crate) fn is_incomplete_stream_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<IncompleteStreamError>().is_some())
 }
 
+#[derive(Debug)]
+pub(crate) struct OutputBudgetExhaustedError;
+
+impl fmt::Display for OutputBudgetExhaustedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "model exhausted its output token budget before emitting any text or tool calls; \
+             not retrying (the same request would hit the same cap)",
+        )
+    }
+}
+
+impl std::error::Error for OutputBudgetExhaustedError {}
+
+pub(crate) fn is_output_budget_exhausted_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<OutputBudgetExhaustedError>().is_some())
+}
+
 pub(crate) fn is_retryable_llm_error(error: &anyhow::Error) -> bool {
     llm_retry_tier(error).is_some()
 }
 
 pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
+    if is_output_budget_exhausted_error(error) {
+        return None;
+    }
+
     if is_incomplete_stream_error(error) {
         return Some(LlmRetryTier::Fast);
     }
 
-    let error = format!("{error:#}");
-    if crate::http_retry::contains_gateway_transient_marker(&error) {
-        return Some(LlmRetryTier::GatewayTransient);
-    }
-
-    (error.contains("stream read error")
-        || error.contains("no meaningful progress")
-        || error.contains("Responses stream failed: server_error")
-        || error.contains("Responses stream failed: server_is_overloaded")
-        || error.contains("Responses stream failed: rate_limit_exceeded")
-        || error.contains("server_is_overloaded")
-        || error.contains("server_error")
-        || error.contains("rate_limit_exceeded"))
-    .then_some(LlmRetryTier::Fast)
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RetryableLlmError>())
+        .map(RetryableLlmError::tier)
 }
 
 pub(crate) const EMPTY_COMPLETION_RETRY_REASON: &str =
@@ -303,7 +344,7 @@ pub struct StreamChatRequest {
     pub on_token: TokenSink,
     pub on_thought: TokenSink,
     pub cancel: CancellationToken,
-    pub idle_timeout: Duration,
+    pub idle_timeouts: IdleTimeouts,
 }
 
 // ---------------------------------------------------------------------------
@@ -656,10 +697,11 @@ pub trait LlmBackend: Send + Sync {
     /// text deltas separate from the assistant text on `on_token`;
     /// backends that don't surface reasoning never invoke it.
     ///
-    /// `idle_timeout` is the maximum gap between two pieces of
-    /// meaningful SSE progress before the backend aborts the stream.
-    /// Threaded from the CLI flag `--llm-idle-timeout-secs` and the
-    /// per-session `/idle-timeout` override.
+    /// `idle_timeouts` contains the first-progress timeout and the
+    /// post-progress inter-chunk stall timeout before the backend aborts
+    /// the stream. Threaded from `--llm-idle-timeout-secs`,
+    /// `--llm-stall-timeout-secs`, and the per-session `/idle-timeout`
+    /// override.
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>>;
 }
 
@@ -1070,6 +1112,8 @@ impl UsageChunk {
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
     delta: ChunkDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1531,7 +1575,7 @@ impl OpenAiClient {
             on_token,
             on_thought,
             cancel,
-            idle_timeout,
+            idle_timeouts,
         } = request;
         let url = self.api_url("/chat/completions");
 
@@ -1614,14 +1658,17 @@ impl OpenAiClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("chat completion failed (HTTP {status}): {body_text}");
+            return Err(crate::http_retry::retryable_llm_error_for_body(
+                format!("chat completion failed (HTTP {status}): {body_text}"),
+                &body_text,
+            ));
         }
 
         let stream = resp
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
 
-        drive_sse_stream(stream, on_token, on_thought, cancel, idle_timeout).await
+        drive_sse_stream(stream, on_token, on_thought, cancel, idle_timeouts).await
     }
 }
 
@@ -1629,7 +1676,8 @@ impl OpenAiClient {
 /// cancellation token fires. Aborts with a clear error if the stream
 /// ends before `[DONE]`, or if
 /// no *meaningful progress* (parsed `data:` event contributing content
-/// or tool-call deltas, or `[DONE]`) is observed within `idle`. SSE
+/// or tool-call deltas, or `[DONE]`) is observed within the current
+/// first-progress or inter-chunk timeout. SSE
 /// keepalive comments (`:\n`), blank lines, and partial bytes that
 /// don't advance the parser do NOT reset the deadline, so a server or
 /// proxy that drip-feeds pings every <90s can no longer hold the
@@ -1639,7 +1687,7 @@ async fn drive_sse_stream<S>(
     mut on_token: TokenSink,
     mut on_thought: TokenSink,
     cancel: CancellationToken,
-    idle: Duration,
+    idle: IdleTimeouts,
 ) -> Result<LlmResponse>
 where
     S: Stream<Item = Result<Vec<u8>>> + Unpin,
@@ -1648,12 +1696,14 @@ where
     let mut full_reasoning = String::new();
     let mut tool_acc = ToolCallAccumulator::default();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut deadline = tokio::time::Instant::now() + idle;
+    let mut deadline = tokio::time::Instant::now() + idle.first_progress;
+    let mut saw_progress = false;
     // Captured from the trailing `usage` chunk emitted when
     // `stream_options.include_usage = true`. The usage chunk arrives
     // *before* `[DONE]` with an empty `choices` array, so we stash it
     // here and attach to whichever variant we return.
     let mut usage = TokenUsage::default();
+    let mut last_finish_reason: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -1665,14 +1715,32 @@ where
                 let chunk_opt = match chunk_or_timeout {
                     Ok(opt) => opt,
                     Err(_elapsed) => {
-                        anyhow::bail!(
-                            "LLM stream made no meaningful progress for {}s; aborting (server-side hang or keepalive-only flood)",
-                            idle.as_secs()
-                        );
+                        if saw_progress {
+                            return Err(crate::http_retry::retryable_llm_error(
+                                format!(
+                                "LLM stream stalled mid-stream for {}s; aborting (server-side hang or keepalive-only flood)",
+                                idle.inter_chunk.as_secs()
+                                ),
+                                RetryableLlmError::fast("stream stalled mid-stream"),
+                            ));
+                        }
+                        return Err(crate::http_retry::retryable_llm_error(
+                            format!(
+                            "LLM stream made no first token for {}s; aborting (server-side hang or keepalive-only flood)",
+                            idle.first_progress.as_secs()
+                            ),
+                            RetryableLlmError::fast("stream made no first token"),
+                        ));
                     }
                 };
                 let eof_after_buffer = if let Some(chunk) = chunk_opt {
-                    let chunk = chunk.context("stream read error")?;
+                    let chunk = chunk.map_err(|err| {
+                        crate::http_retry::retryable_llm_context(
+                            err,
+                            "stream read error",
+                            RetryableLlmError::fast("stream read error"),
+                        )
+                    })?;
                     raw_buf.extend_from_slice(&chunk);
                     false
                 } else if raw_buf.is_empty() {
@@ -1699,13 +1767,28 @@ where
                     };
 
                     if data == "[DONE]" {
+                        let output_budget_exhausted =
+                            last_finish_reason.as_deref() == Some("length");
                         let reasoning_content = (!full_reasoning.is_empty()).then_some(full_reasoning);
                         if tool_acc.is_empty() {
+                            if output_budget_exhausted {
+                                if full_text.trim().is_empty() {
+                                    return Err(anyhow::Error::new(OutputBudgetExhaustedError));
+                                }
+                                tracing::warn!(
+                                    "chat completions stream ended with finish_reason=length after emitting text; returning truncated content"
+                                );
+                            }
                             return Ok(LlmResponse::Text {
                                 text: full_text,
                                 reasoning_content,
                                 usage,
                             });
+                        }
+                        if output_budget_exhausted {
+                            tracing::warn!(
+                                "chat completions stream ended with finish_reason=length after emitting tool calls; returning truncated content"
+                            );
                         }
                         return Ok(LlmResponse::ToolCalls {
                             text: full_text,
@@ -1721,6 +1804,14 @@ where
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
                             for choice in &chunk.choices {
+                                if let Some(reason) = choice
+                                    .finish_reason
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|reason| !reason.is_empty())
+                                {
+                                    last_finish_reason = Some(reason.to_string());
+                                }
                                 // Accumulate text content
                                 if let Some(content) = &choice.delta.content {
                                     made_progress = true;
@@ -1757,7 +1848,8 @@ where
                 }
 
                 if made_progress {
-                    deadline = tokio::time::Instant::now() + idle;
+                    saw_progress = true;
+                    deadline = tokio::time::Instant::now() + idle.inter_chunk;
                 }
                 if eof_after_buffer {
                     break;
@@ -1787,7 +1879,9 @@ where
 mod tests {
     use super::*;
     use crate::structured_output::StructuredOutputRequest;
+    use futures::StreamExt;
     use futures::stream;
+    use futures::stream::BoxStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -1800,6 +1894,17 @@ mod tests {
             inner.lock().unwrap().push(t.to_string());
         });
         (cb, collected)
+    }
+
+    fn delayed_chunks(
+        chunks: Vec<(Duration, &'static str)>,
+    ) -> BoxStream<'static, Result<Vec<u8>>> {
+        stream::unfold(chunks.into_iter(), |mut chunks| async move {
+            let (delay, chunk) = chunks.next()?;
+            tokio::time::sleep(delay).await;
+            Some((Ok(chunk.as_bytes().to_vec()), chunks))
+        })
+        .boxed()
     }
 
     struct EmptyThenOkBackend {
@@ -1835,6 +1940,24 @@ mod tests {
         }
     }
 
+    struct OutputBudgetErrorBackend {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for OutputBudgetErrorBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn stream_chat(&self, _request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::new(OutputBudgetExhaustedError))
+            })
+        }
+    }
+
     struct RetryThenSseResponder {
         calls: Arc<AtomicUsize>,
     }
@@ -1858,8 +1981,9 @@ mod tests {
 
     #[test]
     fn retryable_llm_error_classifies_gateway_markers_only_as_long_tier() {
-        let gateway = anyhow::anyhow!(
-            "chat completion failed (HTTP 400): JSON-RPC error -32602: Job registration failed"
+        let gateway = crate::http_retry::retryable_llm_error_for_body(
+            "chat completion failed (HTTP 400): JSON-RPC error -32602: Job registration failed",
+            "JSON-RPC error -32602: Job registration failed",
         )
         .context("teacher rollout request failed");
         assert_eq!(
@@ -1868,7 +1992,10 @@ mod tests {
         );
         assert!(is_retryable_llm_error(&gateway));
 
-        let standard = anyhow::anyhow!("Responses stream failed: server_error: overloaded");
+        let standard = crate::http_retry::retryable_llm_error_for_responses_failure(
+            "Responses stream failed: server_error: overloaded",
+            "server_error: overloaded",
+        );
         assert_eq!(
             llm_retry_tier(&standard),
             Some(crate::http_retry::LlmRetryTier::Fast)
@@ -1878,6 +2005,10 @@ mod tests {
             anyhow::anyhow!("chat completion failed (HTTP 400): missing required field messages");
         assert_eq!(llm_retry_tier(&validation), None);
         assert!(!is_retryable_llm_error(&validation));
+
+        let quoted_upstream_text =
+            anyhow::anyhow!("tool output mentioned server_error but the request was valid");
+        assert_eq!(llm_retry_tier(&quoted_upstream_text), None);
     }
 
     #[tokio::test]
@@ -1902,7 +2033,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: cancel.clone(),
-                idle_timeout: Duration::from_secs(30),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(30)),
             },
         )
         .await
@@ -1910,6 +2041,39 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
+    }
+
+    #[tokio::test]
+    async fn no_visible_output_retry_does_not_retry_output_budget_exhaustion() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend = OutputBudgetErrorBackend {
+            attempts: attempts.clone(),
+        };
+        let cancel = CancellationToken::new();
+
+        let err = stream_chat_no_visible_output_with_retry(
+            &backend,
+            "output budget test",
+            &cancel,
+            || StreamChatRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatMessage::user("hello")],
+                tools: None,
+                reasoning_effort: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(30)),
+            },
+        )
+        .await
+        .expect_err("output budget exhaustion should not retry");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(is_output_budget_exhausted_error(&err));
+        assert!(!is_retryable_llm_error(&err));
     }
 
     #[tokio::test]
@@ -1938,7 +2102,7 @@ mod tests {
                 on_token,
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(30),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(30)),
             })
             .await
             .expect("retry should recover");
@@ -1976,7 +2140,7 @@ mod tests {
                 on_token,
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(30),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(30)),
             })
             .await
             .expect_err("HTTP 400 should fail");
@@ -2082,7 +2246,7 @@ mod tests {
                 on_token,
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(30),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(30)),
             })
             .await
             .expect("mock stream completes");
@@ -2213,16 +2377,102 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
         let err = result.expect_err("keepalive-only stream should bail");
         let msg = err.to_string();
         assert!(
-            msg.contains("no meaningful progress") && msg.contains("90"),
-            "error should mention 'no meaningful progress' and the timeout, got: {msg}"
+            msg.contains("no first token for 90s"),
+            "error should mention the first-token timeout, got: {msg}"
         );
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_sse_stream_allows_slow_first_progress() {
+        let stream = delayed_chunks(vec![
+            (
+                Duration::from_secs(5),
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n",
+            ),
+            (Duration::ZERO, "data: [DONE]\n"),
+        ]);
+
+        let (on_token, collected) = collect_tokens();
+        let result = drive_sse_stream(
+            stream,
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            IdleTimeouts {
+                first_progress: Duration::from_secs(10),
+                inter_chunk: Duration::from_secs(2),
+            },
+        )
+        .await;
+
+        match result.expect("first chunk may arrive after the stall timeout") {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "ok"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(*collected.lock().unwrap(), vec!["ok"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_sse_stream_times_out_on_mid_stream_stall() {
+        let stream = delayed_chunks(vec![
+            (
+                Duration::ZERO,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n",
+            ),
+            (Duration::from_secs(3), "data: [DONE]\n"),
+        ]);
+
+        let (on_token, _) = collect_tokens();
+        let err = drive_sse_stream(
+            stream,
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            IdleTimeouts {
+                first_progress: Duration::from_secs(10),
+                inter_chunk: Duration::from_secs(2),
+            },
+        )
+        .await
+        .expect_err("mid-stream stall should abort");
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("stalled mid-stream for 2s"), "got: {msg}");
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drive_sse_stream_times_out_waiting_for_first_progress() {
+        let stream = delayed_chunks(vec![(
+            Duration::from_secs(3),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n",
+        )]);
+
+        let (on_token, _) = collect_tokens();
+        let err = drive_sse_stream(
+            stream,
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            IdleTimeouts {
+                first_progress: Duration::from_secs(2),
+                inter_chunk: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect_err("missing first progress should abort");
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("no first token for 2s"), "got: {msg}");
+        assert!(is_retryable_llm_error(&err));
     }
 
     /// A stream that emits content data resets the deadline. Mixed with
@@ -2245,7 +2495,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2272,7 +2522,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2281,6 +2531,89 @@ mod tests {
             other => panic!("expected text response, got {other:?}"),
         }
         assert_eq!(*collected.lock().unwrap(), vec!["hi"]);
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_errors_on_empty_length_finish_reason() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":\"length\"}]}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, _) = collect_tokens();
+        let thoughts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let thoughts_for_cb = Arc::clone(&thoughts);
+        let on_thought: TokenSink = Box::new(move |s: &str| {
+            thoughts_for_cb.lock().unwrap().push(s.to_string());
+        });
+        let err = drive_sse_stream(
+            s,
+            on_token,
+            on_thought,
+            CancellationToken::new(),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
+        )
+        .await
+        .expect_err("empty length-limited completion should be classified");
+
+        assert!(is_output_budget_exhausted_error(&err));
+        assert!(!is_retryable_llm_error(&err));
+        assert_eq!(*thoughts.lock().unwrap(), vec!["thinking".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_returns_truncated_text_on_length_finish_reason() {
+        let chunks: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n".to_vec()),
+            Ok(b"data: [DONE]\n".to_vec()),
+        ];
+        let s = stream::iter(chunks);
+
+        let (on_token, collected) = collect_tokens();
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            Box::new(|_| {}),
+            CancellationToken::new(),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
+        )
+        .await
+        .expect("length after text should return truncated content");
+
+        match result {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "partial"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+        assert_eq!(*collected.lock().unwrap(), vec!["partial".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drive_sse_stream_ignores_empty_finish_reason_and_allows_empty_stop() {
+        for finish_reason in ["", "stop"] {
+            let raw = format!(
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}]}}\n"
+            );
+            let chunks: Vec<Result<Vec<u8>>> =
+                vec![Ok(raw.into_bytes()), Ok(b"data: [DONE]\n".to_vec())];
+            let s = stream::iter(chunks);
+
+            let (on_token, _) = collect_tokens();
+            let result = drive_sse_stream(
+                s,
+                on_token,
+                Box::new(|_| {}),
+                CancellationToken::new(),
+                IdleTimeouts::uniform(Duration::from_secs(90)),
+            )
+            .await
+            .expect("non-length empty completions keep existing behavior");
+
+            match result {
+                LlmResponse::Text { text, .. } => assert!(text.is_empty()),
+                other => panic!("expected text response, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -2298,7 +2631,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2325,7 +2658,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2361,7 +2694,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2394,7 +2727,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             CancellationToken::new(),
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2424,7 +2757,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             CancellationToken::new(),
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await
         .expect_err("unterminated streamed arguments should be retryable truncation");
@@ -2451,7 +2784,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2483,7 +2816,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await;
 
@@ -2517,9 +2850,15 @@ mod tests {
             thoughts_for_cb.lock().unwrap().push(s.to_string());
         });
         let cancel = CancellationToken::new();
-        let result = drive_sse_stream(s, on_token, on_thought, cancel, Duration::from_secs(90))
-            .await
-            .expect("should complete");
+        let result = drive_sse_stream(
+            s,
+            on_token,
+            on_thought,
+            cancel,
+            IdleTimeouts::uniform(Duration::from_secs(90)),
+        )
+        .await
+        .expect("should complete");
 
         match result {
             LlmResponse::Text {
@@ -2553,7 +2892,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await
         .expect_err("EOF before [DONE] must be an incomplete stream");
@@ -2573,7 +2912,7 @@ mod tests {
             on_token,
             Box::new(|_| {}),
             cancel,
-            Duration::from_secs(90),
+            IdleTimeouts::uniform(Duration::from_secs(90)),
         )
         .await
         .expect_err("empty EOF before [DONE] must be incomplete");

@@ -95,7 +95,9 @@ use agent_client_protocol::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
-use crate::llm_client::{ChatContentPart, ChatMessage, ModelMetadata, ResolvedModelInfo};
+use crate::llm_client::{
+    ChatContentPart, ChatMessage, IdleTimeouts, ModelMetadata, ResolvedModelInfo,
+};
 use crate::multi_backend::MultiBackend;
 use crate::session::{
     CloseSessionResult, ConversationTurn, ForkOutcome, LifecycleReopen, PermissionMode,
@@ -1385,6 +1387,7 @@ pub async fn run_agent(
     sessions: SessionStore,
     max_turns: usize,
     default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
 ) -> agent_client_protocol::Result<()> {
     let llm_init = llm.clone();
     let sessions_init = sessions.clone();
@@ -2206,6 +2209,7 @@ pub async fn run_agent(
                         login_sessions: &sessions_login,
                         refresh_lock: &refresh_lock_login,
                         default_idle_timeout_secs,
+                        default_stall_timeout_secs,
                         current_session_idle_timeout: snap.idle_timeout_secs,
                     };
                     let report = handle_setup(&setup_ctx, &raw_prompt_text, &session_id).await;
@@ -2394,10 +2398,10 @@ pub async fn run_agent(
                     .and_then(|m| m.context_length);
                 // Idle timeout for the summarization LLM call mirrors the
                 // resolution used for the main chat call below.
-                let compression_idle_timeout = Duration::from_secs(
-                    snap.idle_timeout_secs
-                        .unwrap_or(default_idle_timeout_secs)
-                        .max(1),
+                let compression_idle_timeout = resolve_idle_timeouts(
+                    snap.idle_timeout_secs,
+                    default_idle_timeout_secs,
+                    default_stall_timeout_secs,
                 );
 
                 // `/compress` runs synchronously here (not via the
@@ -2510,6 +2514,7 @@ pub async fn run_agent(
                                     &loop_spec.target,
                                     structured_output_request_for_loop.as_ref(),
                                     default_idle_timeout_secs,
+                                    default_stall_timeout_secs,
                                     max_turns,
                                     cancel.clone(),
                                 )
@@ -2621,6 +2626,7 @@ pub async fn run_agent(
                             llm_for_goal,
                             &goal_spec,
                             default_idle_timeout_secs,
+                            default_stall_timeout_secs,
                             max_turns,
                             cancel.clone(),
                         ))
@@ -2752,10 +2758,10 @@ pub async fn run_agent(
                     let orchestration_model_for_response =
                         llm_for_gate.resolve_model_info(&model_for_gate);
                     let reasoning_effort_for_gate = snap.reasoning_effort.clone();
-                    let idle_timeout_for_gate = Duration::from_secs(
-                        snap.idle_timeout_secs
-                            .unwrap_or(default_idle_timeout_secs)
-                            .max(1),
+                    let idle_timeout_for_gate = resolve_idle_timeouts(
+                        snap.idle_timeout_secs,
+                        default_idle_timeout_secs,
+                        default_stall_timeout_secs,
                     );
                     let turn_recap_enabled_for_gate = sessions_prompt
                         .turn_recap_enabled(&session_id)
@@ -2994,13 +3000,13 @@ pub async fn run_agent(
                 let orchestration_model_for_response =
                     llm_for_loop.resolve_model_info(&model_for_loop);
                 let reasoning_effort_for_loop = snap.reasoning_effort;
-                // Resolve per-turn idle timeout: the session override wins,
-                // otherwise fall back to the binary-wide default from
-                // `--llm-idle-timeout-secs` / `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS`.
-                let idle_timeout_for_loop = Duration::from_secs(
-                    snap.idle_timeout_secs
-                        .unwrap_or(default_idle_timeout_secs)
-                        .max(1),
+                // Resolve per-turn stream timeouts: the session override wins,
+                // otherwise fall back to the binary-wide defaults from
+                // `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs`.
+                let idle_timeout_for_loop = resolve_idle_timeouts(
+                    snap.idle_timeout_secs,
+                    default_idle_timeout_secs,
+                    default_stall_timeout_secs,
                 );
                 let turn_recap_enabled_for_loop = sessions_prompt
                     .turn_recap_enabled(&session_id)
@@ -3320,6 +3326,20 @@ pub async fn run_agent(
         .await
 }
 
+fn resolve_idle_timeouts(
+    session_override_secs: Option<u64>,
+    default_first_progress_secs: u64,
+    default_inter_chunk_secs: u64,
+) -> IdleTimeouts {
+    if let Some(secs) = session_override_secs {
+        return IdleTimeouts::uniform(Duration::from_secs(secs.max(1)));
+    }
+    IdleTimeouts {
+        first_progress: Duration::from_secs(default_first_progress_secs.max(1)),
+        inter_chunk: Duration::from_secs(default_inter_chunk_secs.max(1)),
+    }
+}
+
 /// Extract text content from ACP content blocks.
 fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
     blocks
@@ -3632,6 +3652,7 @@ async fn run_loop_iteration(
     target: &str,
     structured_output_request: Option<&StructuredOutputRequest>,
     default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<LoopIterationOutcome, LoopIterationError> {
@@ -3680,6 +3701,7 @@ async fn run_loop_iteration(
             login_sessions: sessions,
             refresh_lock,
             default_idle_timeout_secs,
+            default_stall_timeout_secs,
             current_session_idle_timeout: snap.idle_timeout_secs,
         };
         send_message(
@@ -3735,10 +3757,10 @@ async fn run_loop_iteration(
             .iter()
             .find(|m| m.id == snap.model)
             .and_then(|m| m.context_length);
-        let idle_timeout = Duration::from_secs(
-            snap.idle_timeout_secs
-                .unwrap_or(default_idle_timeout_secs)
-                .max(1),
+        let idle_timeout = resolve_idle_timeouts(
+            snap.idle_timeout_secs,
+            default_idle_timeout_secs,
+            default_stall_timeout_secs,
         );
         let report = handle_compress(
             &snap,
@@ -3812,6 +3834,7 @@ async fn run_loop_iteration(
         &prompt_parts,
         structured_output_request,
         default_idle_timeout_secs,
+        default_stall_timeout_secs,
         max_turns,
         cancel,
         turn_recap_enabled,
@@ -3848,6 +3871,7 @@ async fn run_goal_turn(
     llm: Arc<dyn crate::llm_client::LlmBackend>,
     prompt_text: &str,
     default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<GoalTurnOutcome, LoopIterationError> {
@@ -3870,6 +3894,7 @@ async fn run_goal_turn(
         // never forces structured output on its turns.
         None,
         default_idle_timeout_secs,
+        default_stall_timeout_secs,
         max_turns,
         cancel,
         false,
@@ -3911,6 +3936,7 @@ async fn run_goal_loop(
     llm: Arc<dyn crate::llm_client::LlmBackend>,
     spec: &GoalSpec,
     default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
 ) -> crate::llm_client::TokenUsage {
@@ -3969,6 +3995,7 @@ async fn run_goal_loop(
             llm.clone(),
             &prompt,
             default_idle_timeout_secs,
+            default_stall_timeout_secs,
             max_turns,
             cancel.clone(),
         )
@@ -4125,7 +4152,7 @@ async fn build_prompt_messages_with_compression(
     sessions: &SessionStore,
     session_id: &str,
     cancel: tokio_util::sync::CancellationToken,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     context_length: Option<u32>,
 ) -> Vec<ChatMessage> {
     use crate::context_manager::{context_budget, summarize_turn};
@@ -4241,7 +4268,7 @@ struct PlanningTurnInput<'a> {
     model: &'a str,
     reasoning_effort: Option<&'a str>,
     messages: Vec<ChatMessage>,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
     original_user_request: String,
 }
@@ -4742,7 +4769,7 @@ async fn recap_work_summary(
     model: &str,
     turn: &ConversationTurn,
     context_length: Option<u32>,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<String> {
     let visible = crate::host_notice::model_visible_assistant_text(&turn.agent_response);
@@ -4781,7 +4808,7 @@ async fn run_model_turn_in_spawn(
     structured_output_request: Option<&StructuredOutputRequest>,
     messages: Vec<ChatMessage>,
     max_turns: usize,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
     turn_recap_enabled: bool,
     prompt_text_for_turn: String,
@@ -4939,6 +4966,7 @@ async fn run_prepared_model_turn(
     prompt_parts: &[ChatContentPart],
     structured_output_request: Option<&StructuredOutputRequest>,
     default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
     max_turns: usize,
     cancel: tokio_util::sync::CancellationToken,
     turn_recap_enabled: bool,
@@ -4955,12 +4983,13 @@ async fn run_prepared_model_turn(
         .iter()
         .find(|m| m.id == snap.model)
         .and_then(|m| m.context_length);
-    // The compression and chat calls share one idle timeout (the previous
-    // inline copies computed this same value twice).
-    let idle_timeout = Duration::from_secs(
-        snap.idle_timeout_secs
-            .unwrap_or(default_idle_timeout_secs)
-            .max(1),
+    // The compression and chat calls share one resolved timeout policy. A
+    // per-session `/idle-timeout N` override preserves the historical meaning
+    // by setting both phases to N.
+    let idle_timeout = resolve_idle_timeouts(
+        snap.idle_timeout_secs,
+        default_idle_timeout_secs,
+        default_stall_timeout_secs,
     );
     let messages = build_prompt_messages_with_compression(
         snap,
@@ -5864,6 +5893,7 @@ async fn handle_idle_timeout(
     sessions: &SessionStore,
     current_session_override: Option<u64>,
     default_secs: u64,
+    default_stall_secs: u64,
 ) -> String {
     let action = match parse_idle_timeout_arg(prompt_text) {
         Ok(action) => action,
@@ -5872,22 +5902,24 @@ async fn handle_idle_timeout(
     match action {
         IdleTimeoutAction::Show => match current_session_override {
             Some(secs) => format!(
-                "LLM idle timeout: {secs}s (session override).\n\
-                 Server default is {default_secs}s. Use `/setup timeout default` to clear, \
-                 or `/setup timeout <seconds>` to change."
+                "LLM idle timeout: {secs}s (session override for both first-progress and \
+                 mid-stream stall phases).\n\
+                 Server defaults are first-progress {default_secs}s and stall {default_stall_secs}s. \
+                 Use `/idle-timeout default` to clear, or `/idle-timeout <seconds>` to change."
             ),
             None => format!(
-                "LLM idle timeout: {default_secs}s (server default).\n\
-                 Use `/setup timeout <seconds>` to override for this session only, \
-                 or restart with `--llm-idle-timeout-secs` / `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS` \
-                 to change the default."
+                "LLM idle timeout defaults: first-progress {default_secs}s, \
+                 mid-stream stall {default_stall_secs}s.\n\
+                 Use `/idle-timeout <seconds>` to override both phases for this session only, \
+                 or restart with `--llm-idle-timeout-secs` / `ANVIL_LLM_IDLE_TIMEOUT_SECS` and \
+                 `--llm-stall-timeout-secs` / `ANVIL_LLM_STALL_TIMEOUT_SECS` to change defaults."
             ),
         },
         IdleTimeoutAction::Clear => {
             if sessions.set_idle_timeout_secs(session_id, None).await {
                 format!(
-                    "Cleared session override. LLM idle timeout is back to the server \
-                     default ({default_secs}s)."
+                    "Cleared session override. LLM idle timeouts are back to the server \
+                     defaults: first-progress {default_secs}s, stall {default_stall_secs}s."
                 )
             } else {
                 "Error: unknown session.".to_string()
@@ -5896,9 +5928,10 @@ async fn handle_idle_timeout(
         IdleTimeoutAction::Set(secs) => {
             if sessions.set_idle_timeout_secs(session_id, Some(secs)).await {
                 format!(
-                    "LLM idle timeout set to {secs}s for this session. \
+                    "LLM idle timeout set to {secs}s for this session. This applies to both \
+                     first-progress and mid-stream stall phases for back compatibility. \
                      In-memory only -- reload or restart resets to the server \
-                     default ({default_secs}s)."
+                     defaults: first-progress {default_secs}s, stall {default_stall_secs}s."
                 )
             } else {
                 "Error: unknown session.".to_string()
@@ -6478,6 +6511,7 @@ struct SetupContext<'a> {
     login_sessions: &'a SessionStore,
     refresh_lock: &'a Arc<tokio::sync::Mutex<()>>,
     default_idle_timeout_secs: u64,
+    default_stall_timeout_secs: u64,
     current_session_idle_timeout: Option<u64>,
 }
 
@@ -6583,6 +6617,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
                 ctx.sessions,
                 ctx.current_session_idle_timeout,
                 ctx.default_idle_timeout_secs,
+                ctx.default_stall_timeout_secs,
             )
             .await
         }
@@ -8401,7 +8436,7 @@ async fn handle_compress(
     sessions: &SessionStore,
     session_id: &str,
     cancel: tokio_util::sync::CancellationToken,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     context_length: Option<u32>,
     cx: &ConnectionTo<Client>,
 ) -> String {

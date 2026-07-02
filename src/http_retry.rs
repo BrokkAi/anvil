@@ -25,12 +25,103 @@ impl LlmRetryTier {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct RetryableLlmError {
+    tier: LlmRetryTier,
+    reason: &'static str,
+}
+
+impl RetryableLlmError {
+    pub(crate) fn new(tier: LlmRetryTier, reason: &'static str) -> Self {
+        Self { tier, reason }
+    }
+
+    pub(crate) fn fast(reason: &'static str) -> Self {
+        Self::new(LlmRetryTier::Fast, reason)
+    }
+
+    pub(crate) fn gateway_transient(reason: &'static str) -> Self {
+        Self::new(LlmRetryTier::GatewayTransient, reason)
+    }
+
+    pub(crate) fn tier(&self) -> LlmRetryTier {
+        self.tier
+    }
+}
+
+impl std::fmt::Display for RetryableLlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "retryable LLM error ({:?}): {}", self.tier, self.reason)
+    }
+}
+
+impl std::error::Error for RetryableLlmError {}
+
+pub(crate) fn retryable_llm_error(
+    message: impl Into<String>,
+    marker: RetryableLlmError,
+) -> anyhow::Error {
+    anyhow::Error::new(marker).context(message.into())
+}
+
+pub(crate) fn retryable_llm_context(
+    error: anyhow::Error,
+    context: &'static str,
+    marker: RetryableLlmError,
+) -> anyhow::Error {
+    error.context(marker).context(context)
+}
+
+pub(crate) fn retryable_llm_error_for_body(
+    message: impl Into<String>,
+    body: &str,
+) -> anyhow::Error {
+    let message = message.into();
+    if contains_gateway_transient_marker(body) {
+        return retryable_llm_error(
+            message,
+            RetryableLlmError::gateway_transient("gateway transient response body"),
+        );
+    }
+    if contains_standard_transient_marker(body) {
+        return retryable_llm_error(
+            message,
+            RetryableLlmError::fast("standard transient response body"),
+        );
+    }
+    anyhow::anyhow!(message)
+}
+
+pub(crate) fn retryable_llm_error_for_responses_failure(
+    message: impl Into<String>,
+    failure: &str,
+) -> anyhow::Error {
+    let message = message.into();
+    if contains_standard_transient_marker(failure) {
+        return retryable_llm_error(
+            message,
+            RetryableLlmError::fast("Responses stream transient failure"),
+        );
+    }
+    anyhow::anyhow!(message)
+}
+
 pub(crate) fn contains_gateway_transient_marker(message: &str) -> bool {
     [
         "JSON-RPC error -32602",
         "Job registration failed",
         "Task submission failed",
         "Engine not found",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+pub(crate) fn contains_standard_transient_marker(message: &str) -> bool {
+    [
+        "server_error",
+        "server_is_overloaded",
+        "rate_limit_exceeded",
     ]
     .iter()
     .any(|marker| message.contains(marker))

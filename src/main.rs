@@ -68,8 +68,8 @@ struct Args {
 
     /// Optional cap on tool-calling turns per prompt. Defaults to `0` =
     /// unbounded: the loop runs until the model answers without a tool call
-    /// (normal completion), with stalls caught earlier by the LLM idle timeout
-    /// and the no-progress nudges -- the same model-driven termination Codex
+    /// (normal completion), with stalls caught earlier by the LLM stream
+    /// timeouts and the no-progress nudges -- the same model-driven termination Codex
     /// uses and that `/goal` already uses here. A turn count is a poor work
     /// budget (you can't know up front how many tool rounds a task needs), so
     /// it is opt-in: pass a positive `--max-turns N` only to deliberately bound
@@ -97,13 +97,11 @@ struct Args {
     #[arg(long, env = "BROKK_BIFROST_BINARY", hide = true)]
     bifrost_binary: Option<PathBuf>,
 
-    /// Seconds of SSE inactivity before aborting a streaming LLM response.
-    /// Counts only meaningful progress (parsed content/tool-call deltas);
-    /// keepalive comments and unparseable chunks do not reset the timer.
-    /// Bump higher for slow local models with large context (e.g. 600+ on a
-    /// MacBook running a 70B). Overridable per-session via `/setup timeout`.
-    /// Bounds match the `/setup timeout` command for a single,
-    /// consistent UX between boot config and runtime override.
+    /// Seconds to wait for the first meaningful SSE progress before aborting
+    /// a streaming LLM response. Bump higher for models/providers that spend
+    /// a long time reasoning before streaming any text. Overridable
+    /// per-session via `/idle-timeout`, which sets both first-progress and
+    /// mid-stream stall timeouts for back compatibility.
     #[arg(
         long,
         env = "ANVIL_LLM_IDLE_TIMEOUT_SECS",
@@ -112,6 +110,18 @@ struct Args {
             .range(llm_client::MIN_IDLE_CHUNK_TIMEOUT_SECS..=llm_client::MAX_IDLE_CHUNK_TIMEOUT_SECS),
     )]
     llm_idle_timeout_secs: u64,
+
+    /// Seconds to wait between meaningful SSE chunks after streaming has
+    /// started before aborting a stalled LLM response. Keepalive comments and
+    /// unparseable chunks do not reset this timer.
+    #[arg(
+        long,
+        env = "ANVIL_LLM_STALL_TIMEOUT_SECS",
+        default_value_t = llm_client::DEFAULT_INTER_CHUNK_TIMEOUT_SECS,
+        value_parser = RangedU64ValueParser::<u64>::new()
+            .range(llm_client::MIN_IDLE_CHUNK_TIMEOUT_SECS..=llm_client::MAX_IDLE_CHUNK_TIMEOUT_SECS),
+    )]
+    llm_stall_timeout_secs: u64,
 
     /// Keep setup preferences process-local. Model, reasoning-effort, sandbox,
     /// and first-run setup choices made during this Anvil process still seed
@@ -166,6 +176,7 @@ impl std::fmt::Debug for Args {
             .field("max_history_turns", &self.max_history_turns)
             .field("bifrost_binary", &self.bifrost_binary)
             .field("llm_idle_timeout_secs", &self.llm_idle_timeout_secs)
+            .field("llm_stall_timeout_secs", &self.llm_stall_timeout_secs)
             .field("transient_setup", &self.transient_setup)
             // Deprecated flags omitted from Debug to avoid leaking api_key.
             .finish()
@@ -607,20 +618,26 @@ async fn main() -> Result<()> {
 
     // `0` means "no turn cap" (matching `--max-sessions`/`--max-history-turns`):
     // map it to the max so the `for turn in 0..turn_limit` loop is bounded only
-    // by the model's own completion signal, the idle timeout, and the nudges.
+    // by the model's own completion signal, the stream timeouts, and the nudges.
     let max_turns = if args.max_turns == 0 {
         usize::MAX
     } else {
         args.max_turns
     };
-    // Bounds on `llm_idle_timeout_secs` are enforced by the clap
-    // `value_parser`, so the value reaches us already validated.
-    agent::run_agent(llm, sessions, max_turns, args.llm_idle_timeout_secs)
-        .await
-        .map_err(|e| {
-            tracing::error!("agent error: {e}");
-            anyhow::anyhow!("agent error: {e}")
-        })
+    // Bounds on the LLM timeout values are enforced by the clap
+    // `value_parser`, so the values reach us already validated.
+    agent::run_agent(
+        llm,
+        sessions,
+        max_turns,
+        args.llm_idle_timeout_secs,
+        args.llm_stall_timeout_secs,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("agent error: {e}");
+        anyhow::anyhow!("agent error: {e}")
+    })
 }
 
 #[cfg(test)]

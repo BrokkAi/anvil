@@ -729,9 +729,9 @@ pub struct Session {
     /// In-memory only -- the issue scope explicitly excludes
     /// workspace-level persistence for this knob.
     pub selected_reasoning_effort: Option<String>,
-    /// Per-session override of the LLM SSE idle timeout (seconds).
-    /// `None` means "use the binary-wide default" (CLI flag
-    /// `--llm-idle-timeout-secs` / env `BROKK_ACP_LLM_IDLE_TIMEOUT_SECS`).
+    /// Per-session override of both LLM SSE first-progress and mid-stream stall
+    /// timeouts (seconds). `None` means "use the binary-wide defaults" (CLI
+    /// flags `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs`).
     /// Set via `/idle-timeout <secs>`, cleared via `/idle-timeout default`.
     /// In-memory only -- does not survive a reload.
     pub idle_timeout_secs: Option<u64>,
@@ -1046,8 +1046,9 @@ pub struct SessionSnapshot {
     /// effort presets or the user explicitly selected reasoning `off`, so
     /// the backend will omit the field.
     pub reasoning_effort: Option<String>,
-    /// Per-session override of the LLM SSE idle timeout (seconds).
-    /// `None` means the caller should fall back to the binary-wide default.
+    /// Per-session override of both LLM SSE first-progress and mid-stream
+    /// stall timeouts (seconds). `None` means the caller should fall back to
+    /// the binary-wide defaults.
     pub idle_timeout_secs: Option<u64>,
     /// AGENTS.md / CLAUDE.md content discovered for this session,
     /// concatenated general -> specific. Empty when nothing is found.

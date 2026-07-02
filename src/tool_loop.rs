@@ -16,10 +16,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, EMPTY_COMPLETION_RETRY_REASON, LlmBackend, LlmResponse, StreamChatRequest,
-    TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion, is_retryable_llm_error,
-    llm_retry_tier, messages_include_images, rewrite_image_prompt_provider_error,
-    stream_chat_no_visible_output_with_retry,
+    ChatMessage, EMPTY_COMPLETION_RETRY_REASON, IdleTimeouts, LlmBackend, LlmResponse,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition, is_degenerate_empty_completion,
+    is_retryable_llm_error, llm_retry_tier, messages_include_images,
+    rewrite_image_prompt_provider_error, stream_chat_no_visible_output_with_retry,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 use crate::semantic_rerank;
@@ -185,7 +185,7 @@ async fn stream_chat_with_transient_retry(
     on_text: &TextSink,
     on_thought: &TextSink,
     cancel: &CancellationToken,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
 ) -> anyhow::Result<LlmResponse> {
     let mut attempt = 1u64;
     loop {
@@ -214,7 +214,7 @@ async fn stream_chat_with_transient_retry(
                 on_token,
                 on_thought: on_thought_cb,
                 cancel: cancel.clone(),
-                idle_timeout,
+                idle_timeouts: idle_timeout,
             })
             .await;
 
@@ -1576,7 +1576,7 @@ pub(crate) async fn run(
     structured_output: Option<&StructuredOutputRequest>,
     mut messages: Vec<ChatMessage>,
     max_turns: usize,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     on_text: TextSink,
     on_thought: TextSink,
@@ -1921,12 +1921,10 @@ pub(crate) async fn run(
         };
 
         // Wall-clock bound on this stream is enforced by the reqwest client's
-        // own `.timeout(...)` (see `OpenAiClient::new`). Per-chunk idle
-        // inactivity (the case in #3366 / #3453: streams that drip
-        // occasional bytes and would defeat wall-clock) is enforced inside
-        // the SSE driver via `idle_timeout`, threaded here from
-        // `--llm-idle-timeout-secs` and the per-session `/idle-timeout`
-        // override.
+        // own `.timeout(...)` (see `OpenAiClient::new`). First-progress and
+        // per-chunk stall inactivity are enforced inside the SSE driver via
+        // `idle_timeout`, threaded here from the LLM timeout CLI flags and the
+        // per-session `/idle-timeout` override.
         let request_tools = turn_tools.clone();
         let advertised_this_request = advertised_tool_names(request_tools.as_ref());
         if let Some(config) = p2t_config.as_ref() {
@@ -2532,7 +2530,7 @@ async fn execute_step_tool_calls(
     replay_events: &mut Vec<TurnReplayEvent>,
     turn_usage: &mut TokenUsage,
     max_turns: usize,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
     session_id: &str,
@@ -3607,7 +3605,7 @@ async fn classify_permission_scope_with_model(
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: cancel.clone(),
-            idle_timeout: request
+            idle_timeouts: request
                 .idle_timeout
                 .min(AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT),
         },
@@ -3795,7 +3793,7 @@ struct GateCheck<'a> {
     model: &'a str,
     reasoning_effort: Option<&'a str>,
     original_user_request: &'a str,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     session_id: &'a str,
     tool_name: &'a str,
     kind: ToolKind,
@@ -4106,7 +4104,7 @@ async fn build_train_bifrost_nudge(
     tool_exchanges: &[ToolExchange],
     training_packet: Option<&TrainingPacket>,
     cancel: &CancellationToken,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
 ) -> Option<(String, TokenUsage)> {
     let packet = training_packet?;
     train_bifrost::compose_no_edit_nudge(
@@ -4349,7 +4347,7 @@ async fn execute_subagent(
     _structured_output: Option<&StructuredOutputRequest>,
     args: &Value,
     max_turns: usize,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     spawned_cx: &SpawnedCx<'_>,
     session_id: &str,
@@ -4628,7 +4626,9 @@ fn ordered_tool_call_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::{FunctionCall, FunctionDef, IncompleteStreamError};
+    use crate::llm_client::{
+        FunctionCall, FunctionDef, IncompleteStreamError, OutputBudgetExhaustedError,
+    };
     use futures::future::{BoxFuture, FutureExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4827,7 +4827,7 @@ mod tests {
     struct RetryBackend {
         attempts: Arc<AtomicUsize>,
         emit_before_error: bool,
-        first_error: &'static str,
+        first_error: fn() -> anyhow::Error,
     }
 
     impl LlmBackend for RetryBackend {
@@ -4848,7 +4848,7 @@ mod tests {
                     if emit_before_error {
                         (request.on_token)("partial");
                     }
-                    anyhow::bail!(first_error);
+                    return Err(first_error());
                 }
                 (request.on_token)("ok");
                 Ok(LlmResponse::Text {
@@ -4859,6 +4859,34 @@ mod tests {
             }
             .boxed()
         }
+    }
+
+    fn codex_stream_read_error() -> anyhow::Error {
+        crate::http_retry::retryable_llm_error(
+            "Codex stream read error: simulated disconnect",
+            crate::http_retry::RetryableLlmError::fast("Codex stream read error"),
+        )
+    }
+
+    fn codex_server_overloaded_error() -> anyhow::Error {
+        crate::http_retry::retryable_llm_error_for_responses_failure(
+            "Codex Responses stream failed: server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+            "server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+        )
+    }
+
+    fn responses_server_error() -> anyhow::Error {
+        crate::http_retry::retryable_llm_error_for_responses_failure(
+            "Responses stream failed: server_error: The server had an error while processing your request.",
+            "server_error: The server had an error while processing your request.",
+        )
+    }
+
+    fn responses_rate_limit_error() -> anyhow::Error {
+        crate::http_retry::retryable_llm_error_for_responses_failure(
+            "Responses stream failed: rate_limit_exceeded: slow down",
+            "rate_limit_exceeded: slow down",
+        )
     }
 
     struct IncompleteStreamRetryBackend {
@@ -4894,6 +4922,28 @@ mod tests {
                     reasoning_content: None,
                     usage: TokenUsage::default(),
                 })
+            }
+            .boxed()
+        }
+    }
+
+    struct OutputBudgetExhaustedBackend {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for OutputBudgetExhaustedBackend {
+        fn list_models(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn stream_chat(
+            &self,
+            _request: StreamChatRequest,
+        ) -> BoxFuture<'_, anyhow::Result<LlmResponse>> {
+            let attempts = self.attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::new(OutputBudgetExhaustedError))
             }
             .boxed()
         }
@@ -5105,7 +5155,7 @@ mod tests {
             model: "test-model",
             reasoning_effort: None,
             original_user_request: "fix the failing tests",
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: IdleTimeouts::uniform(Duration::from_secs(300)),
             session_id: "session",
             tool_name: "run_shell_command",
             kind: ToolKind::Execute,
@@ -5147,7 +5197,7 @@ mod tests {
             model: "test-model",
             reasoning_effort: None,
             original_user_request: "fix the failing tests",
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: IdleTimeouts::uniform(Duration::from_secs(300)),
             session_id: "session",
             tool_name: "run_shell_command",
             kind: ToolKind::Execute,
@@ -5197,7 +5247,7 @@ mod tests {
             model: "test-model",
             reasoning_effort: None,
             original_user_request: "fix the failing tests",
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: IdleTimeouts::uniform(Duration::from_secs(300)),
             session_id: "session",
             tool_name: "run_shell_command",
             kind: ToolKind::Execute,
@@ -5456,7 +5506,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
             emit_before_error: false,
-            first_error: "Codex stream read error: simulated disconnect",
+            first_error: codex_stream_read_error,
         });
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
@@ -5473,7 +5523,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("retry should recover");
@@ -5507,7 +5557,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("an empty completion should retry and recover");
@@ -5542,7 +5592,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("an exhausted empty completion is returned, not an error");
@@ -5577,7 +5627,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("incomplete streams should retry before output");
@@ -5585,6 +5635,38 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(matches!(response, LlmResponse::Text { text, .. } if text == "ok"));
         assert_eq!(output.lock().unwrap().as_str(), "ok");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_output_budget_exhaustion() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn LlmBackend> = Arc::new(OutputBudgetExhaustedBackend {
+            attempts: attempts.clone(),
+        });
+        let output = Arc::new(Mutex::new(String::new()));
+        let thoughts = Arc::new(Mutex::new(String::new()));
+
+        let err = stream_chat_with_transient_retry(
+            &backend,
+            0,
+            "codex::test",
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+            None,
+            None,
+            &text_sink_for_test(output.clone()),
+            &text_sink_for_test(thoughts),
+            &CancellationToken::new(),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
+        )
+        .await
+        .expect_err("output budget exhaustion should not retry");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(crate::llm_client::is_output_budget_exhausted_error(&err));
+        assert!(!is_retryable_llm_error(&err));
+        assert!(output.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5597,7 +5679,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
             emit_before_error: true,
-            first_error: "Codex stream read error: simulated disconnect",
+            first_error: codex_stream_read_error,
         });
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
@@ -5614,7 +5696,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("a mid-stream disconnect should retry even after partial output");
@@ -5646,7 +5728,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("an incomplete stream should retry even after partial output");
@@ -5677,7 +5759,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
             emit_before_error: false,
-            first_error: "Codex Responses stream failed: server_is_overloaded: Our servers are currently overloaded. Please try again later.",
+            first_error: codex_server_overloaded_error,
         });
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
@@ -5694,7 +5776,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("overload should be retried before output");
@@ -5710,7 +5792,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
             emit_before_error: false,
-            first_error: "Responses stream failed: server_error: The server had an error while processing your request.",
+            first_error: responses_server_error,
         });
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
@@ -5727,7 +5809,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("server_error should be retried before output");
@@ -5743,7 +5825,7 @@ mod tests {
         let backend: Arc<dyn LlmBackend> = Arc::new(RetryBackend {
             attempts: attempts.clone(),
             emit_before_error: false,
-            first_error: "Responses stream failed: rate_limit_exceeded: slow down",
+            first_error: responses_rate_limit_error,
         });
         let output = Arc::new(Mutex::new(String::new()));
         let thoughts = Arc::new(Mutex::new(String::new()));
@@ -5760,7 +5842,7 @@ mod tests {
             &text_sink_for_test(output.clone()),
             &text_sink_for_test(thoughts),
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("rate_limit_exceeded should be retried before output");

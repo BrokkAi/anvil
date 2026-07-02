@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::llm_client::IdleTimeouts;
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
     ModelsResponse, OpenAiClient, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
@@ -529,7 +531,7 @@ impl BedrockClient {
             mut on_token,
             mut on_thought,
             cancel,
-            idle_timeout: _,
+            idle_timeouts: _,
         } = request;
         let resolved_model = self.resolve_invocable_model_id(&model).await?;
         let enable_cache = requires_explicit_caching(&resolved_model);
@@ -676,7 +678,7 @@ impl BedrockClient {
             on_token,
             on_thought,
             cancel,
-            idle_timeout,
+            idle_timeouts,
         } = request;
         let reasoning_spec = bedrock_reasoning_spec_or_fallback(&model);
         let reasoning_effort = reasoning_effort
@@ -709,12 +711,15 @@ impl BedrockClient {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Bedrock Responses API failed (HTTP {status}): {body_text}");
+            return Err(crate::http_retry::retryable_llm_error_for_body(
+                format!("Bedrock Responses API failed (HTTP {status}): {body_text}"),
+                &body_text,
+            ));
         }
         let stream = resp
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
-        drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeout).await
+        drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeouts).await
     }
 
     async fn list_mantle_model_metadata(&self) -> Result<Vec<ModelMetadata>> {
@@ -759,7 +764,10 @@ impl BedrockClient {
         if !needs_inference_profile_retry(status, &body_text)
             || looks_like_inference_profile_identifier(model)
         {
-            anyhow::bail!("Bedrock request failed (HTTP {status}): {body_text}");
+            return Err(crate::http_retry::retryable_llm_error_for_body(
+                format!("Bedrock request failed (HTTP {status}): {body_text}"),
+                &body_text,
+            ));
         }
 
         let mut last_retry_error = None;
@@ -782,13 +790,20 @@ impl BedrockClient {
         }
 
         if let Some((profile_id, retry_status, retry_body)) = last_retry_error {
-            anyhow::bail!(
+            let message = format!(
                 "Bedrock request failed (HTTP {status}): {body_text}; retry with inference profile {} also failed (HTTP {retry_status}): {retry_body}",
                 profile_id
             );
+            let bodies = format!("{body_text}\n{retry_body}");
+            return Err(crate::http_retry::retryable_llm_error_for_body(
+                message, &bodies,
+            ));
         }
 
-        anyhow::bail!("Bedrock request failed (HTTP {status}): {body_text}");
+        Err(crate::http_retry::retryable_llm_error_for_body(
+            format!("Bedrock request failed (HTTP {status}): {body_text}"),
+            &body_text,
+        ))
     }
 
     async fn post_native_invoke(
@@ -2490,7 +2505,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("native request with thinking should succeed");
@@ -2547,7 +2562,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("native request should keep generic thinking controls");
@@ -2603,7 +2618,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("manual thinking request should succeed");
@@ -2650,7 +2665,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("adaptive request should accept xhigh");
@@ -2741,7 +2756,7 @@ mod tests {
                     on_token: Box::new(|_| {}),
                     on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
                     cancel: CancellationToken::new(),
-                    idle_timeout: Duration::from_secs(5),
+                    idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
                 },
                 thoughts,
             )
@@ -2829,7 +2844,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("responses request should succeed");
@@ -2906,7 +2921,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("supported reasoning request should succeed");
@@ -2923,7 +2938,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("unsupported reasoning request should omit reasoning");
@@ -2966,7 +2981,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("responses request should succeed");
@@ -3011,7 +3026,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("native request should succeed");
@@ -3078,7 +3093,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("request should retry with inference profile");
@@ -3138,7 +3153,7 @@ mod tests {
                 on_token: Box::new(|_| {}),
                 on_thought: Box::new(|_| {}),
                 cancel: CancellationToken::new(),
-                idle_timeout: Duration::from_secs(5),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
             .await
             .expect("request should resolve directly to prefixed profile");

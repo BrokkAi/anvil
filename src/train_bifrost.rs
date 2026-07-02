@@ -1,16 +1,16 @@
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
-
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage, is_retryable_llm_error,
-    stream_chat_no_visible_output_with_retry,
+    ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest, TokenUsage,
+    is_retryable_llm_error, stream_chat_no_visible_output_with_retry,
 };
 use crate::session::ToolExchange;
 use crate::trace_logging::append_trace_record;
@@ -331,7 +331,7 @@ pub(crate) async fn compose_no_edit_nudge(
     tool_exchanges: &[ToolExchange],
     packet: &TrainingPacket,
     cancel: &CancellationToken,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
 ) -> Option<(String, TokenUsage)> {
     let unread = unread_files(packet, tool_exchanges);
     let deterministic_nudges = deterministic_summary_nudges(packet, tool_exchanges);
@@ -417,7 +417,7 @@ struct HintRequest<'a> {
     turn: usize,
     context: HintRequestContext<'a>,
     cancel: &'a CancellationToken,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
 }
 
 async fn request_hint_with_retries(req: HintRequest<'_>) -> Result<(String, TokenUsage)> {
@@ -478,7 +478,7 @@ async fn request_hint(req: &HintRequest<'_>, attempt: usize) -> Result<(String, 
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: req.cancel.clone(),
-            idle_timeout: req.idle_timeout,
+            idle_timeouts: req.idle_timeout,
         },
     )
     .await
@@ -811,7 +811,7 @@ mod tests {
             &[],
             &packet,
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("third attempt should produce a nudge");
@@ -851,7 +851,7 @@ mod tests {
             &[],
             &packet,
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("transport retry should recover hint request");
@@ -883,7 +883,7 @@ mod tests {
             &[],
             &packet,
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await;
 
@@ -921,7 +921,7 @@ mod tests {
             &[source],
             &packet,
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("all-read state should nudge");
@@ -965,7 +965,7 @@ mod tests {
             &[discovered],
             &packet,
             &CancellationToken::new(),
-            Duration::from_secs(30),
+            IdleTimeouts::uniform(Duration::from_secs(30)),
         )
         .await
         .expect("nudge should include deterministic and flash hints");

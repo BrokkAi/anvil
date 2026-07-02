@@ -28,6 +28,8 @@ use crate::discovery::{
     DiscoveredModel, ModelSource, OLLAMA_DEFAULT_URL, discover_all, discover_ollama_model_metadata,
     discovery_http_client, split_wire_id,
 };
+#[cfg(test)]
+use crate::llm_client::IdleTimeouts;
 use crate::llm_client::{
     LlmBackend, LlmResponse, ModelMetadata, ResolvedModelInfo, StreamChatRequest,
 };
@@ -613,7 +615,7 @@ mod tests {
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: tokio_util::sync::CancellationToken::new(),
-            idle_timeout: std::time::Duration::from_secs(60),
+            idle_timeouts: IdleTimeouts::uniform(std::time::Duration::from_secs(60)),
         }
     }
 

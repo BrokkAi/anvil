@@ -27,14 +27,14 @@
 //! state and leaves the verbatim log on disk, the session is
 //! recoverable from any failure mode.
 
-use std::time::Duration;
-
 use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
+#[cfg(test)]
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, LlmBackend, LlmResponse, StreamChatRequest,
+    ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
     stream_chat_no_visible_output_with_retry,
 };
 use crate::session::ConversationTurn;
@@ -105,7 +105,7 @@ pub async fn summarize_turn(
     model: &str,
     turn: &ConversationTurn,
     context_length: Option<u32>,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<String> {
     summarize_turn_styled(
@@ -130,7 +130,7 @@ pub async fn summarize_turn_for_recap(
     model: &str,
     turn: &ConversationTurn,
     context_length: Option<u32>,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<String> {
     summarize_turn_styled(
@@ -150,7 +150,7 @@ async fn summarize_turn_styled(
     model: &str,
     turn: &ConversationTurn,
     context_length: Option<u32>,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     style: SummaryStyle,
 ) -> Result<String> {
@@ -177,7 +177,7 @@ async fn summarize_turn_hierarchical(
     model: &str,
     turn: &ConversationTurn,
     budget: usize,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     style: SummaryStyle,
 ) -> Result<String> {
@@ -216,7 +216,7 @@ async fn summarize_chunks_parallel(
     llm: &dyn LlmBackend,
     model: &str,
     chunks: &[String],
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<Vec<String>> {
     let chunk_count = chunks.len();
@@ -261,7 +261,7 @@ async fn combine_chunk_summaries(
     model: &str,
     chunk_summaries: &[String],
     budget: usize,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
     style: SummaryStyle,
 ) -> Result<String> {
@@ -312,7 +312,7 @@ async fn run_summarization_request(
     llm: &dyn LlmBackend,
     model: &str,
     messages: Vec<ChatMessage>,
-    idle_timeout: Duration,
+    idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
 ) -> Result<String> {
     let response = stream_chat_no_visible_output_with_retry(
@@ -332,7 +332,7 @@ async fn run_summarization_request(
             on_token: Box::new(|_| {}),
             on_thought: Box::new(|_| {}),
             cancel: cancel.clone(),
-            idle_timeout,
+            idle_timeouts: idle_timeout,
         },
     )
     .await?;
@@ -1116,7 +1116,7 @@ mod tests {
             "mock",
             &t,
             Some(200_000),
-            Duration::from_secs(60),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
@@ -1150,7 +1150,7 @@ mod tests {
             "mock",
             &t,
             Some(200_000),
-            Duration::from_secs(60),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
@@ -1180,7 +1180,7 @@ mod tests {
             "mock",
             &t,
             Some(200_000),
-            Duration::from_secs(60),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
@@ -1214,7 +1214,7 @@ mod tests {
             "mock",
             &t,
             Some(16_000),
-            Duration::from_secs(60),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
@@ -1293,7 +1293,7 @@ mod tests {
             "mock",
             &t,
             Some(16_000),
-            Duration::from_secs(60),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
             cancel.clone(),
         )
         .await;
@@ -1387,7 +1387,7 @@ mod tests {
             "mock",
             &t,
             Some(16_000),
-            Duration::from_secs(60),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
             CancellationToken::new(),
         )
         .await
