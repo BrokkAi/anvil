@@ -398,8 +398,9 @@ fn permission_config_option(current: PermissionMode) -> SessionConfigOption {
     let options = vec![
         SessionConfigSelectOption::new("default", "Default")
             .description("Ask for permission before each tool call"),
-        SessionConfigSelectOption::new("auto", "Auto")
-            .description("Use the permission classifier only for promptable tool calls"),
+        SessionConfigSelectOption::new("auto", "Auto").description(
+            "Classify promptable tool calls automatically; never show permission prompts",
+        ),
         SessionConfigSelectOption::new("acceptEdits", "Accept Edits")
             .description("Auto-allow edits; ask for everything else"),
         SessionConfigSelectOption::new("readOnly", "Read-only")

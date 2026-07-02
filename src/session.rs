@@ -383,8 +383,8 @@ impl SessionMode {
 pub enum PermissionMode {
     #[serde(rename = "default")]
     Default,
-    /// Like Default, but promptable tool calls may be approved by the
-    /// permission scope classifier when clearly inside the user's request.
+    /// Like Default, but promptable tool calls are decided by the permission
+    /// scope classifier instead of prompting the user.
     #[serde(rename = "auto")]
     #[default]
     Auto,
