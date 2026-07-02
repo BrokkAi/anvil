@@ -401,6 +401,7 @@ Core tools include:
 - `edit`
 - `list_directory`
 - `grep_search`
+- `web_search`
 - `run_shell_command`
 
 MCP servers can add more tools at runtime. The default Bifrost MCP server adds
@@ -451,8 +452,9 @@ compatibility with camelCase frontmatter.
 
 `tools` is optional. When omitted, a subagent inherits the parent tool catalog.
 When present, it is an allowlist. Claude-style tool names such as `Read`,
-`Write`, `Edit`, `Bash`, `Grep`, `Glob`, and `LS` are mapped to Anvil's
-built-in tool names; Anvil and MCP tool names can also be listed directly.
+`Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebSearch`, `WebFetch`, and `LS`
+are mapped to Anvil's built-in tool names; Anvil and MCP tool names can also
+be listed directly.
 
 Discovery order:
 
