@@ -24,28 +24,172 @@ fn requires_explicit_caching(model: &str) -> bool {
     model.contains("anthropic")
 }
 
-/// Bedrock reasoning is intentionally enabled for every Bedrock model we
-/// advertise. Some models may reject the provider-specific wire field at
-/// runtime; in that case the provider error is surfaced to the user.
-fn supports_extended_thinking(_model: &str) -> bool {
-    true
+const OPENAI_GPT_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("none", "No reasoning effort."),
+    ("low", "Light reasoning for simpler problems."),
+    ("medium", "Balanced reasoning for moderate complexity."),
+    ("high", "Deep reasoning for complex problems."),
+    ("xhigh", "Extra-high reasoning for the hardest problems."),
+];
+
+const OPENAI_GPT_OSS_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("low", "Light reasoning for low-latency responses."),
+    ("medium", "Balanced reasoning for general use."),
+    ("high", "Deep reasoning for harder tasks."),
+];
+
+const ANTHROPIC_BASIC_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("low", "Most efficient; significant token savings."),
+    ("medium", "Balanced speed, cost, and performance."),
+    ("high", "High capability; provider default."),
+];
+
+const ANTHROPIC_MAX_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("low", "Most efficient; significant token savings."),
+    ("medium", "Balanced speed, cost, and performance."),
+    ("high", "High capability; provider default."),
+    (
+        "max",
+        "Absolute maximum capability with no token-spend constraint.",
+    ),
+];
+
+const ANTHROPIC_XHIGH_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("low", "Most efficient; significant token savings."),
+    ("medium", "Balanced speed, cost, and performance."),
+    ("high", "High capability; provider default."),
+    ("xhigh", "Extended capability for long-horizon work."),
+    (
+        "max",
+        "Absolute maximum capability with no token-spend constraint.",
+    ),
+];
+
+const ANTHROPIC_MANUAL_THINKING_PRESETS: &[(&str, &str)] = &[
+    ("low", "Manual extended thinking with a 2K token budget."),
+    ("medium", "Manual extended thinking with a 4K token budget."),
+    ("high", "Manual extended thinking with an 8K token budget."),
+];
+
+const BEDROCK_LEGACY_REASONING_PRESETS: &[(&str, &str)] = &[
+    ("low", "Light reasoning for shorter problems."),
+    ("medium", "Balanced reasoning for moderate complexity."),
+    ("high", "Deep reasoning for harder problems."),
+];
+
+#[derive(Debug, Clone, Copy)]
+struct BedrockReasoningSpec {
+    default_level: Option<&'static str>,
+    presets: &'static [(&'static str, &'static str)],
+    anthropic_thinking_shape: Option<ThinkingShape>,
+    send_output_effort: bool,
 }
 
-/// Reasoning-effort presets surfaced for Bedrock models. `medium` is used as
-/// the default so sessions send reasoning unless the user selects another
-/// effort.
-fn anthropic_thinking_presets() -> Vec<ReasoningLevelPreset> {
-    [
-        ("low", "Light reasoning for shorter problems."),
-        ("medium", "Balanced reasoning for moderate complexity."),
-        ("high", "Deep reasoning for harder problems."),
-    ]
-    .into_iter()
-    .map(|(effort, description)| ReasoningLevelPreset {
-        effort: effort.to_string(),
-        description: description.to_string(),
+impl BedrockReasoningSpec {
+    fn supports_reasoning_level(self, effort: &str) -> bool {
+        self.presets
+            .iter()
+            .any(|(level, _)| *level == effort.trim())
+    }
+
+    fn to_presets(self) -> Vec<ReasoningLevelPreset> {
+        self.presets
+            .iter()
+            .map(|(effort, description)| ReasoningLevelPreset {
+                effort: (*effort).to_string(),
+                description: (*description).to_string(),
+            })
+            .collect()
+    }
+}
+
+fn is_prefixed_bedrock_model(model: &str, bases: &[&str]) -> bool {
+    bases.iter().any(|base| match model.strip_prefix(base) {
+        Some(rest) => rest.is_empty() || rest.starts_with('-'),
+        None => false,
     })
-    .collect()
+}
+
+fn bedrock_reasoning_spec_for_model(model: &str) -> Option<BedrockReasoningSpec> {
+    let model = model.trim().to_ascii_lowercase();
+    if is_prefixed_bedrock_model(&model, &["openai.gpt-oss-120b", "openai.gpt-oss-20b"]) {
+        return Some(BedrockReasoningSpec {
+            default_level: Some("medium"),
+            presets: OPENAI_GPT_OSS_REASONING_PRESETS,
+            anthropic_thinking_shape: None,
+            send_output_effort: false,
+        });
+    }
+    if is_prefixed_bedrock_model(&model, &["openai.gpt-5.5", "openai.gpt-5.4"]) {
+        return Some(BedrockReasoningSpec {
+            default_level: Some("medium"),
+            presets: OPENAI_GPT_REASONING_PRESETS,
+            anthropic_thinking_shape: None,
+            send_output_effort: false,
+        });
+    }
+
+    let anthropic = |needle: &str| model.contains(needle);
+    if anthropic("claude-fable-5")
+        || anthropic("claude-mythos-5")
+        || anthropic("claude-opus-4-8")
+        || anthropic("claude-opus-4-7")
+        || anthropic("claude-sonnet-5")
+    {
+        return Some(BedrockReasoningSpec {
+            default_level: Some("high"),
+            presets: ANTHROPIC_XHIGH_REASONING_PRESETS,
+            anthropic_thinking_shape: Some(ThinkingShape::Adaptive),
+            send_output_effort: true,
+        });
+    }
+    if anthropic("claude-mythos-preview")
+        || anthropic("claude-opus-4-6")
+        || anthropic("claude-sonnet-4-6")
+    {
+        return Some(BedrockReasoningSpec {
+            default_level: Some("high"),
+            presets: ANTHROPIC_MAX_REASONING_PRESETS,
+            anthropic_thinking_shape: Some(ThinkingShape::Adaptive),
+            send_output_effort: true,
+        });
+    }
+    if anthropic("claude-opus-4-5") {
+        return Some(BedrockReasoningSpec {
+            default_level: Some("high"),
+            presets: ANTHROPIC_BASIC_REASONING_PRESETS,
+            anthropic_thinking_shape: Some(ThinkingShape::Enabled),
+            send_output_effort: true,
+        });
+    }
+    if anthropic("claude-haiku-4-5")
+        || anthropic("claude-sonnet-4-5")
+        || anthropic("claude-opus-4-1")
+        || anthropic("claude-sonnet-4-2025")
+        || model.ends_with("claude-sonnet-4")
+    {
+        return Some(BedrockReasoningSpec {
+            default_level: None,
+            presets: ANTHROPIC_MANUAL_THINKING_PRESETS,
+            anthropic_thinking_shape: Some(ThinkingShape::Enabled),
+            send_output_effort: false,
+        });
+    }
+    None
+}
+
+fn fallback_bedrock_reasoning_spec(model: &str) -> BedrockReasoningSpec {
+    BedrockReasoningSpec {
+        default_level: Some("medium"),
+        presets: BEDROCK_LEGACY_REASONING_PRESETS,
+        anthropic_thinking_shape: (!uses_responses_api(model)).then_some(ThinkingShape::Enabled),
+        send_output_effort: false,
+    }
+}
+
+fn bedrock_reasoning_spec_or_fallback(model: &str) -> BedrockReasoningSpec {
+    bedrock_reasoning_spec_for_model(model)
+        .unwrap_or_else(|| fallback_bedrock_reasoning_spec(model))
 }
 
 /// Map a reasoning-effort preset to an Anthropic extended-thinking
@@ -70,17 +214,22 @@ fn thinking_max_tokens(budget_tokens: u32) -> u32 {
     budget_tokens.saturating_add(MAX_TOKENS)
 }
 
-/// Build a native Anthropic request, attaching the reasoning controls for
-/// the given wire `shape` when an `effort` is present. `effort` is assumed
-/// already validated (`thinking_budget_for_effort` returns `Some`).
+/// Build a native Anthropic request, attaching the reasoning controls for the
+/// given wire `shape` when a validated reasoning level is present.
+#[derive(Debug, Clone, Copy)]
+struct AnthropicReasoningControls<'a> {
+    effort: Option<&'a str>,
+    shape: ThinkingShape,
+    send_output_effort: bool,
+}
+
 fn build_anthropic_request(
     anthropic_version: &'static str,
     system: Option<Vec<BedrockTextBlock>>,
     messages: Vec<BedrockMessage>,
     tools: Option<Vec<BedrockTool>>,
-    effort: Option<&str>,
     temperature: Option<f64>,
-    shape: ThinkingShape,
+    reasoning: AnthropicReasoningControls<'_>,
 ) -> BedrockAnthropicRequest {
     let mut request = BedrockAnthropicRequest {
         anthropic_version,
@@ -92,15 +241,20 @@ fn build_anthropic_request(
         thinking: None,
         output_config: None,
     };
-    let Some(effort) = effort else {
+    let Some(effort) = reasoning.effort else {
         return request;
     };
-    match shape {
+    match reasoning.shape {
         ThinkingShape::Enabled => {
             if let Some(budget_tokens) = thinking_budget_for_effort(effort) {
                 request.max_tokens = thinking_max_tokens(budget_tokens);
                 request.temperature = None;
                 request.thinking = Some(BedrockThinking::Enabled { budget_tokens });
+                if reasoning.send_output_effort {
+                    request.output_config = Some(BedrockOutputConfig {
+                        effort: effort.to_string(),
+                    });
+                }
             }
         }
         ThinkingShape::Adaptive => {
@@ -124,13 +278,12 @@ fn error_requires_adaptive_thinking(err: &anyhow::Error) -> bool {
         && (msg.contains("adaptive") || msg.contains("output_config"))
 }
 
-/// Attach reasoning presets to every Bedrock model in the merged catalog.
-fn attach_anthropic_reasoning_presets(models: &mut [ModelMetadata]) {
+/// Attach Bedrock/provider-specific reasoning presets in the merged catalog.
+fn apply_bedrock_reasoning_presets(models: &mut [ModelMetadata]) {
     for model in models.iter_mut() {
-        model.supported_reasoning_levels = anthropic_thinking_presets();
-        model
-            .default_reasoning_level
-            .get_or_insert_with(|| "medium".to_string());
+        let spec = bedrock_reasoning_spec_or_fallback(&model.id);
+        model.supported_reasoning_levels = spec.to_presets();
+        model.default_reasoning_level = spec.default_level.map(str::to_string);
     }
 }
 
@@ -210,11 +363,9 @@ pub struct BedrockClient {
     mantle_base_url: String,
     control_base_url: String,
     /// Per-resolved-model record of which Anthropic thinking wire shape the
-    /// model actually accepts. The Bedrock catalog publishes no capability
-    /// signal for this, so the first reasoning request probes with the
-    /// legacy `enabled` shape and, on the documented "use adaptive" 400,
-    /// learns `Adaptive` for subsequent calls. Avoids a brittle
-    /// model-id-version allowlist and re-probing on every request.
+    /// model actually accepts. Most shapes are selected from the documented
+    /// model family, but this cache preserves the provider-directed adaptive
+    /// fallback if a manual-thinking model rejects `enabled`.
     thinking_shape_cache: Arc<RwLock<HashMap<String, ThinkingShape>>>,
 }
 
@@ -390,17 +541,21 @@ impl BedrockClient {
         };
         let tools = tools.map(|t| convert_tools(t, enable_cache));
 
-        // Bedrock reasoning is enabled for every Bedrock model we advertise;
-        // validate the requested/default effort before emitting the native
-        // `thinking` block.
+        // Bedrock does not publish a single uniform reasoning schema. Validate
+        // against the model family we advertise, then emit that family's native
+        // Anthropic thinking shape below.
+        let reasoning_spec = bedrock_reasoning_spec_or_fallback(&resolved_model);
         let effort = reasoning_effort
             .as_deref()
-            .filter(|e| thinking_budget_for_effort(e).is_some())
+            .filter(|e| reasoning_spec.supports_reasoning_level(e))
             .map(str::to_string);
+        let send_output_effort = reasoning_spec.send_output_effort;
+        let preferred_shape = reasoning_spec
+            .anthropic_thinking_shape
+            .unwrap_or(ThinkingShape::Enabled);
 
-        // Start from the shape we last learned worked for this model
-        // (defaulting to the legacy `enabled` form, whose rejection error is
-        // well-defined so we can detect and fall back to `adaptive`).
+        // Start from the documented shape for this family, unless a prior
+        // request learned a different accepted shape from the provider.
         let mut shape = match &effort {
             Some(_) => self
                 .thinking_shape_cache
@@ -408,8 +563,8 @@ impl BedrockClient {
                 .await
                 .get(&resolved_model)
                 .copied()
-                .unwrap_or(ThinkingShape::Enabled),
-            None => ThinkingShape::Enabled,
+                .unwrap_or(preferred_shape),
+            None => preferred_shape,
         };
 
         let url = self.invoke_url(&resolved_model);
@@ -419,9 +574,12 @@ impl BedrockClient {
                 system.clone(),
                 messages.clone(),
                 tools.clone(),
-                effort.as_deref(),
                 temperature,
-                shape,
+                AnthropicReasoningControls {
+                    effort: effort.as_deref(),
+                    shape,
+                    send_output_effort,
+                },
             );
             trace_bedrock_request(&body);
             match self
@@ -520,6 +678,11 @@ impl BedrockClient {
             cancel,
             idle_timeout,
         } = request;
+        let reasoning_spec = bedrock_reasoning_spec_or_fallback(&model);
+        let reasoning_effort = reasoning_effort
+            .as_deref()
+            .filter(|e| reasoning_spec.supports_reasoning_level(e))
+            .map(str::to_string);
         let body = build_responses_request(
             &model,
             &messages,
@@ -745,21 +908,18 @@ impl LlmBackend for BedrockClient {
             );
             models = normalize_bedrock_model_ids(models, &inference_profiles, &self.region);
 
-            // Enrich AFTER merge + normalization: the two discovery sources
-            // (Mantle `/models` and foundation models) can both yield the
-            // same Anthropic id, and dedup keeps whichever was inserted
-            // first -- often the Mantle entry, which advertises no reasoning
-            // presets. Attaching presets here, keyed on the final invocable
-            // id, is source-agnostic and immune to merge ordering. It only
-            // matches native-invoke Anthropic ids (never `openai.*`), which
-            // is exactly the path that sends the `thinking` block.
-            attach_anthropic_reasoning_presets(&mut models);
+            // Enrich AFTER merge + normalization: the discovery sources can
+            // disagree or omit per-effort details. The final picker must match
+            // the real Bedrock/provider model family, not generic catalog
+            // defaults.
+            apply_bedrock_reasoning_presets(&mut models);
 
             if !models.iter().any(|m| m.id == default_model) {
+                let reasoning_spec = bedrock_reasoning_spec_or_fallback(&default_model);
                 models.push(ModelMetadata {
                     id: default_model.clone(),
-                    default_reasoning_level: Some("medium".to_string()),
-                    supported_reasoning_levels: anthropic_thinking_presets(),
+                    default_reasoning_level: reasoning_spec.default_level.map(str::to_string),
+                    supported_reasoning_levels: reasoning_spec.to_presets(),
                     supports_images: None,
                     context_length: Some(200_000),
                     pricing: None,
@@ -1101,8 +1261,8 @@ enum BedrockThinking {
     Adaptive,
 }
 
-/// `output_config.effort` companion for the adaptive thinking shape. Carries
-/// the user's chosen effort verbatim (`low`/`medium`/`high`).
+/// `output_config.effort` companion for Anthropic effort-aware thinking.
+/// Carries the user's chosen model-supported effort verbatim.
 #[derive(Debug, Serialize)]
 struct BedrockOutputConfig {
     effort: String,
@@ -1627,15 +1787,11 @@ impl BedrockFoundationModelSummary {
             .input_modalities
             .iter()
             .any(|modality| modality == "IMAGE");
-        let supported_reasoning_levels = if supports_extended_thinking(&self.model_id) {
-            anthropic_thinking_presets()
-        } else {
-            Vec::new()
-        };
+        let reasoning_spec = bedrock_reasoning_spec_or_fallback(&self.model_id);
         ModelMetadata {
             id: self.model_id,
-            default_reasoning_level: Some("medium".to_string()),
-            supported_reasoning_levels,
+            default_reasoning_level: reasoning_spec.default_level.map(str::to_string),
+            supported_reasoning_levels: reasoning_spec.to_presets(),
             supports_images: Some(supports_images),
             context_length: None,
             pricing: None,
@@ -1663,15 +1819,57 @@ mod tests {
     }
 
     #[test]
-    fn extended_thinking_support_is_enabled_for_all_bedrock_models() {
-        assert!(supports_extended_thinking("us.anthropic.claude-sonnet-4-6"));
-        assert!(supports_extended_thinking(
-            "global.anthropic.claude-opus-4-8"
-        ));
-        assert!(supports_extended_thinking("anthropic.claude-3-7-sonnet"));
-        assert!(supports_extended_thinking("us.anthropic.claude-3-5-sonnet"));
-        assert!(supports_extended_thinking("openai.gpt-5.4"));
-        assert!(supports_extended_thinking("amazon.titan-text"));
+    fn reasoning_specs_match_bedrock_model_families() {
+        let efforts = |model: &str| {
+            bedrock_reasoning_spec_for_model(model)
+                .expect("reasoning spec")
+                .presets
+                .iter()
+                .map(|(effort, _)| *effort)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            efforts("openai.gpt-5.5"),
+            ["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(efforts("openai.gpt-oss-120b"), ["low", "medium", "high"]);
+        assert_eq!(
+            efforts("openai.gpt-oss-120b-1:0"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts("global.anthropic.claude-opus-4-8"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            efforts("us.anthropic.claude-sonnet-4-6"),
+            ["low", "medium", "high", "max"]
+        );
+        assert_eq!(
+            efforts("anthropic.claude-opus-4-5"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts("global.anthropic.claude-sonnet-4-5"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts("anthropic.claude-haiku-4-5"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts("anthropic.claude-opus-4-1"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts("anthropic.claude-sonnet-4-20250514-v1:0"),
+            ["low", "medium", "high"]
+        );
+
+        assert!(bedrock_reasoning_spec_for_model("anthropic.claude-3-5-sonnet").is_none());
+        assert!(bedrock_reasoning_spec_for_model("openai.gpt-oss-safeguard-120b").is_none());
+        assert!(bedrock_reasoning_spec_for_model("amazon.titan-text").is_none());
     }
 
     #[test]
@@ -1693,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn foundation_models_advertise_reasoning_presets() {
+    fn foundation_models_advertise_family_reasoning_presets() {
         let summary = BedrockFoundationModelSummary {
             model_id: "anthropic.claude-sonnet-4-6".to_string(),
             input_modalities: vec!["TEXT".to_string()],
@@ -1701,13 +1899,13 @@ mod tests {
             response_streaming_supported: Some(true),
         };
         let meta = summary.into_model_metadata();
-        assert_eq!(meta.default_reasoning_level.as_deref(), Some("medium"));
+        assert_eq!(meta.default_reasoning_level.as_deref(), Some("high"));
         let efforts: Vec<_> = meta
             .supported_reasoning_levels
             .iter()
             .map(|p| p.effort.as_str())
             .collect();
-        assert_eq!(efforts, ["low", "medium", "high"]);
+        assert_eq!(efforts, ["low", "medium", "high", "max"]);
 
         let plain = BedrockFoundationModelSummary {
             model_id: "amazon.titan-text".to_string(),
@@ -1726,13 +1924,28 @@ mod tests {
             .map(|p| p.effort.as_str())
             .collect();
         assert_eq!(plain_efforts, ["low", "medium", "high"]);
+
+        let manual = BedrockFoundationModelSummary {
+            model_id: "anthropic.claude-sonnet-4-5".to_string(),
+            input_modalities: vec!["TEXT".to_string()],
+            output_modalities: vec!["TEXT".to_string()],
+            response_streaming_supported: Some(true),
+        };
+        let manual_meta = manual.into_model_metadata();
+        assert_eq!(manual_meta.default_reasoning_level, None);
+        let manual_efforts: Vec<_> = manual_meta
+            .supported_reasoning_levels
+            .iter()
+            .map(|p| p.effort.as_str())
+            .collect();
+        assert_eq!(manual_efforts, ["low", "medium", "high"]);
     }
 
     #[test]
-    fn enrichment_attaches_presets_to_every_bedrock_model() {
+    fn enrichment_attaches_family_specific_presets() {
         let mut models = vec![
             ModelMetadata {
-                id: "us.anthropic.claude-sonnet-4-6".to_string(),
+                id: "global.anthropic.claude-opus-4-8".to_string(),
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
                 supports_images: Some(true),
@@ -1755,27 +1968,83 @@ mod tests {
                 context_length: Some(200_000),
                 pricing: None,
             },
+            ModelMetadata {
+                id: "openai.gpt-oss-20b".to_string(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                supports_images: Some(false),
+                context_length: Some(128_000),
+                pricing: None,
+            },
+            ModelMetadata {
+                id: "global.anthropic.claude-sonnet-4-5".to_string(),
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: Vec::new(),
+                supports_images: Some(true),
+                context_length: Some(200_000),
+                pricing: None,
+            },
         ];
-        attach_anthropic_reasoning_presets(&mut models);
+        apply_bedrock_reasoning_presets(&mut models);
 
-        for model in &models {
-            assert_eq!(model.default_reasoning_level.as_deref(), Some("medium"));
-            assert_eq!(
-                model
-                    .supported_reasoning_levels
-                    .iter()
-                    .map(|p| p.effort.as_str())
-                    .collect::<Vec<_>>(),
-                ["low", "medium", "high"]
-            );
-        }
+        let by_id = |id: &str| models.iter().find(|model| model.id == id).unwrap();
+        assert_eq!(
+            by_id("global.anthropic.claude-opus-4-8")
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            by_id("us.anthropic.claude-3-5-sonnet")
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            by_id("us.anthropic.claude-3-5-sonnet")
+                .default_reasoning_level
+                .as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            by_id("openai.gpt-5.4")
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            by_id("openai.gpt-oss-20b")
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            by_id("global.anthropic.claude-sonnet-4-5")
+                .supported_reasoning_levels
+                .iter()
+                .map(|p| p.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            by_id("global.anthropic.claude-sonnet-4-5").default_reasoning_level,
+            None
+        );
     }
 
     #[test]
-    fn enrichment_preserves_existing_presets() {
+    fn enrichment_overrides_stale_presets_with_model_card_values() {
         let mut models = vec![ModelMetadata {
             id: "us.anthropic.claude-sonnet-4-6".to_string(),
-            default_reasoning_level: Some("high".to_string()),
+            default_reasoning_level: Some("medium".to_string()),
             supported_reasoning_levels: vec![ReasoningLevelPreset {
                 effort: "high".to_string(),
                 description: "preset".to_string(),
@@ -1784,14 +2053,14 @@ mod tests {
             context_length: Some(200_000),
             pricing: None,
         }];
-        attach_anthropic_reasoning_presets(&mut models);
+        apply_bedrock_reasoning_presets(&mut models);
         assert_eq!(
             models[0]
                 .supported_reasoning_levels
                 .iter()
                 .map(|p| p.effort.as_str())
                 .collect::<Vec<_>>(),
-            ["low", "medium", "high"]
+            ["low", "medium", "high", "max"]
         );
         assert_eq!(models[0].default_reasoning_level.as_deref(), Some("high"));
     }
@@ -2099,8 +2368,11 @@ mod tests {
             }],
             Some(converted),
             None,
-            None,
-            ThinkingShape::Enabled,
+            AnthropicReasoningControls {
+                effort: None,
+                shape: ThinkingShape::Enabled,
+                send_output_effort: false,
+            },
         );
         let serialized = serde_json::to_value(&request).expect("serialize Bedrock request");
         let input_schema = &serialized["tools"][0]["input_schema"];
@@ -2174,20 +2446,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_effort_adds_thinking_block_and_surfaces_thoughts() {
+    async fn reasoning_effort_adds_adaptive_thinking_and_surfaces_thoughts() {
         use std::sync::{Arc, Mutex};
         use wiremock::matchers::body_partial_json;
 
         let server = MockServer::start().await;
-        // Match only when the thinking block is present with the expected
-        // medium budget and the bumped max_tokens. If the field were dropped
-        // (the old behavior) this mock would not match and the request would
-        // 404, failing the test.
+        // Claude 4.6+ uses adaptive thinking plus output_config.effort, not
+        // the legacy budget_tokens shape.
         Mock::given(method("POST"))
             .and(path("/model/us.anthropic.claude-sonnet-4-6/invoke"))
             .and(body_partial_json(serde_json::json!({
-                "max_tokens": 12_288,
-                "thinking": {"type": "enabled", "budget_tokens": 4_096}
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "medium"}
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [
@@ -2232,16 +2502,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_effort_adds_thinking_for_all_native_bedrock_models() {
-        use wiremock::matchers::body_partial_json;
+    async fn unrecognized_anthropic_models_keep_generic_thinking_budget() {
+        use wiremock::{Match, Request};
+
+        struct GenericThinkingBlock;
+        impl Match for GenericThinkingBlock {
+            fn matches(&self, request: &Request) -> bool {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                v.get("thinking")
+                    == Some(&serde_json::json!({"type": "enabled", "budget_tokens": 8192}))
+                    && v.get("output_config").is_none()
+            }
+        }
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/model/us.anthropic.claude-3-5-sonnet/invoke"))
-            .and(body_partial_json(serde_json::json!({
-                "thinking": {"type": "enabled", "budget_tokens": 8192},
-                "max_tokens": 16_384
-            })))
+            .and(GenericThinkingBlock)
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{"type": "text", "text": "plain"}],
                 "usage": {"input_tokens": 2, "output_tokens": 1}
@@ -2271,9 +2550,112 @@ mod tests {
                 idle_timeout: Duration::from_secs(5),
             })
             .await
-            .expect("native request with thinking should succeed");
+            .expect("native request should keep generic thinking controls");
         match response {
             LlmResponse::Text { text, .. } => assert_eq!(text, "plain"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_anthropic_reasoning_models_send_budget_without_effort_field() {
+        use wiremock::{Match, Request};
+
+        struct ManualThinkingOnly;
+        impl Match for ManualThinkingOnly {
+            fn matches(&self, request: &Request) -> bool {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                v.get("thinking")
+                    == Some(&serde_json::json!({"type": "enabled", "budget_tokens": 8192}))
+                    && v.get("output_config").is_none()
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/global.anthropic.claude-sonnet-4-5/invoke"))
+            .and(ManualThinkingOnly)
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "manual ok"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "global.anthropic.claude-sonnet-4-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "global.anthropic.claude-sonnet-4-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("high".to_string()),
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("manual thinking request should succeed");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "manual ok"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adaptive_anthropic_models_forward_xhigh_effort() {
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/global.anthropic.claude-opus-4-8/invoke"))
+            .and(body_partial_json(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "xhigh"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "xhigh ok"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "global.anthropic.claude-opus-4-8".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "global.anthropic.claude-opus-4-8".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("xhigh".to_string()),
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("adaptive request should accept xhigh");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "xhigh ok"),
             other => panic!("expected text response, got {other:?}"),
         }
     }
@@ -2285,11 +2667,11 @@ mod tests {
         use wiremock::matchers::body_partial_json;
         use wiremock::{Match, Request};
 
-        // First attempt: legacy `enabled` shape -> model rejects it with the
-        // documented "use adaptive + output_config.effort" 400.
+        // First attempt: manual `enabled` shape -> provider rejects it with
+        // the documented "use adaptive + output_config.effort" 400.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-opus-4-8/invoke"))
+            .and(path("/model/anthropic.claude-opus-4-5/invoke"))
             .and(body_partial_json(serde_json::json!({
                 "thinking": {"type": "enabled"}
             })))
@@ -2324,7 +2706,7 @@ mod tests {
             }
         }
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-opus-4-8/invoke"))
+            .and(path("/model/anthropic.claude-opus-4-5/invoke"))
             .and(AdaptiveShape(adaptive_hits.clone()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [
@@ -2339,7 +2721,7 @@ mod tests {
         let client = BedrockClient::with_base_urls(
             "token".to_string(),
             "us-east-2".to_string(),
-            "us.anthropic.claude-opus-4-8".to_string(),
+            "anthropic.claude-opus-4-5".to_string(),
             server.uri(),
             format!("{}/v1", server.uri()),
             server.uri(),
@@ -2350,7 +2732,7 @@ mod tests {
             let captured = thoughts.clone();
             (
                 StreamChatRequest {
-                    model: "us.anthropic.claude-opus-4-8".to_string(),
+                    model: "anthropic.claude-opus-4-5".to_string(),
                     messages: vec![ChatMessage::user("hi")],
                     tools: None,
                     reasoning_effort: Some("high".to_string()),
@@ -2458,6 +2840,94 @@ mod tests {
             }
             other => panic!("expected text response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn gpt5_responses_models_filter_reasoning_effort_to_model_card_values() {
+        use wiremock::matchers::body_partial_json;
+        use wiremock::{Match, Request};
+
+        struct NoReasoningObject;
+        impl Match for NoReasoningObject {
+            fn matches(&self, request: &Request) -> bool {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                v.get("reasoning").is_none()
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(body_partial_json(serde_json::json!({
+                "reasoning": {"effort": "xhigh"}
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"xhigh\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(NoReasoningObject)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"filtered\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let supported = client
+            .stream_chat(StreamChatRequest {
+                model: "openai.gpt-5.5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("xhigh".to_string()),
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("supported reasoning request should succeed");
+        assert!(matches!(supported, LlmResponse::Text { ref text, .. } if text == "xhigh"));
+
+        let unsupported = client
+            .stream_chat(StreamChatRequest {
+                model: "openai.gpt-5.5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("minimal".to_string()),
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeout: Duration::from_secs(5),
+            })
+            .await
+            .expect("unsupported reasoning request should omit reasoning");
+        assert!(matches!(unsupported, LlmResponse::Text { ref text, .. } if text == "filtered"));
     }
 
     #[tokio::test]
