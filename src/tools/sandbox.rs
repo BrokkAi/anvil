@@ -326,6 +326,162 @@ fn sandbox_io_error(msg: String) -> std::io::Error {
 }
 
 // ---------------------------------------------------------------------------
+// Git metadata discovery
+// ---------------------------------------------------------------------------
+
+/// Maximum size for tiny Git pointer files that we parse while constructing
+/// the sandbox policy. Real `.git`, `commondir`, and `gitdir` files are a
+/// single short line; a larger file is treated as suspicious and ignored.
+const GIT_TEXT_FILE_MAX_BYTES: u64 = 8 * 1024;
+
+/// Discover Git metadata directories that need write access for ordinary Git
+/// commands run from `cwd`.
+///
+/// The workspace-write sandbox normally permits writes only below the command's
+/// working directory. Linked Git worktrees split their writable state: the
+/// worktree has a `.git` pointer file, but refs, logs, objects, and the
+/// per-worktree index live under the main repository's real Git directory,
+/// outside the worktree. Without allowing those metadata directories, Git can
+/// read the repository but fails when it tries to create ref/index lockfiles.
+///
+/// Security posture:
+/// - return only canonicalized existing directories;
+/// - accept an in-tree `.git/` directory directly;
+/// - for a `.git` pointer file, only accept the linked-worktree layout Git
+///   creates, including the reciprocal `gitdir` back-pointer to this exact
+///   worktree. This prevents an arbitrary checked-out `.git` file from granting
+///   sandbox writes to an unrelated path.
+fn discover_git_metadata_write_paths(cwd: &Path) -> Vec<PathBuf> {
+    let Some(worktree_root) = find_git_worktree_root(cwd).or_else(|| {
+        cwd.canonicalize()
+            .ok()
+            .and_then(|real_cwd| find_git_worktree_root(&real_cwd))
+    }) else {
+        return Vec::new();
+    };
+
+    let marker = worktree_root.join(".git");
+    let Ok(marker_meta) = std::fs::symlink_metadata(&marker) else {
+        return Vec::new();
+    };
+    let marker_type = marker_meta.file_type();
+    if marker_type.is_dir() {
+        return canonical_dir(&marker).into_iter().collect();
+    }
+    if marker_type.is_file() {
+        return linked_worktree_git_metadata_paths(&worktree_root, &marker);
+    }
+
+    Vec::new()
+}
+
+fn find_git_worktree_root(start: &Path) -> Option<PathBuf> {
+    let mut cursor = start.to_path_buf();
+    loop {
+        if std::fs::symlink_metadata(cursor.join(".git")).is_ok() {
+            return Some(cursor);
+        }
+        if !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+fn linked_worktree_git_metadata_paths(worktree_root: &Path, marker: &Path) -> Vec<PathBuf> {
+    let Some(git_dir) = read_prefixed_git_path_file(marker, "gitdir:", worktree_root)
+        .and_then(|path| canonical_dir(&path))
+    else {
+        return Vec::new();
+    };
+
+    let Some(common_dir) = read_plain_git_path_file(&git_dir.join("commondir"), &git_dir)
+        .and_then(|path| canonical_dir(&path))
+    else {
+        return Vec::new();
+    };
+
+    if !is_valid_linked_worktree_admin_dir(&git_dir, &common_dir, marker) {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::with_capacity(2);
+    push_unique_path(&mut paths, git_dir);
+    push_unique_path(&mut paths, common_dir);
+    paths
+}
+
+fn is_valid_linked_worktree_admin_dir(git_dir: &Path, common_dir: &Path, marker: &Path) -> bool {
+    let Some(worktrees_dir) = canonical_dir(&common_dir.join("worktrees")) else {
+        return false;
+    };
+    if git_dir == worktrees_dir || !git_dir.starts_with(&worktrees_dir) {
+        return false;
+    }
+
+    let Some(back_pointer) = read_plain_git_path_file(&git_dir.join("gitdir"), git_dir)
+        .and_then(|path| path.canonicalize().ok())
+    else {
+        return false;
+    };
+    let Ok(marker_canonical) = marker.canonicalize() else {
+        return false;
+    };
+
+    back_pointer == marker_canonical
+}
+
+fn read_prefixed_git_path_file(path: &Path, prefix: &str, base: &Path) -> Option<PathBuf> {
+    let text = read_small_text_file(path)?;
+    let line = first_non_empty_trimmed_line(&text)?;
+    let raw = line.strip_prefix(prefix)?.trim();
+    resolve_git_path(base, raw)
+}
+
+fn read_plain_git_path_file(path: &Path, base: &Path) -> Option<PathBuf> {
+    let text = read_small_text_file(path)?;
+    let raw = first_non_empty_trimmed_line(&text)?;
+    resolve_git_path(base, raw)
+}
+
+fn read_small_text_file(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > GIT_TEXT_FILE_MAX_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn first_non_empty_trimmed_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn resolve_git_path(base: &Path, raw: &str) -> Option<PathBuf> {
+    if raw.is_empty() || raw.as_bytes().contains(&0) {
+        return None;
+    }
+    let path = Path::new(raw);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    })
+}
+
+fn canonical_dir(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    std::fs::metadata(&canonical)
+        .ok()
+        .filter(|meta| meta.is_dir())?;
+    Some(canonical)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // macOS / Seatbelt
 // ---------------------------------------------------------------------------
 
@@ -421,34 +577,45 @@ fn build_seatbelt_policy(policy: SandboxPolicy, cwd: &Path) -> String {
         return SEATBELT_BASE_POLICY.to_string();
     }
 
+    let mut write_paths = workspace_write_paths(cwd);
+    for path in discover_git_metadata_write_paths(cwd) {
+        push_unique_path(&mut write_paths, path);
+    }
+
+    let write_rules = write_paths
+        .iter()
+        .filter_map(|path| path.to_str())
+        .map(|path| {
+            let escaped = escape_for_seatbelt(path);
+            format!("(allow file-write* (subpath \"{escaped}\"))")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{SEATBELT_BASE_POLICY}\n{write_rules}\n")
+}
+
+fn workspace_write_paths(cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(2);
     // `wrap_command` rejects non-UTF-8 cwds, so to_str is Some here.
     let abs = cwd
         .to_str()
         .expect("validated UTF-8 in wrap_command")
         .to_string();
-    let abs_escaped = escape_for_seatbelt(&abs);
+    push_unique_path(&mut paths, PathBuf::from(&abs));
 
-    // Mirror Environment.java:432-442: emit BOTH lexical and canonical
-    // subpath rules when they differ (covers /var -> /private/var on macOS,
-    // /tmp -> /private/tmp, and bind-mounted symlinks). Fall back to the
-    // lexical rule when canonicalize fails (e.g. cwd no longer exists).
-    let write_rule = match cwd.canonicalize() {
-        Ok(real) => match real.to_str() {
-            Some(real_str) if real_str == abs => {
-                format!("(allow file-write* (subpath \"{abs_escaped}\"))")
-            }
-            Some(real_str) => {
-                let real_escaped = escape_for_seatbelt(real_str);
-                format!(
-                    "(allow file-write* (subpath \"{abs_escaped}\") (subpath \"{real_escaped}\"))"
-                )
-            }
-            None => format!("(allow file-write* (subpath \"{abs_escaped}\"))"),
-        },
-        Err(_) => format!("(allow file-write* (subpath \"{abs_escaped}\"))"),
-    };
+    // Mirror Environment.java:432-442: include BOTH lexical and canonical
+    // paths when they differ (covers /var -> /private/var on macOS, /tmp ->
+    // /private/tmp, and bind-mounted symlinks). Fall back to the lexical path
+    // when canonicalize fails (e.g. cwd no longer exists).
+    if let Ok(real) = cwd.canonicalize()
+        && let Some(real_str) = real.to_str()
+        && real_str != abs
+    {
+        push_unique_path(&mut paths, PathBuf::from(real_str));
+    }
 
-    format!("{SEATBELT_BASE_POLICY}\n{write_rule}\n")
+    paths
 }
 
 /// Atomically create the policy file with mode 0600 to defeat any TOCTOU
@@ -808,13 +975,13 @@ fn build_bwrap_argv_with_tail(
         .expect("validated UTF-8 in wrap_command")
         .to_string();
     if policy.allows_workspace_writes() {
-        a.extend(["--bind".into(), abs.clone(), abs.clone()]);
-
-        if let Ok(real) = cwd.canonicalize()
-            && let Some(real_str) = real.to_str()
-            && real_str != abs
+        for path in workspace_write_paths(cwd)
+            .into_iter()
+            .chain(discover_git_metadata_write_paths(cwd))
         {
-            a.extend(["--bind".into(), real_str.to_string(), real_str.to_string()]);
+            if let Some(path_str) = path.to_str() {
+                a.extend(["--bind".into(), path_str.to_string(), path_str.to_string()]);
+            }
         }
 
         if let Some(home) = std::env::var_os("HOME") {
@@ -952,6 +1119,59 @@ fn warn_unsupported_os_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LinkedWorktreeFixture {
+        _tmp: tempfile::TempDir,
+        worktree: PathBuf,
+        main_git_dir: PathBuf,
+        worktree_git_dir: PathBuf,
+    }
+
+    impl LinkedWorktreeFixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("create linked-worktree fixture");
+            let root = tmp.path();
+            let worktree = root.join("linked-worktree");
+            let main_git_dir = root.join("main-repo").join(".git");
+            let worktree_git_dir = main_git_dir.join("worktrees").join("linked-worktree");
+            std::fs::create_dir_all(&worktree).expect("create worktree");
+            std::fs::create_dir_all(&worktree_git_dir).expect("create worktree admin dir");
+            std::fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", worktree_git_dir.display()),
+            )
+            .expect("write worktree .git pointer");
+            std::fs::write(worktree_git_dir.join("commondir"), "../..\n")
+                .expect("write commondir pointer");
+            std::fs::write(
+                worktree_git_dir.join("gitdir"),
+                format!("{}\n", worktree.join(".git").display()),
+            )
+            .expect("write reciprocal gitdir pointer");
+            Self {
+                _tmp: tmp,
+                worktree,
+                main_git_dir,
+                worktree_git_dir,
+            }
+        }
+
+        fn worktree_canonical(&self) -> PathBuf {
+            self.worktree.canonicalize().expect("canonicalize worktree")
+        }
+
+        fn main_git_dir_canonical(&self) -> PathBuf {
+            self.main_git_dir
+                .canonicalize()
+                .expect("canonicalize common git dir")
+        }
+
+        fn worktree_git_dir_canonical(&self) -> PathBuf {
+            self.worktree_git_dir
+                .canonicalize()
+                .expect("canonicalize worktree git dir")
+        }
+    }
 
     #[test]
     fn from_permission_mode_maps_to_expected_tiers() {
@@ -1250,6 +1470,140 @@ mod tests {
         assert_eq!(escape_for_seatbelt(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 
+    #[test]
+    fn discovers_git_dir_for_normal_repo() {
+        let tmp = tempfile::tempdir().expect("create normal repo fixture");
+        let worktree = tmp.path().join("repo");
+        let git_dir = worktree.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+
+        let paths = discover_git_metadata_write_paths(&worktree);
+
+        assert_eq!(
+            paths,
+            vec![git_dir.canonicalize().expect("canonicalize .git dir")],
+            "normal repos should grant only the repo's own .git directory"
+        );
+    }
+
+    #[test]
+    fn discovers_common_and_worktree_git_dirs_for_linked_worktree() {
+        let fixture = LinkedWorktreeFixture::new();
+
+        let paths = discover_git_metadata_write_paths(&fixture.worktree);
+
+        assert!(
+            paths.contains(&fixture.worktree_git_dir_canonical()),
+            "linked worktrees need write access to their per-worktree admin dir; got {paths:?}"
+        );
+        assert!(
+            paths.contains(&fixture.main_git_dir_canonical()),
+            "linked worktrees need write access to the common git dir for refs/logs/objects; got {paths:?}"
+        );
+        assert_eq!(
+            paths.len(),
+            2,
+            "only scoped git metadata dirs should be added"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_discovery_works_from_nested_subdirectory() {
+        let fixture = LinkedWorktreeFixture::new();
+        let nested = fixture.worktree.join("src/deeper");
+        std::fs::create_dir_all(&nested).expect("create nested cwd");
+
+        let paths = discover_git_metadata_write_paths(&nested);
+
+        assert!(paths.contains(&fixture.worktree_git_dir_canonical()));
+        assert!(paths.contains(&fixture.main_git_dir_canonical()));
+    }
+
+    #[test]
+    fn linked_worktree_requires_reciprocal_gitdir_pointer() {
+        let fixture = LinkedWorktreeFixture::new();
+        let unrelated = fixture._tmp.path().join("unrelated").join(".git");
+        std::fs::create_dir_all(unrelated.parent().expect("unrelated parent"))
+            .expect("create unrelated parent");
+        std::fs::write(&unrelated, "not the real worktree marker\n")
+            .expect("write unrelated marker");
+        std::fs::write(
+            fixture.worktree_git_dir.join("gitdir"),
+            format!("{}\n", unrelated.display()),
+        )
+        .expect("rewrite reciprocal pointer to wrong path");
+
+        let paths = discover_git_metadata_write_paths(&fixture.worktree);
+
+        assert!(
+            paths.is_empty(),
+            "a .git pointer must not grant writes without a matching gitdir back-pointer"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_rejects_gitdir_outside_common_worktrees_dir() {
+        let tmp = tempfile::tempdir().expect("create malicious fixture");
+        let worktree = tmp.path().join("worktree");
+        let common_git = tmp.path().join("main.git");
+        let outside_git = tmp.path().join("outside-admin");
+        std::fs::create_dir_all(&worktree).expect("create worktree");
+        std::fs::create_dir_all(common_git.join("worktrees")).expect("create common worktrees");
+        std::fs::create_dir_all(&outside_git).expect("create outside admin");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", outside_git.display()),
+        )
+        .expect("write .git pointer");
+        std::fs::write(
+            outside_git.join("commondir"),
+            format!("{}\n", common_git.display()),
+        )
+        .expect("write commondir");
+        std::fs::write(
+            outside_git.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .expect("write back pointer");
+
+        let paths = discover_git_metadata_write_paths(&worktree);
+
+        assert!(
+            paths.is_empty(),
+            "gitdir outside <commondir>/worktrees must not expand sandbox writes"
+        );
+    }
+
+    #[test]
+    fn seatbelt_policy_workspace_write_includes_linked_worktree_git_metadata() {
+        let fixture = LinkedWorktreeFixture::new();
+
+        let content = build_seatbelt_policy(SandboxPolicy::WorkspaceWrite, &fixture.worktree);
+
+        assert!(content.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            escape_for_seatbelt(fixture.worktree_canonical().to_str().expect("utf8 worktree"))
+        )));
+        assert!(content.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            escape_for_seatbelt(
+                fixture
+                    .worktree_git_dir_canonical()
+                    .to_str()
+                    .expect("utf8 worktree git dir")
+            )
+        )));
+        assert!(content.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            escape_for_seatbelt(
+                fixture
+                    .main_git_dir_canonical()
+                    .to_str()
+                    .expect("utf8 common git dir")
+            )
+        )));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_wrap_command_emits_sandbox_exec_argv() {
@@ -1340,6 +1694,29 @@ mod tests {
             .any(|w| w[0] == "--bind" && w[1] == "/workspace" && w[2] == "/workspace");
         assert!(workspace_bind, "WorkspaceWrite must bind workspace rw");
         assert!(argv.contains(&"--tmpfs".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bwrap_argv_workspace_write_binds_linked_worktree_git_metadata_rw() {
+        let fixture = LinkedWorktreeFixture::new();
+        let argv = build_bwrap_argv(
+            SandboxPolicy::WorkspaceWrite,
+            &fixture.worktree,
+            "git status",
+        );
+
+        for expected in [
+            fixture.worktree_canonical(),
+            fixture.worktree_git_dir_canonical(),
+            fixture.main_git_dir_canonical(),
+        ] {
+            let expected = expected.to_string_lossy().into_owned();
+            let is_bound = argv
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == expected && w[2] == expected);
+            assert!(is_bound, "expected rw bind for {expected}; argv: {argv:?}");
+        }
     }
 
     #[cfg(unix)]
