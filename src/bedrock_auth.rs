@@ -122,11 +122,20 @@ pub fn auth_path() -> Result<PathBuf> {
 /// first, then the legacy per-provider file (pre-migration installs, or a
 /// migration that could not complete). The `~/.secrets/` token fallback is
 /// separate and resolved by `bedrock_client`.
+/// A malformed secrets store must not mask a valid legacy file, so store
+/// errors degrade to the fallback with a warning instead of propagating --
+/// one bad file never disables every provider at once.
 pub fn read() -> Result<Option<BedrockAuth>> {
-    if let Some(secrets) = crate::secrets::read()?
-        && let Some(auth) = secrets.bedrock
-    {
-        return Ok(Some(auth));
+    match crate::secrets::read() {
+        Ok(Some(secrets)) => {
+            if let Some(auth) = secrets.bedrock {
+                return Ok(Some(auth));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("secrets store unreadable; falling back to legacy bedrock.json: {e:#}")
+        }
     }
     Ok(read_legacy_file()?.map(|(_, auth)| auth))
 }
@@ -135,14 +144,7 @@ pub fn read() -> Result<Option<BedrockAuth>> {
 /// parsed record so `secrets::migrate_legacy_files` can delete the file
 /// once its contents are safely consolidated.
 pub(crate) fn read_legacy_file() -> Result<Option<(PathBuf, BedrockAuth)>> {
-    let path = auth_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed = serde_json::from_slice::<BedrockAuth>(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some((path, parsed)))
+    crate::secrets::read_legacy_json(auth_path()?)
 }
 
 /// Persist the credentials into the consolidated secrets store, then drop
@@ -150,36 +152,31 @@ pub(crate) fn read_legacy_file() -> Result<Option<(PathBuf, BedrockAuth)>> {
 /// merely shadowed, never read back in preference to the store).
 pub fn write(auth: &BedrockAuth) -> Result<()> {
     crate::secrets::update(|secrets| secrets.bedrock = Some(auth.clone()))?;
-    remove_legacy_file();
+    crate::secrets::remove_legacy_credential_file(&auth_path()?);
     Ok(())
 }
 
 /// Best-effort logout: delete the stored credentials. Missing state is
-/// not an error -- `/setup bedrock disconnect` is idempotent.
+/// not an error -- `/setup bedrock disconnect` is idempotent. The
+/// section-clear result is deferred so the legacy-file and `~/.secrets/`
+/// removals always run: disconnect is the command a user reaches for to
+/// reset broken state, so a store failure must not block the rest of the
+/// cleanup (a malformed store is quarantined by `update` and the clear
+/// succeeds).
 pub fn logout() -> Result<()> {
-    if crate::secrets::read()?.is_some_and(|secrets| secrets.bedrock.is_some()) {
-        crate::secrets::update(|secrets| secrets.bedrock = None)?;
-    }
+    let store_result = match crate::secrets::read() {
+        Ok(Some(secrets)) if secrets.bedrock.is_some() => {
+            crate::secrets::update(|secrets| secrets.bedrock = None)
+        }
+        Ok(_) => Ok(()),
+        Err(_) => crate::secrets::update(|secrets| secrets.bedrock = None),
+    };
     let path = auth_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     logout_legacy_secrets()?;
-    Ok(())
-}
-
-fn remove_legacy_file() {
-    let Ok(path) = auth_path() else {
-        return;
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => tracing::info!("removed legacy credential file {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(
-            "failed to remove legacy credential file {}: {e}",
-            path.display()
-        ),
-    }
+    store_result
 }
 
 /// Delete legacy `~/.secrets/` Bedrock token files. Missing files are

@@ -139,12 +139,21 @@ fn append_refresh_log_inner(line: &str) -> Result<()> {
 
 /// Read the stored OpenRouter credentials: the consolidated secrets store
 /// first, then the legacy per-provider file (pre-migration installs, or a
-/// migration that could not complete).
+/// migration that could not complete). A malformed secrets store must not
+/// mask a valid legacy file, so store errors degrade to the fallback with
+/// a warning instead of propagating -- one bad file never disables every
+/// provider at once.
 pub fn read() -> Result<Option<OpenRouterAuth>> {
-    if let Some(secrets) = crate::secrets::read()?
-        && let Some(auth) = secrets.openrouter
-    {
-        return Ok(Some(auth));
+    match crate::secrets::read() {
+        Ok(Some(secrets)) => {
+            if let Some(auth) = secrets.openrouter {
+                return Ok(Some(auth));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "secrets store unreadable; falling back to legacy openrouter.json: {e:#}"
+        ),
     }
     Ok(read_legacy_file()?.map(|(_, auth)| auth))
 }
@@ -153,14 +162,7 @@ pub fn read() -> Result<Option<OpenRouterAuth>> {
 /// parsed record so `secrets::migrate_legacy_files` can delete the file
 /// once its contents are safely consolidated.
 pub(crate) fn read_legacy_file() -> Result<Option<(PathBuf, OpenRouterAuth)>> {
-    let path = auth_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed = serde_json::from_slice::<OpenRouterAuth>(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some((path, parsed)))
+    crate::secrets::read_legacy_json(auth_path()?)
 }
 
 /// Persist the key into the consolidated secrets store, then drop the
@@ -168,35 +170,29 @@ pub(crate) fn read_legacy_file() -> Result<Option<(PathBuf, OpenRouterAuth)>> {
 /// shadowed, never read back in preference to the store).
 pub fn write(auth: &OpenRouterAuth) -> Result<()> {
     crate::secrets::update(|secrets| secrets.openrouter = Some(auth.clone()))?;
-    remove_legacy_file();
+    crate::secrets::remove_legacy_credential_file(&auth_path()?);
     Ok(())
 }
 
 /// Best-effort logout: delete the stored credentials. Missing state is
-/// not an error -- `/openrouter-login disconnect` is idempotent.
+/// not an error -- `/openrouter-login disconnect` is idempotent. The
+/// section-clear result is deferred so the legacy-file removal always
+/// runs: disconnect is the command a user reaches for to reset broken
+/// state, so a store failure must not block the rest of the cleanup
+/// (a malformed store is quarantined by `update` and the clear succeeds).
 pub fn logout() -> Result<()> {
-    if crate::secrets::read()?.is_some_and(|secrets| secrets.openrouter.is_some()) {
-        crate::secrets::update(|secrets| secrets.openrouter = None)?;
-    }
+    let store_result = match crate::secrets::read() {
+        Ok(Some(secrets)) if secrets.openrouter.is_some() => {
+            crate::secrets::update(|secrets| secrets.openrouter = None)
+        }
+        Ok(_) => Ok(()),
+        Err(_) => crate::secrets::update(|secrets| secrets.openrouter = None),
+    };
     let path = auth_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
-    Ok(())
-}
-
-fn remove_legacy_file() {
-    let Ok(path) = auth_path() else {
-        return;
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => tracing::info!("removed legacy credential file {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(
-            "failed to remove legacy credential file {}: {e}",
-            path.display()
-        ),
-    }
+    store_result
 }
 
 /// Test-only helpers shared with sibling modules so any test that
@@ -336,6 +332,50 @@ mod tests {
         logout().unwrap();
         assert!(!auth_path().unwrap().exists());
         assert!(read().unwrap().is_none());
+    }
+
+    #[test]
+    fn read_falls_back_to_legacy_when_store_is_malformed() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
+
+        std::fs::write(crate::secrets::secrets_path().unwrap(), "{not json").unwrap();
+        std::fs::write(auth_path().unwrap(), r#"{"api_key":"sk-or-legacy"}"#).unwrap();
+
+        let got = read()
+            .expect("a malformed store must not poison read()")
+            .expect("legacy fallback must be reachable");
+        assert_eq!(got.api_key, "sk-or-legacy");
+    }
+
+    #[test]
+    fn logout_with_malformed_store_still_cleans_up_and_quarantines() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
+
+        std::fs::write(crate::secrets::secrets_path().unwrap(), "{not json").unwrap();
+        std::fs::write(auth_path().unwrap(), r#"{"api_key":"sk-or-legacy"}"#).unwrap();
+
+        logout().expect("disconnect must repair, not report failure");
+        assert!(
+            !auth_path().unwrap().exists(),
+            "legacy file removed even when the store was malformed"
+        );
+        assert!(
+            read().unwrap().is_none(),
+            "fresh store written with the section cleared"
+        );
+        let quarantined = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("secrets.json.corrupt-")
+            });
+        assert!(quarantined, "corrupt store preserved aside for recovery");
     }
 
     #[test]

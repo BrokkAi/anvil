@@ -29,8 +29,18 @@
 //! consolidated file is safely on disk). The provider modules keep a
 //! read-only fallback to their legacy file so a failed or skipped
 //! migration never locks a user out.
+//!
+//! The migration is ONE-WAY: once the legacy files are folded in and
+//! removed, downgrading to an Anvil release that predates `secrets.json`
+//! shows every provider as "not connected" until the user re-runs the
+//! login/setup commands (env vars keep working). A malformed
+//! `secrets.json` never locks anything: reads fall back to the legacy
+//! files, and the first setup command that needs to write quarantines the
+//! corrupt file aside (`secrets.json.corrupt-<id>`) so its contents stay
+//! recoverable by hand.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -82,9 +92,29 @@ pub fn read() -> Result<Option<SetupSecrets>> {
     Ok(Some(parsed))
 }
 
-/// Atomic write: stage to a unique `.tmp` in the same directory, chmod to
-/// 0600, then rename. Mirrors the per-provider files this store replaces
-/// so a crash mid-write never leaves a half-written credential file.
+/// Serializes every read-modify-write of `secrets.json` within this
+/// process. Consolidating the per-provider files into one document made
+/// concurrent setup commands (separate sessions, or setup racing the
+/// startup migration) able to silently drop each other's sections via
+/// stale reads; the per-provider files could never interfere across
+/// providers. Cross-process writers remain unsynchronized -- writes only
+/// happen on interactive setup commands, and the atomic rename keeps the
+/// file itself intact either way.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    // The lock only brackets small fs reads/writes; a poisoned guard means
+    // a previous writer panicked mid-update, which the atomic rename makes
+    // safe to continue past.
+    STORE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Atomic write: stage to a unique `.tmp` in the same directory (created
+/// 0600 on Unix *before* any secret bytes land on disk), then rename.
+/// A crash mid-write never leaves a half-written or loosely-permissioned
+/// credential file.
 pub fn write(secrets: &SetupSecrets) -> Result<()> {
     let path = secrets_path()?;
     if let Some(parent) = path.parent() {
@@ -93,19 +123,82 @@ pub fn write(secrets: &SetupSecrets) -> Result<()> {
     }
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(secrets).context("serializing SetupSecrets")?;
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    set_user_only_perms(&tmp)?;
+    write_user_only(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
 /// Read-modify-write helper for the provider modules: load the current
-/// secrets (or an empty default), apply `mutate`, and persist.
+/// secrets (or an empty default), apply `mutate`, and persist -- all under
+/// [`STORE_LOCK`]. A malformed store is quarantined rather than parsed
+/// over: the corrupt file moves aside so the write can proceed on a fresh
+/// document without destroying possibly-recoverable key material.
 pub fn update(mutate: impl FnOnce(&mut SetupSecrets)) -> Result<()> {
-    let mut secrets = read()?.unwrap_or_default();
+    let _guard = store_guard();
+    let mut secrets = match read() {
+        Ok(secrets) => secrets.unwrap_or_default(),
+        Err(read_err) => {
+            quarantine_corrupt_store(read_err)?;
+            SetupSecrets::default()
+        }
+    };
     mutate(&mut secrets);
     write(&secrets)
+}
+
+/// Move a malformed `secrets.json` aside so a fresh one can be written.
+/// Renaming (not deleting) preserves whatever key material the corrupt
+/// file still holds for manual recovery. Errors if the rename fails --
+/// writing over the corrupt file would destroy that material.
+fn quarantine_corrupt_store(read_err: anyhow::Error) -> Result<()> {
+    let path = secrets_path()?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secrets.json");
+    let quarantine = path.with_file_name(format!("{file_name}.corrupt-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(&path, &quarantine).with_context(|| {
+        format!(
+            "quarantining malformed {} (original error: {read_err:#})",
+            path.display()
+        )
+    })?;
+    tracing::warn!(
+        "malformed secrets store moved aside to {}; starting a fresh one ({read_err:#})",
+        quarantine.display()
+    );
+    Ok(())
+}
+
+/// Read and parse a legacy per-provider credential file, returning its
+/// path alongside the record so the migration can delete the file once
+/// its contents are safely consolidated. Shared by the provider modules'
+/// `read_legacy_file` wrappers.
+pub(crate) fn read_legacy_json<T: serde::de::DeserializeOwned>(
+    path: PathBuf,
+) -> Result<Option<(PathBuf, T)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed = serde_json::from_slice::<T>(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some((path, parsed)))
+}
+
+/// Best-effort removal of a superseded legacy credential file. Missing is
+/// fine; other failures only warn -- a leftover legacy file is shadowed by
+/// the consolidated store, never read back in preference to it.
+pub(crate) fn remove_legacy_credential_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::info!("removed legacy credential file {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            "failed to remove legacy credential file {}: {e}",
+            path.display()
+        ),
+    }
 }
 
 /// One-time consolidation of the Anvil-owned legacy per-provider
@@ -125,9 +218,13 @@ pub fn update(mutate: impl FnOnce(&mut SetupSecrets)) -> Result<()> {
 /// files keep working through the read fallbacks) rather than block
 /// startup.
 pub fn migrate_legacy_files() {
+    let _guard = store_guard();
     let mut secrets = match read() {
         Ok(secrets) => secrets.unwrap_or_default(),
         Err(e) => {
+            // Do not quarantine here: startup is a passive moment and the
+            // provider read fallbacks keep working. The first explicit
+            // setup write quarantines instead.
             tracing::warn!("skipping secrets migration: cannot read secrets.json: {e:#}");
             return;
         }
@@ -141,6 +238,11 @@ pub fn migrate_legacy_files() {
             if secrets.openrouter.is_none() {
                 secrets.openrouter = Some(auth);
                 changed = true;
+            } else {
+                tracing::info!(
+                    "legacy {} is shadowed by the consolidated store; discarding its contents",
+                    path.display()
+                );
             }
             migrated_paths.push(path);
         }
@@ -152,6 +254,11 @@ pub fn migrate_legacy_files() {
             if secrets.bedrock.is_none() {
                 secrets.bedrock = Some(auth);
                 changed = true;
+            } else {
+                tracing::info!(
+                    "legacy {} is shadowed by the consolidated store; discarding its contents",
+                    path.display()
+                );
             }
             migrated_paths.push(path);
         }
@@ -165,34 +272,37 @@ pub fn migrate_legacy_files() {
             return;
         }
         tracing::info!(
-            "migrated legacy provider credential files into {}",
+            "migrated legacy provider credential files into {}; note this is one-way -- \
+             a downgraded Anvil will need its login/setup commands re-run",
             secrets_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "secrets.json".to_string())
         );
     }
     for path in migrated_paths {
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!("removed legacy credential file {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                "failed to remove legacy credential file {}: {e}",
-                path.display()
-            ),
-        }
+        remove_legacy_credential_file(&path);
     }
 }
 
+/// Create `path` and write `bytes` such that the content never touches
+/// disk with looser-than-owner-only permissions: on Unix the file is
+/// created 0600 *before* any bytes are written (umask can only tighten
+/// that), rather than written first and chmod'd after.
 #[cfg(unix)]
-fn set_user_only_perms(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))
+fn write_user_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
 }
 
 #[cfg(not(unix))]
-fn set_user_only_perms(_path: &Path) -> Result<()> {
-    Ok(())
+fn write_user_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 /// Snapshot of where DeepSeek credentials currently come from. Single
@@ -384,6 +494,70 @@ mod tests {
         assert!(
             !openrouter_legacy.exists(),
             "shadowed legacy file still removed"
+        );
+    }
+
+    #[test]
+    fn update_quarantines_a_malformed_store_instead_of_failing() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
+
+        std::fs::write(secrets_path().unwrap(), "{not json").unwrap();
+
+        update(|s| {
+            s.deepseek = Some(DeepSeekAuth {
+                api_key: "sk-ds".into(),
+            })
+        })
+        .expect("update must recover from a malformed store");
+
+        let got = read().unwrap().expect("fresh store written");
+        assert_eq!(got.deepseek.unwrap().api_key, "sk-ds");
+
+        // The corrupt content is preserved aside, not destroyed.
+        let quarantined: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("secrets.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "corrupt store must be moved aside");
+        assert_eq!(
+            std::fs::read_to_string(quarantined[0].path()).unwrap(),
+            "{not json"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_legacy_files_preserves_legacy_when_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
+
+        let openrouter_legacy = tmp.path().join("openrouter.json");
+        std::fs::write(&openrouter_legacy, r#"{"api_key":"sk-or-legacy"}"#).unwrap();
+
+        // Make the config dir read-only so the consolidated write fails.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        migrate_legacy_files();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            openrouter_legacy.exists(),
+            "a failed consolidated write must never delete the legacy credential"
+        );
+        assert_eq!(
+            crate::openrouter_auth::read()
+                .unwrap()
+                .expect("legacy still readable")
+                .api_key,
+            "sk-or-legacy"
         );
     }
 
