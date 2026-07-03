@@ -344,8 +344,6 @@ pub(crate) fn acp_mcp_servers_to_configs(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionMode {
     Lutz,
-    Code,
-    Ask,
     Plan,
 }
 
@@ -353,8 +351,6 @@ impl SessionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Lutz => "LUTZ",
-            Self::Code => "CODE",
-            Self::Ask => "ASK",
             Self::Plan => "PLAN",
         }
     }
@@ -362,8 +358,6 @@ impl SessionMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "LUTZ" => Some(Self::Lutz),
-            "CODE" => Some(Self::Code),
-            "ASK" => Some(Self::Ask),
             "PLAN" => Some(Self::Plan),
             _ => None,
         }
@@ -5078,7 +5072,7 @@ mod tests {
     #[tokio::test]
     async fn set_mode_unknown_session_returns_ok_false() {
         let store = SessionStore::new("test-model".to_string());
-        let result = store.set_mode("no-such-session", SessionMode::Code).await;
+        let result = store.set_mode("no-such-session", SessionMode::Lutz).await;
         assert!(matches!(result, Ok(false)));
     }
 
@@ -5115,7 +5109,7 @@ mod tests {
             created: 1,
             modified: 2,
             version: "4.0".into(),
-            mode: Some("CODE".into()),
+            mode: Some("PLAN".into()),
             model: Some("m".into()),
             brokk_mcp_servers: None,
             cwd: None,
@@ -5130,7 +5124,7 @@ mod tests {
         let session = Session::from_persisted(
             "abc".into(),
             PathBuf::from("/tmp/x"),
-            SessionMode::Code,
+            SessionMode::Plan,
             "m".into(),
             history.clone(),
             manifest.clone(),
@@ -5143,7 +5137,7 @@ mod tests {
 
         assert_eq!(session.id, "abc");
         assert_eq!(session.cwd, PathBuf::from("/tmp/x"));
-        assert_eq!(session.mode, SessionMode::Code);
+        assert_eq!(session.mode, SessionMode::Plan);
         assert_eq!(session.model, "m");
         assert_eq!(session.history.len(), 1);
         assert_eq!(session.manifest.id, manifest.id);
@@ -5476,12 +5470,7 @@ mod tests {
     /// the canonical (uppercase) spelling.
     #[test]
     fn session_mode_parse_round_trip() {
-        for mode in [
-            SessionMode::Lutz,
-            SessionMode::Code,
-            SessionMode::Ask,
-            SessionMode::Plan,
-        ] {
+        for mode in [SessionMode::Lutz, SessionMode::Plan] {
             assert_eq!(
                 SessionMode::parse(mode.as_str()),
                 Some(mode),
@@ -5496,8 +5485,6 @@ mod tests {
     #[test]
     fn session_mode_parse_is_case_insensitive() {
         assert_eq!(SessionMode::parse("lutz"), Some(SessionMode::Lutz));
-        assert_eq!(SessionMode::parse("Code"), Some(SessionMode::Code));
-        assert_eq!(SessionMode::parse("aSk"), Some(SessionMode::Ask));
         assert_eq!(SessionMode::parse("plan"), Some(SessionMode::Plan));
     }
 
@@ -5506,6 +5493,8 @@ mod tests {
     #[test]
     fn session_mode_parse_rejects_unknown() {
         assert_eq!(SessionMode::parse(""), None);
+        assert_eq!(SessionMode::parse("CODE"), None);
+        assert_eq!(SessionMode::parse("ASK"), None);
         assert_eq!(SessionMode::parse("EDIT"), None);
         assert_eq!(SessionMode::parse("LUT"), None);
         assert_eq!(SessionMode::parse(" LUTZ "), None);

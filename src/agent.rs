@@ -385,8 +385,6 @@ fn acp_usage_from_token_usage(usage: crate::llm_client::TokenUsage) -> AcpUsage 
 fn available_modes() -> Vec<AcpSessionMode> {
     vec![
         AcpSessionMode::new("LUTZ", "LUTZ").description("Agentic loop with task list"),
-        AcpSessionMode::new("CODE", "CODE").description("Code changes only"),
-        AcpSessionMode::new("ASK", "ASK").description("Question answering"),
         AcpSessionMode::new("PLAN", "PLAN").description("Planning only"),
     ]
 }
@@ -426,8 +424,6 @@ fn permission_config_option(current: PermissionMode) -> SessionConfigOption {
 fn behavior_config_option(current: SessionMode) -> SessionConfigOption {
     let options = vec![
         SessionConfigSelectOption::new("LUTZ", "LUTZ").description("Agentic loop with task list"),
-        SessionConfigSelectOption::new("CODE", "CODE").description("Code changes only"),
-        SessionConfigSelectOption::new("ASK", "ASK").description("Question answering"),
         SessionConfigSelectOption::new("PLAN", "PLAN").description("Planning only"),
     ];
     SessionConfigOption::select(BEHAVIOR_CONFIG_ID, "Mode", current.as_str(), options)
@@ -725,12 +721,7 @@ async fn apply_config_option(
             let Some(behavior_mode) = SessionMode::parse(value) else {
                 return Err(ConfigApplyError::InvalidValue {
                     reason: format!("unknown behavior mode '{value}'"),
-                    supported: vec![
-                        "LUTZ".to_string(),
-                        "CODE".to_string(),
-                        "ASK".to_string(),
-                        "PLAN".to_string(),
-                    ],
+                    supported: vec!["LUTZ".to_string(), "PLAN".to_string()],
                 });
             };
             match sessions.set_mode(session_id, behavior_mode).await {
@@ -4337,7 +4328,7 @@ fn classify_prompt_for_planning(
     prompt_text: &str,
     prompt_parts: &[ChatContentPart],
 ) -> PlanningGateDecision {
-    if matches!(mode, SessionMode::Plan | SessionMode::Ask) {
+    if matches!(mode, SessionMode::Plan) {
         return PlanningGateDecision::Direct;
     }
 
@@ -5125,36 +5116,99 @@ fn build_system_prompt(
     let mode_prompt = match mode {
         SessionMode::Lutz => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. You work \
-             using an agentic approach: break complex tasks into steps, execute them, and report \
-             results. When appropriate, create a task list to track progress."
-        }
-        SessionMode::Code => {
-            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. In this mode, \
-             focus on code changes: generate modifications, refactors, and implementations. Be \
-             concise and focus on the code."
-        }
-        SessionMode::Ask => {
-            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. Answer \
-             questions about code, architecture, and software engineering concepts thoroughly \
-             but concisely."
+             software engineering, but you can help with any task the user brings to you. Work the task \
+             to completion: investigate with your tools, make the changes, verify them, and \
+             report the result."
         }
         SessionMode::Plan => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. In this mode, \
+             software engineering, but you can help with any task the user brings to you. In this mode, \
              focus on planning: analyze requirements, design solutions, and create implementation \
              plans. Do not write code directly."
         }
     };
 
-    format!("{cwd_context}{mode_prompt}")
+    format!("{cwd_context}{mode_prompt}\n\n{CORE_GUIDANCE}")
 }
+
+/// Shared behavioral guidance appended to every mode's system prompt.
+///
+/// Distilled 2026-07 from the first-party prompts for the model families we
+/// target as students (qwen-code, gemini-cli, opencode's kimi variant,
+/// mistral-vibe, codex): act-with-tools over narrating, convention-following,
+/// minimal diffs, discover-then-run real verification commands, faithful
+/// outcome reporting, dedicated-tool preference, concise CLI output, and
+/// blast-radius care. Kept deliberately compact (~450 words): small open
+/// models follow short imperative rules better than long constitutions, and
+/// this string rides on every request.
+///
+/// Tool-preference language is conditioned on what is ADVERTISED because the
+/// active toolset varies by session (bifrost may be absent; P2T gates tools):
+/// an unconditional "use read_file, not cat" invites calls to tools that are
+/// not in the manifest, which we have observed as hallucinated tool names.
+const CORE_GUIDANCE: &str = "\
+# How you work
+
+- Act through tools. When the task calls for creating, modifying, or running anything, use \
+tools to actually do it — never just describe the change. Code or commands that appear only \
+in your reply change nothing.
+- Never end your reply with a promise of future action (\"I will now run the tests\"): make \
+the tool call in the same response, or deliver the final result.
+- When a request has an obvious default interpretation, act on it; ask only when it is \
+genuinely ambiguous.
+- Make independent tool calls in parallel in a single response; sequence a call only when it \
+depends on an earlier result. Do not edit the same file twice in one response.
+- Before changing code, understand it: read the relevant files and see how the surrounding \
+project does things. Follow the project's existing conventions — style, naming, structure, \
+error handling, test framework. Never assume a library is available; verify the project \
+already uses it first.
+- Change the minimum needed for the task: no drive-by refactors, no speculative error \
+handling, no unrequested features. Prefer editing existing files over creating new ones. Do \
+not revert changes that are not yours.
+- Comments: add one only when the \"why\" cannot be expressed in the code itself. Never \
+narrate what code does or address the user in comments.
+
+# Verification
+
+- After changing code, verify it: find the project's real build, test, and lint commands \
+(README, package configuration, CI files, neighboring tests) and run the relevant ones. \
+Never assume standard commands.
+- Report outcomes faithfully. If tests fail, say so and include the relevant output. Do not \
+claim \"tested\", \"working\", or \"done\" unless you ran the check and saw it pass; if you \
+could not verify, say so plainly.
+- If the same approach fails twice, stop and diagnose — re-read the file, question your \
+assumptions — rather than retrying blindly. Keep going until the task is resolved or you \
+are genuinely blocked on input only the user can provide.
+
+# Tools
+
+- Call only tools that are currently advertised. If a capability seems missing, use the \
+closest advertised tool instead of guessing at names.
+- Prefer a dedicated tool over its shell equivalent whenever one is advertised: file-read \
+tools over cat/head/sed, edit/write tools over sed or heredocs, content search over \
+grep/rg, directory listing over ls.
+- When code-intelligence tools are advertised, prefer them for code questions: \
+search_symbols to locate declarations, get_summaries for API shape and orientation, \
+get_symbol_sources for full definitions, scan_usages for callers. Use text search for \
+plain text, configuration, and docs.
+- Use the shell where CLI semantics matter: builds, tests, git, package managers, pipelines.
+- If a tool call is denied, do not attempt the same action by another route; ask or move on.
+
+# Output
+
+- Be concise and direct; this is a CLI. No filler, preamble, or apologies. Use \
+GitHub-flavored Markdown.
+- Text is for findings and results; tools are for actions. Do not narrate tool calls \
+(\"I will now run...\").
+- End a task with a short summary: what changed, how it was verified, and anything the user \
+should know. One to three sentences is enough for simple tasks.
+
+# Safety
+
+- Before a destructive or hard-to-reverse command (rm, git reset --hard, force-push, \
+dropping data), state in one line what it does and why.
+- Do not push or otherwise mutate state outside the workspace (remotes, deploys, published \
+packages, external services) unless the user asked. Never expose, log, or commit secrets.";
 
 /// Returns true when `prompt_text` invokes the slash command `name`,
 /// matching `/name` exactly or `/name <args>`. Whitespace and case are
@@ -7547,17 +7601,13 @@ async fn handle_setup_mode(
     if rest.is_empty() {
         return "How should Anvil behave?\n\n\
                 - `/setup mode agent` - General coding assistant.\n\
-                - `/setup mode code` - Focus on code changes.\n\
-                - `/setup mode ask` - Answer questions.\n\
                 - `/setup mode plan` - Plan only."
             .to_string();
     }
     let value = match rest.to_ascii_lowercase().as_str() {
         "agent" | "default" | "lutz" => "LUTZ",
-        "code" => "CODE",
-        "ask" => "ASK",
         "plan" => "PLAN",
-        _ => return "Unknown mode. Try `/setup mode agent`, `code`, `ask`, or `plan`.".to_string(),
+        _ => return "Unknown mode. Try `/setup mode agent` or `plan`.".to_string(),
     };
     apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
 }
@@ -9140,7 +9190,7 @@ mod tests {
 
         let edit = "Fix the typo in README.md";
         assert_eq!(
-            classify_prompt_for_planning(SessionMode::Code, edit, &[ChatContentPart::text(edit)]),
+            classify_prompt_for_planning(SessionMode::Lutz, edit, &[ChatContentPart::text(edit)]),
             PlanningGateDecision::Direct
         );
     }
@@ -9150,7 +9200,7 @@ mod tests {
         for prompt in ["Fix decision handling", "Make startup more efficient"] {
             assert_eq!(
                 classify_prompt_for_planning(
-                    SessionMode::Code,
+                    SessionMode::Lutz,
                     prompt,
                     &[ChatContentPart::text(prompt)],
                 ),
@@ -9182,7 +9232,7 @@ mod tests {
             assert!(
                 matches!(
                     classify_prompt_for_planning(
-                        SessionMode::Code,
+                        SessionMode::Lutz,
                         prompt,
                         &[ChatContentPart::text(prompt)],
                     ),
@@ -9195,7 +9245,7 @@ mod tests {
         let all_issues = "Get all issues, fix them, merge every PR, and do not ask for approval.";
         assert!(matches!(
             classify_prompt_for_planning(
-                SessionMode::Code,
+                SessionMode::Lutz,
                 all_issues,
                 &[ChatContentPart::text(all_issues)],
             ),
@@ -10038,7 +10088,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![
                 ConversationTurn {
@@ -10080,7 +10130,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "u".into(),
@@ -10510,7 +10560,7 @@ mod tests {
         );
     }
 
-    /// All four behavior modes embed the cwd into the system prompt and
+    /// Both behavior modes embed the cwd into the system prompt and
     /// open with the shared general-purpose identity line, while still
     /// carrying a distinct mode-specific paragraph. The "AI coding
     /// assistant" wording must stay gone -- some models refuse non-coding
@@ -10519,9 +10569,7 @@ mod tests {
     fn build_system_prompt_includes_cwd_and_mode_specific_text() {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         for (mode, marker) in [
-            (SessionMode::Lutz, "agentic approach"),
-            (SessionMode::Code, "focus on code changes"),
-            (SessionMode::Ask, "Answer questions about code"),
+            (SessionMode::Lutz, "Work the task to completion"),
             (SessionMode::Plan, "focus on planning"),
         ] {
             let prompt = build_system_prompt(&mode, cwd, &[]);
@@ -10541,6 +10589,15 @@ mod tests {
                 !prompt.contains("AI coding assistant"),
                 "system prompt for {mode:?} must not revive the 'AI coding assistant' wording, got: {prompt}"
             );
+            assert!(
+                prompt.contains("Call only tools that are currently advertised"),
+                "system prompt for {mode:?} must carry the shared core guidance, got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("create a task list"),
+                "system prompt for {mode:?} must not revive the task-list invitation (anvil has \
+                 no todo tool; it induces prose plans instead of tool calls), got: {prompt}"
+            );
         }
     }
 
@@ -10549,7 +10606,7 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         let additional = vec![PathBuf::from("/tmp/other-root")];
 
-        let prompt = build_system_prompt(&SessionMode::Code, cwd, &additional);
+        let prompt = build_system_prompt(&SessionMode::Lutz, cwd, &additional);
 
         assert!(
             prompt.contains("/tmp/other-root") || prompt.contains("\\tmp\\other-root"),
@@ -10572,7 +10629,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
                 user_prompt: "hi".repeat(8),
@@ -10594,7 +10651,7 @@ mod tests {
         }];
         let report = render_context_report(&snap, PermissionMode::AcceptEdits, &catalog);
 
-        assert!(report.contains("Mode: `CODE`"));
+        assert!(report.contains("Mode: `LUTZ`"));
         assert!(report.contains("Permission mode: `acceptEdits`"));
         assert!(report.contains("Model: `gpt-99`"));
         assert!(report.contains("(1 known in catalog)"));
@@ -10617,7 +10674,7 @@ mod tests {
         let snapshot = |agent_response: String| SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "hi".into(),
@@ -10669,7 +10726,7 @@ mod tests {
         crate::session::SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: model.into(),
             history: vec![],
             reasoning_effort: None,
@@ -10941,7 +10998,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
                 user_prompt: "investigate context accounting".into(),
@@ -10979,7 +11036,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Ask,
+            mode: SessionMode::Plan,
             model: "codex::gpt-5-codex".into(),
             history: vec![],
             reasoning_effort: None,
@@ -11012,7 +11069,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Ask,
+            mode: SessionMode::Plan,
             model: "openrouter::openai/gpt-4o".into(),
             history: vec![],
             reasoning_effort: None,
@@ -11141,7 +11198,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "what is rust?".into(),
@@ -11175,7 +11232,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "find TODOs".into(),
@@ -11274,7 +11331,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "find TODOs".into(),
@@ -11343,7 +11400,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "search".into(),
@@ -11399,7 +11456,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "search".into(),
@@ -11470,7 +11527,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
@@ -11511,7 +11568,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "search".into(),
@@ -11590,7 +11647,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
@@ -11622,7 +11679,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
@@ -12556,7 +12613,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![
                 ConversationTurn {
@@ -12610,7 +12667,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "verbatim user".into(),
