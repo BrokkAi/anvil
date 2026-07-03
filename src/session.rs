@@ -146,13 +146,16 @@ pub(crate) fn rfc3339_from_millis(millis: u64) -> Option<String> {
     DateTime::<Utc>::from_timestamp_millis(millis).map(|ts| ts.to_rfc3339())
 }
 
-fn effective_mcp_servers(extra_servers: Option<Vec<McpServerConfig>>) -> Vec<McpServerConfig> {
+fn effective_mcp_servers(
+    cwd: &Path,
+    extra_servers: Option<Vec<McpServerConfig>>,
+) -> Vec<McpServerConfig> {
     let mut servers = crate::setup_state::read_mcp_servers();
     // Plugin-provided servers merge below user-configured ones: a
     // configured server of the same name wins, and bifrost stays Anvil's
     // managed binary even when a plugin (e.g. brokk) ships its own.
     let home = dirs::home_dir();
-    for server in crate::plugins::discover(home.as_deref()).mcp_servers() {
+    for server in crate::plugins::discover(Some(cwd), home.as_deref()).mcp_servers() {
         if server.name == "bifrost" {
             tracing::debug!(
                 command = %server.command,
@@ -3092,7 +3095,7 @@ impl SessionStore {
             (
                 session.skills.clone(),
                 session.agents.clone(),
-                effective_mcp_servers(session.mcp_servers.clone()),
+                effective_mcp_servers(&normalized_cwd, session.mcp_servers.clone()),
                 session.additional_directories.clone(),
             )
         };
@@ -3113,6 +3116,8 @@ impl SessionStore {
             }
             return Some(existing);
         };
+        let plugin_hooks =
+            crate::plugins::discover(Some(&normalized_cwd), dirs::home_dir().as_deref()).hooks();
         let registry = Arc::new(
             ToolRegistry::new(
                 normalized_cwd,
@@ -3120,6 +3125,7 @@ impl SessionStore {
                 mcp_servers,
                 skills,
                 agents,
+                plugin_hooks,
             )
             .await,
         );

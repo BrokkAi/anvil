@@ -203,7 +203,7 @@ fn discover_with_backend(
 
     // Plugin scope: overrides bundled, overridden by user/project.
     // A manifest can declare individual `.md` files or directories.
-    let plugin_catalog = crate::plugins::discover(home);
+    let plugin_catalog = crate::plugins::discover(Some(&cwd), home);
     for diag in &plugin_catalog.diagnostics {
         reg.push_diagnostic(diag.clone());
     }

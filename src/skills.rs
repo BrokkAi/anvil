@@ -71,6 +71,16 @@ pub struct SkillMeta {
     /// a confirmation step before activation; user-scope ones don't).
     #[allow(dead_code)]
     pub scope: SkillScope,
+    /// Whether this entry is a proper skill (`SKILL.md`, activated with
+    /// a structured payload) or a plugin command (a prompt template with
+    /// `$ARGUMENTS`/`$1..$9` placeholders, expanded verbatim).
+    pub kind: SkillKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillKind {
+    Skill,
+    Command,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,13 +221,18 @@ fn discover_with_backend(
     let mut candidates = Vec::new();
 
     // Plugin scope first, so user/project skills win under last-wins.
-    let plugin_catalog = crate::plugins::discover(home);
+    // Commands register immediately (they are not SKILL.md candidates),
+    // so any later same-name skill overrides them.
+    let plugin_catalog = crate::plugins::discover(Some(&cwd), home);
     for diag in &plugin_catalog.diagnostics {
         reg.push_diagnostic(diag.clone());
     }
     for plugin in plugin_catalog.enabled() {
         for root in plugin.skill_roots() {
             scan_spec_root(&root, SkillScope::Plugin, &mut candidates, &mut reg);
+        }
+        for (name, path) in plugin.command_files() {
+            load_plugin_command(name, &path, &mut reg, backend);
         }
     }
 
@@ -538,6 +553,64 @@ fn load_skill(
         location: path.to_path_buf(),
         skill_dir,
         scope,
+        kind: SkillKind::Skill,
+    });
+}
+
+/// Register a plugin command file (`commands/<name>.md`) as a
+/// `SkillKind::Command` entry. Unlike `SKILL.md`, frontmatter is
+/// optional for commands: a bare markdown prompt is valid, and the
+/// description falls back to the first non-empty line.
+fn load_plugin_command(
+    name: String,
+    path: &Path,
+    reg: &mut SkillRegistry,
+    backend: &crate::sandbox_backend::SandboxBackend,
+) {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            reg.push_diagnostic(format!(
+                "plugin command unreadable at '{}': {e}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if raw.len() > MAX_BODY_BYTES {
+        reg.push_diagnostic(format!(
+            "plugin command at '{}' exceeds {MAX_BODY_BYTES} bytes; skipping",
+            path.display()
+        ));
+        return;
+    }
+
+    let (front, body) = match split_frontmatter(&raw) {
+        Ok((front, body)) => (Some(front), body),
+        Err(_) => (None, raw.as_str()),
+    };
+    let description = front
+        .and_then(|front| backend.parse_skill_frontmatter(front).ok())
+        .and_then(|parsed| parsed.description)
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .or_else(|| {
+            body.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| line.trim_start_matches('#').trim().to_string())
+                .filter(|line| !line.is_empty())
+        })
+        .unwrap_or_else(|| format!("Plugin command {name}"));
+
+    let skill_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    reg.add(SkillMeta {
+        name,
+        description,
+        location: path.to_path_buf(),
+        skill_dir,
+        scope: SkillScope::Plugin,
+        kind: SkillKind::Command,
     });
 }
 
@@ -778,6 +851,55 @@ mod tests {
     }
 
     #[test]
+    fn plugin_commands_register_as_command_kind() {
+        let project = TempDir::new().unwrap();
+        let (home, plugin) = home_with_plugin_skill("from plugin");
+        write(
+            &plugin.path().join("commands").join("deploy.md"),
+            "---\ndescription: Ship it\n---\nDeploy $ARGUMENTS now.",
+        );
+        write(
+            &plugin.path().join("commands").join("bare.md"),
+            "# Do the bare thing\n\nBody.",
+        );
+
+        let reg = discover_inner(project.path(), Some(home.path()));
+        let deploy = reg.get("deploy").expect("frontmatter command");
+        assert_eq!(deploy.kind, SkillKind::Command);
+        assert_eq!(deploy.scope, SkillScope::Plugin);
+        assert_eq!(deploy.description, "Ship it");
+        // Frontmatter-less command falls back to its first line.
+        let bare = reg.get("bare").expect("bare command");
+        assert_eq!(bare.kind, SkillKind::Command);
+        assert_eq!(bare.description, "Do the bare thing");
+        // Body reads back frontmatter-stripped either way.
+        assert!(read_skill_body(deploy).unwrap().starts_with("Deploy"));
+        assert!(read_skill_body(bare).unwrap().starts_with("# Do the bare thing"));
+    }
+
+    #[test]
+    fn project_skill_overrides_plugin_command() {
+        let project = TempDir::new().unwrap();
+        touch_git(project.path());
+        skill_at(
+            project.path(),
+            AGENTS_DIR,
+            "deploy",
+            &minimal("deploy", "project skill"),
+        );
+        let (home, plugin) = home_with_plugin_skill("from plugin");
+        write(
+            &plugin.path().join("commands").join("deploy.md"),
+            "Deploy things.",
+        );
+
+        let reg = discover_inner(project.path(), Some(home.path()));
+        let meta = reg.get("deploy").unwrap();
+        assert_eq!(meta.kind, SkillKind::Skill);
+        assert_eq!(meta.description, "project skill");
+    }
+
+    #[test]
     fn disabled_plugin_skills_are_not_discovered() {
         let project = TempDir::new().unwrap();
         let (home, _plugin) = home_with_plugin_skill("from plugin");
@@ -868,6 +990,7 @@ mod tests {
                 location: skill_dir.join(SKILL_FILE),
                 skill_dir,
                 scope: SkillScope::Project,
+                kind: SkillKind::Skill,
             });
         }
 

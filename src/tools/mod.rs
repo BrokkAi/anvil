@@ -618,6 +618,10 @@ pub struct ToolRegistry {
     advertised_builtin_tools: RwLock<HashSet<String>>,
     skills: RwLock<Arc<SkillRegistry>>,
     agents: RwLock<Arc<AgentRegistry>>,
+    /// Hooks contributed by enabled plugins, captured at registry build
+    /// time. Ordered; executed by `tool_loop::execute_tool` around each
+    /// tool call.
+    plugin_hooks: Vec<crate::plugins::HookCommand>,
 }
 
 impl ToolRegistry {
@@ -673,6 +677,7 @@ impl ToolRegistry {
         mcp_servers: Vec<McpServerConfig>,
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
+        plugin_hooks: Vec<crate::plugins::HookCommand>,
     ) -> Self {
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
@@ -739,7 +744,13 @@ impl ToolRegistry {
             ),
             skills: RwLock::new(skills),
             agents: RwLock::new(agents),
+            plugin_hooks,
         }
+    }
+
+    /// Hooks contributed by enabled plugins at registry build time.
+    pub(crate) fn plugin_hooks(&self) -> &[crate::plugins::HookCommand] {
+        &self.plugin_hooks
     }
 
     /// All tool definitions for the OpenAI tools parameter.
@@ -1795,7 +1806,7 @@ mod tests {
     /// `tool_definitions()` (otherwise the LLM never sees it). If you add a
     /// new built-in dispatch arm in `execute`, also add the name to
     /// `BUILTIN_TOOL_NAMES`, the `TOOLS` table, and `tool_definitions()`.
-    use crate::skills::{SkillMeta, SkillScope};
+    use crate::skills::{SkillKind, SkillMeta, SkillScope};
 
     fn registry_with_skills(skills: Vec<SkillMeta>) -> ToolRegistry {
         let mut reg = SkillRegistry::default();
@@ -1816,6 +1827,7 @@ mod tests {
             ),
             skills: RwLock::new(Arc::new(reg)),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
+            plugin_hooks: Vec::new(),
         }
     }
 
@@ -1838,6 +1850,7 @@ mod tests {
             ),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(reg)),
+            plugin_hooks: Vec::new(),
         }
     }
 
@@ -1857,6 +1870,7 @@ mod tests {
             location,
             skill_dir,
             scope: SkillScope::Project,
+            kind: SkillKind::Skill,
         };
         (tmp, meta)
     }
@@ -1966,6 +1980,7 @@ mod tests {
             ),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
+            plugin_hooks: Vec::new(),
         };
         let advertised: Vec<String> = registry
             .tool_definitions()

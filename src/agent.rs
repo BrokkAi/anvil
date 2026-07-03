@@ -2236,8 +2236,13 @@ pub async fn run_agent(
                 }
 
                 if is_slash_command(&raw_prompt_text, "plugin") {
-                    let report =
-                        handle_plugin(&raw_prompt_text, &sessions_prompt, &session_id).await;
+                    let report = handle_plugin(
+                        &raw_prompt_text,
+                        &sessions_prompt,
+                        &session_id,
+                        &snap.cwd,
+                    )
+                    .await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(prompt_end_turn_response());
                 }
@@ -2318,22 +2323,69 @@ pub async fn run_agent(
                     }
                 }
 
-                let prompt_text = if let Some((name, args)) = slash_command.as_ref()
+                // UserPromptSubmit plugin hooks run on the raw user
+                // prompt before any slash/skill expansion. A blocking
+                // hook (exit 2) stops the turn; stdout from successful
+                // hooks is appended as extra context for the model.
+                let prompt_hook_context = {
+                    let hooks = crate::plugins::discover(
+                        Some(&snap.cwd),
+                        dirs::home_dir().as_deref(),
+                    )
+                    .hooks();
+                    if hooks
+                        .iter()
+                        .any(|h| h.event == crate::plugins::HookEvent::UserPromptSubmit)
+                    {
+                        let payload = serde_json::json!({
+                            "hook_event_name": crate::plugins::HookEvent::UserPromptSubmit.name(),
+                            "prompt": raw_prompt_text,
+                            "cwd": snap.cwd.display().to_string(),
+                        });
+                        let decision = crate::plugins::run_hooks(
+                            &hooks,
+                            crate::plugins::HookEvent::UserPromptSubmit,
+                            None,
+                            &payload,
+                            &snap.cwd,
+                        )
+                        .await;
+                        if decision.blocked {
+                            send_message(
+                                &cx,
+                                &session_id,
+                                &format!(
+                                    "Prompt blocked by plugin hook:\n{}",
+                                    decision.reasons.join("\n")
+                                ),
+                            );
+                            return responder.respond(prompt_end_turn_response());
+                        }
+                        decision.context
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                let mut prompt_text = if let Some((name, args)) = slash_command.as_ref()
                     && let Some(meta) = snap.skills.get_for_slash_command(name)
                 {
                     tracing::info!(skill = %meta.name, "slash-command activating skill");
-                    sessions_prompt
-                        .mark_skill_activated(&session_id, &meta.name)
-                        .await;
-                    let body = build_skill_payload(meta);
-                    if args.is_empty() {
-                        body
-                    } else {
-                        format!("{body}\n\nUser input: {args}")
+                    if meta.kind == crate::skills::SkillKind::Skill {
+                        sessions_prompt
+                            .mark_skill_activated(&session_id, &meta.name)
+                            .await;
                     }
+                    build_slash_payload(meta, args)
                 } else {
                     raw_prompt_text.clone()
                 };
+                if !prompt_hook_context.is_empty() {
+                    prompt_text.push_str(&format!(
+                        "\n\n<plugin_hook_context>\n{}\n</plugin_hook_context>",
+                        prompt_hook_context.join("\n")
+                    ));
+                }
                 let prompt_parts = if prompt_text == raw_prompt_text {
                     raw_prompt_parts
                 } else {
@@ -3803,13 +3855,10 @@ async fn run_loop_iteration(
         tracing::info!(skill = %meta.name, "loop activating skill");
         // `mark_skill_activated` writes into the session's HashSet of
         // activated skills, so repeated loop iterations are idempotent.
-        sessions.mark_skill_activated(session_id, &meta.name).await;
-        let body = build_skill_payload(meta);
-        if args.is_empty() {
-            body
-        } else {
-            format!("{body}\n\nUser input: {args}")
+        if meta.kind == crate::skills::SkillKind::Skill {
+            sessions.mark_skill_activated(session_id, &meta.name).await;
         }
+        build_slash_payload(meta, args)
     } else {
         raw_prompt_text.clone()
     };
@@ -5177,6 +5226,67 @@ fn build_skills_catalog(registry: &crate::skills::SkillRegistry) -> Option<Strin
     Some(out)
 }
 
+/// Expand a slash-command invocation into the prompt text sent to the
+/// model. Skills get the structured `<skill_content>` payload with user
+/// input appended; plugin commands are prompt templates expanded with
+/// `$ARGUMENTS`/`$1..$9` substitution (Claude Code command semantics).
+pub(crate) fn build_slash_payload(meta: &crate::skills::SkillMeta, args: &str) -> String {
+    match meta.kind {
+        crate::skills::SkillKind::Skill => {
+            let body = build_skill_payload(meta);
+            if args.is_empty() {
+                body
+            } else {
+                format!("{body}\n\nUser input: {args}")
+            }
+        }
+        crate::skills::SkillKind::Command => {
+            let body = match crate::skills::read_skill_body(meta) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %meta.location.display(),
+                        "plugin command became unreadable between discovery and dispatch: {e}"
+                    );
+                    return format!(
+                        "[plugin command {} could not be read: {e}]",
+                        meta.location.display()
+                    );
+                }
+            };
+            expand_command_arguments(&body, args)
+        }
+    }
+}
+
+/// Substitute `$ARGUMENTS` (the full argument string) and `$1`..`$9`
+/// (shell-words positional) in a plugin command body. A body with no
+/// placeholders gets the arguments appended, matching Claude Code.
+fn expand_command_arguments(body: &str, args: &str) -> String {
+    let has_placeholders =
+        body.contains("$ARGUMENTS") || (1..=9).any(|i| body.contains(&format!("${i}")));
+    if !has_placeholders {
+        return if args.is_empty() {
+            body.to_string()
+        } else {
+            format!("{body}\n\n{args}")
+        };
+    }
+    let positional = parse_shell_words(args)
+        .unwrap_or_else(|_| args.split_whitespace().map(str::to_string).collect());
+    let mut out = body.replace("$ARGUMENTS", args);
+    // Descending so `$1` doesn't clobber the prefix of `$9`-adjacent
+    // text; single-digit positionals only, per Claude Code.
+    for i in (1..=9usize).rev() {
+        if !out.contains(&format!("${i}")) {
+            continue;
+        }
+        let value = positional.get(i - 1).map(String::as_str).unwrap_or("");
+        out = out.replace(&format!("${i}"), value);
+    }
+    out
+}
+
 /// Build the structured-wrapping payload sent to the LLM when a skill is
 /// activated (whether via slash command or the `activate_skill` tool).
 /// Format follows the spec's recommended "Structured wrapping" example:
@@ -5892,10 +6002,15 @@ fn shell_quote(value: &str) -> String {
 /// installs are read-only from here except for enable/disable, which is
 /// stored as an Anvil-side override so Claude Code's own settings are
 /// never touched.
-async fn handle_plugin(prompt_text: &str, sessions: &SessionStore, session_id: &str) -> String {
+async fn handle_plugin(
+    prompt_text: &str,
+    sessions: &SessionStore,
+    session_id: &str,
+    cwd: &Path,
+) -> String {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
-        return render_plugins();
+        return render_plugins(cwd);
     }
 
     let words = match parse_shell_words(&trimmed) {
@@ -5907,32 +6022,32 @@ async fn handle_plugin(prompt_text: &str, sessions: &SessionStore, session_id: &
         .map(|word| word.to_ascii_lowercase())
         .unwrap_or_default();
     if command == "list" {
-        return render_plugins();
+        return render_plugins(cwd);
     }
     let result = match command.as_str() {
         "add" | "install" => {
             let Some(source) = words.get(1) else {
                 return plugin_usage();
             };
-            plugin_add(source).await
+            plugin_add(cwd, source, words.get(2).map(String::as_str)).await
         }
         "remove" | "delete" | "rm" | "uninstall" => {
             let Some(name) = words.get(1) else {
                 return plugin_usage();
             };
-            plugin_remove(name)
+            plugin_remove(cwd, name)
         }
         "enable" | "disable" => {
             let Some(name) = words.get(1) else {
                 return plugin_usage();
             };
-            plugin_set_enabled(name, command == "enable")
+            plugin_set_enabled(cwd, name, command == "enable")
         }
         "update" => {
             let Some(name) = words.get(1) else {
                 return plugin_usage();
             };
-            plugin_update(name).await
+            plugin_update(cwd, name).await
         }
         "help" => return plugin_usage(),
         _ => return format!("Unknown plugin command `{command}`.\n\n{}", plugin_usage()),
@@ -5974,25 +6089,118 @@ fn plugin_git_url(source: &str) -> Option<String> {
     None
 }
 
-async fn plugin_add(source: &str) -> Result<String, String> {
+async fn plugin_add(
+    cwd: &Path,
+    source: &str,
+    marketplace_plugin: Option<&str>,
+) -> Result<String, String> {
     if let Some(url) = plugin_git_url(source) {
-        return plugin_add_from_git(source, &url).await;
+        return plugin_add_from_git(cwd, source, &url, marketplace_plugin, None).await;
     }
 
-    // Local path install: registered in place, not copied.
+    // Local path: either a plugin (registered in place, not copied) or a
+    // marketplace checkout to pick a plugin from.
     let expanded = expand_tilde(source);
     let root = std::fs::canonicalize(&expanded)
         .map_err(|e| format!("plugin path '{source}' is not accessible: {e}"))?;
-    let name = crate::plugins::register_native(source, &root)
+    if !crate::plugins::is_plugin_root(&root)
+        && let Some(marketplace) = crate::plugins::load_marketplace(&root).map_err(|e| {
+            format!("'{source}' is not a plugin and its marketplace listing is unreadable: {e:#}")
+        })?
+    {
+        let Some(plugin_name) = marketplace_plugin else {
+            return Err(marketplace_pick_message(source, &marketplace));
+        };
+        let entry = find_marketplace_entry(&marketplace, plugin_name, source)?;
+        return match &entry.source {
+            crate::plugins::MarketplaceSource::Path(rel) => {
+                let plugin_root = root.join(rel.trim_start_matches("./"));
+                let name = crate::plugins::register_native(source, &plugin_root, None)
+                    .map_err(|e| format!("failed to register plugin: {e:#}"))?;
+                Ok(format!(
+                    "Plugin `{name}` registered from `{}`.\n\n{}",
+                    plugin_root.display(),
+                    describe_plugin(cwd, &name)
+                ))
+            }
+            crate::plugins::MarketplaceSource::Detailed(detail) => {
+                let (url, subdir) = marketplace_source_git(detail)?;
+                plugin_add_from_git(cwd, source, &url, None, subdir.as_deref()).await
+            }
+        };
+    }
+    let name = crate::plugins::register_native(source, &root, None)
         .map_err(|e| format!("failed to register plugin: {e:#}"))?;
     Ok(format!(
         "Plugin `{name}` registered from `{}`.\n\n{}",
         root.display(),
-        describe_plugin(&name)
+        describe_plugin(cwd, &name)
     ))
 }
 
-async fn plugin_add_from_git(source: &str, url: &str) -> Result<String, String> {
+/// Resolve a detailed marketplace source into a clone URL and optional
+/// subdirectory within the clone.
+fn marketplace_source_git(
+    detail: &crate::plugins::MarketplaceSourceDetail,
+) -> Result<(String, Option<String>), String> {
+    let url = match (detail.source.as_str(), &detail.url, &detail.repo) {
+        ("github", _, Some(repo)) => format!("https://github.com/{repo}.git"),
+        (_, Some(url), _) => url.clone(),
+        _ => {
+            return Err(format!(
+                "marketplace source '{}' has no usable git location",
+                detail.source
+            ));
+        }
+    };
+    Ok((url, detail.path.clone()))
+}
+
+fn marketplace_pick_message(source: &str, marketplace: &crate::plugins::Marketplace) -> String {
+    let mut out = format!(
+        "`{source}` is a marketplace ({}) listing {} plugin(s). Pick one with \
+         `/plugin add {source} <name>`:\n\n",
+        marketplace.name,
+        marketplace.plugins.len()
+    );
+    for entry in &marketplace.plugins {
+        let description = entry
+            .description
+            .as_deref()
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        out.push_str(&format!("- `{}`{description}\n", entry.name));
+    }
+    out
+}
+
+fn find_marketplace_entry<'a>(
+    marketplace: &'a crate::plugins::Marketplace,
+    plugin_name: &str,
+    source: &str,
+) -> Result<&'a crate::plugins::MarketplaceEntry, String> {
+    marketplace
+        .plugins
+        .iter()
+        .find(|entry| entry.name == plugin_name)
+        .ok_or_else(|| {
+            format!(
+                "marketplace `{source}` has no plugin named `{plugin_name}`; \
+                 run `/plugin add {source}` to list what it offers"
+            )
+        })
+}
+
+/// Clone `url` and register the plugin found at its root (or `subdir`
+/// within it). When the clone turns out to be a marketplace instead of a
+/// plugin, `marketplace_plugin` picks the entry to install.
+async fn plugin_add_from_git(
+    cwd: &Path,
+    source: &str,
+    url: &str,
+    marketplace_plugin: Option<&str>,
+    subdir: Option<&str>,
+) -> Result<String, String> {
     let plugins_dir = crate::plugins::native_plugins_dir()
         .map_err(|e| format!("cannot resolve plugin install directory: {e:#}"))?;
     let dir_name = url
@@ -6044,11 +6252,82 @@ async fn plugin_add_from_git(source: &str, url: &str) -> Result<String, String> 
         return Err(format!("git clone failed: {}", stderr.trim()));
     }
 
-    match crate::plugins::register_native(source, &dest) {
+    // A clone with a marketplace listing instead of a plugin manifest:
+    // either resolve the picked entry or list the options and clean up.
+    if subdir.is_none() && !crate::plugins::is_plugin_root(&dest) {
+        let marketplace = crate::plugins::load_marketplace(&dest);
+        match marketplace {
+            Ok(Some(marketplace)) => {
+                let result = match marketplace_plugin {
+                    None => Err(marketplace_pick_message(source, &marketplace)),
+                    Some(plugin_name) => {
+                        match find_marketplace_entry(&marketplace, plugin_name, source) {
+                            Err(e) => Err(e),
+                            Ok(entry) => match &entry.source {
+                                crate::plugins::MarketplaceSource::Path(rel) => {
+                                    // The plugin lives inside this clone:
+                                    // keep the clone and register the
+                                    // subdirectory.
+                                    let plugin_root = dest.join(rel.trim_start_matches("./"));
+                                    return crate::plugins::register_native(
+                                        source,
+                                        &plugin_root,
+                                        Some(&dest),
+                                    )
+                                    .map(|name| {
+                                        format!(
+                                            "Plugin `{name}` installed from `{url}` into `{}`.\n\n{}",
+                                            plugin_root.display(),
+                                            describe_plugin(cwd, &name)
+                                        )
+                                    })
+                                    .map_err(|e| {
+                                        let _ = std::fs::remove_dir_all(&dest);
+                                        format!("marketplace entry is not a valid plugin: {e:#}")
+                                    });
+                                }
+                                crate::plugins::MarketplaceSource::Detailed(detail) => {
+                                    // External plugin repo: this clone was
+                                    // only needed for the listing.
+                                    match marketplace_source_git(detail) {
+                                        Ok((plugin_url, plugin_subdir)) => {
+                                            let _ = std::fs::remove_dir_all(&dest);
+                                            return Box::pin(plugin_add_from_git(
+                                                cwd,
+                                                source,
+                                                &plugin_url,
+                                                None,
+                                                plugin_subdir.as_deref(),
+                                            ))
+                                            .await;
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                };
+                let _ = std::fs::remove_dir_all(&dest);
+                return result;
+            }
+            Ok(None) => {} // fall through to plugin registration error below
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(format!("{e:#}"));
+            }
+        }
+    }
+
+    let plugin_root = match subdir {
+        Some(rel) => dest.join(rel.trim_start_matches("./")),
+        None => dest.clone(),
+    };
+    match crate::plugins::register_native(source, &plugin_root, Some(&dest)) {
         Ok(name) => Ok(format!(
             "Plugin `{name}` installed from `{url}` into `{}`.\n\n{}",
-            dest.display(),
-            describe_plugin(&name)
+            plugin_root.display(),
+            describe_plugin(cwd, &name)
         )),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dest);
@@ -6057,11 +6336,11 @@ async fn plugin_add_from_git(source: &str, url: &str) -> Result<String, String> 
     }
 }
 
-fn plugin_remove(name: &str) -> Result<String, String> {
+fn plugin_remove(cwd: &Path, name: &str) -> Result<String, String> {
     let entry = crate::plugins::remove_native(name)
         .map_err(|e| format!("failed to update plugin registry: {e:#}"))?;
     let Some(entry) = entry else {
-        if let Some(key) = find_claude_plugin_key(name) {
+        if let Some(key) = find_claude_plugin_key(cwd, name) {
             return Err(format!(
                 "`{key}` is managed by Claude Code; disable it here with `/plugin disable {name}` \
                  or uninstall it with the `claude` CLI"
@@ -6069,16 +6348,13 @@ fn plugin_remove(name: &str) -> Result<String, String> {
         }
         return Err(format!("no plugin named `{name}` is installed"));
     };
-    // Only delete directories we created (git clones under the managed
-    // plugins dir); local-path registrations are left in place.
-    let managed = crate::plugins::native_plugins_dir()
-        .ok()
-        .is_some_and(|dir| entry.path.starts_with(&dir));
-    if managed {
-        if let Err(e) = std::fs::remove_dir_all(&entry.path) {
+    // Only delete directories we created (git clones recorded as the
+    // entry's install root); local-path registrations are left in place.
+    if let Some(install_root) = &entry.install_root {
+        if let Err(e) = std::fs::remove_dir_all(install_root) {
             return Ok(format!(
                 "Plugin `{name}` unregistered, but its files at `{}` could not be deleted: {e}",
-                entry.path.display()
+                install_root.display()
             ));
         }
         Ok(format!("Plugin `{name}` removed."))
@@ -6090,14 +6366,14 @@ fn plugin_remove(name: &str) -> Result<String, String> {
     }
 }
 
-fn plugin_set_enabled(name: &str, enabled: bool) -> Result<String, String> {
+fn plugin_set_enabled(cwd: &Path, name: &str, enabled: bool) -> Result<String, String> {
     let state = if enabled { "enabled" } else { "disabled" };
     let flipped = crate::plugins::set_native_enabled(name, enabled)
         .map_err(|e| format!("failed to update plugin registry: {e:#}"))?;
     if flipped {
         return Ok(format!("Plugin `{name}` {state}."));
     }
-    if let Some(key) = find_claude_plugin_key(name) {
+    if let Some(key) = find_claude_plugin_key(cwd, name) {
         crate::plugins::set_claude_override(&key, enabled)
             .map_err(|e| format!("failed to update plugin registry: {e:#}"))?;
         return Ok(format!(
@@ -6107,17 +6383,18 @@ fn plugin_set_enabled(name: &str, enabled: bool) -> Result<String, String> {
     Err(format!("no plugin named `{name}` is installed"))
 }
 
-async fn plugin_update(name: &str) -> Result<String, String> {
+async fn plugin_update(cwd: &Path, name: &str) -> Result<String, String> {
     let registry = crate::plugins::read_native_registry();
     let Some(entry) = registry.plugins.iter().find(|p| p.name == name) else {
-        if find_claude_plugin_key(name).is_some() {
+        if find_claude_plugin_key(cwd, name).is_some() {
             return Err(format!(
                 "`{name}` is managed by Claude Code; update it with the `claude` CLI"
             ));
         }
         return Err(format!("no plugin named `{name}` is installed"));
     };
-    if !entry.path.join(".git").exists() {
+    let repo_dir = entry.install_root.as_ref().unwrap_or(&entry.path);
+    if !repo_dir.join(".git").exists() {
         return Err(format!(
             "plugin `{name}` was registered from a local path; there is nothing to pull"
         ));
@@ -6126,7 +6403,7 @@ async fn plugin_update(name: &str) -> Result<String, String> {
         std::time::Duration::from_secs(300),
         tokio::process::Command::new("git")
             .arg("-C")
-            .arg(&entry.path)
+            .arg(repo_dir)
             .arg("pull")
             .arg("--ff-only")
             .output(),
@@ -6147,8 +6424,8 @@ async fn plugin_update(name: &str) -> Result<String, String> {
 
 /// Resolve a user-typed name to a Claude Code plugin key. Accepts the
 /// full `name@marketplace` key or the bare plugin name when unambiguous.
-fn find_claude_plugin_key(name: &str) -> Option<String> {
-    let catalog = crate::plugins::discover(dirs::home_dir().as_deref());
+fn find_claude_plugin_key(cwd: &Path, name: &str) -> Option<String> {
+    let catalog = crate::plugins::discover(Some(cwd), dirs::home_dir().as_deref());
     let claude: Vec<&crate::plugins::InstalledPlugin> = catalog
         .plugins
         .iter()
@@ -6177,8 +6454,8 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 /// One-line summary of what a freshly-registered native plugin provides.
-fn describe_plugin(name: &str) -> String {
-    let catalog = crate::plugins::discover(dirs::home_dir().as_deref());
+fn describe_plugin(cwd: &Path, name: &str) -> String {
+    let catalog = crate::plugins::discover(Some(cwd), dirs::home_dir().as_deref());
     let Some(plugin) = catalog
         .plugins
         .iter()
@@ -6218,13 +6495,26 @@ fn plugin_contents_summary(plugin: &crate::plugins::InstalledPlugin) -> String {
             }
         })
         .sum::<usize>();
+    let commands = plugin.command_files().len();
     let mut diags = Vec::new();
     let mcp = plugin.mcp_servers(&mut diags).len();
-    format!("{skills} skill(s), {agents} subagent(s), {mcp} MCP server(s)")
+    let hooks = plugin.hooks(&mut diags).len();
+    let mut parts = vec![
+        format!("{skills} skill(s)"),
+        format!("{agents} subagent(s)"),
+        format!("{mcp} MCP server(s)"),
+    ];
+    if commands > 0 {
+        parts.push(format!("{commands} command(s)"));
+    }
+    if hooks > 0 {
+        parts.push(format!("{hooks} hook(s)"));
+    }
+    parts.join(", ")
 }
 
-fn render_plugins() -> String {
-    let catalog = crate::plugins::discover(dirs::home_dir().as_deref());
+fn render_plugins(cwd: &Path) -> String {
+    let catalog = crate::plugins::discover(Some(cwd), dirs::home_dir().as_deref());
     let mut out = String::from("Plugins\n\n");
     if catalog.plugins.is_empty() {
         out.push_str(
@@ -6276,16 +6566,18 @@ fn render_plugins() -> String {
 fn plugin_usage() -> String {
     "Commands:\n\
      - `/plugin list`\n\
-     - `/plugin add <git-url | owner/repo | local-path>`\n\
+     - `/plugin add <git-url | owner/repo | local-path> [marketplace-plugin]`\n\
      - `/plugin enable <name>`\n\
      - `/plugin disable <name>`\n\
      - `/plugin update <name>`\n\
      - `/plugin remove <name>`\n\n\
-     Plugins provide skills, subagents, and MCP servers in the Claude Code plugin \
+     Plugins provide skills, subagents, slash commands, hooks (PreToolUse, \
+     PostToolUse, UserPromptSubmit), and MCP servers in the Claude Code plugin \
      format (`.claude-plugin/plugin.json`). Plugins installed with \
      `claude plugin install` are discovered automatically; `/plugin add` installs \
-     into Anvil's own config directory. Enable/disable of Claude Code plugins is \
-     stored on the Anvil side and never modifies Claude Code's settings."
+     into Anvil's own config directory. Adding a marketplace repository lists its \
+     plugins; pass a second argument to pick one. Enable/disable of Claude Code \
+     plugins is stored on the Anvil side and never modifies Claude Code's settings."
         .to_string()
 }
 
@@ -11739,7 +12031,7 @@ mod tests {
     // built-in collision precedence, command merging, payload format).
     // ---------------------------------------------------------------
 
-    use crate::skills::{SkillMeta, SkillRegistry, SkillScope};
+    use crate::skills::{SkillKind, SkillMeta, SkillRegistry, SkillScope};
     use std::path::PathBuf as TestPathBuf;
 
     fn make_registry(skills: Vec<(&str, &str)>) -> std::sync::Arc<SkillRegistry> {
@@ -11761,6 +12053,7 @@ mod tests {
                 location: location.clone(),
                 skill_dir: skill_dir.clone(),
                 scope: SkillScope::Project,
+                kind: SkillKind::Skill,
             });
         }
         // Leak the TempDir so files survive the test (we don't manage
@@ -11865,6 +12158,7 @@ mod tests {
                 location: TestPathBuf::from(format!("/tmp/{name}/SKILL.md")),
                 skill_dir: TestPathBuf::from(format!("/tmp/{name}")),
                 scope: SkillScope::Project,
+                kind: SkillKind::Skill,
             });
         }
 
@@ -12180,6 +12474,7 @@ mod tests {
             location,
             skill_dir: skill_dir.clone(),
             scope: SkillScope::Project,
+            kind: SkillKind::Skill,
         };
         let payload = build_skill_payload(&meta);
         assert!(payload.starts_with("<skill_content name=\"demo\">"));
@@ -12192,6 +12487,77 @@ mod tests {
         // Skill directory + relative-path hint present.
         assert!(payload.contains(&format!("Skill directory: {}", skill_dir.display())));
         assert!(payload.ends_with("</skill_content>"));
+    }
+
+    #[test]
+    fn expand_command_arguments_substitutes_placeholders() {
+        assert_eq!(
+            expand_command_arguments("Deploy $1 to $2 with $ARGUMENTS", "alpha beta"),
+            "Deploy alpha to beta with alpha beta"
+        );
+        // Shell-style quoting groups positional arguments.
+        assert_eq!(
+            expand_command_arguments("First: $1", "'a b' c"),
+            "First: a b"
+        );
+        // Unfilled positionals become empty.
+        assert_eq!(
+            expand_command_arguments("Missing [$3] here", "one two"),
+            "Missing [] here"
+        );
+        // No placeholders: args are appended (or nothing, when empty).
+        assert_eq!(
+            expand_command_arguments("No placeholders.", "extra args"),
+            "No placeholders.\n\nextra args"
+        );
+        assert_eq!(
+            expand_command_arguments("No placeholders.", ""),
+            "No placeholders."
+        );
+    }
+
+    #[test]
+    fn build_slash_payload_expands_command_and_wraps_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let command_path = tmp.path().join("deploy.md");
+        std::fs::write(
+            &command_path,
+            "---\ndescription: Ship it\n---\nDeploy $ARGUMENTS now.\n",
+        )
+        .unwrap();
+        let command_meta = SkillMeta {
+            name: "deploy".into(),
+            description: "Ship it".into(),
+            location: command_path,
+            skill_dir: tmp.path().to_path_buf(),
+            scope: SkillScope::Plugin,
+            kind: SkillKind::Command,
+        };
+        // Commands expand verbatim: no <skill_content> wrapper.
+        assert_eq!(
+            build_slash_payload(&command_meta, "prod"),
+            "Deploy prod now."
+        );
+
+        let skill_dir = tmp.path().join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let location = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &location,
+            "---\nname: demo\ndescription: demo skill\n---\nDo a thing.\n",
+        )
+        .unwrap();
+        let skill_meta = SkillMeta {
+            name: "demo".into(),
+            description: "demo skill".into(),
+            location,
+            skill_dir,
+            scope: SkillScope::Project,
+            kind: SkillKind::Skill,
+        };
+        let payload = build_slash_payload(&skill_meta, "prod");
+        assert!(payload.starts_with("<skill_content name=\"demo\">"));
+        assert!(payload.ends_with("User input: prod"));
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! A plugin is a directory with a `.claude-plugin/plugin.json` manifest
 //! that can provide skills (`skills/<name>/SKILL.md`), subagents
-//! (`agents/<name>.md`), and MCP servers (`.mcp.json`). Anvil consumes
+//! (`agents/<name>.md`), slash commands (`commands/<name>.md`), hooks
+//! (`hooks/hooks.json`), and MCP servers (`.mcp.json`). Anvil consumes
 //! plugins from two sources:
 //!
 //!   1. **Claude Code installs** -- `~/.claude/plugins/installed_plugins.json`
@@ -53,8 +54,8 @@ static NATIVE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 // ---------------------------------------------------------------------------
 
 /// Parsed `.claude-plugin/plugin.json`. Only the fields Anvil consumes
-/// are modelled; unknown fields (hooks, commands, marketplace metadata)
-/// are ignored.
+/// are modelled; unknown fields (author, keywords, marketplace display
+/// metadata) are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -66,6 +67,10 @@ pub struct PluginManifest {
     skills: Option<StringOrList>,
     #[serde(default)]
     agents: Option<StringOrList>,
+    #[serde(default)]
+    commands: Option<StringOrList>,
+    #[serde(default)]
+    hooks: Option<HooksSpec>,
     #[serde(default, rename = "mcpServers")]
     mcp_servers: Option<McpServersSpec>,
 }
@@ -95,6 +100,40 @@ impl StringOrList {
 enum McpServersSpec {
     Path(String),
     Inline(serde_json::Map<String, serde_json::Value>),
+}
+
+/// `hooks` in the manifest is either a path to a `hooks.json` file or
+/// the inline equivalent of its contents.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum HooksSpec {
+    Path(String),
+    Inline(HooksFile),
+}
+
+/// Claude Code `hooks/hooks.json` schema: event name -> matcher groups.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct HooksFile {
+    #[serde(default)]
+    hooks: HashMap<String, Vec<HookMatcherGroup>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HookMatcherGroup {
+    #[serde(default)]
+    matcher: Option<String>,
+    #[serde(default)]
+    hooks: Vec<HookDef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HookDef {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    command: String,
+    /// Seconds; Claude Code's default is 60.
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 /// One server entry in Claude Code `.mcp.json` format. Fields Anvil does
@@ -185,6 +224,19 @@ impl PluginCatalog {
         servers
     }
 
+    /// All hook commands from enabled plugins, in catalog order.
+    pub fn hooks(&self) -> Vec<HookCommand> {
+        let mut diagnostics = Vec::new();
+        let hooks: Vec<HookCommand> = self
+            .enabled()
+            .flat_map(|p| p.hooks(&mut diagnostics))
+            .collect();
+        for msg in diagnostics {
+            tracing::warn!("{msg}");
+        }
+        hooks
+    }
+
     fn push_diagnostic(&mut self, msg: String) {
         tracing::warn!("{msg}");
         self.diagnostics.push(msg);
@@ -210,6 +262,116 @@ impl InstalledPlugin {
             None => vec![self.root.join("agents")],
         };
         sources.into_iter().filter(|p| p.exists()).collect()
+    }
+
+    /// Slash-command prompt files: `(name, path)` pairs. Defaults to
+    /// `commands/` under the plugin root; a file in a subdirectory is
+    /// namespaced `subdir:name`, matching Claude Code's convention.
+    pub fn command_files(&self) -> Vec<(String, PathBuf)> {
+        let sources: Vec<PathBuf> = match &self.manifest.commands {
+            Some(spec) => spec.iter().map(|p| self.resolve(p)).collect(),
+            None => vec![self.root.join("commands")],
+        };
+        let mut out = Vec::new();
+        for source in sources {
+            if source.is_file() {
+                if let Some(name) = command_name(&source, source.parent()) {
+                    out.push((name, source));
+                }
+                continue;
+            }
+            if !source.is_dir() {
+                continue;
+            }
+            let walker = walkdir::WalkDir::new(&source)
+                .max_depth(3)
+                .follow_links(false)
+                .sort_by_file_name();
+            for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if let Some(name) = command_name(entry.path(), Some(&source)) {
+                    out.push((name, entry.path().to_path_buf()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Hook commands declared by this plugin. The manifest `hooks` field
+    /// (path or inline) wins; otherwise `hooks/hooks.json` is auto-loaded
+    /// when present, mirroring the other component defaults.
+    pub fn hooks(&self, diagnostics: &mut Vec<String>) -> Vec<HookCommand> {
+        let file = match &self.manifest.hooks {
+            Some(HooksSpec::Inline(file)) => file.clone(),
+            Some(HooksSpec::Path(rel)) => {
+                let path = self.resolve(rel);
+                match self.read_hooks_file(&path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        diagnostics.push(format!("plugin '{}': {e:#}", self.key));
+                        return Vec::new();
+                    }
+                }
+            }
+            None => {
+                let path = self.root.join("hooks").join("hooks.json");
+                if !path.is_file() {
+                    return Vec::new();
+                }
+                match self.read_hooks_file(&path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        diagnostics.push(format!("plugin '{}': {e:#}", self.key));
+                        return Vec::new();
+                    }
+                }
+            }
+        };
+
+        let mut out = Vec::new();
+        let mut events: Vec<&String> = file.hooks.keys().collect();
+        events.sort();
+        for event_name in events {
+            let Some(event) = HookEvent::parse(event_name) else {
+                diagnostics.push(format!(
+                    "plugin '{}': hook event '{event_name}' is not supported by Anvil; ignoring",
+                    self.key
+                ));
+                continue;
+            };
+            for group in &file.hooks[event_name] {
+                for def in &group.hooks {
+                    match def.kind.as_deref() {
+                        None | Some("command") => {}
+                        Some(other) => {
+                            diagnostics.push(format!(
+                                "plugin '{}': hook type '{other}' is not supported; ignoring",
+                                self.key
+                            ));
+                            continue;
+                        }
+                    }
+                    out.push(HookCommand {
+                        plugin: self.key.clone(),
+                        event,
+                        matcher: group.matcher.clone().filter(|m| !m.trim().is_empty()),
+                        command: self.substitute(&def.command),
+                        timeout: std::time::Duration::from_secs(
+                            def.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
+                        ),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn read_hooks_file(&self, path: &Path) -> Result<HooksFile> {
+        let raw = read_small_file(path)?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("invalid hooks config at '{}'", path.display()))
     }
 
     /// Translate the plugin's MCP servers into Anvil's config model.
@@ -360,11 +522,218 @@ fn join_normalized(root: &Path, rel: &Path) -> PathBuf {
     out
 }
 
+/// Derive a slash-command name from a command file path: the `.md` stem,
+/// prefixed with `subdir:` segments relative to the commands root
+/// (`commands/git/commit.md` -> `git:commit`), matching Claude Code's
+/// namespacing convention.
+fn command_name(path: &Path, root: Option<&Path>) -> Option<String> {
+    let is_md = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("md"));
+    if !is_md {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    if stem.is_empty() || stem.starts_with('.') {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    if let Some(rel) = root.and_then(|root| path.strip_prefix(root).ok())
+        && let Some(parent) = rel.parent()
+    {
+        for comp in parent.components() {
+            segments.push(comp.as_os_str().to_str()?);
+        }
+    }
+    segments.push(stem);
+    Some(segments.join(":"))
+}
+
 fn valid_server_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
+
+/// Hook events Anvil executes. Claude Code defines more (SessionStart,
+/// Stop, PreCompact, ...); unsupported ones surface a diagnostic at
+/// discovery so plugin authors aren't silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    PreToolUse,
+    PostToolUse,
+    UserPromptSubmit,
+}
+
+impl HookEvent {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "PreToolUse" => Some(Self::PreToolUse),
+            "PostToolUse" => Some(Self::PostToolUse),
+            "UserPromptSubmit" => Some(Self::UserPromptSubmit),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PreToolUse => "PreToolUse",
+            Self::PostToolUse => "PostToolUse",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+        }
+    }
+}
+
+/// One executable hook, flattened from a plugin's hooks config with
+/// `${CLAUDE_PLUGIN_ROOT}` already substituted.
+#[derive(Debug, Clone)]
+pub struct HookCommand {
+    pub plugin: String,
+    pub event: HookEvent,
+    /// Regex matched against the tool name for tool events; `None`
+    /// matches everything. Prompt events ignore matchers.
+    pub matcher: Option<String>,
+    pub command: String,
+    pub timeout: std::time::Duration,
+}
+
+/// Aggregate outcome of running the hooks for one event occurrence.
+#[derive(Debug, Default)]
+pub struct HookDecision {
+    /// A hook exited with code 2: the operation should be blocked (for
+    /// PreToolUse/UserPromptSubmit) or the feedback fed back to the
+    /// model (PostToolUse). `reasons` carries the hooks' stderr.
+    pub blocked: bool,
+    pub reasons: Vec<String>,
+    /// stdout from successful (exit 0) hooks, used as added context for
+    /// UserPromptSubmit.
+    pub context: Vec<String>,
+}
+
+/// Run every hook registered for `event` whose matcher accepts
+/// `matcher_input`, feeding each the JSON `payload` on stdin. The
+/// exit-code protocol is Claude Code's: 0 = success (stdout may add
+/// context), 2 = block (stderr is the reason), anything else = warn and
+/// continue. Hooks run sequentially; a blocking result does not stop
+/// later hooks (their reasons aggregate).
+pub async fn run_hooks(
+    hooks: &[HookCommand],
+    event: HookEvent,
+    matcher_input: Option<&str>,
+    payload: &serde_json::Value,
+    cwd: &Path,
+) -> HookDecision {
+    let mut decision = HookDecision::default();
+    let payload_bytes = payload.to_string();
+    for hook in hooks.iter().filter(|h| h.event == event) {
+        if let Some(matcher) = &hook.matcher {
+            let Some(input) = matcher_input else { continue };
+            match regex::Regex::new(matcher) {
+                Ok(re) => {
+                    if !re.is_match(input) {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %hook.plugin,
+                        matcher = %matcher,
+                        "invalid hook matcher regex; skipping hook: {e}"
+                    );
+                    continue;
+                }
+            }
+        }
+        match run_one_hook(hook, &payload_bytes, cwd).await {
+            HookResult::Ok(stdout) => {
+                if !stdout.trim().is_empty() {
+                    decision.context.push(stdout.trim().to_string());
+                }
+            }
+            HookResult::Block(stderr) => {
+                decision.blocked = true;
+                let reason = if stderr.trim().is_empty() {
+                    format!("blocked by plugin '{}' hook", hook.plugin)
+                } else {
+                    stderr.trim().to_string()
+                };
+                decision.reasons.push(reason);
+            }
+            HookResult::Error(msg) => {
+                tracing::warn!(plugin = %hook.plugin, event = event.name(), "{msg}");
+            }
+        }
+    }
+    decision
+}
+
+enum HookResult {
+    Ok(String),
+    Block(String),
+    Error(String),
+}
+
+async fn run_one_hook(hook: &HookCommand, payload: &str, cwd: &Path) -> HookResult {
+    use tokio::io::AsyncWriteExt;
+
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(&hook.command);
+        c
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(&hook.command);
+        c
+    };
+
+    let child = command
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => return HookResult::Error(format!("hook failed to spawn: {e}")),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // A hook that never reads stdin closes the pipe; that's fine.
+        let _ = stdin.write_all(payload.as_bytes()).await;
+        drop(stdin);
+    }
+    let output = match tokio::time::timeout(hook.timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return HookResult::Error(format!("hook failed: {e}")),
+        Err(_) => {
+            return HookResult::Error(format!(
+                "hook timed out after {}s",
+                hook.timeout.as_secs()
+            ));
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    match output.status.code() {
+        Some(0) => HookResult::Ok(stdout),
+        Some(2) => HookResult::Block(stderr),
+        code => HookResult::Error(format!(
+            "hook exited with {:?}: {}",
+            code,
+            stderr.trim()
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,11 +743,15 @@ fn valid_server_name(name: &str) -> bool {
 /// Discover all installed plugins (Claude Code + native). Disabled
 /// plugins are included with `enabled: false` so `/plugin list` can show
 /// them; skill/agent/MCP consumers filter via [`PluginCatalog::enabled`].
-pub fn discover(home: Option<&Path>) -> PluginCatalog {
+///
+/// `cwd` locates project-scope `enabledPlugins` overrides in the git
+/// root's `.claude/settings.json` / `.claude/settings.local.json`;
+/// `None` skips the project scope.
+pub fn discover(cwd: Option<&Path>, home: Option<&Path>) -> PluginCatalog {
     let mut catalog = PluginCatalog::default();
     let native = read_native_registry();
     if let Some(home) = home {
-        discover_claude_installs(home, &native.claude_overrides, &mut catalog);
+        discover_claude_installs(cwd, home, &native.claude_overrides, &mut catalog);
     }
     discover_native(&native, &mut catalog);
     catalog
@@ -400,6 +773,7 @@ struct InstallRecord {
 }
 
 fn discover_claude_installs(
+    cwd: Option<&Path>,
     home: &Path,
     overrides: &HashMap<String, bool>,
     catalog: &mut PluginCatalog,
@@ -429,7 +803,16 @@ fn discover_claude_installs(
         ));
     }
 
-    let enabled_map = read_enabled_plugins(&home.join(CLAUDE_DIR).join(SETTINGS_FILE));
+    // Claude Code precedence: project settings.local.json > project
+    // settings.json > user settings.json. Later reads overwrite earlier
+    // keys.
+    let mut enabled_map = read_enabled_plugins(&home.join(CLAUDE_DIR).join(SETTINGS_FILE));
+    if let Some(project_root) = cwd.and_then(find_git_root) {
+        let claude_dir = project_root.join(CLAUDE_DIR);
+        for file in [SETTINGS_FILE, "settings.local.json"] {
+            enabled_map.extend(read_enabled_plugins(&claude_dir.join(file)));
+        }
+    }
 
     let mut keys: Vec<&String> = installed.plugins.keys().collect();
     keys.sort();
@@ -462,6 +845,8 @@ fn discover_claude_installs(
                 description: None,
                 skills: None,
                 agents: None,
+                commands: None,
+                hooks: None,
                 mcp_servers: None,
             }
         };
@@ -481,6 +866,32 @@ fn discover_claude_installs(
             enabled,
         });
     }
+}
+
+/// Locate the enclosing git root, mirroring the same helper in
+/// `skills`/`agents` discovery (handles both `.git/` dirs and worktree
+/// `gitdir:` files).
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(p) = cur {
+        let marker = p.join(".git");
+        let is_root = if marker.is_dir() {
+            marker.join("HEAD").is_file()
+        } else {
+            marker.is_file()
+                && std::fs::read_to_string(&marker).is_ok_and(|content| {
+                    content
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.starts_with("gitdir:"))
+                })
+        };
+        if is_root {
+            return Some(p.to_path_buf());
+        }
+        cur = p.parent();
+    }
+    None
 }
 
 /// Read the `enabledPlugins` map out of a Claude Code `settings.json`.
@@ -544,7 +955,17 @@ pub struct NativePluginEntry {
     pub name: String,
     /// What the user asked to install: a git URL or a local path.
     pub source: String,
+    /// The plugin root (where `.claude-plugin/plugin.json` lives).
     pub path: PathBuf,
+    /// Directory Anvil created for this install (a git clone); `path`
+    /// may be a subdirectory of it for marketplace installs. `None` for
+    /// local-path registrations, which are never deleted.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "installRoot"
+    )]
+    pub install_root: Option<PathBuf>,
     pub enabled: bool,
 }
 
@@ -588,8 +1009,9 @@ pub fn write_native_registry(registry: &NativeRegistry) -> Result<()> {
 
 /// Register a plugin rooted at `path`. Validates the manifest and
 /// rejects name collisions with existing native entries. Returns the
-/// registered plugin's manifest name.
-pub fn register_native(source: &str, path: &Path) -> Result<String> {
+/// registered plugin's manifest name. `install_root` is the clone
+/// directory Anvil owns for this install, when there is one.
+pub fn register_native(source: &str, path: &Path, install_root: Option<&Path>) -> Result<String> {
     let manifest = load_manifest(path)?;
     let name = manifest.name.clone();
     let mut registry = read_native_registry();
@@ -602,6 +1024,7 @@ pub fn register_native(source: &str, path: &Path) -> Result<String> {
         name: name.clone(),
         source: source.to_string(),
         path: path.to_path_buf(),
+        install_root: install_root.map(Path::to_path_buf),
         enabled: true,
     });
     write_native_registry(&registry)?;
@@ -635,6 +1058,67 @@ pub fn set_claude_override(key: &str, enabled: bool) -> Result<()> {
     registry.claude_overrides.insert(key.to_string(), enabled);
     write_native_registry(&registry)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Marketplaces
+// ---------------------------------------------------------------------------
+
+/// Parsed `.claude-plugin/marketplace.json`: a repository that lists
+/// plugins rather than being one.
+#[derive(Debug, Deserialize)]
+pub struct Marketplace {
+    pub name: String,
+    #[serde(default)]
+    pub plugins: Vec<MarketplaceEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarketplaceEntry {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub source: MarketplaceSource,
+}
+
+/// A marketplace entry's source: a path relative to the marketplace
+/// repo, or a detailed object pointing at an external git location.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum MarketplaceSource {
+    Path(String),
+    Detailed(MarketplaceSourceDetail),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarketplaceSourceDetail {
+    /// `github`, `git-subdir`, `url`, ...
+    pub source: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// `owner/repo`, for `source: github`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Subdirectory within the repo, for `source: git-subdir`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Load a repo's marketplace listing, if it has one.
+pub fn load_marketplace(root: &Path) -> Result<Option<Marketplace>> {
+    let path = root.join(MANIFEST_DIR).join("marketplace.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = read_small_file(&path)?;
+    let marketplace = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid marketplace listing at '{}'", path.display()))?;
+    Ok(Some(marketplace))
+}
+
+/// Whether a repo root is a plugin (has a plugin manifest).
+pub fn is_plugin_root(root: &Path) -> bool {
+    root.join(MANIFEST_DIR).join(MANIFEST_FILE).is_file()
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +1186,7 @@ mod tests {
         plugin_at(plugin.path(), r#"{"name":"demo","version":"1.0.0"}"#);
         let home = claude_home("demo@mkt", plugin.path());
 
-        let catalog = discover(Some(home.path()));
+        let catalog = discover(None, Some(home.path()));
         assert_eq!(catalog.plugins.len(), 1);
         let p = &catalog.plugins[0];
         assert_eq!(p.key, "demo@mkt");
@@ -715,7 +1199,7 @@ mod tests {
             &home.path().join(CLAUDE_DIR).join(SETTINGS_FILE),
             r#"{"enabledPlugins":{"demo@mkt":false}}"#,
         );
-        let catalog = discover(Some(home.path()));
+        let catalog = discover(None, Some(home.path()));
         assert!(!catalog.plugins[0].enabled);
         assert_eq!(catalog.enabled().count(), 0);
     }
@@ -726,7 +1210,7 @@ mod tests {
         plugin_at(plugin.path(), "{not json");
         let home = claude_home("bad@mkt", plugin.path());
 
-        let catalog = discover(Some(home.path()));
+        let catalog = discover(None, Some(home.path()));
         assert!(catalog.plugins.is_empty());
         assert!(
             catalog.diagnostics.iter().any(|d| d.contains("bad@mkt")),
@@ -740,7 +1224,7 @@ mod tests {
         let plugin = TempDir::new().unwrap();
         let home = claude_home("lsp-only@mkt", plugin.path());
 
-        let catalog = discover(Some(home.path()));
+        let catalog = discover(None, Some(home.path()));
         assert!(catalog.diagnostics.is_empty(), "{:?}", catalog.diagnostics);
         assert_eq!(catalog.plugins.len(), 1);
         let p = &catalog.plugins[0];
@@ -873,24 +1357,267 @@ mod tests {
         let plugin = TempDir::new().unwrap();
         plugin_at(plugin.path(), r#"{"name":"local-demo"}"#);
 
-        let name = register_native("/some/source", plugin.path()).unwrap();
+        let name = register_native("/some/source", plugin.path(), None).unwrap();
         assert_eq!(name, "local-demo");
         // Duplicate registration is rejected.
-        assert!(register_native("/some/source", plugin.path()).is_err());
+        assert!(register_native("/some/source", plugin.path(), None).is_err());
 
-        let catalog = discover(None);
+        let catalog = discover(None, None);
         assert_eq!(catalog.plugins.len(), 1);
         assert_eq!(catalog.plugins[0].source, PluginSource::Native);
         assert!(catalog.plugins[0].enabled);
 
         assert!(set_native_enabled("local-demo", false).unwrap());
-        assert!(!discover(None).plugins[0].enabled);
+        assert!(!discover(None, None).plugins[0].enabled);
         assert!(!set_native_enabled("nope", true).unwrap());
 
         let removed = remove_native("local-demo").unwrap().unwrap();
         assert_eq!(removed.name, "local-demo");
-        assert!(discover(None).plugins.is_empty());
+        assert!(discover(None, None).plugins.is_empty());
         assert!(remove_native("local-demo").unwrap().is_none());
+    }
+
+    #[test]
+    fn command_files_default_dir_and_nested_namespacing() {
+        let plugin = TempDir::new().unwrap();
+        plugin_at(plugin.path(), r#"{"name":"demo"}"#);
+        write(&plugin.path().join("commands").join("deploy.md"), "Deploy");
+        write(
+            &plugin.path().join("commands").join("git").join("commit.md"),
+            "Commit",
+        );
+        write(&plugin.path().join("commands").join("notes.txt"), "x");
+
+        let p = InstalledPlugin {
+            key: "demo".into(),
+            root: plugin.path().to_path_buf(),
+            manifest: load_manifest(plugin.path()).unwrap(),
+            source: PluginSource::Native,
+            enabled: true,
+        };
+        let names: Vec<String> = p.command_files().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["deploy".to_string(), "git:commit".to_string()]);
+    }
+
+    #[test]
+    fn hooks_autoload_parse_and_diagnostics() {
+        let plugin = TempDir::new().unwrap();
+        plugin_at(plugin.path(), r#"{"name":"demo"}"#);
+        write(
+            &plugin.path().join("hooks").join("hooks.json"),
+            r#"{"hooks":{
+                "PreToolUse":[{"matcher":"run_shell_command","hooks":[
+                    {"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/check.sh","timeout":5},
+                    {"type":"prompt","command":"unsupported-kind"}
+                ]}],
+                "SessionStart":[{"hooks":[{"command":"echo hi"}]}],
+                "UserPromptSubmit":[{"hooks":[{"command":"validate"}]}]
+            }}"#,
+        );
+        let p = InstalledPlugin {
+            key: "demo".into(),
+            root: plugin.path().to_path_buf(),
+            manifest: load_manifest(plugin.path()).unwrap(),
+            source: PluginSource::Native,
+            enabled: true,
+        };
+        let mut diags = Vec::new();
+        let hooks = p.hooks(&mut diags);
+        assert_eq!(hooks.len(), 2, "hooks: {hooks:?}");
+        let pre = hooks
+            .iter()
+            .find(|h| h.event == HookEvent::PreToolUse)
+            .unwrap();
+        assert_eq!(pre.matcher.as_deref(), Some("run_shell_command"));
+        assert_eq!(
+            pre.command,
+            format!("{}/check.sh", plugin.path().display())
+        );
+        assert_eq!(pre.timeout, std::time::Duration::from_secs(5));
+        let prompt = hooks
+            .iter()
+            .find(|h| h.event == HookEvent::UserPromptSubmit)
+            .unwrap();
+        assert_eq!(prompt.timeout, std::time::Duration::from_secs(60));
+        assert!(
+            diags.iter().any(|d| d.contains("SessionStart")),
+            "unsupported event diagnostic missing: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("'prompt'")),
+            "unsupported hook type diagnostic missing: {diags:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn hook(event: HookEvent, matcher: Option<&str>, command: &str) -> HookCommand {
+        HookCommand {
+            plugin: "demo".into(),
+            event,
+            matcher: matcher.map(str::to_string),
+            command: command.to_string(),
+            timeout: std::time::Duration::from_secs(10),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_hooks_exit_codes_and_matchers() {
+        let cwd = TempDir::new().unwrap();
+        let hooks = vec![
+            // Matches: echoes context from stdin payload.
+            hook(
+                HookEvent::PreToolUse,
+                Some("run_shell.*"),
+                "cat > /dev/null; echo seen-by-hook",
+            ),
+            // Doesn't match this tool name.
+            hook(HookEvent::PreToolUse, Some("^edit_file$"), "exit 2"),
+            // Wrong event.
+            hook(HookEvent::PostToolUse, None, "exit 2"),
+        ];
+        let payload = serde_json::json!({"tool_name": "run_shell_command"});
+        let decision = run_hooks(
+            &hooks,
+            HookEvent::PreToolUse,
+            Some("run_shell_command"),
+            &payload,
+            cwd.path(),
+        )
+        .await;
+        assert!(!decision.blocked);
+        assert_eq!(decision.context, vec!["seen-by-hook".to_string()]);
+
+        // Blocking hook: exit 2 with stderr reason.
+        let hooks = vec![hook(
+            HookEvent::PreToolUse,
+            None,
+            "echo 'nope, not allowed' >&2; exit 2",
+        )];
+        let decision = run_hooks(
+            &hooks,
+            HookEvent::PreToolUse,
+            Some("anything"),
+            &payload,
+            cwd.path(),
+        )
+        .await;
+        assert!(decision.blocked);
+        assert_eq!(decision.reasons, vec!["nope, not allowed".to_string()]);
+
+        // Non-0/2 exit codes are non-blocking errors.
+        let hooks = vec![hook(HookEvent::PreToolUse, None, "exit 1")];
+        let decision = run_hooks(
+            &hooks,
+            HookEvent::PreToolUse,
+            Some("anything"),
+            &payload,
+            cwd.path(),
+        )
+        .await;
+        assert!(!decision.blocked);
+        assert!(decision.context.is_empty());
+
+        // Hooks with matchers are skipped for events with no matcher
+        // input (prompt events); matcher-less hooks still run.
+        let hooks = vec![
+            hook(HookEvent::UserPromptSubmit, Some(".*"), "exit 2"),
+            hook(HookEvent::UserPromptSubmit, None, "echo prompt-ctx"),
+        ];
+        let decision =
+            run_hooks(&hooks, HookEvent::UserPromptSubmit, None, &payload, cwd.path()).await;
+        assert!(!decision.blocked);
+        assert_eq!(decision.context, vec!["prompt-ctx".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_hooks_timeout_is_nonblocking() {
+        let cwd = TempDir::new().unwrap();
+        let hooks = vec![HookCommand {
+            plugin: "demo".into(),
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "sleep 5".into(),
+            timeout: std::time::Duration::from_millis(50),
+        }];
+        let payload = serde_json::json!({});
+        let decision = run_hooks(
+            &hooks,
+            HookEvent::PreToolUse,
+            Some("x"),
+            &payload,
+            cwd.path(),
+        )
+        .await;
+        assert!(!decision.blocked);
+    }
+
+    #[test]
+    fn project_settings_override_user_enabled_map() {
+        let plugin = TempDir::new().unwrap();
+        plugin_at(plugin.path(), r#"{"name":"demo"}"#);
+        let home = claude_home("demo@mkt", plugin.path());
+        write(
+            &home.path().join(CLAUDE_DIR).join(SETTINGS_FILE),
+            r#"{"enabledPlugins":{"demo@mkt":true}}"#,
+        );
+
+        let project = TempDir::new().unwrap();
+        fs::create_dir_all(project.path().join(".git")).unwrap();
+        fs::write(
+            project.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        write(
+            &project.path().join(CLAUDE_DIR).join(SETTINGS_FILE),
+            r#"{"enabledPlugins":{"demo@mkt":false}}"#,
+        );
+
+        let catalog = discover(Some(project.path()), Some(home.path()));
+        assert!(!catalog.plugins[0].enabled, "project setting should win");
+
+        // settings.local.json wins over settings.json.
+        write(
+            &project.path().join(CLAUDE_DIR).join("settings.local.json"),
+            r#"{"enabledPlugins":{"demo@mkt":true}}"#,
+        );
+        let catalog = discover(Some(project.path()), Some(home.path()));
+        assert!(catalog.plugins[0].enabled, "local setting should win");
+    }
+
+    #[test]
+    fn marketplace_listing_parses_both_source_forms() {
+        let repo = TempDir::new().unwrap();
+        write(
+            &repo.path().join(MANIFEST_DIR).join("marketplace.json"),
+            r#"{"name":"mkt","plugins":[
+                {"name":"local","source":"./plugins/local","description":"in-repo"},
+                {"name":"external","source":{"source":"git-subdir","url":"https://example.com/r.git","path":"plugins/x"}},
+                {"name":"gh","source":{"source":"github","repo":"owner/repo"}}
+            ]}"#,
+        );
+        assert!(!is_plugin_root(repo.path()));
+        let marketplace = load_marketplace(repo.path()).unwrap().unwrap();
+        assert_eq!(marketplace.name, "mkt");
+        assert_eq!(marketplace.plugins.len(), 3);
+        assert!(matches!(
+            marketplace.plugins[0].source,
+            MarketplaceSource::Path(_)
+        ));
+        match &marketplace.plugins[1].source {
+            MarketplaceSource::Detailed(d) => {
+                assert_eq!(d.source, "git-subdir");
+                assert_eq!(d.path.as_deref(), Some("plugins/x"));
+            }
+            other => panic!("expected detailed source, got {other:?}"),
+        }
+        // A plugin repo is not a marketplace.
+        let plugin = TempDir::new().unwrap();
+        plugin_at(plugin.path(), r#"{"name":"p"}"#);
+        assert!(is_plugin_root(plugin.path()));
+        assert!(load_marketplace(plugin.path()).unwrap().is_none());
     }
 
     #[test]
@@ -907,7 +1634,7 @@ mod tests {
         );
 
         set_claude_override("demo@mkt", false).unwrap();
-        let catalog = discover(Some(home.path()));
+        let catalog = discover(None, Some(home.path()));
         assert!(!catalog.plugins[0].enabled);
     }
 }

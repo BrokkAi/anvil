@@ -4223,6 +4223,46 @@ struct ToolExecRequest<'a> {
 }
 
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
+    use crate::plugins::HookEvent;
+
+    // PreToolUse plugin hooks may veto the call before it runs (exit
+    // code 2, Claude Code semantics); their stderr goes back to the
+    // model as the error text.
+    let hooks = registry.plugin_hooks();
+    let has_tool_hooks = hooks
+        .iter()
+        .any(|h| matches!(h.event, HookEvent::PreToolUse | HookEvent::PostToolUse));
+    if has_tool_hooks {
+        let payload = serde_json::json!({
+            "hook_event_name": HookEvent::PreToolUse.name(),
+            "tool_name": request.tool_name,
+            "tool_input": request.args,
+            "cwd": registry.cwd().display().to_string(),
+        });
+        let decision = crate::plugins::run_hooks(
+            hooks,
+            HookEvent::PreToolUse,
+            Some(request.tool_name),
+            &payload,
+            registry.cwd(),
+        )
+        .await;
+        if decision.blocked {
+            return ToolExecution {
+                output: format!(
+                    "Error: tool call blocked by plugin hook:\n{}",
+                    decision.reasons.join("\n")
+                ),
+                failed: true,
+            };
+        }
+    }
+
+    let tool_input = if has_tool_hooks {
+        Some(request.args.clone())
+    } else {
+        None
+    };
     let result = registry
         .execute_with_sandbox_mode_cancellable(
             request.tool_name,
@@ -4233,12 +4273,39 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
             Some(request.cancel),
         )
         .await;
-    tool_result_to_execution(
+    let mut execution = tool_result_to_execution(
         request.tool_name,
         request.shell_sandboxed,
         request.outside_sandbox_once,
         result,
-    )
+    );
+
+    // PostToolUse hooks see the result; an exit-2 hook's stderr is
+    // appended as feedback for the model (the tool already ran).
+    if has_tool_hooks {
+        let payload = serde_json::json!({
+            "hook_event_name": HookEvent::PostToolUse.name(),
+            "tool_name": request.tool_name,
+            "tool_input": tool_input,
+            "tool_response": execution.output,
+            "cwd": registry.cwd().display().to_string(),
+        });
+        let decision = crate::plugins::run_hooks(
+            hooks,
+            HookEvent::PostToolUse,
+            Some(request.tool_name),
+            &payload,
+            registry.cwd(),
+        )
+        .await;
+        if decision.blocked {
+            execution.output.push_str(&format!(
+                "\n\nPlugin hook feedback:\n{}",
+                decision.reasons.join("\n")
+            ));
+        }
+    }
+    execution
 }
 
 fn tool_result_to_execution(
