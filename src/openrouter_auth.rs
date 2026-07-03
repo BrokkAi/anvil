@@ -1,20 +1,19 @@
-//! On-disk credential store for OpenRouter.
+//! Credential access for OpenRouter.
 //!
 //! Unlike Codex, OpenRouter has no OAuth flow -- the user pastes a static
 //! `sk-or-...` key once and we reuse it forever (until they rotate or
 //! disconnect). Persistence is opt-in: users who export
 //! `OPENROUTER_API_KEY` in their shell get the existing zero-config
-//! behaviour, and this file is only created when `/openrouter-login
+//! behaviour, and on-disk state is only created when `/openrouter-login
 //! <key>` is invoked from a session.
 //!
-//! Storage location follows OS conventions via `dirs::config_dir()`:
-//! `~/.config/brokk/openrouter.json` on Linux (or `$XDG_CONFIG_HOME`),
-//! `~/Library/Application Support/brokk/openrouter.json` on macOS,
-//! `%APPDATA%\brokk\openrouter.json` on Windows. The file is written
-//! atomically (stage `.tmp` then rename) and chmod'd to 0600 on Unix so
-//! other local users can't read the key.
+//! Storage lives in the consolidated [`crate::secrets`] store
+//! (`<config>/brokk/secrets.json`, 0600, atomic). The pre-consolidation
+//! per-provider file (`<config>/brokk/openrouter.json`) is still read as
+//! a fallback and is folded into the consolidated store by
+//! [`crate::secrets::migrate_legacy_files`] at startup.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -86,9 +85,11 @@ impl CredentialState {
     }
 }
 
-/// Resolve `<config>/brokk/openrouter.json`. Honours `$BROKK_CONFIG_HOME`
-/// if set so tests (and power users) can redirect the credential file
-/// without touching the real one.
+/// Resolve the legacy `<config>/brokk/openrouter.json` path. Honours
+/// `$BROKK_CONFIG_HOME` if set so tests (and power users) can redirect the
+/// credential files without touching the real ones. New writes go to the
+/// consolidated store; this path survives as the read/migration fallback
+/// and as the anchor for `refresh_log_path`.
 pub fn auth_path() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var("BROKK_CONFIG_HOME") {
         return Ok(PathBuf::from(custom).join("openrouter.json"));
@@ -136,7 +137,22 @@ fn append_refresh_log_inner(line: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read the stored OpenRouter credentials: the consolidated secrets store
+/// first, then the legacy per-provider file (pre-migration installs, or a
+/// migration that could not complete).
 pub fn read() -> Result<Option<OpenRouterAuth>> {
+    if let Some(secrets) = crate::secrets::read()?
+        && let Some(auth) = secrets.openrouter
+    {
+        return Ok(Some(auth));
+    }
+    Ok(read_legacy_file()?.map(|(_, auth)| auth))
+}
+
+/// Read the legacy `openrouter.json`, returning its path alongside the
+/// parsed record so `secrets::migrate_legacy_files` can delete the file
+/// once its contents are safely consolidated.
+pub(crate) fn read_legacy_file() -> Result<Option<(PathBuf, OpenRouterAuth)>> {
     let path = auth_path()?;
     if !path.exists() {
         return Ok(None);
@@ -144,30 +160,24 @@ pub fn read() -> Result<Option<OpenRouterAuth>> {
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let parsed = serde_json::from_slice::<OpenRouterAuth>(&bytes)
         .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(parsed))
+    Ok(Some((path, parsed)))
 }
 
-/// Atomic write: stage to `openrouter.json.tmp` in the same directory,
-/// chmod to 0600, then rename. Mirrors `codex_auth::write_auth_dot_json`
-/// so a crash mid-write never leaves a half-written credential file.
+/// Persist the key into the consolidated secrets store, then drop the
+/// superseded legacy file (best-effort: a leftover legacy file is merely
+/// shadowed, never read back in preference to the store).
 pub fn write(auth: &OpenRouterAuth) -> Result<()> {
-    let path = auth_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(auth).context("serializing OpenRouterAuth")?;
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    set_user_only_perms(&tmp)?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    crate::secrets::update(|secrets| secrets.openrouter = Some(auth.clone()))?;
+    remove_legacy_file();
     Ok(())
 }
 
-/// Best-effort logout: delete the stored credentials. Missing file is
+/// Best-effort logout: delete the stored credentials. Missing state is
 /// not an error -- `/openrouter-login disconnect` is idempotent.
 pub fn logout() -> Result<()> {
+    if crate::secrets::read()?.is_some_and(|secrets| secrets.openrouter.is_some()) {
+        crate::secrets::update(|secrets| secrets.openrouter = None)?;
+    }
     let path = auth_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -175,16 +185,18 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_user_only_perms(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_user_only_perms(_path: &Path) -> Result<()> {
-    Ok(())
+fn remove_legacy_file() {
+    let Ok(path) = auth_path() else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::info!("removed legacy credential file {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            "failed to remove legacy credential file {}: {e}",
+            path.display()
+        ),
+    }
 }
 
 /// Test-only helpers shared with sibling modules so any test that
@@ -273,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn logout_removes_file_and_is_idempotent() {
+    fn logout_clears_stored_key_and_is_idempotent() {
         let _lock = ENV_GUARD.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
@@ -282,33 +294,48 @@ mod tests {
             api_key: "sk-or-test".to_string(),
         })
         .unwrap();
-        assert!(auth_path().unwrap().exists());
+        assert!(read().unwrap().is_some());
         logout().unwrap();
-        assert!(!auth_path().unwrap().exists());
+        assert!(read().unwrap().is_none());
         // second call must not error
         logout().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn write_sets_user_only_permissions() {
-        use std::os::unix::fs::PermissionsExt;
+    fn write_goes_to_consolidated_store_and_supersedes_legacy() {
         let _lock = ENV_GUARD.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
 
+        // Simulate a pre-consolidation install.
+        std::fs::write(auth_path().unwrap(), r#"{"api_key":"sk-or-legacy"}"#).unwrap();
+        assert_eq!(
+            read().unwrap().expect("legacy fallback readable").api_key,
+            "sk-or-legacy"
+        );
+
         write(&OpenRouterAuth {
-            api_key: "sk-or-test".to_string(),
+            api_key: "sk-or-new".to_string(),
         })
         .unwrap();
-        let perms = std::fs::metadata(auth_path().unwrap())
-            .unwrap()
-            .permissions();
-        assert_eq!(
-            perms.mode() & 0o777,
-            0o600,
-            "credential file must be readable only by the owner"
+        assert!(
+            !auth_path().unwrap().exists(),
+            "legacy file removed once superseded"
         );
+        assert!(crate::secrets::secrets_path().unwrap().exists());
+        assert_eq!(read().unwrap().expect("key present").api_key, "sk-or-new");
+    }
+
+    #[test]
+    fn logout_also_removes_legacy_file() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _scope = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
+
+        std::fs::write(auth_path().unwrap(), r#"{"api_key":"sk-or-legacy"}"#).unwrap();
+        logout().unwrap();
+        assert!(!auth_path().unwrap().exists());
+        assert!(read().unwrap().is_none());
     }
 
     #[test]
