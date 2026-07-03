@@ -10422,7 +10422,7 @@ mod tests {
         }];
         let report = render_context_report(&snap, PermissionMode::AcceptEdits, &catalog);
 
-        assert!(report.contains("Mode: `CODE`"));
+        assert!(report.contains("Mode: `LUTZ`"));
         assert!(report.contains("Permission mode: `acceptEdits`"));
         assert!(report.contains("Model: `gpt-99`"));
         assert!(report.contains("(1 known in catalog)"));
