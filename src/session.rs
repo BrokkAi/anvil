@@ -3141,9 +3141,10 @@ impl SessionStore {
     /// MCP server config is consulted only when the registry is built. If
     /// config changes, callers should invalidate the registry first.
     ///
-    /// If the session cwd is unchanged, refresh the cached `SkillRegistry`
-    /// in place so `activate_skill` sees the latest on-disk skills without
-    /// respawning Bifrost.
+    /// If the session cwd is unchanged, reuse the registry and swap in the
+    /// session's current cached skills/agents without respawning Bifrost.
+    /// Callers that change catalog sources should refresh the session context
+    /// first.
     /// If the cwd changed, drop the stale registry and rebuild it so the
     /// registry's own cwd and Bifrost subprocess are rooted in the new
     /// workspace.
@@ -3214,6 +3215,41 @@ impl SessionStore {
 
     pub async fn invalidate_registry(&self, session_id: &str) {
         self.registries.write().await.remove(session_id);
+    }
+
+    /// Re-discover cwd-scoped prompt context, skills, and subagents for a live
+    /// session, then drop its cached tool registry so the next prompt rebuilds
+    /// with fresh plugin hooks and MCP servers.
+    pub async fn refresh_discovered_context(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::skills::SkillRegistry>> {
+        let (cwd, sandbox_mode) = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.closed_sessions.read().await.contains(id) {
+                return None;
+            }
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(id)?;
+            (session.cwd.clone(), session.sandbox_mode)
+        };
+
+        let (project_instructions, skills, agents) = discover_session_context(&cwd, sandbox_mode);
+
+        {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            if self.closed_sessions.read().await.contains(id) {
+                return None;
+            }
+            let mut sessions = self.sessions.write().await;
+            let session = sessions.get_mut(id)?;
+            session.project_instructions = project_instructions;
+            session.skills = skills.clone();
+            session.agents = agents;
+            session.activated_skills.clear();
+        }
+        self.invalidate_registry(id).await;
+        Some(skills)
     }
 
     /// Apply the MCP server set supplied by an ACP `session/load` or
@@ -7815,9 +7851,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refresh_discovered_context_picks_up_plugin_capabilities() {
+        let config = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let plugin_name = format!("refresh-{unique}");
+        let skill_name = format!("skill-{unique}");
+        let command_name = format!("command-{unique}");
+        let agent_name = format!("agent-{unique}");
+        let plugin = tempfile::tempdir().expect("plugin");
+        std::fs::create_dir_all(plugin.path().join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin.path().join(".claude-plugin").join("plugin.json"),
+            format!(r#"{{"name":"{plugin_name}"}}"#),
+        )
+        .unwrap();
+        let skill_dir = plugin.path().join("skills").join(&skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: Plugin skill\n---\n\nbody\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.path().join("commands")).unwrap();
+        std::fs::write(
+            plugin
+                .path()
+                .join("commands")
+                .join(format!("{command_name}.md")),
+            "Run the plugin command\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.path().join("agents")).unwrap();
+        std::fs::write(
+            plugin
+                .path()
+                .join("agents")
+                .join(format!("{agent_name}.md")),
+            format!("---\nname: {agent_name}\ndescription: Plugin agent\n---\n\nbody\n"),
+        )
+        .unwrap();
+
+        {
+            let before = store.sessions.read().await;
+            let before = before.get(&session.id).expect("session exists");
+            assert!(before.skills.get(&skill_name).is_none());
+            assert!(before.skills.get_for_slash_command(&command_name).is_none());
+            assert!(before.agents.get(&agent_name).is_none());
+        }
+
+        crate::plugins::register_native("test-source", plugin.path(), None)
+            .expect("register plugin");
+        let refreshed = store
+            .refresh_discovered_context(&session.id)
+            .await
+            .expect("session should refresh");
+        assert!(refreshed.get(&skill_name).is_some());
+        assert!(refreshed.get_for_slash_command(&command_name).is_some());
+
+        let after = store.sessions.read().await;
+        let after = after.get(&session.id).expect("session exists");
+        assert!(after.skills.get(&skill_name).is_some());
+        assert!(after.skills.get_for_slash_command(&command_name).is_some());
+        assert!(after.agents.get(&agent_name).is_some());
+    }
+
     /// `get_or_create_registry` should reuse the cached registry when the
     /// cwd is only spelled differently (e.g. `path/.`). That keeps the
-    /// existing Bifrost subprocess alive and only refreshes skills in place.
+    /// existing Bifrost subprocess alive while swapping in the session's
+    /// current cached skills and subagents.
     #[tokio::test]
     async fn get_or_create_registry_reuses_cached_registry_for_equivalent_cwd_paths() {
         let store = SessionStore::new("m".to_string());

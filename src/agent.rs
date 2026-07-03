@@ -2083,6 +2083,26 @@ pub async fn run_agent(
                     }
                 };
 
+                // UserPromptSubmit plugin hooks run on the raw user prompt
+                // before any built-in slash command can short-circuit and before
+                // any skill slash expansion. A blocking hook (exit 2) stops the
+                // turn; stdout from successful hooks is appended as extra context
+                // for model-backed prompts below.
+                let prompt_hook_decision =
+                    run_user_prompt_submit_hooks(&snap.cwd, &raw_prompt_text).await;
+                if prompt_hook_decision.blocked {
+                    send_message(
+                        &cx,
+                        &session_id,
+                        &format!(
+                            "Prompt blocked by plugin hook:\n{}",
+                            prompt_hook_decision.reasons.join("\n")
+                        ),
+                    );
+                    return responder.respond(prompt_end_turn_response());
+                }
+                let prompt_hook_context = prompt_hook_decision.context;
+
                 // Slash commands run locally and short-circuit the LLM round-trip.
                 // They are not persisted as conversation turns -- the response is
                 // purely informational and replaying it on the next session load
@@ -2225,14 +2245,17 @@ pub async fn run_agent(
                 }
 
                 if is_slash_command(&raw_prompt_text, "plugin") {
-                    let report = handle_plugin(
+                    let outcome = handle_plugin(
                         &raw_prompt_text,
                         &sessions_prompt,
                         &session_id,
                         &snap.cwd,
                     )
                     .await;
-                    send_message(&cx, &session_id, &report);
+                    send_message(&cx, &session_id, &outcome.report);
+                    if let Some(skills) = outcome.available_commands.as_ref() {
+                        send_available_commands_update(&cx, &session_id, skills);
+                    }
                     return responder.respond(prompt_end_turn_response());
                 }
 
@@ -2311,50 +2334,6 @@ pub async fn run_agent(
                         }
                     }
                 }
-
-                // UserPromptSubmit plugin hooks run on the raw user
-                // prompt before any slash/skill expansion. A blocking
-                // hook (exit 2) stops the turn; stdout from successful
-                // hooks is appended as extra context for the model.
-                let prompt_hook_context = {
-                    let hooks = crate::plugins::discover(
-                        Some(&snap.cwd),
-                        dirs::home_dir().as_deref(),
-                    )
-                    .hooks();
-                    if hooks
-                        .iter()
-                        .any(|h| h.event == crate::plugins::HookEvent::UserPromptSubmit)
-                    {
-                        let payload = serde_json::json!({
-                            "hook_event_name": crate::plugins::HookEvent::UserPromptSubmit.name(),
-                            "prompt": raw_prompt_text,
-                            "cwd": snap.cwd.display().to_string(),
-                        });
-                        let decision = crate::plugins::run_hooks(
-                            &hooks,
-                            crate::plugins::HookEvent::UserPromptSubmit,
-                            None,
-                            &payload,
-                            &snap.cwd,
-                        )
-                        .await;
-                        if decision.blocked {
-                            send_message(
-                                &cx,
-                                &session_id,
-                                &format!(
-                                    "Prompt blocked by plugin hook:\n{}",
-                                    decision.reasons.join("\n")
-                                ),
-                            );
-                            return responder.respond(prompt_end_turn_response());
-                        }
-                        decision.context
-                    } else {
-                        Vec::new()
-                    }
-                };
 
                 let mut prompt_text = if let Some((name, args)) = slash_command.as_ref()
                     && let Some(meta) = snap.skills.get_for_slash_command(name)
@@ -3648,6 +3627,33 @@ fn acp_diff_from_exchange_diff(diff: &ToolExchangeDiff) -> Diff {
 
 fn trace_openrouter_refresh(line: &str) {
     crate::openrouter_auth::append_refresh_log(line);
+}
+
+async fn run_user_prompt_submit_hooks(
+    cwd: &Path,
+    raw_prompt_text: &str,
+) -> crate::plugins::HookDecision {
+    let hooks = crate::plugins::discover(Some(cwd), dirs::home_dir().as_deref()).hooks();
+    if !hooks
+        .iter()
+        .any(|h| h.event == crate::plugins::HookEvent::UserPromptSubmit)
+    {
+        return crate::plugins::HookDecision::default();
+    }
+
+    let payload = serde_json::json!({
+        "hook_event_name": crate::plugins::HookEvent::UserPromptSubmit.name(),
+        "prompt": raw_prompt_text,
+        "cwd": cwd.display().to_string(),
+    });
+    crate::plugins::run_hooks(
+        &hooks,
+        crate::plugins::HookEvent::UserPromptSubmit,
+        None,
+        &payload,
+        cwd,
+    )
+    .await
 }
 
 /// Send a user_message_chunk session update to the client (used when replaying history).
@@ -6120,63 +6126,87 @@ fn shell_quote(value: &str) -> String {
 /// installs are read-only from here except for enable/disable, which is
 /// stored as an Anvil-side override so Claude Code's own settings are
 /// never touched.
+struct PluginCommandOutcome {
+    report: String,
+    available_commands: Option<Arc<crate::skills::SkillRegistry>>,
+}
+
+impl PluginCommandOutcome {
+    fn message(report: String) -> Self {
+        Self {
+            report,
+            available_commands: None,
+        }
+    }
+}
+
 async fn handle_plugin(
     prompt_text: &str,
     sessions: &SessionStore,
     session_id: &str,
     cwd: &Path,
-) -> String {
+) -> PluginCommandOutcome {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
-        return render_plugins(cwd);
+        return PluginCommandOutcome::message(render_plugins(cwd));
     }
 
     let words = match parse_shell_words(&trimmed) {
         Ok(words) => words,
-        Err(e) => return format!("Error: {e}"),
+        Err(e) => return PluginCommandOutcome::message(format!("Error: {e}")),
     };
     let command = words
         .first()
         .map(|word| word.to_ascii_lowercase())
         .unwrap_or_default();
     if command == "list" {
-        return render_plugins(cwd);
+        return PluginCommandOutcome::message(render_plugins(cwd));
     }
     let result = match command.as_str() {
         "add" | "install" => {
             let Some(source) = words.get(1) else {
-                return plugin_usage();
+                return PluginCommandOutcome::message(plugin_usage());
             };
             plugin_add(cwd, source, words.get(2).map(String::as_str)).await
         }
         "remove" | "delete" | "rm" | "uninstall" => {
             let Some(name) = words.get(1) else {
-                return plugin_usage();
+                return PluginCommandOutcome::message(plugin_usage());
             };
             plugin_remove(cwd, name)
         }
         "enable" | "disable" => {
             let Some(name) = words.get(1) else {
-                return plugin_usage();
+                return PluginCommandOutcome::message(plugin_usage());
             };
             plugin_set_enabled(cwd, name, command == "enable")
         }
         "update" => {
             let Some(name) = words.get(1) else {
-                return plugin_usage();
+                return PluginCommandOutcome::message(plugin_usage());
             };
             plugin_update(cwd, name).await
         }
-        "help" => return plugin_usage(),
-        _ => return format!("Unknown plugin command `{command}`.\n\n{}", plugin_usage()),
+        "help" => return PluginCommandOutcome::message(plugin_usage()),
+        _ => {
+            return PluginCommandOutcome::message(format!(
+                "Unknown plugin command `{command}`.\n\n{}",
+                plugin_usage()
+            ));
+        }
     };
 
     match result {
         Ok(message) => {
-            sessions.invalidate_registry(session_id).await;
-            format!("{message}\n\nChanges take effect on the next tool-capable prompt.")
+            let available_commands = sessions.refresh_discovered_context(session_id).await;
+            PluginCommandOutcome {
+                report: format!(
+                    "{message}\n\nChanges take effect on the next tool-capable prompt."
+                ),
+                available_commands,
+            }
         }
-        Err(e) => format!("Error: {e}"),
+        Err(e) => PluginCommandOutcome::message(format!("Error: {e}")),
     }
 }
 
@@ -6255,6 +6285,17 @@ fn resolve_plugin_subpath(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(joined)
 }
 
+fn resolve_local_plugin_source(cwd: &Path, source: &str) -> Result<PathBuf, String> {
+    let expanded = expand_tilde(source);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
+    std::fs::canonicalize(&candidate)
+        .map_err(|e| format!("plugin path '{source}' is not accessible: {e}"))
+}
+
 async fn plugin_add(
     cwd: &Path,
     source: &str,
@@ -6266,9 +6307,7 @@ async fn plugin_add(
 
     // Local path: either a plugin (registered in place, not copied) or a
     // marketplace checkout to pick a plugin from.
-    let expanded = expand_tilde(source);
-    let root = std::fs::canonicalize(&expanded)
-        .map_err(|e| format!("plugin path '{source}' is not accessible: {e}"))?;
+    let root = resolve_local_plugin_source(cwd, source)?;
     if !crate::plugins::is_plugin_root(&root)
         && let Some(marketplace) = crate::plugins::load_marketplace(&root).map_err(|e| {
             format!("'{source}' is not a plugin and its marketplace listing is unreadable: {e:#}")
@@ -10467,6 +10506,90 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
             assert!(resolve_plugin_subpath(root.path(), "escape").is_err());
         }
+    }
+
+    #[test]
+    fn resolve_local_plugin_source_uses_session_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let plugin = cwd.path().join("local-plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+
+        assert_eq!(
+            resolve_local_plugin_source(cwd.path(), "./local-plugin").unwrap(),
+            plugin.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_add_refreshes_session_skills_for_existing_session() {
+        let config = tempfile::tempdir().unwrap();
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config.path().to_path_buf());
+        let store = SessionStore::new("m".to_string());
+        let cwd = tempfile::tempdir().unwrap();
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let skill_name = format!("plugin-skill-{unique}");
+        let plugin = cwd.path().join("local-plugin");
+        std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".claude-plugin").join("plugin.json"),
+            format!(r#"{{"name":"local-{unique}"}}"#),
+        )
+        .unwrap();
+        let skill_dir = plugin.join("skills").join(&skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: Local plugin skill\n---\n\nbody\n"),
+        )
+        .unwrap();
+
+        let outcome = handle_plugin(
+            "/plugin add ./local-plugin",
+            &store,
+            &session.id,
+            cwd.path(),
+        )
+        .await;
+
+        assert!(outcome.report.contains("registered"));
+        let available_commands = outcome
+            .available_commands
+            .expect("successful plugin add should refresh commands");
+        assert!(available_commands.get(&skill_name).is_some());
+        let snap = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("session should still exist");
+        assert!(snap.skills.get(&skill_name).is_some());
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_hooks_see_builtin_slash_prompts() {
+        let config = tempfile::tempdir().unwrap();
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config.path().to_path_buf());
+        let cwd = tempfile::tempdir().unwrap();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let plugin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plugin.path().join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin.path().join(".claude-plugin").join("plugin.json"),
+            format!(r#"{{"name":"hook-{unique}"}}"#),
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.path().join("hooks")).unwrap();
+        std::fs::write(
+            plugin.path().join("hooks").join("hooks.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo blocked >&2; exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        crate::plugins::register_native("test-source", plugin.path(), None)
+            .expect("register plugin");
+
+        let decision = run_user_prompt_submit_hooks(cwd.path(), "/plugin add ./local").await;
+
+        assert!(decision.blocked);
+        assert_eq!(decision.reasons, vec!["blocked".to_string()]);
     }
 
     #[test]
