@@ -879,6 +879,10 @@ fn builtin_commands() -> Vec<AvailableCommand> {
         AvailableCommand::new("rewind", "Remove the latest completed conversation turn"),
         AvailableCommand::new("mcp", "List and configure MCP servers"),
         AvailableCommand::new(
+            "plugin",
+            "List, install, and manage plugins (skills, subagents, MCP servers)",
+        ),
+        AvailableCommand::new(
             "pr-create",
             "Create a GitHub pull request from the current branch (e.g. `/pr-create [title]`)",
         ),
@@ -903,6 +907,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
         "compress",
         "rewind",
         "mcp",
+        "plugin",
         "pr-create",
         "usage",
     ]
@@ -2226,6 +2231,13 @@ pub async fn run_agent(
 
                 if is_slash_command(&raw_prompt_text, "mcp") {
                     let report = handle_mcp(&raw_prompt_text, &sessions_prompt, &session_id).await;
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(prompt_end_turn_response());
+                }
+
+                if is_slash_command(&raw_prompt_text, "plugin") {
+                    let report =
+                        handle_plugin(&raw_prompt_text, &sessions_prompt, &session_id).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(prompt_end_turn_response());
                 }
@@ -5873,6 +5885,408 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Handle the `/plugin` slash command: list installed plugins (Claude
+/// Code + Anvil-native) and manage Anvil-native installs. Claude Code
+/// installs are read-only from here except for enable/disable, which is
+/// stored as an Anvil-side override so Claude Code's own settings are
+/// never touched.
+async fn handle_plugin(prompt_text: &str, sessions: &SessionStore, session_id: &str) -> String {
+    let trimmed = slash_command_args(prompt_text);
+    if trimmed.is_empty() {
+        return render_plugins();
+    }
+
+    let words = match parse_shell_words(&trimmed) {
+        Ok(words) => words,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let command = words
+        .first()
+        .map(|word| word.to_ascii_lowercase())
+        .unwrap_or_default();
+    if command == "list" {
+        return render_plugins();
+    }
+    let result = match command.as_str() {
+        "add" | "install" => {
+            let Some(source) = words.get(1) else {
+                return plugin_usage();
+            };
+            plugin_add(source).await
+        }
+        "remove" | "delete" | "rm" | "uninstall" => {
+            let Some(name) = words.get(1) else {
+                return plugin_usage();
+            };
+            plugin_remove(name)
+        }
+        "enable" | "disable" => {
+            let Some(name) = words.get(1) else {
+                return plugin_usage();
+            };
+            plugin_set_enabled(name, command == "enable")
+        }
+        "update" => {
+            let Some(name) = words.get(1) else {
+                return plugin_usage();
+            };
+            plugin_update(name).await
+        }
+        "help" => return plugin_usage(),
+        _ => return format!("Unknown plugin command `{command}`.\n\n{}", plugin_usage()),
+    };
+
+    match result {
+        Ok(message) => {
+            sessions.invalidate_registry(session_id).await;
+            format!("{message}\n\nChanges take effect on the next tool-capable prompt.")
+        }
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// Sources that `/plugin add` treats as git remotes rather than local
+/// paths. `owner/repo` shorthand expands to a GitHub HTTPS URL.
+fn plugin_git_url(source: &str) -> Option<String> {
+    if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@")
+        || source.starts_with("ssh://")
+        || source.ends_with(".git")
+    {
+        return Some(source.to_string());
+    }
+    let mut parts = source.split('/');
+    if let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next())
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Some(format!("https://github.com/{owner}/{repo}.git"));
+    }
+    None
+}
+
+async fn plugin_add(source: &str) -> Result<String, String> {
+    if let Some(url) = plugin_git_url(source) {
+        return plugin_add_from_git(source, &url).await;
+    }
+
+    // Local path install: registered in place, not copied.
+    let expanded = expand_tilde(source);
+    let root = std::fs::canonicalize(&expanded)
+        .map_err(|e| format!("plugin path '{source}' is not accessible: {e}"))?;
+    let name = crate::plugins::register_native(source, &root)
+        .map_err(|e| format!("failed to register plugin: {e:#}"))?;
+    Ok(format!(
+        "Plugin `{name}` registered from `{}`.\n\n{}",
+        root.display(),
+        describe_plugin(&name)
+    ))
+}
+
+async fn plugin_add_from_git(source: &str, url: &str) -> Result<String, String> {
+    let plugins_dir = crate::plugins::native_plugins_dir()
+        .map_err(|e| format!("cannot resolve plugin install directory: {e:#}"))?;
+    let dir_name = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git")
+        .to_string();
+    if dir_name.is_empty()
+        || !dir_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(format!("cannot derive a plugin directory name from '{url}'"));
+    }
+    let dest = plugins_dir.join(&dir_name);
+    if dest.exists() {
+        return Err(format!(
+            "'{}' already exists; remove it first with `/plugin remove <name>`",
+            dest.display()
+        ));
+    }
+    std::fs::create_dir_all(&plugins_dir)
+        .map_err(|e| format!("cannot create '{}': {e}", plugins_dir.display()))?;
+
+    let clone = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        tokio::process::Command::new("git")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg(url)
+            .arg(&dest)
+            .output(),
+    )
+    .await;
+    let output = match clone {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("failed to run git clone: {e}")),
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err("git clone timed out after 300s".to_string());
+        }
+    };
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&dest);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git clone failed: {}", stderr.trim()));
+    }
+
+    match crate::plugins::register_native(source, &dest) {
+        Ok(name) => Ok(format!(
+            "Plugin `{name}` installed from `{url}` into `{}`.\n\n{}",
+            dest.display(),
+            describe_plugin(&name)
+        )),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            Err(format!("cloned repository is not a valid plugin: {e:#}"))
+        }
+    }
+}
+
+fn plugin_remove(name: &str) -> Result<String, String> {
+    let entry = crate::plugins::remove_native(name)
+        .map_err(|e| format!("failed to update plugin registry: {e:#}"))?;
+    let Some(entry) = entry else {
+        if let Some(key) = find_claude_plugin_key(name) {
+            return Err(format!(
+                "`{key}` is managed by Claude Code; disable it here with `/plugin disable {name}` \
+                 or uninstall it with the `claude` CLI"
+            ));
+        }
+        return Err(format!("no plugin named `{name}` is installed"));
+    };
+    // Only delete directories we created (git clones under the managed
+    // plugins dir); local-path registrations are left in place.
+    let managed = crate::plugins::native_plugins_dir()
+        .ok()
+        .is_some_and(|dir| entry.path.starts_with(&dir));
+    if managed {
+        if let Err(e) = std::fs::remove_dir_all(&entry.path) {
+            return Ok(format!(
+                "Plugin `{name}` unregistered, but its files at `{}` could not be deleted: {e}",
+                entry.path.display()
+            ));
+        }
+        Ok(format!("Plugin `{name}` removed."))
+    } else {
+        Ok(format!(
+            "Plugin `{name}` unregistered. Its files at `{}` were left in place.",
+            entry.path.display()
+        ))
+    }
+}
+
+fn plugin_set_enabled(name: &str, enabled: bool) -> Result<String, String> {
+    let state = if enabled { "enabled" } else { "disabled" };
+    let flipped = crate::plugins::set_native_enabled(name, enabled)
+        .map_err(|e| format!("failed to update plugin registry: {e:#}"))?;
+    if flipped {
+        return Ok(format!("Plugin `{name}` {state}."));
+    }
+    if let Some(key) = find_claude_plugin_key(name) {
+        crate::plugins::set_claude_override(&key, enabled)
+            .map_err(|e| format!("failed to update plugin registry: {e:#}"))?;
+        return Ok(format!(
+            "Plugin `{key}` {state} for Anvil (Claude Code's own setting is untouched)."
+        ));
+    }
+    Err(format!("no plugin named `{name}` is installed"))
+}
+
+async fn plugin_update(name: &str) -> Result<String, String> {
+    let registry = crate::plugins::read_native_registry();
+    let Some(entry) = registry.plugins.iter().find(|p| p.name == name) else {
+        if find_claude_plugin_key(name).is_some() {
+            return Err(format!(
+                "`{name}` is managed by Claude Code; update it with the `claude` CLI"
+            ));
+        }
+        return Err(format!("no plugin named `{name}` is installed"));
+    };
+    if !entry.path.join(".git").exists() {
+        return Err(format!(
+            "plugin `{name}` was registered from a local path; there is nothing to pull"
+        ));
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&entry.path)
+            .arg("pull")
+            .arg("--ff-only")
+            .output(),
+    )
+    .await;
+    let output = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("failed to run git pull: {e}")),
+        Err(_) => return Err("git pull timed out after 300s".to_string()),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git pull failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(format!("Plugin `{name}` updated.\n\n{}", stdout.trim()))
+}
+
+/// Resolve a user-typed name to a Claude Code plugin key. Accepts the
+/// full `name@marketplace` key or the bare plugin name when unambiguous.
+fn find_claude_plugin_key(name: &str) -> Option<String> {
+    let catalog = crate::plugins::discover(dirs::home_dir().as_deref());
+    let claude: Vec<&crate::plugins::InstalledPlugin> = catalog
+        .plugins
+        .iter()
+        .filter(|p| p.source == crate::plugins::PluginSource::ClaudeCode)
+        .collect();
+    if let Some(p) = claude.iter().find(|p| p.key == name) {
+        return Some(p.key.clone());
+    }
+    let mut short_matches = claude
+        .iter()
+        .filter(|p| p.key.split('@').next() == Some(name) || p.manifest.name == name);
+    let first = short_matches.next()?;
+    if short_matches.next().is_some() {
+        return None;
+    }
+    Some(first.key.clone())
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// One-line summary of what a freshly-registered native plugin provides.
+fn describe_plugin(name: &str) -> String {
+    let catalog = crate::plugins::discover(dirs::home_dir().as_deref());
+    let Some(plugin) = catalog
+        .plugins
+        .iter()
+        .find(|p| p.source == crate::plugins::PluginSource::Native && p.key == name)
+    else {
+        return String::new();
+    };
+    format!("It provides {}.", plugin_contents_summary(plugin))
+}
+
+/// Human-readable "N skills, M subagents, K MCP servers" summary.
+fn plugin_contents_summary(plugin: &crate::plugins::InstalledPlugin) -> String {
+    let skills = plugin
+        .skill_roots()
+        .iter()
+        .flat_map(|root| std::fs::read_dir(root).into_iter().flatten().flatten())
+        .filter(|entry| entry.path().join("SKILL.md").is_file())
+        .count();
+    let agents = plugin
+        .agent_sources()
+        .iter()
+        .map(|source| {
+            if source.is_dir() {
+                std::fs::read_dir(source)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|s| s.eq_ignore_ascii_case("md"))
+                    })
+                    .count()
+            } else {
+                1
+            }
+        })
+        .sum::<usize>();
+    let mut diags = Vec::new();
+    let mcp = plugin.mcp_servers(&mut diags).len();
+    format!("{skills} skill(s), {agents} subagent(s), {mcp} MCP server(s)")
+}
+
+fn render_plugins() -> String {
+    let catalog = crate::plugins::discover(dirs::home_dir().as_deref());
+    let mut out = String::from("Plugins\n\n");
+    if catalog.plugins.is_empty() {
+        out.push_str(
+            "No plugins are installed. Plugins installed with `claude plugin install` \
+             are picked up automatically.\n\n",
+        );
+    } else {
+        for plugin in &catalog.plugins {
+            let status = if plugin.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let source = match plugin.source {
+                crate::plugins::PluginSource::ClaudeCode => "Claude Code",
+                crate::plugins::PluginSource::Native => "native",
+            };
+            let version = plugin
+                .manifest
+                .version
+                .as_deref()
+                .map(|v| format!(" v{v}"))
+                .unwrap_or_default();
+            let description = plugin
+                .manifest
+                .description
+                .as_deref()
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- `{}`{version} ({source}, {status}): {}{description}\n",
+                plugin.key,
+                plugin_contents_summary(plugin),
+            ));
+        }
+        out.push('\n');
+    }
+    if !catalog.diagnostics.is_empty() {
+        out.push_str("Warnings:\n");
+        for diag in &catalog.diagnostics {
+            out.push_str(&format!("- {diag}\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str(&plugin_usage());
+    out
+}
+
+fn plugin_usage() -> String {
+    "Commands:\n\
+     - `/plugin list`\n\
+     - `/plugin add <git-url | owner/repo | local-path>`\n\
+     - `/plugin enable <name>`\n\
+     - `/plugin disable <name>`\n\
+     - `/plugin update <name>`\n\
+     - `/plugin remove <name>`\n\n\
+     Plugins provide skills, subagents, and MCP servers in the Claude Code plugin \
+     format (`.claude-plugin/plugin.json`). Plugins installed with \
+     `claude plugin install` are discovered automatically; `/plugin add` installs \
+     into Anvil's own config directory. Enable/disable of Claude Code plugins is \
+     stored on the Anvil side and never modifies Claude Code's settings."
+        .to_string()
 }
 
 /// Handle the `/idle-timeout` slash command. Reads/sets the per-session
@@ -11432,6 +11846,7 @@ mod tests {
                 "compress",
                 "rewind",
                 "mcp",
+                "plugin",
                 "pr-create",
                 "usage",
                 "apple",

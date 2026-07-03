@@ -148,6 +148,27 @@ pub(crate) fn rfc3339_from_millis(millis: u64) -> Option<String> {
 
 fn effective_mcp_servers(extra_servers: Option<Vec<McpServerConfig>>) -> Vec<McpServerConfig> {
     let mut servers = crate::setup_state::read_mcp_servers();
+    // Plugin-provided servers merge below user-configured ones: a
+    // configured server of the same name wins, and bifrost stays Anvil's
+    // managed binary even when a plugin (e.g. brokk) ships its own.
+    let home = dirs::home_dir();
+    for server in crate::plugins::discover(home.as_deref()).mcp_servers() {
+        if server.name == "bifrost" {
+            tracing::debug!(
+                command = %server.command,
+                "ignoring plugin bifrost MCP server; Anvil manages bifrost natively"
+            );
+            continue;
+        }
+        if servers.iter().any(|s| s.name == server.name) {
+            tracing::warn!(
+                name = %server.name,
+                "plugin MCP server shadowed by configured server of the same name"
+            );
+            continue;
+        }
+        servers.push(server);
+    }
     for server in extra_servers.into_iter().flatten() {
         if server.name == "bifrost" {
             tracing::warn!(

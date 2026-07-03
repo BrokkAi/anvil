@@ -5,18 +5,19 @@
 //! cursor, claude code). The full client-implementation guide is at
 //! <https://agentskills.io/client-implementation/adding-skills-support>.
 //!
-//! Discovery scans four roots in order, with **last-wins union**
-//! semantics modelled on opencode
+//! Discovery scans plugin roots plus four filesystem roots in order,
+//! with **last-wins union** semantics modelled on opencode
 //! (`packages/opencode/src/skill/index.ts::discoverSkills`). Scan order
 //! is picked so that the natural precedence emerges from the merge:
 //!
+//!   0. installed plugin `skills/` dirs ([`crate::plugins`])
 //!   1. `~/.claude/skills/`                       (user, Claude compat)
 //!   2. `~/.agents/skills/`                       (user, cross-client)
 //!   3. `<git-root walk down to cwd>/.claude/skills/` (project, Claude compat)
 //!   4. `<git-root walk down to cwd>/.agents/skills/` (project, cross-client)
 //!
-//! As a result: project > user, and within each scope `.agents/` overrides
-//! `.claude/`. On collision the prior entry is overwritten and a
+//! As a result: project > user > plugin, and within each scope `.agents/`
+//! overrides `.claude/`. On collision the prior entry is overwritten and a
 //! diagnostic is pushed (surfaced via `/context`, not the LLM catalog).
 //!
 //! Reading another vendor's config dir (`.claude/`) is endorsed by the
@@ -74,6 +75,9 @@ pub struct SkillMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillScope {
+    /// Provided by an installed plugin (Claude Code or Anvil-native).
+    /// Lowest precedence: user and project skills override on collision.
+    Plugin,
     User,
     Project,
 }
@@ -205,6 +209,17 @@ fn discover_with_backend(
     let cwd = normalize_path(cwd);
     let mut reg = SkillRegistry::default();
     let mut candidates = Vec::new();
+
+    // Plugin scope first, so user/project skills win under last-wins.
+    let plugin_catalog = crate::plugins::discover(home);
+    for diag in &plugin_catalog.diagnostics {
+        reg.push_diagnostic(diag.clone());
+    }
+    for plugin in plugin_catalog.enabled() {
+        for root in plugin.skill_roots() {
+            scan_spec_root(&root, SkillScope::Plugin, &mut candidates, &mut reg);
+        }
+    }
 
     // User scope: `$CODEX_HOME/skills` (or `~/.codex/skills`) first for
     // Codex compatibility, then `~/.claude/skills/`, then
@@ -701,6 +716,77 @@ mod tests {
         let home = TempDir::new().unwrap();
         let reg = discover_inner(project.path(), Some(home.path()));
         assert!(reg.is_empty());
+    }
+
+    /// A home dir with one Claude Code-installed plugin providing a
+    /// `hello` skill. Returns (home, plugin_root) -- the plugin root
+    /// TempDir must outlive the discovery call.
+    fn home_with_plugin_skill(desc: &str) -> (TempDir, TempDir) {
+        let plugin = TempDir::new().unwrap();
+        write(
+            &plugin.path().join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"demo"}"#,
+        );
+        write(
+            &plugin
+                .path()
+                .join("skills")
+                .join("hello")
+                .join(SKILL_FILE),
+            &minimal("hello", desc),
+        );
+        let home = TempDir::new().unwrap();
+        write(
+            &home
+                .path()
+                .join(CLAUDE_DIR)
+                .join("plugins")
+                .join("installed_plugins.json"),
+            &format!(
+                r#"{{"version":2,"plugins":{{"demo@mkt":[{{"scope":"user","installPath":{}}}]}}}}"#,
+                serde_json::to_string(&plugin.path().display().to_string()).unwrap()
+            ),
+        );
+        (home, plugin)
+    }
+
+    #[test]
+    fn plugin_skills_are_discovered() {
+        let project = TempDir::new().unwrap();
+        let (home, _plugin) = home_with_plugin_skill("from plugin");
+        let reg = discover_inner(project.path(), Some(home.path()));
+        let meta = reg.get("hello").expect("plugin skill should register");
+        assert_eq!(meta.description, "from plugin");
+        assert_eq!(meta.scope, SkillScope::Plugin);
+    }
+
+    #[test]
+    fn project_skill_overrides_plugin_skill() {
+        let project = TempDir::new().unwrap();
+        touch_git(project.path());
+        skill_at(
+            project.path(),
+            AGENTS_DIR,
+            "hello",
+            &minimal("hello", "from project"),
+        );
+        let (home, _plugin) = home_with_plugin_skill("from plugin");
+        let reg = discover_inner(project.path(), Some(home.path()));
+        let meta = reg.get("hello").unwrap();
+        assert_eq!(meta.description, "from project");
+        assert_eq!(meta.scope, SkillScope::Project);
+    }
+
+    #[test]
+    fn disabled_plugin_skills_are_not_discovered() {
+        let project = TempDir::new().unwrap();
+        let (home, _plugin) = home_with_plugin_skill("from plugin");
+        write(
+            &home.path().join(CLAUDE_DIR).join("settings.json"),
+            r#"{"enabledPlugins":{"demo@mkt":false}}"#,
+        );
+        let reg = discover_inner(project.path(), Some(home.path()));
+        assert!(reg.get("hello").is_none());
     }
 
     #[test]
