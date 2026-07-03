@@ -5186,11 +5186,7 @@ pub(crate) fn build_skill_payload(meta: &crate::skills::SkillMeta) -> String {
             );
         }
     };
-    let resources = if meta.scope == crate::skills::SkillScope::BuiltIn {
-        Vec::new()
-    } else {
-        crate::skills::list_bundled_resources(&meta.skill_dir)
-    };
+    let resources = crate::skills::list_bundled_resources(&meta.skill_dir);
     let mut out = format!("<skill_content name=\"{}\">\n", xml_escape(&meta.name));
     out.push_str(&body);
     if !body.ends_with('\n') {
@@ -11351,7 +11347,6 @@ mod tests {
                 location: location.clone(),
                 skill_dir: skill_dir.clone(),
                 scope: SkillScope::Project,
-                bundled_body: None,
             });
         }
         // Leak the TempDir so files survive the test (we don't manage
@@ -11455,7 +11450,6 @@ mod tests {
                 location: TestPathBuf::from(format!("/tmp/{name}/SKILL.md")),
                 skill_dir: TestPathBuf::from(format!("/tmp/{name}")),
                 scope: SkillScope::Project,
-                bundled_body: None,
             });
         }
 
@@ -11771,7 +11765,6 @@ mod tests {
             location,
             skill_dir: skill_dir.clone(),
             scope: SkillScope::Project,
-            bundled_body: None,
         };
         let payload = build_skill_payload(&meta);
         assert!(payload.starts_with("<skill_content name=\"demo\">"));

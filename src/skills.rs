@@ -56,59 +56,6 @@ const CLAUDE_DIR: &str = ".claude";
 const CODEX_DIR: &str = ".codex";
 const SKILLS_SUBDIR: &str = "skills";
 
-#[derive(Clone, Copy)]
-struct BundledSkill {
-    path: &'static str,
-    content: &'static str,
-}
-
-const BUNDLED_SKILLS: &[BundledSkill] = &[
-    BundledSkill {
-        path: "code-navigation/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/code-navigation/SKILL.md"),
-    },
-    BundledSkill {
-        path: "code-reading/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/code-reading/SKILL.md"),
-    },
-    BundledSkill {
-        path: "codebase-search/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/codebase-search/SKILL.md"),
-    },
-    BundledSkill {
-        path: "git-exploration/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/git-exploration/SKILL.md"),
-    },
-    BundledSkill {
-        path: "guided-issue/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/guided-issue/SKILL.md"),
-    },
-    BundledSkill {
-        path: "guided-review/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/guided-review/SKILL.md"),
-    },
-    BundledSkill {
-        path: "review-pr/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/review-pr/SKILL.md"),
-    },
-    BundledSkill {
-        path: "review/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/review/SKILL.md"),
-    },
-    BundledSkill {
-        path: "today/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/today/SKILL.md"),
-    },
-    BundledSkill {
-        path: "workspace/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/workspace/SKILL.md"),
-    },
-    BundledSkill {
-        path: "write-issue/SKILL.md",
-        content: include_str!("../bundled/brokk-skills/write-issue/SKILL.md"),
-    },
-];
-
 /// Discovered SKILL.md metadata. The body is loaded on demand by the
 /// activation path (slash command or `activate_skill` tool), not eagerly,
 /// so a session with 30 skills doesn't pay the I/O cost upfront.
@@ -118,18 +65,15 @@ pub struct SkillMeta {
     pub description: String,
     pub location: PathBuf,
     pub skill_dir: PathBuf,
-    /// Where this skill was discovered. Kept for diagnostics today and
+    /// Where this skill was discovered. Only read by tests today;
     /// reserved for future trust-gating (project-scope skills may want
     /// a confirmation step before activation; user-scope ones don't).
+    #[allow(dead_code)]
     pub scope: SkillScope,
-    /// Built-in skill body, when the skill ships with Anvil rather than
-    /// coming from a filesystem root.
-    pub bundled_body: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillScope {
-    BuiltIn,
     User,
     Project,
 }
@@ -262,8 +206,6 @@ fn discover_with_backend(
     let mut reg = SkillRegistry::default();
     let mut candidates = Vec::new();
 
-    load_bundled_skills(&mut reg, backend);
-
     // User scope: `$CODEX_HOME/skills` (or `~/.codex/skills`) first for
     // Codex compatibility, then `~/.claude/skills/`, then
     // `~/.agents/skills/`. `.agents/` remains last so explicit
@@ -333,72 +275,6 @@ fn codex_home_dir(home: &Path) -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(CODEX_DIR))
-}
-
-fn load_bundled_skills(reg: &mut SkillRegistry, backend: &crate::sandbox_backend::SandboxBackend) {
-    for skill in BUNDLED_SKILLS {
-        load_bundled_skill(*skill, reg, backend);
-    }
-}
-
-fn load_bundled_skill(
-    skill: BundledSkill,
-    reg: &mut SkillRegistry,
-    backend: &crate::sandbox_backend::SandboxBackend,
-) {
-    let path = Path::new(skill.path);
-    let (front, body) = match split_frontmatter(skill.content) {
-        Ok(p) => p,
-        Err(e) => {
-            reg.push_diagnostic(format!(
-                "bundled SKILL.md at '{}' missing or unterminated frontmatter: {e}",
-                path.display()
-            ));
-            return;
-        }
-    };
-
-    let parsed = match backend.parse_skill_frontmatter(front) {
-        Ok(p) => p,
-        Err(e) => {
-            reg.push_diagnostic(format!(
-                "bundled SKILL.md at '{}' has invalid YAML frontmatter: {e}",
-                path.display()
-            ));
-            return;
-        }
-    };
-
-    let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
-        reg.push_diagnostic(format!(
-            "bundled SKILL.md at '{}' has no usable `name`; skipping",
-            path.display()
-        ));
-        return;
-    };
-    let description = match parsed.description {
-        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
-        _ => {
-            reg.push_diagnostic(format!(
-                "bundled SKILL.md at '{}' is missing or has empty `description`; skipping",
-                path.display()
-            ));
-            return;
-        }
-    };
-
-    let location = PathBuf::from("<anvil>").join("brokk-skills").join(path);
-    let skill_dir = PathBuf::from("<anvil>")
-        .join("brokk-skills")
-        .join(path.parent().unwrap_or_else(|| Path::new("")));
-    reg.add(SkillMeta {
-        name,
-        description,
-        location,
-        skill_dir,
-        scope: SkillScope::BuiltIn,
-        bundled_body: Some(body.trim_start_matches('\n').trim_end()),
-    });
 }
 
 fn scan_spec_root(
@@ -647,7 +523,6 @@ fn load_skill(
         location: path.to_path_buf(),
         skill_dir,
         scope,
-        bundled_body: None,
     });
 }
 
@@ -712,9 +587,6 @@ fn build_dir_chain(cwd: &Path, git_root: Option<&Path>) -> Vec<PathBuf> {
 /// success; on any I/O or parse error returns the raw file contents so
 /// the user still gets something useful out of `/skill-name`.
 pub fn read_skill_body(meta: &SkillMeta) -> std::io::Result<String> {
-    if let Some(body) = meta.bundled_body {
-        return Ok(body.to_string());
-    }
     let raw = std::fs::read_to_string(&meta.location)?;
     let body = match split_frontmatter(&raw) {
         Ok((_, body)) => body.trim_start_matches('\n').trim_end().to_string(),
@@ -824,16 +696,11 @@ mod tests {
     }
 
     #[test]
-    fn bundled_skills_are_discovered_when_no_files_present() {
+    fn no_skills_discovered_when_no_files_present() {
         let project = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let reg = discover_inner(project.path(), Some(home.path()));
-        assert!(reg.get("brokk-code-navigation").is_some());
-        assert!(reg.get("brokk-review-pr").is_some());
-        assert_eq!(
-            reg.get("brokk-code-navigation").unwrap().scope,
-            SkillScope::BuiltIn
-        );
+        assert!(reg.is_empty());
     }
 
     #[test]
@@ -915,7 +782,6 @@ mod tests {
                 location: skill_dir.join(SKILL_FILE),
                 skill_dir,
                 scope: SkillScope::Project,
-                bundled_body: None,
             });
         }
 
@@ -1250,11 +1116,7 @@ mod tests {
 
         let home = TempDir::new().unwrap();
         let reg = discover_inner(project.path(), Some(home.path()));
-        let names: Vec<&str> = reg
-            .iter_sorted()
-            .filter(|m| m.scope == SkillScope::Project)
-            .map(|m| m.name.as_str())
-            .collect();
+        let names: Vec<&str> = reg.iter_sorted().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["apple", "mango", "zebra"]);
     }
 }
