@@ -4,9 +4,9 @@
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
 //! setup screen and the last selected
-//! model/reasoning effort/permission/sandbox plus the `/setup recap` preference
-//! so configured installs get a short hint instead of the full welcome on every
-//! new session. It also stores
+//! model/reasoning effort/behavior/permission/sandbox plus the `/setup recap`
+//! preference so configured installs get a short hint instead of the full
+//! welcome on every new session. It also stores
 //! user-configured MCP servers; when that field is absent, Anvil seeds the
 //! config with its preinstalled servers.
 
@@ -23,6 +23,12 @@ pub struct SetupState {
     pub last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reasoning_effort: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_optional"
+    )]
+    pub last_behavior_mode: Option<crate::session::SessionMode>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -146,6 +152,10 @@ pub fn remember_last_permission_mode(mode: crate::session::PermissionMode) -> Re
     update(|state| state.last_permission_mode = Some(mode))
 }
 
+pub fn remember_last_behavior_mode(mode: crate::session::SessionMode) -> Result<()> {
+    update(|state| state.last_behavior_mode = Some(mode))
+}
+
 pub fn remember_sandbox_mode(mode: Option<crate::sandbox_backend::SandboxMode>) -> Result<()> {
     update(|state| state.last_sandbox_mode = mode)
 }
@@ -241,10 +251,11 @@ mod tests {
     #[test]
     fn unknown_enum_value_degrades_to_none_and_preserves_siblings() {
         use crate::sandbox_backend::SandboxMode;
-        use crate::session::PermissionMode;
+        use crate::session::{PermissionMode, SessionMode};
 
         let state = SetupState {
             last_model: Some("keep-me".to_string()),
+            last_behavior_mode: Some(SessionMode::Plan),
             last_permission_mode: Some(PermissionMode::AcceptEdits),
             last_sandbox_mode: Some(SandboxMode::Wasm),
             mcp_servers: Some(vec![crate::mcp::McpServerConfig {
@@ -264,7 +275,23 @@ mod tests {
         let parsed: SetupState =
             serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
         assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
+        assert_eq!(parsed.last_behavior_mode, Some(SessionMode::Plan));
         assert_eq!(parsed.last_permission_mode, None);
+        assert_eq!(parsed.last_sandbox_mode, Some(SandboxMode::Wasm));
+        assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
+
+        // Behavior mode is also lenient because it is a persisted enum
+        // preference written by newer builds.
+        let mut json = serde_json::to_value(&state).expect("serialize setup state");
+        json["last_behavior_mode"] = serde_json::Value::String("CODE".to_string());
+        let parsed: SetupState =
+            serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
+        assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
+        assert_eq!(parsed.last_behavior_mode, None);
+        assert_eq!(
+            parsed.last_permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        );
         assert_eq!(parsed.last_sandbox_mode, Some(SandboxMode::Wasm));
         assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
 
@@ -274,6 +301,7 @@ mod tests {
         let parsed: SetupState =
             serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
         assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
+        assert_eq!(parsed.last_behavior_mode, Some(SessionMode::Plan));
         assert_eq!(parsed.last_sandbox_mode, None);
         assert_eq!(
             parsed.last_permission_mode,
