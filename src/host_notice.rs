@@ -182,8 +182,8 @@ pub(crate) fn render_turn_recap(
     stop: &LoopStop,
 ) -> String {
     render_recap_block(
-        summary,
         &describe_loop_stop_for_recap(stop),
+        summary,
         &ToolCallStats::from_exchanges(tool_exchanges),
     )
 }
@@ -198,10 +198,10 @@ pub(crate) fn render_goal_recap(
     detail: Option<&str>,
     stats: &ToolCallStats,
 ) -> String {
-    render_recap_block(detail, stop_line, stats)
+    render_recap_block(stop_line, detail, stats)
 }
 
-fn render_recap_block(detail: Option<&str>, stop_line: &str, stats: &ToolCallStats) -> String {
+fn render_recap_block(stop_line: &str, detail: Option<&str>, stats: &ToolCallStats) -> String {
     let mut out = String::from(TURN_RECAP_NOTICE_SENTINEL);
     if let Some(detail) = detail {
         let detail = sanitize_recap_summary(detail);

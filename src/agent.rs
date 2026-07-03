@@ -3858,6 +3858,9 @@ struct GoalTurnOutcome {
     /// This turn's tool-call statistics, merged into the goal-level
     /// aggregate for the final `/goal` recap.
     tool_stats: crate::host_notice::ToolCallStats,
+    /// Fragment id of this turn's persisted record, when it persisted.
+    /// The goal loop keeps the most recent one as the recap anchor.
+    persisted_fragment_id: Option<String>,
 }
 
 /// Run one model turn for an active goal: inject `prompt_text` as the turn's
@@ -3911,6 +3914,7 @@ async fn run_goal_turn(
         // seam that needs it, rather than carrying a parallel `failure` field.
         failure: turn.stop.failure().cloned(),
         tool_stats: turn.tool_stats,
+        persisted_fragment_id: turn.persisted_fragment_id,
     })
 }
 
@@ -3969,10 +3973,12 @@ async fn run_goal_loop(
     // Aggregate recap state: tool-call stats merged across every goal turn
     // that actually ran (retried failures included -- their tool calls
     // happened), plus the Stop line + optional detail paragraph set at
-    // whichever exit ends the goal. `recorded_turns` gates the recap on at
-    // least one persisted turn existing to anchor it to.
+    // whichever exit ends the goal. `recap_anchor` tracks the fragment id of
+    // the most recent goal turn that actually PERSISTED -- the recap is
+    // gated on it and appended to exactly that turn, never to whatever
+    // happens to be last in history (a pre-goal turn, if a persist failed).
     let mut goal_stats = crate::host_notice::ToolCallStats::default();
-    let mut recorded_turns = 0u32;
+    let mut recap_anchor: Option<String> = None;
 
     let recap_parts: (String, Option<String>) = loop {
         if cancel.is_cancelled() {
@@ -4014,7 +4020,9 @@ async fn run_goal_loop(
         {
             Ok(outcome) => {
                 cumulative = outcome.cumulative_usage;
-                recorded_turns += 1;
+                if let Some(fragment_id) = &outcome.persisted_fragment_id {
+                    recap_anchor = Some(fragment_id.clone());
+                }
                 goal_stats.merge(&outcome.tool_stats);
 
                 // A turn that ended in an LLM failure produced no real
@@ -4121,11 +4129,12 @@ async fn run_goal_loop(
 
     // One aggregate recap for the whole goal run, replacing the per-turn
     // recaps goal turns deliberately skip. Emitted only when at least one
-    // turn was persisted (there is a turn to anchor durability to) and the
-    // user hasn't disabled recaps. Appending to the final goal turn's
-    // persisted response makes it durable on reload like the per-turn recap.
+    // goal turn actually persisted (so there is a specific turn to anchor
+    // durability to) and the user hasn't disabled recaps. Appending to that
+    // exact turn's persisted response makes the recap durable on reload
+    // like the per-turn recap.
     let (stop_line, detail) = recap_parts;
-    if recorded_turns > 0
+    if let Some(anchor_fragment_id) = recap_anchor
         && sessions
             .turn_recap_enabled(session_id)
             .await
@@ -4135,14 +4144,15 @@ async fn run_goal_loop(
             crate::host_notice::render_goal_recap(&stop_line, detail.as_deref(), &goal_stats);
         send_message(cx, session_id, &notice);
         match sessions
-            .append_to_last_turn_response(session_id, &notice)
+            .append_to_last_turn_response(session_id, &anchor_fragment_id, &notice)
             .await
         {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(
                     session_id = %session_id,
-                    "goal recap not persisted: no persisted turn to anchor it to"
+                    "goal recap not persisted: the final goal turn is no longer the \
+                     last turn in this session"
                 );
             }
             Err(e) => {
@@ -4311,6 +4321,10 @@ struct ModelTurnResult {
     /// its full exchanges, diff bodies included) is moved into persistence.
     /// `/goal` merges these across turns for its aggregate recap.
     tool_stats: crate::host_notice::ToolCallStats,
+    /// Fragment id the persisted turn was assigned by `add_turn`, or `None`
+    /// when persistence failed or was discarded. `/goal` anchors its
+    /// aggregate recap to this exact turn rather than "whatever is last".
+    persisted_fragment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5000,16 +5014,20 @@ async fn run_model_turn_in_spawn(
     };
     turn.agent_response = visible_response;
 
-    if let Err(e) = sessions.add_turn(session_id, turn).await {
-        send_message(
-            cx,
-            session_id,
-            &format!(
-                "\n**Warning:** failed to save this conversation turn to disk; \
-                 it will not survive a session reload: {e}\n"
-            ),
-        );
-    }
+    let persisted_fragment_id = match sessions.add_turn(session_id, turn).await {
+        Ok(fragment_id) => fragment_id,
+        Err(e) => {
+            send_message(
+                cx,
+                session_id,
+                &format!(
+                    "\n**Warning:** failed to save this conversation turn to disk; \
+                     it will not survive a session reload: {e}\n"
+                ),
+            );
+            None
+        }
+    };
 
     send_session_usage_update(cx, sessions, session_id, fallback_cwd).await;
     ModelTurnResult {
@@ -5018,6 +5036,7 @@ async fn run_model_turn_in_spawn(
         response: response_text,
         stop,
         tool_stats,
+        persisted_fragment_id,
     }
 }
 

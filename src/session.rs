@@ -2031,7 +2031,12 @@ where
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating sessions dir {}", dir.display()))?;
 
-    let tmp = zip_path.with_extension("tmp");
+    // Unique temp name: multiple rewriters can target the same session zip
+    // concurrently (turn append, manifest rewrite, summary rewrite, goal
+    // recap append), and a shared fixed `.tmp` would let their interleaved
+    // writes corrupt whichever rename lands last. Every error path below
+    // unlinks the temp so unique names don't accumulate orphans.
+    let tmp = zip_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     let file = std::fs::File::create(&tmp)
         .with_context(|| format!("creating temp zip {}", tmp.display()))?;
 
@@ -2046,11 +2051,15 @@ where
         return Err(e);
     }
 
-    writer
-        .finish()
-        .with_context(|| format!("finalizing temp zip {}", tmp.display()))?;
-    std::fs::rename(&tmp, zip_path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), zip_path.display()))?;
+    if let Err(e) = writer.finish() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("finalizing temp zip {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, zip_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), zip_path.display()));
+    }
     Ok(())
 }
 
@@ -4380,13 +4389,25 @@ impl SessionStore {
     /// assistant response, both in memory and in the session zip. Used by
     /// `/goal` to land its aggregate recap on the goal's final turn, which
     /// was already persisted by the shared per-turn pipeline before the goal
-    /// loop knew its stop condition. Returns `Ok(false)` when the session,
-    /// a last turn, or its `fragment_id` is missing (nothing to anchor to).
+    /// loop knew its stop condition. Returns `Ok(false)` when the session or
+    /// a last turn is missing, or when the last turn's `fragment_id` does not
+    /// match `expected_fragment_id` (nothing safe to anchor to).
     pub async fn append_to_last_turn_response(
         &self,
         id: &str,
+        expected_fragment_id: &str,
         notice: &str,
     ) -> anyhow::Result<bool> {
+        // The notice becomes part of the persisted assistant text, so it MUST
+        // strip back out of model history. A non-strippable notice would leak
+        // into future prompts silently; catch that contract violation in
+        // debug/test builds at the seam every caller funnels through.
+        debug_assert_eq!(
+            crate::host_notice::model_visible_assistant_text(&format!("x{notice}")),
+            "x",
+            "append_to_last_turn_response requires a strippable host notice"
+        );
+
         let snapshot = {
             let mut sessions = self.sessions.write().await;
             let Some(session) = sessions.get_mut(id) else {
@@ -4395,22 +4416,24 @@ impl SessionStore {
             let Some(turn) = session.history.last_mut() else {
                 return Ok(false);
             };
-            let Some(fragment_id) = turn.fragment_id.clone() else {
+            // Anchor by identity, not recency: the caller names the exact
+            // persisted turn it means to annotate. If the last turn is a
+            // different one (that turn's persist failed, or something else
+            // landed since), refuse rather than annotate an unrelated turn.
+            if turn.fragment_id.as_deref() != Some(expected_fragment_id) {
                 tracing::warn!(
                     session_id = %id,
-                    "rejecting append_to_last_turn_response: last turn has no fragment_id \
-                     (was it persisted?)"
+                    expected_fragment_id,
+                    actual_fragment_id = turn.fragment_id.as_deref().unwrap_or("(none)"),
+                    "rejecting append_to_last_turn_response: last turn is not the expected anchor"
                 );
                 return Ok(false);
-            };
+            }
             turn.agent_response.push_str(notice);
-            (
-                session.cwd.clone(),
-                fragment_id,
-                turn.agent_response.clone(),
-            )
+            (session.cwd.clone(), turn.agent_response.clone())
         };
-        let (cwd, fragment_id, new_response) = snapshot;
+        let (cwd, new_response) = snapshot;
+        let fragment_id = expected_fragment_id.to_string();
 
         let zip_path = session_zip_path(&cwd, id);
         let fragment_for_zip = fragment_id.clone();
@@ -4732,7 +4755,16 @@ impl SessionStore {
     /// `finish_prompt` runs *after* `add_turn` returns. Without that
     /// ordering, a second `session/prompt` could push a new turn between
     /// this turn's push and its rollback `pop()`, removing the wrong entry.
-    pub async fn add_turn(&self, id: &str, turn: ConversationTurn) -> anyhow::Result<()> {
+    /// Returns the persisted turn's assigned fragment id on success, or
+    /// `Ok(None)` when there was nothing to persist (unknown session, or a
+    /// turn discarded because the session was concurrently deleted). `/goal`
+    /// uses the returned id to anchor its aggregate recap to the exact turn
+    /// it persisted.
+    pub async fn add_turn(
+        &self,
+        id: &str,
+        turn: ConversationTurn,
+    ) -> anyhow::Result<Option<String>> {
         // Mutate in-memory state first, then release the lock BEFORE blocking I/O.
         // Capture pre-mutation `modified` so we can reverse the bump on failure.
         let snapshot = {
@@ -4755,7 +4787,7 @@ impl SessionStore {
         let Some((zip_path, manifest, prev_modified)) = snapshot else {
             // Session is unknown -- no in-memory state to roll back, nothing
             // to persist. Treat as a no-op success.
-            return Ok(());
+            return Ok(None);
         };
 
         let turn_for_zip = turn.clone();
@@ -4803,7 +4835,7 @@ impl SessionStore {
                 let _ = std::fs::remove_file(&zip_path_for_compensate);
             })
             .await;
-            return Ok(());
+            return Ok(None);
         }
         // Stamp the persisted fragment id back onto the in-memory
         // turn so subsequent `set_turn_summary` calls can locate the
@@ -4814,7 +4846,7 @@ impl SessionStore {
         if let Some(session) = self.sessions.write().await.get_mut(id)
             && let Some(last) = session.history.last_mut()
         {
-            last.fragment_id = Some(assigned_fragment_id);
+            last.fragment_id = Some(assigned_fragment_id.clone());
         }
 
         // Persistence succeeded. Apply the in-memory sliding window so
@@ -4832,7 +4864,7 @@ impl SessionStore {
         }
 
         self.touch(id);
-        Ok(())
+        Ok(Some(assigned_fragment_id))
     }
 
     /// List sessions from disk, filtered by cwd.
@@ -8785,8 +8817,9 @@ done
             uuid::Uuid::new_v4()
         ));
         let s = store.create_session(cwd.clone()).await;
+        let mut anchor = None;
         for i in 0..2 {
-            store
+            anchor = store
                 .add_turn(
                     &s.id,
                     ConversationTurn {
@@ -8798,10 +8831,11 @@ done
                 .await
                 .expect("turn persists");
         }
+        let anchor = anchor.expect("add_turn returns the assigned fragment id");
 
-        let notice = "\n\n**Anvil Recap**\n- *Stop: goal achieved after 2 goal turn(s)*.\n";
+        let notice = STRIPPABLE_TEST_NOTICE;
         let ok = store
-            .append_to_last_turn_response(&s.id, notice)
+            .append_to_last_turn_response(&s.id, &anchor, notice)
             .await
             .expect("append persists");
         assert!(ok, "a persisted last turn must accept the notice");
@@ -8827,8 +8861,17 @@ done
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// Appending to a session with no turns (or an unknown session) is a
-    /// graceful no-op, mirroring the `set_turn_summary` guards.
+    /// A well-formed recap block whose three-line tail satisfies the
+    /// model-history stripper, matching what `render_goal_recap` emits;
+    /// `append_to_last_turn_response` debug-asserts strippability.
+    const STRIPPABLE_TEST_NOTICE: &str = "\n\n**Anvil Recap**\n\
+         - *Stop: goal achieved after 2 goal turn(s)*.\n\
+         - *Tools: none*.\n\
+         - *Files changed: none*.\n";
+
+    /// Appending to a session with no turns, an unknown session, or a last
+    /// turn whose fragment id is not the expected anchor is a graceful
+    /// no-op, mirroring the `set_turn_summary` guards.
     #[tokio::test]
     async fn append_to_last_turn_response_without_anchor_is_noop() {
         let store = SessionStore::with_limits(
@@ -8845,16 +8888,87 @@ done
         let s = store.create_session(cwd.clone()).await;
 
         let ok = store
-            .append_to_last_turn_response(&s.id, "notice")
+            .append_to_last_turn_response(&s.id, "anything", STRIPPABLE_TEST_NOTICE)
             .await
             .expect("no error");
         assert!(!ok, "no turns yet: nothing to anchor the notice to");
 
         let ok = store
-            .append_to_last_turn_response("no-such-session", "notice")
+            .append_to_last_turn_response("no-such-session", "anything", STRIPPABLE_TEST_NOTICE)
             .await
             .expect("no error");
         assert!(!ok, "unknown session must be a noop");
+
+        // A last turn that is NOT the expected anchor must be refused: the
+        // recap would otherwise annotate an unrelated turn.
+        store
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "u".into(),
+                    agent_response: "a".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists");
+        let ok = store
+            .append_to_last_turn_response(&s.id, "not-the-real-fragment", STRIPPABLE_TEST_NOTICE)
+            .await
+            .expect("no error");
+        assert!(!ok, "mismatched anchor must be refused");
+        let snap = store.snapshot(&s.id, &cwd).await.expect("snapshot");
+        assert_eq!(
+            snap.history[0].agent_response, "a",
+            "refused append must leave the turn untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A zip-persistence failure must roll the in-memory append back so
+    /// `memory == disk` holds, mirroring
+    /// `add_turn_rolls_back_on_persistence_failure`.
+    #[tokio::test]
+    async fn append_to_last_turn_response_rolls_back_on_persistence_failure() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-append-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+        let anchor = store
+            .add_turn(
+                &s.id,
+                ConversationTurn {
+                    user_prompt: "u".into(),
+                    agent_response: "a".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists")
+            .expect("fragment id assigned");
+
+        // Sabotage the archive so the response rewrite cannot succeed.
+        std::fs::remove_file(session_zip_path(&cwd, &s.id)).expect("remove zip");
+
+        let result = store
+            .append_to_last_turn_response(&s.id, &anchor, STRIPPABLE_TEST_NOTICE)
+            .await;
+        assert!(result.is_err(), "persistence failure must surface as Err");
+
+        let snap = store.snapshot(&s.id, &cwd).await.expect("snapshot");
+        assert_eq!(
+            snap.history[0].agent_response, "a",
+            "failed append must roll the in-memory response back"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
