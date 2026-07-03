@@ -351,7 +351,7 @@ pub struct StreamChatRequest {
 // Chat message (extended for tool calling)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -364,6 +364,50 @@ pub struct ChatMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+}
+
+impl Serialize for ChatMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut len = 1;
+        if !self.content.is_empty() {
+            len += 1;
+        }
+        if self.tool_calls.is_some() {
+            len += 1;
+        }
+        if self.tool_call_id.is_some() {
+            len += 1;
+        }
+        if self.name.is_some() {
+            len += 1;
+        }
+        if self.reasoning_content.is_some() {
+            len += 2;
+        }
+
+        let mut state = serializer.serialize_struct("ChatMessage", len)?;
+        state.serialize_field("role", &self.role)?;
+        if !self.content.is_empty() {
+            state.serialize_field("content", &self.content)?;
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            state.serialize_field("tool_calls", tool_calls)?;
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            state.serialize_field("tool_call_id", tool_call_id)?;
+        }
+        if let Some(name) = &self.name {
+            state.serialize_field("name", name)?;
+        }
+        if let Some(reasoning_content) = &self.reasoning_content {
+            state.serialize_field("reasoning_content", reasoning_content)?;
+            state.serialize_field("reasoning", reasoning_content)?;
+        }
+        state.end()
+    }
 }
 
 impl ChatMessage {
@@ -745,7 +789,7 @@ impl Serialize for ChatCompletionMessage<'_> {
             len += 1;
         }
         if message.reasoning_content.is_some() {
-            len += 1;
+            len += 2;
         }
 
         let mut state = serializer.serialize_struct("ChatCompletionMessage", len)?;
@@ -772,6 +816,7 @@ impl Serialize for ChatCompletionMessage<'_> {
         }
         if let Some(reasoning_content) = &message.reasoning_content {
             state.serialize_field("reasoning_content", reasoning_content)?;
+            state.serialize_field("reasoning", reasoning_content)?;
         }
         state.end()
     }
@@ -1116,14 +1161,37 @@ struct ChunkChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct ChunkDelta {
-    #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
     reasoning_content: Option<String>,
-    #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+impl<'de> Deserialize<'de> for ChunkDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawChunkDelta {
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            reasoning_content: Option<String>,
+            #[serde(default)]
+            reasoning: Option<String>,
+            #[serde(default)]
+            tool_calls: Option<Vec<ChunkToolCall>>,
+        }
+
+        let raw = RawChunkDelta::deserialize(deserializer)?;
+        Ok(Self {
+            content: raw.content,
+            reasoning_content: raw.reasoning_content.or(raw.reasoning),
+            tool_calls: raw.tool_calls,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2875,6 +2943,26 @@ mod tests {
         assert_eq!(*thoughts.lock().unwrap(), vec!["think ", "hard"]);
     }
 
+    #[test]
+    fn chat_completion_chunk_accepts_vllm_reasoning_delta() {
+        let chunk: ChatCompletionChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"reasoning":"thinking"}}]}"#).unwrap();
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("thinking")
+        );
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_content":"deepseek","reasoning":"vllm"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("deepseek")
+        );
+    }
+
     /// Stream EOF without `[DONE]` is incomplete, even if the server
     /// already emitted text. The caller may only retry this safely when
     /// no user-visible output escaped.
@@ -3015,6 +3103,35 @@ mod tests {
             v["content"],
             serde_json::json!([{ "type": "text", "text": "contents" }])
         );
+    }
+
+    #[test]
+    fn chat_message_reasoning_serializes_with_deepseek_and_vllm_keys() {
+        let m = ChatMessage::assistant_with_reasoning("answer", Some("thinking".into()));
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["reasoning_content"], "thinking");
+        assert_eq!(v["reasoning"], "thinking");
+
+        let body = ChatCompletionRequest {
+            model: "openai-compatible-model".into(),
+            messages: vec![m],
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            reasoning: None,
+            thinking: None,
+            reasoning_effort: None,
+            response_format: None,
+        };
+        let body: serde_json::Value = serde_json::to_value(&body).unwrap();
+        let message = &body["messages"][0];
+        assert_eq!(message["reasoning_content"], "thinking");
+        assert_eq!(message["reasoning"], "thinking");
     }
 
     /// `assistant_tool_calls` omits `content` entirely (not `null`),
