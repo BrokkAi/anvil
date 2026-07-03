@@ -385,8 +385,6 @@ fn acp_usage_from_token_usage(usage: crate::llm_client::TokenUsage) -> AcpUsage 
 fn available_modes() -> Vec<AcpSessionMode> {
     vec![
         AcpSessionMode::new("LUTZ", "LUTZ").description("Agentic loop with task list"),
-        AcpSessionMode::new("CODE", "CODE").description("Code changes only"),
-        AcpSessionMode::new("ASK", "ASK").description("Question answering"),
         AcpSessionMode::new("PLAN", "PLAN").description("Planning only"),
     ]
 }
@@ -426,8 +424,6 @@ fn permission_config_option(current: PermissionMode) -> SessionConfigOption {
 fn behavior_config_option(current: SessionMode) -> SessionConfigOption {
     let options = vec![
         SessionConfigSelectOption::new("LUTZ", "LUTZ").description("Agentic loop with task list"),
-        SessionConfigSelectOption::new("CODE", "CODE").description("Code changes only"),
-        SessionConfigSelectOption::new("ASK", "ASK").description("Question answering"),
         SessionConfigSelectOption::new("PLAN", "PLAN").description("Planning only"),
     ];
     SessionConfigOption::select(BEHAVIOR_CONFIG_ID, "Mode", current.as_str(), options)
@@ -725,12 +721,7 @@ async fn apply_config_option(
             let Some(behavior_mode) = SessionMode::parse(value) else {
                 return Err(ConfigApplyError::InvalidValue {
                     reason: format!("unknown behavior mode '{value}'"),
-                    supported: vec![
-                        "LUTZ".to_string(),
-                        "CODE".to_string(),
-                        "ASK".to_string(),
-                        "PLAN".to_string(),
-                    ],
+                    supported: vec!["LUTZ".to_string(), "PLAN".to_string()],
                 });
             };
             match sessions.set_mode(session_id, behavior_mode).await {
@@ -1326,9 +1317,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
     let deepseek_count = source_count(catalog, ModelSource::DeepSeek);
     let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
     let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
-    let deepseek_env_ready = std::env::var(crate::discovery::DEEPSEEK_API_KEY_ENV)
-        .ok()
-        .is_some_and(|raw| !raw.trim().is_empty());
+    let deepseek_state = crate::deepseek_auth::CredentialState::snapshot();
     let ready = if model.is_empty() {
         "No model selected yet.".to_string()
     } else {
@@ -1343,7 +1332,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
          - `/setup bedrock` - Use AWS Bedrock.\n\
          - `/setup local` - Use free local models on this computer.\n\
-         - Set `DEEPSEEK_API_KEY` - Use hosted DeepSeek.\n\
+         - `/setup deepseek` - Use hosted DeepSeek.\n\
          - `/setup openrouter` - Use OpenRouter.\n\
          - `/setup recap` - Configure automatic turn recaps.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
@@ -1371,10 +1360,10 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
         },
         deepseek_status = if deepseek_count > 0 {
             "ready".to_string()
-        } else if deepseek_env_ready {
-            "connected, no models found yet".to_string()
-        } else {
+        } else if deepseek_state.active_source() == "none" {
             "not connected".to_string()
+        } else {
+            "connected, no models found yet".to_string()
         },
         openrouter_status = if openrouter_count > 0 {
             "ready".to_string()
@@ -3916,6 +3905,12 @@ struct GoalTurnOutcome {
     response: String,
     cumulative_usage: crate::llm_client::TokenUsage,
     failure: Option<crate::tool_loop::TurnFailure>,
+    /// This turn's tool-call statistics, merged into the goal-level
+    /// aggregate for the final `/goal` recap.
+    tool_stats: crate::host_notice::ToolCallStats,
+    /// Fragment id of this turn's persisted record, when it persisted.
+    /// The goal loop keeps the most recent one as the recap anchor.
+    persisted_fragment_id: Option<String>,
 }
 
 /// Run one model turn for an active goal: inject `prompt_text` as the turn's
@@ -3968,6 +3963,8 @@ async fn run_goal_turn(
         // Derive the failure from the single source of truth (`stop`) at the one
         // seam that needs it, rather than carrying a parallel `failure` field.
         failure: turn.stop.failure().cloned(),
+        tool_stats: turn.tool_stats,
+        persisted_fragment_id: turn.persisted_fragment_id,
     })
 }
 
@@ -4023,11 +4020,19 @@ async fn run_goal_loop(
     // spinning. Reset by any turn that produced a real model response.
     let mut consecutive_failures = 0u32;
     let mut turn = 0u32;
+    // Aggregate recap state: tool-call stats merged across every goal turn
+    // that actually ran (retried failures included -- their tool calls
+    // happened), plus the Stop line + optional detail paragraph set at
+    // whichever exit ends the goal. `recap_anchor` tracks the fragment id of
+    // the most recent goal turn that actually PERSISTED -- the recap is
+    // gated on it and appended to exactly that turn, never to whatever
+    // happens to be last in history (a pre-goal turn, if a persist failed).
+    let mut goal_stats = crate::host_notice::ToolCallStats::default();
+    let mut recap_anchor: Option<String> = None;
 
-    loop {
+    let (exit, turns_ran): (GoalExit, u32) = loop {
         if cancel.is_cancelled() {
-            send_message(cx, session_id, "Goal cancelled.\n");
-            break;
+            break (GoalExit::Cancelled, turn);
         }
 
         turn += 1;
@@ -4064,6 +4069,10 @@ async fn run_goal_loop(
         {
             Ok(outcome) => {
                 cumulative = outcome.cumulative_usage;
+                if let Some(fragment_id) = &outcome.persisted_fragment_id {
+                    recap_anchor = Some(fragment_id.clone());
+                }
+                goal_stats.merge(&outcome.tool_stats);
 
                 // A turn that ended in an LLM failure produced no real
                 // assistant response to scan for a sentinel. Classify it:
@@ -4074,16 +4083,7 @@ async fn run_goal_loop(
                 if let Some(failure) = outcome.failure {
                     match decide_after_goal_failure(&failure, consecutive_failures) {
                         GoalFailureAction::Stop => {
-                            send_message(
-                                cx,
-                                session_id,
-                                &format!(
-                                    "\n⛔ Goal stopped after {turn} turn(s): the model request \
-                                     failed and cannot be retried.\nReason: {}\n",
-                                    failure.message
-                                ),
-                            );
-                            break;
+                            break (GoalExit::FatalFailure(failure), turn);
                         }
                         GoalFailureAction::Backoff {
                             consecutive_failures: updated,
@@ -4106,8 +4106,7 @@ async fn run_goal_loop(
                             turn -= 1;
                             tokio::select! {
                                 _ = cancel.cancelled() => {
-                                    send_message(cx, session_id, "Goal cancelled.\n");
-                                    break;
+                                    break (GoalExit::Cancelled, turn);
                                 }
                                 _ = tokio::time::sleep(delay) => {}
                             }
@@ -4121,12 +4120,7 @@ async fn run_goal_loop(
                 let signal = detect_goal_signal(&outcome.response);
                 match decide_after_goal_turn(signal, turn, spec.max_turns, consecutive_blocked) {
                     GoalStep::Stop(stop) => {
-                        send_message(
-                            cx,
-                            session_id,
-                            &render_goal_stop(&stop, turn, spec.max_turns),
-                        );
-                        break;
+                        break (GoalExit::Stop(stop), turn);
                     }
                     GoalStep::Continue {
                         consecutive_blocked: updated,
@@ -4139,14 +4133,60 @@ async fn run_goal_loop(
                 }
             }
             Err(LoopIterationError::Terminal(err)) => {
-                send_message(cx, session_id, &format!("\nGoal stopped: {err}\n"));
-                break;
+                // This attempt never ran a model turn, so it doesn't count
+                // toward the recap's goal-turn total.
+                break (GoalExit::Terminal(err), turn.saturating_sub(1));
             }
         }
 
         if cancel.is_cancelled() {
-            send_message(cx, session_id, "Goal cancelled.\n");
-            break;
+            break (GoalExit::Cancelled, turn);
+        }
+    };
+
+    let exit_text = render_goal_exit(&exit, turns_ran, spec.max_turns);
+    send_message(cx, session_id, &exit_text.user_message);
+
+    // One aggregate recap for the whole goal run, replacing the per-turn
+    // recaps goal turns deliberately skip. Emitted only when at least one
+    // goal turn actually persisted (so there is a specific turn to anchor
+    // durability to) and the user hasn't disabled recaps. Appending to that
+    // exact turn's persisted response makes the recap durable on reload
+    // like the per-turn recap.
+    if let Some(anchor_fragment_id) = recap_anchor
+        && sessions
+            .turn_recap_enabled(session_id)
+            .await
+            .unwrap_or(true)
+    {
+        let notice = crate::host_notice::render_goal_recap(
+            &exit_text.recap_stop_line,
+            exit_text.recap_detail.as_deref(),
+            &goal_stats,
+        );
+        send_message(cx, session_id, &notice);
+        match sessions
+            .append_to_last_turn_response(session_id, &anchor_fragment_id, &notice)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "goal recap not persisted: the final goal turn is no longer the \
+                     last turn in this session"
+                );
+            }
+            Err(e) => {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!(
+                        "\n**Warning:** failed to save the goal recap to disk; \
+                         it will not survive a session reload: {e}\n"
+                    ),
+                );
+            }
         }
     }
 
@@ -4299,6 +4339,14 @@ struct ModelTurnResult {
     cumulative_usage: crate::llm_client::TokenUsage,
     response: String,
     stop: crate::tool_loop::LoopStop,
+    /// Compact per-turn tool-call statistics, computed before the turn (and
+    /// its full exchanges, diff bodies included) is moved into persistence.
+    /// `/goal` merges these across turns for its aggregate recap.
+    tool_stats: crate::host_notice::ToolCallStats,
+    /// Fragment id the persisted turn was assigned by `add_turn`, or `None`
+    /// when persistence failed or was discarded. `/goal` anchors its
+    /// aggregate recap to this exact turn rather than "whatever is last".
+    persisted_fragment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4339,7 +4387,7 @@ fn classify_prompt_for_planning(
     prompt_text: &str,
     prompt_parts: &[ChatContentPart],
 ) -> PlanningGateDecision {
-    if matches!(mode, SessionMode::Plan | SessionMode::Ask) {
+    if matches!(mode, SessionMode::Plan) {
         return PlanningGateDecision::Direct;
     }
 
@@ -4968,6 +5016,7 @@ async fn run_model_turn_in_spawn(
         fragment_id: None,
     };
 
+    let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges);
     let visible_response = if turn_recap_enabled && !cancel_status.is_cancelled() {
         let summary = recap_work_summary(
             llm.as_ref(),
@@ -4987,16 +5036,20 @@ async fn run_model_turn_in_spawn(
     };
     turn.agent_response = visible_response;
 
-    if let Err(e) = sessions.add_turn(session_id, turn).await {
-        send_message(
-            cx,
-            session_id,
-            &format!(
-                "\n**Warning:** failed to save this conversation turn to disk; \
-                 it will not survive a session reload: {e}\n"
-            ),
-        );
-    }
+    let persisted_fragment_id = match sessions.add_turn(session_id, turn).await {
+        Ok(fragment_id) => fragment_id,
+        Err(e) => {
+            send_message(
+                cx,
+                session_id,
+                &format!(
+                    "\n**Warning:** failed to save this conversation turn to disk; \
+                     it will not survive a session reload: {e}\n"
+                ),
+            );
+            None
+        }
+    };
 
     send_session_usage_update(cx, sessions, session_id, fallback_cwd).await;
     ModelTurnResult {
@@ -5004,6 +5057,8 @@ async fn run_model_turn_in_spawn(
         cumulative_usage,
         response: response_text,
         stop,
+        tool_stats,
+        persisted_fragment_id,
     }
 }
 
@@ -5120,36 +5175,99 @@ fn build_system_prompt(
     let mode_prompt = match mode {
         SessionMode::Lutz => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. You work \
-             using an agentic approach: break complex tasks into steps, execute them, and report \
-             results. When appropriate, create a task list to track progress."
-        }
-        SessionMode::Code => {
-            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. In this mode, \
-             focus on code changes: generate modifications, refactors, and implementations. Be \
-             concise and focus on the code."
-        }
-        SessionMode::Ask => {
-            "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. Answer \
-             questions about code, architecture, and software engineering concepts thoroughly \
-             but concisely."
+             software engineering, but you can help with any task the user brings to you. Work the task \
+             to completion: investigate with your tools, make the changes, verify them, and \
+             report the result."
         }
         SessionMode::Plan => {
             "You are Brokk, an AI assistant running in a terminal environment. You specialize in \
-             software engineering — code analysis, generation, refactoring, debugging, and \
-             architecture — but you can help with any task the user brings to you. In this mode, \
+             software engineering, but you can help with any task the user brings to you. In this mode, \
              focus on planning: analyze requirements, design solutions, and create implementation \
              plans. Do not write code directly."
         }
     };
 
-    format!("{cwd_context}{mode_prompt}")
+    format!("{cwd_context}{mode_prompt}\n\n{CORE_GUIDANCE}")
 }
+
+/// Shared behavioral guidance appended to every mode's system prompt.
+///
+/// Distilled 2026-07 from the first-party prompts for the model families we
+/// target as students (qwen-code, gemini-cli, opencode's kimi variant,
+/// mistral-vibe, codex): act-with-tools over narrating, convention-following,
+/// minimal diffs, discover-then-run real verification commands, faithful
+/// outcome reporting, dedicated-tool preference, concise CLI output, and
+/// blast-radius care. Kept deliberately compact (~450 words): small open
+/// models follow short imperative rules better than long constitutions, and
+/// this string rides on every request.
+///
+/// Tool-preference language is conditioned on what is ADVERTISED because the
+/// active toolset varies by session (bifrost may be absent; P2T gates tools):
+/// an unconditional "use read_file, not cat" invites calls to tools that are
+/// not in the manifest, which we have observed as hallucinated tool names.
+const CORE_GUIDANCE: &str = "\
+# How you work
+
+- Act through tools. When the task calls for creating, modifying, or running anything, use \
+tools to actually do it — never just describe the change. Code or commands that appear only \
+in your reply change nothing.
+- Never end your reply with a promise of future action (\"I will now run the tests\"): make \
+the tool call in the same response, or deliver the final result.
+- When a request has an obvious default interpretation, act on it; ask only when it is \
+genuinely ambiguous.
+- Make independent tool calls in parallel in a single response; sequence a call only when it \
+depends on an earlier result. Do not edit the same file twice in one response.
+- Before changing code, understand it: read the relevant files and see how the surrounding \
+project does things. Follow the project's existing conventions — style, naming, structure, \
+error handling, test framework. Never assume a library is available; verify the project \
+already uses it first.
+- Change the minimum needed for the task: no drive-by refactors, no speculative error \
+handling, no unrequested features. Prefer editing existing files over creating new ones. Do \
+not revert changes that are not yours.
+- Comments: add one only when the \"why\" cannot be expressed in the code itself. Never \
+narrate what code does or address the user in comments.
+
+# Verification
+
+- After changing code, verify it: find the project's real build, test, and lint commands \
+(README, package configuration, CI files, neighboring tests) and run the relevant ones. \
+Never assume standard commands.
+- Report outcomes faithfully. If tests fail, say so and include the relevant output. Do not \
+claim \"tested\", \"working\", or \"done\" unless you ran the check and saw it pass; if you \
+could not verify, say so plainly.
+- If the same approach fails twice, stop and diagnose — re-read the file, question your \
+assumptions — rather than retrying blindly. Keep going until the task is resolved or you \
+are genuinely blocked on input only the user can provide.
+
+# Tools
+
+- Call only tools that are currently advertised. If a capability seems missing, use the \
+closest advertised tool instead of guessing at names.
+- Prefer a dedicated tool over its shell equivalent whenever one is advertised: file-read \
+tools over cat/head/sed, edit/write tools over sed or heredocs, content search over \
+grep/rg, directory listing over ls.
+- When code-intelligence tools are advertised, prefer them for code questions: \
+search_symbols to locate declarations, get_summaries for API shape and orientation, \
+get_symbol_sources for full definitions, scan_usages for callers. Use text search for \
+plain text, configuration, and docs.
+- Use the shell where CLI semantics matter: builds, tests, git, package managers, pipelines.
+- If a tool call is denied, do not attempt the same action by another route; ask or move on.
+
+# Output
+
+- Be concise and direct; this is a CLI. No filler, preamble, or apologies. Use \
+GitHub-flavored Markdown.
+- Text is for findings and results; tools are for actions. Do not narrate tool calls \
+(\"I will now run...\").
+- End a task with a short summary: what changed, how it was verified, and anything the user \
+should know. One to three sentences is enough for simple tasks.
+
+# Safety
+
+- Before a destructive or hard-to-reverse command (rm, git reset --hard, force-push, \
+dropping data), state in one line what it does and why.
+- Do not push or otherwise mutate state outside the workspace (remotes, deploys, published \
+packages, external services) unless the user asked. Never expose, log, or commit secrets.";
 
 /// Returns true when `prompt_text` invokes the slash command `name`,
 /// matching `/name` exactly or `/name <args>`. Whitespace and case are
@@ -7080,8 +7198,7 @@ async fn apply_sandbox_elicitation_outcome(
 
 /// A choice from the interactive `/setup` home menu, mapped to the sub-flow it
 /// dispatches into. The set mirrors the actionable links in the Markdown home
-/// (`render_setup_home_for_model`); the env-var-only DeepSeek hint has no
-/// menu action, so it is omitted.
+/// (`render_setup_home_for_model`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupHomeRoute {
     /// Pick a ready model automatically (`/setup choose`).
@@ -7092,6 +7209,8 @@ enum SetupHomeRoute {
     Bedrock,
     /// Local Ollama models (`/setup local`).
     Local,
+    /// Hosted DeepSeek key entry (`/setup deepseek`).
+    DeepSeek,
     /// Interactive OpenRouter key entry (`/setup openrouter`).
     OpenRouter,
     /// Turn recap preference (`/setup recap`).
@@ -7108,6 +7227,7 @@ impl SetupHomeRoute {
             Self::Codex => "codex",
             Self::Bedrock => "bedrock",
             Self::Local => "local",
+            Self::DeepSeek => "deepseek",
             Self::OpenRouter => "openrouter",
             Self::Recap => "recap",
             Self::Advanced => "advanced",
@@ -7116,17 +7236,9 @@ impl SetupHomeRoute {
 
     /// Parse a wire value back into a route, ignoring anything unrecognized.
     fn from_value(value: &str) -> Option<Self> {
-        [
-            Self::Choose,
-            Self::Codex,
-            Self::Bedrock,
-            Self::Local,
-            Self::OpenRouter,
-            Self::Recap,
-            Self::Advanced,
-        ]
-        .into_iter()
-        .find(|route| route.value() == value)
+        Self::menu()
+            .into_iter()
+            .find(|route| route.value() == value)
     }
 
     /// Human-readable option label shown in the menu.
@@ -7136,6 +7248,7 @@ impl SetupHomeRoute {
             Self::Codex => "Sign in to Codex / ChatGPT",
             Self::Bedrock => "Use AWS Bedrock",
             Self::Local => "Use free local models (Ollama)",
+            Self::DeepSeek => "Use hosted DeepSeek",
             Self::OpenRouter => "Use OpenRouter",
             Self::Recap => "Configure automatic turn recaps",
             Self::Advanced => "Advanced settings (model ids, sandbox, behavior)",
@@ -7144,12 +7257,13 @@ impl SetupHomeRoute {
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 7] {
+    fn menu() -> [Self; 8] {
         [
             Self::Choose,
             Self::Codex,
             Self::Bedrock,
             Self::Local,
+            Self::DeepSeek,
             Self::OpenRouter,
             Self::Recap,
             Self::Advanced,
@@ -7238,6 +7352,11 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::DeepSeek) => {
+            let message =
+                handle_setup_deepseek(cx, sessions, session_id, llm, refresh_lock, "").await;
             send_message(cx, session_id, &message);
         }
         Some(SetupHomeRoute::Recap) => {
@@ -7349,6 +7468,17 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "bedrock" => {
             handle_setup_bedrock(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
+        }
+        "deepseek" => {
+            handle_setup_deepseek(
                 ctx.cx,
                 ctx.sessions,
                 session_id,
@@ -7619,6 +7749,54 @@ fn render_local_setup_help() -> String {
         .to_string()
 }
 
+/// Shared `refresh | try-again` arm for the provider setup flows: force a
+/// catalog refresh now and report whether the provider's models arrived.
+/// One home for the wording that used to be copied per provider.
+#[allow(clippy::too_many_arguments)]
+async fn handle_provider_setup_refresh(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    source: ModelSource,
+    provider: &str,
+    render_help: fn() -> String,
+) -> String {
+    match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock).await {
+        Ok(catalog) => {
+            let count = source_count(&catalog, source);
+            if count > 0 {
+                format!(
+                    "{provider} models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
+                )
+            } else {
+                format!("{provider} is not showing models yet.\n\n{}", render_help())
+            }
+        }
+        Err(e) => format!("Could not check {provider} yet: {e}\n\n{}", render_help()),
+    }
+}
+
+/// Kick off a background model-catalog refresh with a transcript progress
+/// line -- the tail boilerplate of every provider setup mutation.
+fn refresh_catalog_after(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    sessions: &SessionStore,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    progress: &'static str,
+) {
+    spawn_background_refresh(
+        refresh_lock.clone(),
+        llm.clone(),
+        sessions.clone(),
+        Some((cx.clone(), session_id.to_string(), progress)),
+        None,
+    );
+}
+
 async fn handle_setup_bedrock(
     cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
@@ -7634,33 +7812,17 @@ async fn handle_setup_bedrock(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        return match refresh_model_catalog_now(
-            Some(cx),
-            Some(session_id),
-            llm,
+        return handle_provider_setup_refresh(
+            cx,
             sessions,
+            session_id,
+            llm,
             refresh_lock,
+            ModelSource::Bedrock,
+            "Bedrock",
+            render_bedrock_setup_help,
         )
-        .await
-        {
-            Ok(catalog) => {
-                let count = source_count(&catalog, ModelSource::Bedrock);
-                if count > 0 {
-                    format!(
-                        "Bedrock models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
-                    )
-                } else {
-                    format!(
-                        "Bedrock is not showing models yet.\n\n{}",
-                        render_bedrock_setup_help()
-                    )
-                }
-            }
-            Err(e) => format!(
-                "Could not check Bedrock yet: {e}\n\n{}",
-                render_bedrock_setup_help()
-            ),
-        };
+        .await;
     }
 
     if let Some(key) = rest.strip_prefix("key ") {
@@ -7700,16 +7862,13 @@ async fn handle_setup_bedrock(
                         default_model.clone(),
                     ));
                 llm.install_bedrock(backend);
-                spawn_background_refresh(
-                    refresh_lock.clone(),
-                    llm.clone(),
-                    sessions.clone(),
-                    Some((
-                        cx.clone(),
-                        session_id.to_string(),
-                        "Refreshing model catalog after Bedrock setup...",
-                    )),
-                    None,
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock setup...",
                 );
                 format!(
                     "Bedrock credentials saved.\n\
@@ -7749,16 +7908,13 @@ async fn handle_setup_bedrock(
                             .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string()),
                     ));
                 llm.install_bedrock(backend);
-                spawn_background_refresh(
-                    refresh_lock.clone(),
-                    llm.clone(),
-                    sessions.clone(),
-                    Some((
-                        cx.clone(),
-                        session_id.to_string(),
-                        "Refreshing model catalog after Bedrock region change...",
-                    )),
-                    None,
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock region change...",
                 );
                 format!("Bedrock region set to {region}.")
             }
@@ -7788,16 +7944,13 @@ async fn handle_setup_bedrock(
                         model.to_string(),
                     ));
                 llm.install_bedrock(backend);
-                spawn_background_refresh(
-                    refresh_lock.clone(),
-                    llm.clone(),
-                    sessions.clone(),
-                    Some((
-                        cx.clone(),
-                        session_id.to_string(),
-                        "Refreshing model catalog after Bedrock model change...",
-                    )),
-                    None,
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock model change...",
                 );
                 format!("Bedrock default model set to {model}.")
             }
@@ -7826,7 +7979,7 @@ async fn handle_setup_bedrock(
                                 auth.bearer_token.len()
                             )
                         }
-                        Ok(None) if state.secrets_present => format!(
+                        Ok(None) if state.legacy_secrets_present => format!(
                             "Bedrock is configured from a legacy `~/.secrets` credential file.\n  \
                              Region: {}\n  Model: {}\n\n\
                              Tip: migrate to a managed credential file with `/setup bedrock key <token>`.",
@@ -7846,16 +7999,13 @@ async fn handle_setup_bedrock(
                 match crate::bedrock_auth::logout() {
                     Ok(()) => {
                         llm.uninstall_bedrock();
-                        spawn_background_refresh(
-                            refresh_lock.clone(),
-                            llm.clone(),
-                            sessions.clone(),
-                            Some((
-                                cx.clone(),
-                                session_id.to_string(),
-                                "Refreshing model catalog after Bedrock disconnect...",
-                            )),
-                            None,
+                        refresh_catalog_after(
+                            cx,
+                            session_id,
+                            sessions,
+                            llm,
+                            refresh_lock,
+                            "Refreshing model catalog after Bedrock disconnect...",
                         );
                         render_bedrock_disconnect_success(state)
                     }
@@ -7881,7 +8031,7 @@ fn render_bedrock_disconnect_success(state: crate::bedrock_auth::CredentialState
         );
     }
 
-    if state.active_source() == "secrets" {
+    if state.active_source() == "legacy" {
         "Bedrock legacy `~/.secrets` credentials cleared and the in-memory backend was unloaded. Run `/setup bedrock key <token>` to reconnect."
             .to_string()
     } else {
@@ -7898,7 +8048,7 @@ fn render_bedrock_setup_help() -> String {
             crate::bedrock_client::BEDROCK_API_KEY_ENV
         ),
         "file" => "Bedrock is connected from saved credentials.".to_string(),
-        "secrets" => "Bedrock is connected from a legacy `~/.secrets` credential file.".to_string(),
+        "legacy" => "Bedrock is connected from a legacy `~/.secrets` credential file.".to_string(),
         _ => "Bedrock is not connected.".to_string(),
     };
     let key_help = if state.env_owns() {
@@ -7922,6 +8072,158 @@ fn render_bedrock_setup_help() -> String {
     )
 }
 
+/// Handle `/setup deepseek` and its subcommands: `key <key>` stores the
+/// API key in the consolidated secrets store and installs the backend
+/// live, `status` reports where the active credential comes from, and
+/// `disconnect` wipes the stored key. Mirrors the Bedrock flow, including
+/// the env-owns contract: when `DEEPSEEK_API_KEY` is set, the command
+/// explains rather than mutating state the environment will shadow.
+async fn handle_setup_deepseek(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    rest: &str,
+) -> String {
+    if rest.is_empty() {
+        return render_deepseek_setup_help();
+    }
+    let lower = rest.to_ascii_lowercase();
+    if matches!(lower.as_str(), "refresh" | "try-again") {
+        return handle_provider_setup_refresh(
+            cx,
+            sessions,
+            session_id,
+            llm,
+            refresh_lock,
+            ModelSource::DeepSeek,
+            "DeepSeek",
+            render_deepseek_setup_help,
+        )
+        .await;
+    }
+
+    if let Some(key) = rest.strip_prefix("key ") {
+        let state = crate::deepseek_auth::CredentialState::snapshot();
+        if state.env_owns() {
+            return format!(
+                "DeepSeek credentials are managed by the {} environment variable. \
+                 Unset it and restart before using `/setup deepseek key`.",
+                crate::discovery::DEEPSEEK_API_KEY_ENV
+            );
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return "Provide an API key: `/setup deepseek key <key>`.".to_string();
+        }
+
+        match crate::deepseek_auth::write(&crate::deepseek_auth::DeepSeekAuth {
+            api_key: key.to_string(),
+        }) {
+            Ok(()) => {
+                if let Some(backend) = crate::deepseek_backend_from_key(key) {
+                    llm.install_deepseek(backend);
+                }
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after DeepSeek setup...",
+                );
+                format!(
+                    "DeepSeek API key saved (length {}).\n\n\
+                     Run `/setup choose` or `/setup model` to pick a DeepSeek model.",
+                    key.len()
+                )
+            }
+            Err(e) => format!("Failed to save the DeepSeek API key: {e:#}"),
+        }
+    } else {
+        match lower.as_str() {
+            "status" => {
+                let state = crate::deepseek_auth::CredentialState::snapshot();
+                match state.active_source() {
+                    "env" => format!(
+                        "DeepSeek is configured via the {} environment variable.",
+                        crate::discovery::DEEPSEEK_API_KEY_ENV
+                    ),
+                    "file" => "DeepSeek is configured from the saved API key.".to_string(),
+                    _ => "No DeepSeek credentials found. Run `/setup deepseek key <key>`."
+                        .to_string(),
+                }
+            }
+            "disconnect" => {
+                let state = crate::deepseek_auth::CredentialState::snapshot();
+                match crate::deepseek_auth::logout() {
+                    Ok(()) => {
+                        llm.uninstall_deepseek();
+                        refresh_catalog_after(
+                            cx,
+                            session_id,
+                            sessions,
+                            llm,
+                            refresh_lock,
+                            "Refreshing model catalog after DeepSeek disconnect...",
+                        );
+                        if state.env_owns() {
+                            let env = crate::discovery::DEEPSEEK_API_KEY_ENV;
+                            format!(
+                                "DeepSeek stored key cleared and the in-memory backend was \
+                                 unloaded, but {env} is still set.\n\
+                                 Unset it and restart Anvil to fully disconnect DeepSeek:\n\n  \
+                                 unset {env}\n\n\
+                                 If it comes back after restart, remove it from your shell \
+                                 profile or secrets manager."
+                            )
+                        } else {
+                            "DeepSeek credentials cleared and the in-memory backend was \
+                             unloaded. Run `/setup deepseek key <key>` to reconnect."
+                                .to_string()
+                        }
+                    }
+                    Err(e) => format!("Failed to remove DeepSeek credentials: {e:#}"),
+                }
+            }
+            _ => format!(
+                "Unknown DeepSeek setup option `{rest}`.\n\n{}",
+                render_deepseek_setup_help()
+            ),
+        }
+    }
+}
+
+fn render_deepseek_setup_help() -> String {
+    let state = crate::deepseek_auth::CredentialState::snapshot();
+    let status = match state.active_source() {
+        "env" => format!(
+            "DeepSeek is connected from the {} environment variable.",
+            crate::discovery::DEEPSEEK_API_KEY_ENV
+        ),
+        "file" => "DeepSeek is connected from the saved API key.".to_string(),
+        _ => "DeepSeek is not connected.".to_string(),
+    };
+    let key_help = if state.env_owns() {
+        "Credentials are managed by the environment variable. Unset it and restart to use `/setup deepseek key`."
+            .to_string()
+    } else {
+        "If you have a DeepSeek API key (from https://platform.deepseek.com), run:\n`/setup deepseek key <key>`"
+            .to_string()
+    };
+    format!(
+        "Use hosted DeepSeek\n\n\
+         {status}\n\n\
+         {key_help}\n\n\
+         Other commands:\n\
+         - `/setup deepseek status`\n\
+         - `/setup deepseek disconnect`\n\
+         - `/setup deepseek refresh`\n\n\
+         Choose for me: `/setup choose`."
+    )
+}
+
 async fn handle_setup_openrouter(
     cx: &ConnectionTo<Client>,
     session_id: &str,
@@ -7935,31 +8237,17 @@ async fn handle_setup_openrouter(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        return match refresh_model_catalog_now(
-            Some(cx),
-            Some(session_id),
-            llm,
+        return handle_provider_setup_refresh(
+            cx,
             sessions,
+            session_id,
+            llm,
             refresh_lock,
+            ModelSource::OpenRouter,
+            "OpenRouter",
+            render_openrouter_setup_help,
         )
-        .await
-        {
-            Ok(catalog) => {
-                let count = source_count(&catalog, ModelSource::OpenRouter);
-                if count > 0 {
-                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
-                } else {
-                    format!(
-                        "OpenRouter is not showing models yet.\n\n{}",
-                        render_openrouter_setup_help()
-                    )
-                }
-            }
-            Err(e) => format!(
-                "Could not check OpenRouter yet: {e}\n\n{}",
-                render_openrouter_setup_help()
-            ),
-        };
+        .await;
     }
 
     let prompt = match rest.split_once(char::is_whitespace) {
@@ -8252,17 +8540,13 @@ async fn handle_setup_mode(
     if rest.is_empty() {
         return "How should Anvil behave?\n\n\
                 - `/setup mode agent` - General coding assistant.\n\
-                - `/setup mode code` - Focus on code changes.\n\
-                - `/setup mode ask` - Answer questions.\n\
                 - `/setup mode plan` - Plan only."
             .to_string();
     }
     let value = match rest.to_ascii_lowercase().as_str() {
         "agent" | "default" | "lutz" => "LUTZ",
-        "code" => "CODE",
-        "ask" => "ASK",
         "plan" => "PLAN",
-        _ => return "Unknown mode. Try `/setup mode agent`, `code`, `ask`, or `plan`.".to_string(),
+        _ => return "Unknown mode. Try `/setup mode agent` or `plan`.".to_string(),
     };
     apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
 }
@@ -8803,6 +9087,100 @@ fn render_goal_stop(stop: &GoalStop, turn: u32, max_turns: Option<u32>) -> Strin
              completion signal. Review the progress above and re-run `/goal` \
              (raise or drop `--max-turns`) to keep going.\n",
             max_turns.unwrap_or(turn)
+        ),
+    }
+}
+
+/// Why a goal run ended. Every `run_goal_loop` break site carries one of
+/// these plus the number of goal turns that ran, so a single pure function
+/// ([`render_goal_exit`]) owns all exit wording -- the live stop message
+/// and the aggregate recap's Stop line + detail -- instead of six break
+/// sites assembling strings by hand.
+enum GoalExit {
+    /// Sentinel-driven stop: completed, blocked, or turn ceiling.
+    Stop(GoalStop),
+    Cancelled,
+    /// The model request failed and cannot be retried.
+    FatalFailure(crate::tool_loop::TurnFailure),
+    /// The turn pipeline failed before a model turn could run.
+    Terminal(String),
+}
+
+/// Everything user-visible about one goal exit, from one match.
+struct GoalExitText {
+    /// Streamed to the transcript when the loop ends.
+    user_message: String,
+    /// The aggregate recap's `Stop:` line (host-authored, single line).
+    recap_stop_line: String,
+    /// Optional recap detail paragraph: blocked reason, failure message,
+    /// or remaining-work note.
+    recap_detail: Option<String>,
+}
+
+/// Render every user-visible string for a goal exit. Pure so the wording
+/// is unit-testable without driving the loop; the sentinel-driven arm
+/// reuses [`render_goal_stop`] and [`goal_recap_parts`] so the historical
+/// message wording is unchanged.
+fn render_goal_exit(exit: &GoalExit, turns_ran: u32, max_turns: Option<u32>) -> GoalExitText {
+    match exit {
+        GoalExit::Stop(stop) => {
+            let (recap_stop_line, recap_detail) = goal_recap_parts(stop, turns_ran, max_turns);
+            GoalExitText {
+                user_message: render_goal_stop(stop, turns_ran, max_turns),
+                recap_stop_line,
+                recap_detail,
+            }
+        }
+        GoalExit::Cancelled => GoalExitText {
+            user_message: "Goal cancelled.\n".to_string(),
+            recap_stop_line: format!("goal cancelled after {turns_ran} goal turn(s)"),
+            recap_detail: None,
+        },
+        GoalExit::FatalFailure(failure) => GoalExitText {
+            user_message: format!(
+                "\n⛔ Goal stopped after {turns_ran} turn(s): the model request \
+                 failed and cannot be retried.\nReason: {}\n",
+                failure.message
+            ),
+            recap_stop_line: format!(
+                "goal stopped after {turns_ran} goal turn(s) on a fatal model failure"
+            ),
+            recap_detail: Some(failure.message.clone()),
+        },
+        GoalExit::Terminal(err) => GoalExitText {
+            user_message: format!("\nGoal stopped: {err}\n"),
+            recap_stop_line: format!(
+                "goal stopped after {turns_ran} goal turn(s) on a fatal error"
+            ),
+            recap_detail: Some(err.clone()),
+        },
+    }
+}
+
+/// Host-authored Stop line + optional detail paragraph for the aggregate
+/// goal recap, for the sentinel-driven stops. Pure so the wording can be
+/// unit-tested like [`render_goal_stop`].
+fn goal_recap_parts(
+    stop: &GoalStop,
+    turn: u32,
+    max_turns: Option<u32>,
+) -> (String, Option<String>) {
+    match stop {
+        GoalStop::Completed => (format!("goal achieved after {turn} goal turn(s)"), None),
+        GoalStop::Blocked(reason) => (
+            format!("goal blocked after {turn} goal turn(s)"),
+            Some(format!("Blocked: {reason}")),
+        ),
+        GoalStop::CeilingReached => (
+            format!(
+                "goal stopped at the opt-in {}-turn ceiling",
+                max_turns.unwrap_or(turn)
+            ),
+            Some(
+                "The objective did not report completion before the turn ceiling; \
+                 see the final wrap-up turn above for remaining work."
+                    .to_string(),
+            ),
         ),
     }
 }
@@ -9751,7 +10129,7 @@ mod tests {
 
         let edit = "Fix the typo in README.md";
         assert_eq!(
-            classify_prompt_for_planning(SessionMode::Code, edit, &[ChatContentPart::text(edit)]),
+            classify_prompt_for_planning(SessionMode::Lutz, edit, &[ChatContentPart::text(edit)]),
             PlanningGateDecision::Direct
         );
     }
@@ -9761,7 +10139,7 @@ mod tests {
         for prompt in ["Fix decision handling", "Make startup more efficient"] {
             assert_eq!(
                 classify_prompt_for_planning(
-                    SessionMode::Code,
+                    SessionMode::Lutz,
                     prompt,
                     &[ChatContentPart::text(prompt)],
                 ),
@@ -9793,7 +10171,7 @@ mod tests {
             assert!(
                 matches!(
                     classify_prompt_for_planning(
-                        SessionMode::Code,
+                        SessionMode::Lutz,
                         prompt,
                         &[ChatContentPart::text(prompt)],
                     ),
@@ -9806,7 +10184,7 @@ mod tests {
         let all_issues = "Get all issues, fix them, merge every PR, and do not ask for approval.";
         assert!(matches!(
             classify_prompt_for_planning(
-                SessionMode::Code,
+                SessionMode::Lutz,
                 all_issues,
                 &[ChatContentPart::text(all_issues)],
             ),
@@ -10541,6 +10919,75 @@ mod tests {
     }
 
     #[test]
+    fn render_goal_exit_wording_is_stable() {
+        // Cancelled: fixed live message, turn count in the recap line only.
+        let text = render_goal_exit(&GoalExit::Cancelled, 3, None);
+        assert_eq!(text.user_message, "Goal cancelled.\n");
+        assert_eq!(text.recap_stop_line, "goal cancelled after 3 goal turn(s)");
+        assert_eq!(text.recap_detail, None);
+
+        // Fatal model failure: message matches the historical ⛔ wording and
+        // the failure reason rides into the recap detail.
+        let failure = crate::tool_loop::TurnFailure {
+            retryable: false,
+            message: "invalid_api_key".to_string(),
+        };
+        let text = render_goal_exit(&GoalExit::FatalFailure(failure), 2, None);
+        assert_eq!(
+            text.user_message,
+            "\n⛔ Goal stopped after 2 turn(s): the model request failed and \
+             cannot be retried.\nReason: invalid_api_key\n"
+        );
+        assert_eq!(
+            text.recap_stop_line,
+            "goal stopped after 2 goal turn(s) on a fatal model failure"
+        );
+        assert_eq!(text.recap_detail.as_deref(), Some("invalid_api_key"));
+
+        // Terminal pipeline error.
+        let text = render_goal_exit(&GoalExit::Terminal("unknown session".to_string()), 0, None);
+        assert_eq!(text.user_message, "\nGoal stopped: unknown session\n");
+        assert_eq!(
+            text.recap_stop_line,
+            "goal stopped after 0 goal turn(s) on a fatal error"
+        );
+        assert_eq!(text.recap_detail.as_deref(), Some("unknown session"));
+
+        // Sentinel stops reuse render_goal_stop + goal_recap_parts verbatim.
+        let text = render_goal_exit(&GoalExit::Stop(GoalStop::Completed), 4, None);
+        assert_eq!(
+            text.user_message,
+            render_goal_stop(&GoalStop::Completed, 4, None)
+        );
+        assert_eq!(
+            (text.recap_stop_line, text.recap_detail),
+            goal_recap_parts(&GoalStop::Completed, 4, None)
+        );
+    }
+
+    #[test]
+    fn goal_recap_parts_are_stable() {
+        assert_eq!(
+            goal_recap_parts(&GoalStop::Completed, 4, None),
+            ("goal achieved after 4 goal turn(s)".to_string(), None)
+        );
+        assert_eq!(
+            goal_recap_parts(&GoalStop::Blocked("needs credentials".into()), 7, None),
+            (
+                "goal blocked after 7 goal turn(s)".to_string(),
+                Some("Blocked: needs credentials".to_string())
+            )
+        );
+        let (stop_line, detail) = goal_recap_parts(&GoalStop::CeilingReached, 10, Some(10));
+        assert_eq!(stop_line, "goal stopped at the opt-in 10-turn ceiling");
+        assert!(
+            detail
+                .expect("ceiling stop carries a remaining-work note")
+                .contains("did not report completion"),
+        );
+    }
+
+    #[test]
     fn render_blocked_progress_only_reports_nonzero_counts() {
         assert_eq!(render_blocked_progress(0), None);
         assert_eq!(
@@ -10643,7 +11090,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![
                 ConversationTurn {
@@ -10685,7 +11132,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "u".into(),
@@ -11115,7 +11562,7 @@ mod tests {
         );
     }
 
-    /// All four behavior modes embed the cwd into the system prompt and
+    /// Both behavior modes embed the cwd into the system prompt and
     /// open with the shared general-purpose identity line, while still
     /// carrying a distinct mode-specific paragraph. The "AI coding
     /// assistant" wording must stay gone -- some models refuse non-coding
@@ -11124,9 +11571,7 @@ mod tests {
     fn build_system_prompt_includes_cwd_and_mode_specific_text() {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         for (mode, marker) in [
-            (SessionMode::Lutz, "agentic approach"),
-            (SessionMode::Code, "focus on code changes"),
-            (SessionMode::Ask, "Answer questions about code"),
+            (SessionMode::Lutz, "Work the task to completion"),
             (SessionMode::Plan, "focus on planning"),
         ] {
             let prompt = build_system_prompt(&mode, cwd, &[]);
@@ -11146,6 +11591,15 @@ mod tests {
                 !prompt.contains("AI coding assistant"),
                 "system prompt for {mode:?} must not revive the 'AI coding assistant' wording, got: {prompt}"
             );
+            assert!(
+                prompt.contains("Call only tools that are currently advertised"),
+                "system prompt for {mode:?} must carry the shared core guidance, got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("create a task list"),
+                "system prompt for {mode:?} must not revive the task-list invitation (anvil has \
+                 no todo tool; it induces prose plans instead of tool calls), got: {prompt}"
+            );
         }
     }
 
@@ -11154,7 +11608,7 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/some-cwd");
         let additional = vec![PathBuf::from("/tmp/other-root")];
 
-        let prompt = build_system_prompt(&SessionMode::Code, cwd, &additional);
+        let prompt = build_system_prompt(&SessionMode::Lutz, cwd, &additional);
 
         assert!(
             prompt.contains("/tmp/other-root") || prompt.contains("\\tmp\\other-root"),
@@ -11177,7 +11631,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
                 user_prompt: "hi".repeat(8),
@@ -11199,7 +11653,7 @@ mod tests {
         }];
         let report = render_context_report(&snap, PermissionMode::AcceptEdits, &catalog);
 
-        assert!(report.contains("Mode: `CODE`"));
+        assert!(report.contains("Mode: `LUTZ`"));
         assert!(report.contains("Permission mode: `acceptEdits`"));
         assert!(report.contains("Model: `gpt-99`"));
         assert!(report.contains("(1 known in catalog)"));
@@ -11222,7 +11676,7 @@ mod tests {
         let snapshot = |agent_response: String| SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "hi".into(),
@@ -11274,7 +11728,7 @@ mod tests {
         crate::session::SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: model.into(),
             history: vec![],
             reasoning_effort: None,
@@ -11546,7 +12000,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "gpt-99".into(),
             history: vec![ConversationTurn {
                 user_prompt: "investigate context accounting".into(),
@@ -11584,7 +12038,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Ask,
+            mode: SessionMode::Plan,
             model: "codex::gpt-5-codex".into(),
             history: vec![],
             reasoning_effort: None,
@@ -11617,7 +12071,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Ask,
+            mode: SessionMode::Plan,
             model: "openrouter::openai/gpt-4o".into(),
             history: vec![],
             reasoning_effort: None,
@@ -11746,7 +12200,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "what is rust?".into(),
@@ -11780,7 +12234,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "find TODOs".into(),
@@ -11879,7 +12333,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "find TODOs".into(),
@@ -11948,7 +12402,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "search".into(),
@@ -12004,7 +12458,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "search".into(),
@@ -12075,7 +12529,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
@@ -12116,7 +12570,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "search".into(),
@@ -12196,7 +12650,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
@@ -12228,7 +12682,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: TestPathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
@@ -12492,7 +12946,7 @@ mod tests {
         let msg = render_bedrock_disconnect_success(crate::bedrock_auth::CredentialState {
             env_set: true,
             file_present: true,
-            secrets_present: true,
+            legacy_secrets_present: true,
         });
 
         assert!(
@@ -13236,7 +13690,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![
                 ConversationTurn {
@@ -13290,7 +13744,7 @@ mod tests {
         let snap = SessionSnapshot {
             cwd: std::path::PathBuf::from("/tmp/cwd"),
             additional_directories: Vec::new(),
-            mode: SessionMode::Code,
+            mode: SessionMode::Lutz,
             model: "m".into(),
             history: vec![ConversationTurn {
                 user_prompt: "verbatim user".into(),
@@ -13388,6 +13842,7 @@ mod tests {
                 "codex",
                 "bedrock",
                 "local",
+                "deepseek",
                 "openrouter",
                 "recap",
                 "advanced"

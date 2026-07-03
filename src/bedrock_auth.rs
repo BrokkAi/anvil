@@ -1,26 +1,27 @@
-//! On-disk credential store for AWS Bedrock.
+//! Credential access for AWS Bedrock.
 //!
 //! Bedrock authentication uses a bearer token (AWS SSO token or similar)
 //! plus an optional region and default model override. Unlike Codex,
 //! Bedrock has no OAuth flow -- the user pastes a static bearer token
 //! once and we reuse it forever (until they rotate or disconnect).
 //! Persistence is opt-in: users who export `AWS_BEARER_TOKEN_BEDROCK`
-//! in their shell get the existing zero-config behaviour, and this file
-//! is only created when `/setup bedrock key <token>` is invoked from a
-//! session.
+//! in their shell get the existing zero-config behaviour, and on-disk
+//! state is only created when `/setup bedrock key <token>` is invoked
+//! from a session.
 //!
-//! Storage location follows OS conventions via `dirs::config_dir()`:
-//! `~/.config/brokk/bedrock.json` on Linux (or `$XDG_CONFIG_HOME`),
-//! `~/Library/Application Support/brokk/bedrock.json` on macOS,
-//! `%APPDATA%\brokk\bedrock.json` on Windows. The file is written
-//! atomically (stage `.tmp` then rename) and chmod'd to 0600 on Unix so
-//! other local users can't read the credentials.
+//! Storage lives in the consolidated [`crate::secrets`] store
+//! (`<config>/brokk/secrets.json`, 0600, atomic). The pre-consolidation
+//! per-provider file (`<config>/brokk/bedrock.json`) is still read as a
+//! fallback and is folded into the consolidated store by
+//! [`crate::secrets::migrate_legacy_files`] at startup.
 //!
 //! Legacy fallback: `~/.secrets/bedrock_api_key` and
 //! `~/.secrets/aws_bearer_token_bedrock` are still read as a fallback
-//! for users who configured Bedrock before this file existed.
+//! for users who configured Bedrock before any managed file existed.
+//! That directory is shared with other tools, so those files are never
+//! migrated -- they are only removed on an explicit disconnect.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -52,7 +53,7 @@ pub struct CredentialState {
     /// still resolves. Tracked separately from `file_present` because the
     /// setup commands (`key`/`region`/`model`) write the managed config,
     /// while `disconnect` also has to clear these fallback files.
-    pub secrets_present: bool,
+    pub legacy_secrets_present: bool,
 }
 
 impl CredentialState {
@@ -71,14 +72,14 @@ impl CredentialState {
             Ok(Some(auth)) => !auth.bearer_token.trim().is_empty(),
             _ => false,
         };
-        let secrets_present = matches!(
+        let legacy_secrets_present = matches!(
             crate::bedrock_client::bearer_token_from_secrets(),
             Ok(Some(_))
         );
         Self {
             env_set,
             file_present,
-            secrets_present,
+            legacy_secrets_present,
         }
     }
 
@@ -91,8 +92,8 @@ impl CredentialState {
             "env"
         } else if self.file_present {
             "file"
-        } else if self.secrets_present {
-            "secrets"
+        } else if self.legacy_secrets_present {
+            "legacy"
         } else {
             "none"
         }
@@ -104,8 +105,10 @@ impl CredentialState {
     }
 }
 
-/// Resolve `<config>/brokk/bedrock.json`. Honours `$BROKK_CONFIG_HOME`
-/// if set so tests (and power users) can redirect the credential file.
+/// Resolve the legacy `<config>/brokk/bedrock.json` path. Honours
+/// `$BROKK_CONFIG_HOME` if set so tests (and power users) can redirect the
+/// credential files. New writes go to the consolidated store; this path
+/// survives as the read/migration fallback.
 pub fn auth_path() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var("BROKK_CONFIG_HOME") {
         return Ok(PathBuf::from(custom).join("bedrock.json"));
@@ -115,44 +118,65 @@ pub fn auth_path() -> Result<PathBuf> {
     Ok(base.join("brokk").join("bedrock.json"))
 }
 
+/// Read the stored Bedrock credentials: the consolidated secrets store
+/// first, then the legacy per-provider file (pre-migration installs, or a
+/// migration that could not complete). The `~/.secrets/` token fallback is
+/// separate and resolved by `bedrock_client`.
+/// A malformed secrets store must not mask a valid legacy file, so store
+/// errors degrade to the fallback with a warning instead of propagating --
+/// one bad file never disables every provider at once.
 pub fn read() -> Result<Option<BedrockAuth>> {
-    let path = auth_path()?;
-    if !path.exists() {
-        return Ok(None);
+    match crate::secrets::read() {
+        Ok(Some(secrets)) => {
+            if let Some(auth) = secrets.bedrock {
+                return Ok(Some(auth));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("secrets store unreadable; falling back to legacy bedrock.json: {e:#}")
+        }
     }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed = serde_json::from_slice::<BedrockAuth>(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(parsed))
+    Ok(read_legacy_file()?.map(|(_, auth)| auth))
 }
 
-/// Atomic write: stage to `bedrock.json.tmp` in the same directory,
-/// chmod to 0600, then rename. Mirrors `openrouter_auth::write` so a
-/// crash mid-write never leaves a half-written credential file.
+/// Read the legacy `bedrock.json`, returning its path alongside the
+/// parsed record so `secrets::migrate_legacy_files` can delete the file
+/// once its contents are safely consolidated.
+pub(crate) fn read_legacy_file() -> Result<Option<(PathBuf, BedrockAuth)>> {
+    crate::secrets::read_legacy_json(auth_path()?)
+}
+
+/// Persist the credentials into the consolidated secrets store, then drop
+/// the superseded legacy file (best-effort: a leftover legacy file is
+/// merely shadowed, never read back in preference to the store).
 pub fn write(auth: &BedrockAuth) -> Result<()> {
-    let path = auth_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(auth).context("serializing BedrockAuth")?;
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    set_user_only_perms(&tmp)?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    crate::secrets::update(|secrets| secrets.bedrock = Some(auth.clone()))?;
+    crate::secrets::remove_legacy_credential_file(&auth_path()?);
     Ok(())
 }
 
-/// Best-effort logout: delete the stored credentials. Missing file is
-/// not an error -- `/setup bedrock disconnect` is idempotent.
+/// Best-effort logout: delete the stored credentials. Missing state is
+/// not an error -- `/setup bedrock disconnect` is idempotent. The
+/// section-clear result is deferred so the legacy-file and `~/.secrets/`
+/// removals always run: disconnect is the command a user reaches for to
+/// reset broken state, so a store failure must not block the rest of the
+/// cleanup (a malformed store is quarantined by `update` and the clear
+/// succeeds).
 pub fn logout() -> Result<()> {
+    let store_result = match crate::secrets::read() {
+        Ok(Some(secrets)) if secrets.bedrock.is_some() => {
+            crate::secrets::update(|secrets| secrets.bedrock = None)
+        }
+        Ok(_) => Ok(()),
+        Err(_) => crate::secrets::update(|secrets| secrets.bedrock = None),
+    };
     let path = auth_path()?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     logout_legacy_secrets()?;
-    Ok(())
+    store_result
 }
 
 /// Delete legacy `~/.secrets/` Bedrock token files. Missing files are
@@ -168,18 +192,6 @@ fn logout_legacy_secrets() -> Result<()> {
             Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
         }
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_user_only_perms(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_user_only_perms(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -270,7 +282,7 @@ mod tests {
                 // Redirect the legacy secrets dir into the temp config
                 // home too, so detection never reads the developer's real
                 // ~/.secrets/. It holds no secret-named files unless a
-                // test writes one, so `secrets_present` stays false by
+                // test writes one, so `legacy_secrets_present` stays false by
                 // default.
                 std::env::set_var("BROKK_SECRETS_HOME", config_home);
             }
@@ -322,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn logout_removes_file_and_is_idempotent() {
+    fn logout_clears_stored_credentials_and_is_idempotent() {
         let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let _env = EnvScope::new(tmp.path());
@@ -333,10 +345,38 @@ mod tests {
             default_model: None,
         })
         .unwrap();
-        assert!(auth_path().unwrap().exists());
+        assert!(read().unwrap().is_some());
         logout().unwrap();
-        assert!(!auth_path().unwrap().exists());
+        assert!(read().unwrap().is_none());
         logout().unwrap();
+    }
+
+    #[test]
+    fn read_falls_back_to_legacy_file_and_write_supersedes_it() {
+        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvScope::new(tmp.path());
+
+        // Simulate a pre-consolidation install.
+        std::fs::write(
+            auth_path().unwrap(),
+            r#"{"bearer_token":"legacy-token","region":"eu-west-1"}"#,
+        )
+        .unwrap();
+        let got = read().unwrap().expect("legacy fallback readable");
+        assert_eq!(got.bearer_token, "legacy-token");
+
+        write(&BedrockAuth {
+            bearer_token: "new-token".to_string(),
+            region: Some("us-east-1".to_string()),
+            default_model: None,
+        })
+        .unwrap();
+        assert!(
+            !auth_path().unwrap().exists(),
+            "legacy file removed once superseded"
+        );
+        assert_eq!(read().unwrap().expect("present").bearer_token, "new-token");
     }
 
     #[test]
@@ -349,12 +389,12 @@ mod tests {
         std::fs::write(&aws_secret, "aws-secret-token\n").unwrap();
         std::fs::write(&bedrock_secret, "bedrock-secret-token\n").unwrap();
 
-        assert!(CredentialState::snapshot().secrets_present);
+        assert!(CredentialState::snapshot().legacy_secrets_present);
         logout().unwrap();
 
         assert!(!aws_secret.exists());
         assert!(!bedrock_secret.exists());
-        assert!(!CredentialState::snapshot().secrets_present);
+        assert!(!CredentialState::snapshot().legacy_secrets_present);
         logout().unwrap();
     }
 
@@ -376,41 +416,16 @@ mod tests {
         let before = CredentialState::snapshot();
         assert!(before.env_set);
         assert!(before.file_present);
-        assert!(before.secrets_present);
+        assert!(before.legacy_secrets_present);
 
         logout().unwrap();
 
         let after = CredentialState::snapshot();
         assert!(after.env_set);
         assert!(!after.file_present);
-        assert!(!after.secrets_present);
+        assert!(!after.legacy_secrets_present);
         assert_eq!(after.active_source(), "env");
-        assert!(!auth_path().unwrap().exists());
         assert!(!secret.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_sets_user_only_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::openrouter_auth::test_support::ENV_GUARD.blocking_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvScope::new(tmp.path());
-
-        write(&BedrockAuth {
-            bearer_token: "test-token".to_string(),
-            region: None,
-            default_model: None,
-        })
-        .unwrap();
-        let perms = std::fs::metadata(auth_path().unwrap())
-            .unwrap()
-            .permissions();
-        assert_eq!(
-            perms.mode() & 0o777,
-            0o600,
-            "credential file must be readable only by the owner"
-        );
     }
 
     #[test]
@@ -442,7 +457,7 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(state.file_present);
-        assert!(!state.secrets_present);
+        assert!(!state.legacy_secrets_present);
         assert!(!state.env_owns());
         assert_eq!(state.active_source(), "file");
     }
@@ -456,7 +471,7 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(!state.file_present);
-        assert!(!state.secrets_present);
+        assert!(!state.legacy_secrets_present);
         assert!(!state.env_owns());
         assert_eq!(state.active_source(), "none");
     }
@@ -475,9 +490,9 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(!state.file_present);
-        assert!(state.secrets_present);
+        assert!(state.legacy_secrets_present);
         assert!(!state.env_owns());
-        assert_eq!(state.active_source(), "secrets");
+        assert_eq!(state.active_source(), "legacy");
     }
 
     #[test]
@@ -495,7 +510,7 @@ mod tests {
 
         let state = CredentialState::snapshot();
         assert!(state.file_present);
-        assert!(state.secrets_present);
+        assert!(state.legacy_secrets_present);
         assert_eq!(state.active_source(), "file");
     }
 
