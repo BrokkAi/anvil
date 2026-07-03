@@ -290,6 +290,10 @@ pub(crate) fn p2t_initial_builtin_tools() -> HashSet<String> {
 pub(crate) fn p2t_post_edit_builtin_tools() -> HashSet<String> {
     let mut tools = p2t_initial_builtin_tools();
     tools.insert("run_shell_command".to_string());
+    // Native ranged file read unlocks with shell: pre-unlock the agent must
+    // investigate through the symbol tools only (no file-level reads); once it
+    // has edited, raw reads reveal nothing the edit phase shouldn't see.
+    tools.insert("read_file".to_string());
     tools
 }
 

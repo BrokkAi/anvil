@@ -5523,7 +5523,7 @@ mod tests {
     }
 
     #[test]
-    fn train_bifrost_post_edit_policy_only_adds_shell() {
+    fn train_bifrost_post_edit_policy_adds_shell_and_raw_read() {
         let initial = train_bifrost_initial_builtin_tools();
         let post_edit = train_bifrost_post_edit_builtin_tools();
 
@@ -5535,7 +5535,7 @@ mod tests {
         assert!(!initial.contains("run_shell_command"));
 
         assert!(post_edit.contains("run_shell_command"));
-        assert!(!post_edit.contains("read_file"));
+        assert!(post_edit.contains("read_file"));
         assert!(!post_edit.contains("grep_search"));
     }
 
