@@ -2659,6 +2659,21 @@ fn rewrite_turn_response_in_zip(
     })
 }
 
+/// Flatten a `spawn_blocking` join result into its persistence result,
+/// converting a panicked task into an error. Shared by every
+/// "snapshot -> spawn_blocking -> roll back on failure" persistence path
+/// in [`SessionStore`].
+fn flatten_persist_join<T>(
+    join_result: Result<anyhow::Result<T>, tokio::task::JoinError>,
+) -> anyhow::Result<T> {
+    match join_result {
+        Ok(result) => result,
+        Err(join_err) => Err(anyhow::anyhow!(
+            "session persistence task panicked: {join_err}"
+        )),
+    }
+}
+
 /// Replace manifest.json in an existing session zip, copying all other entries as-is.
 ///
 /// Atomic: any failure leaves the on-disk zip untouched, so callers can roll back
@@ -3735,12 +3750,7 @@ impl SessionStore {
             tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
                 .await;
 
-        let persist_result = match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        };
+        let persist_result = flatten_persist_join(join_result);
 
         if let Err(e) = persist_result {
             tracing::error!(
@@ -4284,12 +4294,7 @@ impl SessionStore {
             tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
                 .await;
 
-        let persist_result = match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        };
+        let persist_result = flatten_persist_join(join_result);
 
         if let Err(e) = persist_result {
             tracing::error!(
@@ -4363,12 +4368,7 @@ impl SessionStore {
             rewrite_turn_summary_in_zip(&zip_path, &fragment_id, &summary_for_zip)
         })
         .await;
-        let persist_result = match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        };
+        let persist_result = flatten_persist_join(join_result);
         if let Err(e) = persist_result {
             tracing::error!(
                 session_id = %id,
@@ -4441,12 +4441,7 @@ impl SessionStore {
             rewrite_turn_response_in_zip(&zip_path, &fragment_for_zip, &new_response)
         })
         .await;
-        let persist_result = match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        };
+        let persist_result = flatten_persist_join(join_result);
         if let Err(e) = persist_result {
             tracing::error!(
                 session_id = %id,
@@ -4514,13 +4509,7 @@ impl SessionStore {
             })
             .await;
 
-        let Some(rewritten) = (match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        })?
-        else {
+        let Some(rewritten) = flatten_persist_join(join_result)? else {
             return Ok(RewindOutcome::Empty);
         };
         let RewrittenHistory {
@@ -4653,12 +4642,7 @@ impl SessionStore {
                 })
                 .await;
 
-                let persist_result = match join_result {
-                    Ok(r) => r,
-                    Err(join_err) => Err(anyhow::anyhow!(
-                        "session persistence task panicked: {join_err}"
-                    )),
-                };
+                let persist_result = flatten_persist_join(join_result);
 
                 if let Err(e) = persist_result {
                     tracing::error!(
@@ -4798,12 +4782,7 @@ impl SessionStore {
         })
         .await;
 
-        let persist_result: anyhow::Result<String> = match join_result {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "session persistence task panicked: {join_err}"
-            )),
-        };
+        let persist_result = flatten_persist_join(join_result);
 
         let assigned_fragment_id = match persist_result {
             Ok(id) => id,

@@ -3980,10 +3980,9 @@ async fn run_goal_loop(
     let mut goal_stats = crate::host_notice::ToolCallStats::default();
     let mut recap_anchor: Option<String> = None;
 
-    let recap_parts: (String, Option<String>) = loop {
+    let (exit, turns_ran): (GoalExit, u32) = loop {
         if cancel.is_cancelled() {
-            send_message(cx, session_id, "Goal cancelled.\n");
-            break (format!("goal cancelled after {turn} goal turn(s)"), None);
+            break (GoalExit::Cancelled, turn);
         }
 
         turn += 1;
@@ -4034,22 +4033,7 @@ async fn run_goal_loop(
                 if let Some(failure) = outcome.failure {
                     match decide_after_goal_failure(&failure, consecutive_failures) {
                         GoalFailureAction::Stop => {
-                            send_message(
-                                cx,
-                                session_id,
-                                &format!(
-                                    "\n⛔ Goal stopped after {turn} turn(s): the model request \
-                                     failed and cannot be retried.\nReason: {}\n",
-                                    failure.message
-                                ),
-                            );
-                            break (
-                                format!(
-                                    "goal stopped after {turn} goal turn(s) on a fatal \
-                                     model failure"
-                                ),
-                                Some(failure.message.clone()),
-                            );
+                            break (GoalExit::FatalFailure(failure), turn);
                         }
                         GoalFailureAction::Backoff {
                             consecutive_failures: updated,
@@ -4072,11 +4056,7 @@ async fn run_goal_loop(
                             turn -= 1;
                             tokio::select! {
                                 _ = cancel.cancelled() => {
-                                    send_message(cx, session_id, "Goal cancelled.\n");
-                                    break (
-                                        format!("goal cancelled after {turn} goal turn(s)"),
-                                        None,
-                                    );
+                                    break (GoalExit::Cancelled, turn);
                                 }
                                 _ = tokio::time::sleep(delay) => {}
                             }
@@ -4090,12 +4070,7 @@ async fn run_goal_loop(
                 let signal = detect_goal_signal(&outcome.response);
                 match decide_after_goal_turn(signal, turn, spec.max_turns, consecutive_blocked) {
                     GoalStep::Stop(stop) => {
-                        send_message(
-                            cx,
-                            session_id,
-                            &render_goal_stop(&stop, turn, spec.max_turns),
-                        );
-                        break goal_recap_parts(&stop, turn, spec.max_turns);
+                        break (GoalExit::Stop(stop), turn);
                     }
                     GoalStep::Continue {
                         consecutive_blocked: updated,
@@ -4108,24 +4083,19 @@ async fn run_goal_loop(
                 }
             }
             Err(LoopIterationError::Terminal(err)) => {
-                send_message(cx, session_id, &format!("\nGoal stopped: {err}\n"));
                 // This attempt never ran a model turn, so it doesn't count
                 // toward the recap's goal-turn total.
-                break (
-                    format!(
-                        "goal stopped after {} goal turn(s) on a fatal error",
-                        turn.saturating_sub(1)
-                    ),
-                    Some(err),
-                );
+                break (GoalExit::Terminal(err), turn.saturating_sub(1));
             }
         }
 
         if cancel.is_cancelled() {
-            send_message(cx, session_id, "Goal cancelled.\n");
-            break (format!("goal cancelled after {turn} goal turn(s)"), None);
+            break (GoalExit::Cancelled, turn);
         }
     };
+
+    let exit_text = render_goal_exit(&exit, turns_ran, spec.max_turns);
+    send_message(cx, session_id, &exit_text.user_message);
 
     // One aggregate recap for the whole goal run, replacing the per-turn
     // recaps goal turns deliberately skip. Emitted only when at least one
@@ -4133,15 +4103,17 @@ async fn run_goal_loop(
     // durability to) and the user hasn't disabled recaps. Appending to that
     // exact turn's persisted response makes the recap durable on reload
     // like the per-turn recap.
-    let (stop_line, detail) = recap_parts;
     if let Some(anchor_fragment_id) = recap_anchor
         && sessions
             .turn_recap_enabled(session_id)
             .await
             .unwrap_or(true)
     {
-        let notice =
-            crate::host_notice::render_goal_recap(&stop_line, detail.as_deref(), &goal_stats);
+        let notice = crate::host_notice::render_goal_recap(
+            &exit_text.recap_stop_line,
+            exit_text.recap_detail.as_deref(),
+            &goal_stats,
+        );
         send_message(cx, session_id, &notice);
         match sessions
             .append_to_last_turn_response(session_id, &anchor_fragment_id, &notice)
@@ -8130,10 +8102,75 @@ fn render_goal_stop(stop: &GoalStop, turn: u32, max_turns: Option<u32>) -> Strin
     }
 }
 
+/// Why a goal run ended. Every `run_goal_loop` break site carries one of
+/// these plus the number of goal turns that ran, so a single pure function
+/// ([`render_goal_exit`]) owns all exit wording -- the live stop message
+/// and the aggregate recap's Stop line + detail -- instead of six break
+/// sites assembling strings by hand.
+enum GoalExit {
+    /// Sentinel-driven stop: completed, blocked, or turn ceiling.
+    Stop(GoalStop),
+    Cancelled,
+    /// The model request failed and cannot be retried.
+    FatalFailure(crate::tool_loop::TurnFailure),
+    /// The turn pipeline failed before a model turn could run.
+    Terminal(String),
+}
+
+/// Everything user-visible about one goal exit, from one match.
+struct GoalExitText {
+    /// Streamed to the transcript when the loop ends.
+    user_message: String,
+    /// The aggregate recap's `Stop:` line (host-authored, single line).
+    recap_stop_line: String,
+    /// Optional recap detail paragraph: blocked reason, failure message,
+    /// or remaining-work note.
+    recap_detail: Option<String>,
+}
+
+/// Render every user-visible string for a goal exit. Pure so the wording
+/// is unit-testable without driving the loop; the sentinel-driven arm
+/// reuses [`render_goal_stop`] and [`goal_recap_parts`] so the historical
+/// message wording is unchanged.
+fn render_goal_exit(exit: &GoalExit, turns_ran: u32, max_turns: Option<u32>) -> GoalExitText {
+    match exit {
+        GoalExit::Stop(stop) => {
+            let (recap_stop_line, recap_detail) = goal_recap_parts(stop, turns_ran, max_turns);
+            GoalExitText {
+                user_message: render_goal_stop(stop, turns_ran, max_turns),
+                recap_stop_line,
+                recap_detail,
+            }
+        }
+        GoalExit::Cancelled => GoalExitText {
+            user_message: "Goal cancelled.\n".to_string(),
+            recap_stop_line: format!("goal cancelled after {turns_ran} goal turn(s)"),
+            recap_detail: None,
+        },
+        GoalExit::FatalFailure(failure) => GoalExitText {
+            user_message: format!(
+                "\n⛔ Goal stopped after {turns_ran} turn(s): the model request \
+                 failed and cannot be retried.\nReason: {}\n",
+                failure.message
+            ),
+            recap_stop_line: format!(
+                "goal stopped after {turns_ran} goal turn(s) on a fatal model failure"
+            ),
+            recap_detail: Some(failure.message.clone()),
+        },
+        GoalExit::Terminal(err) => GoalExitText {
+            user_message: format!("\nGoal stopped: {err}\n"),
+            recap_stop_line: format!(
+                "goal stopped after {turns_ran} goal turn(s) on a fatal error"
+            ),
+            recap_detail: Some(err.clone()),
+        },
+    }
+}
+
 /// Host-authored Stop line + optional detail paragraph for the aggregate
 /// goal recap, for the sentinel-driven stops. Pure so the wording can be
-/// unit-tested like [`render_goal_stop`]; failure/cancel/terminal exits
-/// build their parts inline at their break sites in [`run_goal_loop`].
+/// unit-tested like [`render_goal_stop`].
 fn goal_recap_parts(
     stop: &GoalStop,
     turn: u32,
@@ -9826,6 +9863,53 @@ mod tests {
         assert_eq!(
             render_goal_stop(&GoalStop::CeilingReached, 10, Some(10)),
             "\n🛑 Goal stopped: reached the opt-in 10-turn ceiling without a completion signal. Review the progress above and re-run `/goal` (raise or drop `--max-turns`) to keep going.\n"
+        );
+    }
+
+    #[test]
+    fn render_goal_exit_wording_is_stable() {
+        // Cancelled: fixed live message, turn count in the recap line only.
+        let text = render_goal_exit(&GoalExit::Cancelled, 3, None);
+        assert_eq!(text.user_message, "Goal cancelled.\n");
+        assert_eq!(text.recap_stop_line, "goal cancelled after 3 goal turn(s)");
+        assert_eq!(text.recap_detail, None);
+
+        // Fatal model failure: message matches the historical ⛔ wording and
+        // the failure reason rides into the recap detail.
+        let failure = crate::tool_loop::TurnFailure {
+            retryable: false,
+            message: "invalid_api_key".to_string(),
+        };
+        let text = render_goal_exit(&GoalExit::FatalFailure(failure), 2, None);
+        assert_eq!(
+            text.user_message,
+            "\n⛔ Goal stopped after 2 turn(s): the model request failed and \
+             cannot be retried.\nReason: invalid_api_key\n"
+        );
+        assert_eq!(
+            text.recap_stop_line,
+            "goal stopped after 2 goal turn(s) on a fatal model failure"
+        );
+        assert_eq!(text.recap_detail.as_deref(), Some("invalid_api_key"));
+
+        // Terminal pipeline error.
+        let text = render_goal_exit(&GoalExit::Terminal("unknown session".to_string()), 0, None);
+        assert_eq!(text.user_message, "\nGoal stopped: unknown session\n");
+        assert_eq!(
+            text.recap_stop_line,
+            "goal stopped after 0 goal turn(s) on a fatal error"
+        );
+        assert_eq!(text.recap_detail.as_deref(), Some("unknown session"));
+
+        // Sentinel stops reuse render_goal_stop + goal_recap_parts verbatim.
+        let text = render_goal_exit(&GoalExit::Stop(GoalStop::Completed), 4, None);
+        assert_eq!(
+            text.user_message,
+            render_goal_stop(&GoalStop::Completed, 4, None)
+        );
+        assert_eq!(
+            (text.recap_stop_line, text.recap_detail),
+            goal_recap_parts(&GoalStop::Completed, 4, None)
         );
     }
 
