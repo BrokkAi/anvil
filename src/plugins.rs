@@ -248,8 +248,8 @@ impl InstalledPlugin {
     /// under the plugin root when the manifest has no `skills` field.
     pub fn skill_roots(&self) -> Vec<PathBuf> {
         let roots: Vec<PathBuf> = match &self.manifest.skills {
-            Some(spec) => spec.iter().map(|p| self.resolve(p)).collect(),
-            None => vec![self.root.join("skills")],
+            Some(spec) => spec.iter().filter_map(|p| self.resolve(p).ok()).collect(),
+            None => self.resolve("skills").ok().into_iter().collect(),
         };
         roots.into_iter().filter(|p| p.is_dir()).collect()
     }
@@ -258,8 +258,8 @@ impl InstalledPlugin {
     /// Defaults to `agents/` under the plugin root.
     pub fn agent_sources(&self) -> Vec<PathBuf> {
         let sources: Vec<PathBuf> = match &self.manifest.agents {
-            Some(spec) => spec.iter().map(|p| self.resolve(p)).collect(),
-            None => vec![self.root.join("agents")],
+            Some(spec) => spec.iter().filter_map(|p| self.resolve(p).ok()).collect(),
+            None => self.resolve("agents").ok().into_iter().collect(),
         };
         sources.into_iter().filter(|p| p.exists()).collect()
     }
@@ -269,8 +269,8 @@ impl InstalledPlugin {
     /// namespaced `subdir:name`, matching Claude Code's convention.
     pub fn command_files(&self) -> Vec<(String, PathBuf)> {
         let sources: Vec<PathBuf> = match &self.manifest.commands {
-            Some(spec) => spec.iter().map(|p| self.resolve(p)).collect(),
-            None => vec![self.root.join("commands")],
+            Some(spec) => spec.iter().filter_map(|p| self.resolve(p).ok()).collect(),
+            None => self.resolve("commands").ok().into_iter().collect(),
         };
         let mut out = Vec::new();
         for source in sources {
@@ -306,7 +306,13 @@ impl InstalledPlugin {
         let file = match &self.manifest.hooks {
             Some(HooksSpec::Inline(file)) => file.clone(),
             Some(HooksSpec::Path(rel)) => {
-                let path = self.resolve(rel);
+                let path = match self.resolve(rel) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        diagnostics.push(format!("plugin '{}': {e}", self.key));
+                        return Vec::new();
+                    }
+                };
                 match self.read_hooks_file(&path) {
                     Ok(file) => file,
                     Err(e) => {
@@ -316,7 +322,13 @@ impl InstalledPlugin {
                 }
             }
             None => {
-                let path = self.root.join("hooks").join("hooks.json");
+                let path = match self.resolve("hooks/hooks.json") {
+                    Ok(path) => path,
+                    Err(e) => {
+                        diagnostics.push(format!("plugin '{}': {e}", self.key));
+                        return Vec::new();
+                    }
+                };
                 if !path.is_file() {
                     return Vec::new();
                 }
@@ -381,7 +393,13 @@ impl InstalledPlugin {
         let map = match &self.manifest.mcp_servers {
             Some(McpServersSpec::Inline(map)) => map.clone(),
             Some(McpServersSpec::Path(rel)) => {
-                let path = self.resolve(rel);
+                let path = match self.resolve(rel) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        diagnostics.push(format!("plugin '{}': {e}", self.key));
+                        return Vec::new();
+                    }
+                };
                 match self.read_mcp_file(&path) {
                     Ok(map) => map,
                     Err(e) => {
@@ -393,7 +411,13 @@ impl InstalledPlugin {
             // Claude Code auto-loads a root `.mcp.json` even without a
             // manifest field; mirror that.
             None => {
-                let path = self.root.join(".mcp.json");
+                let path = match self.resolve(".mcp.json") {
+                    Ok(path) => path,
+                    Err(e) => {
+                        diagnostics.push(format!("plugin '{}': {e}", self.key));
+                        return Vec::new();
+                    }
+                };
                 if !path.is_file() {
                     return Vec::new();
                 }
@@ -452,7 +476,9 @@ impl InstalledPlugin {
             serde_json::from_value(value).map_err(|e| format!("invalid entry: {e}"))?;
         match parsed.kind.as_deref() {
             None | Some("stdio") => {}
-            Some(other) => return Err(format!("transport '{other}' is not supported (stdio only)")),
+            Some(other) => {
+                return Err(format!("transport '{other}' is not supported (stdio only)"));
+            }
         }
         let Some(command) = parsed.command.filter(|c| !c.trim().is_empty()) else {
             return Err("missing `command`".into());
@@ -497,16 +523,71 @@ impl InstalledPlugin {
         join_normalized(&self.root, path).display().to_string()
     }
 
-    /// Resolve a manifest-relative path against the plugin root.
-    fn resolve(&self, rel: &str) -> PathBuf {
+    /// Resolve a manifest path against the plugin root. Relative paths
+    /// must stay inside the root, and absolute paths are accepted only
+    /// after `${CLAUDE_PLUGIN_ROOT}` substitution keeps them inside it.
+    fn resolve(&self, rel: &str) -> std::result::Result<PathBuf, String> {
         let rel = self.substitute(rel);
-        let path = Path::new(&rel);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            join_normalized(&self.root, path)
-        }
+        resolve_manifest_path(&self.root, &rel)
     }
+}
+
+fn resolve_manifest_path(root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err("manifest path must not be empty".to_string());
+    }
+    let path = Path::new(rel);
+    if path
+        .components()
+        .any(|comp| matches!(comp, std::path::Component::ParentDir))
+    {
+        return Err(format!("manifest path `{rel}` must not contain `..`"));
+    }
+
+    let root = canonicalize_with_missing_tail(root)?;
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        join_normalized(&root, path)
+    };
+    let resolved = canonicalize_with_missing_tail(&candidate)?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "manifest path `{rel}` resolves outside '{}'",
+            root.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> std::result::Result<PathBuf, String> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .map_err(|e| format!("cannot resolve '{}': {e}", path.display()));
+    }
+
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            return Err(format!(
+                "path '{}' has no existing ancestor",
+                path.display()
+            ));
+        };
+        tail.push(name.to_owned());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| format!("path '{}' has no existing ancestor", path.display()))?;
+    }
+
+    let mut resolved = std::fs::canonicalize(ancestor)
+        .map_err(|e| format!("cannot resolve '{}': {e}", ancestor.display()))?;
+    for name in tail.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
 /// Join dropping `.` segments (`root` + `./bin/x` -> `root/bin/x`) so
@@ -717,10 +798,7 @@ async fn run_one_hook(hook: &HookCommand, payload: &str, cwd: &Path) -> HookResu
         Ok(Ok(output)) => output,
         Ok(Err(e)) => return HookResult::Error(format!("hook failed: {e}")),
         Err(_) => {
-            return HookResult::Error(format!(
-                "hook timed out after {}s",
-                hook.timeout.as_secs()
-            ));
+            return HookResult::Error(format!("hook timed out after {}s", hook.timeout.as_secs()));
         }
     };
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -728,11 +806,7 @@ async fn run_one_hook(hook: &HookCommand, payload: &str, cwd: &Path) -> HookResu
     match output.status.code() {
         Some(0) => HookResult::Ok(stdout),
         Some(2) => HookResult::Block(stderr),
-        code => HookResult::Error(format!(
-            "hook exited with {:?}: {}",
-            code,
-            stderr.trim()
-        )),
+        code => HookResult::Error(format!("hook exited with {:?}: {}", code, stderr.trim())),
     }
 }
 
@@ -1250,8 +1324,14 @@ mod tests {
             source: PluginSource::Native,
             enabled: true,
         };
-        assert_eq!(p.skill_roots(), vec![plugin.path().join("skills")]);
-        assert_eq!(p.agent_sources(), vec![plugin.path().join("agents")]);
+        assert_eq!(
+            p.skill_roots(),
+            vec![plugin.path().join("skills").canonicalize().unwrap()]
+        );
+        assert_eq!(
+            p.agent_sources(),
+            vec![plugin.path().join("agents").canonicalize().unwrap()]
+        );
 
         // Explicit manifest entries, one missing on disk.
         plugin_at(
@@ -1262,13 +1342,70 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             ..p
         };
-        assert_eq!(p.agent_sources(), vec![plugin.path().join("agents/a.md")]);
+        assert_eq!(
+            p.agent_sources(),
+            vec![plugin.path().join("agents/a.md").canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn manifest_paths_do_not_escape_plugin_root() {
+        let plugin = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(plugin.path().join("skills")).unwrap();
+        fs::create_dir_all(outside.path().join("skills")).unwrap();
+        plugin_at(
+            plugin.path(),
+            &format!(
+                r#"{{"name":"demo","skills":["../outside",{}],"mcpServers":"../mcp.json"}}"#,
+                serde_json::to_string(&outside.path().join("skills").display().to_string())
+                    .unwrap()
+            ),
+        );
+
+        let p = InstalledPlugin {
+            key: "demo".into(),
+            root: plugin.path().to_path_buf(),
+            manifest: load_manifest(plugin.path()).unwrap(),
+            source: PluginSource::Native,
+            enabled: true,
+        };
+        assert!(p.skill_roots().is_empty());
+
+        let mut diags = Vec::new();
+        assert!(p.mcp_servers(&mut diags).is_empty());
+        assert!(
+            diags.iter().any(|d| d.contains("must not contain `..`")),
+            "diags: {diags:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_paths_reject_symlink_escape() {
+        let plugin = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join("skills")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), plugin.path().join("escape")).unwrap();
+        plugin_at(plugin.path(), r#"{"name":"demo","skills":"escape/skills"}"#);
+
+        let p = InstalledPlugin {
+            key: "demo".into(),
+            root: plugin.path().to_path_buf(),
+            manifest: load_manifest(plugin.path()).unwrap(),
+            source: PluginSource::Native,
+            enabled: true,
+        };
+        assert!(p.skill_roots().is_empty());
     }
 
     #[test]
     fn mcp_translation_resolves_paths_and_substitutes_root() {
         let plugin = TempDir::new().unwrap();
-        plugin_at(plugin.path(), r#"{"name":"demo","mcpServers":"./.mcp.json"}"#);
+        plugin_at(
+            plugin.path(),
+            r#"{"name":"demo","mcpServers":"./.mcp.json"}"#,
+        );
         write(
             &plugin.path().join(".mcp.json"),
             r#"{"mcpServers":{"srv":{
@@ -1429,10 +1566,7 @@ mod tests {
             .find(|h| h.event == HookEvent::PreToolUse)
             .unwrap();
         assert_eq!(pre.matcher.as_deref(), Some("run_shell_command"));
-        assert_eq!(
-            pre.command,
-            format!("{}/check.sh", plugin.path().display())
-        );
+        assert_eq!(pre.command, format!("{}/check.sh", plugin.path().display()));
         assert_eq!(pre.timeout, std::time::Duration::from_secs(5));
         let prompt = hooks
             .iter()
@@ -1524,8 +1658,14 @@ mod tests {
             hook(HookEvent::UserPromptSubmit, Some(".*"), "exit 2"),
             hook(HookEvent::UserPromptSubmit, None, "echo prompt-ctx"),
         ];
-        let decision =
-            run_hooks(&hooks, HookEvent::UserPromptSubmit, None, &payload, cwd.path()).await;
+        let decision = run_hooks(
+            &hooks,
+            HookEvent::UserPromptSubmit,
+            None,
+            &payload,
+            cwd.path(),
+        )
+        .await;
         assert!(!decision.blocked);
         assert_eq!(decision.context, vec!["prompt-ctx".to_string()]);
     }

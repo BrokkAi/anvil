@@ -6065,6 +6065,10 @@ async fn handle_plugin(
 /// Sources that `/plugin add` treats as git remotes rather than local
 /// paths. `owner/repo` shorthand expands to a GitHub HTTPS URL.
 fn plugin_git_url(source: &str) -> Option<String> {
+    let source = source.trim();
+    if source.is_empty() || source.starts_with('-') {
+        return None;
+    }
     if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("git@")
@@ -6087,6 +6091,48 @@ fn plugin_git_url(source: &str) -> Option<String> {
         return Some(format!("https://github.com/{owner}/{repo}.git"));
     }
     None
+}
+
+fn resolve_plugin_subpath(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err("plugin path must not be empty".to_string());
+    }
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return Err(format!("plugin path `{rel}` must be relative"));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                return Err(format!("plugin path `{rel}` must not contain `..`"));
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!("plugin path `{rel}` must be relative"));
+            }
+        }
+    }
+
+    let joined = if normalized.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(normalized)
+    };
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| format!("plugin root '{}' is not accessible: {e}", root.display()))?;
+    let joined = std::fs::canonicalize(&joined)
+        .map_err(|e| format!("plugin path `{rel}` is not accessible: {e}"))?;
+    if !joined.starts_with(&root) {
+        return Err(format!(
+            "plugin path `{rel}` resolves outside '{}'",
+            root.display()
+        ));
+    }
+    Ok(joined)
 }
 
 async fn plugin_add(
@@ -6114,7 +6160,7 @@ async fn plugin_add(
         let entry = find_marketplace_entry(&marketplace, plugin_name, source)?;
         return match &entry.source {
             crate::plugins::MarketplaceSource::Path(rel) => {
-                let plugin_root = root.join(rel.trim_start_matches("./"));
+                let plugin_root = resolve_plugin_subpath(&root, rel)?;
                 let name = crate::plugins::register_native(source, &plugin_root, None)
                     .map_err(|e| format!("failed to register plugin: {e:#}"))?;
                 Ok(format!(
@@ -6144,8 +6190,12 @@ fn marketplace_source_git(
     detail: &crate::plugins::MarketplaceSourceDetail,
 ) -> Result<(String, Option<String>), String> {
     let url = match (detail.source.as_str(), &detail.url, &detail.repo) {
-        ("github", _, Some(repo)) => format!("https://github.com/{repo}.git"),
-        (_, Some(url), _) => url.clone(),
+        ("github", _, Some(repo)) => plugin_git_url(repo).ok_or_else(|| {
+            format!("marketplace github source repo `{repo}` must be in `owner/repo` form")
+        })?,
+        (_, Some(url), _) => plugin_git_url(url).ok_or_else(|| {
+            format!("marketplace source URL `{url}` is not a supported git location")
+        })?,
         _ => {
             return Err(format!(
                 "marketplace source '{}' has no usable git location",
@@ -6215,7 +6265,9 @@ async fn plugin_add_from_git(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
-        return Err(format!("cannot derive a plugin directory name from '{url}'"));
+        return Err(format!(
+            "cannot derive a plugin directory name from '{url}'"
+        ));
     }
     let dest = plugins_dir.join(&dir_name);
     if dest.exists() {
@@ -6233,6 +6285,7 @@ async fn plugin_add_from_git(
             .arg("clone")
             .arg("--depth")
             .arg("1")
+            .arg("--")
             .arg(url)
             .arg(&dest)
             .output(),
@@ -6268,7 +6321,13 @@ async fn plugin_add_from_git(
                                     // The plugin lives inside this clone:
                                     // keep the clone and register the
                                     // subdirectory.
-                                    let plugin_root = dest.join(rel.trim_start_matches("./"));
+                                    let plugin_root = match resolve_plugin_subpath(&dest, rel) {
+                                        Ok(path) => path,
+                                        Err(e) => {
+                                            let _ = std::fs::remove_dir_all(&dest);
+                                            return Err(e);
+                                        }
+                                    };
                                     return crate::plugins::register_native(
                                         source,
                                         &plugin_root,
@@ -6320,7 +6379,13 @@ async fn plugin_add_from_git(
     }
 
     let plugin_root = match subdir {
-        Some(rel) => dest.join(rel.trim_start_matches("./")),
+        Some(rel) => match resolve_plugin_subpath(&dest, rel) {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(e);
+            }
+        },
         None => dest.clone(),
     };
     match crate::plugins::register_native(source, &plugin_root, Some(&dest)) {
@@ -9958,6 +10023,69 @@ mod tests {
     fn parse_shell_words_rejects_unclosed_quotes() {
         let err = parse_shell_words(r#"add bad "unterminated"#).expect_err("must reject");
         assert!(err.contains("Unclosed double quote"), "got: {err}");
+    }
+
+    #[test]
+    fn plugin_git_url_rejects_option_like_sources() {
+        assert_eq!(plugin_git_url("--upload-pack=/tmp/pwn.git"), None);
+        assert_eq!(
+            plugin_git_url("owner/repo"),
+            Some("https://github.com/owner/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn marketplace_source_git_validates_locations() {
+        let github = crate::plugins::MarketplaceSourceDetail {
+            source: "github".to_string(),
+            url: None,
+            repo: Some("owner/repo".to_string()),
+            path: Some("plugins/demo".to_string()),
+        };
+        assert_eq!(
+            marketplace_source_git(&github),
+            Ok((
+                "https://github.com/owner/repo.git".to_string(),
+                Some("plugins/demo".to_string())
+            ))
+        );
+
+        let bad_repo = crate::plugins::MarketplaceSourceDetail {
+            source: "github".to_string(),
+            url: None,
+            repo: Some("../repo".to_string()),
+            path: None,
+        };
+        assert!(marketplace_source_git(&bad_repo).is_err());
+
+        let option_like_url = crate::plugins::MarketplaceSourceDetail {
+            source: "url".to_string(),
+            url: Some("--upload-pack=/tmp/pwn.git".to_string()),
+            repo: None,
+            path: None,
+        };
+        assert!(marketplace_source_git(&option_like_url).is_err());
+    }
+
+    #[test]
+    fn resolve_plugin_subpath_stays_inside_root() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("plugins").join("demo");
+        std::fs::create_dir_all(&plugin).unwrap();
+
+        assert_eq!(
+            resolve_plugin_subpath(root.path(), "./plugins/demo").unwrap(),
+            plugin.canonicalize().unwrap()
+        );
+        assert!(resolve_plugin_subpath(root.path(), "../demo").is_err());
+        assert!(resolve_plugin_subpath(root.path(), "/tmp").is_err());
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+            assert!(resolve_plugin_subpath(root.path(), "escape").is_err());
+        }
     }
 
     #[test]

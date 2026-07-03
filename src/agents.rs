@@ -413,6 +413,9 @@ fn load_agent(
     reg: &mut AgentRegistry,
     backend: &crate::sandbox_backend::SandboxBackend,
 ) {
+    if file_exceeds_max_body(path, reg) {
+        return;
+    }
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -543,6 +546,20 @@ fn load_agent(
         scope,
         bundled_body: None,
     });
+}
+
+fn file_exceeds_max_body(path: &Path, reg: &mut AgentRegistry) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_BODY_BYTES as u64 => {
+            reg.push_diagnostic(format!(
+                "subagent at '{}' exceeds {MAX_BODY_BYTES} bytes; skipping",
+                path.display()
+            ));
+            true
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
 }
 
 fn parse_max_turns(frontmatter: &str) -> Result<Option<usize>, String> {

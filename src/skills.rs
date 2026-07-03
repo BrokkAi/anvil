@@ -451,6 +451,9 @@ fn load_skill(
     reg: &mut SkillRegistry,
     backend: &crate::sandbox_backend::SandboxBackend,
 ) {
+    if file_exceeds_max_body(path, reg, "SKILL.md") {
+        return;
+    }
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -567,6 +570,9 @@ fn load_plugin_command(
     reg: &mut SkillRegistry,
     backend: &crate::sandbox_backend::SandboxBackend,
 ) {
+    if file_exceeds_max_body(path, reg, "plugin command") {
+        return;
+    }
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -612,6 +618,20 @@ fn load_plugin_command(
         scope: SkillScope::Plugin,
         kind: SkillKind::Command,
     });
+}
+
+fn file_exceeds_max_body(path: &Path, reg: &mut SkillRegistry, label: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_BODY_BYTES as u64 => {
+            reg.push_diagnostic(format!(
+                "{label} at '{}' exceeds {MAX_BODY_BYTES} bytes; skipping",
+                path.display()
+            ));
+            true
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
 }
 
 // Frontmatter parsing (`split_frontmatter`, `parse_frontmatter`, and the
@@ -801,11 +821,7 @@ mod tests {
             r#"{"name":"demo"}"#,
         );
         write(
-            &plugin
-                .path()
-                .join("skills")
-                .join("hello")
-                .join(SKILL_FILE),
+            &plugin.path().join("skills").join("hello").join(SKILL_FILE),
             &minimal("hello", desc),
         );
         let home = TempDir::new().unwrap();
@@ -874,7 +890,11 @@ mod tests {
         assert_eq!(bare.description, "Do the bare thing");
         // Body reads back frontmatter-stripped either way.
         assert!(read_skill_body(deploy).unwrap().starts_with("Deploy"));
-        assert!(read_skill_body(bare).unwrap().starts_with("# Do the bare thing"));
+        assert!(
+            read_skill_body(bare)
+                .unwrap()
+                .starts_with("# Do the bare thing")
+        );
     }
 
     #[test]
