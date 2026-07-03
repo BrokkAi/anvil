@@ -1857,7 +1857,6 @@ mod tests {
             location,
             skill_dir,
             scope: SkillScope::Project,
-            bundled_body: None,
         };
         (tmp, meta)
     }
