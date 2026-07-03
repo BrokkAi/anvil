@@ -37,7 +37,7 @@ use crate::trace_logging::append_trace_record;
 use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
-const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
+pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 

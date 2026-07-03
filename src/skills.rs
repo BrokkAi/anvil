@@ -258,6 +258,17 @@ fn discover_with_backend(
     home: Option<&Path>,
     backend: &crate::sandbox_backend::SandboxBackend,
 ) -> SkillRegistry {
+    // Training modes (P2T / train-bifrost) expose no skills at all: the
+    // `<available_skills>` system-prompt block advertises tools (e.g.
+    // get_file_contents) that the restricted training catalog rejects, and
+    // trainees imitating skill usage would learn workflows their toolset
+    // cannot execute. An empty registry suppresses both the prompt block and
+    // the `activate_skill` tool.
+    if crate::p2t::env_var_truthy(crate::p2t::PATCHES_TO_TRACES_ENV)
+        || crate::p2t::env_var_truthy(crate::tool_loop::TRAIN_BIFROST_ENV)
+    {
+        return SkillRegistry::default();
+    }
     let cwd = normalize_path(cwd);
     let mut reg = SkillRegistry::default();
     let mut candidates = Vec::new();
@@ -821,6 +832,28 @@ mod tests {
 
     fn minimal(name: &str, desc: &str) -> String {
         format!("---\nname: {name}\ndescription: {desc}\n---\n\nBody")
+    }
+
+    #[test]
+    fn training_modes_discover_no_skills() {
+        use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
+        let _lock = ENV_GUARD.blocking_lock();
+        let project = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        for var in [
+            crate::p2t::PATCHES_TO_TRACES_ENV,
+            crate::tool_loop::TRAIN_BIFROST_ENV,
+        ] {
+            let _scope = EnvScope::set(var, "1");
+            let reg = discover_inner(project.path(), Some(home.path()));
+            assert!(
+                reg.is_empty(),
+                "{var} should suppress all skills, got {:?}",
+                reg.iter_sorted()
+                    .map(|m| m.name.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
