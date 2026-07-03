@@ -90,6 +90,23 @@ fn tool_unavailable_message(tool_name: &str) -> String {
     )
 }
 
+const BIFROST_OMITTED_DELIMITER_PREFIX: &str = "----- OMITTED ";
+const TRUNCATED_VIEW_READ_FILE_HINT: &str =
+    "[truncated view: use read_file with offset/limit to fetch the omitted line range]";
+
+fn maybe_append_truncated_view_hint(output: &mut String, read_file_available: bool) {
+    if !read_file_available
+        || !output.contains(BIFROST_OMITTED_DELIMITER_PREFIX)
+        || output.contains(TRUNCATED_VIEW_READ_FILE_HINT)
+    {
+        return;
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(TRUNCATED_VIEW_READ_FILE_HINT);
+}
+
 struct ExecutedStepOutcome {
     results: Vec<p2t::PrefixToolResult>,
     cancelled: bool,
@@ -2796,7 +2813,7 @@ async fn execute_step_tool_calls(
         turn_usage.add(decision.usage);
         let decision = decision.decision;
 
-        let (output, status, replay_diff, permission_notice) = match decision {
+        let (mut output, status, replay_diff, permission_notice) = match decision {
             GateDecision::Reject {
                 message,
                 permission_notice,
@@ -2986,6 +3003,10 @@ async fn execute_step_tool_calls(
                 (exec.output, status, replay_diff, permission_notice)
             }
         };
+        maybe_append_truncated_view_hint(
+            &mut output,
+            advertised_this_request.contains("read_file"),
+        );
 
         messages.push(ChatMessage::tool_result(&call.id, &tool_name, &output));
         step_results.push(p2t::PrefixToolResult {
@@ -5414,6 +5435,41 @@ mod tests {
         assert!(names.contains("read_file"));
         assert!(names.contains("edit"));
         assert!(!names.contains("run_shell_command"));
+    }
+
+    #[test]
+    fn truncated_view_hint_is_appended_once_for_omitted_tool_result() {
+        let mut output = [
+            "head",
+            "----- OMITTED 12 LINES -----",
+            "middle",
+            "----- OMITTED 7 LINES -----",
+            "tail",
+        ]
+        .join("\n");
+
+        maybe_append_truncated_view_hint(&mut output, true);
+
+        assert!(output.ends_with(TRUNCATED_VIEW_READ_FILE_HINT));
+        assert_eq!(output.matches(TRUNCATED_VIEW_READ_FILE_HINT).count(), 1);
+    }
+
+    #[test]
+    fn truncated_view_hint_leaves_untruncated_tool_result_unchanged() {
+        let mut output = "head\nmiddle\ntail".to_string();
+
+        maybe_append_truncated_view_hint(&mut output, true);
+
+        assert_eq!(output, "head\nmiddle\ntail");
+    }
+
+    #[test]
+    fn truncated_view_hint_requires_read_file_availability() {
+        let mut output = "head\n----- OMITTED 12 LINES -----\ntail".to_string();
+
+        maybe_append_truncated_view_hint(&mut output, false);
+
+        assert_eq!(output, "head\n----- OMITTED 12 LINES -----\ntail");
     }
 
     #[test]
