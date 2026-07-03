@@ -130,6 +130,22 @@ impl MultiBackend {
         *self.codex.write().unwrap() = None;
     }
 
+    /// Install (or replace) the hosted DeepSeek backend at runtime.
+    /// Called from `/setup deepseek key <key>` so a session that started
+    /// without `DEEPSEEK_API_KEY` or a stored key picks up the new key on
+    /// the next discovery refresh.
+    pub fn install_deepseek(&self, backend: Arc<dyn LlmBackend>) {
+        *self.deepseek.write().unwrap() = Some(backend);
+    }
+
+    /// Drop the currently-installed DeepSeek backend, if any. Called from
+    /// `/setup deepseek disconnect` after the stored credentials are
+    /// wiped so a subsequent `deepseek::*` request fails with "backend
+    /// not configured" instead of firing 401-bound requests.
+    pub fn uninstall_deepseek(&self) {
+        *self.deepseek.write().unwrap() = None;
+    }
+
     /// Install (or replace) the OpenRouter backend at runtime. Called
     /// from `/openrouter-login <key>` so a session that started without
     /// `OPENROUTER_API_KEY` or an on-disk credential file picks up the
