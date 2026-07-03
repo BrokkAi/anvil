@@ -1431,7 +1431,12 @@ mod tests {
         assert_eq!(s.name, "srv");
         assert_eq!(
             s.command,
-            plugin.path().join("bin").join("launch.sh").display().to_string()
+            plugin
+                .path()
+                .join("bin")
+                .join("launch.sh")
+                .display()
+                .to_string()
         );
         assert_eq!(s.args[1], format!("{}/data", plugin.path().display()));
         // Anvil's own `{cwd}` placeholder must survive untouched.
