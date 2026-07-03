@@ -6197,18 +6197,20 @@ fn plugin_git_url(source: &str) -> Option<String> {
     }
     let mut parts = source.split('/');
     if let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next())
-        && !owner.is_empty()
-        && !repo.is_empty()
-        && owner
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        && repo
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && valid_github_path_component(owner)
+        && valid_github_path_component(repo)
     {
         return Some(format!("https://github.com/{owner}/{repo}.git"));
     }
     None
+}
+
+fn valid_github_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 fn resolve_plugin_subpath(root: &Path, rel: &str) -> Result<PathBuf, String> {
@@ -10406,6 +10408,7 @@ mod tests {
     #[test]
     fn plugin_git_url_rejects_option_like_sources() {
         assert_eq!(plugin_git_url("--upload-pack=/tmp/pwn.git"), None);
+        assert_eq!(plugin_git_url("../repo"), None);
         assert_eq!(
             plugin_git_url("owner/repo"),
             Some("https://github.com/owner/repo.git".to_string())
