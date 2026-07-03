@@ -15,6 +15,7 @@ mod codex_auth;
 mod codex_client;
 mod codex_credits;
 mod context_manager;
+mod deepseek_auth;
 mod discovery;
 mod host_notice;
 mod http_retry;
@@ -332,9 +333,8 @@ fn build_deepseek_backend() -> Option<Arc<dyn LlmBackend>> {
         }
     }
 
-    match secrets::read() {
-        Ok(Some(stored)) => {
-            let auth = stored.deepseek?;
+    match deepseek_auth::read() {
+        Ok(Some(auth)) => {
             let trimmed = auth.api_key.trim();
             if trimmed.is_empty() {
                 tracing::info!(

@@ -46,15 +46,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::bedrock_auth::BedrockAuth;
+use crate::deepseek_auth::DeepSeekAuth;
 use crate::openrouter_auth::OpenRouterAuth;
-
-/// Flat one-field record for hosted DeepSeek. Like OpenRouter, DeepSeek
-/// keys are static (no refresh, no expiry) so there's nothing more to
-/// persist.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeepSeekAuth {
-    pub api_key: String,
-}
 
 /// The consolidated secrets file: one optional section per provider.
 /// Sections are omitted from the JSON entirely when absent so the file
@@ -305,54 +298,6 @@ fn write_user_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// Snapshot of where DeepSeek credentials currently come from. Single
-/// source of truth for the "env owns" contract, mirroring the OpenRouter
-/// and Bedrock `CredentialState` types: whenever `DEEPSEEK_API_KEY` is
-/// non-empty the environment owns the credential lifecycle and `/setup
-/// deepseek key` explains rather than mutating state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeepSeekCredentialState {
-    pub env_set: bool,
-    pub file_present: bool,
-}
-
-impl DeepSeekCredentialState {
-    pub fn snapshot() -> Self {
-        let env_set = std::env::var(crate::discovery::DEEPSEEK_API_KEY_ENV)
-            .ok()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        let file_present = match read() {
-            Ok(Some(secrets)) => secrets
-                .deepseek
-                .is_some_and(|auth| !auth.api_key.trim().is_empty()),
-            _ => false,
-        };
-        Self {
-            env_set,
-            file_present,
-        }
-    }
-
-    /// Where the active credential, if any, is being read from. Mirrors
-    /// the precedence in `build_deepseek_backend`: env wins over file,
-    /// file wins over nothing.
-    pub fn active_source(&self) -> &'static str {
-        if self.env_set {
-            "env"
-        } else if self.file_present {
-            "file"
-        } else {
-            "none"
-        }
-    }
-
-    /// True when the environment owns the credential lifecycle.
-    pub fn env_owns(&self) -> bool {
-        self.env_set
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,33 +525,5 @@ mod tests {
             read().unwrap().is_none(),
             "nothing to migrate, secrets.json not created"
         );
-    }
-
-    #[test]
-    fn deepseek_credential_state_reports_sources() {
-        let _lock = ENV_GUARD.blocking_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let _brokk = EnvScope::set("BROKK_CONFIG_HOME", tmp.path());
-
-        {
-            let _env = EnvScope::set("DEEPSEEK_API_KEY", "sk-ds-env");
-            let state = DeepSeekCredentialState::snapshot();
-            assert!(state.env_set && state.env_owns());
-            assert_eq!(state.active_source(), "env");
-        }
-
-        let _env = EnvScope::remove("DEEPSEEK_API_KEY");
-        let state = DeepSeekCredentialState::snapshot();
-        assert_eq!(state.active_source(), "none");
-
-        update(|s| {
-            s.deepseek = Some(DeepSeekAuth {
-                api_key: "sk-ds-file".into(),
-            })
-        })
-        .unwrap();
-        let state = DeepSeekCredentialState::snapshot();
-        assert!(state.file_present && !state.env_owns());
-        assert_eq!(state.active_source(), "file");
     }
 }

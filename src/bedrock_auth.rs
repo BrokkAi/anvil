@@ -53,7 +53,7 @@ pub struct CredentialState {
     /// still resolves. Tracked separately from `file_present` because the
     /// setup commands (`key`/`region`/`model`) write the managed config,
     /// while `disconnect` also has to clear these fallback files.
-    pub secrets_present: bool,
+    pub legacy_secrets_present: bool,
 }
 
 impl CredentialState {
@@ -72,14 +72,14 @@ impl CredentialState {
             Ok(Some(auth)) => !auth.bearer_token.trim().is_empty(),
             _ => false,
         };
-        let secrets_present = matches!(
+        let legacy_secrets_present = matches!(
             crate::bedrock_client::bearer_token_from_secrets(),
             Ok(Some(_))
         );
         Self {
             env_set,
             file_present,
-            secrets_present,
+            legacy_secrets_present,
         }
     }
 
@@ -92,8 +92,8 @@ impl CredentialState {
             "env"
         } else if self.file_present {
             "file"
-        } else if self.secrets_present {
-            "secrets"
+        } else if self.legacy_secrets_present {
+            "legacy"
         } else {
             "none"
         }
@@ -282,7 +282,7 @@ mod tests {
                 // Redirect the legacy secrets dir into the temp config
                 // home too, so detection never reads the developer's real
                 // ~/.secrets/. It holds no secret-named files unless a
-                // test writes one, so `secrets_present` stays false by
+                // test writes one, so `legacy_secrets_present` stays false by
                 // default.
                 std::env::set_var("BROKK_SECRETS_HOME", config_home);
             }
@@ -389,12 +389,12 @@ mod tests {
         std::fs::write(&aws_secret, "aws-secret-token\n").unwrap();
         std::fs::write(&bedrock_secret, "bedrock-secret-token\n").unwrap();
 
-        assert!(CredentialState::snapshot().secrets_present);
+        assert!(CredentialState::snapshot().legacy_secrets_present);
         logout().unwrap();
 
         assert!(!aws_secret.exists());
         assert!(!bedrock_secret.exists());
-        assert!(!CredentialState::snapshot().secrets_present);
+        assert!(!CredentialState::snapshot().legacy_secrets_present);
         logout().unwrap();
     }
 
@@ -416,14 +416,14 @@ mod tests {
         let before = CredentialState::snapshot();
         assert!(before.env_set);
         assert!(before.file_present);
-        assert!(before.secrets_present);
+        assert!(before.legacy_secrets_present);
 
         logout().unwrap();
 
         let after = CredentialState::snapshot();
         assert!(after.env_set);
         assert!(!after.file_present);
-        assert!(!after.secrets_present);
+        assert!(!after.legacy_secrets_present);
         assert_eq!(after.active_source(), "env");
         assert!(!secret.exists());
     }
@@ -457,7 +457,7 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(state.file_present);
-        assert!(!state.secrets_present);
+        assert!(!state.legacy_secrets_present);
         assert!(!state.env_owns());
         assert_eq!(state.active_source(), "file");
     }
@@ -471,7 +471,7 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(!state.file_present);
-        assert!(!state.secrets_present);
+        assert!(!state.legacy_secrets_present);
         assert!(!state.env_owns());
         assert_eq!(state.active_source(), "none");
     }
@@ -490,9 +490,9 @@ mod tests {
         let state = CredentialState::snapshot();
         assert!(!state.env_set);
         assert!(!state.file_present);
-        assert!(state.secrets_present);
+        assert!(state.legacy_secrets_present);
         assert!(!state.env_owns());
-        assert_eq!(state.active_source(), "secrets");
+        assert_eq!(state.active_source(), "legacy");
     }
 
     #[test]
@@ -510,7 +510,7 @@ mod tests {
 
         let state = CredentialState::snapshot();
         assert!(state.file_present);
-        assert!(state.secrets_present);
+        assert!(state.legacy_secrets_present);
         assert_eq!(state.active_source(), "file");
     }
 
