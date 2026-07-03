@@ -1523,7 +1523,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
     // the legacy modes surface (#157).
     let set_behavior = client.request(
         "session/set_config_option",
-        json!({ "sessionId": session_id, "configId": "behavior_mode", "value": "CODE" }),
+        json!({ "sessionId": session_id, "configId": "behavior_mode", "value": "PLAN" }),
     );
     assert_response_ok(
         &case,
@@ -1541,7 +1541,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
         });
     assert_eq!(
         mode_update["currentModeId"].as_str(),
-        Some("CODE"),
+        Some("PLAN"),
         "{}: current_mode_update carried the wrong mode: {mode_update}",
         case.name
     );
@@ -1568,7 +1568,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
     // for the config-options surface (#156).
     let set_mode = client.request(
         "session/set_mode",
-        json!({ "sessionId": session_id, "modeId": "ASK" }),
+        json!({ "sessionId": session_id, "modeId": "LUTZ" }),
     );
     assert_response_ok(&case, "session/set_mode", &set_mode, &client);
     let config_update = client
@@ -1579,7 +1579,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
                 case.name
             )
         });
-    // The behavior-mode selector specifically must reflect the new mode (ASK),
+    // The behavior-mode selector specifically must reflect the new mode (LUTZ),
     // not merely some unrelated field containing the substring.
     let behavior_option = config_update["configOptions"]
         .as_array()
@@ -1593,7 +1593,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
             )
         });
     assert!(
-        behavior_option.to_string().contains("ASK"),
+        behavior_option.to_string().contains("LUTZ"),
         "{}: behavior_mode selector did not reflect the new mode after set_mode: {behavior_option}",
         case.name
     );
