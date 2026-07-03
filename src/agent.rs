@@ -10580,7 +10580,7 @@ mod tests {
         std::fs::create_dir_all(plugin.path().join("hooks")).unwrap();
         std::fs::write(
             plugin.path().join("hooks").join("hooks.json"),
-            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo blocked >&2; exit 2"}]}]}}"#,
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo blocked 1>&2 && exit 2"}]}]}}"#,
         )
         .unwrap();
         crate::plugins::register_native("test-source", plugin.path(), None)
