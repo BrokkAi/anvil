@@ -2600,6 +2600,56 @@ fn rewrite_turn_summary_in_zip(
     })
 }
 
+/// Overwrite the visible-response content blob of the task whose id is
+/// `fragment_id` with `response_text`. The blob is referenced by both the
+/// task's `markdownContentId` and its flat `ai` message entry, so rewriting
+/// it in place updates every reader; `brokkReplayMessages` blobs (raw model
+/// text) are untouched, so model replay never sees appended host notices.
+/// Used by `append_to_last_turn_response` to land the `/goal` aggregate
+/// recap on an already-persisted turn.
+///
+/// Atomic via `with_temp_zip_writer`, mirroring `rewrite_turn_summary_in_zip`:
+/// any failure leaves the on-disk zip unchanged so the caller can roll back
+/// its in-memory mutation and keep `memory == disk`.
+fn rewrite_turn_response_in_zip(
+    zip_path: &Path,
+    fragment_id: &str,
+    response_text: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let backend = crate::sandbox_backend::global();
+    let fragments = backend
+        .read_zip_entry_text(
+            zip_path,
+            "fragments-v4.json",
+            MAX_SESSION_ARCHIVE_BYTES,
+            MAX_FRAGMENTS_BYTES,
+        )
+        .context("reading fragments-v4.json for response rewrite")?
+        .unwrap_or_default();
+    let fragments: serde_json::Value = serde_json::from_str(&fragments)
+        .context("parsing fragments-v4.json for response rewrite")?;
+    let Some(content_id) = fragments
+        .get("task")
+        .and_then(|tasks| tasks.get(fragment_id))
+        .and_then(|task| task.get("markdownContentId"))
+        .and_then(|v| v.as_str())
+    else {
+        anyhow::bail!(
+            "no task fragment `{fragment_id}` with a markdownContentId in fragments-v4.json"
+        );
+    };
+    let entry_name = format!("content/{content_id}.txt");
+
+    with_temp_zip_writer(zip_path, |writer, options| {
+        copy_zip_entries_via_sandbox(zip_path, writer, options, |n| n == entry_name)?;
+        writer.start_file(&entry_name, options)?;
+        writer.write_all(response_text.as_bytes())?;
+        Ok(())
+    })
+}
+
 /// Replace manifest.json in an existing session zip, copying all other entries as-is.
 ///
 /// Atomic: any failure leaves the on-disk zip untouched, so callers can roll back
@@ -4320,6 +4370,72 @@ impl SessionStore {
                 && let Some(turn) = session.history.get_mut(turn_index)
             {
                 turn.summary = prev_summary;
+            }
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Append host-notice text to the most recent persisted turn's visible
+    /// assistant response, both in memory and in the session zip. Used by
+    /// `/goal` to land its aggregate recap on the goal's final turn, which
+    /// was already persisted by the shared per-turn pipeline before the goal
+    /// loop knew its stop condition. Returns `Ok(false)` when the session,
+    /// a last turn, or its `fragment_id` is missing (nothing to anchor to).
+    pub async fn append_to_last_turn_response(
+        &self,
+        id: &str,
+        notice: &str,
+    ) -> anyhow::Result<bool> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(id) else {
+                return Ok(false);
+            };
+            let Some(turn) = session.history.last_mut() else {
+                return Ok(false);
+            };
+            let Some(fragment_id) = turn.fragment_id.clone() else {
+                tracing::warn!(
+                    session_id = %id,
+                    "rejecting append_to_last_turn_response: last turn has no fragment_id \
+                     (was it persisted?)"
+                );
+                return Ok(false);
+            };
+            turn.agent_response.push_str(notice);
+            (
+                session.cwd.clone(),
+                fragment_id,
+                turn.agent_response.clone(),
+            )
+        };
+        let (cwd, fragment_id, new_response) = snapshot;
+
+        let zip_path = session_zip_path(&cwd, id);
+        let fragment_for_zip = fragment_id.clone();
+        let join_result = tokio::task::spawn_blocking(move || {
+            rewrite_turn_response_in_zip(&zip_path, &fragment_for_zip, &new_response)
+        })
+        .await;
+        let persist_result = match join_result {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!(
+                "session persistence task panicked: {join_err}"
+            )),
+        };
+        if let Err(e) = persist_result {
+            tracing::error!(
+                session_id = %id,
+                "failed to persist appended turn notice; rolling back in-memory state: {e:#}"
+            );
+            if let Some(session) = self.sessions.write().await.get_mut(id)
+                && let Some(turn) = session.history.last_mut()
+                && turn.fragment_id.as_deref() == Some(fragment_id.as_str())
+                && turn.agent_response.ends_with(notice)
+            {
+                let new_len = turn.agent_response.len() - notice.len();
+                turn.agent_response.truncate(new_len);
             }
             return Err(e);
         }
@@ -8648,6 +8764,97 @@ done
             .await
             .expect("no error");
         assert!(!ok, "out-of-range index must return false");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The `/goal` aggregate recap is appended to the goal's final turn
+    /// after that turn was persisted; the appended text must survive a
+    /// reload from disk (issue #208) while earlier turns stay untouched.
+    #[tokio::test]
+    async fn append_to_last_turn_response_round_trips_through_zip() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-append-notice-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+        for i in 0..2 {
+            store
+                .add_turn(
+                    &s.id,
+                    ConversationTurn {
+                        user_prompt: format!("user-{i}"),
+                        agent_response: format!("agent-{i}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("turn persists");
+        }
+
+        let notice = "\n\n**Anvil Recap**\n- *Stop: goal achieved after 2 goal turn(s)*.\n";
+        let ok = store
+            .append_to_last_turn_response(&s.id, notice)
+            .await
+            .expect("append persists");
+        assert!(ok, "a persisted last turn must accept the notice");
+
+        // In-memory state reflects the append immediately.
+        let snap = store.snapshot(&s.id, &cwd).await.expect("snapshot");
+        assert_eq!(snap.history[1].agent_response, format!("agent-1{notice}"));
+
+        // Drop the in-memory copy and reload from disk.
+        store.sessions.write().await.remove(&s.id);
+        let snap = store.snapshot(&s.id, &cwd).await.expect("reload succeeds");
+        assert_eq!(snap.history.len(), 2);
+        assert_eq!(
+            snap.history[0].agent_response, "agent-0",
+            "earlier turns must be untouched"
+        );
+        assert_eq!(
+            snap.history[1].agent_response,
+            format!("agent-1{notice}"),
+            "the appended notice must survive reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Appending to a session with no turns (or an unknown session) is a
+    /// graceful no-op, mirroring the `set_turn_summary` guards.
+    #[tokio::test]
+    async fn append_to_last_turn_response_without_anchor_is_noop() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-append-noop-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let s = store.create_session(cwd.clone()).await;
+
+        let ok = store
+            .append_to_last_turn_response(&s.id, "notice")
+            .await
+            .expect("no error");
+        assert!(!ok, "no turns yet: nothing to anchor the notice to");
+
+        let ok = store
+            .append_to_last_turn_response("no-such-session", "notice")
+            .await
+            .expect("no error");
+        assert!(!ok, "unknown session must be a noop");
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

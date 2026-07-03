@@ -63,26 +63,61 @@ fn describe_loop_stop_for_recap(stop: &LoopStop) -> String {
     }
 }
 
-fn render_tool_counts(tool_exchanges: &[ToolExchange]) -> String {
-    if tool_exchanges.is_empty() {
+/// Aggregate tool-call statistics for one or more turns. The per-turn recap
+/// builds one from a single turn's exchanges; `/goal` merges one per goal
+/// turn so the final aggregate recap can report the whole run without
+/// keeping every exchange (diff bodies included) resident across turns.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolCallStats {
+    total: usize,
+    failed: usize,
+    by_name: BTreeMap<String, usize>,
+    changed_files: BTreeSet<String>,
+}
+
+impl ToolCallStats {
+    pub(crate) fn from_exchanges(tool_exchanges: &[ToolExchange]) -> Self {
+        let mut stats = Self::default();
+        for exchange in tool_exchanges {
+            stats.total += 1;
+            if matches!(exchange.status, ToolExchangeStatus::Failed) {
+                stats.failed += 1;
+            }
+            *stats.by_name.entry(exchange.tool_name.clone()).or_default() += 1;
+            if matches!(exchange.status, ToolExchangeStatus::Completed)
+                && let Some(diff) = &exchange.diff
+            {
+                stats
+                    .changed_files
+                    .insert(recap_field_text(&diff.path.display().to_string()));
+            }
+        }
+        stats
+    }
+
+    pub(crate) fn merge(&mut self, other: &ToolCallStats) {
+        self.total += other.total;
+        self.failed += other.failed;
+        for (name, count) in &other.by_name {
+            *self.by_name.entry(name.clone()).or_default() += count;
+        }
+        self.changed_files
+            .extend(other.changed_files.iter().cloned());
+    }
+}
+
+fn render_tool_counts(stats: &ToolCallStats) -> String {
+    if stats.total == 0 {
         return "none".to_string();
     }
 
-    let total = tool_exchanges.len();
-    let failed = tool_exchanges
+    let succeeded = stats.total.saturating_sub(stats.failed);
+    let mut names: Vec<String> = stats
+        .by_name
         .iter()
-        .filter(|exchange| matches!(exchange.status, ToolExchangeStatus::Failed))
-        .count();
-    let succeeded = total.saturating_sub(failed);
-    let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
-    for exchange in tool_exchanges {
-        *by_name.entry(exchange.tool_name.as_str()).or_default() += 1;
-    }
-    let mut names: Vec<String> = by_name
-        .into_iter()
         .map(|(name, count)| {
             let name = recap_field_text(name);
-            if count == 1 {
+            if *count == 1 {
                 name
             } else {
                 format!("{name} x{count}")
@@ -98,29 +133,26 @@ fn render_tool_counts(tool_exchanges: &[ToolExchange]) -> String {
 
     format!(
         "{} ({} succeeded, {} failed): {}",
-        plural(total, "call", "calls"),
+        plural(stats.total, "call", "calls"),
         succeeded,
-        failed,
+        stats.failed,
         names.join(", ")
     )
 }
 
-fn render_changed_files(tool_exchanges: &[ToolExchange]) -> String {
-    let mut paths = BTreeSet::new();
-    for exchange in tool_exchanges {
-        if matches!(exchange.status, ToolExchangeStatus::Completed)
-            && let Some(diff) = &exchange.diff
-        {
-            paths.insert(recap_field_text(&diff.path.display().to_string()));
-        }
-    }
-    if paths.is_empty() {
+fn render_changed_files(stats: &ToolCallStats) -> String {
+    if stats.changed_files.is_empty() {
         return "none".to_string();
     }
 
     const MAX_CHANGED_FILES_IN_RECAP: usize = 8;
-    let total = paths.len();
-    let mut listed: Vec<String> = paths.into_iter().take(MAX_CHANGED_FILES_IN_RECAP).collect();
+    let total = stats.changed_files.len();
+    let mut listed: Vec<String> = stats
+        .changed_files
+        .iter()
+        .take(MAX_CHANGED_FILES_IN_RECAP)
+        .cloned()
+        .collect();
     if total > MAX_CHANGED_FILES_IN_RECAP {
         listed.push(format!("+{} more", total - MAX_CHANGED_FILES_IN_RECAP));
     }
@@ -149,11 +181,32 @@ pub(crate) fn render_turn_recap(
     tool_exchanges: &[ToolExchange],
     stop: &LoopStop,
 ) -> String {
+    render_recap_block(
+        summary,
+        &describe_loop_stop_for_recap(stop),
+        &ToolCallStats::from_exchanges(tool_exchanges),
+    )
+}
+
+/// Render the aggregate `/goal` recap: an optional detail paragraph (blocked
+/// reason, failure message, remaining-work note) above goal-level Stop /
+/// Tools / Files-changed stats accumulated across every goal turn. Same
+/// block shape as the per-turn recap, so `strip_trailing_turn_recap`
+/// detaches it from model history unchanged.
+pub(crate) fn render_goal_recap(
+    stop_line: &str,
+    detail: Option<&str>,
+    stats: &ToolCallStats,
+) -> String {
+    render_recap_block(detail, stop_line, stats)
+}
+
+fn render_recap_block(detail: Option<&str>, stop_line: &str, stats: &ToolCallStats) -> String {
     let mut out = String::from(TURN_RECAP_NOTICE_SENTINEL);
-    if let Some(summary) = summary {
-        let summary = sanitize_recap_summary(summary);
-        if !summary.is_empty() {
-            out.push_str(&summary);
+    if let Some(detail) = detail {
+        let detail = sanitize_recap_summary(detail);
+        if !detail.is_empty() {
+            out.push_str(&detail);
             out.push_str("\n\n");
         }
     }
@@ -161,11 +214,14 @@ pub(crate) fn render_turn_recap(
     // recap as an italic aside. The `- ` bullet and trailing `.` stay outside
     // the emphasis so `strip_trailing_turn_recap` still matches on its prefix
     // and `.` suffix anchors (and so the bullet renders as a list marker).
+    // The stop line is escaped to stay single-line: a stray newline would
+    // break the three-line tail validation and leak the recap into model
+    // history.
     out.push_str(&format!(
         "- *Stop: {}*.\n- *Tools: {}*.\n- *Files changed: {}*.\n",
-        describe_loop_stop_for_recap(stop),
-        render_tool_counts(tool_exchanges),
-        render_changed_files(tool_exchanges)
+        recap_field_text(stop_line),
+        render_tool_counts(stats),
+        render_changed_files(stats)
     ));
     out
 }
@@ -370,6 +426,100 @@ mod tests {
         );
 
         let persisted = format!("answer{recap}");
+        assert_eq!(model_visible_assistant_text(&persisted), "answer");
+    }
+
+    #[test]
+    fn tool_call_stats_merge_accumulates_across_turns() {
+        let mut aggregate = ToolCallStats::from_exchanges(&[
+            ToolExchange {
+                call_id: "c1".into(),
+                tool_name: "edit".into(),
+                status: ToolExchangeStatus::Completed,
+                diff: Some(ToolExchangeDiff {
+                    path: PathBuf::from("src/a.rs"),
+                    old_text: Some("old".into()),
+                    new_text: "new".into(),
+                }),
+                ..ToolExchange::default()
+            },
+            ToolExchange {
+                call_id: "c2".into(),
+                tool_name: "run_shell_command".into(),
+                status: ToolExchangeStatus::Failed,
+                ..ToolExchange::default()
+            },
+        ]);
+        aggregate.merge(&ToolCallStats::from_exchanges(&[
+            ToolExchange {
+                call_id: "c3".into(),
+                tool_name: "edit".into(),
+                status: ToolExchangeStatus::Completed,
+                diff: Some(ToolExchangeDiff {
+                    path: PathBuf::from("src/b.rs"),
+                    old_text: None,
+                    new_text: "new".into(),
+                }),
+                ..ToolExchange::default()
+            },
+            // A second write to an already-changed file must not double-count.
+            ToolExchange {
+                call_id: "c4".into(),
+                tool_name: "edit".into(),
+                status: ToolExchangeStatus::Completed,
+                diff: Some(ToolExchangeDiff {
+                    path: PathBuf::from("src/a.rs"),
+                    old_text: Some("new".into()),
+                    new_text: "newer".into(),
+                }),
+                ..ToolExchange::default()
+            },
+        ]));
+
+        let recap = render_goal_recap("goal achieved after 2 goal turn(s)", None, &aggregate);
+        assert!(recap.contains("- *Stop: goal achieved after 2 goal turn(s)*."));
+        assert!(
+            recap.contains(
+                "- *Tools: 4 calls (3 succeeded, 1 failed): edit x3, run_shell_command*."
+            )
+        );
+        assert!(recap.contains("- *Files changed: src/a.rs, src/b.rs*."));
+    }
+
+    #[test]
+    fn render_goal_recap_strips_from_model_history_and_stays_line_parseable() {
+        let stats = ToolCallStats::from_exchanges(&[ToolExchange {
+            call_id: "c1".into(),
+            tool_name: "read_file".into(),
+            status: ToolExchangeStatus::Completed,
+            ..ToolExchange::default()
+        }]);
+
+        // Detail paragraph (e.g. a blocked reason) renders above the stats
+        // and the whole block strips back out of model history.
+        let recap = render_goal_recap(
+            "goal blocked after 5 goal turn(s)",
+            Some("Blocked: waiting on credentials for the staging registry."),
+            &stats,
+        );
+        assert!(recap.starts_with(TURN_RECAP_NOTICE_SENTINEL));
+        let detail_at = recap
+            .find("waiting on credentials")
+            .expect("detail present");
+        let stop_at = recap.find("- *Stop: ").expect("stats present");
+        assert!(detail_at < stop_at, "detail renders above the stat lines");
+        let persisted = format!("final goal turn text{recap}");
+        assert_eq!(
+            model_visible_assistant_text(&persisted),
+            "final goal turn text"
+        );
+
+        // A stop line carrying control characters must stay single-line, or
+        // the stripper's three-line tail validation would leak the recap
+        // into model history.
+        let evil = render_goal_recap("stopped\nafter 1 goal turn(s)", None, &stats);
+        assert!(evil.contains("- *Stop: stopped\\nafter 1 goal turn(s)*."));
+        let persisted = format!("answer{evil}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
     }
 

@@ -3855,6 +3855,9 @@ struct GoalTurnOutcome {
     response: String,
     cumulative_usage: crate::llm_client::TokenUsage,
     failure: Option<crate::tool_loop::TurnFailure>,
+    /// This turn's tool-call statistics, merged into the goal-level
+    /// aggregate for the final `/goal` recap.
+    tool_stats: crate::host_notice::ToolCallStats,
 }
 
 /// Run one model turn for an active goal: inject `prompt_text` as the turn's
@@ -3907,6 +3910,7 @@ async fn run_goal_turn(
         // Derive the failure from the single source of truth (`stop`) at the one
         // seam that needs it, rather than carrying a parallel `failure` field.
         failure: turn.stop.failure().cloned(),
+        tool_stats: turn.tool_stats,
     })
 }
 
@@ -3962,11 +3966,18 @@ async fn run_goal_loop(
     // spinning. Reset by any turn that produced a real model response.
     let mut consecutive_failures = 0u32;
     let mut turn = 0u32;
+    // Aggregate recap state: tool-call stats merged across every goal turn
+    // that actually ran (retried failures included -- their tool calls
+    // happened), plus the Stop line + optional detail paragraph set at
+    // whichever exit ends the goal. `recorded_turns` gates the recap on at
+    // least one persisted turn existing to anchor it to.
+    let mut goal_stats = crate::host_notice::ToolCallStats::default();
+    let mut recorded_turns = 0u32;
 
-    loop {
+    let recap_parts: (String, Option<String>) = loop {
         if cancel.is_cancelled() {
             send_message(cx, session_id, "Goal cancelled.\n");
-            break;
+            break (format!("goal cancelled after {turn} goal turn(s)"), None);
         }
 
         turn += 1;
@@ -4003,6 +4014,8 @@ async fn run_goal_loop(
         {
             Ok(outcome) => {
                 cumulative = outcome.cumulative_usage;
+                recorded_turns += 1;
+                goal_stats.merge(&outcome.tool_stats);
 
                 // A turn that ended in an LLM failure produced no real
                 // assistant response to scan for a sentinel. Classify it:
@@ -4022,7 +4035,13 @@ async fn run_goal_loop(
                                     failure.message
                                 ),
                             );
-                            break;
+                            break (
+                                format!(
+                                    "goal stopped after {turn} goal turn(s) on a fatal \
+                                     model failure"
+                                ),
+                                Some(failure.message.clone()),
+                            );
                         }
                         GoalFailureAction::Backoff {
                             consecutive_failures: updated,
@@ -4046,7 +4065,10 @@ async fn run_goal_loop(
                             tokio::select! {
                                 _ = cancel.cancelled() => {
                                     send_message(cx, session_id, "Goal cancelled.\n");
-                                    break;
+                                    break (
+                                        format!("goal cancelled after {turn} goal turn(s)"),
+                                        None,
+                                    );
                                 }
                                 _ = tokio::time::sleep(delay) => {}
                             }
@@ -4065,7 +4087,7 @@ async fn run_goal_loop(
                             session_id,
                             &render_goal_stop(&stop, turn, spec.max_turns),
                         );
-                        break;
+                        break goal_recap_parts(&stop, turn, spec.max_turns);
                     }
                     GoalStep::Continue {
                         consecutive_blocked: updated,
@@ -4079,13 +4101,60 @@ async fn run_goal_loop(
             }
             Err(LoopIterationError::Terminal(err)) => {
                 send_message(cx, session_id, &format!("\nGoal stopped: {err}\n"));
-                break;
+                // This attempt never ran a model turn, so it doesn't count
+                // toward the recap's goal-turn total.
+                break (
+                    format!(
+                        "goal stopped after {} goal turn(s) on a fatal error",
+                        turn.saturating_sub(1)
+                    ),
+                    Some(err),
+                );
             }
         }
 
         if cancel.is_cancelled() {
             send_message(cx, session_id, "Goal cancelled.\n");
-            break;
+            break (format!("goal cancelled after {turn} goal turn(s)"), None);
+        }
+    };
+
+    // One aggregate recap for the whole goal run, replacing the per-turn
+    // recaps goal turns deliberately skip. Emitted only when at least one
+    // turn was persisted (there is a turn to anchor durability to) and the
+    // user hasn't disabled recaps. Appending to the final goal turn's
+    // persisted response makes it durable on reload like the per-turn recap.
+    let (stop_line, detail) = recap_parts;
+    if recorded_turns > 0
+        && sessions
+            .turn_recap_enabled(session_id)
+            .await
+            .unwrap_or(true)
+    {
+        let notice =
+            crate::host_notice::render_goal_recap(&stop_line, detail.as_deref(), &goal_stats);
+        send_message(cx, session_id, &notice);
+        match sessions
+            .append_to_last_turn_response(session_id, &notice)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "goal recap not persisted: no persisted turn to anchor it to"
+                );
+            }
+            Err(e) => {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!(
+                        "\n**Warning:** failed to save the goal recap to disk; \
+                         it will not survive a session reload: {e}\n"
+                    ),
+                );
+            }
         }
     }
 
@@ -4238,6 +4307,10 @@ struct ModelTurnResult {
     cumulative_usage: crate::llm_client::TokenUsage,
     response: String,
     stop: crate::tool_loop::LoopStop,
+    /// Compact per-turn tool-call statistics, computed before the turn (and
+    /// its full exchanges, diff bodies included) is moved into persistence.
+    /// `/goal` merges these across turns for its aggregate recap.
+    tool_stats: crate::host_notice::ToolCallStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4907,6 +4980,7 @@ async fn run_model_turn_in_spawn(
         fragment_id: None,
     };
 
+    let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges);
     let visible_response = if turn_recap_enabled && !cancel_status.is_cancelled() {
         let summary = recap_work_summary(
             llm.as_ref(),
@@ -4943,6 +5017,7 @@ async fn run_model_turn_in_spawn(
         cumulative_usage,
         response: response_text,
         stop,
+        tool_stats,
     }
 }
 
@@ -8036,6 +8111,35 @@ fn render_goal_stop(stop: &GoalStop, turn: u32, max_turns: Option<u32>) -> Strin
     }
 }
 
+/// Host-authored Stop line + optional detail paragraph for the aggregate
+/// goal recap, for the sentinel-driven stops. Pure so the wording can be
+/// unit-tested like [`render_goal_stop`]; failure/cancel/terminal exits
+/// build their parts inline at their break sites in [`run_goal_loop`].
+fn goal_recap_parts(
+    stop: &GoalStop,
+    turn: u32,
+    max_turns: Option<u32>,
+) -> (String, Option<String>) {
+    match stop {
+        GoalStop::Completed => (format!("goal achieved after {turn} goal turn(s)"), None),
+        GoalStop::Blocked(reason) => (
+            format!("goal blocked after {turn} goal turn(s)"),
+            Some(format!("Blocked: {reason}")),
+        ),
+        GoalStop::CeilingReached => (
+            format!(
+                "goal stopped at the opt-in {}-turn ceiling",
+                max_turns.unwrap_or(turn)
+            ),
+            Some(
+                "The objective did not report completion before the turn ceiling; \
+                 see the final wrap-up turn above for remaining work."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
 fn render_blocked_progress(consecutive_blocked: u32) -> Option<String> {
     (consecutive_blocked > 0).then(|| {
         format!(
@@ -9703,6 +9807,28 @@ mod tests {
         assert_eq!(
             render_goal_stop(&GoalStop::CeilingReached, 10, Some(10)),
             "\n🛑 Goal stopped: reached the opt-in 10-turn ceiling without a completion signal. Review the progress above and re-run `/goal` (raise or drop `--max-turns`) to keep going.\n"
+        );
+    }
+
+    #[test]
+    fn goal_recap_parts_are_stable() {
+        assert_eq!(
+            goal_recap_parts(&GoalStop::Completed, 4, None),
+            ("goal achieved after 4 goal turn(s)".to_string(), None)
+        );
+        assert_eq!(
+            goal_recap_parts(&GoalStop::Blocked("needs credentials".into()), 7, None),
+            (
+                "goal blocked after 7 goal turn(s)".to_string(),
+                Some("Blocked: needs credentials".to_string())
+            )
+        );
+        let (stop_line, detail) = goal_recap_parts(&GoalStop::CeilingReached, 10, Some(10));
+        assert_eq!(stop_line, "goal stopped at the opt-in 10-turn ceiling");
+        assert!(
+            detail
+                .expect("ceiling stop carries a remaining-work note")
+                .contains("did not report completion"),
         );
     }
 
