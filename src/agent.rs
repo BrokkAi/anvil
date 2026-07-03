@@ -1312,9 +1312,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
     let deepseek_count = source_count(catalog, ModelSource::DeepSeek);
     let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
     let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
-    let deepseek_env_ready = std::env::var(crate::discovery::DEEPSEEK_API_KEY_ENV)
-        .ok()
-        .is_some_and(|raw| !raw.trim().is_empty());
+    let deepseek_state = crate::deepseek_auth::CredentialState::snapshot();
     let ready = if model.is_empty() {
         "No model selected yet.".to_string()
     } else {
@@ -1329,7 +1327,7 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
          - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
          - `/setup bedrock` - Use AWS Bedrock.\n\
          - `/setup local` - Use free local models on this computer.\n\
-         - Set `DEEPSEEK_API_KEY` - Use hosted DeepSeek.\n\
+         - `/setup deepseek` - Use hosted DeepSeek.\n\
          - `/setup openrouter` - Use OpenRouter.\n\
          - `/setup recap` - Configure automatic turn recaps.\n\
          - `/setup advanced` - Show model ids and extra settings.\n\n\
@@ -1357,10 +1355,10 @@ fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String
         },
         deepseek_status = if deepseek_count > 0 {
             "ready".to_string()
-        } else if deepseek_env_ready {
-            "connected, no models found yet".to_string()
-        } else {
+        } else if deepseek_state.active_source() == "none" {
             "not connected".to_string()
+        } else {
+            "connected, no models found yet".to_string()
         },
         openrouter_status = if openrouter_count > 0 {
             "ready".to_string()
@@ -6429,8 +6427,7 @@ async fn apply_sandbox_elicitation_outcome(
 
 /// A choice from the interactive `/setup` home menu, mapped to the sub-flow it
 /// dispatches into. The set mirrors the actionable links in the Markdown home
-/// (`render_setup_home_for_model`); the env-var-only DeepSeek hint has no
-/// menu action, so it is omitted.
+/// (`render_setup_home_for_model`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupHomeRoute {
     /// Pick a ready model automatically (`/setup choose`).
@@ -6441,6 +6438,8 @@ enum SetupHomeRoute {
     Bedrock,
     /// Local Ollama models (`/setup local`).
     Local,
+    /// Hosted DeepSeek key entry (`/setup deepseek`).
+    DeepSeek,
     /// Interactive OpenRouter key entry (`/setup openrouter`).
     OpenRouter,
     /// Turn recap preference (`/setup recap`).
@@ -6457,6 +6456,7 @@ impl SetupHomeRoute {
             Self::Codex => "codex",
             Self::Bedrock => "bedrock",
             Self::Local => "local",
+            Self::DeepSeek => "deepseek",
             Self::OpenRouter => "openrouter",
             Self::Recap => "recap",
             Self::Advanced => "advanced",
@@ -6465,17 +6465,9 @@ impl SetupHomeRoute {
 
     /// Parse a wire value back into a route, ignoring anything unrecognized.
     fn from_value(value: &str) -> Option<Self> {
-        [
-            Self::Choose,
-            Self::Codex,
-            Self::Bedrock,
-            Self::Local,
-            Self::OpenRouter,
-            Self::Recap,
-            Self::Advanced,
-        ]
-        .into_iter()
-        .find(|route| route.value() == value)
+        Self::menu()
+            .into_iter()
+            .find(|route| route.value() == value)
     }
 
     /// Human-readable option label shown in the menu.
@@ -6485,6 +6477,7 @@ impl SetupHomeRoute {
             Self::Codex => "Sign in to Codex / ChatGPT",
             Self::Bedrock => "Use AWS Bedrock",
             Self::Local => "Use free local models (Ollama)",
+            Self::DeepSeek => "Use hosted DeepSeek",
             Self::OpenRouter => "Use OpenRouter",
             Self::Recap => "Configure automatic turn recaps",
             Self::Advanced => "Advanced settings (model ids, sandbox, behavior)",
@@ -6493,12 +6486,13 @@ impl SetupHomeRoute {
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 7] {
+    fn menu() -> [Self; 8] {
         [
             Self::Choose,
             Self::Codex,
             Self::Bedrock,
             Self::Local,
+            Self::DeepSeek,
             Self::OpenRouter,
             Self::Recap,
             Self::Advanced,
@@ -6587,6 +6581,11 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::DeepSeek) => {
+            let message =
+                handle_setup_deepseek(cx, sessions, session_id, llm, refresh_lock, "").await;
             send_message(cx, session_id, &message);
         }
         Some(SetupHomeRoute::Recap) => {
@@ -6698,6 +6697,17 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "bedrock" => {
             handle_setup_bedrock(
+                ctx.cx,
+                ctx.sessions,
+                session_id,
+                ctx.llm,
+                ctx.refresh_lock,
+                rest,
+            )
+            .await
+        }
+        "deepseek" => {
+            handle_setup_deepseek(
                 ctx.cx,
                 ctx.sessions,
                 session_id,
@@ -6968,6 +6978,54 @@ fn render_local_setup_help() -> String {
         .to_string()
 }
 
+/// Shared `refresh | try-again` arm for the provider setup flows: force a
+/// catalog refresh now and report whether the provider's models arrived.
+/// One home for the wording that used to be copied per provider.
+#[allow(clippy::too_many_arguments)]
+async fn handle_provider_setup_refresh(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    source: ModelSource,
+    provider: &str,
+    render_help: fn() -> String,
+) -> String {
+    match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock).await {
+        Ok(catalog) => {
+            let count = source_count(&catalog, source);
+            if count > 0 {
+                format!(
+                    "{provider} models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
+                )
+            } else {
+                format!("{provider} is not showing models yet.\n\n{}", render_help())
+            }
+        }
+        Err(e) => format!("Could not check {provider} yet: {e}\n\n{}", render_help()),
+    }
+}
+
+/// Kick off a background model-catalog refresh with a transcript progress
+/// line -- the tail boilerplate of every provider setup mutation.
+fn refresh_catalog_after(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    sessions: &SessionStore,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    progress: &'static str,
+) {
+    spawn_background_refresh(
+        refresh_lock.clone(),
+        llm.clone(),
+        sessions.clone(),
+        Some((cx.clone(), session_id.to_string(), progress)),
+        None,
+    );
+}
+
 async fn handle_setup_bedrock(
     cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
@@ -6983,33 +7041,17 @@ async fn handle_setup_bedrock(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        return match refresh_model_catalog_now(
-            Some(cx),
-            Some(session_id),
-            llm,
+        return handle_provider_setup_refresh(
+            cx,
             sessions,
+            session_id,
+            llm,
             refresh_lock,
+            ModelSource::Bedrock,
+            "Bedrock",
+            render_bedrock_setup_help,
         )
-        .await
-        {
-            Ok(catalog) => {
-                let count = source_count(&catalog, ModelSource::Bedrock);
-                if count > 0 {
-                    format!(
-                        "Bedrock models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
-                    )
-                } else {
-                    format!(
-                        "Bedrock is not showing models yet.\n\n{}",
-                        render_bedrock_setup_help()
-                    )
-                }
-            }
-            Err(e) => format!(
-                "Could not check Bedrock yet: {e}\n\n{}",
-                render_bedrock_setup_help()
-            ),
-        };
+        .await;
     }
 
     if let Some(key) = rest.strip_prefix("key ") {
@@ -7049,16 +7091,13 @@ async fn handle_setup_bedrock(
                         default_model.clone(),
                     ));
                 llm.install_bedrock(backend);
-                spawn_background_refresh(
-                    refresh_lock.clone(),
-                    llm.clone(),
-                    sessions.clone(),
-                    Some((
-                        cx.clone(),
-                        session_id.to_string(),
-                        "Refreshing model catalog after Bedrock setup...",
-                    )),
-                    None,
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock setup...",
                 );
                 format!(
                     "Bedrock credentials saved.\n\
@@ -7098,16 +7137,13 @@ async fn handle_setup_bedrock(
                             .unwrap_or_else(|| BEDROCK_DEFAULT_MODEL.to_string()),
                     ));
                 llm.install_bedrock(backend);
-                spawn_background_refresh(
-                    refresh_lock.clone(),
-                    llm.clone(),
-                    sessions.clone(),
-                    Some((
-                        cx.clone(),
-                        session_id.to_string(),
-                        "Refreshing model catalog after Bedrock region change...",
-                    )),
-                    None,
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock region change...",
                 );
                 format!("Bedrock region set to {region}.")
             }
@@ -7137,16 +7173,13 @@ async fn handle_setup_bedrock(
                         model.to_string(),
                     ));
                 llm.install_bedrock(backend);
-                spawn_background_refresh(
-                    refresh_lock.clone(),
-                    llm.clone(),
-                    sessions.clone(),
-                    Some((
-                        cx.clone(),
-                        session_id.to_string(),
-                        "Refreshing model catalog after Bedrock model change...",
-                    )),
-                    None,
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock model change...",
                 );
                 format!("Bedrock default model set to {model}.")
             }
@@ -7175,7 +7208,7 @@ async fn handle_setup_bedrock(
                                 auth.bearer_token.len()
                             )
                         }
-                        Ok(None) if state.secrets_present => format!(
+                        Ok(None) if state.legacy_secrets_present => format!(
                             "Bedrock is configured from a legacy `~/.secrets` credential file.\n  \
                              Region: {}\n  Model: {}\n\n\
                              Tip: migrate to a managed credential file with `/setup bedrock key <token>`.",
@@ -7195,16 +7228,13 @@ async fn handle_setup_bedrock(
                 match crate::bedrock_auth::logout() {
                     Ok(()) => {
                         llm.uninstall_bedrock();
-                        spawn_background_refresh(
-                            refresh_lock.clone(),
-                            llm.clone(),
-                            sessions.clone(),
-                            Some((
-                                cx.clone(),
-                                session_id.to_string(),
-                                "Refreshing model catalog after Bedrock disconnect...",
-                            )),
-                            None,
+                        refresh_catalog_after(
+                            cx,
+                            session_id,
+                            sessions,
+                            llm,
+                            refresh_lock,
+                            "Refreshing model catalog after Bedrock disconnect...",
                         );
                         render_bedrock_disconnect_success(state)
                     }
@@ -7230,7 +7260,7 @@ fn render_bedrock_disconnect_success(state: crate::bedrock_auth::CredentialState
         );
     }
 
-    if state.active_source() == "secrets" {
+    if state.active_source() == "legacy" {
         "Bedrock legacy `~/.secrets` credentials cleared and the in-memory backend was unloaded. Run `/setup bedrock key <token>` to reconnect."
             .to_string()
     } else {
@@ -7247,7 +7277,7 @@ fn render_bedrock_setup_help() -> String {
             crate::bedrock_client::BEDROCK_API_KEY_ENV
         ),
         "file" => "Bedrock is connected from saved credentials.".to_string(),
-        "secrets" => "Bedrock is connected from a legacy `~/.secrets` credential file.".to_string(),
+        "legacy" => "Bedrock is connected from a legacy `~/.secrets` credential file.".to_string(),
         _ => "Bedrock is not connected.".to_string(),
     };
     let key_help = if state.env_owns() {
@@ -7271,6 +7301,158 @@ fn render_bedrock_setup_help() -> String {
     )
 }
 
+/// Handle `/setup deepseek` and its subcommands: `key <key>` stores the
+/// API key in the consolidated secrets store and installs the backend
+/// live, `status` reports where the active credential comes from, and
+/// `disconnect` wipes the stored key. Mirrors the Bedrock flow, including
+/// the env-owns contract: when `DEEPSEEK_API_KEY` is set, the command
+/// explains rather than mutating state the environment will shadow.
+async fn handle_setup_deepseek(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    rest: &str,
+) -> String {
+    if rest.is_empty() {
+        return render_deepseek_setup_help();
+    }
+    let lower = rest.to_ascii_lowercase();
+    if matches!(lower.as_str(), "refresh" | "try-again") {
+        return handle_provider_setup_refresh(
+            cx,
+            sessions,
+            session_id,
+            llm,
+            refresh_lock,
+            ModelSource::DeepSeek,
+            "DeepSeek",
+            render_deepseek_setup_help,
+        )
+        .await;
+    }
+
+    if let Some(key) = rest.strip_prefix("key ") {
+        let state = crate::deepseek_auth::CredentialState::snapshot();
+        if state.env_owns() {
+            return format!(
+                "DeepSeek credentials are managed by the {} environment variable. \
+                 Unset it and restart before using `/setup deepseek key`.",
+                crate::discovery::DEEPSEEK_API_KEY_ENV
+            );
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return "Provide an API key: `/setup deepseek key <key>`.".to_string();
+        }
+
+        match crate::deepseek_auth::write(&crate::deepseek_auth::DeepSeekAuth {
+            api_key: key.to_string(),
+        }) {
+            Ok(()) => {
+                if let Some(backend) = crate::deepseek_backend_from_key(key) {
+                    llm.install_deepseek(backend);
+                }
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after DeepSeek setup...",
+                );
+                format!(
+                    "DeepSeek API key saved (length {}).\n\n\
+                     Run `/setup choose` or `/setup model` to pick a DeepSeek model.",
+                    key.len()
+                )
+            }
+            Err(e) => format!("Failed to save the DeepSeek API key: {e:#}"),
+        }
+    } else {
+        match lower.as_str() {
+            "status" => {
+                let state = crate::deepseek_auth::CredentialState::snapshot();
+                match state.active_source() {
+                    "env" => format!(
+                        "DeepSeek is configured via the {} environment variable.",
+                        crate::discovery::DEEPSEEK_API_KEY_ENV
+                    ),
+                    "file" => "DeepSeek is configured from the saved API key.".to_string(),
+                    _ => "No DeepSeek credentials found. Run `/setup deepseek key <key>`."
+                        .to_string(),
+                }
+            }
+            "disconnect" => {
+                let state = crate::deepseek_auth::CredentialState::snapshot();
+                match crate::deepseek_auth::logout() {
+                    Ok(()) => {
+                        llm.uninstall_deepseek();
+                        refresh_catalog_after(
+                            cx,
+                            session_id,
+                            sessions,
+                            llm,
+                            refresh_lock,
+                            "Refreshing model catalog after DeepSeek disconnect...",
+                        );
+                        if state.env_owns() {
+                            let env = crate::discovery::DEEPSEEK_API_KEY_ENV;
+                            format!(
+                                "DeepSeek stored key cleared and the in-memory backend was \
+                                 unloaded, but {env} is still set.\n\
+                                 Unset it and restart Anvil to fully disconnect DeepSeek:\n\n  \
+                                 unset {env}\n\n\
+                                 If it comes back after restart, remove it from your shell \
+                                 profile or secrets manager."
+                            )
+                        } else {
+                            "DeepSeek credentials cleared and the in-memory backend was \
+                             unloaded. Run `/setup deepseek key <key>` to reconnect."
+                                .to_string()
+                        }
+                    }
+                    Err(e) => format!("Failed to remove DeepSeek credentials: {e:#}"),
+                }
+            }
+            _ => format!(
+                "Unknown DeepSeek setup option `{rest}`.\n\n{}",
+                render_deepseek_setup_help()
+            ),
+        }
+    }
+}
+
+fn render_deepseek_setup_help() -> String {
+    let state = crate::deepseek_auth::CredentialState::snapshot();
+    let status = match state.active_source() {
+        "env" => format!(
+            "DeepSeek is connected from the {} environment variable.",
+            crate::discovery::DEEPSEEK_API_KEY_ENV
+        ),
+        "file" => "DeepSeek is connected from the saved API key.".to_string(),
+        _ => "DeepSeek is not connected.".to_string(),
+    };
+    let key_help = if state.env_owns() {
+        "Credentials are managed by the environment variable. Unset it and restart to use `/setup deepseek key`."
+            .to_string()
+    } else {
+        "If you have a DeepSeek API key (from https://platform.deepseek.com), run:\n`/setup deepseek key <key>`"
+            .to_string()
+    };
+    format!(
+        "Use hosted DeepSeek\n\n\
+         {status}\n\n\
+         {key_help}\n\n\
+         Other commands:\n\
+         - `/setup deepseek status`\n\
+         - `/setup deepseek disconnect`\n\
+         - `/setup deepseek refresh`\n\n\
+         Choose for me: `/setup choose`."
+    )
+}
+
 async fn handle_setup_openrouter(
     cx: &ConnectionTo<Client>,
     session_id: &str,
@@ -7284,31 +7466,17 @@ async fn handle_setup_openrouter(
     }
     let lower = rest.to_ascii_lowercase();
     if matches!(lower.as_str(), "refresh" | "try-again") {
-        return match refresh_model_catalog_now(
-            Some(cx),
-            Some(session_id),
-            llm,
+        return handle_provider_setup_refresh(
+            cx,
             sessions,
+            session_id,
+            llm,
             refresh_lock,
+            ModelSource::OpenRouter,
+            "OpenRouter",
+            render_openrouter_setup_help,
         )
-        .await
-        {
-            Ok(catalog) => {
-                let count = source_count(&catalog, ModelSource::OpenRouter);
-                if count > 0 {
-                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
-                } else {
-                    format!(
-                        "OpenRouter is not showing models yet.\n\n{}",
-                        render_openrouter_setup_help()
-                    )
-                }
-            }
-            Err(e) => format!(
-                "Could not check OpenRouter yet: {e}\n\n{}",
-                render_openrouter_setup_help()
-            ),
-        };
+        .await;
     }
 
     let prompt = match rest.split_once(char::is_whitespace) {
@@ -11941,7 +12109,7 @@ mod tests {
         let msg = render_bedrock_disconnect_success(crate::bedrock_auth::CredentialState {
             env_set: true,
             file_present: true,
-            secrets_present: true,
+            legacy_secrets_present: true,
         });
 
         assert!(
@@ -12765,6 +12933,7 @@ mod tests {
                 "codex",
                 "bedrock",
                 "local",
+                "deepseek",
                 "openrouter",
                 "recap",
                 "advanced"

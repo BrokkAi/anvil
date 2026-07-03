@@ -15,6 +15,7 @@ mod codex_auth;
 mod codex_client;
 mod codex_credits;
 mod context_manager;
+mod deepseek_auth;
 mod discovery;
 mod host_notice;
 mod http_retry;
@@ -26,6 +27,7 @@ mod openrouter_credits;
 mod p2t;
 mod responses_api;
 mod sandbox_backend;
+mod secrets;
 mod semantic_rerank;
 mod session;
 mod setup_state;
@@ -309,28 +311,50 @@ pub fn deepseek_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
     ))
 }
 
-/// Build the hosted DeepSeek backend from `DEEPSEEK_API_KEY`. Unlike
-/// OpenRouter and Bedrock, there is no interactive login flow or on-disk
-/// credential store here yet, so env-only is the intended path.
+/// Build the hosted DeepSeek backend from `DEEPSEEK_API_KEY`, falling back
+/// to the consolidated secrets store (written by `/setup deepseek key`).
+/// Precedence matches OpenRouter and Bedrock: env > file > nothing.
 fn build_deepseek_backend() -> Option<Arc<dyn LlmBackend>> {
-    let Ok(raw) = std::env::var(discovery::DEEPSEEK_API_KEY_ENV) else {
-        return None;
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        tracing::info!(
-            "{} is set but empty; hosted DeepSeek backend skipped",
-            discovery::DEEPSEEK_API_KEY_ENV
-        );
-        return None;
+    if let Ok(raw) = std::env::var(discovery::DEEPSEEK_API_KEY_ENV) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            tracing::info!(
+                "{} is set but empty; falling back to the secrets store",
+                discovery::DEEPSEEK_API_KEY_ENV
+            );
+        } else {
+            tracing::info!(
+                "DeepSeek backend wired from {} at {} (chat + discovery); key length={}",
+                discovery::DEEPSEEK_API_KEY_ENV,
+                discovery::DEEPSEEK_BASE_URL,
+                trimmed.len()
+            );
+            return deepseek_backend_from_key(trimmed);
+        }
     }
-    tracing::info!(
-        "DeepSeek backend wired from {} at {} (chat + discovery); key length={}",
-        discovery::DEEPSEEK_API_KEY_ENV,
-        discovery::DEEPSEEK_BASE_URL,
-        trimmed.len()
-    );
-    deepseek_backend_from_key(trimmed)
+
+    match deepseek_auth::read() {
+        Ok(Some(auth)) => {
+            let trimmed = auth.api_key.trim();
+            if trimmed.is_empty() {
+                tracing::info!(
+                    "DeepSeek entry in the secrets store has an empty key; backend skipped"
+                );
+                return None;
+            }
+            tracing::info!(
+                "DeepSeek backend wired from the secrets store at {} (chat + discovery); key length={}",
+                discovery::DEEPSEEK_BASE_URL,
+                trimmed.len()
+            );
+            deepseek_backend_from_key(trimmed)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("failed to read the secrets store for DeepSeek: {e:#}");
+            None
+        }
+    }
 }
 
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks
@@ -548,6 +572,10 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Fold any pre-consolidation per-provider credential files into the
+    // single secrets store before the backends read their credentials.
+    secrets::migrate_legacy_files();
+
     let bedrock_backend = build_bedrock_backend();
     let codex_backend = build_codex_backend().await;
     let deepseek_backend = build_deepseek_backend();
@@ -570,7 +598,8 @@ async fn main() -> Result<()> {
     }
     if deepseek_backend.is_none() {
         tracing::info!(
-            "DeepSeek backend not available; set {} to enable hosted DeepSeek.",
+            "DeepSeek backend not available; set {} or run `/setup deepseek key <key>` \
+             from a session to enable hosted DeepSeek.",
             discovery::DEEPSEEK_API_KEY_ENV
         );
     }
