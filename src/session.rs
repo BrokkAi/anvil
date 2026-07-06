@@ -365,9 +365,11 @@ pub(crate) fn acp_mcp_servers_to_configs(
 // Session modes
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionMode {
+    #[serde(rename = "LUTZ")]
     Lutz,
+    #[serde(rename = "PLAN")]
     Plan,
 }
 
@@ -3041,6 +3043,19 @@ impl SessionStore {
         }
     }
 
+    fn remember_last_behavior_mode(&self, mode: SessionMode) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .last_behavior_mode = Some(mode);
+                Ok(())
+            }
+            None => crate::setup_state::remember_last_behavior_mode(mode),
+        }
+    }
+
     fn remember_sandbox_mode(
         &self,
         mode: Option<crate::sandbox_backend::SandboxMode>,
@@ -3362,6 +3377,7 @@ impl SessionStore {
             default_reasoning_effort.or(prefs.last_reasoning_effort),
             &catalog,
         );
+        let session_mode = prefs.last_behavior_mode.unwrap_or(SessionMode::Lutz);
         let permission_mode = prefs.last_permission_mode.unwrap_or_default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
@@ -3382,6 +3398,8 @@ impl SessionStore {
             ),
         };
         session.additional_directories = additional_directories.clone();
+        session.mode = session_mode;
+        session.manifest.mode = Some(session_mode.as_str().to_string());
         session.manifest.additional_directories =
             additional_directories_manifest(&additional_directories);
         session.mcp_servers = mcp_servers.clone();
@@ -4364,6 +4382,12 @@ impl SessionStore {
             }
             return Err(e);
         }
+        if let Err(e) = self.remember_last_behavior_mode(mode) {
+            tracing::warn!(
+                session_id = %id,
+                "failed to persist last behavior mode preference: {e:#}"
+            );
+        }
         Ok(true)
     }
 
@@ -5139,6 +5163,57 @@ mod tests {
         assert!(matches!(result, Ok(false)));
     }
 
+    /// Changing behavior mode should update the per-install default for future
+    /// sessions, while existing sessions still reload their own manifest mode.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_mode_seeds_future_sessions_without_overriding_existing_manifests() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::new("test-model".to_string());
+
+        let first_cwd = tempfile::tempdir().expect("first cwd");
+        let first = store.create_session(first_cwd.path().to_path_buf()).await;
+        assert_eq!(first.mode, SessionMode::Lutz);
+
+        store
+            .set_mode(&first.id, SessionMode::Plan)
+            .await
+            .expect("set_mode persists");
+        assert_eq!(
+            crate::setup_state::read().last_behavior_mode,
+            Some(SessionMode::Plan)
+        );
+
+        let next_cwd = tempfile::tempdir().expect("next cwd");
+        let next = store.create_session(next_cwd.path().to_path_buf()).await;
+        assert_eq!(next.mode, SessionMode::Plan);
+
+        store
+            .set_mode(&next.id, SessionMode::Lutz)
+            .await
+            .expect("set_mode persists");
+        assert_eq!(
+            crate::setup_state::read().last_behavior_mode,
+            Some(SessionMode::Lutz)
+        );
+
+        store.sessions.write().await.remove(&first.id);
+        store.registries.write().await.remove(&first.id);
+        let reloaded = store
+            .get_session(&first.id, first_cwd.path())
+            .await
+            .expect("session must reload from disk");
+        assert_eq!(
+            reloaded.mode,
+            SessionMode::Plan,
+            "manifest mode must win over the current install-level default"
+        );
+
+        let third_cwd = tempfile::tempdir().expect("third cwd");
+        let third = store.create_session(third_cwd.path().to_path_buf()).await;
+        assert_eq!(third.mode, SessionMode::Lutz);
+    }
+
     /// Sanity check that `add_turn` on an unknown session id is a no-op
     /// success rather than an error -- callers may race between session
     /// removal (none today, but reserved) and turn persistence.
@@ -5905,6 +5980,25 @@ mod tests {
         );
     }
 
+    /// A persisted install-level behavior-mode preference should seed the next
+    /// new session and be written into that session's manifest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_reuses_persisted_behavior_mode() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        crate::setup_state::remember_last_behavior_mode(SessionMode::Plan)
+            .expect("persist behavior mode preference");
+
+        let store = SessionStore::new("model-a".to_string());
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+
+        assert_eq!(session.mode, SessionMode::Plan);
+        let manifest = read_manifest_from_zip(&session_zip_path(cwd.path(), &session.id))
+            .expect("manifest must round-trip");
+        assert_eq!(manifest.mode.as_deref(), Some("PLAN"));
+    }
+
     /// `get_session` for an unknown id (with no on-disk zip either) must
     /// return None, not panic or allocate a session under the wrong id.
     #[tokio::test]
@@ -6064,12 +6158,12 @@ mod tests {
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
     }
 
-    /// Transient setup mode keeps model/reasoning/permission/sandbox choices
+    /// Transient setup mode keeps model/reasoning/behavior/permission/sandbox choices
     /// process-local: they seed later sessions and cold reloads in this
     /// `SessionStore`, but the on-disk setup file is neither read nor written
     /// for those preferences.
     #[tokio::test(flavor = "current_thread")]
-    async fn transient_setup_keeps_model_sandbox_and_permission_preferences_in_memory_only() {
+    async fn transient_setup_keeps_session_config_preferences_in_memory_only() {
         use crate::llm_client::ReasoningLevelPreset;
         use crate::sandbox_backend::SandboxMode;
 
@@ -6080,6 +6174,8 @@ mod tests {
             Some("high".to_string()),
         )
         .expect("seed persistent model preference");
+        crate::setup_state::remember_last_behavior_mode(SessionMode::Plan)
+            .expect("seed persistent behavior preference");
         crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Wasm))
             .expect("seed persistent sandbox preference");
         crate::setup_state::remember_last_permission_mode(PermissionMode::ReadOnly)
@@ -6139,12 +6235,30 @@ mod tests {
             PermissionMode::Auto,
             "transient stores must ignore persisted permission preferences"
         );
+        assert_eq!(
+            first.mode,
+            SessionMode::Lutz,
+            "transient stores must ignore persisted behavior preferences"
+        );
 
         assert!(
             store
                 .set_sandbox_mode(&first.id, Some(SandboxMode::Off))
                 .await
         );
+        store
+            .set_mode(&first.id, SessionMode::Lutz)
+            .await
+            .expect("set_mode should persist");
+        assert_eq!(
+            crate::setup_state::read().last_behavior_mode,
+            Some(SessionMode::Plan),
+            "transient choices must not overwrite setup.json behavior preference"
+        );
+        store
+            .set_mode(&first.id, SessionMode::Plan)
+            .await
+            .expect("set_mode should persist");
         assert!(
             store
                 .set_permission_mode(&first.id, PermissionMode::AcceptEdits)
@@ -6166,6 +6280,7 @@ mod tests {
         let next = store.create_session(next_cwd.path().to_path_buf()).await;
         assert_eq!(next.model, "runtime-model");
         assert_eq!(next.selected_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(next.mode, SessionMode::Plan);
         assert_eq!(next.sandbox_mode, Some(SandboxMode::Off));
         assert_eq!(next.permission_mode, PermissionMode::AcceptEdits);
 
@@ -6173,6 +6288,11 @@ mod tests {
             crate::setup_state::read().last_model.as_deref(),
             Some("persisted-model"),
             "transient choices must not overwrite setup.json model preference"
+        );
+        assert_eq!(
+            crate::setup_state::read().last_behavior_mode,
+            Some(SessionMode::Plan),
+            "transient choices must not overwrite setup.json behavior preference"
         );
         assert_eq!(
             crate::setup_state::read().last_sandbox_mode,
@@ -6191,6 +6311,7 @@ mod tests {
             .get_session(&first.id, cwd.path())
             .await
             .expect("session must reload from disk");
+        assert_eq!(reloaded.mode, SessionMode::Plan);
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
         assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
     }
