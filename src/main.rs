@@ -125,12 +125,12 @@ struct Args {
     )]
     llm_stall_timeout_secs: u64,
 
-    /// Keep setup preferences process-local. Model, reasoning-effort, sandbox,
-    /// and first-run setup choices made during this Anvil process still seed
-    /// later sessions in the same run, but are not read from or written to
-    /// the global setup file. Intended for scripts that pass an explicit
-    /// `--default-model` or `/setup sandbox ...` and must not mutate user
-    /// configuration.
+    /// Keep setup preferences process-local. Model, reasoning-effort, behavior,
+    /// permission, sandbox, and first-run setup choices made during this Anvil
+    /// process still seed later sessions in the same run, but are not read
+    /// from or written to the global setup file. Intended for scripts that pass
+    /// an explicit `--default-model` or `/setup sandbox ...` and must not
+    /// mutate user configuration.
     #[arg(long, env = "ANVIL_TRANSIENT_SETUP", default_value_t = false)]
     transient_setup: bool,
 
