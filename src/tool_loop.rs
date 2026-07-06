@@ -2906,61 +2906,70 @@ async fn execute_step_tool_calls(
                     );
                 }
 
-                let exec = if tool_name == "task" {
-                    let (exec, nested_usage) = execute_subagent(
-                        llm,
-                        registry,
-                        model,
-                        reasoning_effort,
-                        structured_output,
-                        &parsed_input,
-                        max_turns,
-                        idle_timeout,
-                        cancel.clone(),
-                        spawned_cx,
-                        session_id,
-                        sessions,
-                        depth + 1,
-                    )
-                    .await;
-                    turn_usage.add(nested_usage);
-                    exec
-                } else if tool_name == "semantic_search"
-                    && registry.is_bifrost_tool("semantic_search")
+                let exec = if let Some(exec) =
+                    run_pre_tool_use_hooks(registry, &tool_name, &parsed_input).await
                 {
-                    // Transparently rerank bifrost's raw three-list result with a
-                    // disposable LLM turn so the model sees a clean, relevance-ordered
-                    // hit list instead. Falls back to the raw payload on any failure.
-                    let outcome = semantic_rerank::rerank_semantic_search(
-                        llm,
-                        model,
-                        registry,
-                        messages,
-                        &parsed_input,
-                        idle_timeout,
-                        &cancel,
-                    )
-                    .await;
-                    turn_usage.add(outcome.usage);
-                    ToolExecution {
-                        output: outcome.output,
-                        failed: outcome.failed,
-                    }
+                    exec
                 } else {
-                    trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
-                    execute_tool(
-                        registry,
-                        ToolExecRequest {
-                            tool_name: &tool_name,
-                            args: parsed_input.clone(),
-                            policy,
-                            outside_sandbox_once,
-                            sandbox_mode,
-                            shell_sandboxed: sandbox_policy_override.is_none() && shell_sandboxed,
-                            cancel: &cancel,
-                        },
-                    )
-                    .await
+                    let mut exec = if tool_name == "task" {
+                        let (exec, nested_usage) = execute_subagent(
+                            llm,
+                            registry,
+                            model,
+                            reasoning_effort,
+                            structured_output,
+                            &parsed_input,
+                            max_turns,
+                            idle_timeout,
+                            cancel.clone(),
+                            spawned_cx,
+                            session_id,
+                            sessions,
+                            depth + 1,
+                        )
+                        .await;
+                        turn_usage.add(nested_usage);
+                        exec
+                    } else if tool_name == "semantic_search"
+                        && registry.is_bifrost_tool("semantic_search")
+                    {
+                        // Transparently rerank bifrost's raw three-list result with a
+                        // disposable LLM turn so the model sees a clean, relevance-ordered
+                        // hit list instead. Falls back to the raw payload on any failure.
+                        let outcome = semantic_rerank::rerank_semantic_search(
+                            llm,
+                            model,
+                            registry,
+                            messages,
+                            &parsed_input,
+                            idle_timeout,
+                            &cancel,
+                        )
+                        .await;
+                        turn_usage.add(outcome.usage);
+                        ToolExecution {
+                            output: outcome.output,
+                            failed: outcome.failed,
+                        }
+                    } else {
+                        trace_bifrost_context_shadow(&tool_name, &parsed_input, tool_exchanges);
+                        execute_tool(
+                            registry,
+                            ToolExecRequest {
+                                tool_name: &tool_name,
+                                args: parsed_input.clone(),
+                                policy,
+                                outside_sandbox_once,
+                                sandbox_mode,
+                                shell_sandboxed: sandbox_policy_override.is_none()
+                                    && shell_sandboxed,
+                                cancel: &cancel,
+                            },
+                        )
+                        .await
+                    };
+                    run_post_tool_use_hooks(registry, &tool_name, &parsed_input, &mut exec).await;
+                    exec
                 };
 
                 let (update, status, replay_diff) = if exec.failed {
@@ -4220,6 +4229,80 @@ struct ToolExecRequest<'a> {
     sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     shell_sandboxed: bool,
     cancel: &'a CancellationToken,
+}
+
+async fn run_pre_tool_use_hooks(
+    registry: &ToolRegistry,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Option<ToolExecution> {
+    use crate::plugins::HookEvent;
+
+    // PreToolUse plugin hooks may veto the call before it runs (exit
+    // code 2, Claude Code semantics); their stderr goes back to the
+    // model as the error text.
+    let hooks = registry.plugin_hooks();
+    if !hooks.iter().any(|h| h.event == HookEvent::PreToolUse) {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "hook_event_name": HookEvent::PreToolUse.name(),
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "cwd": registry.cwd().display().to_string(),
+    });
+    let decision = crate::plugins::run_hooks(
+        hooks,
+        HookEvent::PreToolUse,
+        Some(tool_name),
+        &payload,
+        registry.cwd(),
+    )
+    .await;
+    decision.blocked.then(|| ToolExecution {
+        output: format!(
+            "Error: tool call blocked by plugin hook:\n{}",
+            decision.reasons.join("\n")
+        ),
+        failed: true,
+    })
+}
+
+async fn run_post_tool_use_hooks(
+    registry: &ToolRegistry,
+    tool_name: &str,
+    tool_input: &Value,
+    execution: &mut ToolExecution,
+) {
+    use crate::plugins::HookEvent;
+
+    // PostToolUse hooks see the result; an exit-2 hook's stderr is
+    // appended as feedback for the model (the tool already ran).
+    let hooks = registry.plugin_hooks();
+    if !hooks.iter().any(|h| h.event == HookEvent::PostToolUse) {
+        return;
+    }
+    let payload = serde_json::json!({
+        "hook_event_name": HookEvent::PostToolUse.name(),
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "tool_response": execution.output,
+        "cwd": registry.cwd().display().to_string(),
+    });
+    let decision = crate::plugins::run_hooks(
+        hooks,
+        HookEvent::PostToolUse,
+        Some(tool_name),
+        &payload,
+        registry.cwd(),
+    )
+    .await;
+    if decision.blocked {
+        execution.output.push_str(&format!(
+            "\n\nPlugin hook feedback:\n{}",
+            decision.reasons.join("\n")
+        ));
+    }
 }
 
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
@@ -6395,6 +6478,80 @@ mod tests {
         )
         .await;
         assert!(read.is_none(), "read-only should allow read tools");
+    }
+
+    #[cfg(unix)]
+    async fn registry_with_tool_hook(
+        event: crate::plugins::HookEvent,
+        matcher: Option<&str>,
+        command: &str,
+    ) -> (tempfile::TempDir, ToolRegistry) {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            vec![crate::plugins::HookCommand {
+                plugin: "test-plugin".into(),
+                event,
+                matcher: matcher.map(str::to_string),
+                command: command.to_string(),
+                timeout: Duration::from_secs(5),
+            }],
+        )
+        .await;
+        (cwd, registry)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_tool_use_hooks_block_special_task_dispatch() {
+        let (_cwd, registry) = registry_with_tool_hook(
+            crate::plugins::HookEvent::PreToolUse,
+            Some("^task$"),
+            "echo blocked-task >&2; exit 2",
+        )
+        .await;
+
+        let exec = run_pre_tool_use_hooks(
+            &registry,
+            "task",
+            &serde_json::json!({"subagent_type":"reviewer","description":"d","prompt":"p"}),
+        )
+        .await
+        .expect("matching PreToolUse hook should block");
+
+        assert!(exec.failed);
+        assert!(exec.output.contains("blocked-task"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_tool_use_hooks_append_feedback_for_reranked_semantic_search() {
+        let (_cwd, registry) = registry_with_tool_hook(
+            crate::plugins::HookEvent::PostToolUse,
+            Some("^semantic_search$"),
+            "echo review-feedback >&2; exit 2",
+        )
+        .await;
+        let mut exec = ToolExecution {
+            output: "raw reranked output".into(),
+            failed: false,
+        };
+
+        run_post_tool_use_hooks(
+            &registry,
+            "semantic_search",
+            &serde_json::json!({"query":"q"}),
+            &mut exec,
+        )
+        .await;
+
+        assert!(!exec.failed);
+        assert!(exec.output.contains("raw reranked output"));
+        assert!(exec.output.contains("review-feedback"));
     }
 
     #[tokio::test]

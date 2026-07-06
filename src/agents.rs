@@ -99,6 +99,9 @@ pub struct AgentMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentScope {
     BuiltIn,
+    /// Provided by an installed plugin (Claude Code or Anvil-native).
+    /// Overrides bundled subagents; user and project ones override it.
+    Plugin,
     User,
     Project,
 }
@@ -197,6 +200,22 @@ fn discover_with_backend(
     let mut reg = AgentRegistry::default();
 
     load_bundled_agents(&mut reg, backend);
+
+    // Plugin scope: overrides bundled, overridden by user/project.
+    // A manifest can declare individual `.md` files or directories.
+    let plugin_catalog = crate::plugins::discover(Some(&cwd), home);
+    for diag in &plugin_catalog.diagnostics {
+        reg.push_diagnostic(diag.clone());
+    }
+    for plugin in plugin_catalog.enabled() {
+        for source in plugin.agent_sources() {
+            if source.is_dir() {
+                scan_root(&source, AgentScope::Plugin, &mut reg, backend);
+            } else {
+                load_agent(&source, AgentScope::Plugin, &mut reg, backend);
+            }
+        }
+    }
 
     // 1+2. User scope.
     if let Some(h) = home {
@@ -394,6 +413,9 @@ fn load_agent(
     reg: &mut AgentRegistry,
     backend: &crate::sandbox_backend::SandboxBackend,
 ) {
+    if file_exceeds_max_body(path, reg) {
+        return;
+    }
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -524,6 +546,20 @@ fn load_agent(
         scope,
         bundled_body: None,
     });
+}
+
+fn file_exceeds_max_body(path: &Path, reg: &mut AgentRegistry) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_BODY_BYTES as u64 => {
+            reg.push_diagnostic(format!(
+                "subagent at '{}' exceeds {MAX_BODY_BYTES} bytes; skipping",
+                path.display()
+            ));
+            true
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
 }
 
 fn parse_max_turns(frontmatter: &str) -> Result<Option<usize>, String> {
@@ -796,6 +832,70 @@ mod tests {
         assert_eq!(meta.scope, AgentScope::BuiltIn);
         assert!(reg.get("security-reviewer").is_some());
         assert!(reg.diagnostics().is_empty(), "{:?}", reg.diagnostics());
+    }
+
+    /// A home dir with one Claude Code-installed plugin whose manifest
+    /// lists a single agent file explicitly. Returns (home, plugin_root).
+    fn home_with_plugin_agent(name: &str, description: &str) -> (TempDir, TempDir) {
+        let plugin = TempDir::new().unwrap();
+        write(
+            &plugin.path().join(".claude-plugin").join("plugin.json"),
+            &format!(r#"{{"name":"demo","agents":["./agents/{name}.md"]}}"#),
+        );
+        write(
+            &plugin.path().join("agents").join(format!("{name}.md")),
+            &agent_md(name, description, "Body."),
+        );
+        let home = TempDir::new().unwrap();
+        write(
+            &home
+                .path()
+                .join(".claude")
+                .join("plugins")
+                .join("installed_plugins.json"),
+            &format!(
+                r#"{{"version":2,"plugins":{{"demo@mkt":[{{"scope":"user","installPath":{}}}]}}}}"#,
+                serde_json::to_string(&plugin.path().display().to_string()).unwrap()
+            ),
+        );
+        (home, plugin)
+    }
+
+    #[test]
+    fn plugin_agents_are_discovered() {
+        let tmp = TempDir::new().unwrap();
+        let (home, _plugin) = home_with_plugin_agent("plugin-hunter", "Plugin-provided hunter");
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("plugin-hunter").unwrap();
+        assert_eq!(meta.description, "Plugin-provided hunter");
+        assert_eq!(meta.scope, AgentScope::Plugin);
+    }
+
+    #[test]
+    fn plugin_agent_overrides_bundled_and_user_overrides_plugin() {
+        let tmp = TempDir::new().unwrap();
+        // Same name as a bundled subagent: plugin wins over bundled.
+        let (home, _plugin) =
+            home_with_plugin_agent("architect-reviewer", "Plugin-provided reviewer");
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        assert_eq!(
+            reg.get("architect-reviewer").unwrap().scope,
+            AgentScope::Plugin
+        );
+
+        // User file wins over the plugin.
+        write(
+            &home
+                .path()
+                .join(".claude")
+                .join("agents")
+                .join("architect-reviewer.md"),
+            &agent_md("architect-reviewer", "User-provided reviewer", "Body."),
+        );
+        let reg = discover_inner(tmp.path(), Some(home.path()));
+        let meta = reg.get("architect-reviewer").unwrap();
+        assert_eq!(meta.scope, AgentScope::User);
+        assert_eq!(meta.description, "User-provided reviewer");
     }
 
     #[test]

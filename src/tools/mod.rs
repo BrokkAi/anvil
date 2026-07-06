@@ -6,7 +6,7 @@ mod web_search;
 use crate::agents::AgentRegistry;
 use crate::llm_client::{FunctionDef, ToolDefinition};
 use crate::mcp::{McpClient, McpServerConfig};
-use crate::skills::SkillRegistry;
+use crate::skills::{SkillKind, SkillRegistry};
 use agent_client_protocol::schema::v1::ToolKind;
 use sandbox::SandboxPolicy;
 use serde::de::DeserializeOwned;
@@ -618,6 +618,10 @@ pub struct ToolRegistry {
     advertised_builtin_tools: RwLock<HashSet<String>>,
     skills: RwLock<Arc<SkillRegistry>>,
     agents: RwLock<Arc<AgentRegistry>>,
+    /// Hooks contributed by enabled plugins, captured at registry build
+    /// time. Ordered; executed by `tool_loop::execute_tool` around each
+    /// tool call.
+    plugin_hooks: Vec<crate::plugins::HookCommand>,
 }
 
 impl ToolRegistry {
@@ -673,6 +677,7 @@ impl ToolRegistry {
         mcp_servers: Vec<McpServerConfig>,
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
+        plugin_hooks: Vec<crate::plugins::HookCommand>,
     ) -> Self {
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
@@ -739,7 +744,13 @@ impl ToolRegistry {
             ),
             skills: RwLock::new(skills),
             agents: RwLock::new(agents),
+            plugin_hooks,
         }
+    }
+
+    /// Hooks contributed by enabled plugins at registry build time.
+    pub(crate) fn plugin_hooks(&self) -> &[crate::plugins::HookCommand] {
+        &self.plugin_hooks
     }
 
     /// All tool definitions for the OpenAI tools parameter.
@@ -971,8 +982,12 @@ impl ToolRegistry {
         // The spec's "Filtering" note: don't expose the tool with an
         // empty enum -- the model would waste turns guessing.
         let skills = self.skills.read().await;
-        if !skills.is_empty() {
-            let names: Vec<String> = skills.iter_sorted().map(|m| m.name.clone()).collect();
+        let names: Vec<String> = skills
+            .iter_sorted()
+            .filter(|m| m.kind == SkillKind::Skill)
+            .map(|m| m.name.clone())
+            .collect();
+        if !names.is_empty() {
             defs.push(tool_def(
                 "activate_skill",
                 "Load the full instructions for a previously listed skill from `<available_skills>`. \
@@ -1341,8 +1356,12 @@ impl ToolRegistry {
         };
         let name = args.name;
         let skills = self.skills.read().await.clone();
-        let Some(meta) = skills.get(&name) else {
-            let available: Vec<&str> = skills.iter_sorted().map(|m| m.name.as_str()).collect();
+        let Some(meta) = skills.get(&name).filter(|m| m.kind == SkillKind::Skill) else {
+            let available: Vec<&str> = skills
+                .iter_sorted()
+                .filter(|m| m.kind == SkillKind::Skill)
+                .map(|m| m.name.as_str())
+                .collect();
             return ToolResult {
                 status: ToolStatus::RequestError,
                 output: format!(
@@ -1795,7 +1814,7 @@ mod tests {
     /// `tool_definitions()` (otherwise the LLM never sees it). If you add a
     /// new built-in dispatch arm in `execute`, also add the name to
     /// `BUILTIN_TOOL_NAMES`, the `TOOLS` table, and `tool_definitions()`.
-    use crate::skills::{SkillMeta, SkillScope};
+    use crate::skills::{SkillKind, SkillMeta, SkillScope};
 
     fn registry_with_skills(skills: Vec<SkillMeta>) -> ToolRegistry {
         let mut reg = SkillRegistry::default();
@@ -1816,6 +1835,7 @@ mod tests {
             ),
             skills: RwLock::new(Arc::new(reg)),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
+            plugin_hooks: Vec::new(),
         }
     }
 
@@ -1838,6 +1858,7 @@ mod tests {
             ),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(reg)),
+            plugin_hooks: Vec::new(),
         }
     }
 
@@ -1857,6 +1878,24 @@ mod tests {
             location,
             skill_dir,
             scope: SkillScope::Project,
+            kind: SkillKind::Skill,
+        };
+        (tmp, meta)
+    }
+
+    fn write_command_fixture(name: &str, body: &str) -> (tempfile::TempDir, SkillMeta) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let location = skill_dir.join(format!("{name}.md"));
+        std::fs::write(&location, body).unwrap();
+        let meta = SkillMeta {
+            name: name.to_string(),
+            description: "cmd".to_string(),
+            location,
+            skill_dir,
+            scope: SkillScope::Plugin,
+            kind: SkillKind::Command,
         };
         (tmp, meta)
     }
@@ -1881,6 +1920,41 @@ mod tests {
         let names: Vec<&str> = enum_field.iter().filter_map(|v| v.as_str()).collect();
         // Alphabetically sorted by SkillRegistry::iter_sorted.
         assert_eq!(names, vec!["bar", "foo"]);
+    }
+
+    #[tokio::test]
+    async fn activate_skill_ignores_plugin_commands() {
+        let (_skill_tmp, skill) = write_skill_fixture("real-skill", "body");
+        let (_command_tmp, command) = write_command_fixture("deploy", "run deploy");
+        let registry = registry_with_skills(vec![skill, command]);
+        let defs = registry.tool_definitions().await;
+        let activate = defs
+            .iter()
+            .find(|d| d.function.name == "activate_skill")
+            .expect("activate_skill must be advertised for the real skill");
+        let names: Vec<&str> = activate
+            .function
+            .parameters
+            .pointer("/properties/name/enum")
+            .expect("name property has an enum constraint")
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(names, vec!["real-skill"]);
+
+        let result = registry
+            .execute(
+                "activate_skill",
+                json!({ "name": "deploy" }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+        assert!(matches!(result.status, ToolStatus::RequestError));
+        assert!(result.output.contains("Unknown skill 'deploy'"));
+        assert!(result.output.contains("real-skill"));
+        assert!(!result.output.contains("deploy,"));
     }
 
     #[tokio::test]
@@ -1966,6 +2040,7 @@ mod tests {
             ),
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
+            plugin_hooks: Vec::new(),
         };
         let advertised: Vec<String> = registry
             .tool_definitions()

@@ -242,13 +242,27 @@ Built-in commands:
   token budget is likewise optional.
 - `/compress`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
+- `/plugin`: list, install, update, enable, disable, or remove Claude
+  Code-format plugins.
 - `/pr-create [title]`: create a GitHub pull request from the current branch.
 
 Skill slash commands are discovered from `SKILL.md` files under
 `$CODEX_HOME/skills` (or `~/.codex/skills`), `~/.claude/skills`,
-`~/.agents/skills`, and project `.claude/skills` / `.agents/skills` roots. If a
-skill name collides with a built-in command, the built-in command wins and the
-skill slash entry is hidden from autocomplete.
+`~/.agents/skills`, project `.claude/skills` / `.agents/skills` roots, and
+installed plugins. Plugin command markdown files are also exposed as slash
+commands. If a skill or plugin command name collides with a built-in command,
+the built-in command wins and the slash entry is hidden from autocomplete.
+Plugin-provided entries have the lowest precedence, so user and project entries
+override them.
+
+## Plugins
+
+Anvil discovers Claude Code-format plugins (`.claude-plugin/plugin.json`) from
+Claude Code installs automatically. `/plugin add <git-url | owner/repo |
+local-path> [marketplace-plugin]` installs or registers plugins in Anvil's own
+config directory; `/plugin list`, `/plugin update`, `/plugin enable`, `/plugin
+disable`, and `/plugin remove` manage them. Plugins can provide skills,
+subagents, slash commands, hooks, and MCP servers.
 
 ## MCP Servers
 
@@ -458,13 +472,16 @@ be listed directly.
 
 Discovery order:
 
-1. `~/.claude/agents/`
-2. `~/.agents/agents/`
-3. `<git-root>/.claude/agents/` walking down to `cwd`
-4. `<git-root>/.agents/agents/` walking down to `cwd`
+1. Bundled agents.
+2. Installed plugin agents.
+3. `~/.claude/agents/`
+4. `~/.agents/agents/`
+5. `<git-root>/.claude/agents/` walking down to `cwd`
+6. `<git-root>/.agents/agents/` walking down to `cwd`
 
 Layout is flat: one `<name>.md` file per subagent. Later scopes override earlier
-ones. Project-level agents override user-level agents.
+ones. Project-level agents override user-level agents, and user/project agents
+override plugin-provided agents.
 
 Constraints:
 
