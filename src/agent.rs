@@ -2875,12 +2875,12 @@ pub async fn run_agent(
                             return Ok(());
                         }
 
+                        let review_plan = format_plan_for_review(&plan_result.response);
                         send_message(
                             &cx_for_gate,
                             &session_id_for_gate,
                             &format!(
-                                "\n\n{}\n\nAccept the plan to execute the original request.\n",
-                                plan_result.response.trim()
+                                "\n\n{review_plan}\n\nAccept the plan to execute the original request.\n"
                             ),
                         );
                         let approval = request_plan_approval(
@@ -4838,7 +4838,33 @@ fn plan_approval_for_outcome(outcome: RequestPermissionOutcome) -> PlanApproval 
     }
 }
 
+fn max_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+fn markdown_fence_for(text: &str) -> String {
+    "`".repeat(3.max(max_backtick_run(text) + 1))
+}
+
+fn format_plan_for_review(plan: &str) -> String {
+    let plan = plan.trim();
+    let fence = markdown_fence_for(plan);
+    format!("{fence}text\nBEGIN GENERATED PLAN\n{plan}\nEND GENERATED PLAN\n{fence}")
+}
+
 fn plan_approval_tool_call(plan: &str) -> ToolCallUpdate {
+    let plan = plan.trim();
+    let review_plan = format_plan_for_review(plan);
     ToolCallUpdate::new(
         ToolCallId::new("planning-gate-approval".to_string()),
         ToolCallUpdateFields::new()
@@ -4846,10 +4872,9 @@ fn plan_approval_tool_call(plan: &str) -> ToolCallUpdate {
             .status(ToolCallStatus::Pending)
             .title("Approve plan before execution")
             .content(vec![ToolCallContent::from(format!(
-                "Review the generated plan before deciding whether to execute it.\n\n{}",
-                plan.trim()
+                "Review the generated plan before deciding whether to execute it.\n\n{review_plan}"
             ))])
-            .raw_input(serde_json::json!({ "plan": plan.trim() })),
+            .raw_input(serde_json::json!({ "plan": plan })),
     )
 }
 
@@ -10402,7 +10427,25 @@ mod tests {
     }
 
     #[test]
-    fn plan_approval_prompt_includes_visible_plan_content() {
+    fn format_plan_for_review_marks_generated_plan_boundaries() {
+        let plan = "1. Inspect the planning gate\n2. Fix the approval order";
+        let text = format_plan_for_review(plan);
+        assert!(text.starts_with("```text\nBEGIN GENERATED PLAN\n"));
+        assert!(text.contains("1. Inspect the planning gate"));
+        assert!(text.contains("2. Fix the approval order"));
+        assert!(text.ends_with("\nEND GENERATED PLAN\n```"));
+    }
+
+    #[test]
+    fn format_plan_for_review_uses_fence_longer_than_plan_backticks() {
+        let plan = "1. Inspect\n```rust\nfn main() {}\n```\n2. Test";
+        let text = format_plan_for_review(plan);
+        assert!(text.starts_with("````text\nBEGIN GENERATED PLAN\n"));
+        assert!(text.ends_with("\nEND GENERATED PLAN\n````"));
+    }
+
+    #[test]
+    fn plan_approval_prompt_includes_delimited_visible_plan_content() {
         let plan = "1. Inspect the planning gate\n2. Fix the approval order";
         let tool_call = plan_approval_tool_call(plan);
         assert_eq!(tool_call.fields.status, Some(ToolCallStatus::Pending));
@@ -10426,8 +10469,10 @@ mod tests {
             panic!("approval content must be text: {content:?}");
         };
         assert!(text.text.contains("Review the generated plan"));
+        assert!(text.text.contains("BEGIN GENERATED PLAN"));
         assert!(text.text.contains("1. Inspect the planning gate"));
         assert!(text.text.contains("2. Fix the approval order"));
+        assert!(text.text.contains("END GENERATED PLAN"));
     }
 
     #[test]
