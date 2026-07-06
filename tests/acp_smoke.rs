@@ -20,6 +20,12 @@ enum PlanPermissionResponse {
     Cancel,
 }
 
+#[derive(Clone, Copy)]
+enum AutoEscalationCase {
+    ApproveOutside,
+    ApproveNormalOnly,
+}
+
 #[test]
 fn slopcop_shaped_acp_path_does_not_abort() {
     let cases = [SmokeCase {
@@ -39,6 +45,34 @@ fn auto_permission_classifier_denial_does_not_prompt_or_abort() {
         prompt: "Check the external cargo registry source if needed.".to_string(),
     };
     run_auto_classifier_denial_case(&case);
+}
+
+#[test]
+fn auto_permission_classifier_can_approve_outside_sandbox_without_prompt() {
+    if !os_shell_sandbox_available_for_smoke() {
+        eprintln!("skipping outside-sandbox auto smoke: OS shell sandbox is unavailable");
+        return;
+    }
+
+    let case = SmokeCase {
+        name: "auto_permission_classifier_approves_outside_sandbox",
+        prompt: "Create the requested outside-workspace marker file.".to_string(),
+    };
+    run_auto_classifier_escalation_case(&case, AutoEscalationCase::ApproveOutside);
+}
+
+#[test]
+fn auto_permission_classifier_denies_unapproved_sandbox_escape_without_prompt() {
+    if !os_shell_sandbox_available_for_smoke() {
+        eprintln!("skipping outside-sandbox auto smoke: OS shell sandbox is unavailable");
+        return;
+    }
+
+    let case = SmokeCase {
+        name: "auto_permission_classifier_denies_outside_sandbox",
+        prompt: "Create the requested outside-workspace marker file.".to_string(),
+    };
+    run_auto_classifier_escalation_case(&case, AutoEscalationCase::ApproveNormalOnly);
 }
 
 #[test]
@@ -2654,6 +2688,224 @@ fn run_auto_classifier_denial_case(case: &SmokeCase) {
     let _ = stderr_join.join();
 }
 
+fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEscalationCase) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+    let outside_marker = temp.path().join("outside-marker.txt");
+    let outside_marker_arg = shell_single_quote(&outside_marker.to_string_lossy());
+    let command =
+        format!("printf 'auto-approved\\n' > {outside_marker_arg} && cat {outside_marker_arg}");
+    let shell_args = json!({
+        "command": command,
+        "sandbox_permissions": "require_escalated"
+    })
+    .to_string();
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let classifier_body = match escalation_case {
+        AutoEscalationCase::ApproveOutside => text_sse_body(
+            r#"{"allow":true,"sandbox":"outside","rationale":"the user requested an outside-workspace marker file"}"#,
+        ),
+        AutoEscalationCase::ApproveNormalOnly => text_sse_body(
+            r#"{"allow":true,"sandbox":"normal","rationale":"normal sandbox execution is enough"}"#,
+        ),
+    };
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_openai_smoke_server(vec![
+        tool_call_sse_body_for("call_shell", "run_shell_command", &shell_args),
+        classifier_body,
+        text_sse_body("Escalation decision was handled."),
+    ]);
+    let mut child = spawn_anvil(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        2,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(case, "initialize", &initialize, &client);
+
+    let new_session = client.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": []
+        }),
+    );
+    assert_response_ok(case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let config = client.request(
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "permission_mode",
+            "value": "auto"
+        }),
+    );
+    assert_response_ok(
+        case,
+        "session/set_config_option (permission)",
+        &config,
+        &client,
+    );
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [
+                {
+                    "type": "text",
+                    "text": case.prompt
+                }
+            ]
+        }),
+    );
+    assert_response_ok(case, "session/prompt", &prompt, &client);
+    assert!(
+        !client.exited(),
+        "{}: anvil exited after auto-classifier escalation case; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+    assert_eq!(
+        client.permission_request_count, 0,
+        "{}: auto mode must not send client permission prompts",
+        case.name
+    );
+    assert_eq!(
+        prompt["result"]["stopReason"].as_str(),
+        Some("end_turn"),
+        "{}: classifier escalation case should complete as a normal turn: {prompt}",
+        case.name
+    );
+    assert_eq!(
+        provider.request_count(),
+        3,
+        "{}: expected provider to receive tool, classifier, and follow-up requests",
+        case.name
+    );
+
+    let bodies = provider.request_bodies();
+    assert!(
+        bodies.get(1).is_some_and(
+            |body| body.contains("sandbox_permissions") && body.contains("require_escalated")
+        ),
+        "{}: classifier request did not include the escalation marker; requests: {:?}",
+        case.name,
+        bodies
+    );
+    let updates_json =
+        serde_json::to_string(&client.take_updates()).expect("encode captured session updates");
+    match escalation_case {
+        AutoEscalationCase::ApproveOutside => {
+            let marker = std::fs::read_to_string(&outside_marker).unwrap_or_else(|error| {
+                panic!("{}: failed to read host marker: {error}", case.name)
+            });
+            assert_eq!(
+                marker, "auto-approved\n",
+                "{}: outside-sandbox approval did not create the host marker",
+                case.name
+            );
+            assert!(
+                updates_json.contains("approved outside-sandbox execution for this tool call"),
+                "{}: update stream missing auto outside-sandbox approval notice: {updates_json}",
+                case.name
+            );
+            assert!(
+                bodies
+                    .get(2)
+                    .is_some_and(|body| body.contains("auto-approved")),
+                "{}: follow-up request did not include successful shell output; requests: {:?}",
+                case.name,
+                bodies
+            );
+        }
+        AutoEscalationCase::ApproveNormalOnly => {
+            assert!(
+                !outside_marker.exists(),
+                "{}: classifier denial should not execute the outside write",
+                case.name
+            );
+            assert!(
+                updates_json.contains("did not approve outside-sandbox execution"),
+                "{}: update stream missing auto outside-sandbox denial notice: {updates_json}",
+                case.name
+            );
+            assert!(
+                bodies
+                    .get(2)
+                    .is_some_and(|body| body
+                        .contains("did not explicitly approve running outside the sandbox")),
+                "{}: follow-up request did not include classifier escalation denial; requests: {:?}",
+                case.name,
+                bodies
+            );
+        }
+    }
+
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn os_shell_sandbox_available_for_smoke() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if Path::new("/usr/bin/bwrap").is_file() {
+            return true;
+        }
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|dir| dir.join("bwrap").is_file()))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 fn spawn_anvil(
     home: &Path,
     config_home: &Path,
@@ -2861,6 +3113,7 @@ fn text_sse_body(text: &str) -> String {
 
 fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
     let fake_bifrost = make_fake_bifrost_binary(temp, bifrost_log);
+    seed_fake_managed_bifrost(config_home, &fake_bifrost);
     let setup = json!({
         "mcp_servers": [
             {
@@ -2873,6 +3126,56 @@ fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &
         ]
     });
     std::fs::write(config_home.join("setup.json"), setup.to_string()).expect("write setup");
+}
+
+#[cfg(unix)]
+fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cache_dir = config_home
+        .join("bifrost")
+        .join("0.7.2")
+        .join(bifrost_target_triple_for_smoke());
+    std::fs::create_dir_all(&cache_dir).expect("create fake managed bifrost cache");
+    let target = cache_dir.join("bifrost");
+    std::fs::copy(fake_bifrost, &target).expect("seed fake managed bifrost");
+    let mut perms = std::fs::metadata(&target)
+        .expect("stat fake managed bifrost")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&target, perms).expect("chmod fake managed bifrost");
+}
+
+#[cfg(not(unix))]
+fn seed_fake_managed_bifrost(_config_home: &Path, _fake_bifrost: &str) {}
+
+#[cfg(unix)]
+fn bifrost_target_triple_for_smoke() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "universal-apple-darwin"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "x86_64-unknown-linux-gnu"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "aarch64-unknown-linux-gnu"
+    }
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    {
+        "aarch64-linux-android"
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "android", target_arch = "aarch64"),
+    )))]
+    {
+        "unsupported"
+    }
 }
 
 #[cfg(unix)]
