@@ -652,9 +652,6 @@ enum ConfigApplyError {
         supported: Vec<String>,
     },
     UnknownSession,
-    PersistFailed {
-        details: String,
-    },
 }
 
 impl ConfigApplyError {
@@ -672,9 +669,6 @@ impl ConfigApplyError {
                 }
             }
             ConfigApplyError::UnknownSession => "unknown session".to_string(),
-            ConfigApplyError::PersistFailed { details } => {
-                format!("failed to persist setting: {details}")
-            }
         }
     }
 }
@@ -789,14 +783,8 @@ async fn apply_config_option(
                     supported: vec!["LUTZ".to_string(), "PLAN".to_string()],
                 });
             };
-            match sessions.set_mode(session_id, behavior_mode).await {
-                Ok(true) => {}
-                Ok(false) => return Err(ConfigApplyError::UnknownSession),
-                Err(e) => {
-                    return Err(ConfigApplyError::PersistFailed {
-                        details: format!("{e:#}"),
-                    });
-                }
+            if !sessions.set_mode(session_id, behavior_mode).await {
+                return Err(ConfigApplyError::UnknownSession);
             }
         }
         MODEL_CONFIG_ID => {
@@ -818,16 +806,11 @@ async fn apply_config_option(
                 });
             }
             match sessions.set_model(session_id, value.to_string()).await {
-                Ok((true, cleared, cleared_tier)) => {
+                (true, cleared, cleared_tier) => {
                     cleared_reasoning = cleared;
                     cleared_service_tier = cleared_tier;
                 }
-                Ok((false, _, _)) => return Err(ConfigApplyError::UnknownSession),
-                Err(e) => {
-                    return Err(ConfigApplyError::PersistFailed {
-                        details: format!("{e:#}"),
-                    });
-                }
+                (false, _, _) => return Err(ConfigApplyError::UnknownSession),
             }
         }
         REASONING_EFFORT_CONFIG_ID => {
@@ -3335,39 +3318,31 @@ pub async fn run_agent(
                     );
                 };
 
-                match sessions_mode.set_mode(&session_id, mode).await {
-                    Ok(true) => {
-                        // Config options supersede legacy modes, but Anvil
-                        // exposes both. Keep clients on the config-options
-                        // surface in sync by emitting a config_option_update
-                        // with the complete current set after a mode change
-                        // through the legacy modes API (#156).
-                        if let Some(options) =
-                            current_config_options(&sessions_mode, &session_id).await
-                        {
-                            let notification = SessionNotification::new(
-                                session_id.clone(),
-                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                if sessions_mode.set_mode(&session_id, mode).await {
+                    // Config options supersede legacy modes, but Anvil
+                    // exposes both. Keep clients on the config-options
+                    // surface in sync by emitting a config_option_update
+                    // with the complete current set after a mode change
+                    // through the legacy modes API (#156).
+                    if let Some(options) = current_config_options(&sessions_mode, &session_id).await
+                    {
+                        let notification = SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                        );
+                        if let Err(e) = cx.send_notification(notification) {
+                            tracing::warn!(
+                                "failed to send config_option_update after set_mode: {e}"
                             );
-                            if let Err(e) = cx.send_notification(notification) {
-                                tracing::warn!(
-                                    "failed to send config_option_update after set_mode: {e}"
-                                );
-                            }
                         }
-                        responder.respond(SetSessionModeResponse::new())
                     }
-                    Ok(false) => responder.respond_with_error(
+                    responder.respond(SetSessionModeResponse::new())
+                } else {
+                    responder.respond_with_error(
                         agent_client_protocol::Error::invalid_params().data(serde_json::json!({
                             "reason": format!("unknown session '{session_id}'"),
                         })),
-                    ),
-                    Err(e) => responder.respond_with_error(
-                        agent_client_protocol::Error::internal_error().data(serde_json::json!({
-                            "reason": "failed to persist session mode",
-                            "details": format!("{e:#}"),
-                        })),
-                    ),
+                    )
                 }
             },
             on_receive_request!(),
@@ -3423,16 +3398,6 @@ pub async fn run_agent(
                             agent_client_protocol::Error::invalid_params().data(
                                 serde_json::json!({
                                     "reason": format!("unknown session '{session_id}'"),
-                                }),
-                            ),
-                        );
-                    }
-                    Err(ConfigApplyError::PersistFailed { details }) => {
-                        return responder.respond_with_error(
-                            agent_client_protocol::Error::internal_error().data(
-                                serde_json::json!({
-                                    "reason": "failed to persist session mode",
-                                    "details": details,
                                 }),
                             ),
                         );
@@ -12624,8 +12589,6 @@ mod tests {
             created: 1,
             modified: 1_706_000_000_000,
             version: "4.0".into(),
-            mode: None,
-            model: None,
             brokk_mcp_servers: None,
             cwd: None,
             additional_directories: None,
@@ -14010,30 +13973,6 @@ mod tests {
             .await
             .expect("session present");
         assert_eq!(snap.model, "custom/model");
-    }
-
-    #[tokio::test]
-    async fn apply_config_option_reports_model_persistence_failure() {
-        let (store, id, cwd) = make_store_with_session_and_cwd("initial").await;
-        std::fs::remove_dir_all(&cwd).expect("remove persisted session zip parent");
-
-        let err = apply_config_option(&store, &id, MODEL_CONFIG_ID, "custom/model")
-            .await
-            .expect_err("missing session zip should surface as persistence failure");
-
-        match err {
-            ConfigApplyError::PersistFailed { details } => {
-                let lower = details.to_lowercase();
-                assert!(
-                    lower.contains("cannot resolve")
-                        || lower.contains("failed")
-                        || lower.contains("no such file")
-                        || lower.contains("file not found"),
-                    "unexpected persistence details: {details}"
-                );
-            }
-            other => panic!("expected PersistFailed, got {other:?}"),
-        }
     }
 
     #[tokio::test]
