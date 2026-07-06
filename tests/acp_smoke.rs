@@ -2694,10 +2694,17 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
     std::fs::create_dir_all(&cwd).expect("create cwd");
     std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
     std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
-    let outside_marker = temp.path().join("outside-marker.txt");
+    let Some(outside_marker_dir) = outside_sandbox_marker_dir_for_smoke(case.name) else {
+        eprintln!("skipping outside-sandbox auto smoke: HOME is unavailable for outside marker");
+        return;
+    };
+    std::fs::create_dir_all(&outside_marker_dir).expect("create outside marker dir");
+    let _outside_marker_cleanup = RemoveDirOnDrop(outside_marker_dir.clone());
+    let outside_marker = outside_marker_dir.join("outside-marker.txt");
     let outside_marker_arg = shell_single_quote(&outside_marker.to_string_lossy());
     let command =
         format!("printf 'auto-approved\\n' > {outside_marker_arg} && cat {outside_marker_arg}");
+    let normal_shell_args = json!({ "command": command }).to_string();
     let shell_args = json!({
         "command": command,
         "sandbox_permissions": "require_escalated"
@@ -2722,6 +2729,11 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
     };
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
+        tool_call_sse_body_for("call_shell_normal", "run_shell_command", &normal_shell_args),
+        text_sse_body(
+            r#"{"allow":true,"sandbox":"normal","rationale":"precondition should stay sandboxed"}"#,
+        ),
+        text_sse_body("Normal sandbox precondition was handled."),
         tool_call_sse_body_for("call_shell", "run_shell_command", &shell_args),
         classifier_body,
         text_sse_body("Escalation decision was handled."),
@@ -2781,6 +2793,37 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
         &client,
     );
 
+    let precondition = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [
+                {
+                    "type": "text",
+                    "text": "Verify the normal sandbox blocks this outside marker write."
+                }
+            ]
+        }),
+    );
+    assert_response_ok(
+        case,
+        "session/prompt (normal sandbox precondition)",
+        &precondition,
+        &client,
+    );
+    assert_eq!(
+        precondition["result"]["stopReason"].as_str(),
+        Some("end_turn"),
+        "{}: normal-sandbox precondition should complete as a normal turn: {precondition}",
+        case.name
+    );
+    assert!(
+        !outside_marker.exists(),
+        "{}: normal sandbox unexpectedly wrote outside marker at {}; the escalation smoke would not prove an outside-sandbox escape",
+        case.name,
+        outside_marker.display()
+    );
+
     let prompt = client.request(
         "session/prompt",
         json!({
@@ -2814,14 +2857,24 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
     );
     assert_eq!(
         provider.request_count(),
-        3,
-        "{}: expected provider to receive tool, classifier, and follow-up requests",
+        6,
+        "{}: expected provider to receive precondition and escalation tool/classifier/follow-up requests",
         case.name
     );
 
     let bodies = provider.request_bodies();
     assert!(
         bodies.get(1).is_some_and(
+            |body| body.contains("run_shell_command") && body.contains("auto-approved")
+        ) && !bodies
+            .get(1)
+            .is_some_and(|body| body.contains("sandbox_permissions")),
+        "{}: precondition classifier request should be for a normal sandbox call; requests: {:?}",
+        case.name,
+        bodies
+    );
+    assert!(
+        bodies.get(4).is_some_and(
             |body| body.contains("sandbox_permissions") && body.contains("require_escalated")
         ),
         "{}: classifier request did not include the escalation marker; requests: {:?}",
@@ -2847,7 +2900,7 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
             );
             assert!(
                 bodies
-                    .get(2)
+                    .get(5)
                     .is_some_and(|body| body.contains("auto-approved")),
                 "{}: follow-up request did not include successful shell output; requests: {:?}",
                 case.name,
@@ -2867,7 +2920,7 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
             );
             assert!(
                 bodies
-                    .get(2)
+                    .get(5)
                     .is_some_and(|body| body
                         .contains("did not explicitly approve running outside the sandbox")),
                 "{}: follow-up request did not include classifier escalation denial; requests: {:?}",
@@ -2876,10 +2929,38 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
             );
         }
     }
+    assert!(
+        !client
+            .stderr_text()
+            .contains("failed to prepare bundled bifrost"),
+        "{}: fake managed Bifrost cache did not match production discovery path; stderr:\n{}",
+        case.name,
+        client.stderr_text()
+    );
 
     client.shutdown();
     let _ = stdout_join.join();
     let _ = stderr_join.join();
+}
+
+fn outside_sandbox_marker_dir_for_smoke(case_name: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let safe_case: String = case_name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    Some(home.join(format!(
+        ".anvil-acp-smoke-{safe_case}-{}",
+        uuid::Uuid::new_v4()
+    )))
+}
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -3128,28 +3209,38 @@ fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &
     std::fs::write(config_home.join("setup.json"), setup.to_string()).expect("write setup");
 }
 
-#[cfg(unix)]
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
     let cache_dir = config_home
         .join("bifrost")
         .join("0.7.2")
         .join(bifrost_target_triple_for_smoke());
     std::fs::create_dir_all(&cache_dir).expect("create fake managed bifrost cache");
-    let target = cache_dir.join("bifrost");
+    let target = cache_dir.join(bifrost_binary_name_for_smoke());
     std::fs::copy(fake_bifrost, &target).expect("seed fake managed bifrost");
-    let mut perms = std::fs::metadata(&target)
-        .expect("stat fake managed bifrost")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&target, perms).expect("chmod fake managed bifrost");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = std::fs::metadata(&target)
+            .expect("stat fake managed bifrost")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms).expect("chmod fake managed bifrost");
+    }
 }
 
-#[cfg(not(unix))]
-fn seed_fake_managed_bifrost(_config_home: &Path, _fake_bifrost: &str) {}
+fn bifrost_binary_name_for_smoke() -> &'static str {
+    #[cfg(windows)]
+    {
+        "bifrost.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "bifrost"
+    }
+}
 
-#[cfg(unix)]
 fn bifrost_target_triple_for_smoke() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -3163,6 +3254,14 @@ fn bifrost_target_triple_for_smoke() -> &'static str {
     {
         "aarch64-unknown-linux-gnu"
     }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "x86_64-pc-windows-msvc"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        "aarch64-pc-windows-msvc"
+    }
     #[cfg(all(target_os = "android", target_arch = "aarch64"))]
     {
         "aarch64-linux-android"
@@ -3171,6 +3270,8 @@ fn bifrost_target_triple_for_smoke() -> &'static str {
         target_os = "macos",
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "aarch64"),
         all(target_os = "android", target_arch = "aarch64"),
     )))]
     {

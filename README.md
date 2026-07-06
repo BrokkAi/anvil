@@ -301,7 +301,7 @@ Bifrost provides structural code-intelligence tools such as:
 Permission mode controls whether Anvil asks before tool calls:
 
 - `default`: ask before edits, and before shell commands except for a conservative auto-approved subset of sandboxed read-only commands (for example `rg`, `git diff`, `git show`, `git status`).
-- `auto`: like `default`, but promptable tool calls may be approved by the permission classifier when clearly inside the user's request.
+- `auto`: like `default` for conservative sandboxed read-only commands, but promptable tool calls go to the permission classifier; unapproved calls are denied without a human prompt.
 - `acceptEdits`: allow file edits, and ask before shell commands except for a conservative auto-approved subset of sandboxed read-only commands (for example `rg`, `git diff`, `git show`, `git status`).
 - `readOnly`: block edits and shell commands.
 - `bypassPermissions`: allow tool calls without prompting.
