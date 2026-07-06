@@ -2348,17 +2348,20 @@ pub async fn run_agent(
                 } else {
                     raw_prompt_text.clone()
                 };
-                if !prompt_hook_context.is_empty() {
-                    prompt_text.push_str(&format!(
-                        "\n\n<plugin_hook_context>\n{}\n</plugin_hook_context>",
-                        prompt_hook_context.join("\n")
-                    ));
-                }
-                let prompt_parts = if prompt_text == raw_prompt_text {
+                let mut prompt_parts = if prompt_text == raw_prompt_text {
                     raw_prompt_parts
                 } else {
                     vec![ChatContentPart::text(prompt_text.clone())]
                 };
+                if !prompt_hook_context.is_empty() {
+                    let hook_context = format!(
+                        "<plugin_hook_context>\n{}\n</plugin_hook_context>",
+                        prompt_hook_context.join("\n")
+                    );
+                    prompt_text.push_str("\n\n");
+                    prompt_text.push_str(&hook_context);
+                    prompt_parts.push(ChatContentPart::text(hook_context));
+                }
 
                 if let Some(spec) = loop_spec.as_ref()
                     && snap.model.is_empty()
@@ -3633,6 +3636,10 @@ async fn run_user_prompt_submit_hooks(
     cwd: &Path,
     raw_prompt_text: &str,
 ) -> crate::plugins::HookDecision {
+    if is_slash_command(raw_prompt_text, "plugin") {
+        return crate::plugins::HookDecision::default();
+    }
+
     let hooks = crate::plugins::discover(Some(cwd), dirs::home_dir().as_deref()).hooks();
     if !hooks
         .iter()
@@ -5323,11 +5330,15 @@ fn should_auto_rename_session_from_prompt(prompt_text: &str) -> bool {
 /// skip the injection entirely (per the spec's "When no skills are
 /// available" guidance: never emit an empty block).
 fn build_skills_catalog(registry: &crate::skills::SkillRegistry) -> Option<String> {
-    if registry.is_empty() {
+    let skills: Vec<&crate::skills::SkillMeta> = registry
+        .iter_sorted()
+        .filter(|meta| meta.kind == crate::skills::SkillKind::Skill)
+        .collect();
+    if skills.is_empty() {
         return None;
     }
     let mut out = String::from("<available_skills>\n");
-    for meta in registry.iter_sorted() {
+    for meta in skills {
         out.push_str("  <skill>\n");
         out.push_str(&format!("    <name>{}</name>\n", xml_escape(&meta.name)));
         out.push_str(&format!(
@@ -6148,7 +6159,11 @@ async fn handle_plugin(
 ) -> PluginCommandOutcome {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
-        return PluginCommandOutcome::message(render_plugins(cwd));
+        let available_commands = sessions.refresh_discovered_context(session_id).await;
+        return PluginCommandOutcome {
+            report: render_plugins(cwd),
+            available_commands,
+        };
     }
 
     let words = match parse_shell_words(&trimmed) {
@@ -6160,7 +6175,11 @@ async fn handle_plugin(
         .map(|word| word.to_ascii_lowercase())
         .unwrap_or_default();
     if command == "list" {
-        return PluginCommandOutcome::message(render_plugins(cwd));
+        let available_commands = sessions.refresh_discovered_context(session_id).await;
+        return PluginCommandOutcome {
+            report: render_plugins(cwd),
+            available_commands,
+        };
     }
     let result = match command.as_str() {
         "add" | "install" => {
@@ -6217,6 +6236,9 @@ fn plugin_git_url(source: &str) -> Option<String> {
     if source.is_empty() || source.starts_with('-') {
         return None;
     }
+    if http_git_url_has_userinfo(source) {
+        return None;
+    }
     if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("git@")
@@ -6235,54 +6257,34 @@ fn plugin_git_url(source: &str) -> Option<String> {
     None
 }
 
+fn http_git_url_has_userinfo(source: &str) -> bool {
+    let Some(rest) = source
+        .strip_prefix("https://")
+        .or_else(|| source.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.contains('@')
+}
+
+fn reject_credentialed_git_url(source: &str) -> Result<(), String> {
+    if http_git_url_has_userinfo(source) {
+        Err(
+            "git URLs with embedded credentials are not supported; use SSH or a git credential helper"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
 fn valid_github_path_component(value: &str) -> bool {
     !value.is_empty()
         && !matches!(value, "." | "..")
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-}
-
-fn resolve_plugin_subpath(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let rel = rel.trim();
-    if rel.is_empty() {
-        return Err("plugin path must not be empty".to_string());
-    }
-    let path = Path::new(rel);
-    if path.is_absolute() {
-        return Err(format!("plugin path `{rel}` must be relative"));
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                return Err(format!("plugin path `{rel}` must not contain `..`"));
-            }
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                return Err(format!("plugin path `{rel}` must be relative"));
-            }
-        }
-    }
-
-    let joined = if normalized.as_os_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(normalized)
-    };
-    let root = std::fs::canonicalize(root)
-        .map_err(|e| format!("plugin root '{}' is not accessible: {e}", root.display()))?;
-    let joined = std::fs::canonicalize(&joined)
-        .map_err(|e| format!("plugin path `{rel}` is not accessible: {e}"))?;
-    if !joined.starts_with(&root) {
-        return Err(format!(
-            "plugin path `{rel}` resolves outside '{}'",
-            root.display()
-        ));
-    }
-    Ok(joined)
 }
 
 fn resolve_local_plugin_source(cwd: &Path, source: &str) -> Result<PathBuf, String> {
@@ -6301,6 +6303,7 @@ async fn plugin_add(
     source: &str,
     marketplace_plugin: Option<&str>,
 ) -> Result<String, String> {
+    reject_credentialed_git_url(source)?;
     if let Some(url) = plugin_git_url(source) {
         return plugin_add_from_git(cwd, source, &url, marketplace_plugin, None).await;
     }
@@ -6319,7 +6322,7 @@ async fn plugin_add(
         let entry = find_marketplace_entry(&marketplace, plugin_name, source)?;
         return match &entry.source {
             crate::plugins::MarketplaceSource::Path(rel) => {
-                let plugin_root = resolve_plugin_subpath(&root, rel)?;
+                let plugin_root = crate::plugins::resolve_plugin_subpath(&root, rel)?;
                 let name = crate::plugins::register_native(source, &plugin_root, None)
                     .map_err(|e| format!("failed to register plugin: {e:#}"))?;
                 Ok(format!(
@@ -6352,9 +6355,12 @@ fn marketplace_source_git(
         ("github", _, Some(repo)) => plugin_git_url(repo).ok_or_else(|| {
             format!("marketplace github source repo `{repo}` must be in `owner/repo` form")
         })?,
-        (_, Some(url), _) => plugin_git_url(url).ok_or_else(|| {
-            format!("marketplace source URL `{url}` is not a supported git location")
-        })?,
+        (_, Some(url), _) => {
+            reject_credentialed_git_url(url)?;
+            plugin_git_url(url).ok_or_else(|| {
+                format!("marketplace source URL `{url}` is not a supported git location")
+            })?
+        }
         _ => {
             return Err(format!(
                 "marketplace source '{}' has no usable git location",
@@ -6400,6 +6406,69 @@ fn find_marketplace_entry<'a>(
         })
 }
 
+const PLUGIN_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const PLUGIN_GIT_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+
+async fn run_plugin_git_command(
+    mut command: tokio::process::Command,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    let output = tokio::time::timeout(PLUGIN_GIT_TIMEOUT, {
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command.output()
+    })
+    .await;
+    match output {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("failed to run {label}: {e}")),
+        Err(_) => Err(format!(
+            "{label} timed out after {}s",
+            PLUGIN_GIT_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+fn bounded_command_output(bytes: &[u8]) -> String {
+    let (slice, truncated) = if bytes.len() > PLUGIN_GIT_OUTPUT_MAX_BYTES {
+        (&bytes[..PLUGIN_GIT_OUTPUT_MAX_BYTES], true)
+    } else {
+        (bytes, false)
+    };
+    let mut text = String::from_utf8_lossy(slice).trim().to_string();
+    if truncated {
+        text.push_str("\n... output truncated");
+    }
+    text
+}
+
+fn managed_plugin_install_root(path: &Path) -> Result<PathBuf, String> {
+    let plugins_dir = crate::plugins::native_plugins_dir()
+        .map_err(|e| format!("cannot resolve plugin install directory: {e:#}"))?;
+    let plugins_dir = std::fs::canonicalize(&plugins_dir).map_err(|e| {
+        format!(
+            "plugin install directory '{}' is not accessible: {e}",
+            plugins_dir.display()
+        )
+    })?;
+    let root = std::fs::canonicalize(path).map_err(|e| {
+        format!(
+            "plugin install root '{}' is not accessible: {e}",
+            path.display()
+        )
+    })?;
+    if root.parent() != Some(plugins_dir.as_path()) {
+        return Err(format!(
+            "refusing to operate on plugin install root '{}' outside '{}'",
+            root.display(),
+            plugins_dir.display()
+        ));
+    }
+    Ok(root)
+}
+
 /// Clone `url` and register the plugin found at its root (or `subdir`
 /// within it). When the clone turns out to be a marketplace instead of a
 /// plugin, `marketplace_plugin` picks the entry to install.
@@ -6438,30 +6507,27 @@ async fn plugin_add_from_git(
     std::fs::create_dir_all(&plugins_dir)
         .map_err(|e| format!("cannot create '{}': {e}", plugins_dir.display()))?;
 
-    let clone = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        tokio::process::Command::new("git")
-            .arg("clone")
-            .arg("--depth")
-            .arg("1")
-            .arg("--")
-            .arg(url)
-            .arg(&dest)
-            .output(),
-    )
-    .await;
-    let output = match clone {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(format!("failed to run git clone: {e}")),
-        Err(_) => {
+    let mut clone = tokio::process::Command::new("git");
+    clone
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--")
+        .arg(url)
+        .arg(&dest);
+    let output = match run_plugin_git_command(clone, "git clone").await {
+        Ok(output) => output,
+        Err(e) => {
             let _ = std::fs::remove_dir_all(&dest);
-            return Err("git clone timed out after 300s".to_string());
+            return Err(e);
         }
     };
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&dest);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git clone failed: {}", stderr.trim()));
+        return Err(format!(
+            "git clone failed: {}",
+            bounded_command_output(&output.stderr)
+        ));
     }
 
     // A clone with a marketplace listing instead of a plugin manifest:
@@ -6480,13 +6546,14 @@ async fn plugin_add_from_git(
                                     // The plugin lives inside this clone:
                                     // keep the clone and register the
                                     // subdirectory.
-                                    let plugin_root = match resolve_plugin_subpath(&dest, rel) {
-                                        Ok(path) => path,
-                                        Err(e) => {
-                                            let _ = std::fs::remove_dir_all(&dest);
-                                            return Err(e);
-                                        }
-                                    };
+                                    let plugin_root =
+                                        match crate::plugins::resolve_plugin_subpath(&dest, rel) {
+                                            Ok(path) => path,
+                                            Err(e) => {
+                                                let _ = std::fs::remove_dir_all(&dest);
+                                                return Err(e);
+                                            }
+                                        };
                                     return crate::plugins::register_native(
                                         source,
                                         &plugin_root,
@@ -6538,7 +6605,7 @@ async fn plugin_add_from_git(
     }
 
     let plugin_root = match subdir {
-        Some(rel) => match resolve_plugin_subpath(&dest, rel) {
+        Some(rel) => match crate::plugins::resolve_plugin_subpath(&dest, rel) {
             Ok(path) => path,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dest);
@@ -6575,7 +6642,16 @@ fn plugin_remove(cwd: &Path, name: &str) -> Result<String, String> {
     // Only delete directories we created (git clones recorded as the
     // entry's install root); local-path registrations are left in place.
     if let Some(install_root) = &entry.install_root {
-        if let Err(e) = std::fs::remove_dir_all(install_root) {
+        let install_root = match managed_plugin_install_root(install_root) {
+            Ok(root) => root,
+            Err(e) => {
+                return Ok(format!(
+                    "Plugin `{name}` unregistered, but its files at `{}` were left in place: {e}",
+                    install_root.display()
+                ));
+            }
+        };
+        if let Err(e) = std::fs::remove_dir_all(&install_root) {
             return Ok(format!(
                 "Plugin `{name}` unregistered, but its files at `{}` could not be deleted: {e}",
                 install_root.display()
@@ -6617,33 +6693,30 @@ async fn plugin_update(cwd: &Path, name: &str) -> Result<String, String> {
         }
         return Err(format!("no plugin named `{name}` is installed"));
     };
-    let repo_dir = entry.install_root.as_ref().unwrap_or(&entry.path);
-    if !repo_dir.join(".git").exists() {
+    let Some(repo_dir) = entry.install_root.as_ref() else {
         return Err(format!(
             "plugin `{name}` was registered from a local path; there is nothing to pull"
         ));
-    }
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_dir)
-            .arg("pull")
-            .arg("--ff-only")
-            .output(),
-    )
-    .await;
-    let output = match output {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(format!("failed to run git pull: {e}")),
-        Err(_) => return Err("git pull timed out after 300s".to_string()),
     };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git pull failed: {}", stderr.trim()));
+    let repo_dir = managed_plugin_install_root(repo_dir)?;
+    if !repo_dir.join(".git").exists() {
+        return Err(format!(
+            "plugin `{name}` install root is not a git checkout"
+        ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(format!("Plugin `{name}` updated.\n\n{}", stdout.trim()))
+    let mut pull = tokio::process::Command::new("git");
+    pull.arg("-C").arg(&repo_dir).arg("pull").arg("--ff-only");
+    let output = run_plugin_git_command(pull, "git pull").await?;
+    if !output.status.success() {
+        return Err(format!(
+            "git pull failed: {}",
+            bounded_command_output(&output.stderr)
+        ));
+    }
+    Ok(format!(
+        "Plugin `{name}` updated.\n\n{}",
+        bounded_command_output(&output.stdout)
+    ))
 }
 
 /// Resolve a user-typed name to a Claude Code plugin key. Accepts the
@@ -10449,6 +10522,13 @@ mod tests {
         assert_eq!(plugin_git_url("--upload-pack=/tmp/pwn.git"), None);
         assert_eq!(plugin_git_url("../repo"), None);
         assert_eq!(
+            plugin_git_url("https://user:token@example.com/private/repo.git"),
+            None
+        );
+        assert!(
+            reject_credentialed_git_url("https://user:token@example.com/private/repo.git").is_err()
+        );
+        assert_eq!(
             plugin_git_url("owner/repo"),
             Some("https://github.com/owner/repo.git".to_string())
         );
@@ -10485,6 +10565,14 @@ mod tests {
             path: None,
         };
         assert!(marketplace_source_git(&option_like_url).is_err());
+
+        let credentialed_url = crate::plugins::MarketplaceSourceDetail {
+            source: "url".to_string(),
+            url: Some("https://user:token@example.com/private/repo.git".to_string()),
+            repo: None,
+            path: None,
+        };
+        assert!(marketplace_source_git(&credentialed_url).is_err());
     }
 
     #[test]
@@ -10494,17 +10582,17 @@ mod tests {
         std::fs::create_dir_all(&plugin).unwrap();
 
         assert_eq!(
-            resolve_plugin_subpath(root.path(), "./plugins/demo").unwrap(),
+            crate::plugins::resolve_plugin_subpath(root.path(), "./plugins/demo").unwrap(),
             plugin.canonicalize().unwrap()
         );
-        assert!(resolve_plugin_subpath(root.path(), "../demo").is_err());
-        assert!(resolve_plugin_subpath(root.path(), "/tmp").is_err());
+        assert!(crate::plugins::resolve_plugin_subpath(root.path(), "../demo").is_err());
+        assert!(crate::plugins::resolve_plugin_subpath(root.path(), "/tmp").is_err());
 
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
-            assert!(resolve_plugin_subpath(root.path(), "escape").is_err());
+            assert!(crate::plugins::resolve_plugin_subpath(root.path(), "escape").is_err());
         }
     }
 
@@ -10565,7 +10653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_prompt_submit_hooks_see_builtin_slash_prompts() {
+    async fn user_prompt_submit_hooks_see_builtin_slash_prompts_except_plugin_management() {
         let config = tempfile::tempdir().unwrap();
         let _scope = crate::setup_state::TestConfigHomeScope::set(config.path().to_path_buf());
         let cwd = tempfile::tempdir().unwrap();
@@ -10586,10 +10674,14 @@ mod tests {
         crate::plugins::register_native("test-source", plugin.path(), None)
             .expect("register plugin");
 
-        let decision = run_user_prompt_submit_hooks(cwd.path(), "/plugin add ./local").await;
+        let decision = run_user_prompt_submit_hooks(cwd.path(), "/context").await;
 
         assert!(decision.blocked);
         assert_eq!(decision.reasons, vec!["blocked".to_string()]);
+
+        let decision = run_user_prompt_submit_hooks(cwd.path(), "/plugin disable hook").await;
+        assert!(!decision.blocked);
+        assert!(decision.reasons.is_empty());
     }
 
     #[test]
@@ -12825,6 +12917,42 @@ mod tests {
                     !c.contains("<available_skills>"),
                     "empty registry must not emit an empty catalog block"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn build_prompt_messages_skips_catalog_when_only_commands_exist() {
+        use crate::session::SessionSnapshot;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let command_path = tmp.path().join("deploy.md");
+        std::fs::write(&command_path, "Deploy $ARGUMENTS").unwrap();
+        let mut registry = SkillRegistry::default();
+        registry.insert_for_test(SkillMeta {
+            name: "deploy".into(),
+            description: "Deploy command".into(),
+            location: command_path,
+            skill_dir: tmp.path().to_path_buf(),
+            scope: SkillScope::Plugin,
+            kind: SkillKind::Command,
+        });
+        let snap = SessionSnapshot {
+            cwd: TestPathBuf::from("/tmp/cwd"),
+            additional_directories: Vec::new(),
+            mode: SessionMode::Lutz,
+            model: "m".into(),
+            history: vec![],
+            reasoning_effort: None,
+            idle_timeout_secs: None,
+            project_instructions: String::new(),
+            skills: std::sync::Arc::new(registry),
+        };
+        let msgs = build_prompt_messages(&snap, "hi");
+        assert_eq!(msgs.len(), 2);
+        for m in &msgs {
+            if let Some(c) = m.text_content() {
+                assert!(!c.contains("<available_skills>"));
+                assert!(!c.contains("<name>deploy</name>"));
             }
         }
     }

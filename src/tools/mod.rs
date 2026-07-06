@@ -6,7 +6,7 @@ mod web_search;
 use crate::agents::AgentRegistry;
 use crate::llm_client::{FunctionDef, ToolDefinition};
 use crate::mcp::{McpClient, McpServerConfig};
-use crate::skills::SkillRegistry;
+use crate::skills::{SkillKind, SkillRegistry};
 use agent_client_protocol::schema::v1::ToolKind;
 use sandbox::SandboxPolicy;
 use serde::de::DeserializeOwned;
@@ -982,8 +982,12 @@ impl ToolRegistry {
         // The spec's "Filtering" note: don't expose the tool with an
         // empty enum -- the model would waste turns guessing.
         let skills = self.skills.read().await;
-        if !skills.is_empty() {
-            let names: Vec<String> = skills.iter_sorted().map(|m| m.name.clone()).collect();
+        let names: Vec<String> = skills
+            .iter_sorted()
+            .filter(|m| m.kind == SkillKind::Skill)
+            .map(|m| m.name.clone())
+            .collect();
+        if !names.is_empty() {
             defs.push(tool_def(
                 "activate_skill",
                 "Load the full instructions for a previously listed skill from `<available_skills>`. \
@@ -1352,8 +1356,12 @@ impl ToolRegistry {
         };
         let name = args.name;
         let skills = self.skills.read().await.clone();
-        let Some(meta) = skills.get(&name) else {
-            let available: Vec<&str> = skills.iter_sorted().map(|m| m.name.as_str()).collect();
+        let Some(meta) = skills.get(&name).filter(|m| m.kind == SkillKind::Skill) else {
+            let available: Vec<&str> = skills
+                .iter_sorted()
+                .filter(|m| m.kind == SkillKind::Skill)
+                .map(|m| m.name.as_str())
+                .collect();
             return ToolResult {
                 status: ToolStatus::RequestError,
                 output: format!(
@@ -1875,6 +1883,23 @@ mod tests {
         (tmp, meta)
     }
 
+    fn write_command_fixture(name: &str, body: &str) -> (tempfile::TempDir, SkillMeta) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let location = skill_dir.join(format!("{name}.md"));
+        std::fs::write(&location, body).unwrap();
+        let meta = SkillMeta {
+            name: name.to_string(),
+            description: "cmd".to_string(),
+            location,
+            skill_dir,
+            scope: SkillScope::Plugin,
+            kind: SkillKind::Command,
+        };
+        (tmp, meta)
+    }
+
     #[tokio::test]
     async fn activate_skill_tool_enum_restricted_to_discovered_names() {
         let (_a, meta_a) = write_skill_fixture("foo", "fb");
@@ -1895,6 +1920,41 @@ mod tests {
         let names: Vec<&str> = enum_field.iter().filter_map(|v| v.as_str()).collect();
         // Alphabetically sorted by SkillRegistry::iter_sorted.
         assert_eq!(names, vec!["bar", "foo"]);
+    }
+
+    #[tokio::test]
+    async fn activate_skill_ignores_plugin_commands() {
+        let (_skill_tmp, skill) = write_skill_fixture("real-skill", "body");
+        let (_command_tmp, command) = write_command_fixture("deploy", "run deploy");
+        let registry = registry_with_skills(vec![skill, command]);
+        let defs = registry.tool_definitions().await;
+        let activate = defs
+            .iter()
+            .find(|d| d.function.name == "activate_skill")
+            .expect("activate_skill must be advertised for the real skill");
+        let names: Vec<&str> = activate
+            .function
+            .parameters
+            .pointer("/properties/name/enum")
+            .expect("name property has an enum constraint")
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(names, vec!["real-skill"]);
+
+        let result = registry
+            .execute(
+                "activate_skill",
+                json!({ "name": "deploy" }),
+                SandboxPolicy::WorkspaceWrite,
+            )
+            .await;
+        assert!(matches!(result.status, ToolStatus::RequestError));
+        assert!(result.output.contains("Unknown skill 'deploy'"));
+        assert!(result.output.contains("real-skill"));
+        assert!(!result.output.contains("deploy,"));
     }
 
     #[tokio::test]

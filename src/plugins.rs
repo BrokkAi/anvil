@@ -195,7 +195,14 @@ pub struct InstalledPlugin {
     pub root: PathBuf,
     pub manifest: PluginManifest,
     pub source: PluginSource,
+    /// Whether passive plugin content is available to Anvil. For Claude Code
+    /// installs this follows Claude's enabledPlugins settings, with Anvil
+    /// overrides taking precedence.
     pub enabled: bool,
+    /// Whether executable plugin content may run. Native installs are
+    /// explicitly installed through Anvil, so this tracks `enabled`; Claude
+    /// Code installs require an explicit Anvil-side `/plugin enable`.
+    pub executable_enabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -215,7 +222,9 @@ impl PluginCatalog {
     pub fn mcp_servers(&self) -> Vec<crate::mcp::McpServerConfig> {
         let mut diagnostics = Vec::new();
         let servers = self
-            .enabled()
+            .plugins
+            .iter()
+            .filter(|p| p.enabled && p.executable_enabled)
             .flat_map(|p| p.mcp_servers(&mut diagnostics))
             .collect();
         for msg in diagnostics {
@@ -228,7 +237,9 @@ impl PluginCatalog {
     pub fn hooks(&self) -> Vec<HookCommand> {
         let mut diagnostics = Vec::new();
         let hooks: Vec<HookCommand> = self
-            .enabled()
+            .plugins
+            .iter()
+            .filter(|p| p.enabled && p.executable_enabled)
             .flat_map(|p| p.hooks(&mut diagnostics))
             .collect();
         for msg in diagnostics {
@@ -533,16 +544,62 @@ impl InstalledPlugin {
 }
 
 fn resolve_manifest_path(root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
-    let rel = rel.trim();
-    if rel.is_empty() {
-        return Err("manifest path must not be empty".to_string());
+    resolve_under_plugin_root(root, rel, PluginPathPolicy::Manifest)
+}
+
+/// Resolve a marketplace plugin path relative to a plugin/marketplace root.
+/// Unlike manifest component paths, marketplace entries must be relative and
+/// already exist in the checked-out repository.
+pub fn resolve_plugin_subpath(root: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
+    resolve_under_plugin_root(root, rel, PluginPathPolicy::RelativeExisting)
+}
+
+#[derive(Clone, Copy)]
+enum PluginPathPolicy {
+    /// Manifest paths may be absolute after `${CLAUDE_PLUGIN_ROOT}`
+    /// substitution and may point at not-yet-existing component roots.
+    Manifest,
+    /// Marketplace subpaths must be relative and must exist in the checked-out
+    /// repository before registration.
+    RelativeExisting,
+}
+
+impl PluginPathPolicy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest path",
+            Self::RelativeExisting => "plugin path",
+        }
     }
-    let path = Path::new(rel);
+
+    fn allow_absolute(self) -> bool {
+        matches!(self, Self::Manifest)
+    }
+
+    fn must_exist(self) -> bool {
+        matches!(self, Self::RelativeExisting)
+    }
+}
+
+fn resolve_under_plugin_root(
+    root: &Path,
+    raw: &str,
+    policy: PluginPathPolicy,
+) -> std::result::Result<PathBuf, String> {
+    let label = policy.label();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() && !policy.allow_absolute() {
+        return Err(format!("{label} `{raw}` must be relative"));
+    }
     if path
         .components()
         .any(|comp| matches!(comp, std::path::Component::ParentDir))
     {
-        return Err(format!("manifest path `{rel}` must not contain `..`"));
+        return Err(format!("{label} `{raw}` must not contain `..`"));
     }
 
     let root = canonicalize_with_missing_tail(root)?;
@@ -551,10 +608,15 @@ fn resolve_manifest_path(root: &Path, rel: &str) -> std::result::Result<PathBuf,
     } else {
         join_normalized(&root, path)
     };
-    let resolved = canonicalize_with_missing_tail(&candidate)?;
+    let resolved = if policy.must_exist() {
+        std::fs::canonicalize(&candidate)
+            .map_err(|e| format!("{label} `{raw}` is not accessible: {e}"))?
+    } else {
+        canonicalize_with_missing_tail(&candidate)?
+    };
     if !resolved.starts_with(&root) {
         return Err(format!(
-            "manifest path `{rel}` resolves outside '{}'",
+            "{label} `{raw}` resolves outside '{}'",
             root.display()
         ));
     }
@@ -643,6 +705,9 @@ fn valid_server_name(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
+const MAX_HOOK_OUTPUT_BYTES: usize = 16 * 1024;
+const MAX_HOOK_CONTEXT_TOTAL_BYTES: usize = 32 * 1024;
+const MAX_HOOK_REASON_TOTAL_BYTES: usize = 32 * 1024;
 
 /// Hook events Anvil executes. Claude Code defines more (SessionStart,
 /// Stop, PreCompact, ...); unsupported ones surface a diagnostic at
@@ -736,7 +801,12 @@ pub async fn run_hooks(
         match run_one_hook(hook, &payload_bytes, cwd).await {
             HookResult::Ok(stdout) => {
                 if !stdout.trim().is_empty() {
-                    decision.context.push(stdout.trim().to_string());
+                    push_bounded_text(
+                        &mut decision.context,
+                        stdout.trim(),
+                        MAX_HOOK_CONTEXT_TOTAL_BYTES,
+                        "hook context",
+                    );
                 }
             }
             HookResult::Block(stderr) => {
@@ -746,7 +816,12 @@ pub async fn run_hooks(
                 } else {
                     stderr.trim().to_string()
                 };
-                decision.reasons.push(reason);
+                push_bounded_text(
+                    &mut decision.reasons,
+                    &reason,
+                    MAX_HOOK_REASON_TOTAL_BYTES,
+                    "hook feedback",
+                );
             }
             HookResult::Error(msg) => {
                 tracing::warn!(plugin = %hook.plugin, event = event.name(), "{msg}");
@@ -754,6 +829,26 @@ pub async fn run_hooks(
         }
     }
     decision
+}
+
+fn push_bounded_text(values: &mut Vec<String>, text: &str, max_total: usize, label: &str) {
+    let used: usize = values.iter().map(|value| value.len()).sum();
+    let Some(remaining) = max_total.checked_sub(used) else {
+        return;
+    };
+    if remaining == 0 {
+        return;
+    }
+    let mut value = text.to_string();
+    if value.len() > remaining {
+        let mut cut = remaining;
+        while cut > 0 && !value.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        value.truncate(cut);
+        value.push_str(&format!("\n... {label} truncated"));
+    }
+    values.push(value);
 }
 
 enum HookResult {
@@ -778,6 +873,21 @@ async fn run_one_hook(hook: &HookCommand, payload: &str, cwd: &Path) -> HookResu
         c
     };
 
+    #[cfg(unix)]
+    {
+        // SAFETY: `setpgid` is async-signal-safe and lets timeout cleanup kill
+        // descendants spawned by the shell wrapper.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+
     let child = command
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
@@ -789,25 +899,100 @@ async fn run_one_hook(hook: &HookCommand, payload: &str, cwd: &Path) -> HookResu
         Ok(child) => child,
         Err(e) => return HookResult::Error(format!("hook failed to spawn: {e}")),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        // A hook that never reads stdin closes the pipe; that's fine.
-        let _ = stdin.write_all(payload.as_bytes()).await;
-        drop(stdin);
-    }
-    let output = match tokio::time::timeout(hook.timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return HookResult::Error(format!("hook failed: {e}")),
+    let stdout_task = tokio::spawn(read_hook_pipe_bounded(child.stdout.take()));
+    let stderr_task = tokio::spawn(read_hook_pipe_bounded(child.stderr.take()));
+
+    let run = async {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Some hooks do not read stdin. Keep the timeout around this
+            // write as well as process wait, since large payloads can fill
+            // the pipe before the child exits.
+            let _ = stdin.write_all(payload.as_bytes()).await;
+            drop(stdin);
+        }
+        child.wait().await.map_err(|e| format!("hook failed: {e}"))
+    };
+
+    let status = match tokio::time::timeout(hook.timeout, run).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return HookResult::Error(e),
         Err(_) => {
+            terminate_hook_child_tree(&mut child).await;
+            stdout_task.abort();
+            stderr_task.abort();
             return HookResult::Error(format!("hook timed out after {}s", hook.timeout.as_secs()));
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    match output.status.code() {
+
+    let stdout = join_hook_output(stdout_task).await;
+    let stderr = join_hook_output(stderr_task).await;
+    match status.code() {
         Some(0) => HookResult::Ok(stdout),
         Some(2) => HookResult::Block(stderr),
         code => HookResult::Error(format!("hook exited with {:?}: {}", code, stderr.trim())),
     }
+}
+
+async fn read_hook_pipe_bounded<R>(pipe: Option<R>) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let Some(mut pipe) = pipe else {
+        return (Vec::new(), false);
+    };
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = match pipe.read(&mut buf).await {
+            Ok(0) => return (bytes, false),
+            Ok(n) => n,
+            Err(_) => return (bytes, false),
+        };
+        let remaining = MAX_HOOK_OUTPUT_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return (bytes, true);
+        }
+        if read > remaining {
+            bytes.extend_from_slice(&buf[..remaining]);
+            return (bytes, true);
+        }
+        bytes.extend_from_slice(&buf[..read]);
+    }
+}
+
+async fn join_hook_output(task: tokio::task::JoinHandle<(Vec<u8>, bool)>) -> String {
+    let Ok((bytes, truncated)) = task.await else {
+        return String::new();
+    };
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("\n... hook output truncated");
+    }
+    text
+}
+
+async fn terminate_hook_child_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pgid = -(pid as libc::pid_t);
+        // SAFETY: best-effort process-group kill for the group created above.
+        let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+
+    let _ = child.kill().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -926,18 +1111,22 @@ fn discover_claude_installs(
         };
         // Anvil-side override beats Claude Code's own setting; a plugin
         // absent from `enabledPlugins` counts as enabled (installing it
-        // was the opt-in).
+        // was the opt-in). Executable components (hooks/MCP) are stricter:
+        // a Claude-discovered plugin must be explicitly enabled through
+        // Anvil before it can run host processes.
         let enabled = overrides
             .get(key)
             .or_else(|| enabled_map.get(key))
             .copied()
             .unwrap_or(true);
+        let executable_enabled = enabled && overrides.get(key).copied().unwrap_or(false);
         catalog.plugins.push(InstalledPlugin {
             key: key.clone(),
             root: record.install_path.clone(),
             manifest,
             source: PluginSource::ClaudeCode,
             enabled,
+            executable_enabled,
         });
     }
 }
@@ -1005,6 +1194,7 @@ fn discover_native(registry: &NativeRegistry, catalog: &mut PluginCatalog) {
             manifest,
             source: PluginSource::Native,
             enabled: entry.enabled,
+            executable_enabled: entry.enabled,
         });
     }
 }
@@ -1078,7 +1268,14 @@ pub fn write_native_registry(registry: &NativeRegistry) -> Result<()> {
             .with_context(|| format!("creating '{}'", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(registry)?;
-    std::fs::write(&path, json).with_context(|| format!("writing '{}'", path.display()))
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(NATIVE_REGISTRY_FILE);
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, json).with_context(|| format!("writing '{}'", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("renaming '{}' to '{}'", tmp.display(), path.display()))
 }
 
 /// Register a plugin rooted at `path`. Validates the manifest and
@@ -1266,6 +1463,10 @@ mod tests {
         assert_eq!(p.key, "demo@mkt");
         assert_eq!(p.manifest.name, "demo");
         assert!(p.enabled, "absent from enabledPlugins means enabled");
+        assert!(
+            !p.executable_enabled,
+            "Claude-discovered hooks/MCP require an explicit Anvil enable"
+        );
         assert_eq!(p.source, PluginSource::ClaudeCode);
 
         // Explicitly disabled in Claude Code settings.
@@ -1275,7 +1476,40 @@ mod tests {
         );
         let catalog = discover(None, Some(home.path()));
         assert!(!catalog.plugins[0].enabled);
+        assert!(!catalog.plugins[0].executable_enabled);
         assert_eq!(catalog.enabled().count(), 0);
+    }
+
+    #[test]
+    fn claude_plugin_executables_require_anvil_override() {
+        let config = TempDir::new().unwrap();
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config.path().to_path_buf());
+
+        let plugin = TempDir::new().unwrap();
+        plugin_at(
+            plugin.path(),
+            r#"{"name":"demo","mcpServers":{"srv":{"command":"tool"}}}"#,
+        );
+        write(
+            &plugin.path().join("hooks").join("hooks.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo ok"}]}]}}"#,
+        );
+        let home = claude_home("demo@mkt", plugin.path());
+
+        let catalog = discover(None, Some(home.path()));
+        let p = &catalog.plugins[0];
+        assert!(p.enabled);
+        assert!(!p.executable_enabled);
+        assert!(catalog.mcp_servers().is_empty());
+        assert!(catalog.hooks().is_empty());
+
+        set_claude_override("demo@mkt", true).unwrap();
+        let catalog = discover(None, Some(home.path()));
+        let p = &catalog.plugins[0];
+        assert!(p.enabled);
+        assert!(p.executable_enabled);
+        assert_eq!(catalog.mcp_servers().len(), 1);
+        assert_eq!(catalog.hooks().len(), 1);
     }
 
     #[test]
@@ -1323,6 +1557,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         assert_eq!(
             p.skill_roots(),
@@ -1369,6 +1604,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         assert!(p.skill_roots().is_empty());
 
@@ -1395,6 +1631,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         assert!(p.skill_roots().is_empty());
     }
@@ -1422,6 +1659,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         let mut diags = Vec::new();
         let servers = p.mcp_servers(&mut diags);
@@ -1463,6 +1701,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         let mut diags = Vec::new();
         let servers = p.mcp_servers(&mut diags);
@@ -1486,6 +1725,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         let mut diags = Vec::new();
         assert_eq!(p.mcp_servers(&mut diags).len(), 1);
@@ -1508,9 +1748,12 @@ mod tests {
         assert_eq!(catalog.plugins.len(), 1);
         assert_eq!(catalog.plugins[0].source, PluginSource::Native);
         assert!(catalog.plugins[0].enabled);
+        assert!(catalog.plugins[0].executable_enabled);
 
         assert!(set_native_enabled("local-demo", false).unwrap());
-        assert!(!discover(None, None).plugins[0].enabled);
+        let catalog = discover(None, None);
+        assert!(!catalog.plugins[0].enabled);
+        assert!(!catalog.plugins[0].executable_enabled);
         assert!(!set_native_enabled("nope", true).unwrap());
 
         let removed = remove_native("local-demo").unwrap().unwrap();
@@ -1536,6 +1779,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         let names: Vec<String> = p.command_files().into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, vec!["deploy".to_string(), "git:commit".to_string()]);
@@ -1562,6 +1806,7 @@ mod tests {
             manifest: load_manifest(plugin.path()).unwrap(),
             source: PluginSource::Native,
             enabled: true,
+            executable_enabled: true,
         };
         let mut diags = Vec::new();
         let hooks = p.hooks(&mut diags);
@@ -1695,6 +1940,36 @@ mod tests {
             cwd.path(),
         )
         .await;
+        assert!(!decision.blocked);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_hooks_timeout_covers_stdin_write() {
+        let cwd = TempDir::new().unwrap();
+        let hooks = vec![HookCommand {
+            plugin: "demo".into(),
+            event: HookEvent::PostToolUse,
+            matcher: None,
+            // This process keeps stdin open but never reads it. Large
+            // payloads can fill the pipe, so the hook timeout must wrap
+            // stdin write as well as process wait.
+            command: "sleep 5".into(),
+            timeout: std::time::Duration::from_millis(50),
+        }];
+        let payload = serde_json::json!({"tool_response": "x".repeat(1024 * 1024)});
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_hooks(
+                &hooks,
+                HookEvent::PostToolUse,
+                Some("run_shell_command"),
+                &payload,
+                cwd.path(),
+            ),
+        )
+        .await
+        .expect("hook timeout should cover a blocked stdin write");
         assert!(!decision.blocked);
     }
 
