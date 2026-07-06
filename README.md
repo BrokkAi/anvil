@@ -175,7 +175,11 @@ hide it behind a framework.
 Anvil is zero-config by default:
 
 - **Codex / ChatGPT**: reads `~/.codex/auth.json` when present and can refresh
-  stale credentials. Run `/setup codex` from a session to sign in.
+  stale credentials. Run `/setup codex` from a session to sign in. When the
+  ChatGPT model catalog advertises service tiers, use `/fast` or `/setup fast on`
+  to select the fast tier for the current session, and `/fast off` or
+  `/setup fast off` to clear it. Fast mode can respond sooner but consumes
+  subscription quota more aggressively.
 - **Ollama**: probes `http://localhost:11434/v1/models`. Run Ollama on the
   default port, then use `/setup local refresh`.
 - **ds4** (antirez/ds4): when a `ds4-server` process is running, Anvil detects
@@ -223,6 +227,8 @@ Built-in commands:
 
 - `/setup`: model login, provider selection, behavior mode, sandbox mode,
   turn recaps, timeout, and advanced settings.
+- `/fast [on|off|status]`: use, clear, or inspect the fast Codex service tier
+  for the current session when the selected model supports it.
 - `/permissions`: list or revoke remembered Always allow entries.
 - `/context`: show the current session context snapshot and token estimate.
 - `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or

@@ -3313,7 +3313,41 @@ impl SessionStore {
     }
 
     pub async fn set_available_models(&self, models: Vec<ModelMetadata>) {
+        let supported_service_tiers: HashMap<String, HashSet<String>> = models
+            .iter()
+            .map(|model| {
+                (
+                    model.id.clone(),
+                    model
+                        .service_tiers
+                        .iter()
+                        .map(|tier| tier.id.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+
         *self.available_models.write().await = models;
+
+        let mut sessions = self.sessions.write().await;
+        for session in sessions.values_mut() {
+            let Some(selected_tier) = session.selected_service_tier.clone() else {
+                continue;
+            };
+            let Some(supported) = supported_service_tiers.get(&session.model) else {
+                continue;
+            };
+            if supported.contains(&selected_tier) {
+                continue;
+            }
+            session.selected_service_tier = None;
+            tracing::info!(
+                session_id = %session.id,
+                model = %session.model,
+                service_tier = %selected_tier,
+                "cleared service tier because refreshed model catalog no longer advertises it"
+            );
+        }
     }
 
     /// Record the client's advertised elicitation capabilities (read once from
@@ -3650,9 +3684,10 @@ impl SessionStore {
     /// `session/fork`): a fresh id whose persisted archive is a byte-copy of
     /// the source's, so the fork carries the *full* conversation (not just the
     /// in-memory window) and follow-up prompts on the fork never mutate the
-    /// source. The fork inherits the source's mode, model, and MCP config; the
-    /// caller may override the MCP servers afterwards. The request cwd must
-    /// match the source's cwd, mirroring `session/load`/`resume` (#147).
+    /// source. The fork inherits the source's mode, model, service tier, and
+    /// MCP config; the caller may override the MCP servers afterwards. The
+    /// request cwd must match the source's cwd, mirroring `session/load`/`resume`
+    /// (#147).
     pub async fn fork_session(&self, source_id: &str, cwd: &Path) -> ForkOutcome {
         let source = match self.reopen_session_checked(source_id, cwd).await {
             LifecycleReopen::Reopened(session) => *session,
@@ -3703,6 +3738,7 @@ impl SessionStore {
             Err(e) => return ForkOutcome::Failed(format!("{e}")),
         };
         forked.turn_recap_enabled = source.turn_recap_enabled;
+        forked.selected_service_tier = source.selected_service_tier.clone();
         forked.set_always_allow_keys(load_repo_always_allow_keys(&forked.permission_scope_root));
 
         self.sessions
@@ -7044,6 +7080,11 @@ mod tests {
         let source = store.create_session(cwd.path().to_path_buf()).await;
         let src_id = source.id.clone();
         assert!(store.set_turn_recap_enabled(&src_id, false).await);
+        assert!(
+            store
+                .set_service_tier(&src_id, Some("priority".to_string()))
+                .await
+        );
         store
             .maybe_rename_from_prompt(&src_id, "Source session")
             .await
@@ -7069,6 +7110,11 @@ mod tests {
         assert_eq!(forked.history.len(), 1, "fork copies the source history");
         assert_eq!(forked.history[0].user_prompt, "u1");
         assert!(!forked.turn_recap_enabled, "fork inherits recap preference");
+        assert_eq!(
+            forked.selected_service_tier.as_deref(),
+            Some("priority"),
+            "fork inherits the source service-tier pick"
+        );
         assert!(
             session_zip_path(cwd.path(), &fork_id).exists(),
             "fork archive must be persisted"
@@ -7102,6 +7148,11 @@ mod tests {
         assert!(
             !fork_after.turn_recap_enabled,
             "fork keeps inherited recap preference"
+        );
+        assert_eq!(
+            fork_after.selected_service_tier.as_deref(),
+            Some("priority"),
+            "fork keeps inherited service-tier preference"
         );
         assert_eq!(
             fork_after.history.len(),
@@ -7561,6 +7612,93 @@ mod tests {
             .expect("set_model should persist");
         assert!(ok);
         assert_eq!(cleared_tier.as_deref(), Some("priority"));
+        let snap = store
+            .snapshot(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.service_tier, None);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_clears_service_tier_when_current_model_drops_it() {
+        use crate::llm_client::ModelServiceTier;
+
+        let store = SessionStore::new("codex::gpt-5.5".to_string());
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "codex::gpt-5.5".to_string(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                service_tiers: vec![ModelServiceTier {
+                    id: "priority".to_string(),
+                    name: "Fast".to_string(),
+                    description: "Higher throughput".to_string(),
+                }],
+                supports_images: None,
+                context_length: None,
+                pricing: None,
+            }])
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-catalog-clears-tier-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+        assert!(
+            store
+                .set_service_tier(&id, Some("priority".to_string()))
+                .await
+        );
+        assert_eq!(
+            store
+                .snapshot(&id, &cwd)
+                .await
+                .expect("session still loadable")
+                .service_tier
+                .as_deref(),
+            Some("priority")
+        );
+
+        store
+            .set_available_models(vec![ModelMetadata::id_only("codex::gpt-5.5")])
+            .await;
+
+        let session = store
+            .get_session(&id, &cwd)
+            .await
+            .expect("session still present");
+        assert_eq!(session.selected_service_tier, None);
+        let snap = store
+            .snapshot(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.service_tier, None);
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_clears_service_tier_selected_before_catalog_known() {
+        let store = SessionStore::new("codex::gpt-5.5".to_string());
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-catalog-clears-preknown-tier-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+        assert!(
+            store
+                .set_service_tier(&id, Some("priority".to_string()))
+                .await
+        );
+
+        store
+            .set_available_models(vec![ModelMetadata::id_only("codex::gpt-5.5")])
+            .await;
+
         let snap = store
             .snapshot(&id, &cwd)
             .await
