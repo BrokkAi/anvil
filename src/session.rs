@@ -749,6 +749,12 @@ pub struct Session {
     /// In-memory only -- the issue scope explicitly excludes
     /// workspace-level persistence for this knob.
     pub selected_reasoning_effort: Option<String>,
+    /// User's explicit service-tier pick for this session, if any.
+    /// Codex subscription models currently advertise `priority` as their
+    /// fast tier. `None` means "use the provider default". In-memory only:
+    /// a fast tier can spend subscription quota faster, so it must not
+    /// silently stick across reloaded or future sessions.
+    pub selected_service_tier: Option<String>,
     /// Per-session override of both LLM SSE first-progress and mid-stream stall
     /// timeouts (seconds). `None` means "use the binary-wide defaults" (CLI
     /// flags `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs`).
@@ -912,6 +918,7 @@ impl Session {
             always_allow_tools: HashSet::new(),
             always_allow_order: Vec::new(),
             selected_reasoning_effort: None,
+            selected_service_tier: None,
             idle_timeout_secs: None,
             turn_recap_enabled: true,
             mcp_servers: None,
@@ -1001,6 +1008,7 @@ impl Session {
             // reloaded zip starts at "use model default" until the
             // user picks again.
             selected_reasoning_effort: None,
+            selected_service_tier: None,
             // Same rationale: idle timeout override is in-memory only.
             idle_timeout_secs: None,
             turn_recap_enabled: true,
@@ -1066,6 +1074,9 @@ pub struct SessionSnapshot {
     /// effort presets or the user explicitly selected reasoning `off`, so
     /// the backend will omit the field.
     pub reasoning_effort: Option<String>,
+    /// Concrete service tier to request on this turn. `None` means the
+    /// backend should let the provider use its default tier.
+    pub service_tier: Option<String>,
     /// Per-session override of both LLM SSE first-progress and mid-stream
     /// stall timeouts (seconds). `None` means the caller should fall back to
     /// the binary-wide defaults.
@@ -3724,7 +3735,14 @@ impl SessionStore {
         // Holding both at once is unnecessary and would invite a lock
         // ordering hazard with set_model (which writes sessions then
         // reads available_models on auto-fallback).
-        let (snap_base, selected_effort, idle_timeout_secs, project_instructions, skills) = {
+        let (
+            snap_base,
+            selected_effort,
+            selected_service_tier,
+            idle_timeout_secs,
+            project_instructions,
+            skills,
+        ) = {
             let sessions = self.sessions.read().await;
             let s = sessions.get(id)?;
             (
@@ -3736,6 +3754,7 @@ impl SessionStore {
                     s.history.clone(),
                 ),
                 s.selected_reasoning_effort.clone(),
+                s.selected_service_tier.clone(),
                 s.idle_timeout_secs,
                 s.project_instructions.clone(),
                 s.skills.clone(),
@@ -3767,6 +3786,7 @@ impl SessionStore {
             model,
             history,
             reasoning_effort,
+            service_tier: selected_service_tier,
             idle_timeout_secs,
             project_instructions,
             skills,
@@ -4630,10 +4650,10 @@ impl SessionStore {
 
     /// Update the per-session LLM model and persist the new manifest.
     ///
-    /// Returns `Ok((true, cleared))` on success, `Ok((false, None))` if the
-    /// session is unknown (no-op), or `Err` if persistence failed -- in that
-    /// case the in-memory mutation is rolled back so `memory == disk`,
-    /// mirroring `set_mode`.
+    /// Returns `Ok((true, cleared_reasoning, cleared_service_tier))` on success,
+    /// `Ok((false, None, None))` if the session is unknown (no-op), or `Err` if
+    /// persistence failed -- in that case the in-memory mutation is rolled back
+    /// so `memory == disk`, mirroring `set_mode`.
     ///
     /// When the previously-selected reasoning effort isn't in the new
     /// model's supported set, the selection is auto-cleared so the next
@@ -4647,29 +4667,37 @@ impl SessionStore {
         &self,
         id: &str,
         model: String,
-    ) -> anyhow::Result<(bool, Option<String>)> {
+    ) -> anyhow::Result<(bool, Option<String>, Option<String>)> {
         // Pull the supported-effort set for the new model BEFORE
         // acquiring the sessions write lock -- the available_models
         // store and the sessions store are separate locks, and reading
         // available_models while holding sessions in write would
         // invert the lock order taken by `snapshot()`.
-        let supported_effort: Option<Vec<String>> = {
+        let (supported_effort, supported_service_tiers): (
+            Option<Vec<String>>,
+            Option<Vec<String>>,
+        ) = {
             let catalog = self.available_models.read().await;
-            catalog.iter().find(|m| m.id == model).map(|m| {
-                m.supported_reasoning_levels
-                    .iter()
-                    .map(|p| p.effort.clone())
-                    .collect()
-            })
+            let meta = catalog.iter().find(|m| m.id == model);
+            (
+                meta.map(|m| {
+                    m.supported_reasoning_levels
+                        .iter()
+                        .map(|p| p.effort.clone())
+                        .collect()
+                }),
+                meta.map(|m| m.service_tiers.iter().map(|p| p.id.clone()).collect()),
+            )
         };
 
-        let (snapshot, cleared_effort, remember_selection) = {
+        let (snapshot, cleared_effort, cleared_service_tier, remember_selection) = {
             let mut sessions = self.sessions.write().await;
             match sessions.get_mut(id) {
                 Some(session) => {
                     let prev_model = session.model.clone();
                     let prev_manifest_model = session.manifest.model.clone();
                     let prev_reasoning_effort = session.selected_reasoning_effort.clone();
+                    let prev_service_tier = session.selected_service_tier.clone();
                     session.model = model.clone();
                     session.manifest.model = if model.is_empty() {
                         None
@@ -4694,6 +4722,15 @@ impl SessionStore {
                         // arbiter rather than dropping silently.
                         _ => None,
                     };
+                    let cleared_service =
+                        match (&session.selected_service_tier, &supported_service_tiers) {
+                            (Some(tier), Some(supported))
+                                if !supported.iter().any(|s| s == tier) =>
+                            {
+                                session.selected_service_tier.take()
+                            }
+                            _ => None,
+                        };
                     let remember_model = if model.is_empty() {
                         None
                     } else {
@@ -4707,16 +4744,25 @@ impl SessionStore {
                             prev_model,
                             prev_manifest_model,
                             prev_reasoning_effort,
+                            prev_service_tier,
                         )),
                         cleared,
+                        cleared_service,
                         Some((remember_model, remember_reasoning)),
                     )
                 }
-                None => (None, None, None),
+                None => (None, None, None, None),
             }
         };
         match snapshot {
-            Some((cwd, manifest, prev_model, prev_manifest_model, prev_reasoning_effort)) => {
+            Some((
+                cwd,
+                manifest,
+                prev_model,
+                prev_manifest_model,
+                prev_reasoning_effort,
+                prev_service_tier,
+            )) => {
                 let zip_path = session_zip_path(&cwd, id);
                 let join_result = tokio::task::spawn_blocking(move || {
                     rewrite_manifest_in_zip(&zip_path, &manifest)
@@ -4734,6 +4780,7 @@ impl SessionStore {
                         session.model = prev_model;
                         session.manifest.model = prev_manifest_model;
                         session.selected_reasoning_effort = prev_reasoning_effort;
+                        session.selected_service_tier = prev_service_tier;
                     }
                     return Err(e);
                 }
@@ -4747,9 +4794,9 @@ impl SessionStore {
                     );
                 }
 
-                Ok((true, cleared_effort))
+                Ok((true, cleared_effort, cleared_service_tier))
             }
-            None => Ok((false, None)),
+            None => Ok((false, None, None)),
         }
     }
 
@@ -4772,6 +4819,22 @@ impl SessionStore {
                         "failed to persist last reasoning preference: {e:#}"
                     );
                 }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record the user's per-session service-tier pick.
+    /// `None` clears it back to the provider default. Returns false if the
+    /// session is unknown. In-memory only; unlike reasoning, this is not
+    /// promoted to setup state because fast/priority tiers can spend quota
+    /// more aggressively.
+    pub async fn set_service_tier(&self, id: &str, tier: Option<String>) -> bool {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(id) {
+            Some(session) => {
+                session.selected_service_tier = tier;
                 true
             }
             None => false,
@@ -5512,7 +5575,7 @@ mod tests {
         let session = store.create_session(cwd).await;
         let id = session.id.clone();
 
-        let (ok, cleared) = store
+        let (ok, cleared, _cleared_tier) = store
             .set_model(&id, "next-model".to_string())
             .await
             .expect("set_model should persist");
@@ -5530,7 +5593,7 @@ mod tests {
     #[tokio::test]
     async fn set_model_returns_false_for_unknown_session() {
         let store = SessionStore::new("initial-model".to_string());
-        let (ok, cleared) = store
+        let (ok, cleared, _cleared_tier) = store
             .set_model("no-such-session", "next-model".into())
             .await
             .expect("unknown session should be a non-error no-op");
@@ -5555,6 +5618,7 @@ mod tests {
                         effort: "xhigh".to_string(),
                         description: "".to_string(),
                     }],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -5566,6 +5630,7 @@ mod tests {
                         effort: "high".to_string(),
                         description: "".to_string(),
                     }],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -5782,6 +5847,7 @@ mod tests {
                         effort: "medium".to_string(),
                         description: "".to_string(),
                     }],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -5803,6 +5869,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -5854,6 +5921,7 @@ mod tests {
                         description: "".to_string(),
                     },
                 ],
+                service_tiers: Vec::new(),
                 supports_images: None,
                 context_length: None,
                 pricing: None,
@@ -5895,6 +5963,7 @@ mod tests {
                         effort: "medium".to_string(),
                         description: "".to_string(),
                     }],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -5916,6 +5985,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -6201,6 +6271,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -6212,6 +6283,7 @@ mod tests {
                         effort: "high".to_string(),
                         description: "".to_string(),
                     }],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -6264,7 +6336,7 @@ mod tests {
                 .set_permission_mode(&first.id, PermissionMode::AcceptEdits)
                 .await
         );
-        let (ok, cleared) = store
+        let (ok, cleared, _cleared_tier) = store
             .set_model(&first.id, "runtime-model".to_string())
             .await
             .expect("set_model should persist");
@@ -7264,6 +7336,7 @@ mod tests {
                         description: "".to_string(),
                     },
                 ],
+                service_tiers: Vec::new(),
                 supports_images: None,
                 context_length: None,
                 pricing: None,
@@ -7307,6 +7380,7 @@ mod tests {
                         description: "".to_string(),
                     },
                 ],
+                service_tiers: Vec::new(),
                 supports_images: None,
                 context_length: None,
                 pricing: None,
@@ -7384,6 +7458,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -7405,6 +7480,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -7424,7 +7500,7 @@ mod tests {
         );
 
         // Switch to gpt-mini, which doesn't advertise xhigh.
-        let (ok, cleared) = store
+        let (ok, cleared, _cleared_tier) = store
             .set_model(&id, "gpt-mini".to_string())
             .await
             .expect("set_model should persist");
@@ -7437,6 +7513,59 @@ mod tests {
             .await
             .expect("session still loadable");
         assert_eq!(snap.reasoning_effort.as_deref(), Some("medium"));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A fast service tier is model-specific and can spend subscription quota
+    /// differently, so switching to a model that does not advertise the tier
+    /// must clear the per-session pick instead of forwarding a stale value.
+    #[tokio::test]
+    async fn set_model_clears_service_tier_when_unsupported() {
+        use crate::llm_client::ModelServiceTier;
+
+        let store = SessionStore::new("codex::gpt-5.5".to_string());
+        store
+            .set_available_models(vec![
+                ModelMetadata {
+                    id: "codex::gpt-5.5".to_string(),
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
+                    service_tiers: vec![ModelServiceTier {
+                        id: "priority".to_string(),
+                        name: "Fast".to_string(),
+                        description: "Higher throughput".to_string(),
+                    }],
+                    supports_images: None,
+                    context_length: None,
+                    pricing: None,
+                },
+                ModelMetadata::id_only("plain-model"),
+            ])
+            .await;
+        let cwd = std::env::temp_dir().join(format!(
+            "brokk-acp-rust-set-model-clears-tier-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+        assert!(
+            store
+                .set_service_tier(&id, Some("priority".to_string()))
+                .await
+        );
+
+        let (ok, _cleared_reasoning, cleared_tier) = store
+            .set_model(&id, "plain-model".to_string())
+            .await
+            .expect("set_model should persist");
+        assert!(ok);
+        assert_eq!(cleared_tier.as_deref(), Some("priority"));
+        let snap = store
+            .snapshot(&id, &cwd)
+            .await
+            .expect("session still loadable");
+        assert_eq!(snap.service_tier, None);
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -7468,6 +7597,7 @@ mod tests {
                             description: "".to_string(),
                         },
                     ],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -7476,6 +7606,7 @@ mod tests {
                     id: "plain-model".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: Vec::new(),
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -7494,7 +7625,7 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared) = store
+        let (ok, cleared, _cleared_tier) = store
             .set_model(&id, "plain-model".to_string())
             .await
             .expect("set_model should persist");
@@ -7548,6 +7679,7 @@ mod tests {
                     id: "gpt-a".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: supported.clone(),
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -7556,6 +7688,7 @@ mod tests {
                     id: "gpt-b".to_string(),
                     default_reasoning_level: Some("medium".to_string()),
                     supported_reasoning_levels: supported,
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -7574,7 +7707,7 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared) = store
+        let (ok, cleared, _cleared_tier) = store
             .set_model(&id, "gpt-b".to_string())
             .await
             .expect("set_model should persist");
