@@ -486,13 +486,17 @@ override plugin-provided agents.
 Constraints:
 
 - Subagents inherit the parent session permission gate.
+- `task.permission_mode` defaults to `readOnly`. Read-only task lanes can run
+  concurrently for parallel review, exploration, triage, tests/log analysis,
+  and summarization. Use `inherit` only for implementation/fix lanes that
+  should use the parent permission behavior; inherited lanes remain serial.
 - Nested delegation is disabled.
 - Each subagent inherits the parent's turn budget unless the subagent
   frontmatter sets a lower `max_turns` value.
 - A subagent with `tools` frontmatter sees and can call only those tools.
 - Intermediate subagent updates are silent; only the final answer returns to
   the parent conversation.
-- Cancelling the parent prompt cancels the active subagent.
+- Cancelling the parent prompt cancels any in-flight subagents.
 
 For the full concurrency contract that delegated/audit-lane workflows can rely
 on — sequential vs. parallel execution, ordering/isolation, cancellation and

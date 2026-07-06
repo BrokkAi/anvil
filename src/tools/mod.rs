@@ -524,12 +524,13 @@ const TOOLS: &[ToolMeta] = &[
     },
     // --- Subagent dispatch -------------------------------------------------
     // Like `activate_skill`, registered dynamically in `tool_definitions()`
-    // only when at least one subagent is discovered. Classified `Other`:
-    // its transitive effects are whatever tools the subagent invokes, so
-    // we want the gate to refuse it in `readOnly` mode and prompt in
-    // `default`. Actual dispatch happens in `tool_loop::run` (not
-    // `ToolRegistry::execute`) because the subagent needs `llm`,
-    // `spawned_cx`, and `sessions` -- none of which the registry sees.
+    // only when at least one subagent is discovered. Classified `Other` by
+    // default because inherited lanes have transitive effects from whatever
+    // tools the subagent invokes; the tool loop special-cases lanes whose
+    // effective permission mode is read-only. Actual dispatch happens in
+    // `tool_loop::run` (not `ToolRegistry::execute`) because the subagent
+    // needs `llm`, `spawned_cx`, and `sessions` -- none of which the registry
+    // sees.
     ToolMeta {
         name: "task",
         kind: ToolKind::Other,
@@ -1045,7 +1046,11 @@ impl ToolRegistry {
                      isolated context with the same tools as you; only its final text answer comes \
                      back. Use when the work is well-defined and self-contained, or when you want \
                      to keep its tool-call noise out of the main conversation. The subagent does \
-                     NOT see this conversation -- give it a self-contained prompt.\n\n\
+                     NOT see this conversation -- give it a self-contained prompt. Read-only task \
+                     lanes can run in parallel; use `permission_mode: \"readOnly\"` for review, \
+                     exploration, triage, tests/log analysis, and summarization. Use \
+                     `permission_mode: \"inherit\"` only when the subagent needs the parent \
+                     permission behavior for implementation or fixes.\n\n\
                      Available subagents:\n{catalog}"
                 ),
                 json!({
@@ -1063,6 +1068,11 @@ impl ToolRegistry {
                             "type": "string",
                             "enum": names,
                             "description": "Exact subagent name from the catalog."
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "enum": ["readOnly", "inherit"],
+                            "description": "Permission behavior for this lane. Defaults to `readOnly`, which is safe for parallel review/exploration lanes and prevents edits or shell execution inside the subagent. Use `inherit` only for implementation/fix lanes that should use the parent session's permission behavior; inherited lanes are not parallelized."
                         }
                     },
                     "required": ["description", "prompt", "subagent_type"]
@@ -2532,7 +2542,7 @@ mod tests {
             ],
             "task schema required fields must match TaskArgs"
         );
-        for property in ["description", "prompt", "subagent_type"] {
+        for property in ["description", "prompt", "subagent_type", "permission_mode"] {
             assert_eq!(
                 task_def.function.parameters["properties"][property]["type"], "string",
                 "task.{property} schema type must match TaskArgs"
@@ -2549,6 +2559,15 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec!["bug-hunter", "doc-writer"]);
+
+        let permission_enum = task_def.function.parameters["properties"]["permission_mode"]["enum"]
+            .as_array()
+            .expect("permission_mode should constrain via enum");
+        let permission_values: Vec<&str> = permission_enum
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(permission_values, vec!["readOnly", "inherit"]);
 
         // Description should surface the catalog so the model can pick.
         assert!(

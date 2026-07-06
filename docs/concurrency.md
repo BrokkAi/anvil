@@ -9,10 +9,12 @@ not exist yet, that is stated explicitly along with the issue tracking it.
 
 ## TL;DR
 
-- **Execution is sequential, not parallel.** Within a turn, multiple tool calls
-  run one at a time, in order. A delegated "lane" is an **explicit subagent**
-  (the `task` tool), and subagents run **inline and serially** inside the
-  parent's tool loop — there is no fan-out across lanes today.
+- **Execution is mostly sequential, with bounded read-only subagent fan-out.**
+  Within a turn, ordinary tool calls run one at a time. A delegated "lane" is an
+  **explicit subagent** (the `task` tool). Consecutive task lanes whose
+  `permission_mode` is omitted/defaulted to `readOnly` or explicitly
+  `readOnly` run concurrently, capped at six lanes; `inherit` lanes remain
+  serial.
 - **One cancellation token per prompt** is shared by the parent turn, every tool
   call, and every subagent. `session/cancel` aborts all in-flight delegated
   work atomically.
@@ -35,30 +37,34 @@ There are two distinct mechanisms, and they have different guarantees:
    sub-task to a named subagent. This is the "delegated lane" an audit-style
    workflow would use to get role-separated analysis.
 
-Both run on the **same session**, on the **same thread of execution**, driven by
-the same tool loop (`src/tool_loop.rs`).
+Both run on the **same session** and are driven by the same tool loop
+(`src/tool_loop.rs`). Read-only task lanes may be polled concurrently inside
+that loop; other tools and inherited lanes are awaited serially.
 
-## 2. Concurrency model: sequential by design (today)
+## 2. Concurrency model: serial by default, read-only fan-out
 
-### Tool calls within a turn — sequential
+### Tool calls within a turn — serial except read-only task batches
 
-Multiple tool calls in one turn are dispatched in a `for` loop
+Multiple tool calls in one turn are dispatched in an ordered loop
 (`execute_step_tool_calls`, `src/tool_loop.rs`): each call is awaited to
-completion before the next begins. There is **no parallel dispatch** (no
-`join_all`, no task fan-out).
+completion before the next begins, except for a consecutive batch of read-only
+`task` calls.
 
 Ordering is deterministic and slightly reshaped: built-in/non-Bifrost tools are
 ordered **before** Bifrost tools within a step (to avoid analyzer-context
 shadowing), and relative order is otherwise preserved. Results are appended in
-execution order, so there is no result-ordering ambiguity.
+deterministic dispatch order, not completion order, so there is no
+result-ordering ambiguity.
 
-### Subagents — serial, inline, depth-limited
+### Subagents — isolated, depth-limited, read-only lanes parallel
 
-The `task` tool runs a subagent **synchronously inline** (`Box::pin(run(...))
-.await`) as one step of the parent's tool loop. Consequences:
+The `task` tool runs a nested `run(...)` with a fresh transcript. Consequences:
 
-- If a turn emits several `task` calls, they execute **one after another**, not
-  concurrently — there is no lane-level parallelism.
+- If a turn emits several consecutive `task` calls whose `permission_mode` is
+  omitted/defaulted to `readOnly` or explicitly `readOnly`, Anvil runs those
+  lanes concurrently with a cap of `MAX_PARALLEL_READ_ONLY_SUBAGENTS = 6`.
+- `task` calls with `permission_mode: "inherit"` and any non-task calls remain
+  serial. This keeps write-heavy/promptable workflows deterministic.
 - **Isolation:** each subagent gets a **fresh conversation** (its own
   system + user prompt) but **shares** the parent's tool registry, working
   directory, and session id. Its streamed tokens and thoughts are discarded.
@@ -67,24 +73,22 @@ The `task` tool runs a subagent **synchronously inline** (`Box::pin(run(...))
 - **Result:** the subagent's final assistant text is returned verbatim as the
   `task` tool's result to the parent.
 
-> **Contract for consumers:** treat delegated lanes as **logically isolated but
-> physically serialized**. You get role separation and conversation isolation,
-> but you do **not** get wall-clock parallelism or reduced latency from running
-> lanes "at the same time." Design prompts/policy for correctness under serial
-> execution; do not assume two lanes make progress simultaneously.
+> **Contract for consumers:** use read-only task lanes for parallel review,
+> exploration, triage, log/test analysis, and summarization. Use inherited lanes
+> for implementation/fixes, and assume those run serially.
 
 ## 3. Ordering and isolation guarantees
 
-- **Ordering:** tool calls and subagents complete in a deterministic order
-  (dispatch order, with built-ins before Bifrost tools). Because execution is
-  serial, a later lane observes the side effects (e.g. filesystem writes) of an
-  earlier one in the same turn.
+- **Ordering:** tool results are appended in deterministic dispatch order
+  (with built-ins before Bifrost tools), even when read-only task lanes finish
+  out of order internally.
 - **Conversation isolation:** a subagent never sees the parent's message history
   and vice-versa; only the final text crosses the boundary.
 - **Shared state:** subagents share the session's tool registry (and therefore
   the same Bifrost/MCP subprocesses), cwd, and permission scope. They are **not**
-  sandboxed into separate workspaces. Lanes that mutate shared state do so
-  against the same workspace, in series.
+  sandboxed into separate workspaces. Read-only lanes are prevented from edits
+  and shell execution by the lane-local permission override. Inherited lanes
+  that can mutate shared state run against the same workspace in series.
 
 ## 4. Cancellation and timeouts
 
@@ -95,7 +99,7 @@ Each prompt gets a single `CancellationToken` (`start_prompt`/`cancel_prompt`,
 subagent**. Therefore:
 
 - `session/cancel` cancels the token, which aborts the parent turn, the current
-  tool call, and any in-flight subagent — all of them, atomically.
+  tool call, and any in-flight subagents — all of them, atomically.
 - The tool loop checks the token between steps and between tool calls, so
   cancellation takes effect promptly at the next checkpoint rather than mid-LLM-
   stream only.
@@ -163,8 +167,9 @@ debugging/observing delegated work that is not surfaced over ACP.
   request is **not** propagated into subagents — a subagent returns plain text,
   and the parent is responsible for assembling/validating any structured result
   from the lanes' text outputs.
-- Because execution is serial, result aggregation is order-deterministic: lane
-  outputs are collected in dispatch order with no interleaving.
+- Result aggregation is order-deterministic: lane outputs are collected in
+  dispatch order with no parent-message interleaving, even when read-only lanes
+  run concurrently.
 
 > **Contract for consumers:** collect per-lane results as the **text** returned
 > by each `task` call, and do the structured aggregation/validation at the
@@ -176,19 +181,15 @@ debugging/observing delegated work that is not surfaced over ACP.
 These are real limitations, not oversights — they are called out so consumers
 do not build on behavior that does not exist:
 
-- **No parallel lane execution.** Subagents and multi-tool-call steps are
-  serial. Wall-clock parallel fan-out across lanes is not implemented.
+- **No parallel mutating lane execution.** Only read-only `task` lanes fan out.
+  Inherited/promptable lanes and ordinary tool calls remain serial.
 - **No per-lane cancellation/timeout.** Cancellation and budgets are
   per-prompt, not per-lane.
-- **No per-subagent tool allowlist** — subagents inherit the full parent tool
-  catalog (tracked by [#29](https://github.com/BrokkAi/anvil/issues/29)).
+- **No per-call runtime tool allowlist.** Subagents can narrow their catalog
+  with `tools` frontmatter, but a single `task` call cannot dynamically choose
+  a different tool list.
 - **No per-subagent token budget** beyond the turn cap
   ([#30](https://github.com/BrokkAi/anvil/issues/30)).
 - **No nested-loop integration test coverage** for subagents
   ([#31](https://github.com/BrokkAi/anvil/issues/31)).
 - **No sub-lane observability over ACP** — sub-lane steps are silent by design.
-
-If/when parallel delegated execution is introduced, this document is the place
-to define the added guarantees (max concurrency, per-lane isolation, per-lane
-cancellation, and the observability surface for queued/running/completed
-lanes).
