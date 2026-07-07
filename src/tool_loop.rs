@@ -11,6 +11,7 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -40,12 +41,51 @@ const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
+const MAX_PARALLEL_READ_ONLY_SUBAGENTS: usize = 6;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TaskPermissionMode {
+    #[default]
+    ReadOnly,
+    Inherit,
+}
+
+impl TaskPermissionMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "readOnly" | "read_only" | "read-only" => Some(Self::ReadOnly),
+            "inherit" => Some(Self::Inherit),
+            _ => None,
+        }
+    }
+
+    fn effective(self, parent_mode: PermissionMode) -> PermissionMode {
+        match self {
+            Self::ReadOnly => PermissionMode::ReadOnly,
+            Self::Inherit => parent_mode,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskPermissionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| {
+            serde::de::Error::custom("`permission_mode` must be one of `readOnly` or `inherit`")
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct TaskArgs {
     description: String,
     prompt: String,
     subagent_type: String,
+    #[serde(default, alias = "permissionMode")]
+    permission_mode: TaskPermissionMode,
 }
 
 fn invalid_task_args(message: impl Into<String>) -> (ToolExecution, TokenUsage) {
@@ -63,6 +103,73 @@ fn parse_task_args(args: Value) -> Result<TaskArgs, String> {
     let mut deserializer = serde_json::Deserializer::from_str(&json);
     serde_path_to_error::deserialize(&mut deserializer)
         .map_err(|err| format!("Error: invalid `task` arguments: {err}"))
+}
+
+fn task_permission_mode_from_input(raw_input: &Value) -> Result<TaskPermissionMode, String> {
+    let value = raw_input
+        .get("permission_mode")
+        .or_else(|| raw_input.get("permissionMode"));
+    let Some(value) = value else {
+        return Ok(TaskPermissionMode::default());
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(
+            "Error: invalid `task.permission_mode`: expected `readOnly` or `inherit`.".to_string(),
+        );
+    };
+    TaskPermissionMode::parse(raw).ok_or_else(|| {
+        format!(
+            "Error: invalid `task.permission_mode` value '{raw}': expected `readOnly` or `inherit`."
+        )
+    })
+}
+
+fn task_effective_permission_mode(
+    parent_mode: PermissionMode,
+    raw_input: &Value,
+) -> Result<PermissionMode, String> {
+    Ok(task_permission_mode_from_input(raw_input)?.effective(parent_mode))
+}
+
+fn apply_permission_override(
+    session_mode: PermissionMode,
+    permission_override: Option<PermissionMode>,
+) -> PermissionMode {
+    match permission_override {
+        Some(PermissionMode::ReadOnly) => PermissionMode::ReadOnly,
+        Some(mode) if mode == session_mode => session_mode,
+        // Overrides are a lane-local way to make a child stricter than the
+        // session. They must never make a child looser than the parent session.
+        Some(_) | None => session_mode,
+    }
+}
+
+async fn effective_permission_mode(
+    sessions: &SessionStore,
+    session_id: &str,
+    permission_override: Option<PermissionMode>,
+) -> Option<PermissionMode> {
+    sessions
+        .permission_mode(session_id)
+        .await
+        .map(|mode| apply_permission_override(mode, permission_override))
+}
+
+fn permission_override_for_effective_mode(
+    effective_mode: PermissionMode,
+) -> Option<PermissionMode> {
+    // A read-only lane must stay read-only for its entire life. Pin it with an
+    // explicit `ReadOnly` override even when the session already is read-only,
+    // so that a concurrent switch to a looser session mode mid-batch cannot
+    // loosen an in-flight lane (turns run in a spawned task, so a client
+    // `setSessionConfigOption` can land while lanes are still executing).
+    // `apply_permission_override` guarantees `Some(ReadOnly)` can never make a
+    // child looser than the session. Any other effective mode is the inherited
+    // parent/session mode, which needs no override.
+    match effective_mode {
+        PermissionMode::ReadOnly => Some(PermissionMode::ReadOnly),
+        _ => None,
+    }
 }
 
 fn train_bifrost_enabled() -> bool {
@@ -110,6 +217,50 @@ fn maybe_append_truncated_view_hint(output: &mut String, read_file_available: bo
 struct ExecutedStepOutcome {
     results: Vec<p2t::PrefixToolResult>,
     cancelled: bool,
+}
+
+struct ToolCallRecord {
+    call_id: String,
+    tool_name: String,
+    arguments: String,
+    result: String,
+    status: ToolExchangeStatus,
+    diff: Option<ToolExchangeDiff>,
+    permission_notice: Option<String>,
+}
+
+fn append_tool_call_record(
+    record: ToolCallRecord,
+    messages: &mut Vec<ChatMessage>,
+    tool_exchanges: &mut Vec<ToolExchange>,
+    replay_events: &mut Vec<TurnReplayEvent>,
+    step_results: &mut Vec<p2t::PrefixToolResult>,
+    read_file_available: bool,
+) {
+    let mut output = record.result;
+    maybe_append_truncated_view_hint(&mut output, read_file_available);
+    messages.push(ChatMessage::tool_result(
+        &record.call_id,
+        &record.tool_name,
+        &output,
+    ));
+    step_results.push(p2t::PrefixToolResult {
+        call_id: record.call_id.clone(),
+        content: output.clone(),
+    });
+    record_tool_result(
+        tool_exchanges,
+        replay_events,
+        ToolExchange {
+            call_id: record.call_id,
+            tool_name: record.tool_name,
+            arguments: record.arguments,
+            result: output,
+            status: record.status,
+            diff: record.diff,
+            permission_notice: record.permission_notice,
+        },
+    );
 }
 
 fn tool_call_to_replay(call: &ToolCall) -> ToolCallReplay {
@@ -1609,6 +1760,7 @@ pub(crate) async fn run(
     notifications: NotificationMode,
     depth: usize,
     tool_allowlist: Option<Arc<HashSet<String>>>,
+    permission_override: Option<PermissionMode>,
 ) -> LoopOutcome {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
@@ -1839,6 +1991,7 @@ pub(crate) async fn run(
                 &sessions,
                 notifications,
                 depth,
+                permission_override,
             )
             .await;
             if outcome.cancelled {
@@ -1880,10 +2033,10 @@ pub(crate) async fn run(
             }
             continue;
         }
-        let permission_mode = sessions
-            .permission_mode(&session_id)
-            .await
-            .unwrap_or(PermissionMode::ReadOnly);
+        let permission_mode =
+            effective_permission_mode(&sessions, &session_id, permission_override)
+                .await
+                .unwrap_or(PermissionMode::ReadOnly);
         if train_bifrost
             && should_emit_no_edit_progress_nudge(
                 permission_mode,
@@ -2205,6 +2358,7 @@ pub(crate) async fn run(
                     &sessions,
                     notifications,
                     depth,
+                    permission_override,
                 )
                 .await;
                 if outcome.cancelled {
@@ -2564,10 +2718,14 @@ async fn execute_step_tool_calls(
     sessions: &SessionStore,
     notifications: NotificationMode,
     depth: usize,
+    permission_override: Option<PermissionMode>,
 ) -> ExecutedStepOutcome {
     let mut step_results = Vec::new();
+    let ordered_indices = ordered_tool_call_indices(calls, |name| registry.is_bifrost_tool(name));
+    let mut ordered_position = 0usize;
 
-    for call_index in ordered_tool_call_indices(calls, |name| registry.is_bifrost_tool(name)) {
+    while ordered_position < ordered_indices.len() {
+        let call_index = ordered_indices[ordered_position];
         let call = &calls[call_index];
         if cancel.is_cancelled() {
             return ExecutedStepOutcome {
@@ -2575,6 +2733,46 @@ async fn execute_step_tool_calls(
                 cancelled: true,
             };
         }
+
+        let batch_len = read_only_task_batch_len(calls, &ordered_indices[ordered_position..]);
+        if batch_len > 1 {
+            let outcome = execute_parallel_read_only_task_calls(
+                llm,
+                registry,
+                model,
+                reasoning_effort,
+                service_tier,
+                structured_output,
+                original_user_request,
+                calls,
+                &ordered_indices[ordered_position..ordered_position + batch_len],
+                advertised_this_request,
+                messages,
+                tool_exchanges,
+                replay_events,
+                turn_usage,
+                max_turns,
+                idle_timeout,
+                cancel.clone(),
+                spawned_cx,
+                session_id,
+                sessions,
+                notifications,
+                depth,
+                permission_override,
+            )
+            .await;
+            step_results.extend(outcome.results);
+            if outcome.cancelled {
+                return ExecutedStepOutcome {
+                    results: step_results,
+                    cancelled: true,
+                };
+            }
+            ordered_position += batch_len;
+            continue;
+        }
+        ordered_position += 1;
 
         let tool_name = call.function.name.clone();
         let kind = ToolRegistry::tool_kind(&tool_name);
@@ -2708,6 +2906,7 @@ async fn execute_step_tool_calls(
             kind,
             &parsed_input,
             WorkspaceRoots::new(registry.cwd(), registry.additional_roots()),
+            permission_override,
         )
         .await
         {
@@ -2817,6 +3016,7 @@ async fn execute_step_tool_calls(
                 raw_input: &parsed_input,
                 cwd: registry.cwd(),
                 additional_roots: registry.additional_roots(),
+                permission_override,
             },
         )
         .await;
@@ -2874,7 +3074,8 @@ async fn execute_step_tool_calls(
                         None
                     };
 
-                let permission_mode = sessions.permission_mode(session_id).await;
+                let permission_mode =
+                    effective_permission_mode(sessions, session_id, permission_override).await;
                 if permission_mode.is_none() {
                     tracing::warn!(
                         session_id,
@@ -2937,6 +3138,7 @@ async fn execute_step_tool_calls(
                             session_id,
                             sessions,
                             depth + 1,
+                            permission_override,
                         )
                         .await;
                         turn_usage.add(nested_usage);
@@ -3054,6 +3256,404 @@ async fn execute_step_tool_calls(
     }
 }
 
+struct ParallelTaskReady {
+    call_id: String,
+    tool_name: String,
+    parsed_input: Value,
+    normalized_arguments: String,
+    permission_notice: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_parallel_read_only_task_calls(
+    llm: &Arc<dyn LlmBackend>,
+    registry: &ToolRegistry,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    original_user_request: &str,
+    calls: &[ToolCall],
+    call_indices: &[usize],
+    advertised_this_request: &std::collections::HashSet<String>,
+    messages: &mut Vec<ChatMessage>,
+    tool_exchanges: &mut Vec<ToolExchange>,
+    replay_events: &mut Vec<TurnReplayEvent>,
+    turn_usage: &mut TokenUsage,
+    max_turns: usize,
+    idle_timeout: IdleTimeouts,
+    cancel: CancellationToken,
+    spawned_cx: &SpawnedCx<'_>,
+    session_id: &str,
+    sessions: &SessionStore,
+    notifications: NotificationMode,
+    depth: usize,
+    permission_override: Option<PermissionMode>,
+) -> ExecutedStepOutcome {
+    let mut records: Vec<Option<ToolCallRecord>> = Vec::with_capacity(call_indices.len());
+    let mut ready_jobs = Vec::new();
+
+    for call_index in call_indices {
+        let slot_index = records.len();
+        let call = &calls[*call_index];
+        let tool_name = call.function.name.clone();
+        let kind = ToolRegistry::tool_kind(&tool_name);
+
+        let normalized_arguments =
+            match crate::tool_arguments::normalize_tool_arguments(&call.function.arguments) {
+                Ok(normalized) => {
+                    if normalized.repaired {
+                        tracing::warn!(
+                            session_id,
+                            tool_call_id = %call.id,
+                            tool_name = %tool_name,
+                            "repaired malformed tool-call arguments at parallel subagent dispatch"
+                        );
+                    }
+                    normalized
+                }
+                Err(e) => {
+                    let reason = format!(
+                        "Error: tool arguments are not valid JSON ({e}). \
+                     Please retry with a valid JSON object matching the tool schema."
+                    );
+                    maybe_send_session_update(
+                        notifications,
+                        spawned_cx.cx(),
+                        session_id,
+                        SessionUpdate::ToolCall(announce::initial_tool_call(
+                            &call.id,
+                            &tool_name,
+                            kind,
+                            &Value::String(call.function.arguments.clone()),
+                        )),
+                    );
+                    maybe_send_session_update(
+                        notifications,
+                        spawned_cx.cx(),
+                        session_id,
+                        SessionUpdate::ToolCallUpdate(announce::update_failed(
+                            &call.id,
+                            &reason,
+                            Some(Value::String(reason.clone())),
+                        )),
+                    );
+                    records.push(Some(ToolCallRecord {
+                        call_id: call.id.clone(),
+                        tool_name,
+                        arguments: call.function.arguments.clone(),
+                        result: reason,
+                        status: ToolExchangeStatus::Failed,
+                        diff: None,
+                        permission_notice: None,
+                    }));
+                    continue;
+                }
+            };
+        let parsed_input = normalized_arguments.value;
+        let normalized_arguments = normalized_arguments.arguments;
+
+        if let Some(reason) = announce::rejection_for_oversized_title(&tool_name, &parsed_input)
+            .or_else(|| announce::rejection_for_oversized_input_content(&tool_name, &parsed_input))
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                tool_name = %tool_name,
+                title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
+                    .chars()
+                    .count(),
+                "rejecting parallel subagent call: rendered permission card would hide input",
+            );
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCall(announce::rejected_initial_tool_call(
+                    &call.id,
+                    &tool_name,
+                    kind,
+                    &parsed_input,
+                )),
+            );
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(announce::update_failed(
+                    &call.id,
+                    &reason,
+                    Some(Value::String(reason.clone())),
+                )),
+            );
+            records.push(Some(ToolCallRecord {
+                call_id: call.id.clone(),
+                tool_name,
+                arguments: call.function.arguments.clone(),
+                result: reason,
+                status: ToolExchangeStatus::Failed,
+                diff: None,
+                permission_notice: None,
+            }));
+            continue;
+        }
+
+        if let Some(message) = deterministic_gate_rejection(
+            sessions,
+            session_id,
+            &tool_name,
+            kind,
+            &parsed_input,
+            WorkspaceRoots::new(registry.cwd(), registry.additional_roots()),
+            permission_override,
+        )
+        .await
+        {
+            let (blocked_call, failed_update) =
+                blocked_tool_call_updates(&call.id, &tool_name, kind, &parsed_input, &message);
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCall(blocked_call),
+            );
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(failed_update),
+            );
+            records.push(Some(ToolCallRecord {
+                call_id: call.id.clone(),
+                tool_name,
+                arguments: normalized_arguments,
+                result: message,
+                status: ToolExchangeStatus::Failed,
+                diff: None,
+                permission_notice: None,
+            }));
+            continue;
+        }
+
+        maybe_send_session_update(
+            notifications,
+            spawned_cx.cx(),
+            session_id,
+            SessionUpdate::ToolCall(announce::initial_tool_call(
+                &call.id,
+                &tool_name,
+                kind,
+                &parsed_input,
+            )),
+        );
+
+        if !advertised_this_request.contains(tool_name.as_str()) {
+            let message = tool_unavailable_message(&tool_name);
+            maybe_send_session_update(
+                notifications,
+                spawned_cx.cx(),
+                session_id,
+                SessionUpdate::ToolCallUpdate(announce::update_failed(
+                    &call.id,
+                    &message,
+                    Some(Value::String(message.clone())),
+                )),
+            );
+            records.push(Some(ToolCallRecord {
+                call_id: call.id.clone(),
+                tool_name,
+                arguments: normalized_arguments,
+                result: message,
+                status: ToolExchangeStatus::Failed,
+                diff: None,
+                permission_notice: None,
+            }));
+            continue;
+        }
+
+        let decision = consult_gate(
+            sessions,
+            spawned_cx,
+            &cancel,
+            GateCheck {
+                llm,
+                model,
+                reasoning_effort,
+                original_user_request,
+                idle_timeout,
+                session_id,
+                tool_name: &tool_name,
+                kind,
+                tool_call_id: &call.id,
+                raw_input: &parsed_input,
+                cwd: registry.cwd(),
+                additional_roots: registry.additional_roots(),
+                permission_override,
+            },
+        )
+        .await;
+        turn_usage.add(decision.usage);
+
+        match decision.decision {
+            GateDecision::Reject {
+                message,
+                permission_notice,
+            } => {
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCallUpdate(announce::update_failed_with_notice(
+                        &call.id,
+                        &message,
+                        permission_notice.as_deref(),
+                        Some(Value::String(message.clone())),
+                    )),
+                );
+                records.push(Some(ToolCallRecord {
+                    call_id: call.id.clone(),
+                    tool_name,
+                    arguments: normalized_arguments,
+                    result: message,
+                    status: ToolExchangeStatus::Failed,
+                    diff: None,
+                    permission_notice,
+                }));
+            }
+            GateDecision::Allow {
+                permission_notice, ..
+            } => {
+                maybe_send_session_update(
+                    notifications,
+                    spawned_cx.cx(),
+                    session_id,
+                    SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
+                );
+                tracing::info!(
+                    "executing read-only subagent {} with args: {} (parallel_batch=true)",
+                    tool_name,
+                    normalized_arguments,
+                );
+                records.push(None);
+                ready_jobs.push((
+                    slot_index,
+                    ParallelTaskReady {
+                        call_id: call.id.clone(),
+                        tool_name,
+                        parsed_input,
+                        normalized_arguments,
+                        permission_notice,
+                    },
+                ));
+            }
+        }
+    }
+
+    let completed = futures::stream::iter(ready_jobs.into_iter().map(|(slot_index, ready)| {
+        let cancel = cancel.clone();
+        async move {
+            // Mirror the serial `task` dispatch path (see the `tool_name ==
+            // "task"` arm in `execute_step_tool_calls`): PreToolUse plugin
+            // hooks may veto the lane before the subagent runs, and PostToolUse
+            // hooks post-process its result. Skipping them here would let a
+            // batch of >=2 read-only `task` calls bypass a hook that a single
+            // (serially dispatched) `task` call honors.
+            let (exec, nested_usage) = if let Some(blocked) =
+                run_pre_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input).await
+            {
+                (blocked, TokenUsage::default())
+            } else {
+                let (mut exec, nested_usage) = execute_subagent(
+                    llm,
+                    registry,
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    structured_output,
+                    &ready.parsed_input,
+                    max_turns,
+                    idle_timeout,
+                    cancel,
+                    spawned_cx,
+                    session_id,
+                    sessions,
+                    depth + 1,
+                    permission_override,
+                )
+                .await;
+                run_post_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input, &mut exec)
+                    .await;
+                (exec, nested_usage)
+            };
+            (slot_index, ready, exec, nested_usage)
+        }
+    }))
+    .buffered(MAX_PARALLEL_READ_ONLY_SUBAGENTS)
+    .collect::<Vec<_>>()
+    .await;
+
+    for (slot_index, ready, exec, nested_usage) in completed {
+        turn_usage.add(nested_usage);
+        let (update, status) = if exec.failed {
+            let clean = strip_sandbox_escalation_hint(&exec.output);
+            (
+                announce::update_failed_with_input(
+                    &ready.call_id,
+                    &ready.tool_name,
+                    &ready.parsed_input,
+                    clean,
+                    ready.permission_notice.as_deref(),
+                    Some(Value::String(clean.to_string())),
+                ),
+                ToolExchangeStatus::Failed,
+            )
+        } else {
+            (
+                announce::update_completed(
+                    &ready.call_id,
+                    &ready.tool_name,
+                    &ready.parsed_input,
+                    &exec.output,
+                    None,
+                    ready.permission_notice.as_deref(),
+                ),
+                ToolExchangeStatus::Completed,
+            )
+        };
+        maybe_send_session_update(
+            notifications,
+            spawned_cx.cx(),
+            session_id,
+            SessionUpdate::ToolCallUpdate(update),
+        );
+        records[slot_index] = Some(ToolCallRecord {
+            call_id: ready.call_id,
+            tool_name: ready.tool_name,
+            arguments: ready.normalized_arguments,
+            result: exec.output,
+            status,
+            diff: None,
+            permission_notice: ready.permission_notice,
+        });
+    }
+
+    let mut step_results = Vec::with_capacity(records.len());
+    for record in records.into_iter().flatten() {
+        append_tool_call_record(
+            record,
+            messages,
+            tool_exchanges,
+            replay_events,
+            &mut step_results,
+            advertised_this_request.contains("read_file"),
+        );
+    }
+
+    ExecutedStepOutcome {
+        results: step_results,
+        cancelled: cancel.is_cancelled(),
+    }
+}
+
 fn blocked_tool_call_updates(
     tool_call_id: &str,
     tool_name: &str,
@@ -3106,8 +3706,9 @@ async fn evaluate_pure_gate(
     kind: ToolKind,
     raw_input: &Value,
     workspace_roots: WorkspaceRoots<'_>,
+    permission_override: Option<PermissionMode>,
 ) -> Result<PureGateEvaluation, String> {
-    let mode = match sessions.permission_mode(session_id).await {
+    let session_mode = match sessions.permission_mode(session_id).await {
         Some(m) => m,
         None => {
             tracing::warn!(
@@ -3120,6 +3721,7 @@ async fn evaluate_pure_gate(
                 .to_string());
         }
     };
+    let mode = apply_permission_override(session_mode, permission_override);
     let sandbox_mode = sessions.sandbox_mode(session_id).await.flatten();
     let shell_sandboxed =
         tool_name == "run_shell_command" && shell_command_will_run_sandboxed(mode, sandbox_mode);
@@ -3155,9 +3757,18 @@ async fn evaluate_pure_gate(
             .is_any_always_allowed(session_id, &[tool_name.to_string()])
             .await
     };
+    let decision_kind = if tool_name == "task"
+        && matches!(
+            task_effective_permission_mode(mode, raw_input)?,
+            PermissionMode::ReadOnly
+        ) {
+        ToolKind::Read
+    } else {
+        kind
+    };
     let decision = pure_gate_decision_with_rationale(
         mode,
-        kind,
+        decision_kind,
         tool_name,
         is_always_allowed,
         shell_auto_allow,
@@ -3201,6 +3812,7 @@ async fn deterministic_gate_rejection(
     kind: ToolKind,
     raw_input: &Value,
     workspace_roots: WorkspaceRoots<'_>,
+    permission_override: Option<PermissionMode>,
 ) -> Option<String> {
     match evaluate_pure_gate(
         sessions,
@@ -3209,6 +3821,7 @@ async fn deterministic_gate_rejection(
         kind,
         raw_input,
         workspace_roots,
+        permission_override,
     )
     .await
     {
@@ -3240,6 +3853,7 @@ async fn consult_gate(
         request.kind,
         request.raw_input,
         WorkspaceRoots::new(request.cwd, request.additional_roots),
+        request.permission_override,
     )
     .await
     {
@@ -3843,6 +4457,7 @@ struct GateCheck<'a> {
     raw_input: &'a Value,
     cwd: &'a Path,
     additional_roots: &'a [PathBuf],
+    permission_override: Option<PermissionMode>,
 }
 
 struct PermissionRequest<'a> {
@@ -4470,6 +5085,7 @@ async fn execute_subagent(
     session_id: &str,
     sessions: &SessionStore,
     depth: usize,
+    parent_permission_override: Option<PermissionMode>,
 ) -> (ToolExecution, TokenUsage) {
     let args: TaskArgs = match parse_task_args(args.clone()) {
         Ok(args) => args,
@@ -4486,6 +5102,22 @@ async fn execute_subagent(
     }
     let subagent_name = args.subagent_type.as_str();
     let prompt = args.prompt.as_str();
+    let parent_mode =
+        match effective_permission_mode(sessions, session_id, parent_permission_override).await {
+            Some(mode) => mode,
+            None => {
+                return (
+                    ToolExecution {
+                        output: "Error: failed to run subagent: session is no longer registered."
+                            .to_string(),
+                        failed: true,
+                    },
+                    TokenUsage::default(),
+                );
+            }
+        };
+    let child_mode = args.permission_mode.effective(parent_mode);
+    let child_permission_override = permission_override_for_effective_mode(child_mode);
 
     // Snapshot the agent metadata under the registry lock, then drop the
     // guard before recursing into `run()` -- the nested call also
@@ -4569,6 +5201,7 @@ async fn execute_subagent(
         NotificationMode::Silent,
         depth,
         nested_tool_allowlist,
+        child_permission_override,
     ))
     .await;
 
@@ -4739,6 +5372,26 @@ fn ordered_tool_call_indices(
     }
     builtin_or_other.extend(bifrost);
     builtin_or_other
+}
+
+fn read_only_task_batch_len(calls: &[ToolCall], ordered_indices: &[usize]) -> usize {
+    ordered_indices
+        .iter()
+        .copied()
+        .take_while(|index| {
+            let call = &calls[*index];
+            if call.function.name != "task" {
+                return false;
+            }
+            let Ok(raw_input) = serde_json::from_str::<Value>(&call.function.arguments) else {
+                return false;
+            };
+            matches!(
+                task_permission_mode_from_input(&raw_input),
+                Ok(TaskPermissionMode::ReadOnly)
+            )
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -4940,6 +5593,80 @@ mod tests {
                 "error should mention {field:?}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn task_args_default_to_read_only_permission_mode() {
+        let args = parse_task_args(serde_json::json!({
+            "description": "review",
+            "prompt": "inspect this",
+            "subagent_type": "reviewer"
+        }))
+        .expect("task args should parse");
+
+        assert_eq!(args.permission_mode, TaskPermissionMode::ReadOnly);
+
+        let inherited = parse_task_args(serde_json::json!({
+            "description": "fix",
+            "prompt": "make the change",
+            "subagent_type": "worker",
+            "permissionMode": "inherit"
+        }))
+        .expect("camelCase permission alias should parse");
+
+        assert_eq!(inherited.permission_mode, TaskPermissionMode::Inherit);
+    }
+
+    #[test]
+    fn read_only_task_batch_len_groups_only_read_only_lanes() {
+        let calls = vec![
+            ToolCall {
+                id: "a".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "description": "review a",
+                        "prompt": "inspect a",
+                        "subagent_type": "reviewer"
+                    })
+                    .to_string(),
+                },
+            },
+            ToolCall {
+                id: "b".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "description": "review b",
+                        "prompt": "inspect b",
+                        "subagent_type": "reviewer",
+                        "permission_mode": "readOnly"
+                    })
+                    .to_string(),
+                },
+            },
+            ToolCall {
+                id: "c".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "description": "fix c",
+                        "prompt": "edit c",
+                        "subagent_type": "worker",
+                        "permission_mode": "inherit"
+                    })
+                    .to_string(),
+                },
+            },
+            tool_call_for_test("read_file"),
+        ];
+        let ordered = [0, 1, 2, 3];
+
+        assert_eq!(read_only_task_batch_len(&calls, &ordered), 2);
+        assert_eq!(read_only_task_batch_len(&calls, &ordered[2..]), 0);
     }
 
     struct RetryBackend {
@@ -5281,6 +6008,7 @@ mod tests {
             raw_input: &raw_input,
             cwd: Path::new("/tmp/project"),
             additional_roots: &[],
+            permission_override: None,
         };
 
         let PermissionScopeClassifierOutcome::Classified {
@@ -5323,6 +6051,7 @@ mod tests {
             raw_input: &raw_input,
             cwd: Path::new("/tmp/project"),
             additional_roots: &[],
+            permission_override: None,
         };
 
         let PermissionScopeClassifierOutcome::Classified { classification, .. } =
@@ -5373,6 +6102,7 @@ mod tests {
             raw_input,
             cwd: Path::new("/tmp/project"),
             additional_roots: &[],
+            permission_override: None,
         }
     }
 
@@ -6441,11 +7171,6 @@ mod tests {
                 ToolRegistry::tool_kind("run_shell_command"),
                 serde_json::json!({"command": "touch app.js"}),
             ),
-            (
-                "task",
-                ToolRegistry::tool_kind("task"),
-                serde_json::json!({"subagent_type": "reviewer", "prompt": "edit app.js"}),
-            ),
         ];
 
         for (tool_name, kind, input) in cases {
@@ -6456,6 +7181,7 @@ mod tests {
                 kind,
                 &input,
                 WorkspaceRoots::new(cwd.path(), &[]),
+                None,
             )
             .await
             .unwrap_or_else(|| panic!("{tool_name} should be rejected before execution"));
@@ -6480,6 +7206,7 @@ mod tests {
             ToolRegistry::tool_kind("write_file"),
             &serde_json::json!({"file_path": "app.js", "content": "x"}),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await;
         assert!(
@@ -6499,9 +7226,30 @@ mod tests {
             ToolRegistry::tool_kind("read_file"),
             &serde_json::json!({"file_path": "app.js"}),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await;
         assert!(read.is_none(), "read-only should allow read tools");
+
+        let task = deterministic_gate_rejection(
+            &store,
+            &session.id,
+            "task",
+            ToolRegistry::tool_kind("task"),
+            &serde_json::json!({
+                "description": "review",
+                "prompt": "inspect only",
+                "subagent_type": "reviewer",
+                "permission_mode": "readOnly"
+            }),
+            WorkspaceRoots::new(cwd.path(), &[]),
+            None,
+        )
+        .await;
+        assert!(
+            task.is_none(),
+            "read-only should allow read-only task lanes"
+        );
     }
 
     #[cfg(unix)]
@@ -6604,6 +7352,7 @@ mod tests {
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await
         .expect("escalation without an active OS sandbox must be rejected");
@@ -6642,6 +7391,7 @@ mod tests {
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await
         .expect("read-only mode must reject shell escalation");
@@ -6680,6 +7430,7 @@ mod tests {
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await;
 
@@ -6724,6 +7475,7 @@ mod tests {
             ToolRegistry::tool_kind("run_shell_command"),
             &serde_json::json!({"command": "cargo build"}),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await
         .expect("gate should evaluate");
@@ -6743,6 +7495,7 @@ mod tests {
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await
         .expect("gate should evaluate");
@@ -6777,6 +7530,7 @@ mod tests {
                 "sandbox_permissions": "require_escalated",
             }),
             WorkspaceRoots::new(cwd.path(), &[]),
+            None,
         )
         .await
         .expect("gate should evaluate");
@@ -6813,6 +7567,7 @@ mod tests {
             ToolRegistry::tool_kind("run_shell_command"),
             &input,
             WorkspaceRoots::new(cwd.path(), &[additional.path().to_path_buf()]),
+            None,
         )
         .await
         .expect("gate should evaluate");
