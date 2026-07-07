@@ -155,32 +155,20 @@ async fn effective_permission_mode(
         .map(|mode| apply_permission_override(mode, permission_override))
 }
 
-async fn session_and_effective_permission_mode(
-    sessions: &SessionStore,
-    session_id: &str,
-    permission_override: Option<PermissionMode>,
-) -> Option<(PermissionMode, PermissionMode)> {
-    sessions
-        .permission_mode(session_id)
-        .await
-        .map(|session_mode| {
-            (
-                session_mode,
-                apply_permission_override(session_mode, permission_override),
-            )
-        })
-}
-
 fn permission_override_for_effective_mode(
-    session_mode: PermissionMode,
     effective_mode: PermissionMode,
 ) -> Option<PermissionMode> {
-    if effective_mode == session_mode {
-        None
-    } else if matches!(effective_mode, PermissionMode::ReadOnly) {
-        Some(PermissionMode::ReadOnly)
-    } else {
-        None
+    // A read-only lane must stay read-only for its entire life. Pin it with an
+    // explicit `ReadOnly` override even when the session already is read-only,
+    // so that a concurrent switch to a looser session mode mid-batch cannot
+    // loosen an in-flight lane (turns run in a spawned task, so a client
+    // `setSessionConfigOption` can land while lanes are still executing).
+    // `apply_permission_override` guarantees `Some(ReadOnly)` can never make a
+    // child looser than the session. Any other effective mode is the inherited
+    // parent/session mode, which needs no override.
+    match effective_mode {
+        PermissionMode::ReadOnly => Some(PermissionMode::ReadOnly),
+        _ => None,
     }
 }
 
@@ -3550,23 +3538,38 @@ async fn execute_parallel_read_only_task_calls(
     let completed = futures::stream::iter(ready_jobs.into_iter().map(|(slot_index, ready)| {
         let cancel = cancel.clone();
         async move {
-            let (exec, nested_usage) = execute_subagent(
-                llm,
-                registry,
-                model,
-                reasoning_effort,
-                structured_output,
-                &ready.parsed_input,
-                max_turns,
-                idle_timeout,
-                cancel,
-                spawned_cx,
-                session_id,
-                sessions,
-                depth + 1,
-                permission_override,
-            )
-            .await;
+            // Mirror the serial `task` dispatch path (see the `tool_name ==
+            // "task"` arm in `execute_step_tool_calls`): PreToolUse plugin
+            // hooks may veto the lane before the subagent runs, and PostToolUse
+            // hooks post-process its result. Skipping them here would let a
+            // batch of >=2 read-only `task` calls bypass a hook that a single
+            // (serially dispatched) `task` call honors.
+            let (exec, nested_usage) = if let Some(blocked) =
+                run_pre_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input).await
+            {
+                (blocked, TokenUsage::default())
+            } else {
+                let (mut exec, nested_usage) = execute_subagent(
+                    llm,
+                    registry,
+                    model,
+                    reasoning_effort,
+                    structured_output,
+                    &ready.parsed_input,
+                    max_turns,
+                    idle_timeout,
+                    cancel,
+                    spawned_cx,
+                    session_id,
+                    sessions,
+                    depth + 1,
+                    permission_override,
+                )
+                .await;
+                run_post_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input, &mut exec)
+                    .await;
+                (exec, nested_usage)
+            };
             (slot_index, ready, exec, nested_usage)
         }
     }))
@@ -5083,28 +5086,22 @@ async fn execute_subagent(
     }
     let subagent_name = args.subagent_type.as_str();
     let prompt = args.prompt.as_str();
-    let (session_mode, parent_mode) = match session_and_effective_permission_mode(
-        sessions,
-        session_id,
-        parent_permission_override,
-    )
-    .await
-    {
-        Some(modes) => modes,
-        None => {
-            return (
-                ToolExecution {
-                    output: "Error: failed to run subagent: session is no longer registered."
-                        .to_string(),
-                    failed: true,
-                },
-                TokenUsage::default(),
-            );
-        }
-    };
+    let parent_mode =
+        match effective_permission_mode(sessions, session_id, parent_permission_override).await {
+            Some(mode) => mode,
+            None => {
+                return (
+                    ToolExecution {
+                        output: "Error: failed to run subagent: session is no longer registered."
+                            .to_string(),
+                        failed: true,
+                    },
+                    TokenUsage::default(),
+                );
+            }
+        };
     let child_mode = args.permission_mode.effective(parent_mode);
-    let child_permission_override =
-        permission_override_for_effective_mode(session_mode, child_mode);
+    let child_permission_override = permission_override_for_effective_mode(child_mode);
 
     // Snapshot the agent metadata under the registry lock, then drop the
     // guard before recursing into `run()` -- the nested call also
