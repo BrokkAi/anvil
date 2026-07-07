@@ -268,7 +268,12 @@ fn assistant_message_with_tool_calls(
         tool_calls: Some(tool_calls_from_prefix(tool_calls)),
         tool_call_id: None,
         name: None,
-        reasoning_content: None,
+        // Present-but-empty, not None: DeepSeek thinking-mode rejects an
+        // assistant turn with no reasoning_content ("must be passed back"),
+        // and None omits the field entirely (llm_client serialize). An injected
+        // PrefixStep tool-call has no real reasoning; an empty string satisfies
+        // the field-presence contract without fabricating rationale.
+        reasoning_content: Some(String::new()),
     }
 }
 
