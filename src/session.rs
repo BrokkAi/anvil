@@ -630,11 +630,14 @@ pub struct SessionManifest {
     pub modified: u64,
     #[serde(default = "default_version")]
     pub version: String,
-    /// Brokk ACP-specific: session mode, persisted so it survives reload.
-    /// Absent in manifests produced by the Java executor.
+    /// Legacy Brokk ACP-specific session mode. Deserialized for old archives,
+    /// but no longer written or used as runtime config; clients own ACP
+    /// session config values.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "brokkMode")]
     pub mode: Option<String>,
-    /// Brokk ACP-specific: last selected model for this session.
+    /// Legacy Brokk ACP-specific model selection. Deserialized for old
+    /// archives, but no longer written or used as runtime config; clients own
+    /// ACP session config values.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -891,12 +894,8 @@ impl Session {
             created: now,
             modified: now,
             version: "4.0".to_string(),
-            mode: Some(mode.as_str().to_string()),
-            model: if model.is_empty() {
-                None
-            } else {
-                Some(model.clone())
-            },
+            mode: None,
+            model: None,
             brokk_mcp_servers: None,
             cwd: Some(cwd.to_string_lossy().into_owned()),
             additional_directories: additional_directories_manifest(&additional_directories),
@@ -3009,64 +3008,6 @@ impl SessionStore {
         }
     }
 
-    fn remember_last_selection(
-        &self,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-    ) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                let mut state = state.lock().expect("transient setup state mutex poisoned");
-                state.last_model = model;
-                state.last_reasoning_effort = reasoning_effort;
-                Ok(())
-            }
-            None => crate::setup_state::remember_last_selection(model, reasoning_effort),
-        }
-    }
-
-    fn remember_last_reasoning_effort(
-        &self,
-        reasoning_effort: Option<String>,
-    ) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                state
-                    .lock()
-                    .expect("transient setup state mutex poisoned")
-                    .last_reasoning_effort = reasoning_effort;
-                Ok(())
-            }
-            None => crate::setup_state::remember_last_reasoning_effort(reasoning_effort),
-        }
-    }
-
-    fn remember_last_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                state
-                    .lock()
-                    .expect("transient setup state mutex poisoned")
-                    .last_permission_mode = Some(mode);
-                Ok(())
-            }
-            None => crate::setup_state::remember_last_permission_mode(mode),
-        }
-    }
-
-    fn remember_last_behavior_mode(&self, mode: SessionMode) -> anyhow::Result<()> {
-        match &self.transient_setup_state {
-            Some(state) => {
-                state
-                    .lock()
-                    .expect("transient setup state mutex poisoned")
-                    .last_behavior_mode = Some(mode);
-                Ok(())
-            }
-            None => crate::setup_state::remember_last_behavior_mode(mode),
-        }
-    }
-
     fn remember_sandbox_mode(
         &self,
         mode: Option<crate::sandbox_backend::SandboxMode>,
@@ -3412,18 +3353,15 @@ impl SessionStore {
         additional_directories: Vec<PathBuf>,
     ) -> Session {
         let id = uuid::Uuid::new_v4().to_string();
-        let prefs = self.setup_state_snapshot();
         let default_model = self.default_model.read().await.clone();
         let default_reasoning_effort = self.default_reasoning_effort.read().await.clone();
         let catalog = self.available_models.read().await.clone();
-        let model = select_session_model(prefs.last_model, default_model, &catalog);
-        let reasoning_effort = select_session_reasoning_effort(
-            &model,
-            default_reasoning_effort.or(prefs.last_reasoning_effort),
-            &catalog,
-        );
-        let session_mode = prefs.last_behavior_mode.unwrap_or(SessionMode::Lutz);
-        let permission_mode = prefs.last_permission_mode.unwrap_or_default();
+        let model = select_session_model(None, default_model, &catalog);
+        let reasoning_effort =
+            select_session_reasoning_effort(&model, default_reasoning_effort, &catalog);
+        let prefs = self.setup_state_snapshot();
+        let session_mode = SessionMode::Lutz;
+        let permission_mode = PermissionMode::default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let mut session = match sandbox_mode {
@@ -3444,7 +3382,6 @@ impl SessionStore {
         };
         session.additional_directories = additional_directories.clone();
         session.mode = session_mode;
-        session.manifest.mode = Some(session_mode.as_str().to_string());
         session.manifest.additional_directories =
             additional_directories_manifest(&additional_directories);
         session.mcp_servers = mcp_servers.clone();
@@ -3554,19 +3491,14 @@ impl SessionStore {
         // Disk is unaffected: the persisted zip still contains every turn.
         trim_history(&mut history, self.limits.max_history_turns);
 
-        // Prefer persisted mode/model; fall back to server defaults.
-        let session_mode = manifest
-            .mode
-            .as_deref()
-            .and_then(SessionMode::parse)
-            .unwrap_or(SessionMode::Lutz);
-        let model = match manifest.model.clone() {
-            Some(m) if !m.is_empty() => m,
-            _ => self.default_model.read().await.clone(),
-        };
+        // ACP config options are client-owned. Old manifests may still carry
+        // mode/model values, but cold loads start from server defaults until
+        // the client sends fresh config for the live session.
+        let session_mode = SessionMode::Lutz;
+        let model = self.default_model.read().await.clone();
 
         let prefs = self.setup_state_snapshot();
-        let permission_mode = prefs.last_permission_mode.unwrap_or_default();
+        let permission_mode = PermissionMode::default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let manifest_additional_directories =
@@ -3684,10 +3616,9 @@ impl SessionStore {
     /// `session/fork`): a fresh id whose persisted archive is a byte-copy of
     /// the source's, so the fork carries the *full* conversation (not just the
     /// in-memory window) and follow-up prompts on the fork never mutate the
-    /// source. The fork inherits the source's mode, model, service tier, and
-    /// MCP config; the caller may override the MCP servers afterwards. The
-    /// request cwd must match the source's cwd, mirroring `session/load`/`resume`
-    /// (#147).
+    /// source. ACP session config options reset to defaults; the caller may
+    /// override MCP servers afterwards. The request cwd must match the source's
+    /// cwd, mirroring `session/load`/`resume` (#147).
     pub async fn fork_session(&self, source_id: &str, cwd: &Path) -> ForkOutcome {
         let source = match self.reopen_session_checked(source_id, cwd).await {
             LifecycleReopen::Reopened(session) => *session,
@@ -3729,8 +3660,8 @@ impl SessionStore {
         let mut forked = match Session::from_persisted(
             new_id.clone(),
             cwd.to_path_buf(),
-            source.mode,
-            source.model.clone(),
+            SessionMode::Lutz,
+            self.default_model.read().await.clone(),
             source.history.clone(),
             new_manifest,
         ) {
@@ -3738,7 +3669,6 @@ impl SessionStore {
             Err(e) => return ForkOutcome::Failed(format!("{e}")),
         };
         forked.turn_recap_enabled = source.turn_recap_enabled;
-        forked.selected_service_tier = source.selected_service_tier.clone();
         forked.set_always_allow_keys(load_repo_always_allow_keys(&forked.permission_scope_root));
 
         self.sessions
@@ -4022,36 +3952,19 @@ impl SessionStore {
         }
     }
 
-    /// Update the session's permission mode. Returns false if the session is unknown.
-    /// Permission mode is intentionally not persisted to the workspace manifest;
-    /// the last explicit user choice is saved in trusted setup state for future
-    /// sessions and cold reloads.
-    ///
-    /// `BypassPermissions` is deliberately excluded from persistence: the
-    /// fully-trusting mode requires a fresh opt-in each session, so selecting it
-    /// updates the live session only and never seeds future sessions or cold
-    /// reloads (nor does it overwrite a previously saved non-bypass preference).
+    /// Update the live session's permission mode. Returns false if the
+    /// session is unknown. Permission mode is an ACP session config option, so
+    /// it is intentionally not written to setup state or the workspace
+    /// manifest; clients must resubmit it for each session.
     pub async fn set_permission_mode(&self, id: &str, permission_mode: PermissionMode) -> bool {
-        let updated = {
-            let mut sessions = self.sessions.write().await;
-            match sessions.get_mut(id) {
-                Some(session) => {
-                    session.permission_mode = permission_mode;
-                    true
-                }
-                None => false,
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(id) {
+            Some(session) => {
+                session.permission_mode = permission_mode;
+                true
             }
-        };
-        if updated
-            && !matches!(permission_mode, PermissionMode::BypassPermissions)
-            && let Err(e) = self.remember_last_permission_mode(permission_mode)
-        {
-            tracing::warn!(
-                session_id = %id,
-                "failed to persist last permission preference: {e:#}"
-            );
+            None => false,
         }
-        updated
     }
 
     /// Read the current permission_mode for a session. Returns None if unknown.
@@ -4390,61 +4303,21 @@ impl SessionStore {
         sessions.get(id).map(|session| session.usage)
     }
 
-    /// Update the session's behavior mode and persist the new manifest.
+    /// Update the live session's behavior mode.
     ///
-    /// Returns `Ok(true)` on success, `Ok(false)` if the session is unknown
-    /// (no-op), or `Err` if persistence failed -- in that case the in-memory
-    /// mutation is rolled back so `memory == disk`, mirroring `add_turn`.
-    pub async fn set_mode(&self, id: &str, mode: SessionMode) -> anyhow::Result<bool> {
-        // Update in-memory state and snapshot what we need for persistence.
-        // Capture the pre-mutation mode so we can reverse it on failure.
-        let snapshot = {
-            let mut sessions = self.sessions.write().await;
-            match sessions.get_mut(id) {
-                Some(session) => {
-                    let prev_mode = session.mode;
-                    let prev_manifest_mode = session.manifest.mode.clone();
-                    session.mode = mode;
-                    session.manifest.mode = Some(mode.as_str().to_string());
-                    Some((
-                        session.cwd.clone(),
-                        session.manifest.clone(),
-                        prev_mode,
-                        prev_manifest_mode,
-                    ))
-                }
-                None => None,
+    /// Returns true on success or false if the session is unknown.
+    /// Behavior mode is an ACP session config option, so it is intentionally
+    /// not written to setup state or the workspace manifest; clients must
+    /// resubmit it for each session.
+    pub async fn set_mode(&self, id: &str, mode: SessionMode) -> bool {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(id) {
+            Some(session) => {
+                session.mode = mode;
+                true
             }
-        };
-        let Some((cwd, manifest, prev_mode, prev_manifest_mode)) = snapshot else {
-            return Ok(false);
-        };
-
-        let zip_path = session_zip_path(&cwd, id);
-        let join_result =
-            tokio::task::spawn_blocking(move || rewrite_manifest_in_zip(&zip_path, &manifest))
-                .await;
-
-        let persist_result = flatten_persist_join(join_result);
-
-        if let Err(e) = persist_result {
-            tracing::error!(
-                session_id = %id,
-                "failed to persist session mode; rolling back in-memory state: {e:#}"
-            );
-            if let Some(session) = self.sessions.write().await.get_mut(id) {
-                session.mode = prev_mode;
-                session.manifest.mode = prev_manifest_mode;
-            }
-            return Err(e);
+            None => false,
         }
-        if let Err(e) = self.remember_last_behavior_mode(mode) {
-            tracing::warn!(
-                session_id = %id,
-                "failed to persist last behavior mode preference: {e:#}"
-            );
-        }
-        Ok(true)
     }
 
     /// Store an LLM-produced summary onto a previously-persisted turn,
@@ -4684,12 +4557,10 @@ impl SessionStore {
         Ok(RewindOutcome::Rewound(Box::new(removed)))
     }
 
-    /// Update the per-session LLM model and persist the new manifest.
+    /// Update the live session's LLM model.
     ///
-    /// Returns `Ok((true, cleared_reasoning, cleared_service_tier))` on success,
-    /// `Ok((false, None, None))` if the session is unknown (no-op), or `Err` if
-    /// persistence failed -- in that case the in-memory mutation is rolled back
-    /// so `memory == disk`, mirroring `set_mode`.
+    /// Returns `(true, cleared_reasoning, cleared_service_tier)` on success,
+    /// or `(false, None, None)` if the session is unknown.
     ///
     /// When the previously-selected reasoning effort isn't in the new
     /// model's supported set, the selection is auto-cleared so the next
@@ -4703,7 +4574,7 @@ impl SessionStore {
         &self,
         id: &str,
         model: String,
-    ) -> anyhow::Result<(bool, Option<String>, Option<String>)> {
+    ) -> (bool, Option<String>, Option<String>) {
         // Pull the supported-effort set for the new model BEFORE
         // acquiring the sessions write lock -- the available_models
         // store and the sessions store are separate locks, and reading
@@ -4726,20 +4597,11 @@ impl SessionStore {
             )
         };
 
-        let (snapshot, cleared_effort, cleared_service_tier, remember_selection) = {
+        let (updated, cleared_effort, cleared_service_tier) = {
             let mut sessions = self.sessions.write().await;
             match sessions.get_mut(id) {
                 Some(session) => {
-                    let prev_model = session.model.clone();
-                    let prev_manifest_model = session.manifest.model.clone();
-                    let prev_reasoning_effort = session.selected_reasoning_effort.clone();
-                    let prev_service_tier = session.selected_service_tier.clone();
                     session.model = model.clone();
-                    session.manifest.model = if model.is_empty() {
-                        None
-                    } else {
-                        Some(model.clone())
-                    };
                     // Auto-fallback: if the user had a provider effort
                     // pick but the new model doesn't advertise it, drop
                     // the pick. The next snapshot resolves to the new
@@ -4767,94 +4629,24 @@ impl SessionStore {
                             }
                             _ => None,
                         };
-                    let remember_model = if model.is_empty() {
-                        None
-                    } else {
-                        Some(model.clone())
-                    };
-                    let remember_reasoning = session.selected_reasoning_effort.clone();
-                    (
-                        Some((
-                            session.cwd.clone(),
-                            session.manifest.clone(),
-                            prev_model,
-                            prev_manifest_model,
-                            prev_reasoning_effort,
-                            prev_service_tier,
-                        )),
-                        cleared,
-                        cleared_service,
-                        Some((remember_model, remember_reasoning)),
-                    )
+                    (true, cleared, cleared_service)
                 }
-                None => (None, None, None, None),
+                None => (false, None, None),
             }
         };
-        match snapshot {
-            Some((
-                cwd,
-                manifest,
-                prev_model,
-                prev_manifest_model,
-                prev_reasoning_effort,
-                prev_service_tier,
-            )) => {
-                let zip_path = session_zip_path(&cwd, id);
-                let join_result = tokio::task::spawn_blocking(move || {
-                    rewrite_manifest_in_zip(&zip_path, &manifest)
-                })
-                .await;
-
-                let persist_result = flatten_persist_join(join_result);
-
-                if let Err(e) = persist_result {
-                    tracing::error!(
-                        session_id = %id,
-                        "failed to persist session model; rolling back in-memory state: {e:#}"
-                    );
-                    if let Some(session) = self.sessions.write().await.get_mut(id) {
-                        session.model = prev_model;
-                        session.manifest.model = prev_manifest_model;
-                        session.selected_reasoning_effort = prev_reasoning_effort;
-                        session.selected_service_tier = prev_service_tier;
-                    }
-                    return Err(e);
-                }
-
-                if let Some((remember_model, remember_reasoning)) = remember_selection
-                    && let Err(e) = self.remember_last_selection(remember_model, remember_reasoning)
-                {
-                    tracing::warn!(
-                        session_id = %id,
-                        "failed to persist last model/reasoning preference: {e:#}"
-                    );
-                }
-
-                Ok((true, cleared_effort, cleared_service_tier))
-            }
-            None => Ok((false, None, None)),
-        }
+        (updated, cleared_effort, cleared_service_tier)
     }
 
     /// Record the user's reasoning-effort pick for this session.
     /// `None` clears it (back to "use model default"); `Some("off")`
     /// explicitly omits provider reasoning controls. Returns false
-    /// if the session is unknown. The session manifest still does not
-    /// persist this; the install-wide preference file is updated
-    /// separately so new sessions can inherit the last explicit pick.
+    /// if the session is unknown. This is an ACP session config option, so it
+    /// is intentionally not written to setup state or the workspace manifest.
     pub async fn set_reasoning_effort(&self, id: &str, effort: Option<String>) -> bool {
         let mut sessions = self.sessions.write().await;
         match sessions.get_mut(id) {
             Some(session) => {
                 session.selected_reasoning_effort = effort;
-                if let Err(e) =
-                    self.remember_last_reasoning_effort(session.selected_reasoning_effort.clone())
-                {
-                    tracing::warn!(
-                        session_id = %id,
-                        "failed to persist last reasoning preference: {e:#}"
-                    );
-                }
                 true
             }
             None => false,
@@ -5176,6 +4968,43 @@ mod tests {
     use super::*;
     use crate::setup_state::TestConfigHomeScope;
 
+    fn write_legacy_session_config_setup(config_dir: &Path) {
+        std::fs::create_dir_all(config_dir).expect("create config dir");
+        std::fs::write(
+            config_dir.join("setup.json"),
+            serde_json::json!({
+                "last_model": "model-b",
+                "last_reasoning_effort": "high",
+                "last_behavior_mode": "PLAN",
+                "last_permission_mode": "readOnly"
+            })
+            .to_string(),
+        )
+        .expect("write legacy setup state");
+    }
+
+    fn setup_state_json() -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(crate::setup_state::path().expect("setup path"))
+                .expect("read setup state"),
+        )
+        .expect("setup state json")
+    }
+
+    fn assert_no_legacy_session_config_keys(value: &serde_json::Value) {
+        for key in [
+            "last_model",
+            "last_reasoning_effort",
+            "last_behavior_mode",
+            "last_permission_mode",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "legacy session config key {key} must not be stored"
+            );
+        }
+    }
+
     /// Build an in-memory session that has NEVER been written to disk, then
     /// call `add_turn`. The append step must fail (because the zip file
     /// doesn't exist), and the in-memory state must be rolled back so
@@ -5221,51 +5050,47 @@ mod tests {
         );
     }
 
-    /// `set_mode` must roll back the in-memory mode change when the zip rewrite
-    /// fails, mirroring `add_turn`. Otherwise memory drifts away from disk and
-    /// the next reload silently downgrades the user's selection.
+    /// `set_mode` is live-only: the active session changes, but the persisted
+    /// manifest is left alone so reloads require the client to resend config.
     #[tokio::test]
-    async fn set_mode_rolls_back_on_persistence_failure() {
+    async fn set_mode_updates_live_session_only() {
         let store = SessionStore::new("test-model".to_string());
 
-        let id = "set-mode-rollback".to_string();
-        let cwd = std::env::temp_dir().join(format!("brokk-acp-rust-set-mode-{}", id));
-        let session = Session::new(id.clone(), cwd, "test-model".to_string(), "test".into());
-        let pre_mode = session.mode;
-        let pre_manifest_mode = session.manifest.mode.clone();
-        store.sessions.write().await.insert(id.clone(), session);
+        let cwd =
+            std::env::temp_dir().join(format!("brokk-acp-rust-set-mode-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd.clone()).await;
+        let id = session.id.clone();
+        let pre_manifest =
+            read_manifest_from_zip(&session_zip_path(&cwd, &id)).expect("manifest before update");
 
         let result = store.set_mode(&id, SessionMode::Plan).await;
-        assert!(
-            result.is_err(),
-            "set_mode should fail when the session zip doesn't exist on disk"
-        );
+        assert!(result);
 
         let sessions = store.sessions.read().await;
         let s = sessions.get(&id).expect("session still in memory");
-        assert_eq!(
-            s.mode, pre_mode,
-            "rollback should restore the previous in-memory mode"
-        );
-        assert_eq!(
-            s.manifest.mode, pre_manifest_mode,
-            "rollback should restore the previous manifest.mode"
-        );
+        assert_eq!(s.mode, SessionMode::Plan);
+        assert_eq!(s.manifest.mode, pre_manifest.mode);
+        drop(sessions);
+
+        let manifest =
+            read_manifest_from_zip(&session_zip_path(&cwd, &id)).expect("manifest after update");
+        assert_eq!(manifest.mode, pre_manifest.mode);
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// `set_mode` on an unknown session id is `Ok(false)` (no-op), distinct
-    /// from `Err`, so callers can return a precise "unknown session" error.
+    /// `set_mode` on an unknown session id is false (no-op), so callers can
+    /// return a precise "unknown session" error.
     #[tokio::test]
-    async fn set_mode_unknown_session_returns_ok_false() {
+    async fn set_mode_unknown_session_returns_false() {
         let store = SessionStore::new("test-model".to_string());
         let result = store.set_mode("no-such-session", SessionMode::Lutz).await;
-        assert!(matches!(result, Ok(false)));
+        assert!(!result);
     }
 
-    /// Changing behavior mode should update the per-install default for future
-    /// sessions, while existing sessions still reload their own manifest mode.
+    /// Changing behavior mode must not seed future sessions or cold reloads.
     #[tokio::test(flavor = "current_thread")]
-    async fn set_mode_seeds_future_sessions_without_overriding_existing_manifests() {
+    async fn set_mode_does_not_seed_future_sessions_or_cold_reloads() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("test-model".to_string());
@@ -5274,27 +5099,12 @@ mod tests {
         let first = store.create_session(first_cwd.path().to_path_buf()).await;
         assert_eq!(first.mode, SessionMode::Lutz);
 
-        store
-            .set_mode(&first.id, SessionMode::Plan)
-            .await
-            .expect("set_mode persists");
-        assert_eq!(
-            crate::setup_state::read().last_behavior_mode,
-            Some(SessionMode::Plan)
-        );
+        assert!(store.set_mode(&first.id, SessionMode::Plan).await);
+        assert!(!crate::setup_state::path().expect("setup path").exists());
 
         let next_cwd = tempfile::tempdir().expect("next cwd");
         let next = store.create_session(next_cwd.path().to_path_buf()).await;
-        assert_eq!(next.mode, SessionMode::Plan);
-
-        store
-            .set_mode(&next.id, SessionMode::Lutz)
-            .await
-            .expect("set_mode persists");
-        assert_eq!(
-            crate::setup_state::read().last_behavior_mode,
-            Some(SessionMode::Lutz)
-        );
+        assert_eq!(next.mode, SessionMode::Lutz);
 
         store.sessions.write().await.remove(&first.id);
         store.registries.write().await.remove(&first.id);
@@ -5304,13 +5114,9 @@ mod tests {
             .expect("session must reload from disk");
         assert_eq!(
             reloaded.mode,
-            SessionMode::Plan,
-            "manifest mode must win over the current install-level default"
+            SessionMode::Lutz,
+            "cold reload must not inherit the previous live config option"
         );
-
-        let third_cwd = tempfile::tempdir().expect("third cwd");
-        let third = store.create_session(third_cwd.path().to_path_buf()).await;
-        assert_eq!(third.mode, SessionMode::Lutz);
     }
 
     /// Sanity check that `add_turn` on an unknown session id is a no-op
@@ -5597,12 +5403,11 @@ mod tests {
         assert_eq!(err.loaded, "loaded-id");
     }
 
-    /// `set_model` should update the in-memory `Session.model` and
-    /// `manifest.model` so a subsequent reload from disk picks up the new
-    /// value. Persistence itself is exercised by `rewrite_manifest_in_zip`
-    /// (shared with `set_mode`); this test verifies wiring only.
+    /// `set_model` should update only the live `Session.model`; the manifest
+    /// remains the original session record so reloads require the client to
+    /// resend config.
     #[tokio::test]
-    async fn set_model_updates_session_and_manifest() {
+    async fn set_model_updates_live_session_only() {
         let store = SessionStore::new("initial-model".to_string());
 
         // Use a unique tmp cwd so concurrent test runs don't clobber.
@@ -5610,11 +5415,9 @@ mod tests {
             std::env::temp_dir().join(format!("brokk-acp-rust-set-model-{}", uuid::Uuid::new_v4()));
         let session = store.create_session(cwd).await;
         let id = session.id.clone();
+        let pre_manifest_model = session.manifest.model.clone();
 
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "next-model".to_string())
-            .await
-            .expect("set_model should persist");
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "next-model".to_string()).await;
         assert!(ok);
         assert!(
             cleared.is_none(),
@@ -5623,7 +5426,7 @@ mod tests {
         let sessions = store.sessions.read().await;
         let s = sessions.get(&id).expect("session still in memory");
         assert_eq!(s.model, "next-model");
-        assert_eq!(s.manifest.model.as_deref(), Some("next-model"));
+        assert_eq!(s.manifest.model, pre_manifest_model);
     }
 
     #[tokio::test]
@@ -5631,17 +5434,15 @@ mod tests {
         let store = SessionStore::new("initial-model".to_string());
         let (ok, cleared, _cleared_tier) = store
             .set_model("no-such-session", "next-model".into())
-            .await
-            .expect("unknown session should be a non-error no-op");
+            .await;
         assert!(!ok);
         assert!(cleared.is_none());
     }
 
-    /// `set_model` must roll back all in-memory mutations when the manifest
-    /// rewrite fails: the selected model, manifest model, and any reasoning
-    /// effort auto-clear must all return to their pre-call values.
+    /// `set_model` is live-only even when there is no session zip to rewrite.
+    /// Model-specific reasoning/service-tier cleanup still applies in memory.
     #[tokio::test]
-    async fn set_model_rolls_back_on_persistence_failure() {
+    async fn set_model_live_only_without_session_zip() {
         use crate::llm_client::ReasoningLevelPreset;
 
         let store = SessionStore::new("gpt-big".to_string());
@@ -5678,31 +5479,21 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("brokk-acp-rust-set-model-{id}"));
         let mut session = Session::new(id.clone(), cwd, "gpt-big".to_string(), "test".to_string());
         session.selected_reasoning_effort = Some("xhigh".to_string());
-        let pre_model = session.model.clone();
         let pre_manifest_model = session.manifest.model.clone();
-        let pre_reasoning_effort = session.selected_reasoning_effort.clone();
         store.sessions.write().await.insert(id.clone(), session);
 
-        let result = store.set_model(&id, "gpt-mini".to_string()).await;
-        assert!(
-            result.is_err(),
-            "set_model should fail when the session zip doesn't exist on disk"
-        );
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "gpt-mini".to_string()).await;
+        assert!(ok);
+        assert_eq!(cleared.as_deref(), Some("xhigh"));
 
         let sessions = store.sessions.read().await;
         let s = sessions.get(&id).expect("session still in memory");
-        assert_eq!(
-            s.model, pre_model,
-            "rollback should restore the previous in-memory model"
-        );
+        assert_eq!(s.model, "gpt-mini");
         assert_eq!(
             s.manifest.model, pre_manifest_model,
-            "rollback should restore the previous manifest model"
+            "manifest must remain unchanged by live model config"
         );
-        assert_eq!(
-            s.selected_reasoning_effort, pre_reasoning_effort,
-            "rollback should undo reasoning-effort auto-clear"
-        );
+        assert_eq!(s.selected_reasoning_effort, None);
     }
 
     /// `SessionMode::parse` round-trips every variant via its wire id, with
@@ -5777,8 +5568,8 @@ mod tests {
 
         let manifest = read_manifest_from_zip(&zip_path).expect("manifest must round-trip");
         assert_eq!(manifest.id, session.id);
-        assert_eq!(manifest.mode.as_deref(), Some("LUTZ"));
-        assert_eq!(manifest.model.as_deref(), Some("initial-model"));
+        assert_eq!(manifest.mode, None);
+        assert_eq!(manifest.model, None);
         assert!(manifest.title().is_none(), "new sessions start untitled");
         assert!(
             manifest.updated_at().is_some(),
@@ -5859,19 +5650,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A persisted install-level preference should seed the next new session
-    /// with both the last model and the last supported reasoning effort.
+    /// Legacy setup files may still contain ACP config-option fields from
+    /// older builds, but new sessions must ignore them. The client is the
+    /// source of truth and must resend model/reasoning choices.
     #[tokio::test(flavor = "current_thread")]
-    async fn create_session_reuses_persisted_model_and_reasoning_effort() {
+    async fn create_session_ignores_legacy_persisted_model_and_reasoning_effort() {
         use crate::llm_client::ReasoningLevelPreset;
 
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        crate::setup_state::remember_last_selection(
-            Some("model-b".to_string()),
-            Some("high".to_string()),
-        )
-        .expect("persist preferences");
+        write_legacy_session_config_setup(config_dir.path());
 
         let store = SessionStore::new("model-a".to_string());
         store
@@ -5911,131 +5699,12 @@ mod tests {
                     pricing: None,
                 },
             ])
-            .await;
-        let cwd = tempfile::tempdir().expect("cwd");
-        let session = store.create_session(cwd.path().to_path_buf()).await;
-
-        assert_eq!(session.model, "model-b");
-        assert_eq!(session.selected_reasoning_effort.as_deref(), Some("high"));
-        let snap = store
-            .snapshot(&session.id, cwd.path())
-            .await
-            .expect("session still loadable");
-        assert_eq!(snap.reasoning_effort.as_deref(), Some("high"));
-    }
-
-    /// If the saved model disappeared from the catalog, new sessions should
-    /// fall back to the current default/preferred model rather than failing.
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_session_falls_back_to_default_model_when_persisted_model_is_missing() {
-        use crate::llm_client::ReasoningLevelPreset;
-
-        let config_dir = tempfile::tempdir().expect("config dir");
-        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        crate::setup_state::remember_last_selection(
-            Some("ghost-model".to_string()),
-            Some("high".to_string()),
-        )
-        .expect("persist preferences");
-
-        let store = SessionStore::new("model-a".to_string());
-        store
-            .set_available_models(vec![ModelMetadata {
-                id: "model-a".to_string(),
-                default_reasoning_level: Some("medium".to_string()),
-                supported_reasoning_levels: vec![
-                    ReasoningLevelPreset {
-                        effort: "low".to_string(),
-                        description: "".to_string(),
-                    },
-                    ReasoningLevelPreset {
-                        effort: "medium".to_string(),
-                        description: "".to_string(),
-                    },
-                    ReasoningLevelPreset {
-                        effort: "high".to_string(),
-                        description: "".to_string(),
-                    },
-                ],
-                service_tiers: Vec::new(),
-                supports_images: None,
-                context_length: None,
-                pricing: None,
-            }])
             .await;
         let cwd = tempfile::tempdir().expect("cwd");
         let session = store.create_session(cwd.path().to_path_buf()).await;
 
         assert_eq!(session.model, "model-a");
-        assert_eq!(session.selected_reasoning_effort.as_deref(), Some("high"));
-        let snap = store
-            .snapshot(&session.id, cwd.path())
-            .await
-            .expect("session still loadable");
-        assert_eq!(snap.reasoning_effort.as_deref(), Some("high"));
-    }
-
-    /// Unsupported saved reasoning should fall back to the chosen model's
-    /// default reasoning level on the first prompt.
-    #[tokio::test(flavor = "current_thread")]
-    async fn create_session_falls_back_to_model_default_when_reasoning_is_unsupported() {
-        use crate::llm_client::ReasoningLevelPreset;
-
-        let config_dir = tempfile::tempdir().expect("config dir");
-        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        crate::setup_state::remember_last_selection(
-            Some("model-b".to_string()),
-            Some("xhigh".to_string()),
-        )
-        .expect("persist preferences");
-
-        let store = SessionStore::new("model-a".to_string());
-        store
-            .set_available_models(vec![
-                ModelMetadata {
-                    id: "model-a".to_string(),
-                    default_reasoning_level: Some("medium".to_string()),
-                    supported_reasoning_levels: vec![ReasoningLevelPreset {
-                        effort: "medium".to_string(),
-                        description: "".to_string(),
-                    }],
-                    service_tiers: Vec::new(),
-                    supports_images: None,
-                    context_length: None,
-                    pricing: None,
-                },
-                ModelMetadata {
-                    id: "model-b".to_string(),
-                    default_reasoning_level: Some("medium".to_string()),
-                    supported_reasoning_levels: vec![
-                        ReasoningLevelPreset {
-                            effort: "low".to_string(),
-                            description: "".to_string(),
-                        },
-                        ReasoningLevelPreset {
-                            effort: "medium".to_string(),
-                            description: "".to_string(),
-                        },
-                        ReasoningLevelPreset {
-                            effort: "high".to_string(),
-                            description: "".to_string(),
-                        },
-                    ],
-                    service_tiers: Vec::new(),
-                    supports_images: None,
-                    context_length: None,
-                    pricing: None,
-                },
-            ])
-            .await;
-        let cwd = tempfile::tempdir().expect("cwd");
-        let session = store.create_session(cwd.path().to_path_buf()).await;
-
-        assert_eq!(session.model, "model-b");
-        assert!(
-            session.selected_reasoning_effort.is_none(),
-            "unsupported reasoning should not be seeded explicitly"
-        );
+        assert_eq!(session.selected_reasoning_effort, None);
         let snap = store
             .snapshot(&session.id, cwd.path())
             .await
@@ -6065,44 +5734,43 @@ mod tests {
         );
     }
 
-    /// A persisted install-level permission preference should seed the next
-    /// new session, but still come from trusted setup state rather than the
-    /// workspace session zip.
+    /// Legacy setup files may still contain a permission mode from older
+    /// builds, but new sessions must start from the server default until the
+    /// client sends a fresh config value.
     #[tokio::test(flavor = "current_thread")]
-    async fn create_session_reuses_persisted_permission_mode() {
+    async fn create_session_ignores_legacy_persisted_permission_mode() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        crate::setup_state::remember_last_permission_mode(PermissionMode::ReadOnly)
-            .expect("persist permission preference");
+        write_legacy_session_config_setup(config_dir.path());
 
         let store = SessionStore::new("model-a".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let session = store.create_session(cwd.path().to_path_buf()).await;
 
-        assert_eq!(session.permission_mode, PermissionMode::ReadOnly);
+        assert_eq!(session.permission_mode, PermissionMode::Auto);
         assert_eq!(
             store.permission_mode(&session.id).await,
-            Some(PermissionMode::ReadOnly)
+            Some(PermissionMode::Auto)
         );
     }
 
-    /// A persisted install-level behavior-mode preference should seed the next
-    /// new session and be written into that session's manifest.
+    /// Legacy setup files may still contain a behavior mode from older builds,
+    /// but new sessions must start from the server default until the client
+    /// sends a fresh config value.
     #[tokio::test(flavor = "current_thread")]
-    async fn create_session_reuses_persisted_behavior_mode() {
+    async fn create_session_ignores_legacy_persisted_behavior_mode() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        crate::setup_state::remember_last_behavior_mode(SessionMode::Plan)
-            .expect("persist behavior mode preference");
+        write_legacy_session_config_setup(config_dir.path());
 
         let store = SessionStore::new("model-a".to_string());
         let cwd = tempfile::tempdir().expect("cwd");
         let session = store.create_session(cwd.path().to_path_buf()).await;
 
-        assert_eq!(session.mode, SessionMode::Plan);
+        assert_eq!(session.mode, SessionMode::Lutz);
         let manifest = read_manifest_from_zip(&session_zip_path(cwd.path(), &session.id))
             .expect("manifest must round-trip");
-        assert_eq!(manifest.mode.as_deref(), Some("PLAN"));
+        assert_eq!(manifest.mode, None);
     }
 
     /// `get_session` for an unknown id (with no on-disk zip either) must
@@ -6119,9 +5787,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// Cold path: a session that's been evicted from memory must reload
-    /// from its on-disk zip on the next `get_session`. Mode and model
-    /// survive the round-trip via the manifest.
+    /// Cold path: a session that's been evicted from memory must reload from
+    /// its on-disk zip on the next `get_session`. Live ACP config-option
+    /// changes are not persisted, so they reset on reload.
     #[tokio::test]
     async fn get_session_loads_from_disk_when_cold() {
         let store = SessionStore::new("m".to_string());
@@ -6129,12 +5797,18 @@ mod tests {
             std::env::temp_dir().join(format!("brokk-acp-rust-cold-{}", uuid::Uuid::new_v4()));
         let created = store.create_session(cwd.clone()).await;
         let id = created.id.clone();
+        let zip_path = session_zip_path(&cwd, &id);
 
-        // Persist a non-default mode so we can verify it survives the reload.
-        store
-            .set_mode(&id, SessionMode::Plan)
-            .await
-            .expect("set_mode persists");
+        let mut legacy_manifest =
+            read_manifest_from_zip(&zip_path).expect("created session manifest");
+        legacy_manifest.mode = Some("PLAN".to_string());
+        legacy_manifest.model = Some("legacy-model".to_string());
+        rewrite_manifest_in_zip(&zip_path, &legacy_manifest).expect("seed legacy config fields");
+
+        // Change live config options; the on-disk zip is unaffected.
+        assert!(store.set_mode(&id, SessionMode::Plan).await);
+        let (ok, _, _) = store.set_model(&id, "live-model".to_string()).await;
+        assert!(ok);
 
         // Evict from memory; the on-disk zip is unaffected.
         store.sessions.write().await.remove(&id);
@@ -6145,7 +5819,8 @@ mod tests {
             .await
             .expect("session must reload from disk");
         assert_eq!(reloaded.id, id);
-        assert_eq!(reloaded.mode, SessionMode::Plan);
+        assert_eq!(reloaded.mode, SessionMode::Lutz);
+        assert_eq!(reloaded.model, "m");
         assert_eq!(reloaded.permission_mode, PermissionMode::default());
         assert!(reloaded.sandbox_mode.is_none());
         assert!(reloaded.always_allow_tools.is_empty());
@@ -6264,28 +5939,20 @@ mod tests {
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
     }
 
-    /// Transient setup mode keeps model/reasoning/behavior/permission/sandbox choices
-    /// process-local: they seed later sessions and cold reloads in this
-    /// `SessionStore`, but the on-disk setup file is neither read nor written
-    /// for those preferences.
+    /// Transient setup mode still keeps setup-owned choices process-local, but
+    /// ACP session config options remain live-only and do not seed later
+    /// sessions or cold reloads.
     #[tokio::test(flavor = "current_thread")]
-    async fn transient_setup_keeps_session_config_preferences_in_memory_only() {
+    async fn transient_setup_does_not_persist_session_config_options() {
         use crate::llm_client::ReasoningLevelPreset;
         use crate::sandbox_backend::SandboxMode;
 
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
-        crate::setup_state::remember_last_selection(
-            Some("persisted-model".to_string()),
-            Some("high".to_string()),
-        )
-        .expect("seed persistent model preference");
-        crate::setup_state::remember_last_behavior_mode(SessionMode::Plan)
-            .expect("seed persistent behavior preference");
+        write_legacy_session_config_setup(config_dir.path());
         crate::setup_state::remember_sandbox_mode(Some(SandboxMode::Wasm))
             .expect("seed persistent sandbox preference");
-        crate::setup_state::remember_last_permission_mode(PermissionMode::ReadOnly)
-            .expect("seed persistent permission preference");
+        assert_no_legacy_session_config_keys(&setup_state_json());
 
         let store = SessionStore::with_limits_and_transient_setup(
             "default-model".to_string(),
@@ -6354,19 +6021,9 @@ mod tests {
                 .set_sandbox_mode(&first.id, Some(SandboxMode::Off))
                 .await
         );
-        store
-            .set_mode(&first.id, SessionMode::Lutz)
-            .await
-            .expect("set_mode should persist");
-        assert_eq!(
-            crate::setup_state::read().last_behavior_mode,
-            Some(SessionMode::Plan),
-            "transient choices must not overwrite setup.json behavior preference"
-        );
-        store
-            .set_mode(&first.id, SessionMode::Plan)
-            .await
-            .expect("set_mode should persist");
+        assert!(store.set_mode(&first.id, SessionMode::Lutz).await);
+        assert_no_legacy_session_config_keys(&setup_state_json());
+        assert!(store.set_mode(&first.id, SessionMode::Plan).await);
         assert!(
             store
                 .set_permission_mode(&first.id, PermissionMode::AcceptEdits)
@@ -6374,8 +6031,7 @@ mod tests {
         );
         let (ok, cleared, _cleared_tier) = store
             .set_model(&first.id, "runtime-model".to_string())
-            .await
-            .expect("set_model should persist");
+            .await;
         assert!(ok);
         assert!(cleared.is_none());
         assert!(
@@ -6386,31 +6042,18 @@ mod tests {
 
         let next_cwd = tempfile::tempdir().expect("next cwd");
         let next = store.create_session(next_cwd.path().to_path_buf()).await;
-        assert_eq!(next.model, "runtime-model");
-        assert_eq!(next.selected_reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(next.mode, SessionMode::Plan);
+        assert_eq!(next.model, "default-model");
+        assert_eq!(next.selected_reasoning_effort, None);
+        assert_eq!(next.mode, SessionMode::Lutz);
         assert_eq!(next.sandbox_mode, Some(SandboxMode::Off));
-        assert_eq!(next.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(next.permission_mode, PermissionMode::Auto);
 
-        assert_eq!(
-            crate::setup_state::read().last_model.as_deref(),
-            Some("persisted-model"),
-            "transient choices must not overwrite setup.json model preference"
-        );
-        assert_eq!(
-            crate::setup_state::read().last_behavior_mode,
-            Some(SessionMode::Plan),
-            "transient choices must not overwrite setup.json behavior preference"
-        );
+        let setup_json = setup_state_json();
+        assert_no_legacy_session_config_keys(&setup_json);
         assert_eq!(
             crate::setup_state::read().last_sandbox_mode,
             Some(SandboxMode::Wasm),
             "transient choices must not overwrite setup.json sandbox preference"
-        );
-        assert_eq!(
-            crate::setup_state::read().last_permission_mode,
-            Some(PermissionMode::ReadOnly),
-            "transient choices must not overwrite setup.json permission preference"
         );
 
         store.sessions.write().await.remove(&first.id);
@@ -6419,9 +6062,11 @@ mod tests {
             .get_session(&first.id, cwd.path())
             .await
             .expect("session must reload from disk");
-        assert_eq!(reloaded.mode, SessionMode::Plan);
+        assert_eq!(reloaded.mode, SessionMode::Lutz);
         assert_eq!(reloaded.sandbox_mode, Some(SandboxMode::Off));
-        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(reloaded.permission_mode, PermissionMode::Auto);
+        assert_eq!(reloaded.model, "default-model");
+        assert_eq!(reloaded.selected_reasoning_effort, None);
     }
 
     /// Existing sessions should pick up sandbox changes written by another
@@ -6484,11 +6129,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    /// Permission mode is not trusted from the workspace session zip, but the
-    /// last explicit user choice should seed future sessions and cold reloads
-    /// through trusted setup state.
+    /// Permission mode is live-only: it updates the active session but must
+    /// not seed future sessions or cold reloads.
     #[tokio::test(flavor = "current_thread")]
-    async fn permission_mode_setter_seeds_future_sessions_and_cold_reloads() {
+    async fn permission_mode_setter_does_not_seed_future_sessions_or_cold_reloads() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
@@ -6503,14 +6147,11 @@ mod tests {
                 .set_permission_mode(&id, PermissionMode::AcceptEdits)
                 .await
         );
-        assert_eq!(
-            crate::setup_state::read().last_permission_mode,
-            Some(PermissionMode::AcceptEdits)
-        );
+        assert!(!crate::setup_state::path().expect("setup path").exists());
 
         let next_cwd = tempfile::tempdir().expect("next cwd");
         let next = store.create_session(next_cwd.path().to_path_buf()).await;
-        assert_eq!(next.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(next.permission_mode, PermissionMode::Auto);
 
         store.sessions.write().await.remove(&id);
         store.registries.write().await.remove(&id);
@@ -6519,7 +6160,7 @@ mod tests {
             .get_session(&id, cwd.path())
             .await
             .expect("session must reload from disk");
-        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(reloaded.permission_mode, PermissionMode::Auto);
     }
 
     /// Unknown sessions should be a no-op and must not update the trusted
@@ -6535,15 +6176,13 @@ mod tests {
                 .set_permission_mode("no-such", PermissionMode::ReadOnly)
                 .await
         );
-        assert_eq!(crate::setup_state::read().last_permission_mode, None);
+        assert!(!crate::setup_state::path().expect("setup path").exists());
     }
 
-    /// Selecting `BypassPermissions` updates the live session but must never be
-    /// persisted as the install-level preference: the fully-trusting mode
-    /// requires a fresh opt-in each session. Other modes still persist, and a
-    /// bypass selection must not clobber an existing non-bypass preference.
+    /// Selecting any permission mode updates only the live session and must
+    /// never be persisted as the install-level preference.
     #[tokio::test(flavor = "current_thread")]
-    async fn set_permission_mode_does_not_persist_bypass() {
+    async fn set_permission_mode_never_persists_to_setup_state() {
         let config_dir = tempfile::tempdir().expect("config dir");
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         let store = SessionStore::new("m".to_string());
@@ -6552,8 +6191,7 @@ mod tests {
         let first = store.create_session(cwd.path().to_path_buf()).await;
         let id = first.id.clone();
 
-        // Bypass with no prior preference: the live session changes, but the
-        // trusted setup state stays empty.
+        // Bypass changes only the live session.
         assert!(
             store
                 .set_permission_mode(&id, PermissionMode::BypassPermissions)
@@ -6563,45 +6201,36 @@ mod tests {
             store.permission_mode(&id).await,
             Some(PermissionMode::BypassPermissions)
         );
-        assert_eq!(crate::setup_state::read().last_permission_mode, None);
+        assert!(!crate::setup_state::path().expect("setup path").exists());
 
-        // A fresh session falls back to the safe default, never bypass.
+        // A fresh session falls back to the safe default, never bypass or the
+        // legacy setup value.
         let next_cwd = tempfile::tempdir().expect("next cwd");
         let next = store.create_session(next_cwd.path().to_path_buf()).await;
         assert_eq!(next.permission_mode, PermissionMode::Auto);
 
-        // A non-bypass mode still persists ...
         assert!(
             store
                 .set_permission_mode(&id, PermissionMode::AcceptEdits)
                 .await
         );
-        assert_eq!(
-            crate::setup_state::read().last_permission_mode,
-            Some(PermissionMode::AcceptEdits)
-        );
+        assert!(!crate::setup_state::path().expect("setup path").exists());
 
-        // ... and a later bypass must not overwrite it.
         assert!(
             store
                 .set_permission_mode(&id, PermissionMode::BypassPermissions)
                 .await
         );
-        assert_eq!(
-            crate::setup_state::read().last_permission_mode,
-            Some(PermissionMode::AcceptEdits),
-            "bypass must not overwrite the persisted preference"
-        );
+        assert!(!crate::setup_state::path().expect("setup path").exists());
 
-        // A cold reload of the bypass session falls back to the last persisted
-        // non-bypass mode, never bypass.
+        // A cold reload falls back to the server default.
         store.sessions.write().await.remove(&id);
         store.registries.write().await.remove(&id);
         let reloaded = store
             .get_session(&id, cwd.path())
             .await
             .expect("session must reload from disk");
-        assert_eq!(reloaded.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(reloaded.permission_mode, PermissionMode::Auto);
     }
 
     /// Remembered approvals persist per repo and survive new sessions in that repo.
@@ -7080,6 +6709,9 @@ mod tests {
         let source = store.create_session(cwd.path().to_path_buf()).await;
         let src_id = source.id.clone();
         assert!(store.set_turn_recap_enabled(&src_id, false).await);
+        assert!(store.set_mode(&src_id, SessionMode::Plan).await);
+        let (ok, _, _) = store.set_model(&src_id, "source-model".to_string()).await;
+        assert!(ok);
         assert!(
             store
                 .set_service_tier(&src_id, Some("priority".to_string()))
@@ -7110,10 +6742,12 @@ mod tests {
         assert_eq!(forked.history.len(), 1, "fork copies the source history");
         assert_eq!(forked.history[0].user_prompt, "u1");
         assert!(!forked.turn_recap_enabled, "fork inherits recap preference");
+        assert_eq!(forked.mode, SessionMode::Lutz, "fork resets behavior mode");
+        assert_eq!(forked.model, "m", "fork resets model selection");
         assert_eq!(
             forked.selected_service_tier.as_deref(),
-            Some("priority"),
-            "fork inherits the source service-tier pick"
+            None,
+            "fork resets client-owned service-tier config"
         );
         assert!(
             session_zip_path(cwd.path(), &fork_id).exists(),
@@ -7151,8 +6785,8 @@ mod tests {
         );
         assert_eq!(
             fork_after.selected_service_tier.as_deref(),
-            Some("priority"),
-            "fork keeps inherited service-tier preference"
+            None,
+            "fork keeps service-tier config reset"
         );
         assert_eq!(
             fork_after.history.len(),
@@ -7551,10 +7185,7 @@ mod tests {
         );
 
         // Switch to gpt-mini, which doesn't advertise xhigh.
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "gpt-mini".to_string())
-            .await
-            .expect("set_model should persist");
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "gpt-mini".to_string()).await;
         assert!(ok);
         assert_eq!(cleared.as_deref(), Some("xhigh"));
 
@@ -7606,10 +7237,8 @@ mod tests {
                 .await
         );
 
-        let (ok, _cleared_reasoning, cleared_tier) = store
-            .set_model(&id, "plain-model".to_string())
-            .await
-            .expect("set_model should persist");
+        let (ok, _cleared_reasoning, cleared_tier) =
+            store.set_model(&id, "plain-model".to_string()).await;
         assert!(ok);
         assert_eq!(cleared_tier.as_deref(), Some("priority"));
         let snap = store
@@ -7763,10 +7392,7 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "plain-model".to_string())
-            .await
-            .expect("set_model should persist");
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "plain-model".to_string()).await;
         assert!(ok);
         assert!(cleared.is_none(), "off is not a provider effort to clear");
         let session = store
@@ -7845,10 +7471,7 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "gpt-b".to_string())
-            .await
-            .expect("set_model should persist");
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "gpt-b".to_string()).await;
         assert!(ok);
         assert!(cleared.is_none(), "high is still supported by gpt-b");
         let snap = store

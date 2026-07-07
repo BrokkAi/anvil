@@ -113,9 +113,8 @@ use crate::terminal_notifications::{
     TerminalNotificationEvent, emit as emit_terminal_notification,
 };
 
-/// Stable ids for ACP `SessionConfigOption` selectors. Keep this surface
-/// limited to client-visible, session-scoped controls; install/setup
-/// preferences belong in `/setup` and `SetupState`, not ACP configOptions.
+/// Stable ids for ACP `SessionConfigOption` selectors. These are live
+/// session inputs from the client, not Anvil setup preferences.
 const PERMISSION_CONFIG_ID: &str = "permission_mode";
 const BEHAVIOR_CONFIG_ID: &str = "behavior_mode";
 const SUPPORTED_ACP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
@@ -615,9 +614,7 @@ fn all_config_options(
     opts
 }
 
-/// Wire ids accepted by `apply_config_option`. Kept in a single slice so
-/// the ACP `setSessionConfigOption` request handler and `/setup advanced`
-/// report identical supported-key lists.
+/// Wire ids accepted by `apply_config_option`.
 const CONFIGURE_KNOWN_KEYS: &[&str] = &[
     BEHAVIOR_CONFIG_ID,
     PERMISSION_CONFIG_ID,
@@ -652,9 +649,6 @@ enum ConfigApplyError {
         supported: Vec<String>,
     },
     UnknownSession,
-    PersistFailed {
-        details: String,
-    },
 }
 
 impl ConfigApplyError {
@@ -672,9 +666,6 @@ impl ConfigApplyError {
                 }
             }
             ConfigApplyError::UnknownSession => "unknown session".to_string(),
-            ConfigApplyError::PersistFailed { details } => {
-                format!("failed to persist setting: {details}")
-            }
         }
     }
 }
@@ -789,14 +780,8 @@ async fn apply_config_option(
                     supported: vec!["LUTZ".to_string(), "PLAN".to_string()],
                 });
             };
-            match sessions.set_mode(session_id, behavior_mode).await {
-                Ok(true) => {}
-                Ok(false) => return Err(ConfigApplyError::UnknownSession),
-                Err(e) => {
-                    return Err(ConfigApplyError::PersistFailed {
-                        details: format!("{e:#}"),
-                    });
-                }
+            if !sessions.set_mode(session_id, behavior_mode).await {
+                return Err(ConfigApplyError::UnknownSession);
             }
         }
         MODEL_CONFIG_ID => {
@@ -818,16 +803,11 @@ async fn apply_config_option(
                 });
             }
             match sessions.set_model(session_id, value.to_string()).await {
-                Ok((true, cleared, cleared_tier)) => {
+                (true, cleared, cleared_tier) => {
                     cleared_reasoning = cleared;
                     cleared_service_tier = cleared_tier;
                 }
-                Ok((false, _, _)) => return Err(ConfigApplyError::UnknownSession),
-                Err(e) => {
-                    return Err(ConfigApplyError::PersistFailed {
-                        details: format!("{e:#}"),
-                    });
-                }
+                (false, _, _) => return Err(ConfigApplyError::UnknownSession),
             }
         }
         REASONING_EFFORT_CONFIG_ID => {
@@ -3335,8 +3315,7 @@ pub async fn run_agent(
                     );
                 };
 
-                match sessions_mode.set_mode(&session_id, mode).await {
-                    Ok(true) => {
+                if sessions_mode.set_mode(&session_id, mode).await {
                         // Config options supersede legacy modes, but Anvil
                         // exposes both. Keep clients on the config-options
                         // surface in sync by emitting a config_option_update
@@ -3356,18 +3335,12 @@ pub async fn run_agent(
                             }
                         }
                         responder.respond(SetSessionModeResponse::new())
-                    }
-                    Ok(false) => responder.respond_with_error(
+                } else {
+                    responder.respond_with_error(
                         agent_client_protocol::Error::invalid_params().data(serde_json::json!({
                             "reason": format!("unknown session '{session_id}'"),
                         })),
-                    ),
-                    Err(e) => responder.respond_with_error(
-                        agent_client_protocol::Error::internal_error().data(serde_json::json!({
-                            "reason": "failed to persist session mode",
-                            "details": format!("{e:#}"),
-                        })),
-                    ),
+                    )
                 }
             },
             on_receive_request!(),
@@ -3423,16 +3396,6 @@ pub async fn run_agent(
                             agent_client_protocol::Error::invalid_params().data(
                                 serde_json::json!({
                                     "reason": format!("unknown session '{session_id}'"),
-                                }),
-                            ),
-                        );
-                    }
-                    Err(ConfigApplyError::PersistFailed { details }) => {
-                        return responder.respond_with_error(
-                            agent_client_protocol::Error::internal_error().data(
-                                serde_json::json!({
-                                    "reason": "failed to persist session mode",
-                                    "details": details,
                                 }),
                             ),
                         );
@@ -14015,27 +13978,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_config_option_reports_model_persistence_failure() {
+    async fn apply_config_option_model_is_live_only_without_session_zip() {
         let (store, id, cwd) = make_store_with_session_and_cwd("initial").await;
         std::fs::remove_dir_all(&cwd).expect("remove persisted session zip parent");
 
-        let err = apply_config_option(&store, &id, MODEL_CONFIG_ID, "custom/model")
+        apply_config_option(&store, &id, MODEL_CONFIG_ID, "custom/model")
             .await
-            .expect_err("missing session zip should surface as persistence failure");
+            .expect("model config is live-only and should not need the zip");
 
-        match err {
-            ConfigApplyError::PersistFailed { details } => {
-                let lower = details.to_lowercase();
-                assert!(
-                    lower.contains("cannot resolve")
-                        || lower.contains("failed")
-                        || lower.contains("no such file")
-                        || lower.contains("file not found"),
-                    "unexpected persistence details: {details}"
-                );
-            }
-            other => panic!("expected PersistFailed, got {other:?}"),
-        }
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(snap.model, "custom/model");
     }
 
     #[tokio::test]
