@@ -3,10 +3,11 @@
 //! This is intentionally not the source of truth for whether models work.
 //! Model readiness is re-derived from the live session/catalog every time.
 //! The file only records whether the user has already seen the first-run
-//! setup screen and the last selected
-//! model/reasoning effort/behavior/permission/sandbox plus the `/setup recap`
+//! setup screen and the last selected sandbox plus the `/setup recap`
 //! preference so configured installs get a short hint instead of the full
-//! welcome on every new session. It also stores
+//! welcome on every new session. ACP session config options such as model,
+//! reasoning effort, behavior mode, and permission mode are intentionally not
+//! stored here; clients must send them for each session. It also stores
 //! user-configured MCP servers; when that field is absent, Anvil seeds the
 //! config with its preinstalled servers.
 
@@ -19,22 +20,6 @@ use std::sync::Mutex;
 pub struct SetupState {
     #[serde(default)]
     pub first_run_seen: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_reasoning_effort: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_optional"
-    )]
-    pub last_behavior_mode: Option<crate::session::SessionMode>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_lenient_optional"
-    )]
-    pub last_permission_mode: Option<crate::session::PermissionMode>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -144,18 +129,6 @@ pub fn mark_first_run_seen() -> Result<()> {
     update(|state| state.first_run_seen = true)
 }
 
-pub fn remember_last_reasoning_effort(reasoning_effort: Option<String>) -> Result<()> {
-    update(|state| state.last_reasoning_effort = reasoning_effort)
-}
-
-pub fn remember_last_permission_mode(mode: crate::session::PermissionMode) -> Result<()> {
-    update(|state| state.last_permission_mode = Some(mode))
-}
-
-pub fn remember_last_behavior_mode(mode: crate::session::SessionMode) -> Result<()> {
-    update(|state| state.last_behavior_mode = Some(mode))
-}
-
 pub fn remember_sandbox_mode(mode: Option<crate::sandbox_backend::SandboxMode>) -> Result<()> {
     update(|state| state.last_sandbox_mode = mode)
 }
@@ -180,16 +153,6 @@ pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
 
 pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
     update(|state| state.mcp_servers = Some(servers))
-}
-
-pub fn remember_last_selection(
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-) -> Result<()> {
-    update(|state| {
-        state.last_model = model;
-        state.last_reasoning_effort = reasoning_effort;
-    })
 }
 
 fn update(mutator: impl FnOnce(&mut SetupState)) -> Result<()> {
@@ -246,17 +209,14 @@ mod tests {
     /// An unrecognized value for one enum preference must degrade to `None`
     /// without discarding the rest of the setup state. Before the lenient
     /// deserializer, a single unknown enum value failed the whole-struct parse,
-    /// and `read_inner`'s `unwrap_or_default()` then wiped `last_model`,
-    /// the other enum preference, and the user's MCP server list.
+    /// and `read_inner`'s `unwrap_or_default()` then wiped sibling setup
+    /// preferences and the user's MCP server list.
     #[test]
     fn unknown_enum_value_degrades_to_none_and_preserves_siblings() {
         use crate::sandbox_backend::SandboxMode;
-        use crate::session::{PermissionMode, SessionMode};
 
         let state = SetupState {
-            last_model: Some("keep-me".to_string()),
-            last_behavior_mode: Some(SessionMode::Plan),
-            last_permission_mode: Some(PermissionMode::AcceptEdits),
+            first_run_seen: true,
             last_sandbox_mode: Some(SandboxMode::Wasm),
             mcp_servers: Some(vec![crate::mcp::McpServerConfig {
                 name: "bifrost".to_string(),
@@ -269,45 +229,55 @@ mod tests {
             ..SetupState::default()
         };
 
-        // Corrupt only the permission mode with a value this build cannot parse.
-        let mut json = serde_json::to_value(&state).expect("serialize setup state");
-        json["last_permission_mode"] = serde_json::Value::String("plan".to_string());
-        let parsed: SetupState =
-            serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
-        assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
-        assert_eq!(parsed.last_behavior_mode, Some(SessionMode::Plan));
-        assert_eq!(parsed.last_permission_mode, None);
-        assert_eq!(parsed.last_sandbox_mode, Some(SandboxMode::Wasm));
-        assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
-
-        // Behavior mode is also lenient because it is a persisted enum
-        // preference written by newer builds.
-        let mut json = serde_json::to_value(&state).expect("serialize setup state");
-        json["last_behavior_mode"] = serde_json::Value::String("CODE".to_string());
-        let parsed: SetupState =
-            serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
-        assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
-        assert_eq!(parsed.last_behavior_mode, None);
-        assert_eq!(
-            parsed.last_permission_mode,
-            Some(PermissionMode::AcceptEdits)
-        );
-        assert_eq!(parsed.last_sandbox_mode, Some(SandboxMode::Wasm));
-        assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
-
-        // The same tolerance applies to the sandbox-mode field.
         let mut json = serde_json::to_value(&state).expect("serialize setup state");
         json["last_sandbox_mode"] = serde_json::Value::String("quantum".to_string());
         let parsed: SetupState =
             serde_json::from_value(json).expect("unknown enum must not fail the whole struct");
-        assert_eq!(parsed.last_model.as_deref(), Some("keep-me"));
-        assert_eq!(parsed.last_behavior_mode, Some(SessionMode::Plan));
+        assert!(parsed.first_run_seen);
         assert_eq!(parsed.last_sandbox_mode, None);
-        assert_eq!(
-            parsed.last_permission_mode,
-            Some(PermissionMode::AcceptEdits)
-        );
         assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn legacy_session_config_keys_are_ignored_and_dropped_on_write() {
+        use crate::sandbox_backend::SandboxMode;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        std::fs::create_dir_all(config_dir.path()).expect("create config dir");
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({
+                "last_model": "model-b",
+                "last_reasoning_effort": "high",
+                "last_behavior_mode": "PLAN",
+                "last_permission_mode": "readOnly",
+                "last_sandbox_mode": "wasm"
+            })
+            .to_string(),
+        )
+        .expect("write legacy setup state");
+
+        assert_eq!(read().last_sandbox_mode, Some(SandboxMode::Wasm));
+        remember_turn_recap_enabled(true).expect("write setup state");
+
+        let rewritten: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path().expect("setup path")).expect("read setup"),
+        )
+        .expect("setup json");
+        for key in [
+            "last_model",
+            "last_reasoning_effort",
+            "last_behavior_mode",
+            "last_permission_mode",
+        ] {
+            assert!(
+                rewritten.get(key).is_none(),
+                "legacy session config key {key} must be dropped"
+            );
+        }
+        assert_eq!(rewritten["last_sandbox_mode"], "wasm");
+        assert_eq!(rewritten["turn_recap_enabled"], true);
     }
 
     #[test]
