@@ -4897,6 +4897,7 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
         crate::tool_loop::NotificationMode::Silent,
         0,
         Some(empty_tool_allowlist),
+        None,
     ))
     .catch_unwind()
     .await;
@@ -5114,6 +5115,7 @@ async fn run_model_turn_in_spawn(
         prompt_text_for_turn.clone(),
         crate::tool_loop::NotificationMode::Live,
         0,
+        None,
         None,
     ))
     .catch_unwind()
