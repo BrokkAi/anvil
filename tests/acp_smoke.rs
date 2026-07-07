@@ -160,6 +160,41 @@ fn planning_gate_direct_prompt_does_not_request_permission() {
 }
 
 #[test]
+fn p2t_replayed_prefix_tails_do_not_complete_without_llm_call() {
+    let assistant_step = json!({
+        "step": 1,
+        "assistant_text": "I inspected calc.py; add() concatenates strings. I will fix and finish.",
+        "tool_calls": [],
+        "results": []
+    });
+    let raw_user_step = json!({
+        "step": 2,
+        "assistant_text": "",
+        "tool_calls": [],
+        "results": [],
+        "messages": [{
+            "role": "user",
+            "content": "Still reproduces on my end. Could you take another look?"
+        }]
+    });
+
+    run_p2t_prefix_tail_case(
+        SmokeCase {
+            name: "p2t_prefix_assistant_tail",
+            prompt: "calc.py's add() mishandles string inputs; investigate and fix.".to_string(),
+        },
+        vec![assistant_step.clone()],
+    );
+    run_p2t_prefix_tail_case(
+        SmokeCase {
+            name: "p2t_prefix_raw_user_tail",
+            prompt: "calc.py's add() mishandles string inputs; investigate and fix.".to_string(),
+        },
+        vec![assistant_step, raw_user_step],
+    );
+}
+
+#[test]
 fn session_load_replays_tool_updates_in_order() {
     let case = SmokeCase {
         name: "session_load_tool_replay",
@@ -2475,6 +2510,135 @@ fn run_planning_gate_case(
     provider
 }
 
+fn run_p2t_prefix_tail_case(case: SmokeCase, prefix_steps: Vec<Value>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::write(cwd.join("calc.py"), "def add(a, b):\n    return a + b\n")
+        .expect("write calc.py");
+    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
+
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let config_home = temp.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    let bifrost_log = temp.path().join("bifrost-spawn.log");
+    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+
+    let p2t_dir = temp.path().join("p2t");
+    std::fs::create_dir_all(&p2t_dir).expect("create p2t dir");
+    let prefix_path = p2t_dir.join("prefix.jsonl");
+    let prefix_jsonl = prefix_steps
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&prefix_path, format!("{prefix_jsonl}\n")).expect("write prefix");
+    let step_trace_out = p2t_dir.join("steps.jsonl");
+    let p2t_config = p2t_dir.join("p2t.json");
+    std::fs::write(
+        &p2t_config,
+        json!({
+            "prefix_steps": prefix_path,
+            "forced_first_step": null,
+            "max_steps": 4,
+            "snapshot_dir": null,
+            "temperature": 0.7,
+            "step_trace_out": step_trace_out,
+            "link_base": null
+        })
+        .to_string(),
+    )
+    .expect("write p2t config");
+
+    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
+    let provider = start_openai_smoke_server(vec![text_sse_body("Continuing after prefix.")]);
+    let mut child = spawn_anvil_with_p2t(
+        &home,
+        &config_home,
+        &trace_path,
+        Some(provider.base_url.as_str()),
+        4,
+        &p2t_config,
+    );
+    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
+    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path);
+
+    let initialize = client.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false
+            }
+        }),
+    );
+    assert_response_ok(&case, "initialize", &initialize, &client);
+
+    let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert_response_ok(&case, "session/new", &new_session, &client);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
+        .to_string();
+
+    let prompt = client.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": case.prompt }]
+        }),
+    );
+    assert_response_ok(&case, "session/prompt", &prompt, &client);
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "{}: replayed P2T prefix should not satisfy the turn before the LLM call",
+        case.name
+    );
+    assert!(
+        prompt["result"]["usage"]["totalTokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "{}: prompt should include usage from the mock LLM call: {prompt}",
+        case.name
+    );
+
+    let records = read_jsonl_values(&step_trace_out);
+    assert!(
+        records
+            .iter()
+            .any(|record| record["type"].as_str() == Some("window_start")),
+        "{}: P2T trace missing window_start; records={records:?}",
+        case.name
+    );
+    let step_count = records
+        .iter()
+        .filter(|record| record["type"].as_str() == Some("step"))
+        .count();
+    assert!(
+        step_count > 0,
+        "{}: P2T trace should contain an executed step after replayed prefix; records={records:?}",
+        case.name
+    );
+    assert!(
+        !client.exited(),
+        "{}: anvil exited during P2T prefix-tail smoke test; stderr:\n{}\ntrace:\n{}",
+        case.name,
+        client.stderr_text(),
+        client.trace_text()
+    );
+
+    client.shutdown();
+    let _ = stdout_join.join();
+    let _ = stderr_join.join();
+}
+
 fn run_direct_prompt_case(case: &SmokeCase) -> (OpenAiSmokeServer, usize) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
@@ -2994,6 +3158,42 @@ fn spawn_anvil(
     ollama_base_url: Option<&str>,
     max_turns: usize,
 ) -> Child {
+    spawn_anvil_inner(
+        home,
+        config_home,
+        trace_path,
+        ollama_base_url,
+        max_turns,
+        None,
+    )
+}
+
+fn spawn_anvil_with_p2t(
+    home: &Path,
+    config_home: &Path,
+    trace_path: &Path,
+    ollama_base_url: Option<&str>,
+    max_turns: usize,
+    p2t_config: &Path,
+) -> Child {
+    spawn_anvil_inner(
+        home,
+        config_home,
+        trace_path,
+        ollama_base_url,
+        max_turns,
+        Some(p2t_config),
+    )
+}
+
+fn spawn_anvil_inner(
+    home: &Path,
+    config_home: &Path,
+    trace_path: &Path,
+    ollama_base_url: Option<&str>,
+    max_turns: usize,
+    p2t_config: Option<&Path>,
+) -> Child {
     let bin = std::env::var_os("CARGO_BIN_EXE_anvil")
         .map(PathBuf::from)
         .or_else(|| option_env!("CARGO_BIN_EXE_anvil").map(PathBuf::from))
@@ -3029,7 +3229,21 @@ fn spawn_anvil(
     if let Some(url) = ollama_base_url {
         command.env("ANVIL_TEST_OLLAMA_BASE_URL", url);
     }
+    if let Some(path) = p2t_config {
+        command
+            .env("BRK_PATCHES_TO_TRACES", "1")
+            .env("BRK_P2T_CONFIG", path);
+    }
     command.spawn().expect("spawn anvil")
+}
+
+fn read_jsonl_values(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse jsonl record"))
+        .collect()
 }
 
 struct OpenAiSmokeServer {

@@ -5332,10 +5332,13 @@ mod tests {
 
         // The user drives non-default config options over ACP; these live on the
         // in-memory session only now.
-        let (ok, _cleared, _cleared_tier) =
-            store.set_model(&id, "picked-model".to_string()).await;
+        let (ok, _cleared, _cleared_tier) = store.set_model(&id, "picked-model".to_string()).await;
         assert!(ok);
-        assert!(store.set_reasoning_effort(&id, Some("high".to_string())).await);
+        assert!(
+            store
+                .set_reasoning_effort(&id, Some("high".to_string()))
+                .await
+        );
         assert!(store.set_mode(&id, SessionMode::Plan).await);
         assert!(
             store
@@ -5381,11 +5384,7 @@ mod tests {
         // The snapshot is consumed on reload, so it cannot leak into any other
         // session or a later fresh reload.
         assert!(
-            !store
-                .evicted_session_config
-                .read()
-                .await
-                .contains_key(&id),
+            !store.evicted_session_config.read().await.contains_key(&id),
             "eviction snapshot must be consumed on cold reload"
         );
     }
@@ -5551,8 +5550,9 @@ mod tests {
     #[tokio::test]
     async fn set_model_returns_false_for_unknown_session() {
         let store = SessionStore::new("initial-model".to_string());
-        let (ok, cleared, _cleared_tier) =
-            store.set_model("no-such-session", "next-model".into()).await;
+        let (ok, cleared, _cleared_tier) = store
+            .set_model("no-such-session", "next-model".into())
+            .await;
         assert!(!ok);
         assert!(cleared.is_none());
     }
@@ -6018,8 +6018,9 @@ mod tests {
                 .set_permission_mode(&first.id, PermissionMode::AcceptEdits)
                 .await
         );
-        let (ok, cleared, _cleared_tier) =
-            store.set_model(&first.id, "runtime-model".to_string()).await;
+        let (ok, cleared, _cleared_tier) = store
+            .set_model(&first.id, "runtime-model".to_string())
+            .await;
         assert!(ok);
         assert!(cleared.is_none());
         assert!(
@@ -7151,9 +7152,7 @@ mod tests {
         );
 
         // Switch to gpt-mini, which doesn't advertise xhigh.
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "gpt-mini".to_string())
-            .await;
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "gpt-mini".to_string()).await;
         assert!(ok);
         assert_eq!(cleared.as_deref(), Some("xhigh"));
 
@@ -7205,9 +7204,8 @@ mod tests {
                 .await
         );
 
-        let (ok, _cleared_reasoning, cleared_tier) = store
-            .set_model(&id, "plain-model".to_string())
-            .await;
+        let (ok, _cleared_reasoning, cleared_tier) =
+            store.set_model(&id, "plain-model".to_string()).await;
         assert!(ok);
         assert_eq!(cleared_tier.as_deref(), Some("priority"));
         let snap = store
@@ -7361,9 +7359,7 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "plain-model".to_string())
-            .await;
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "plain-model".to_string()).await;
         assert!(ok);
         assert!(cleared.is_none(), "off is not a provider effort to clear");
         let session = store
@@ -7442,9 +7438,7 @@ mod tests {
                 .await
         );
 
-        let (ok, cleared, _cleared_tier) = store
-            .set_model(&id, "gpt-b".to_string())
-            .await;
+        let (ok, cleared, _cleared_tier) = store.set_model(&id, "gpt-b".to_string()).await;
         assert!(ok);
         assert!(cleared.is_none(), "high is still supported by gpt-b");
         let snap = store
