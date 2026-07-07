@@ -2789,6 +2789,23 @@ pub struct ClientElicitationCaps {
     pub url: bool,
 }
 
+/// Runtime config options captured when a session is evicted from memory by the
+/// LRU cap, so a transparent same-process cold reload can restore the session's
+/// picks instead of resetting them to server defaults.
+///
+/// The client cannot observe LRU eviction -- it issues no `session/load`, so it
+/// has no signal to re-apply these over ACP. Without this snapshot, an evicted
+/// session's next prompt would silently run on the default model/behavior mode.
+/// Permission mode is intentionally excluded: it stays at its default on reload
+/// (unchanged from the surrounding cold-reload contract).
+#[derive(Debug, Clone)]
+struct EvictedSessionConfig {
+    model: String,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    mode: SessionMode,
+}
+
 #[derive(Clone)]
 pub struct SessionStore {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
@@ -2835,6 +2852,12 @@ pub struct SessionStore {
     /// and must not require holding a tokio lock across `.await` points.
     last_accessed: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     next_access: Arc<AtomicU64>,
+    /// Runtime config options snapshotted at LRU eviction (see
+    /// [`EvictedSessionConfig`]). Consulted-and-consumed on the next cold
+    /// reload of the same id, and dropped on explicit close/delete. In-memory
+    /// only -- a process restart legitimately clears it, and the client
+    /// re-applies config on the explicit `session/load` that follows.
+    evicted_session_config: Arc<RwLock<HashMap<String, EvictedSessionConfig>>>,
     /// Elicitation capabilities advertised by the connected client at
     /// `initialize`. Process-global (a property of the client connection,
     /// not of any one session), mirroring `available_models`.
@@ -2941,6 +2964,7 @@ impl SessionStore {
             closed_sessions: Arc::new(RwLock::new(HashSet::new())),
             last_accessed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_access: Arc::new(AtomicU64::new(0)),
+            evicted_session_config: Arc::new(RwLock::new(HashMap::new())),
             client_elicitation_caps: Arc::new(RwLock::new(ClientElicitationCaps::default())),
             limits,
         }
@@ -3080,6 +3104,36 @@ impl SessionStore {
         };
         if to_evict.is_empty() {
             return;
+        }
+        // Snapshot each evicted session's client-owned config options before we
+        // drop its resident state, so the next transparent cold reload restores
+        // the user's picks instead of resetting to server defaults. Collect
+        // under the sessions read lock, then write the cache separately to avoid
+        // holding two locks at once.
+        let snapshots: Vec<(String, EvictedSessionConfig)> = {
+            let sessions = self.sessions.read().await;
+            to_evict
+                .iter()
+                .filter_map(|id| {
+                    sessions.get(id).map(|session| {
+                        (
+                            id.clone(),
+                            EvictedSessionConfig {
+                                model: session.model.clone(),
+                                reasoning_effort: session.selected_reasoning_effort.clone(),
+                                service_tier: session.selected_service_tier.clone(),
+                                mode: session.mode,
+                            },
+                        )
+                    })
+                })
+                .collect()
+        };
+        {
+            let mut cache = self.evicted_session_config.write().await;
+            for (id, cfg) in snapshots {
+                cache.insert(id, cfg);
+            }
         }
         self.remove_resident_sessions(&to_evict).await;
         tracing::info!(
@@ -3524,6 +3578,19 @@ impl SessionStore {
         session.permission_mode = permission_mode;
         session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
+        // Restore client-owned config options captured when this session was
+        // evicted from memory by the LRU cap. The client cannot observe that
+        // eviction, so it has no `session/load` to re-apply them -- without this
+        // the next prompt would silently run on the default model/behavior mode.
+        // Permission mode is deliberately left at its default. The entry is
+        // consumed so a later legitimate reset (process restart, explicit
+        // close/reload) starts fresh.
+        if let Some(cfg) = self.evicted_session_config.write().await.remove(id) {
+            session.model = cfg.model;
+            session.mode = cfg.mode;
+            session.selected_reasoning_effort = cfg.reasoning_effort;
+            session.selected_service_tier = cfg.service_tier;
+        }
         let inserted = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if !reopen_closed && self.closed_sessions.read().await.contains(id) {
@@ -4898,6 +4965,9 @@ impl SessionStore {
             }
         }
         self.remove_resident_session(session_id).await;
+        // Explicit close discards process-local runtime state: forget any
+        // eviction-cached config so a later reopen starts from defaults.
+        self.evicted_session_config.write().await.remove(session_id);
         CloseSessionResult::Closed
     }
 
@@ -4931,6 +5001,7 @@ impl SessionStore {
             // Forget the session, and tombstone it so a racing add_turn from the
             // cancelled prompt cannot resurrect the archive.
             self.known_sessions.write().await.remove(session_id);
+            self.evicted_session_config.write().await.remove(session_id);
             self.closed_sessions
                 .write()
                 .await
@@ -5234,6 +5305,124 @@ mod tests {
         assert!(!sessions.contains_key("a"), "oldest LRU must be evicted");
         assert!(sessions.contains_key("b"), "recently-touched must survive");
         assert!(sessions.contains_key("c"));
+    }
+
+    /// LRU eviction is transparent -- the client issues no `session/load`, so it
+    /// cannot re-apply config options over ACP. A session evicted from memory
+    /// and cold-reloaded on the next prompt must therefore restore the user's
+    /// client-owned config picks (model, behavior mode, reasoning effort,
+    /// service tier) from the eviction snapshot rather than silently resetting
+    /// to server defaults. Permission mode is deliberately NOT restored -- it
+    /// stays at its default on any cold reload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lru_eviction_restores_config_options_except_permission_on_cold_reload() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::with_limits(
+            "default-model".to_string(),
+            SessionLimits {
+                max_sessions: 1,
+                max_history_turns: 0,
+            },
+        );
+
+        let cwd_a = tempfile::tempdir().expect("cwd a");
+        let a = store.create_session(cwd_a.path().to_path_buf()).await;
+        let id = a.id.clone();
+
+        // The user drives non-default config options over ACP; these live on the
+        // in-memory session only now.
+        let (ok, _cleared, _cleared_tier) =
+            store.set_model(&id, "picked-model".to_string()).await;
+        assert!(ok);
+        assert!(store.set_reasoning_effort(&id, Some("high".to_string())).await);
+        assert!(store.set_mode(&id, SessionMode::Plan).await);
+        assert!(
+            store
+                .set_permission_mode(&id, PermissionMode::ReadOnly)
+                .await
+        );
+
+        // Opening a second session exceeds `max_sessions = 1` and evicts session
+        // `a` (the LRU), snapshotting its config into the eviction cache.
+        let cwd_b = tempfile::tempdir().expect("cwd b");
+        let _b = store.create_session(cwd_b.path().to_path_buf()).await;
+        assert!(
+            !store.sessions.read().await.contains_key(&id),
+            "session a must have been evicted from memory"
+        );
+
+        // The transparent cold reload (the path a follow-up prompt takes) must
+        // bring back the user's non-permission config picks.
+        let reloaded = store
+            .get_session(&id, cwd_a.path())
+            .await
+            .expect("session a must reload from disk");
+        assert_eq!(
+            reloaded.model, "picked-model",
+            "model pick must survive a transparent eviction"
+        );
+        assert_eq!(
+            reloaded.mode,
+            SessionMode::Plan,
+            "behavior mode must survive a transparent eviction"
+        );
+        assert_eq!(
+            reloaded.selected_reasoning_effort.as_deref(),
+            Some("high"),
+            "reasoning effort must survive a transparent eviction"
+        );
+        assert_eq!(
+            reloaded.permission_mode,
+            PermissionMode::default(),
+            "permission mode must NOT be restored -- it stays at the default"
+        );
+
+        // The snapshot is consumed on reload, so it cannot leak into any other
+        // session or a later fresh reload.
+        assert!(
+            !store
+                .evicted_session_config
+                .read()
+                .await
+                .contains_key(&id),
+            "eviction snapshot must be consumed on cold reload"
+        );
+    }
+
+    /// An explicit `close_session` discards process-local runtime state, so a
+    /// prior eviction snapshot must be dropped -- a later reopen starts from
+    /// defaults, matching the client-owned-config contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_session_drops_eviction_config_snapshot() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        let store = SessionStore::with_limits(
+            "default-model".to_string(),
+            SessionLimits {
+                max_sessions: 1,
+                max_history_turns: 0,
+            },
+        );
+
+        let cwd_a = tempfile::tempdir().expect("cwd a");
+        let a = store.create_session(cwd_a.path().to_path_buf()).await;
+        let id = a.id.clone();
+        let (ok, _c, _t) = store.set_model(&id, "picked-model".to_string()).await;
+        assert!(ok);
+
+        // Evict `a` by exceeding the cap, then explicitly close it.
+        let cwd_b = tempfile::tempdir().expect("cwd b");
+        let _b = store.create_session(cwd_b.path().to_path_buf()).await;
+        assert!(
+            store.evicted_session_config.read().await.contains_key(&id),
+            "eviction must snapshot the closed-then-evicted session's config"
+        );
+        store.close_session(&id).await;
+        assert!(
+            !store.evicted_session_config.read().await.contains_key(&id),
+            "close must forget the eviction snapshot so a later reopen resets to defaults"
+        );
     }
 
     /// In-flight prompts (those holding a cancellation token via
