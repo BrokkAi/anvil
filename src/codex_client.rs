@@ -37,8 +37,8 @@ use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_st
 use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, IdleTimeouts, IncompleteStreamError, LlmBackend,
-    LlmResponse, ModelMetadata, OpenAiClient, OutputBudgetExhaustedError, ReasoningLevelPreset,
-    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    LlmResponse, ModelMetadata, ModelServiceTier, OpenAiClient, OutputBudgetExhaustedError,
+    ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
@@ -230,6 +230,7 @@ impl CodexClient {
             messages,
             tools,
             reasoning_effort,
+            service_tier,
             temperature: _temperature,
             structured_output,
             on_token,
@@ -243,6 +244,7 @@ impl CodexClient {
             &messages,
             tools.as_deref(),
             reasoning_effort.as_deref(),
+            service_tier.as_deref(),
             structured_output.as_ref(),
         );
         // Keep the caller's sinks behind a mutex so a retry can build
@@ -443,6 +445,11 @@ async fn fetch_chatgpt_models(
                 .into_iter()
                 .map(ReasoningLevelPreset::from)
                 .collect(),
+            service_tiers: m
+                .service_tiers
+                .into_iter()
+                .map(ModelServiceTier::from)
+                .collect(),
             supports_images: None,
             // ChatGPT's `/models` endpoint doesn't expose a context window;
             // the compression layer falls back to a per-backend default.
@@ -497,6 +504,10 @@ struct ChatGptModelEntry {
     /// know what each level actually means.
     #[serde(default)]
     supported_reasoning_levels: Vec<ChatGptReasoningLevel>,
+    /// Optional per-request service tiers. Current Codex catalogs use
+    /// `priority` for fast mode.
+    #[serde(default)]
+    service_tiers: Vec<ChatGptServiceTier>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,10 +517,29 @@ struct ChatGptReasoningLevel {
     description: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatGptServiceTier {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
 impl From<ChatGptReasoningLevel> for ReasoningLevelPreset {
     fn from(value: ChatGptReasoningLevel) -> Self {
         Self {
             effort: value.effort,
+            description: value.description,
+        }
+    }
+}
+
+impl From<ChatGptServiceTier> for ModelServiceTier {
+    fn from(value: ChatGptServiceTier) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
             description: value.description,
         }
     }
@@ -664,6 +694,10 @@ pub(crate) struct ResponsesRequest {
     /// honor the level the user asked for in the picker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<ReasoningConfig>,
+    /// Optional service tier requested by the user. Codex's `priority` tier
+    /// is the fast-mode path and uses more subscription quota.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) text: Option<ResponsesTextConfig>,
 }
@@ -736,6 +770,7 @@ pub(crate) fn build_responses_request(
     messages: &[ChatMessage],
     tools: Option<&[ToolDefinition]>,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     structured_output: Option<&StructuredOutputRequest>,
 ) -> ResponsesRequest {
     let mut instructions_parts: Vec<String> = Vec::new();
@@ -866,6 +901,7 @@ pub(crate) fn build_responses_request(
         stream: true,
         store: false,
         reasoning,
+        service_tier: service_tier.map(str::to_string),
         text,
     }
 }
@@ -1356,7 +1392,7 @@ mod tests {
             ChatMessage::system("also be brief"),
             ChatMessage::user("hi"),
         ];
-        let req = build_responses_request("gpt-5-codex", &messages, None, None, None);
+        let req = build_responses_request("gpt-5-codex", &messages, None, None, None, None);
         assert_eq!(
             req.instructions.as_deref(),
             Some("be helpful\n\nalso be brief")
@@ -1393,7 +1429,7 @@ mod tests {
             }]),
             ChatMessage::tool_result("fc_abc", "search", "no results"),
         ];
-        let req = build_responses_request("gpt-5-codex", &messages, None, None, None);
+        let req = build_responses_request("gpt-5-codex", &messages, None, None, None, None);
         assert_eq!(req.input.len(), 3);
         match &req.input[1] {
             ResponsesInputItem::FunctionCall {
@@ -1432,6 +1468,7 @@ mod tests {
             Some(&tools),
             None,
             None,
+            None,
         );
         let serialized = serde_json::to_value(&req).unwrap();
         let tools = serialized.get("tools").unwrap().as_array().unwrap();
@@ -1466,7 +1503,7 @@ mod tests {
             name: None,
             reasoning_content: None,
         }];
-        let req = build_responses_request("gpt-5", &messages, None, None, None);
+        let req = build_responses_request("gpt-5", &messages, None, None, None, None);
         assert_eq!(req.input.len(), 1);
         assert!(matches!(
             req.input[0],
@@ -1491,6 +1528,7 @@ mod tests {
             &[ChatMessage::user("hi")],
             None,
             None,
+            None,
             Some(&request),
         );
         let serialized = serde_json::to_value(&req).unwrap();
@@ -1513,6 +1551,7 @@ mod tests {
             None,
             Some("xhigh"),
             None,
+            None,
         );
         let serialized = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -1527,11 +1566,49 @@ mod tests {
         // skip_serializing_if=Option::is_none so it must not appear at
         // all (vs. being present with a null/empty value, which the
         // server would reject as an invalid effort).
-        let req = build_responses_request("gpt-5.5", &[ChatMessage::user("hi")], None, None, None);
+        let req = build_responses_request(
+            "gpt-5.5",
+            &[ChatMessage::user("hi")],
+            None,
+            None,
+            None,
+            None,
+        );
         let serialized = serde_json::to_value(&req).unwrap();
         assert!(
             serialized.get("reasoning").is_none(),
             "reasoning field must be omitted entirely when effort is None"
+        );
+    }
+
+    #[test]
+    fn build_request_emits_service_tier_when_set() {
+        let req = build_responses_request(
+            "gpt-5.5",
+            &[ChatMessage::user("hi")],
+            None,
+            None,
+            Some("priority"),
+            None,
+        );
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(serialized.get("service_tier"), Some(&json!("priority")));
+    }
+
+    #[test]
+    fn build_request_omits_service_tier_when_none() {
+        let req = build_responses_request(
+            "gpt-5.5",
+            &[ChatMessage::user("hi")],
+            None,
+            None,
+            None,
+            None,
+        );
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert!(
+            serialized.get("service_tier").is_none(),
+            "service_tier must be omitted unless the user selects a tier"
         );
     }
 
@@ -2032,6 +2109,13 @@ mod tests {
                         {"effort": "medium", "description": "Solid balance of depth and latency"},
                         {"effort": "high",   "description": "Maximize reasoning depth"},
                         {"effort": "xhigh",  "description": "Extra high reasoning for complex problems"}
+                    ],
+                    "service_tiers": [
+                        {
+                            "id": "priority",
+                            "name": "Fast",
+                            "description": "1.5x speed, increased usage"
+                        }
                     ]
                 },
                 {
@@ -2052,11 +2136,19 @@ mod tests {
             gpt52.supported_reasoning_levels[3].description,
             "Extra high reasoning for complex problems"
         );
+        assert_eq!(gpt52.service_tiers.len(), 1);
+        assert_eq!(gpt52.service_tiers[0].id, "priority");
+        assert_eq!(gpt52.service_tiers[0].name, "Fast");
+        assert_eq!(
+            gpt52.service_tiers[0].description,
+            "1.5x speed, increased usage"
+        );
         // Models without the reasoning fields deserialize with serde
         // defaults -- None + empty vec -- so the picker simply omits
         // the effort selector for them rather than crashing.
         let gpt_mini = &parsed.models[1];
         assert!(gpt_mini.default_reasoning_level.is_none());
         assert!(gpt_mini.supported_reasoning_levels.is_empty());
+        assert!(gpt_mini.service_tiers.is_empty());
     }
 }

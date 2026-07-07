@@ -175,7 +175,11 @@ hide it behind a framework.
 Anvil is zero-config by default:
 
 - **Codex / ChatGPT**: reads `~/.codex/auth.json` when present and can refresh
-  stale credentials. Run `/setup codex` from a session to sign in.
+  stale credentials. Run `/setup codex` from a session to sign in. When the
+  ChatGPT model catalog advertises service tiers, use `/fast` or `/setup fast on`
+  to select the fast tier for the current session, and `/fast off` or
+  `/setup fast off` to clear it. Fast mode can respond sooner but consumes
+  subscription quota more aggressively.
 - **Ollama**: probes `http://localhost:11434/v1/models`. Run Ollama on the
   default port, then use `/setup local refresh`.
 - **ds4** (antirez/ds4): when a `ds4-server` process is running, Anvil detects
@@ -223,6 +227,8 @@ Built-in commands:
 
 - `/setup`: model login, provider selection, behavior mode, sandbox mode,
   turn recaps, timeout, and advanced settings.
+- `/fast [on|off|status]`: use, clear, or inspect the fast Codex service tier
+  for the current session when the selected model supports it.
 - `/permissions`: list or revoke remembered Always allow entries.
 - `/context`: show the current session context snapshot and token estimate.
 - `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or
@@ -301,7 +307,7 @@ Bifrost provides structural code-intelligence tools such as:
 Permission mode controls whether Anvil asks before tool calls:
 
 - `default`: ask before edits, and before shell commands except for a conservative auto-approved subset of sandboxed read-only commands (for example `rg`, `git diff`, `git show`, `git status`).
-- `auto`: like `default`, but promptable tool calls may be approved by the permission classifier when clearly inside the user's request.
+- `auto`: like `default` for conservative sandboxed read-only commands, but promptable tool calls go to the permission classifier; unapproved calls are denied without a human prompt.
 - `acceptEdits`: allow file edits, and ask before shell commands except for a conservative auto-approved subset of sandboxed read-only commands (for example `rg`, `git diff`, `git show`, `git status`).
 - `readOnly`: block edits and shell commands.
 - `bypassPermissions`: allow tool calls without prompting.
@@ -323,10 +329,14 @@ setup state on disk and can be inspected or revoked with:
 up front when a command genuinely needs access the sandbox blocks — network or
 DNS access, package downloads, `git push`, attaching to or debugging host
 processes, or writes outside the working directory — without first triggering a
-sandbox failure. An escalation request always prompts the user with a **Run
-outside sandbox** choice (never auto-allowed and never remembered as an
-**Always allow** rule), and Anvil rejects it deterministically when there is no
-active OS sandbox to escape or when the session is in read-only mode.
+sandbox failure. In `auto` permission mode, an escalation request is decided by
+the permission classifier without prompting the user; the classifier may approve
+one outside-sandbox shell run only when the user's task and the classifier's
+output explicitly justify leaving the sandbox. In other permission modes, an
+escalation request prompts the user with a **Run outside sandbox** choice. An
+outside-sandbox approval is never remembered as an **Always allow** rule, and
+Anvil rejects escalation deterministically when there is no active OS sandbox to
+escape or when the session is in read-only mode.
 
 When a sandboxed shell command fails with output that looks like a sandbox
 boundary issue (for example `permission denied`, `operation not permitted`, a

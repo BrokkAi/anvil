@@ -423,6 +423,7 @@ pub async fn discover_ollama_model_metadata(
                         id: model_id,
                         default_reasoning_level: None,
                         supported_reasoning_levels: ollama_thinking_presets(),
+                        service_tiers: Vec::new(),
                         supports_images: Some(
                             parsed.capabilities.iter().any(|cap| cap == "vision"),
                         ),
@@ -440,9 +441,8 @@ pub async fn discover_ollama_model_metadata(
                     id: model_id,
                     default_reasoning_level: None,
                     supported_reasoning_levels: Vec::new(),
-                    supports_images: Some(
-                        parsed.capabilities.iter().any(|cap| cap == "vision"),
-                    ),
+                    service_tiers: Vec::new(),
+                    supports_images: Some(parsed.capabilities.iter().any(|cap| cap == "vision")),
                     context_length: None,
                     pricing: None,
                 },

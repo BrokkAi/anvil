@@ -327,6 +327,7 @@ async fn run_summarization_request(
             // reasoning -- "low" keeps cost down on reasoning-capable
             // models that bill thinking tokens.
             reasoning_effort: Some("low".to_string()),
+            service_tier: None,
             temperature: None,
             structured_output: None,
             on_token: Box::new(|_| {}),

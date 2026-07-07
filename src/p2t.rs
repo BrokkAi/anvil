@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::llm_client::{ChatContentPart, ChatMessage, FunctionCall, ToolCall};
 
@@ -54,7 +54,7 @@ pub(crate) struct PrefixStep {
     pub tool_calls: Vec<PrefixToolCall>,
     #[serde(default)]
     pub results: Vec<PrefixToolResult>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_prefix_messages")]
     pub messages: Vec<ChatMessage>,
 }
 
@@ -179,6 +179,29 @@ pub(crate) fn load_prefix_steps(path: &Path) -> Result<Vec<PrefixStep>> {
     Ok(steps)
 }
 
+fn deserialize_prefix_messages<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ChatMessage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(normalize_prefix_message)
+        .map(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn normalize_prefix_message(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(content) = value.get_mut("content")
+        && let Some(text) = content.as_str()
+    {
+        *content = serde_json::json!([{ "type": "text", "text": text }]);
+    }
+    value
+}
+
 pub(crate) fn append_prefix_messages(messages: &mut Vec<ChatMessage>, steps: &[PrefixStep]) {
     messages.extend(prefix_steps_to_messages(steps));
 }
@@ -245,7 +268,12 @@ fn assistant_message_with_tool_calls(
         tool_calls: Some(tool_calls_from_prefix(tool_calls)),
         tool_call_id: None,
         name: None,
-        reasoning_content: None,
+        // Present-but-empty, not None: DeepSeek thinking-mode rejects an
+        // assistant turn with no reasoning_content ("must be passed back"),
+        // and None omits the field entirely (llm_client serialize). An injected
+        // PrefixStep tool-call has no real reasoning; an empty string satisfies
+        // the field-presence contract without fabricating rationale.
+        reasoning_content: Some(String::new()),
     }
 }
 
@@ -755,6 +783,23 @@ mod tests {
 
         let messages = prefix_steps_to_messages(&steps);
         assert_eq!(messages, vec![exact]);
+    }
+
+    #[test]
+    fn load_prefix_steps_accepts_raw_text_message_content() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{"assistant_text":"","tool_calls":[],"results":[],"messages":[{"role":"user","content":"Still reproduces."}]}"#,
+        )
+        .unwrap();
+
+        let steps = load_prefix_steps(file.path()).unwrap();
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].messages.len(), 1);
+        assert_eq!(steps[0].messages[0].role, "user");
+        assert_eq!(steps[0].messages[0].content_text(), "Still reproduces.");
     }
 
     #[test]

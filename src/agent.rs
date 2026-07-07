@@ -131,6 +131,11 @@ const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 /// either an empty string or this token so editor implementations that
 /// strip-trim selection ids still work.
 const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
+/// Per-session service-tier knob. Codex subscription models currently
+/// advertise `priority`, rendered as Fast, for increased throughput.
+const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
+const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
+const CODEX_FAST_SERVICE_TIER_ID: &str = "priority";
 
 fn negotiate_protocol_version(requested: ProtocolVersion) -> ProtocolVersion {
     if requested == SUPPORTED_ACP_PROTOCOL_VERSION {
@@ -528,6 +533,54 @@ fn reasoning_effort_config_option(
     )
 }
 
+/// Build the service-tier `SessionConfigOption` for the active model.
+/// Returns `None` when the model publishes no tiers. For Codex subscription
+/// models this exposes fast mode as the server-provided `priority` tier.
+fn service_tier_config_option(
+    current: Option<&str>,
+    catalog: &[ModelMetadata],
+    current_model: &str,
+) -> Option<SessionConfigOption> {
+    let model = catalog.iter().find(|m| m.id == current_model)?;
+    if model.service_tiers.is_empty() {
+        return None;
+    }
+    let mut options = vec![
+        SessionConfigSelectOption::new(SERVICE_TIER_DEFAULT_VALUE, "Default")
+            .description("Use the provider's default service tier."),
+    ];
+    options.extend(model.service_tiers.iter().map(|tier| {
+        let label = if tier.name.is_empty() {
+            tier.id.clone()
+        } else {
+            tier.name.clone()
+        };
+        let opt = SessionConfigSelectOption::new(tier.id.clone(), label);
+        if tier.description.is_empty() {
+            opt
+        } else {
+            opt.description(tier.description.clone())
+        }
+    }));
+    let current_value = match current {
+        Some(tier) if model.service_tiers.iter().any(|p| p.id == tier) => tier.to_string(),
+        _ => SERVICE_TIER_DEFAULT_VALUE.to_string(),
+    };
+    Some(
+        SessionConfigOption::select(
+            SERVICE_TIER_CONFIG_ID,
+            "Service tier",
+            current_value,
+            options,
+        )
+        .description(
+            "Controls the provider service tier for this session. Fast tiers can respond \
+                 sooner but consume more subscription quota.",
+        )
+        .category(SessionConfigOptionCategory::Model),
+    )
+}
+
 /// All configOption selectors we expose, in display order. The model
 /// selector is appended only when the LLM catalog is known; clients that
 /// drive model selection through the meta extension still see the current
@@ -539,6 +592,7 @@ fn all_config_options(
     current_model: &str,
     available_models: &[ModelMetadata],
     current_reasoning_effort: Option<&str>,
+    current_service_tier: Option<&str>,
 ) -> Vec<SessionConfigOption> {
     let model_ids: Vec<String> = available_models.iter().map(|m| m.id.clone()).collect();
     let mut opts = vec![
@@ -553,6 +607,11 @@ fn all_config_options(
     {
         opts.push(re_opt);
     }
+    if let Some(tier_opt) =
+        service_tier_config_option(current_service_tier, available_models, current_model)
+    {
+        opts.push(tier_opt);
+    }
     opts
 }
 
@@ -564,6 +623,7 @@ const CONFIGURE_KNOWN_KEYS: &[&str] = &[
     PERMISSION_CONFIG_ID,
     MODEL_CONFIG_ID,
     REASONING_EFFORT_CONFIG_ID,
+    SERVICE_TIER_CONFIG_ID,
 ];
 
 /// Outcome of a successful `apply_config_option` call. Carries the full
@@ -576,6 +636,9 @@ struct ConfigApplyOutcome {
     /// is not in the new model's supported set and the store dropped it.
     /// Both callers surface this to the user.
     cleared_reasoning: Option<String>,
+    /// Set only by the `model` arm when the previous service_tier pick is not
+    /// in the new model's supported set and the store dropped it.
+    cleared_service_tier: Option<String>,
 }
 
 /// Validation / dispatch errors from `apply_config_option`. The request
@@ -639,6 +702,7 @@ async fn current_config_options(
         &session.model,
         &catalog,
         session.selected_reasoning_effort.as_deref(),
+        session.selected_service_tier.as_deref(),
     ))
 }
 
@@ -695,6 +759,7 @@ async fn apply_config_option(
     value: &str,
 ) -> Result<ConfigApplyOutcome, ConfigApplyError> {
     let mut cleared_reasoning: Option<String> = None;
+    let mut cleared_service_tier: Option<String> = None;
 
     match config_id {
         PERMISSION_CONFIG_ID => {
@@ -753,10 +818,11 @@ async fn apply_config_option(
                 });
             }
             match sessions.set_model(session_id, value.to_string()).await {
-                Ok((true, cleared)) => {
+                Ok((true, cleared, cleared_tier)) => {
                     cleared_reasoning = cleared;
+                    cleared_service_tier = cleared_tier;
                 }
-                Ok((false, _)) => return Err(ConfigApplyError::UnknownSession),
+                Ok((false, _, _)) => return Err(ConfigApplyError::UnknownSession),
                 Err(e) => {
                     return Err(ConfigApplyError::PersistFailed {
                         details: format!("{e:#}"),
@@ -824,6 +890,46 @@ async fn apply_config_option(
                 return Err(ConfigApplyError::UnknownSession);
             }
         }
+        SERVICE_TIER_CONFIG_ID => {
+            let service_tier = if value.is_empty() || value == SERVICE_TIER_DEFAULT_VALUE {
+                None
+            } else {
+                Some(value.to_string())
+            };
+            if let Some(tier) = &service_tier {
+                let fallback_cwd = std::env::current_dir().unwrap_or_default();
+                let active_model = sessions
+                    .get_session(session_id, &fallback_cwd)
+                    .await
+                    .map(|s| s.model);
+                let catalog = sessions.available_model_metadata().await;
+                if let Some(model_id) = active_model
+                    && let Some(meta) = catalog.iter().find(|m| m.id == model_id)
+                {
+                    if meta.service_tiers.is_empty() {
+                        return Err(ConfigApplyError::InvalidValue {
+                            reason: format!(
+                                "model '{model_id}' does not support configurable service tiers"
+                            ),
+                            supported: Vec::new(),
+                        });
+                    }
+                    if !meta.service_tiers.iter().any(|p| &p.id == tier) {
+                        let supported: Vec<String> =
+                            meta.service_tiers.iter().map(|p| p.id.clone()).collect();
+                        return Err(ConfigApplyError::InvalidValue {
+                            reason: format!(
+                                "service tier '{tier}' is not supported by model '{model_id}'"
+                            ),
+                            supported,
+                        });
+                    }
+                }
+            }
+            if !sessions.set_service_tier(session_id, service_tier).await {
+                return Err(ConfigApplyError::UnknownSession);
+            }
+        }
         _ => return Err(ConfigApplyError::UnknownConfigId),
     }
 
@@ -837,6 +943,7 @@ async fn apply_config_option(
     Ok(ConfigApplyOutcome {
         updated_options,
         cleared_reasoning,
+        cleared_service_tier,
     })
 }
 
@@ -858,6 +965,10 @@ fn builtin_commands() -> Vec<AvailableCommand> {
         AvailableCommand::new(
             "setup",
             "Set up models, login, behavior, sandboxing, and advanced options",
+        ),
+        AvailableCommand::new(
+            "fast",
+            "Use the fast Codex service tier for this session when available",
         ),
         AvailableCommand::new(
             "permissions",
@@ -1575,6 +1686,7 @@ pub async fn run_agent(
                         &session.model,
                         &catalog,
                         session.selected_reasoning_effort.as_deref(),
+                        session.selected_service_tier.as_deref(),
                     ))
                     .meta(meta_map);
 
@@ -1710,6 +1822,7 @@ pub async fn run_agent(
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
+                            session.selected_service_tier.as_deref(),
                         )),
                 );
                 spawn_delayed_available_commands_update(
@@ -1828,6 +1941,7 @@ pub async fn run_agent(
                             &session.model,
                             &catalog,
                             session.selected_reasoning_effort.as_deref(),
+                            session.selected_service_tier.as_deref(),
                         )),
                 );
                 spawn_delayed_available_commands_update(
@@ -1940,6 +2054,7 @@ pub async fn run_agent(
                             &forked.model,
                             &catalog,
                             forked.selected_reasoning_effort.as_deref(),
+                            forked.selected_service_tier.as_deref(),
                         )),
                 );
                 spawn_delayed_available_commands_update(
@@ -2227,6 +2342,13 @@ pub async fn run_agent(
                         current_session_idle_timeout: snap.idle_timeout_secs,
                     };
                     let report = handle_setup(&setup_ctx, &raw_prompt_text, &session_id).await;
+                    send_message(&cx, &session_id, &report);
+                    return responder.respond(prompt_end_turn_response());
+                }
+
+                if is_slash_command(&raw_prompt_text, "fast") {
+                    let report =
+                        handle_fast(&cx, &sessions_prompt, &session_id, &raw_prompt_text).await;
                     send_message(&cx, &session_id, &report);
                     return responder.respond(prompt_end_turn_response());
                 }
@@ -2793,6 +2915,7 @@ pub async fn run_agent(
                     let orchestration_model_for_response =
                         llm_for_gate.resolve_model_info(&model_for_gate);
                     let reasoning_effort_for_gate = snap.reasoning_effort.clone();
+                    let service_tier_for_gate = snap.service_tier.clone();
                     let idle_timeout_for_gate = resolve_idle_timeouts(
                         snap.idle_timeout_secs,
                         default_idle_timeout_secs,
@@ -2834,6 +2957,7 @@ pub async fn run_agent(
                             registry: &registry,
                             model: &model_for_gate,
                             reasoning_effort: reasoning_effort_for_gate.as_deref(),
+                            service_tier: service_tier_for_gate.as_deref(),
                             messages: planning_messages,
                             idle_timeout: idle_timeout_for_gate,
                             cancel: cancel.clone(),
@@ -2875,12 +2999,12 @@ pub async fn run_agent(
                             return Ok(());
                         }
 
+                        let review_plan = format_plan_for_review(&plan_result.response);
                         send_message(
                             &cx_for_gate,
                             &session_id_for_gate,
                             &format!(
-                                "\n\n{}\n\nAccept the plan to execute the original request.\n",
-                                plan_result.response.trim()
+                                "\n\n{review_plan}\n\nAccept the plan to execute the original request.\n"
                             ),
                         );
                         let approval = request_plan_approval(
@@ -2955,6 +3079,7 @@ pub async fn run_agent(
                             &registry,
                             &model_for_gate,
                             reasoning_effort_for_gate.as_deref(),
+                            service_tier_for_gate.as_deref(),
                             structured_output_request_for_turn.as_ref(),
                             messages,
                             max_turns,
@@ -3035,6 +3160,7 @@ pub async fn run_agent(
                 let orchestration_model_for_response =
                     llm_for_loop.resolve_model_info(&model_for_loop);
                 let reasoning_effort_for_loop = snap.reasoning_effort;
+                let service_tier_for_loop = snap.service_tier;
                 // Resolve per-turn stream timeouts: the session override wins,
                 // otherwise fall back to the binary-wide defaults from
                 // `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs`.
@@ -3066,6 +3192,7 @@ pub async fn run_agent(
                         &registry,
                         &model_for_loop,
                         reasoning_effort_for_loop.as_deref(),
+                        service_tier_for_loop.as_deref(),
                         structured_output_request.as_ref(),
                         messages,
                         max_turns,
@@ -3324,6 +3451,16 @@ pub async fn run_agent(
                         &format!(
                             "Reasoning effort reset: `{prev}` is not supported by `{value}`. \
                              Using model default until you pick a level."
+                        ),
+                    );
+                }
+                if let Some(prev) = &outcome.cleared_service_tier {
+                    send_message(
+                        &cx,
+                        &session_id,
+                        &format!(
+                            "Service tier reset: `{prev}` is not supported by `{value}`. \
+                             Using provider default until you pick a tier."
                         ),
                     );
                 }
@@ -3774,6 +3911,15 @@ async fn run_loop_iteration(
             cx,
             session_id,
             &handle_setup(&setup_ctx, target, session_id).await,
+        );
+        return Ok(LoopIterationOutcome::without_usage());
+    }
+
+    if is_slash_command(target, "fast") {
+        send_message(
+            cx,
+            session_id,
+            &handle_fast(cx, sessions, session_id, target).await,
         );
         return Ok(LoopIterationOutcome::without_usage());
     }
@@ -4389,6 +4535,7 @@ struct PlanningTurnInput<'a> {
     registry: &'a Arc<crate::tools::ToolRegistry>,
     model: &'a str,
     reasoning_effort: Option<&'a str>,
+    service_tier: Option<&'a str>,
     messages: Vec<ChatMessage>,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
@@ -4740,6 +4887,7 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
         registry,
         model,
         reasoning_effort,
+        service_tier,
         messages,
         idle_timeout,
         cancel,
@@ -4769,6 +4917,7 @@ async fn run_planning_turn_in_spawn(input: PlanningTurnInput<'_>) -> PlanTurnRes
         registry,
         model,
         reasoning_effort,
+        service_tier,
         None,
         messages,
         1,
@@ -4839,7 +4988,33 @@ fn plan_approval_for_outcome(outcome: RequestPermissionOutcome) -> PlanApproval 
     }
 }
 
+fn max_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+fn markdown_fence_for(text: &str) -> String {
+    "`".repeat(3.max(max_backtick_run(text) + 1))
+}
+
+fn format_plan_for_review(plan: &str) -> String {
+    let plan = plan.trim();
+    let fence = markdown_fence_for(plan);
+    format!("BEGIN GENERATED PLAN\n{fence}text\n{plan}\n{fence}\nEND GENERATED PLAN")
+}
+
 fn plan_approval_tool_call(plan: &str) -> ToolCallUpdate {
+    let plan = plan.trim();
+    let review_plan = format_plan_for_review(plan);
     ToolCallUpdate::new(
         ToolCallId::new("planning-gate-approval".to_string()),
         ToolCallUpdateFields::new()
@@ -4847,10 +5022,9 @@ fn plan_approval_tool_call(plan: &str) -> ToolCallUpdate {
             .status(ToolCallStatus::Pending)
             .title("Approve plan before execution")
             .content(vec![ToolCallContent::from(format!(
-                "Review the generated plan before deciding whether to execute it.\n\n{}",
-                plan.trim()
+                "Review the generated plan before deciding whether to execute it.\n\n{review_plan}"
             ))])
-            .raw_input(serde_json::json!({ "plan": plan.trim() })),
+            .raw_input(serde_json::json!({ "plan": plan })),
     )
 }
 
@@ -4928,6 +5102,7 @@ async fn run_model_turn_in_spawn(
     registry: &Arc<crate::tools::ToolRegistry>,
     model: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     structured_output_request: Option<&StructuredOutputRequest>,
     messages: Vec<ChatMessage>,
     max_turns: usize,
@@ -4961,6 +5136,7 @@ async fn run_model_turn_in_spawn(
         registry,
         model,
         reasoning_effort,
+        service_tier,
         structured_output_request,
         messages,
         max_turns,
@@ -5150,6 +5326,7 @@ async fn run_prepared_model_turn(
         &registry,
         &snap.model,
         snap.reasoning_effort.as_deref(),
+        snap.service_tier.as_deref(),
         structured_output_request,
         messages,
         max_turns,
@@ -7664,12 +7841,65 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
                 .await
             }
         }
+        "fast" | "service-tier" | "service_tier" => {
+            if rest.is_empty() {
+                "Use `/setup fast on` to select the fast Codex service tier, \
+                 `/setup fast off` to clear it, or `/setup service-tier <tier id>`."
+                    .to_string()
+            } else {
+                let lower = rest.to_ascii_lowercase();
+                let value = match lower.as_str() {
+                    "on" | "fast" | "priority" => CODEX_FAST_SERVICE_TIER_ID,
+                    "off" | "default" | "provider-default" => SERVICE_TIER_DEFAULT_VALUE,
+                    _ => rest,
+                };
+                apply_setup_config(
+                    ctx.cx,
+                    ctx.sessions,
+                    session_id,
+                    SERVICE_TIER_CONFIG_ID,
+                    value,
+                )
+                .await
+            }
+        }
         "advanced" => render_setup_advanced(ctx.sessions, session_id).await,
         other => format!(
             "Unknown setup option `{other}`.\n\n{}",
             render_current_setup(ctx.sessions, session_id).await
         ),
     }
+}
+
+async fn handle_fast(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    prompt_text: &str,
+) -> String {
+    let rest = slash_command_args(prompt_text);
+    if rest.eq_ignore_ascii_case("status") {
+        let fallback_cwd = std::env::current_dir().unwrap_or_default();
+        let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
+            return "Error: unknown session.".to_string();
+        };
+        return format!(
+            "Fast mode is `{}` for `{}`.",
+            session
+                .selected_service_tier
+                .as_deref()
+                .unwrap_or(SERVICE_TIER_DEFAULT_VALUE),
+            session.model
+        );
+    }
+
+    let lower = rest.to_ascii_lowercase();
+    let value = match lower.as_str() {
+        "" | "on" | "fast" | "priority" => CODEX_FAST_SERVICE_TIER_ID,
+        "off" | "default" | "provider-default" => SERVICE_TIER_DEFAULT_VALUE,
+        _ => rest.as_str(),
+    };
+    apply_setup_config(cx, sessions, session_id, SERVICE_TIER_CONFIG_ID, value).await
 }
 
 fn is_streamed_setup_openrouter_refresh(prompt_text: &str) -> bool {
@@ -8711,11 +8941,17 @@ async fn apply_setup_config(
                 PERMISSION_CONFIG_ID => "Permission mode updated.".to_string(),
                 BEHAVIOR_CONFIG_ID => "Behavior setup updated.".to_string(),
                 REASONING_EFFORT_CONFIG_ID => "Advanced reasoning setup updated.".to_string(),
+                SERVICE_TIER_CONFIG_ID => "Service tier setup updated.".to_string(),
                 _ => "Setup updated.".to_string(),
             };
             if let Some(prev) = outcome.cleared_reasoning {
                 msg.push_str(&format!(
                     "\nReasoning effort reset: `{prev}` is not supported by the new model."
+                ));
+            }
+            if let Some(prev) = outcome.cleared_service_tier {
+                msg.push_str(&format!(
+                    "\nService tier reset: `{prev}` is not supported by the new model."
                 ));
             }
             msg
@@ -8862,6 +9098,13 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
             .unwrap_or(REASONING_EFFORT_DEFAULT_VALUE)
     ));
     out.push_str(&format!(
+        "- Service tier: `{}`\n",
+        session
+            .selected_service_tier
+            .as_deref()
+            .unwrap_or(SERVICE_TIER_DEFAULT_VALUE)
+    ));
+    out.push_str(&format!(
         "- Turn recap: `{}`\n",
         if session.turn_recap_enabled {
             "enabled"
@@ -8888,6 +9131,9 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     out.push_str("- `/setup recap on|off` - toggle automatic turn recaps.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
     out.push_str("- `/setup reasoning default|off|<level>` - advanced reasoning setting.\n");
+    out.push_str(
+        "- `/setup fast on|off` - use or clear the fast Codex service tier when available.\n",
+    );
     if !openrouter_picks.is_empty() {
         out.push_str("\nFiltered OpenRouter coding candidates:\n");
         for id in openrouter_picks {
@@ -8922,6 +9168,7 @@ fn loop_target_runs_without_model(target: &str) -> bool {
         || is_slash_command(target, "mcp")
         || is_slash_command(target, "pr-create")
         || is_slash_command(target, "usage")
+        || is_slash_command(target, "fast")
         || is_slash_command(target, "rewind")
 }
 
@@ -10404,7 +10651,41 @@ mod tests {
     }
 
     #[test]
-    fn plan_approval_prompt_includes_visible_plan_content() {
+    fn format_plan_for_review_marks_generated_plan_boundaries() {
+        let plan = "1. Inspect the planning gate\n2. Fix the approval order";
+        let text = format_plan_for_review(plan);
+        assert!(text.starts_with("BEGIN GENERATED PLAN\n```text\n"));
+        assert!(text.contains("1. Inspect the planning gate"));
+        assert!(text.contains("2. Fix the approval order"));
+        assert!(text.ends_with("\n```\nEND GENERATED PLAN"));
+    }
+
+    #[test]
+    fn format_plan_for_review_uses_fence_longer_than_plan_backticks() {
+        let plan = "1. Inspect\n```rust\nfn main() {}\n```\n2. Test";
+        let text = format_plan_for_review(plan);
+        assert!(text.starts_with("BEGIN GENERATED PLAN\n````text\n"));
+        assert!(text.ends_with("\n````\nEND GENERATED PLAN"));
+    }
+
+    #[test]
+    fn format_plan_for_review_keeps_trusted_markers_outside_plan_fence() {
+        let plan = "BEGIN GENERATED PLAN\n1. Spoof the marker\nEND GENERATED PLAN\n```rust\nfn main() {}\n```";
+        let text = format_plan_for_review(plan);
+        let lines: Vec<_> = text.lines().collect();
+
+        assert_eq!(lines.first(), Some(&"BEGIN GENERATED PLAN"));
+        assert_eq!(lines.get(1), Some(&"````text"));
+        assert_eq!(lines.get(lines.len() - 2), Some(&"````"));
+        assert_eq!(lines.last(), Some(&"END GENERATED PLAN"));
+        assert!(
+            text.contains("\nEND GENERATED PLAN\n```rust"),
+            "spoofed marker should remain fenced as generated plan text: {text}"
+        );
+    }
+
+    #[test]
+    fn plan_approval_prompt_includes_delimited_visible_plan_content() {
         let plan = "1. Inspect the planning gate\n2. Fix the approval order";
         let tool_call = plan_approval_tool_call(plan);
         assert_eq!(tool_call.fields.status, Some(ToolCallStatus::Pending));
@@ -10428,8 +10709,10 @@ mod tests {
             panic!("approval content must be text: {content:?}");
         };
         assert!(text.text.contains("Review the generated plan"));
+        assert!(text.text.contains("BEGIN GENERATED PLAN"));
         assert!(text.text.contains("1. Inspect the planning gate"));
         assert!(text.text.contains("2. Fix the approval order"));
+        assert!(text.text.contains("END GENERATED PLAN"));
     }
 
     #[test]
@@ -11333,6 +11616,7 @@ mod tests {
                 },
             ],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -11360,6 +11644,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -11648,6 +11933,7 @@ mod tests {
             id: "text-only".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            service_tiers: Vec::new(),
             supports_images: Some(false),
             context_length: None,
             pricing: None,
@@ -11859,6 +12145,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -11867,6 +12154,7 @@ mod tests {
             id: "gpt-99".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            service_tiers: Vec::new(),
             supports_images: None,
             context_length: Some(200_000),
             pricing: None,
@@ -11904,6 +12192,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -11931,6 +12220,7 @@ mod tests {
             model: String::new(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -11952,6 +12242,7 @@ mod tests {
             model: model.into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12228,6 +12519,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12236,6 +12528,7 @@ mod tests {
             id: "gpt-99".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            service_tiers: Vec::new(),
             supports_images: None,
             context_length: Some(200_000),
             pricing: None,
@@ -12262,6 +12555,7 @@ mod tests {
             model: "codex::gpt-5-codex".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12270,6 +12564,7 @@ mod tests {
             id: "codex::gpt-5-codex".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            service_tiers: Vec::new(),
             supports_images: None,
             context_length: None,
             pricing: None,
@@ -12295,6 +12590,7 @@ mod tests {
             model: "openrouter::openai/gpt-4o".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12303,6 +12599,7 @@ mod tests {
             id: "openrouter::openai/gpt-4o".into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            service_tiers: Vec::new(),
             supports_images: None,
             context_length: Some(128_000),
             pricing: None,
@@ -12428,6 +12725,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12481,6 +12779,7 @@ mod tests {
                 fragment_id: None,
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12581,6 +12880,7 @@ mod tests {
                 fragment_id: None,
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12657,6 +12957,7 @@ mod tests {
                 fragment_id: None,
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12706,6 +13007,7 @@ mod tests {
                 fragment_id: None,
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12732,6 +13034,7 @@ mod tests {
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12753,6 +13056,7 @@ mod tests {
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: "Use the local style.".into(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12809,6 +13113,7 @@ mod tests {
                 fragment_id: None,
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -12874,6 +13179,7 @@ mod tests {
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: make_registry(vec![
@@ -12906,6 +13212,7 @@ mod tests {
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(SkillRegistry::default()),
@@ -12945,6 +13252,7 @@ mod tests {
             model: "m".into(),
             history: vec![],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(registry),
@@ -12973,6 +13281,7 @@ mod tests {
                 "loop",
                 "goal",
                 "setup",
+                "fast",
                 "permissions",
                 "compress",
                 "rewind",
@@ -13767,6 +14076,7 @@ mod tests {
                         effort: "high".into(),
                         description: "High".into(),
                     }],
+                    service_tiers: Vec::new(),
                     supports_images: None,
                     context_length: None,
                     pricing: None,
@@ -13806,6 +14116,7 @@ mod tests {
                         description: "High".into(),
                     },
                 ],
+                service_tiers: Vec::new(),
                 supports_images: None,
                 context_length: None,
                 pricing: None,
@@ -13867,6 +14178,102 @@ mod tests {
             .await
             .expect("session present");
         assert_eq!(snap.reasoning_effort, None);
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_sets_and_clears_service_tier() {
+        use crate::llm_client::ModelServiceTier;
+
+        let (store, id) = make_store_with_session("codex::gpt-5.5").await;
+        store
+            .set_available_models(vec![ModelMetadata {
+                id: "codex::gpt-5.5".into(),
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                service_tiers: vec![ModelServiceTier {
+                    id: CODEX_FAST_SERVICE_TIER_ID.into(),
+                    name: "Fast".into(),
+                    description: "Higher throughput".into(),
+                }],
+                supports_images: None,
+                context_length: None,
+                pricing: None,
+            }])
+            .await;
+
+        let outcome = apply_config_option(
+            &store,
+            &id,
+            SERVICE_TIER_CONFIG_ID,
+            CODEX_FAST_SERVICE_TIER_ID,
+        )
+        .await
+        .expect("supported service tier should be accepted");
+        let session = store
+            .get_session(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            session.selected_service_tier.as_deref(),
+            Some(CODEX_FAST_SERVICE_TIER_ID)
+        );
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(
+            snap.service_tier.as_deref(),
+            Some(CODEX_FAST_SERVICE_TIER_ID)
+        );
+        let service_option = outcome
+            .updated_options
+            .iter()
+            .find(|opt| opt.id.to_string() == SERVICE_TIER_CONFIG_ID)
+            .expect("service tier option should be advertised");
+        assert_eq!(
+            select_current_value(service_option),
+            CODEX_FAST_SERVICE_TIER_ID
+        );
+        assert_select_option_values(service_option, &["(default)", CODEX_FAST_SERVICE_TIER_ID]);
+
+        apply_config_option(
+            &store,
+            &id,
+            SERVICE_TIER_CONFIG_ID,
+            SERVICE_TIER_DEFAULT_VALUE,
+        )
+        .await
+        .expect("default sentinel should clear service tier");
+        let snap = store
+            .snapshot(&id, &std::env::temp_dir())
+            .await
+            .expect("session present");
+        assert_eq!(snap.service_tier, None);
+    }
+
+    #[tokio::test]
+    async fn apply_config_option_rejects_service_tier_for_model_without_tiers() {
+        let (store, id) = make_store_with_session("plain-model").await;
+        store
+            .set_available_models(vec![ModelMetadata::id_only("plain-model")])
+            .await;
+
+        let err = apply_config_option(
+            &store,
+            &id,
+            SERVICE_TIER_CONFIG_ID,
+            CODEX_FAST_SERVICE_TIER_ID,
+        )
+        .await
+        .expect_err("known model without tiers cannot accept fast mode");
+
+        match err {
+            ConfigApplyError::InvalidValue { reason, supported } => {
+                assert!(reason.contains("plain-model"));
+                assert!(supported.is_empty());
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -13962,6 +14369,7 @@ mod tests {
                 },
             ],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
@@ -14009,6 +14417,7 @@ mod tests {
                 ..Default::default()
             }],
             reasoning_effort: None,
+            service_tier: None,
             idle_timeout_secs: None,
             project_instructions: String::new(),
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),

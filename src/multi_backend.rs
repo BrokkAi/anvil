@@ -334,6 +334,7 @@ impl MultiBackend {
                             id: wire.clone(),
                             default_reasoning_level: meta.default_reasoning_level.clone(),
                             supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            service_tiers: meta.service_tiers.clone(),
                             supports_images: meta.supports_images,
                             context_length: meta.context_length,
                             pricing: meta.pricing,
@@ -345,6 +346,7 @@ impl MultiBackend {
                             id: wire.clone(),
                             default_reasoning_level: meta.default_reasoning_level.clone(),
                             supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            service_tiers: meta.service_tiers.clone(),
                             supports_images: meta.supports_images,
                             context_length: meta.context_length,
                             pricing: meta.pricing,
@@ -356,6 +358,7 @@ impl MultiBackend {
                             id: wire.clone(),
                             default_reasoning_level: meta.default_reasoning_level.clone(),
                             supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            service_tiers: meta.service_tiers.clone(),
                             supports_images: meta.supports_images,
                             context_length: meta.context_length,
                             pricing: meta.pricing,
@@ -367,6 +370,7 @@ impl MultiBackend {
                             id: wire.clone(),
                             default_reasoning_level: meta.default_reasoning_level.clone(),
                             supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            service_tiers: meta.service_tiers.clone(),
                             supports_images: meta.supports_images,
                             context_length: meta.context_length,
                             pricing: meta.pricing,
@@ -383,6 +387,7 @@ impl MultiBackend {
                             id: wire.clone(),
                             default_reasoning_level: meta.default_reasoning_level.clone(),
                             supported_reasoning_levels: meta.supported_reasoning_levels.clone(),
+                            service_tiers: meta.service_tiers.clone(),
                             supports_images: meta.supports_images,
                             context_length: meta.context_length,
                             pricing: meta.pricing,
@@ -621,11 +626,20 @@ mod tests {
     use std::sync::Mutex;
 
     fn chat_request(model: &str, reasoning_effort: Option<&str>) -> StreamChatRequest {
+        chat_request_with_service_tier(model, reasoning_effort, None)
+    }
+
+    fn chat_request_with_service_tier(
+        model: &str,
+        reasoning_effort: Option<&str>,
+        service_tier: Option<&str>,
+    ) -> StreamChatRequest {
         StreamChatRequest {
             model: model.to_string(),
             messages: vec![],
             tools: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
+            service_tier: service_tier.map(str::to_string),
             temperature: None,
             structured_output: None,
             on_token: Box::new(|_| {}),
@@ -645,6 +659,7 @@ mod tests {
         name: &'static str,
         last_model: Arc<Mutex<Option<String>>>,
         last_reasoning_effort: Arc<Mutex<Option<String>>>,
+        last_service_tier: Arc<Mutex<Option<String>>>,
     }
 
     impl LlmBackend for RecordingBackend {
@@ -656,6 +671,7 @@ mod tests {
         fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
             *self.last_model.lock().unwrap() = Some(request.model);
             *self.last_reasoning_effort.lock().unwrap() = request.reasoning_effort;
+            *self.last_service_tier.lock().unwrap() = request.service_tier;
             let response = LlmResponse::Text {
                 text: format!("hello from {}", self.name),
                 reasoning_content: None,
@@ -669,21 +685,25 @@ mod tests {
     struct RecordingHandles {
         last_model: Arc<Mutex<Option<String>>>,
         last_reasoning_effort: Arc<Mutex<Option<String>>>,
+        last_service_tier: Arc<Mutex<Option<String>>>,
     }
 
     fn recording(name: &'static str) -> (Arc<dyn LlmBackend>, RecordingHandles) {
         let last_model = Arc::new(Mutex::new(None));
         let last_reasoning_effort = Arc::new(Mutex::new(None));
+        let last_service_tier = Arc::new(Mutex::new(None));
         let backend = Arc::new(RecordingBackend {
             name,
             last_model: last_model.clone(),
             last_reasoning_effort: last_reasoning_effort.clone(),
+            last_service_tier: last_service_tier.clone(),
         });
         (
             backend,
             RecordingHandles {
                 last_model,
                 last_reasoning_effort,
+                last_service_tier,
             },
         )
     }
@@ -1193,6 +1213,26 @@ mod tests {
                 .as_deref(),
             Some("xhigh"),
             "reasoning_effort must arrive at the inner backend unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_forwards_service_tier() {
+        let (codex_backend, codex_handles) = recording("codex");
+        let multi = MultiBackend::new(None, Some(codex_backend), None, None, None);
+
+        let _ = multi
+            .stream_chat(chat_request_with_service_tier(
+                "codex::gpt-5.5",
+                None,
+                Some("priority"),
+            ))
+            .await
+            .expect("codex route");
+        assert_eq!(
+            codex_handles.last_service_tier.lock().unwrap().as_deref(),
+            Some("priority"),
+            "service_tier must arrive at the inner backend unchanged"
         );
     }
 

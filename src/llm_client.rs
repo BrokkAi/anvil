@@ -339,6 +339,7 @@ pub struct StreamChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
     pub temperature: Option<f64>,
     pub structured_output: Option<StructuredOutputRequest>,
     pub on_token: TokenSink,
@@ -632,6 +633,15 @@ pub struct ReasoningLevelPreset {
     pub description: String,
 }
 
+/// One optional service tier advertised by a provider for a model.
+/// Codex's ChatGPT subscription catalog uses this for fast/priority mode.
+#[derive(Debug, Clone)]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
 /// Per-token USD pricing published by a provider's model catalog.
 ///
 /// Today this is populated only from OpenRouter's `/models` endpoint,
@@ -669,6 +679,7 @@ pub struct ModelMetadata {
     pub id: String,
     pub default_reasoning_level: Option<String>,
     pub supported_reasoning_levels: Vec<ReasoningLevelPreset>,
+    pub service_tiers: Vec<ModelServiceTier>,
     /// Tri-state image-input support as published by the provider.
     /// `None` means the backend does not expose reliable modality info.
     pub supports_images: Option<bool>,
@@ -698,6 +709,7 @@ impl ModelMetadata {
             id: id.into(),
             default_reasoning_level: None,
             supported_reasoning_levels: Vec::new(),
+            service_tiers: Vec::new(),
             supports_images: None,
             context_length: None,
             pricing: None,
@@ -1058,6 +1070,7 @@ impl ModelEntry {
                 id: self.id.clone(),
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
+                service_tiers: Vec::new(),
                 supports_images: self.supports_images(),
                 context_length: self.context_length,
                 pricing: self.pricing(),
@@ -1071,6 +1084,7 @@ impl ModelEntry {
             )
             .or_else(|| Some("medium".to_string())),
             supported_reasoning_levels: openrouter_reasoning_presets(),
+            service_tiers: Vec::new(),
             supports_images: self.supports_images(),
             context_length: self.context_length,
             pricing: self.pricing(),
@@ -1612,6 +1626,7 @@ impl OpenAiClient {
                     id: model.id.clone(),
                     default_reasoning_level: Some("high".to_string()),
                     supported_reasoning_levels: presets.clone(),
+                    service_tiers: Vec::new(),
                     supports_images: model.supports_images(),
                     context_length: model.context_length,
                     pricing: model.pricing(),
@@ -1638,6 +1653,7 @@ impl OpenAiClient {
             messages,
             tools,
             reasoning_effort,
+            service_tier: _service_tier,
             temperature,
             structured_output,
             on_token,
@@ -2096,6 +2112,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hello")],
                 tools: None,
                 reasoning_effort: None,
+                service_tier: None,
                 temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
@@ -2128,6 +2145,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hello")],
                 tools: None,
                 reasoning_effort: None,
+                service_tier: None,
                 temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
@@ -2165,6 +2183,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hello")],
                 tools: None,
                 reasoning_effort: None,
+                service_tier: None,
                 temperature: None,
                 structured_output: None,
                 on_token,
@@ -2203,6 +2222,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hello")],
                 tools: None,
                 reasoning_effort: None,
+                service_tier: None,
                 temperature: None,
                 structured_output: None,
                 on_token,
@@ -2309,6 +2329,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hi")],
                 tools: None,
                 reasoning_effort: effort.map(str::to_string),
+                service_tier: None,
                 temperature: None,
                 structured_output,
                 on_token,
