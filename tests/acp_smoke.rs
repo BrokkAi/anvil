@@ -3426,7 +3426,7 @@ fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {
     let cache_dir = config_home
         .join("bifrost")
-        .join("0.7.2")
+        .join("0.7.4")
         .join(bifrost_target_triple_for_smoke());
     std::fs::create_dir_all(&cache_dir).expect("create fake managed bifrost cache");
     let target = cache_dir.join(bifrost_binary_name_for_smoke());

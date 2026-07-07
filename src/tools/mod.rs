@@ -326,6 +326,11 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Searching for symbols",
     },
     ToolMeta {
+        name: "search_ast",
+        kind: ToolKind::Search,
+        display_name: "Searching AST",
+    },
+    ToolMeta {
         name: "get_symbol_locations",
         kind: ToolKind::Search,
         display_name: "Finding symbol locations",
@@ -382,6 +387,11 @@ const TOOLS: &[ToolMeta] = &[
         name: "get_file_contents",
         kind: ToolKind::Read,
         display_name: "Reading file contents",
+    },
+    ToolMeta {
+        name: "contains_tests",
+        kind: ToolKind::Read,
+        display_name: "Checking for test files",
     },
     ToolMeta {
         name: "find_filenames",
