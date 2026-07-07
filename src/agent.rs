@@ -5389,9 +5389,9 @@ fn build_system_prompt(
 /// mistral-vibe, codex): act-with-tools over narrating, convention-following,
 /// minimal diffs, discover-then-run real verification commands, faithful
 /// outcome reporting, dedicated-tool preference, concise CLI output, and
-/// blast-radius care. Kept deliberately compact (~450 words): small open
-/// models follow short imperative rules better than long constitutions, and
-/// this string rides on every request.
+/// blast-radius care. Kept deliberately compact: small open models follow
+/// short imperative rules better than long constitutions, and this string
+/// rides on every request.
 ///
 /// Tool-preference language is conditioned on what is ADVERTISED because the
 /// active toolset varies by session (bifrost may be absent; P2T gates tools):
@@ -5409,6 +5409,11 @@ the tool call in the same response, or deliver the final result.
 genuinely ambiguous.
 - Make independent tool calls in parallel in a single response; sequence a call only when it \
 depends on an earlier result. Do not edit the same file twice in one response.
+- Keep the user oriented during tool-heavy work. Before a non-trivial batch of tool calls or \
+when changing strategy, write one short visible sentence explaining the current goal and why \
+the next tools help. After significant tool results, briefly state what was learned and the \
+next step. Do not reveal private chain-of-thought; provide concise intent/evidence summaries \
+only. Skip progress notes for trivial single-tool lookups.
 - Before changing code, understand it: read the relevant files and see how the surrounding \
 project does things. Follow the project's existing conventions — style, naming, structure, \
 error handling, test framework. Never assume a library is available; verify the project \
@@ -5449,8 +5454,9 @@ plain text, configuration, and docs.
 
 - Be concise and direct; this is a CLI. No filler, preamble, or apologies. Use \
 GitHub-flavored Markdown.
-- Text is for findings and results; tools are for actions. Do not narrate tool calls \
-(\"I will now run...\").
+- Text is for progress updates, findings, and results; tools are for actions. Avoid \
+low-value narration of individual tool calls (\"I will now run...\"); progress notes should \
+explain intent or evidence, not list mechanics.
 - End a task with a short summary: what changed, how it was verified, and anything the user \
 should know. One to three sentences is enough for simple tasks.
 
@@ -12100,6 +12106,10 @@ mod tests {
             assert!(
                 prompt.contains("Call only tools that are currently advertised"),
                 "system prompt for {mode:?} must carry the shared core guidance, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("Keep the user oriented during tool-heavy work"),
+                "system prompt for {mode:?} must ask for concise progress updates, got: {prompt}"
             );
             assert!(
                 !prompt.contains("create a task list"),
