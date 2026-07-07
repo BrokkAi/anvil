@@ -14,13 +14,6 @@ struct SmokeCase {
 }
 
 #[derive(Clone, Copy)]
-enum PlanPermissionResponse {
-    Accept,
-    Reject,
-    Cancel,
-}
-
-#[derive(Clone, Copy)]
 enum AutoEscalationCase {
     ApproveOutside,
     ApproveNormalOnly,
@@ -76,85 +69,23 @@ fn auto_permission_classifier_denies_unapproved_sandbox_escape_without_prompt() 
 }
 
 #[test]
-fn planning_gate_rejection_blocks_original_execution() {
+fn complex_prompt_runs_directly_without_plan_permission() {
     let case = SmokeCase {
-        name: "planning_gate_rejection",
+        name: "complex_prompt_runs_directly",
         prompt:
             "Implement the auth database migration, update tests, push the branch, and open a PR."
                 .to_string(),
-    };
-    let provider = run_planning_gate_case(&case, PlanPermissionResponse::Reject);
-    assert_eq!(
-        provider.request_count(),
-        1,
-        "{}: rejected plan must not execute the original request",
-        case.name
-    );
-}
-
-#[test]
-fn planning_gate_cancellation_blocks_original_execution() {
-    let case = SmokeCase {
-        name: "planning_gate_cancellation",
-        prompt:
-            "Implement the auth database migration, update tests, push the branch, and open a PR."
-                .to_string(),
-    };
-    let provider = run_planning_gate_case(&case, PlanPermissionResponse::Cancel);
-    assert_eq!(
-        provider.request_count(),
-        1,
-        "{}: cancelled plan must not execute the original request",
-        case.name
-    );
-}
-
-#[test]
-fn planning_gate_acceptance_executes_with_approved_plan_context() {
-    let case = SmokeCase {
-        name: "planning_gate_acceptance",
-        prompt:
-            "Implement the auth database migration, update tests, push the branch, and open a PR."
-                .to_string(),
-    };
-    let provider = run_planning_gate_case(&case, PlanPermissionResponse::Accept);
-    let bodies = provider.request_bodies();
-    assert_eq!(
-        bodies.len(),
-        2,
-        "{}: accepted plan should produce planning and execution LLM calls",
-        case.name
-    );
-    assert!(
-        bodies[1].contains("<approved_plan>"),
-        "{}: execution request missing approved plan context: {}",
-        case.name,
-        bodies[1]
-    );
-    assert!(
-        bodies[1].contains(&case.prompt),
-        "{}: execution request missing original prompt: {}",
-        case.name,
-        bodies[1]
-    );
-}
-
-#[test]
-fn planning_gate_direct_prompt_does_not_request_permission() {
-    let case = SmokeCase {
-        name: "planning_gate_direct_prompt",
-        prompt: "What is a Rust trait?".to_string(),
     };
     let (provider, permission_requests) = run_direct_prompt_case(&case);
     assert_eq!(
         provider.request_count(),
         1,
-        "{}: direct prompt should make one LLM call",
+        "{}: complex prompt should make one direct LLM call",
         case.name
     );
     assert_eq!(
         permission_requests, 0,
-        "{}: direct prompt should not request plan permission",
+        "{}: complex prompt should not request plan permission",
         case.name
     );
 }
@@ -2397,119 +2328,6 @@ fn run_smoke_case(case: &SmokeCase) {
     let _ = stderr_join.join();
 }
 
-fn run_planning_gate_case(
-    case: &SmokeCase,
-    plan_permission_response: PlanPermissionResponse,
-) -> OpenAiSmokeServer {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let cwd = temp.path().join("repo");
-    std::fs::create_dir_all(&cwd).expect("create cwd");
-    std::fs::write(cwd.join("README.md"), "# smoke\n").expect("write readme");
-    std::fs::create_dir_all(cwd.join(".git")).expect("create git marker");
-
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).expect("create home");
-
-    let config_home = temp.path().join("config");
-    std::fs::create_dir_all(&config_home).expect("create config home");
-    let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
-
-    let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
-    let mut response_bodies = vec![text_sse_body(
-        "1. Inspect current auth flow.\n2. Add migration.\n3. Test and open PR.",
-    )];
-    if matches!(plan_permission_response, PlanPermissionResponse::Accept) {
-        response_bodies.push(text_sse_body("Executed approved plan."));
-    }
-    let provider = start_openai_smoke_server(response_bodies);
-    let mut child = spawn_anvil(
-        &home,
-        &config_home,
-        &trace_path,
-        Some(provider.base_url.as_str()),
-        2,
-    );
-    let (stdout_rx, stdout_join) = spawn_line_reader(child.stdout.take().expect("stdout"));
-    let (stderr_rx, stderr_join) = spawn_line_reader(child.stderr.take().expect("stderr"));
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut client = JsonRpcClient::new(&mut stdin, stdout_rx, stderr_rx, child, trace_path)
-        .with_plan_permission_response(plan_permission_response);
-
-    let initialize = client.request(
-        "initialize",
-        json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": false,
-                    "writeTextFile": false
-                },
-                "terminal": false
-            }
-        }),
-    );
-    assert_response_ok(case, "initialize", &initialize, &client);
-
-    let new_session = client.request(
-        "session/new",
-        json!({
-            "cwd": cwd,
-            "mcpServers": []
-        }),
-    );
-    assert_response_ok(case, "session/new", &new_session, &client);
-    let session_id = new_session["result"]["sessionId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
-        .to_string();
-
-    let prompt = client.request(
-        "session/prompt",
-        json!({
-            "sessionId": session_id,
-            "prompt": [
-                {
-                    "type": "text",
-                    "text": case.prompt
-                }
-            ]
-        }),
-    );
-    assert_response_ok(case, "session/prompt", &prompt, &client);
-    match plan_permission_response {
-        PlanPermissionResponse::Cancel => assert_eq!(
-            prompt["result"]["stopReason"].as_str(),
-            Some("cancelled"),
-            "{}: cancelled plan approval should cancel the prompt: {prompt}",
-            case.name
-        ),
-        PlanPermissionResponse::Accept | PlanPermissionResponse::Reject => assert_eq!(
-            prompt["result"]["stopReason"].as_str(),
-            Some("end_turn"),
-            "{}: accepted/rejected plan should end the prompt normally: {prompt}",
-            case.name
-        ),
-    }
-    assert_eq!(
-        client.permission_request_count, 1,
-        "{}: gated prompt should request plan approval exactly once",
-        case.name
-    );
-    assert!(
-        !client.exited(),
-        "{}: anvil exited during planning gate smoke test; stderr:\n{}\ntrace:\n{}",
-        case.name,
-        client.stderr_text(),
-        client.trace_text()
-    );
-
-    client.shutdown();
-    let _ = stdout_join.join();
-    let _ = stderr_join.join();
-    provider
-}
-
 fn run_p2t_prefix_tail_case(case: SmokeCase, prefix_steps: Vec<Value>) {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().join("repo");
@@ -3611,7 +3429,6 @@ struct JsonRpcClient<'a> {
     trace_path: PathBuf,
     next_id: u64,
     stderr_lines: Vec<String>,
-    plan_permission_response: Option<PlanPermissionResponse>,
     permission_request_count: usize,
     /// `params` of every `session/update` notification observed while waiting
     /// for responses, in arrival order.
@@ -3634,7 +3451,6 @@ impl<'a> JsonRpcClient<'a> {
             trace_path,
             next_id: 1,
             stderr_lines: Vec::new(),
-            plan_permission_response: None,
             permission_request_count: 0,
             session_updates: Vec::new(),
         }
@@ -3678,11 +3494,6 @@ impl<'a> JsonRpcClient<'a> {
             .drain(..)
             .filter_map(|params| params.get("update").cloned())
             .collect()
-    }
-
-    fn with_plan_permission_response(mut self, response: PlanPermissionResponse) -> Self {
-        self.plan_permission_response = Some(response);
-        self
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -3761,24 +3572,8 @@ impl<'a> JsonRpcClient<'a> {
                             == Some("session/request_permission")
                         {
                             self.permission_request_count += 1;
-                            if let Some(response) = self.plan_permission_response {
-                                match response {
-                                    PlanPermissionResponse::Accept => {
-                                        self.respond_permission_selected(&value, "accept_plan");
-                                    }
-                                    PlanPermissionResponse::Reject => {
-                                        self.respond_permission_selected(&value, "reject_plan");
-                                    }
-                                    PlanPermissionResponse::Cancel => {
-                                        self.respond_permission_cancelled(&value);
-                                    }
-                                }
-                            } else {
-                                self.respond_error(&value);
-                            }
-                        } else {
-                            self.respond_error(&value);
                         }
+                        self.respond_error(&value);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -3804,39 +3599,6 @@ impl<'a> JsonRpcClient<'a> {
         });
         writeln!(self.stdin, "{response}").expect("write client error response");
         self.stdin.flush().expect("flush client error response");
-    }
-
-    fn respond_permission_cancelled(&mut self, request: &Value) {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": request.get("id").cloned().unwrap_or(Value::Null),
-            "result": {
-                "outcome": {
-                    "outcome": "cancelled"
-                }
-            }
-        });
-        writeln!(self.stdin, "{response}").expect("write permission cancel response");
-        self.stdin
-            .flush()
-            .expect("flush permission cancel response");
-    }
-
-    fn respond_permission_selected(&mut self, request: &Value, option_id: &str) {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": request.get("id").cloned().unwrap_or(Value::Null),
-            "result": {
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": option_id
-                }
-            }
-        });
-        writeln!(self.stdin, "{response}").expect("write permission selected response");
-        self.stdin
-            .flush()
-            .expect("flush permission selected response");
     }
 
     fn drain_stderr(&mut self) {
