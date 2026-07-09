@@ -15,7 +15,7 @@ pub(crate) const TURN_RECAP_NOTICE_SENTINEL: &str = "\n\n**Anvil Recap**\n";
 /// Upper bound on the rendered work-summary, as a safety valve against a
 /// model that ignores the "a few bullets" instruction. Truncated on a char
 /// boundary with an ellipsis; the deterministic stat lines are unaffected.
-const MAX_RECAP_SUMMARY_CHARS: usize = 4000;
+const MAX_RECAP_SUMMARY_CHARS: usize = 800;
 
 pub(crate) fn render_loop_stop(stop: &LoopStop) -> Option<String> {
     match stop {
