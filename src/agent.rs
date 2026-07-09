@@ -4778,8 +4778,10 @@ GitHub-flavored Markdown.
 - Text is for progress updates, findings, and results; tools are for actions. Avoid \
 low-value narration of individual tool calls (\"I will now run...\"); progress notes should \
 explain intent or evidence, not list mechanics.
-- End a task with a short summary: what changed, how it was verified, and anything the user \
-should know. One to three sentences is enough for simple tasks.
+- For substantial implementation tasks, end with a concise result summary: what changed, how it \
+was verified, and anything the user should know. Skip this wrap-up for simple Q&A, investigation-only \
+turns, or when no change was made. Never imply something was fixed, changed, or tested unless it \
+actually happened.
 
 # Safety
 

@@ -440,18 +440,16 @@ assistant. You will receive one turn -- the user's last message, the \
 assistant's response, and any tool calls and results. Summarize, for the \
 user, what the assistant actually did this turn.\n\
 \n\
-Write a few concise Markdown bullet points (one line each), in plain past \
-tense. Cover:\n\
-- The concrete work performed: files created or edited, commands run, \
-  things investigated or decided.\n\
-- Notable results, conclusions, or answers produced.\n\
-- Any errors hit, tests run and their outcome, and anything left \
-  unfinished or still pending.\n\
+Write at most two concise Markdown bullet points (one line each), in plain \
+past tense. Only mention facts directly supported by the turn:\n\
+- Concrete work actually performed: files created or edited, commands run, \
+  things investigated or decisions made.\n\
+- Notable results, errors, test outcomes, or unfinished work.\n\
 \n\
-Be specific -- name the key files, symbols, commands, and findings. Do not \
-restate the user's request, do not add preamble or a closing remark, and do \
-not wrap the output in any tags or headings. If essentially nothing of \
-substance happened, reply with a single bullet saying so.";
+Do not infer fixes, changes, tests, or conclusions that are not explicit in \
+the turn. Do not restate the user's request, add preamble or a closing remark, \
+or wrap the output in any tags or headings. If no substantive work happened, \
+reply with one short bullet saying so.";
 
 /// Meta-join prompt for the recap style: combine per-part summaries of an
 /// oversized turn into one short user-facing recap.
@@ -460,13 +458,14 @@ part of a single assistant turn that was too large to summarize at once. \
 Combine them into ONE short user-facing recap of what the assistant did \
 this turn.\n\
 \n\
-- Keep the concrete work, results, errors, and anything left unfinished.\n\
+- Keep only concrete work, results, errors, and unfinished items explicit in \
+  the part summaries.\n\
 - Deduplicate facts that appear in multiple parts.\n\
 - Preserve the order in which the work happened.\n\
-- Keep it short: a few Markdown bullet points, one line each.\n\
+- Keep it very short: at most two Markdown bullet points, one line each.\n\
 \n\
-Output only the bullet points -- no preamble, no closing remark, no \
-heading, and no surrounding tags.";
+Do not infer fixes or outcomes that are not explicit. Output only the bullet \
+points -- no preamble, no closing remark, no heading, and no surrounding tags.";
 
 /// Which framing the turn and meta summarization prompts use. The chunk
 /// (extraction) prompt is shared across styles -- only the single-call
