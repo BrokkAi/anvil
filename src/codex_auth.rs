@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
+use std::{future::Future, time::Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -25,10 +26,12 @@ use chrono::{DateTime, Utc};
 // with `oauth2::ExtraTokenFields` generics just to read `id_token`.
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::OpenAiClient;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const AUTH_ISSUER: &str = "https://auth.openai.com";
 const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CALLBACK_PORT: u16 = 1455;
@@ -63,6 +66,101 @@ const REFRESH_AFTER: chrono::Duration = chrono::Duration::days(8);
 
 /// Wait at most this long for the user to complete sign-in in the browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_AUTH_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_DEVICE_INTERVAL_SECS: u64 = 60;
+
+/// The device authorization issued by OpenAI is valid for 15 minutes. Keep
+/// this in lockstep with Codex CLI so headless Anvil logins have the same
+/// completion window.
+const DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone)]
+pub struct DeviceCodePrompt {
+    pub verification_url: String,
+    pub user_code: String,
+}
+
+#[derive(Debug)]
+struct DeviceCode {
+    prompt: DeviceCodePrompt,
+    device_auth_id: String,
+    interval: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceUserCodeResponse {
+    device_auth_id: String,
+    #[serde(alias = "user_code", alias = "usercode")]
+    user_code: String,
+    #[serde(default, deserialize_with = "deserialize_device_interval")]
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceUserCodeRequest<'a> {
+    client_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceTokenRequest<'a> {
+    device_auth_id: &'a str,
+    user_code: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceAuthConfig {
+    issuer: String,
+    token_url: String,
+    client_id: String,
+    timeout: Duration,
+}
+
+impl DeviceAuthConfig {
+    fn production() -> Self {
+        Self {
+            issuer: AUTH_ISSUER.to_string(),
+            token_url: TOKEN_URL.to_string(),
+            client_id: CLIENT_ID.to_string(),
+            timeout: DEVICE_AUTH_TIMEOUT,
+        }
+    }
+
+    fn api_base_url(&self) -> String {
+        format!("{}/api/accounts", self.issuer.trim_end_matches('/'))
+    }
+
+    fn verification_url(&self) -> String {
+        format!("{}/codex/device", self.issuer.trim_end_matches('/'))
+    }
+
+    fn redirect_uri(&self) -> String {
+        format!("{}/deviceauth/callback", self.issuer.trim_end_matches('/'))
+    }
+}
+
+fn deserialize_device_interval<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => value.parse().map_err(serde::de::Error::custom),
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("device interval must be an unsigned integer")),
+        _ => Err(serde::de::Error::custom(
+            "device interval must be a string or unsigned integer",
+        )),
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -237,12 +335,35 @@ pub(crate) fn urlencode(s: &str) -> String {
 }
 
 fn http_client() -> Result<reqwest::Client> {
+    http_client_for(TOKEN_URL)
+}
+
+fn http_client_for(url: &str) -> Result<reqwest::Client> {
     OpenAiClient::apply_runtime_tls_workarounds(
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
-        TOKEN_URL,
+        reqwest::Client::builder()
+            .connect_timeout(AUTH_CONNECT_TIMEOUT)
+            .timeout(AUTH_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none()),
+        url,
     )
     .build()
     .context("building reqwest client")
+}
+
+async fn await_or_cancel<T, F>(cancel: Option<&CancellationToken>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match cancel {
+        Some(cancel) => {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("sign-in was cancelled"),
+                result = future => result,
+            }
+        }
+        None => future.await,
+    }
 }
 
 async fn exchange_code_for_tokens(
@@ -250,14 +371,26 @@ async fn exchange_code_for_tokens(
     code: &str,
     verifier: &str,
 ) -> Result<OidcTokenResponse> {
-    post_token_form(
+    exchange_code_for_tokens_at(http, TOKEN_URL, CLIENT_ID, REDIRECT_URI, code, verifier).await
+}
+
+async fn exchange_code_for_tokens_at(
+    http: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<OidcTokenResponse> {
+    post_token_form_at(
         http,
+        token_url,
         &[
             ("grant_type", "authorization_code"),
-            ("client_id", CLIENT_ID),
+            ("client_id", client_id),
             ("code", code),
             ("code_verifier", verifier),
-            ("redirect_uri", REDIRECT_URI),
+            ("redirect_uri", redirect_uri),
         ],
     )
     .await
@@ -285,20 +418,30 @@ async fn post_token_form(
     http: &reqwest::Client,
     form: &[(&str, &str)],
 ) -> Result<OidcTokenResponse> {
+    post_token_form_at(http, TOKEN_URL, form).await
+}
+
+async fn post_token_form_at(
+    http: &reqwest::Client,
+    token_url: &str,
+    form: &[(&str, &str)],
+) -> Result<OidcTokenResponse> {
     let resp = http
-        .post(TOKEN_URL)
+        .post(token_url)
         .form(form)
         .send()
         .await
         .context("token endpoint POST failed")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("token endpoint returned HTTP {status}: {body}");
+        let body = read_response_text_bounded(resp).await.unwrap_or_default();
+        bail!(
+            "token endpoint returned HTTP {status}: {}",
+            bounded_error_body(&body)
+        );
     }
-    resp.json::<OidcTokenResponse>()
-        .await
-        .context("parsing token endpoint response")
+    let body = read_response_bytes_bounded(resp).await?;
+    serde_json::from_slice::<OidcTokenResponse>(&body).context("parsing token endpoint response")
 }
 
 /// Run the full ChatGPT login flow using the default presenter (open the
@@ -342,6 +485,196 @@ where
     let http = http_client()?;
     let token = exchange_code_for_tokens(&http, &code, verifier.secret()).await?;
 
+    finalize_chatgpt_login(&http, TOKEN_URL, CLIENT_ID, token, None).await
+}
+
+/// Run the official Codex device authorization flow used for headless and
+/// remote clients. The presenter receives a short verification URL and a
+/// one-time code; no loopback listener or SSH port forwarding is required.
+pub async fn interactive_device_login_with<F, Fut>(
+    cancel: &CancellationToken,
+    present: F,
+) -> Result<AuthDotJson>
+where
+    F: FnOnce(DeviceCodePrompt) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    interactive_device_login_with_config(DeviceAuthConfig::production(), cancel, present).await
+}
+
+async fn interactive_device_login_with_config<F, Fut>(
+    config: DeviceAuthConfig,
+    cancel: &CancellationToken,
+    present: F,
+) -> Result<AuthDotJson>
+where
+    F: FnOnce(DeviceCodePrompt) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let http = http_client_for(&config.token_url)?;
+    let device_code = request_device_code(&http, &config, cancel).await?;
+    await_or_cancel(Some(cancel), async {
+        present(device_code.prompt.clone()).await
+    })
+    .await?;
+
+    let authorized = poll_device_code(&http, &config, &device_code, cancel).await?;
+    let redirect_uri = config.redirect_uri();
+    let token = await_or_cancel(Some(cancel), async {
+        exchange_code_for_tokens_at(
+            &http,
+            &config.token_url,
+            &config.client_id,
+            &redirect_uri,
+            &authorized.authorization_code,
+            &authorized.code_verifier,
+        )
+        .await
+    })
+    .await?;
+
+    finalize_chatgpt_login(
+        &http,
+        &config.token_url,
+        &config.client_id,
+        token,
+        Some(cancel),
+    )
+    .await
+}
+
+async fn request_device_code(
+    http: &reqwest::Client,
+    config: &DeviceAuthConfig,
+    cancel: &CancellationToken,
+) -> Result<DeviceCode> {
+    let url = format!("{}/deviceauth/usercode", config.api_base_url());
+    let response = await_or_cancel(Some(cancel), async {
+        http.post(&url)
+            .json(&DeviceUserCodeRequest {
+                client_id: &config.client_id,
+            })
+            .send()
+            .await
+            .context("device-code request failed")
+    })
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = await_or_cancel(Some(cancel), read_response_text_bounded(response))
+            .await
+            .unwrap_or_default();
+        bail!(
+            "device-code request returned HTTP {status}: {}",
+            bounded_error_body(&body)
+        );
+    }
+    let body = await_or_cancel(Some(cancel), read_response_bytes_bounded(response)).await?;
+    let parsed = serde_json::from_slice::<DeviceUserCodeResponse>(&body)
+        .context("parsing device-code response")?;
+    if parsed.device_auth_id.trim().is_empty() || parsed.user_code.trim().is_empty() {
+        bail!("device-code response omitted the authorization id or user code");
+    }
+    Ok(DeviceCode {
+        prompt: DeviceCodePrompt {
+            verification_url: config.verification_url(),
+            user_code: parsed.user_code,
+        },
+        device_auth_id: parsed.device_auth_id,
+        interval: Duration::from_secs(parsed.interval.clamp(1, MAX_DEVICE_INTERVAL_SECS)),
+    })
+}
+
+async fn poll_device_code(
+    http: &reqwest::Client,
+    config: &DeviceAuthConfig,
+    device_code: &DeviceCode,
+    cancel: &CancellationToken,
+) -> Result<DeviceTokenResponse> {
+    let url = format!("{}/deviceauth/token", config.api_base_url());
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= config.timeout {
+            bail!("device authorization timed out after {:?}", config.timeout);
+        }
+        let response = await_or_cancel(Some(cancel), async {
+            http.post(&url)
+                .json(&DeviceTokenRequest {
+                    device_auth_id: &device_code.device_auth_id,
+                    user_code: &device_code.prompt.user_code,
+                })
+                .send()
+                .await
+                .context("device authorization poll failed")
+        })
+        .await?;
+        let status = response.status();
+        if status.is_success() {
+            let body = await_or_cancel(Some(cancel), read_response_bytes_bounded(response)).await?;
+            let parsed = serde_json::from_slice::<DeviceTokenResponse>(&body)
+                .context("parsing device authorization response")?;
+            if parsed.authorization_code.trim().is_empty() || parsed.code_verifier.trim().is_empty()
+            {
+                bail!("device authorization response omitted the authorization code or verifier");
+            }
+            return Ok(parsed);
+        }
+        if status != reqwest::StatusCode::FORBIDDEN && status != reqwest::StatusCode::NOT_FOUND {
+            let body = read_response_text_bounded(response)
+                .await
+                .unwrap_or_default();
+            bail!(
+                "device authorization failed (HTTP {status}): {}",
+                bounded_error_body(&body)
+            );
+        }
+
+        let remaining = config.timeout.saturating_sub(started.elapsed());
+        let delay = device_code.interval.min(remaining);
+        await_or_cancel(Some(cancel), async {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        })
+        .await?;
+    }
+}
+
+fn bounded_error_body(body: &str) -> &str {
+    const MAX_ERROR_BODY_BYTES: usize = 2048;
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        body
+    } else {
+        let mut end = MAX_ERROR_BODY_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        &body[..end]
+    }
+}
+
+async fn read_response_bytes_bounded(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading auth response")? {
+        if body.len().saturating_add(chunk.len()) > MAX_AUTH_RESPONSE_BYTES {
+            bail!("auth response exceeded {MAX_AUTH_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_response_text_bounded(response: reqwest::Response) -> Result<String> {
+    let body = read_response_bytes_bounded(response).await?;
+    String::from_utf8(body).context("auth response was not UTF-8")
+}
+
+async fn finalize_chatgpt_login(
+    http: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    token: OidcTokenResponse,
+    cancel: Option<&CancellationToken>,
+) -> Result<AuthDotJson> {
     let id_token = token
         .id_token
         .clone()
@@ -359,9 +692,17 @@ where
     // Subscription routing only needs the access_token + account_id we
     // already have; the API key is stored only as a convenience for
     // users who later run `codex` itself in apikey mode.
-    let api_key = match token_exchange_id_token(&http, TOKEN_URL, CLIENT_ID, &id_token).await {
+    let api_key = match await_or_cancel(
+        cancel,
+        token_exchange_id_token(http, token_url, client_id, &id_token),
+    )
+    .await
+    {
         Ok(key) => Some(key),
         Err(e) => {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(e);
+            }
             tracing::info!(
                 "skipping API key derivation (typical for ChatGPT-only accounts): {e:#}"
             );
@@ -381,6 +722,9 @@ where
         }),
         last_refresh: Some(Utc::now()),
     };
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        bail!("sign-in was cancelled");
+    }
     write_auth_dot_json(&auth)?;
     Ok(auth)
 }
@@ -489,13 +833,14 @@ async fn token_exchange_id_token(
         .context("token-exchange POST failed")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("token-exchange failed (HTTP {status}): {body}");
+        let body = read_response_text_bounded(resp).await.unwrap_or_default();
+        bail!(
+            "token-exchange failed (HTTP {status}): {}",
+            bounded_error_body(&body)
+        );
     }
-    let parsed: Resp = resp
-        .json()
-        .await
-        .context("parsing token-exchange response")?;
+    let body = read_response_bytes_bounded(resp).await?;
+    let parsed: Resp = serde_json::from_slice(&body).context("parsing token-exchange response")?;
     Ok(parsed.access_token)
 }
 
@@ -614,6 +959,48 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{body_json, body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn test_access_token(account_id: &str) -> String {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+            }
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("header.{payload}.signature")
+    }
+
+    #[derive(Clone)]
+    struct PendingThenAuthorized {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for PendingThenAuthorized {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(403)
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authorization_code": "device-authorization-code",
+                    "code_verifier": "device-verifier",
+                }))
+            }
+        }
+    }
+
+    fn test_device_config(server: &MockServer, timeout: Duration) -> DeviceAuthConfig {
+        DeviceAuthConfig {
+            issuer: server.uri(),
+            token_url: format!("{}/oauth/token", server.uri()),
+            client_id: "test-client".to_string(),
+            timeout,
+        }
+    }
 
     #[test]
     fn auth_json_round_trip_preserves_codex_field_names() {
@@ -747,5 +1134,117 @@ mod tests {
         assert!(url.contains("code_challenge="));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("state=test-state"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_login_polls_and_persists_codex_compatible_credentials() {
+        let server = MockServer::start().await;
+        let codex_home = tempfile::tempdir().unwrap();
+        let _scope = TestCodexHomeScope::set(codex_home.path().to_path_buf());
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/usercode"))
+            .and(body_json(serde_json::json!({"client_id": "test-client"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_auth_id": "device-auth-id",
+                "user_code": "ABCD-EFGH",
+                "interval": "1",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .and(body_json(serde_json::json!({
+                "device_auth_id": "device-auth-id",
+                "user_code": "ABCD-EFGH",
+            })))
+            .respond_with(PendingThenAuthorized {
+                calls: poll_calls.clone(),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=device-authorization-code"))
+            .and(body_string_contains("code_verifier=device-verifier"))
+            .and(body_string_contains("redirect_uri=http%3A%2F%2F127.0.0.1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": test_access_token("acct-device"),
+                "refresh_token": "device-refresh-token",
+                "id_token": "device-id-token",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains("token-exchange"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("no API organization"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_device_config(&server, Duration::from_secs(3));
+        let expected_url = config.verification_url();
+        let cancel = CancellationToken::new();
+        let auth = interactive_device_login_with_config(config, &cancel, |prompt| async move {
+            assert_eq!(prompt.verification_url, expected_url);
+            assert_eq!(prompt.user_code, "ABCD-EFGH");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(auth.auth_mode.as_deref(), Some("chatgpt"));
+        assert_eq!(auth.openai_api_key, None);
+        let tokens = auth.tokens.unwrap();
+        assert_eq!(tokens.account_id, "acct-device");
+        assert_eq!(tokens.refresh_token, "device-refresh-token");
+        assert!(auth_json_path().unwrap().exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_login_cancellation_interrupts_poll_delay_without_writing_credentials() {
+        let server = MockServer::start().await;
+        let codex_home = tempfile::tempdir().unwrap();
+        let _scope = TestCodexHomeScope::set(codex_home.path().to_path_buf());
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/usercode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_auth_id": "pending-device",
+                "user_code": "WAIT-1234",
+                "interval": "30",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let config = test_device_config(&server, Duration::from_secs(60));
+        let cancel = CancellationToken::new();
+        let cancel_after_present = cancel.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            interactive_device_login_with_config(config, &cancel, move |_prompt| async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cancel_after_present.cancel();
+                });
+                Ok(())
+            }),
+        )
+        .await
+        .expect("cancellation must interrupt the long poll delay");
+
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(!auth_json_path().unwrap().exists());
     }
 }
