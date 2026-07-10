@@ -2264,11 +2264,35 @@ pub async fn run_agent(
                     if let Some(target) = setup_elicitation_target(&raw_prompt_text) {
                         let caps = sessions_prompt.client_elicitation_caps().await;
                         if target.is_supported(caps) {
+                            let cancel = match sessions_prompt.start_prompt(&session_id).await {
+                                Ok(cancel) => cancel,
+                                Err(PromptStartError::AlreadyInFlight) => {
+                                    tracing::warn!(
+                                        "rejecting concurrent ACP setup prompt session={session_id}"
+                                    );
+                                    return responder.respond_with_error(
+                                        agent_client_protocol::Error::invalid_params().data(
+                                            serde_json::json!({
+                                                "reason": format!(
+                                                    "prompt already in flight for session '{session_id}'"
+                                                ),
+                                            }),
+                                        ),
+                                    );
+                                }
+                                Err(PromptStartError::UnknownSession) => {
+                                    return responder
+                                        .respond_with_error(unknown_session_error(&session_id));
+                                }
+                            };
                             let cx_for_setup = cx.clone();
                             let sessions_for_setup = sessions_prompt.clone();
+                            let sessions_for_spawn_failure = sessions_prompt.clone();
                             let session_id_for_setup = session_id.clone();
+                            let session_id_for_spawn_failure = session_id.clone();
                             let llm_for_setup = llm_login.clone();
                             let refresh_lock_for_setup = refresh_lock_login.clone();
+                            let cancel_for_setup = cancel.clone();
                             let spawn_result = cx.spawn(async move {
                                 // SAFETY: we are inside `cx.spawn`, so `block_task`
                                 // (reached via the `SpawnedCx` witness) is safe.
@@ -2281,19 +2305,26 @@ pub async fn run_agent(
                                     &session_id_for_setup,
                                     &llm_for_setup,
                                     &refresh_lock_for_setup,
+                                    &cancel_for_setup,
                                 )
                                 .await;
-                                if let Err(e) = responder.respond(prompt_end_turn_response()) {
+                                let cancelled = cancel_for_setup.is_cancelled();
+                                sessions_for_setup
+                                    .finish_prompt(&session_id_for_setup)
+                                    .await;
+                                if let Err(e) = responder.respond(prompt_stop_response(cancelled)) {
                                     tracing::warn!(
                                         "failed to deliver /setup elicitation PromptResponse: {e}"
                                     );
                                 }
                                 Ok(())
                             });
-                            // Unlike the model-turn spawn, there is no
-                            // in-flight token to clear here, so a failed spawn
-                            // just propagates.
-                            spawn_result?;
+                            if let Err(e) = spawn_result {
+                                sessions_for_spawn_failure
+                                    .finish_prompt(&session_id_for_spawn_failure)
+                                    .await;
+                                return Err(e);
+                            }
                             return Ok(());
                         }
                         // Capability not advertised: fall through to the text flow.
@@ -6519,17 +6550,26 @@ async fn run_setup_elicitation(
     session_id: &str,
     llm: &Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
     match target {
         SetupElicitTarget::Home => {
-            run_setup_home_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock).await;
+            run_setup_home_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock, cancel)
+                .await;
         }
         SetupElicitTarget::Sandbox => {
-            run_setup_sandbox_elicitation(spawned_cx, sessions, session_id).await;
+            run_setup_sandbox_elicitation(spawned_cx, sessions, session_id, cancel).await;
         }
         SetupElicitTarget::CodexLogin => {
-            run_setup_codex_login_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock)
-                .await;
+            run_setup_codex_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
         }
         SetupElicitTarget::OpenRouterLogin => {
             run_setup_openrouter_login_elicitation(
@@ -6538,38 +6578,38 @@ async fn run_setup_elicitation(
                 session_id,
                 llm,
                 refresh_lock,
+                cancel,
             )
             .await;
         }
     }
 }
 
-/// Stable id for the in-flight Codex sign-in elicitation. Only one login runs
-/// at a time, so a constant id is enough to pair the `elicitation/create`
-/// request with its `elicitation/complete` notification.
+/// Stable id for the Codex sign-in elicitation. The ACP request is additionally
+/// scoped by `sessionId`, so this id can safely be reused by concurrent sessions
+/// while pairing each request with its `elicitation/complete` notification.
 const CODEX_LOGIN_ELICITATION_ID: &str = "codex-login";
 
-/// `/setup codex` as a URL-mode sign-in prompt. Hands the ChatGPT authorize
-/// URL to the client (which opens it on the *user's* machine -- the whole
-/// point for remote/headless clients, where a server-side `webbrowser::open`
-/// would open on the wrong host), waits for the existing loopback callback to
-/// complete the OAuth exchange, then installs the backend via the shared
-/// `finish_codex_login`. Decline/Cancel (or a transport error) abort the login
-/// and leave credentials untouched.
+/// `/setup codex` as a URL-mode device sign-in prompt. The short verification
+/// URL and one-time code are usable from SSH without a loopback callback or
+/// port forwarding. Decline/Cancel (or a transport error) abort the login and
+/// leave credentials untouched.
 async fn run_setup_codex_login_elicitation(
     spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
     sessions: &SessionStore,
     session_id: &str,
     llm: &Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
     let cx = spawned_cx.cx();
 
-    // Present the authorize URL via url-mode elicitation instead of opening a
-    // browser on the server. `interactive_login_with` awaits this before it
-    // starts the loopback wait; returning `Err` aborts the login.
-    let result = crate::codex_auth::interactive_login_with(|auth_url| async move {
-        let request = build_codex_login_elicitation_request(session_id, auth_url);
+    let result = crate::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
+        let request = build_codex_login_elicitation_request(
+            session_id,
+            prompt.verification_url,
+            &prompt.user_code,
+        );
         match cx.send_request(request).block_task().await {
             Ok(resp) => match resp.action {
                 ElicitationAction::Accept(_) => Ok(()),
@@ -6584,11 +6624,12 @@ async fn run_setup_codex_login_elicitation(
     })
     .await;
 
+    // URL elicitations remain open while device authorization is polling.
+    // Always dismiss the client surface, including timeout/cancel/error paths.
+    notify_elicitation_complete(cx, CODEX_LOGIN_ELICITATION_ID);
+
     match result {
         Ok(auth) => {
-            // Tell the client the URL flow finished so it can dismiss any
-            // lingering prompt, then run the shared post-login bookkeeping.
-            notify_elicitation_complete(cx, CODEX_LOGIN_ELICITATION_ID);
             let message = finish_codex_login(
                 auth,
                 llm,
@@ -6600,11 +6641,13 @@ async fn run_setup_codex_login_elicitation(
             send_message(cx, session_id, &message);
         }
         Err(e) => {
-            send_message(
-                cx,
-                session_id,
-                &format!("Codex login did not complete: {e:#}"),
-            );
+            if !cancel.is_cancelled() {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!("Codex login did not complete: {e:#}"),
+                );
+            }
         }
     }
 }
@@ -6613,16 +6656,17 @@ async fn run_setup_codex_login_elicitation(
 /// authorize URL for the client to open.
 fn build_codex_login_elicitation_request(
     session_id: &str,
-    auth_url: String,
+    verification_url: String,
+    user_code: &str,
 ) -> CreateElicitationRequest {
     let mode = ElicitationUrlMode::new(
         ElicitationSessionScope::new(session_id.to_string()),
         CODEX_LOGIN_ELICITATION_ID,
-        auth_url,
+        verification_url,
     );
     CreateElicitationRequest::new(
         mode,
-        "Open this link to sign in to ChatGPT, then return here.",
+        format!("Open this link and enter the one-time code `{user_code}` to sign in to ChatGPT."),
     )
 }
 
@@ -6647,6 +6691,7 @@ async fn run_setup_openrouter_login_elicitation(
     session_id: &str,
     llm: &Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
     let cx = spawned_cx.cx();
 
@@ -6656,7 +6701,12 @@ async fn run_setup_openrouter_login_elicitation(
     }
 
     let request = build_openrouter_key_elicitation_request(session_id);
-    let message = match cx.send_request(request).block_task().await {
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        response = cx.send_request(request).block_task() => response,
+    };
+    let message = match response {
         Ok(resp) => match resp.action {
             ElicitationAction::Accept(accept) => {
                 let key = accept
@@ -6722,10 +6772,16 @@ async fn run_setup_sandbox_elicitation(
     spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
     sessions: &SessionStore,
     session_id: &str,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
     let request = build_sandbox_elicitation_request(sessions, session_id).await;
     let cx = spawned_cx.cx();
-    match cx.send_request(request).block_task().await {
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        response = cx.send_request(request).block_task() => response,
+    };
+    match response {
         Ok(resp) => {
             let message =
                 apply_sandbox_elicitation_outcome(resp.action, sessions, session_id).await;
@@ -6944,10 +7000,16 @@ async fn run_setup_home_elicitation(
     session_id: &str,
     llm: &Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
     let cx = spawned_cx.cx();
     let request = build_setup_home_elicitation_request(session_id);
-    let action = match cx.send_request(request).block_task().await {
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        response = cx.send_request(request).block_task() => response,
+    };
+    let action = match response {
         Ok(resp) => resp.action,
         Err(e) => {
             tracing::warn!("/setup home elicitation failed: {e}");
@@ -6992,8 +7054,15 @@ async fn run_setup_home_elicitation(
         // Interactive sub-flows: chain into the matching elicitation, which
         // sends its own progress/result messages.
         Some(SetupHomeRoute::Codex) => {
-            run_setup_codex_login_elicitation(spawned_cx, sessions, session_id, llm, refresh_lock)
-                .await;
+            run_setup_codex_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
         }
         Some(SetupHomeRoute::OpenRouter) => {
             run_setup_openrouter_login_elicitation(
@@ -7002,6 +7071,7 @@ async fn run_setup_home_elicitation(
                 session_id,
                 llm,
                 refresh_lock,
+                cancel,
             )
             .await;
         }
@@ -13707,8 +13777,8 @@ mod tests {
     /// carrying the authorize URL and the stable completion id.
     #[test]
     fn codex_login_elicitation_request_shape() {
-        let url = "https://auth.openai.com/authorize?client_id=app&state=xyz";
-        let req = build_codex_login_elicitation_request("sess-1", url.to_string());
+        let url = "https://auth.openai.com/codex/device";
+        let req = build_codex_login_elicitation_request("sess-1", url.to_string(), "ABCD-EFGH");
         let json = serde_json::to_value(&req).unwrap();
 
         assert_eq!(json["mode"], "url");
@@ -13718,7 +13788,7 @@ mod tests {
         assert!(
             json["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("sign in")),
+                .is_some_and(|m| m.contains("ABCD-EFGH") && m.contains("sign in")),
             "got: {}",
             json["message"]
         );
