@@ -252,6 +252,7 @@ fn validate_additional_directories(
 fn prompt_response_meta(
     result: Option<&StructuredOutputResult>,
     orchestration_model: Option<&ResolvedModelInfo>,
+    failure: Option<&crate::tool_loop::TurnFailure>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut meta = build_structured_output_meta(result).unwrap_or_default();
     if let Some(model) = orchestration_model {
@@ -280,6 +281,26 @@ fn prompt_response_meta(
                     "selection_source": "inherits_orchestration",
                     "reason": "ACP session/prompt does not support a separate internal specialist model; task subagents inherit the orchestration model.",
                 }
+            }),
+        );
+        meta.insert(
+            crate::structured_output::ACP_META_NAMESPACE.to_string(),
+            serde_json::Value::Object(namespace),
+        );
+    }
+    if let Some(failure) = failure {
+        let mut namespace = meta
+            .remove(crate::structured_output::ACP_META_NAMESPACE)
+            .and_then(|value| match value {
+                serde_json::Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+        namespace.insert(
+            "turnFailure".to_string(),
+            serde_json::json!({
+                "message": &failure.message,
+                "retryable": failure.retryable,
             }),
         );
         meta.insert(
@@ -2706,6 +2727,7 @@ pub async fn run_agent(
                         let response = response.meta(prompt_response_meta(
                             structured_output_result.as_ref(),
                             Some(&orchestration_model_for_response),
+                            None,
                         ));
                         if let Err(e) = responder.respond(response) {
                             tracing::warn!(
@@ -2785,6 +2807,7 @@ pub async fn run_agent(
                             .meta(prompt_response_meta(
                                 None,
                                 Some(&orchestration_model_for_response),
+                                None,
                             ));
                         if let Err(e) = responder.respond(response) {
                             tracing::warn!(
@@ -2977,6 +3000,7 @@ pub async fn run_agent(
                     let response = response.meta(prompt_response_meta(
                         structured_output_result.as_ref(),
                         Some(&orchestration_model_for_response),
+                        turn_result.stop.failure(),
                     ));
                     if let Err(e) = responder.respond(response) {
                         tracing::warn!(
@@ -11055,7 +11079,7 @@ mod tests {
                 validated_output: serde_json::json!({"answer":"ok"}),
                 coercion_requested: false,
             });
-        let meta = prompt_response_meta(Some(&result), None).expect("meta present");
+        let meta = prompt_response_meta(Some(&result), None, None).expect("meta present");
         assert_eq!(
             meta["anvil"]["structuredOutput"]["status"],
             serde_json::Value::String("success".into())
@@ -11080,7 +11104,7 @@ mod tests {
                 coercion_requested: true,
             },
         );
-        let meta = prompt_response_meta(Some(&result), None).expect("meta present");
+        let meta = prompt_response_meta(Some(&result), None, None).expect("meta present");
         assert_eq!(
             meta["anvil"]["structuredOutput"]["status"],
             serde_json::Value::String("coerced_success".into())
@@ -11109,7 +11133,7 @@ mod tests {
                 coercion_requested: true,
             },
         );
-        let meta = prompt_response_meta(Some(&result), None).expect("meta present");
+        let meta = prompt_response_meta(Some(&result), None, None).expect("meta present");
         assert_eq!(
             meta["anvil"]["structuredOutput"]["status"],
             serde_json::Value::String("validation_error".into())
@@ -11122,7 +11146,20 @@ mod tests {
 
     #[test]
     fn prompt_response_meta_is_absent_without_structured_output() {
-        assert!(prompt_response_meta(None, None).is_none());
+        assert!(prompt_response_meta(None, None, None).is_none());
+    }
+
+    #[test]
+    fn prompt_response_meta_surfaces_failed_turn() {
+        let failure = crate::tool_loop::TurnFailure {
+            retryable: true,
+            message: "stream read error".to_string(),
+        };
+
+        let meta = prompt_response_meta(None, None, Some(&failure)).expect("meta present");
+
+        assert_eq!(meta["anvil"]["turnFailure"]["message"], "stream read error");
+        assert_eq!(meta["anvil"]["turnFailure"]["retryable"], true);
     }
 
     #[test]
@@ -11132,7 +11169,7 @@ mod tests {
             resolved_provider: Some("openrouter".into()),
             resolved_model: "google/gemini-3.1-pro-preview".into(),
         };
-        let meta = prompt_response_meta(None, Some(&model)).expect("meta present");
+        let meta = prompt_response_meta(None, Some(&model), None).expect("meta present");
 
         assert_eq!(
             meta["anvil"]["modelSelection"]["orchestration"]["configured_model"],

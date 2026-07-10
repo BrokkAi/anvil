@@ -137,9 +137,19 @@ pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
         return Some(LlmRetryTier::Fast);
     }
 
+    // `retryable_llm_context` attaches the marker as an anyhow context so the
+    // original transport error remains available as the source. Anyhow can
+    // downcast through contexts from `Error` itself, while the standard
+    // `Error::source` chain does not expose the context value as its concrete
+    // type. Check the full anyhow error first, then retain the chain walk for
+    // marker errors supplied directly by a backend.
     error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<RetryableLlmError>())
+        .downcast_ref::<RetryableLlmError>()
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<RetryableLlmError>())
+        })
         .map(RetryableLlmError::tier)
 }
 
@@ -2093,6 +2103,24 @@ mod tests {
         let quoted_upstream_text =
             anyhow::anyhow!("tool output mentioned server_error but the request was valid");
         assert_eq!(llm_retry_tier(&quoted_upstream_text), None);
+    }
+
+    #[test]
+    fn retryable_stream_context_preserves_transport_classification() {
+        let transport = anyhow::anyhow!(
+            "error decoding response body: error reading a body from connection: connection reset"
+        );
+        let error = crate::http_retry::retryable_llm_context(
+            transport,
+            "stream read error",
+            crate::http_retry::RetryableLlmError::fast("stream read error"),
+        );
+
+        assert_eq!(
+            llm_retry_tier(&error),
+            Some(crate::http_retry::LlmRetryTier::Fast)
+        );
+        assert!(is_retryable_llm_error(&error));
     }
 
     #[tokio::test]
