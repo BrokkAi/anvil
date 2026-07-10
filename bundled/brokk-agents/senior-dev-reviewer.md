@@ -13,7 +13,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources
@@ -76,7 +76,7 @@ Brokk MCP tools (bifrost):
   assess whether the changes are consistent
 - `search_symbols` -- find related symbols (e.g., siblings of a refactored
   method that should also have been updated)
-- `scan_usages` -- verify that ALL callers of modified methods or
+- `scan_usages_by_reference` -- verify that ALL callers of modified methods or
   interfaces were updated (catch incomplete refactors). Requires fully
   qualified names; use `search_symbols` first. Pass
   `include_tests: true` to also find affected tests

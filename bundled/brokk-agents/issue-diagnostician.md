@@ -13,7 +13,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources
@@ -78,7 +78,7 @@ Brokk MCP tools (bifrost):
   classes relevant to the issue (use `kind_filter` to disambiguate)
 - `get_summaries` -- get API-level and package-level summaries of files,
   classes, and packages related to the issue
-- `scan_usages` -- trace usages and call chains across the codebase
+- `scan_usages_by_reference` -- trace usages and call chains across the codebase
   (requires fully qualified names; use `search_symbols` first)
 - `search_file_contents` / `find_files_containing` -- search for error
   messages, configuration keys, log strings, or other non-symbol
@@ -109,7 +109,7 @@ Built-in tools:
    code.
 3. Use `get_symbol_sources` and `get_summaries` to understand the
    implementation.
-4. Use `scan_usages` to trace data flow and call chains.
+4. Use `scan_usages_by_reference` to trace data flow and call chains.
 5. Use `get_git_log` to check recent changes to the affected files.
 6. Synthesize your findings into the structured output below.
 

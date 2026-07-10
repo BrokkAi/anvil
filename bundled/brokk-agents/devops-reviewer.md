@@ -13,7 +13,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources

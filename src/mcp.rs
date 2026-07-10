@@ -1250,7 +1250,6 @@ mod tests {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "scan_usages",
             "usage_graph",
             "activate_workspace",
             "get_active_workspace",
@@ -1264,6 +1263,10 @@ mod tests {
                 "missing tool {expected} in {names:?}"
             );
         }
+        assert!(
+            names.contains(&"scan_usages_by_reference") || names.contains(&"scan_usages"),
+            "missing reference usage-scanning tool in {names:?}"
+        );
 
         // The SlopCop code-quality reporters must be advertised by the default
         // surface AND known to Anvil's permission metadata, so read-only ACP

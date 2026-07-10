@@ -13,7 +13,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources
@@ -76,7 +76,7 @@ Brokk MCP tools (bifrost):
 - `get_symbol_sources` -- read specific methods or classes to evaluate
   complexity and abstraction level (use the optional `kind_filter` to
   disambiguate when a name resolves in multiple kinds)
-- `scan_usages` -- assess coupling by finding every caller and reference
+- `scan_usages_by_reference` -- assess coupling by finding every caller and reference
   of a symbol (requires a fully qualified name; use `search_symbols`
   first)
 - `get_symbol_ancestors` -- inspect a class's inheritance chain when

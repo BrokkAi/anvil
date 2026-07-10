@@ -13,7 +13,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources
@@ -76,7 +76,7 @@ Brokk MCP tools (bifrost):
   diff
 - `get_summaries` -- understand the API surface of security-related
   classes to check if the PR bypasses existing safeguards
-- `scan_usages` -- trace data flow from user inputs to dangerous sinks:
+- `scan_usages_by_reference` -- trace data flow from user inputs to dangerous sinks:
   find every caller and reference of a security-relevant symbol
   (requires a fully qualified name; use `search_symbols` first)
 - `search_file_contents` -- search for sink names (SQL execution,

@@ -13,7 +13,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources
@@ -75,7 +75,7 @@ Brokk MCP tools (bifrost):
 - `get_summaries` -- understand the API surface to ensure your plan is
   compatible with existing interfaces, and the package structure so new
   files or edits land in the right place
-- `scan_usages` -- check that your planned changes won't break callers
+- `scan_usages_by_reference` -- check that your planned changes won't break callers
   (requires fully qualified names; use `search_symbols` first). Pass
   `include_tests: true` to find tests that cover the affected code
 - `most_relevant_files` -- discover related modules and tests by

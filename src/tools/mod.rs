@@ -331,6 +331,11 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Searching AST",
     },
     ToolMeta {
+        name: "query_code",
+        kind: ToolKind::Search,
+        display_name: "Querying code structure",
+    },
+    ToolMeta {
         name: "get_symbol_locations",
         kind: ToolKind::Search,
         display_name: "Finding symbol locations",
@@ -356,6 +361,13 @@ const TOOLS: &[ToolMeta] = &[
         display_name: "Finding related files",
     },
     ToolMeta {
+        name: "scan_usages_by_reference",
+        kind: ToolKind::Search,
+        display_name: "Scanning symbol usages",
+    },
+    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
+    // New guidance and local Bifrost builds advertise the split reference name.
+    ToolMeta {
         name: "scan_usages",
         kind: ToolKind::Search,
         display_name: "Scanning symbol usages",
@@ -365,6 +377,12 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Search,
         display_name: "Building usage graph",
     },
+    ToolMeta {
+        name: "get_definitions_by_reference",
+        kind: ToolKind::Search,
+        display_name: "Finding definition",
+    },
+    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
     ToolMeta {
         name: "get_definition_by_reference",
         kind: ToolKind::Search,
@@ -388,6 +406,12 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Read,
         display_name: "Reading file contents",
     },
+    ToolMeta {
+        name: "classify_test_files",
+        kind: ToolKind::Read,
+        display_name: "Classifying test files",
+    },
+    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
     ToolMeta {
         name: "contains_tests",
         kind: ToolKind::Read,
@@ -878,7 +902,7 @@ impl ToolRegistry {
         if builtin_tools.contains("grep_search") {
             defs.push(tool_def(
                 "grep_search",
-                "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages.",
+                "Searches file contents with a regex. Use for text/config/docs or when symbol tools do not fit; for code declarations prefer search_symbols, and for references/callers prefer scan_usages_by_reference.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2043,6 +2067,15 @@ mod tests {
             mcp_tool_description("search_symbols", "bifrost's raw description"),
             "bifrost's raw description"
         );
+    }
+
+    #[test]
+    fn split_and_legacy_scan_usage_names_are_permission_classified() {
+        assert_eq!(
+            ToolRegistry::tool_kind("scan_usages_by_reference"),
+            ToolKind::Search
+        );
+        assert_eq!(ToolRegistry::tool_kind("scan_usages"), ToolKind::Search);
     }
 
     #[tokio::test]

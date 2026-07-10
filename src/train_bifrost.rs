@@ -198,7 +198,7 @@ fn inspected_training_files<'a>(
 fn is_successful_bifrost_content_exchange(exchange: &ToolExchange) -> bool {
     matches!(
         exchange.tool_name.as_str(),
-        "get_symbol_sources" | "get_summaries" | "scan_usages"
+        "get_symbol_sources" | "get_summaries" | "scan_usages_by_reference" | "scan_usages"
     ) && !exchange.result.starts_with("Error:")
         && !exchange.result.starts_with("Internal error:")
 }

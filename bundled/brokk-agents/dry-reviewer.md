@@ -12,7 +12,7 @@ tools:
   - run_shell_command
   - search_symbols
   - get_symbol_locations
-  - scan_usages
+  - scan_usages_by_reference
   - get_symbol_ancestors
   - most_relevant_files
   - get_symbol_sources
@@ -69,7 +69,7 @@ Brokk MCP tools (bifrost):
   neighboring utilities before checking concrete method bodies
 - `get_symbol_sources` -- read the bodies of candidate existing
   implementations to confirm they actually duplicate the new code
-- `scan_usages` -- check whether callers of similar code elsewhere
+- `scan_usages_by_reference` -- check whether callers of similar code elsewhere
   already use a shared helper that this PR should also use (requires a
   fully qualified name; use `search_symbols` first)
 - `report_structural_clone_smells` -- run directly on the PR's changed

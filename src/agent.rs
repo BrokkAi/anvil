@@ -4797,7 +4797,7 @@ tools over cat/head/sed, edit/write tools over sed or heredocs, content search o
 grep/rg, directory listing over ls.
 - When code-intelligence tools are advertised, prefer them for code questions: \
 search_symbols to locate declarations, get_summaries for API shape and orientation, \
-get_symbol_sources for full definitions, scan_usages for callers. Use text search for \
+get_symbol_sources for full definitions, scan_usages_by_reference for callers. Use text search for \
 plain text, configuration, and docs.
 - Use the shell where CLI semantics matter: builds, tests, git, package managers, pipelines.
 - If a tool call is denied, do not attempt the same action by another route; ask or move on.

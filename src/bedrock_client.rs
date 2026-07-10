@@ -2361,7 +2361,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             r#type: "function".to_string(),
             function: FunctionDef {
-                name: "scan_usages".to_string(),
+                name: "scan_usages_by_reference".to_string(),
                 description: "Find references by symbol or source location".to_string(),
                 parameters: serde_json::json!({
                     "oneOf": [

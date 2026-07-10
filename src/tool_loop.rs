@@ -4596,6 +4596,10 @@ fn is_text_navigation_tool(name: &str) -> bool {
     matches!(name, "read_file" | "grep_search" | "list_directory")
 }
 
+fn is_scan_usages_tool(name: &str) -> bool {
+    matches!(name, "scan_usages_by_reference" | "scan_usages")
+}
+
 fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
     serde_json::json!({
         "read_file": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "read_file").count(),
@@ -4604,7 +4608,7 @@ fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
         "run_shell_command": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "run_shell_command").count(),
         "search_symbols": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "search_symbols").count(),
         "get_symbol_sources": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "get_symbol_sources").count(),
-        "scan_usages": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "scan_usages").count(),
+        "scan_usages_by_reference": tool_exchanges.iter().filter(|exchange| is_scan_usages_tool(&exchange.tool_name)).count(),
         "get_summaries": tool_exchanges.iter().filter(|exchange| exchange.tool_name == "get_summaries").count(),
     })
 }
@@ -4659,14 +4663,11 @@ fn tool_result_failed(result: &str) -> bool {
 }
 
 fn is_bifrost_context_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "search_symbols"
-            | "get_symbol_sources"
-            | "scan_usages"
-            | "get_summaries"
-            | "get_symbol_locations"
-    )
+    is_scan_usages_tool(name)
+        || matches!(
+            name,
+            "search_symbols" | "get_symbol_sources" | "get_summaries" | "get_symbol_locations"
+        )
 }
 
 fn trace_bifrost_context_shadow(
@@ -4717,16 +4718,16 @@ fn should_reject_no_edit_final_answer(
         return false;
     }
     tool_exchanges.iter().any(|exchange| {
-        matches!(
-            exchange.tool_name.as_str(),
-            "search_symbols"
-                | "get_symbol_sources"
-                | "scan_usages"
-                | "get_summaries"
-                | "read_file"
-                | "grep_search"
-                | "list_directory"
-        )
+        is_scan_usages_tool(&exchange.tool_name)
+            || matches!(
+                exchange.tool_name.as_str(),
+                "search_symbols"
+                    | "get_symbol_sources"
+                    | "get_summaries"
+                    | "read_file"
+                    | "grep_search"
+                    | "list_directory"
+            )
     })
 }
 
@@ -4814,7 +4815,7 @@ fn maybe_text_navigation_gate(
     }
     if !is_text_navigation_tool(tool_name)
         || !has_tool(tools, "get_summaries")
-        || !has_tool(tools, "scan_usages")
+        || !(has_tool(tools, "scan_usages_by_reference") || has_tool(tools, "scan_usages"))
     {
         return None;
     }
@@ -4829,7 +4830,7 @@ fn maybe_text_navigation_gate(
             "Navigation gate: you have used text/file navigation several times in this turn. \
              Before another read_file/grep_search call, choose one: call `get_summaries` for the \
              relevant module, package, class, API, or file glob if you are still orienting; call \
-             `scan_usages` if you are looking for callers, references, or related tests for a known \
+             `scan_usages_by_reference` if you are looking for callers, references, or related tests for a known \
              symbol; or retry the text-navigation call if the needed context is already localized. \
              Do not call Bifrost ceremonially -- use it only if it answers the current context question."
                 .to_string(),
@@ -6223,11 +6224,17 @@ mod tests {
             tool_call_for_test("grep_search"),
             tool_call_for_test("search_symbols"),
             tool_call_for_test("read_file"),
-            tool_call_for_test("scan_usages"),
+            tool_call_for_test("scan_usages_by_reference"),
         ];
 
-        let names =
-            ordered_names_for_test(&calls, &["get_summaries", "search_symbols", "scan_usages"]);
+        let names = ordered_names_for_test(
+            &calls,
+            &[
+                "get_summaries",
+                "search_symbols",
+                "scan_usages_by_reference",
+            ],
+        );
 
         assert_eq!(
             names,
@@ -6236,7 +6243,7 @@ mod tests {
                 "read_file",
                 "get_summaries",
                 "search_symbols",
-                "scan_usages"
+                "scan_usages_by_reference"
             ]
         );
     }
@@ -6751,7 +6758,7 @@ mod tests {
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
             tool_def_for_test("get_summaries"),
-            tool_def_for_test("scan_usages"),
+            tool_def_for_test("scan_usages_by_reference"),
         ];
         let prior = vec![
             exchange_for_test("read_file"),
@@ -6764,7 +6771,7 @@ mod tests {
 
         assert!(output.contains("Navigation gate:"));
         assert!(output.contains("get_summaries"));
-        assert!(output.contains("scan_usages"));
+        assert!(output.contains("scan_usages_by_reference"));
     }
 
     #[test]
@@ -6773,7 +6780,7 @@ mod tests {
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
             tool_def_for_test("get_summaries"),
-            tool_def_for_test("scan_usages"),
+            tool_def_for_test("scan_usages_by_reference"),
         ];
         let prior = vec![
             exchange_for_test("read_file"),
@@ -6792,7 +6799,7 @@ mod tests {
             tool_def_for_test("read_file"),
             tool_def_for_test("grep_search"),
             tool_def_for_test("get_summaries"),
-            tool_def_for_test("scan_usages"),
+            tool_def_for_test("scan_usages_by_reference"),
         ];
         let prior = vec![
             exchange_for_test("read_file"),
@@ -6992,7 +6999,7 @@ mod tests {
         let prior = vec![
             exchange_for_test("search_symbols"),
             exchange_for_test("get_symbol_sources"),
-            exchange_for_test("scan_usages"),
+            exchange_for_test("scan_usages_by_reference"),
             exchange_for_test("get_summaries"),
             exchange_for_test("read_file"),
         ];
@@ -7036,7 +7043,7 @@ mod tests {
     fn no_edit_progress_nudge_uses_turn_threshold_without_context_gate() {
         let prior = vec![
             exchange_for_test("search_symbols"),
-            exchange_for_test("scan_usages"),
+            exchange_for_test("scan_usages_by_reference"),
             exchange_for_test("get_summaries"),
             exchange_for_test("search_symbols"),
             exchange_for_test("read_file"),
@@ -7066,7 +7073,7 @@ mod tests {
         let prior = vec![
             exchange_for_test("search_symbols"),
             exchange_for_test("get_symbol_sources"),
-            exchange_for_test("scan_usages"),
+            exchange_for_test("scan_usages_by_reference"),
             exchange_for_test("get_summaries"),
             exchange_for_test("search_symbols"),
             exchange_for_test("get_symbol_sources"),
