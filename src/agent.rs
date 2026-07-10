@@ -1378,6 +1378,14 @@ fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
     })
 }
 
+async fn seed_default_model_if_empty(sessions: &SessionStore, catalog: &[ModelMetadata]) {
+    if sessions.default_model().await.trim().is_empty()
+        && let Some(model) = preferred_model(catalog)
+    {
+        sessions.set_default_model(model).await;
+    }
+}
+
 fn render_setup_home(session: &Session, catalog: &[ModelMetadata]) -> String {
     render_setup_home_for_model(&session.model, catalog)
 }
@@ -1392,47 +1400,60 @@ fn render_setup_home_from_snapshot(snap: &SessionSnapshot, catalog: &[ModelMetad
 fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String {
     let bedrock_count = source_count(catalog, ModelSource::Bedrock);
     let codex_count = source_count(catalog, ModelSource::Codex);
-    let ollama_count = source_count(catalog, ModelSource::Ollama);
+    let local_count =
+        source_count(catalog, ModelSource::Ollama) + source_count(catalog, ModelSource::Ds4);
     let deepseek_count = source_count(catalog, ModelSource::DeepSeek);
     let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
+    let bedrock_state = crate::bedrock_auth::CredentialState::snapshot();
     let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
     let deepseek_state = crate::deepseek_auth::CredentialState::snapshot();
+    let codex_connected = crate::codex_auth::read_auth_dot_json()
+        .ok()
+        .flatten()
+        .is_some_and(|auth| {
+            auth.tokens.is_some()
+                || auth
+                    .openai_api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty())
+        });
+    let choices = SetupHomeRoute::menu()
+        .into_iter()
+        .map(SetupHomeRoute::markdown_line)
+        .collect::<Vec<_>>()
+        .join("\n");
     let ready = if model.is_empty() {
         "No model selected yet.".to_string()
     } else {
-        "A model is selected.".to_string()
+        format!("Current-session model: `{model}`.")
     };
 
     format!(
         "**Anvil setup**\n\n\
          {ready}\n\n\
-         Pick one:\n\
-         - `/setup choose` - Choose for me.\n\
-         - `/setup codex` - Use Codex or ChatGPT sign-in.\n\
-         - `/setup bedrock` - Use AWS Bedrock.\n\
-         - `/setup local` - Use free local models on this computer.\n\
-         - `/setup deepseek` - Use hosted DeepSeek.\n\
-         - `/setup openrouter` - Use OpenRouter.\n\
-         - `/setup recap` - Configure automatic turn recaps.\n\
-         - `/setup advanced` - Show model ids and extra settings.\n\n\
-         Found now:\n\
+         Pick one:\n{choices}\n\n\
+         Provider status (global):\n\
          - Bedrock: {bedrock_status}\n\
          - Codex: {codex_status}\n\
-         - Local models: {local_status}\n\
+         - Local models (Ollama / ds4): {local_status}\n\
          - DeepSeek: {deepseek_status}\n\
          - OpenRouter: {openrouter_status}\n\n\
          You can run `/setup` anytime.",
         bedrock_status = if bedrock_count > 0 {
             "ready".to_string()
-        } else {
+        } else if bedrock_state.active_source() == "none" {
             "not connected".to_string()
+        } else {
+            "connected, no models found yet".to_string()
         },
         codex_status = if codex_count > 0 {
             "ready".to_string()
+        } else if codex_connected {
+            "connected, no models found yet".to_string()
         } else {
             "not signed in".to_string()
         },
-        local_status = if ollama_count > 0 {
+        local_status = if local_count > 0 {
             "ready".to_string()
         } else {
             "not found".to_string()
@@ -1528,12 +1549,7 @@ pub async fn run_agent(
                         vec![]
                     }
                 };
-                let current_default_model = sessions_init.default_model().await;
-                if current_default_model.trim().is_empty()
-                    && let Some(first) = models.first()
-                {
-                    sessions_init.set_default_model(first.id.clone()).await;
-                }
+                seed_default_model_if_empty(&sessions_init, &models).await;
                 sessions_init.set_available_models(models).await;
 
                 let capabilities = AgentCapabilities::new()
@@ -6493,6 +6509,10 @@ enum SetupElicitTarget {
     CodexLogin,
     /// `/setup openrouter` with no explicit value -> form-mode key entry.
     OpenRouterLogin,
+    /// `/setup bedrock` with no explicit value -> form-mode token entry.
+    BedrockLogin,
+    /// `/setup deepseek` with no explicit value -> form-mode key entry.
+    DeepSeekLogin,
 }
 
 impl SetupElicitTarget {
@@ -6507,17 +6527,19 @@ impl SetupElicitTarget {
             Self::CodexLogin => caps.url,
             // OpenRouter key entry is a form-mode (text field) elicitation.
             Self::OpenRouterLogin => caps.form,
+            // Hosted-provider secrets use form fields so they never enter the
+            // prompt transcript.
+            Self::BedrockLogin | Self::DeepSeekLogin => caps.form,
         }
     }
 }
 
 /// Decide whether a `/setup` invocation should be handled via elicitation.
 ///
-/// Bare `/setup` maps to the interactive home menu. Otherwise, returns `None`
-/// for invocations that carry an explicit value (the user already chose, so
-/// there is nothing to prompt) or that have no elicitation equivalent yet --
-/// those keep the existing Markdown text flow. Only the bare, value-less forms
-/// map to a menu.
+/// Bare `/setup` maps to the interactive home menu. Bare provider commands map
+/// to their credential/login forms when available. Invocations that carry an
+/// explicit value (the user already chose) or have no elicitation equivalent
+/// keep the existing Markdown text flow.
 fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
     if !is_slash_command(prompt_text, "setup") {
         return None;
@@ -6536,6 +6558,8 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
         // Bare `/setup openrouter` collects the API key via a form field;
         // `key <k>` / `status` / `disconnect` keep the text flow.
         "openrouter" if rest.is_empty() => Some(SetupElicitTarget::OpenRouterLogin),
+        "bedrock" if rest.is_empty() => Some(SetupElicitTarget::BedrockLogin),
+        "deepseek" if rest.is_empty() => Some(SetupElicitTarget::DeepSeekLogin),
         _ => None,
     }
 }
@@ -6573,6 +6597,28 @@ async fn run_setup_elicitation(
         }
         SetupElicitTarget::OpenRouterLogin => {
             run_setup_openrouter_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
+        }
+        SetupElicitTarget::BedrockLogin => {
+            run_setup_bedrock_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
+        }
+        SetupElicitTarget::DeepSeekLogin => {
+            run_setup_deepseek_login_elicitation(
                 spawned_cx,
                 sessions,
                 session_id,
@@ -6764,6 +6810,133 @@ fn build_openrouter_key_elicitation_request(session_id: &str) -> CreateElicitati
     CreateElicitationRequest::new(mode, "Enter your OpenRouter API key")
 }
 
+fn build_provider_secret_elicitation_request(
+    session_id: &str,
+    provider: &str,
+    field_title: &str,
+    description: &str,
+) -> CreateElicitationRequest {
+    let field = StringPropertySchema::new()
+        .title(field_title)
+        .description(description)
+        .min_length(1u32);
+    let schema = ElicitationSchema::new()
+        .title(format!("{provider} setup"))
+        .property("key", field, true);
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, format!("Enter your {provider} credential"))
+}
+
+async fn request_setup_secret(
+    cx: &ConnectionTo<Client>,
+    cancel: &tokio_util::sync::CancellationToken,
+    request: CreateElicitationRequest,
+) -> Result<Option<String>, String> {
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(None),
+        response = cx.send_request(request).block_task() => response,
+    }
+    .map_err(|e| format!("could not show the credential prompt: {e}"))?;
+
+    match response.action {
+        ElicitationAction::Accept(accept) => Ok(accept
+            .content
+            .as_ref()
+            .and_then(|content| content.get("key"))
+            .and_then(|value| match value {
+                ElicitationContentValue::String(s) => Some(s.trim().to_string()),
+                _ => None,
+            })
+            .filter(|key| !key.is_empty())),
+        ElicitationAction::Decline | ElicitationAction::Cancel => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+async fn run_setup_bedrock_login_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    let cx = spawned_cx.cx();
+    if crate::bedrock_auth::CredentialState::snapshot().env_owns() {
+        send_message(cx, session_id, &render_bedrock_setup_help());
+        return;
+    }
+    let request = build_provider_secret_elicitation_request(
+        session_id,
+        "AWS Bedrock",
+        "Bearer token",
+        "Paste your AWS Bedrock bearer token. It will be stored in Anvil's protected secrets file.",
+    );
+    let message = match request_setup_secret(cx, cancel, request).await {
+        Ok(Some(key)) => {
+            handle_setup_bedrock(
+                cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                &format!("key {key}"),
+            )
+            .await
+        }
+        Ok(None) => "Bedrock setup cancelled; credentials are unchanged.".to_string(),
+        Err(e) => {
+            tracing::warn!("/setup bedrock elicitation failed: {e}");
+            "Setup could not show the Bedrock credential prompt; credentials are unchanged."
+                .to_string()
+        }
+    };
+    send_message(cx, session_id, &message);
+}
+
+async fn run_setup_deepseek_login_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    let cx = spawned_cx.cx();
+    if crate::deepseek_auth::CredentialState::snapshot().env_owns() {
+        send_message(cx, session_id, &render_deepseek_setup_help());
+        return;
+    }
+    let request = build_provider_secret_elicitation_request(
+        session_id,
+        "DeepSeek",
+        "API key",
+        "Paste your key from https://platform.deepseek.com. It will be stored in Anvil's protected secrets file.",
+    );
+    let message = match request_setup_secret(cx, cancel, request).await {
+        Ok(Some(key)) => {
+            handle_setup_deepseek(
+                cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                &format!("key {key}"),
+            )
+            .await
+        }
+        Ok(None) => "DeepSeek setup cancelled; credentials are unchanged.".to_string(),
+        Err(e) => {
+            tracing::warn!("/setup deepseek elicitation failed: {e}");
+            "Setup could not show the DeepSeek credential prompt; credentials are unchanged."
+                .to_string()
+        }
+    };
+    send_message(cx, session_id, &message);
+}
+
 /// `/setup sandbox` as a single-select menu. Sends an `elicitation/create`
 /// form request, then applies the chosen backend through the same
 /// `handle_setup_sandbox` writer the slash path uses. Decline/Cancel (and a
@@ -6874,9 +7047,9 @@ async fn apply_sandbox_elicitation_outcome(
     }
 }
 
-/// A choice from the interactive `/setup` home menu, mapped to the sub-flow it
-/// dispatches into. The set mirrors the actionable links in the Markdown home
-/// (`render_setup_home_for_model`).
+/// A choice from the `/setup` home, mapped to the sub-flow it dispatches into.
+/// This registry is the source for both the interactive menu and Markdown
+/// fallback, including their scope labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupHomeRoute {
     /// Pick a ready model automatically (`/setup choose`).
@@ -6925,12 +7098,49 @@ impl SetupHomeRoute {
             Self::Choose => "Choose a model for me",
             Self::Codex => "Sign in to Codex / ChatGPT",
             Self::Bedrock => "Use AWS Bedrock",
-            Self::Local => "Use free local models (Ollama)",
+            Self::Local => "Use local models (Ollama / ds4)",
             Self::DeepSeek => "Use hosted DeepSeek",
             Self::OpenRouter => "Use OpenRouter",
             Self::Recap => "Configure automatic turn recaps",
-            Self::Advanced => "Advanced settings (model ids, sandbox, behavior)",
+            Self::Advanced => "Review all settings",
         }
+    }
+
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Codex | Self::Bedrock | Self::Local | Self::DeepSeek | Self::OpenRouter => {
+                "global provider"
+            }
+            Self::Choose => "current session",
+            Self::Recap => "install default",
+            Self::Advanced => "all scopes",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Choose => "/setup choose",
+            Self::Codex => "/setup codex",
+            Self::Bedrock => "/setup bedrock",
+            Self::Local => "/setup local",
+            Self::DeepSeek => "/setup deepseek",
+            Self::OpenRouter => "/setup openrouter",
+            Self::Recap => "/setup recap",
+            Self::Advanced => "/setup advanced",
+        }
+    }
+
+    fn menu_label(self) -> String {
+        format!("[{}] {}", self.scope(), self.label())
+    }
+
+    fn markdown_line(self) -> String {
+        format!(
+            "- `{}` — **{}**: {}.",
+            self.command(),
+            self.scope(),
+            self.label()
+        )
     }
 
     /// The menu in display order. `choose` leads because it is the fastest path
@@ -6971,7 +7181,7 @@ fn parse_setup_home_choice(action: &ElicitationAction) -> Option<SetupHomeRoute>
 fn build_setup_home_elicitation_request(session_id: &str) -> CreateElicitationRequest {
     let options = SetupHomeRoute::menu()
         .into_iter()
-        .map(|route| EnumOption::new(route.value(), route.label()))
+        .map(|route| EnumOption::new(route.value(), route.menu_label()))
         .collect::<Vec<_>>();
 
     let field = StringPropertySchema::new()
@@ -6990,10 +7200,10 @@ fn build_setup_home_elicitation_request(session_id: &str) -> CreateElicitationRe
 }
 
 /// Bare `/setup` as the single interactive entry point. Presents the home menu
-/// and routes the choice into the existing sub-flow: the model picker, the
-/// interactive Codex/OpenRouter logins, the Bedrock/local text flows, or the
-/// advanced page. Decline/Cancel leave everything unchanged; a transport error
-/// falls back to the Markdown home so the user still sees the options.
+/// and routes the choice into the existing sub-flow: the model picker,
+/// interactive hosted-provider logins, local-model guidance, recap settings,
+/// or the advanced page. Decline/Cancel leave everything unchanged; a transport
+/// error falls back to the Markdown home so the user still sees the options.
 async fn run_setup_home_elicitation(
     spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
     sessions: &SessionStore,
@@ -7029,18 +7239,8 @@ async fn run_setup_home_elicitation(
             let message = handle_setup_choose(cx, sessions, session_id, llm, refresh_lock).await;
             send_message(cx, session_id, &message);
         }
-        Some(SetupHomeRoute::Bedrock) => {
-            let message =
-                handle_setup_bedrock(cx, sessions, session_id, llm, refresh_lock, "").await;
-            send_message(cx, session_id, &message);
-        }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
-            send_message(cx, session_id, &message);
-        }
-        Some(SetupHomeRoute::DeepSeek) => {
-            let message =
-                handle_setup_deepseek(cx, sessions, session_id, llm, refresh_lock, "").await;
             send_message(cx, session_id, &message);
         }
         Some(SetupHomeRoute::Recap) => {
@@ -7066,6 +7266,28 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::OpenRouter) => {
             run_setup_openrouter_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
+        }
+        Some(SetupHomeRoute::Bedrock) => {
+            run_setup_bedrock_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
+        }
+        Some(SetupHomeRoute::DeepSeek) => {
+            run_setup_deepseek_login_elicitation(
                 spawned_cx,
                 sessions,
                 session_id,
@@ -7219,7 +7441,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "reasoning" | "reasoning-effort" => {
             if rest.is_empty() {
-                "Use `/setup reasoning default`, `/setup reasoning off`, or `/setup reasoning <level>`.\n\
+                "Current-session setting. Use `/setup reasoning default`, `/setup reasoning off`, or `/setup reasoning <level>`.\n\
                  This is an advanced setting; most users should leave it alone."
                     .to_string()
             } else {
@@ -7242,7 +7464,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "fast" | "service-tier" | "service_tier" => {
             if rest.is_empty() {
-                "Use `/setup fast on` to select the fast Codex service tier, \
+                "Current-session setting. Use `/setup fast on` to select the fast Codex service tier, \
                  `/setup fast off` to clear it, or `/setup service-tier <tier id>`."
                     .to_string()
             } else {
@@ -7388,9 +7610,10 @@ async fn refresh_model_catalog_after_lock(
             .await
             .map_err(|e| format!("{e:#}"))?
     };
-    if let Some(model) = preferred_model(&models) {
-        sessions.set_default_model(model).await;
-    }
+    // Discovery refreshes the shared catalog but must not silently replace an
+    // existing process default: model selection is a client-owned per-session
+    // control. Seed a fallback only when the server has no default at all.
+    seed_default_model_if_empty(sessions, &models).await;
     sessions.set_available_models(models.clone()).await;
     if let Some((cx, session_id)) = cx.zip(session_id) {
         trace_openrouter_refresh(&format!(
@@ -7436,7 +7659,9 @@ async fn handle_setup_choose(
     };
     match apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, &model).await {
         msg if msg.starts_with("Error:") => msg,
-        _ => "Anvil is ready. Run `/setup` anytime to change or repair model setup.".to_string(),
+        _ => format!(
+            "Current-session model set to `{model}`. Anvil is ready. Run `/setup` anytime to change or repair setup."
+        ),
     }
 }
 
@@ -7451,22 +7676,26 @@ async fn handle_setup_local(
     match rest.to_ascii_lowercase().as_str() {
         "use" | "choose" => {
             let catalog = sessions.available_model_metadata().await;
-            if let Some(model) = catalog
-                .iter()
-                .find(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == ModelSource::Ollama))
-                .map(|m| m.id.clone())
+            if let Some(model) = [ModelSource::Ollama, ModelSource::Ds4]
+                .into_iter()
+                .find_map(|source| {
+                    catalog
+                        .iter()
+                        .find(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
+                        .map(|m| m.id.clone())
+                })
             {
                 return apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, &model).await;
             }
-            "No local model is ready yet. Install Ollama, start it, then run `/setup local refresh`."
-                .to_string()
+            "No local model is ready yet. Start Ollama or ds4-server, then run `/setup local refresh`.".to_string()
         }
         "refresh" | "try-again" => {
             match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock)
                 .await
             {
                 Ok(catalog) => {
-                    let local_count = source_count(&catalog, ModelSource::Ollama);
+                    let local_count = source_count(&catalog, ModelSource::Ollama)
+                        + source_count(&catalog, ModelSource::Ds4);
                     if local_count > 0 {
                         "Local models are ready. Run `/setup local use` to use them, or `/setup choose` to let Anvil pick.".to_string()
                     } else {
@@ -7484,13 +7713,14 @@ async fn handle_setup_local(
 }
 
 fn render_local_setup_help() -> String {
-    "Use free local models\n\n\
-     Anvil looks for Ollama automatically. You do not need to know ports or model ids.\n\n\
-     1. Install Ollama from https://ollama.com\n\
-     2. Start Ollama.\n\
-     3. Run `/setup local refresh`.\n\
-     4. Run `/setup local use`.\n\n\
-     llama.cpp and custom local servers belong in `/setup advanced`."
+    "Use local models\n\n\
+     Scope: global provider discovery; model selection applies to the current session.\n\n\
+     Anvil automatically discovers Ollama and a running ds4-server.\n\n\
+     1. Start Ollama (https://ollama.com) or ds4-server.\n\
+     2. Run `/setup local refresh`.\n\
+     3. Run `/setup local use`.\n\n\
+     Set `DS4_BASE_URL` for a remote ds4 endpoint. Other custom OpenAI-compatible \
+     servers require explicit server configuration."
         .to_string()
 }
 
@@ -7800,10 +8030,13 @@ fn render_bedrock_setup_help() -> String {
         "Credentials are managed by the environment variable. Unset it and restart to use `/setup bedrock key`."
             .to_string()
     } else {
-        "If you have a Bedrock bearer token, run:\n`/setup bedrock key <token>`".to_string()
+        "If this client supports setup forms, run `/setup bedrock` and enter the token in the out-of-transcript field.\n\
+         Text fallback: `/setup bedrock key <token>` (the token will appear in the session transcript)."
+            .to_string()
     };
     format!(
         "Use AWS Bedrock\n\n\
+         Scope: global provider connection; model selection applies to the current session.\n\n\
          {status}\n\n\
          {key_help}\n\n\
          You also need:\n\
@@ -7954,11 +8187,13 @@ fn render_deepseek_setup_help() -> String {
         "Credentials are managed by the environment variable. Unset it and restart to use `/setup deepseek key`."
             .to_string()
     } else {
-        "If you have a DeepSeek API key (from https://platform.deepseek.com), run:\n`/setup deepseek key <key>`"
+        "If this client supports setup forms, run `/setup deepseek` and enter the key in the out-of-transcript field.\n\
+         Text fallback: `/setup deepseek key <key>` (the key will appear in the session transcript)."
             .to_string()
     };
     format!(
         "Use hosted DeepSeek\n\n\
+         Scope: global provider connection; model selection applies to the current session.\n\n\
          {status}\n\n\
          {key_help}\n\n\
          Other commands:\n\
@@ -8030,11 +8265,20 @@ fn render_openrouter_setup_help() -> String {
         "file" => "OpenRouter is connected from saved credentials.",
         _ => "OpenRouter is not connected.",
     };
+    let key_help = if state.env_owns() {
+        "Credentials are managed by OPENROUTER_API_KEY. Unset it and restart before using \
+         `/setup openrouter key <your key>` to save a different key through Anvil."
+            .to_string()
+    } else {
+        "If this client supports setup forms, run `/setup openrouter` and enter the key in the out-of-transcript field.\n\
+         Text fallback: `/setup openrouter key <your key>` (the key will appear in the session transcript)."
+            .to_string()
+    };
     format!(
         "Use OpenRouter\n\n\
+         Scope: global provider connection; model selection applies to the current session.\n\n\
          {status}\n\n\
-         If you already know OpenRouter and have a key, run:\n\
-         `/setup openrouter key <your key>`\n\n\
+         {key_help}\n\n\
          Other useful commands:\n\
          - `/setup openrouter status`\n\
          - `/setup openrouter disconnect`\n\
@@ -8283,7 +8527,7 @@ async fn handle_setup_mode(
     rest: &str,
 ) -> String {
     if rest.is_empty() {
-        return "How should Anvil behave?\n\n\
+        return "Current-session behavior\n\n\
                 - `/setup mode agent` - General coding assistant.\n\
                 - `/setup mode plan` - Plan only."
             .to_string();
@@ -8304,9 +8548,10 @@ async fn handle_setup_recap(sessions: &SessionStore, session_id: &str, rest: &st
             .map(|enabled| if enabled { "on" } else { "off" })
             .unwrap_or("unknown");
         return format!(
-            "Turn recap is `{state}`.\n\n\
+            "Turn recap is `{state}` for this session. This is also the install default.\n\n\
              When on, each normal turn ends with a recap: a short summary of the work \
              done since your last message, plus the stop/tools/files stats. \
+             Changes apply to this session and seed future sessions. \
              Use `/setup recap on` to enable it, or `/setup recap off` to disable it."
         );
     }
@@ -8314,7 +8559,8 @@ async fn handle_setup_recap(sessions: &SessionStore, session_id: &str, rest: &st
         return "Unknown recap mode. Try `/setup recap on` or `/setup recap off`.".to_string();
     };
     if sessions.set_turn_recap_enabled(session_id, enabled).await {
-        "Turn recap setup updated.".to_string()
+        "Turn recap updated for this session and saved as the install default for future sessions."
+            .to_string()
     } else {
         "Error: unknown session".to_string()
     }
@@ -8336,11 +8582,13 @@ async fn apply_setup_config(
             let fallback_cwd = std::env::current_dir().unwrap_or_default();
             send_session_usage_update(cx, sessions, session_id, &fallback_cwd).await;
             let mut msg = match key {
-                MODEL_CONFIG_ID => "Model setup updated.".to_string(),
-                PERMISSION_CONFIG_ID => "Permission mode updated.".to_string(),
-                BEHAVIOR_CONFIG_ID => "Behavior setup updated.".to_string(),
-                REASONING_EFFORT_CONFIG_ID => "Advanced reasoning setup updated.".to_string(),
-                SERVICE_TIER_CONFIG_ID => "Service tier setup updated.".to_string(),
+                MODEL_CONFIG_ID => "Current-session model updated.".to_string(),
+                PERMISSION_CONFIG_ID => "Current-session permission mode updated.".to_string(),
+                BEHAVIOR_CONFIG_ID => "Current-session behavior updated.".to_string(),
+                REASONING_EFFORT_CONFIG_ID => {
+                    "Current-session reasoning effort updated.".to_string()
+                }
+                SERVICE_TIER_CONFIG_ID => "Current-session service tier updated.".to_string(),
                 _ => "Setup updated.".to_string(),
             };
             if let Some(prev) = outcome.cleared_reasoning {
@@ -8471,7 +8719,9 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     };
     let catalog = sessions.available_model_metadata().await;
     let openrouter_picks = filtered_openrouter_models(&catalog);
-    let mut out = String::from("Advanced setup\n\n");
+    let mut out = String::from(
+        "Advanced setup\n\nCurrent session (client-owned; not saved as Anvil install defaults)\n\n",
+    );
     out.push_str(&format!(
         "- Selected model: `{}`\n",
         if session.model.is_empty() {
@@ -8483,10 +8733,6 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     out.push_str(&format!(
         "- Permission mode: `{}`\n",
         session.permission_mode.as_str()
-    ));
-    out.push_str(&format!(
-        "- Sandbox mode: `{}`\n",
-        crate::sandbox_backend::resolve_mode(session.sandbox_mode).as_str()
     ));
     out.push_str(&format!("- Behavior mode: `{}`\n", session.mode.as_str()));
     out.push_str(&format!(
@@ -8504,35 +8750,41 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
             .unwrap_or(SERVICE_TIER_DEFAULT_VALUE)
     ));
     out.push_str(&format!(
-        "- Turn recap: `{}`\n",
+        "- LLM idle timeout: `{}`\n",
+        session
+            .idle_timeout_secs
+            .map(|s| format!("{s}s"))
+            .unwrap_or_else(|| "server default".to_string())
+    ));
+    out.push_str("\nInstall defaults (persisted and applied to future sessions)\n\n");
+    out.push_str(&format!(
+        "- Sandbox mode: `{}`\n",
+        crate::sandbox_backend::resolve_mode(session.sandbox_mode).as_str()
+    ));
+    out.push_str(&format!(
+        "- Turn recap: `{}`\n\n",
         if session.turn_recap_enabled {
             "enabled"
         } else {
             "disabled"
         }
     ));
-    out.push_str(&format!(
-        "- LLM idle timeout: `{}`\n\n",
-        session
-            .idle_timeout_secs
-            .map(|s| format!("{s}s"))
-            .unwrap_or_else(|| "server default".to_string())
-    ));
-    out.push_str("Commands:\n");
+    out.push_str("Current-session commands:\n");
     out.push_str("- `/setup model` - list model ids.\n");
     out.push_str("- `/setup model <model id>` - choose a specific model.\n");
     out.push_str("- Permission selector - change edit/command approval mode.\n");
     out.push_str("- `/permissions` - list or revoke remembered Always allow approvals.\n");
-    out.push_str(
-        "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
-    );
     out.push_str("- `/setup mode` - change assistant behavior.\n");
-    out.push_str("- `/setup recap on|off` - toggle automatic turn recaps.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
     out.push_str("- `/setup reasoning default|off|<level>` - advanced reasoning setting.\n");
     out.push_str(
         "- `/setup fast on|off` - use or clear the fast Codex service tier when available.\n",
     );
+    out.push_str("\nInstall-default commands:\n");
+    out.push_str(
+        "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
+    );
+    out.push_str("- `/setup recap on|off` - toggle automatic turn recaps.\n");
     if !openrouter_picks.is_empty() {
         out.push_str("\nFiltered OpenRouter coding candidates:\n");
         for id in openrouter_picks {
@@ -13143,7 +13395,10 @@ mod tests {
         assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
 
         let off = handle_setup_recap(&store, &id, "off").await;
-        assert_eq!(off, "Turn recap setup updated.");
+        assert_eq!(
+            off,
+            "Turn recap updated for this session and saved as the install default for future sessions."
+        );
         assert_eq!(store.turn_recap_enabled(&id).await, Some(false));
         assert_eq!(store.setup_state_snapshot().turn_recap_enabled, Some(false));
 
@@ -13151,7 +13406,10 @@ mod tests {
         assert!(status.contains("Turn recap is `off`"));
 
         let on = handle_setup_recap(&store, &id, "on").await;
-        assert_eq!(on, "Turn recap setup updated.");
+        assert_eq!(
+            on,
+            "Turn recap updated for this session and saved as the install default for future sessions."
+        );
         assert_eq!(store.turn_recap_enabled(&id).await, Some(true));
         assert_eq!(store.setup_state_snapshot().turn_recap_enabled, Some(true));
     }
@@ -13594,9 +13852,9 @@ mod tests {
 
     // --- Interactive `/setup` elicitation (#207) ---
 
-    /// Only the bare, value-less `/setup sandbox` maps to the sandbox menu; an
-    /// explicit value, other sub-commands, and unrelated slash commands keep
-    /// the text flow (return `None`). Bare `/setup` maps to the home menu.
+    /// Bare provider/setup commands with an interactive equivalent map to an
+    /// elicitation target. Explicit values and unrelated commands keep the text
+    /// flow (return `None`). Bare `/setup` maps to the home menu.
     #[test]
     fn setup_elicitation_target_only_for_value_less_sandbox() {
         assert_eq!(
@@ -13676,6 +13934,24 @@ mod tests {
             ]
         );
         assert_eq!(json["requestedSchema"]["required"][0], "choice");
+
+        let labels: Vec<&str> = choice["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["title"].as_str().unwrap())
+            .collect();
+        let expected_labels = SetupHomeRoute::menu()
+            .into_iter()
+            .map(SetupHomeRoute::menu_label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, expected_labels);
+        for route in SetupHomeRoute::menu() {
+            let line = route.markdown_line();
+            assert!(line.contains(route.command()), "got: {line}");
+            assert!(line.contains(route.scope()), "got: {line}");
+            assert!(line.contains(route.label()), "got: {line}");
+        }
     }
 
     /// An accepted choice maps to its route; Decline/Cancel, empty content, a
@@ -13813,6 +14089,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn setup_elicitation_target_recognizes_hosted_provider_logins() {
+        assert_eq!(
+            setup_elicitation_target("/setup bedrock"),
+            Some(SetupElicitTarget::BedrockLogin)
+        );
+        assert_eq!(
+            setup_elicitation_target("/setup deepseek"),
+            Some(SetupElicitTarget::DeepSeekLogin)
+        );
+        for prompt in [
+            "/setup bedrock key token",
+            "/setup bedrock status",
+            "/setup deepseek key secret",
+            "/setup deepseek disconnect",
+        ] {
+            assert_eq!(setup_elicitation_target(prompt), None, "prompt: {prompt}");
+        }
+    }
+
+    #[test]
+    fn hosted_provider_login_targets_require_form_capability() {
+        use crate::session::ClientElicitationCaps;
+        for target in [
+            SetupElicitTarget::BedrockLogin,
+            SetupElicitTarget::DeepSeekLogin,
+        ] {
+            assert!(!target.is_supported(ClientElicitationCaps::default()));
+            assert!(!target.is_supported(ClientElicitationCaps {
+                form: false,
+                url: true,
+            }));
+            assert!(target.is_supported(ClientElicitationCaps {
+                form: true,
+                url: false,
+            }));
+        }
+    }
+
+    #[test]
+    fn setup_choose_provider_priority_matches_documented_order() {
+        let mut catalog = vec![
+            ModelMetadata::id_only("openrouter::demo"),
+            ModelMetadata::id_only("deepseek::demo"),
+            ModelMetadata::id_only("ds4::demo"),
+            ModelMetadata::id_only("ollama::demo"),
+            ModelMetadata::id_only("codex::demo"),
+            ModelMetadata::id_only("bedrock::demo"),
+        ];
+        for expected in [
+            "bedrock",
+            "codex",
+            "ollama",
+            "ds4",
+            "deepseek",
+            "openrouter",
+        ] {
+            let selected = preferred_model(&catalog).expect("a provider should remain");
+            assert!(selected.starts_with(&format!("{expected}::")));
+            catalog.retain(|model| !model.id.starts_with(&format!("{expected}::")));
+        }
+        assert_eq!(preferred_model(&catalog), None);
+    }
+
+    #[tokio::test]
+    async fn discovery_only_seeds_an_empty_process_default() {
+        let catalog = vec![ModelMetadata::id_only("bedrock::preferred")];
+
+        let configured = SessionStore::new("codex::explicit".to_string());
+        seed_default_model_if_empty(&configured, &catalog).await;
+        assert_eq!(configured.default_model().await, "codex::explicit");
+
+        let empty = SessionStore::new(String::new());
+        seed_default_model_if_empty(&empty, &catalog).await;
+        assert_eq!(empty.default_model().await, "bedrock::preferred");
+    }
+
     /// OpenRouter key entry is a form-mode elicitation, so it needs `form`.
     #[test]
     fn openrouter_login_target_requires_form_capability() {
@@ -13841,6 +14194,24 @@ mod tests {
         let key = &json["requestedSchema"]["properties"]["key"];
         assert_eq!(key["type"], "string");
         assert!(key.get("oneOf").is_none(), "key is free text, not a select");
+        assert_eq!(key["minLength"], 1);
+        assert_eq!(json["requestedSchema"]["required"][0], "key");
+    }
+
+    #[test]
+    fn hosted_provider_secret_elicitation_request_shape() {
+        let req = build_provider_secret_elicitation_request(
+            "sess-provider",
+            "DeepSeek",
+            "API key",
+            "Paste the key.",
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"], "sess-provider");
+        assert_eq!(json["requestedSchema"]["title"], "DeepSeek setup");
+        let key = &json["requestedSchema"]["properties"]["key"];
+        assert_eq!(key["title"], "API key");
         assert_eq!(key["minLength"], 1);
         assert_eq!(json["requestedSchema"]["required"][0], "key");
     }

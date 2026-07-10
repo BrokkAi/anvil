@@ -16,13 +16,14 @@ not exist yet, that is stated explicitly along with the issue tracking it.
   `readOnly` run concurrently, capped at six lanes; `inherit` lanes remain
   serial.
 - **One cancellation token per prompt** is shared by the parent turn, every tool
-  call, and every subagent. `session/cancel` aborts all in-flight delegated
-  work atomically.
-- **Bounded runtime** comes by default from the model's own completion signal,
-  the LLM stream timeouts (`--llm-idle-timeout-secs` and
-  `--llm-stall-timeout-secs`), and per-shell-command
-  timeouts; an optional per-prompt turn ceiling (`--max-turns N`) can be set to
-  bound cost/time. There is no separate per-tool-call wall-clock timeout.
+  call, and every subagent. `session/cancel` signals all in-flight delegated
+  work through that shared token; each operation stops at its next cancellation
+  checkpoint.
+- **Runtime controls are scoped, not an overall deadline.** LLM streams and
+  shell commands have their own timeouts, and an optional per-prompt turn
+  ceiling (`--max-turns N`) can limit agent-loop iterations. An arbitrary
+  non-shell tool call and the prompt as a whole have no built-in wall-clock
+  deadline; the consumer must cancel the prompt to enforce one.
 - **Observability** for the parent's own tool calls is rich
   (`Pending → InProgress → Completed/Failed` via `session/update`), but a
   subagent's *internal* steps are intentionally **not** surfaced to the client.
@@ -98,8 +99,9 @@ Each prompt gets a single `CancellationToken` (`start_prompt`/`cancel_prompt`,
 `src/session.rs`). That **same token is cloned into every tool call and every
 subagent**. Therefore:
 
-- `session/cancel` cancels the token, which aborts the parent turn, the current
-  tool call, and any in-flight subagents — all of them, atomically.
+- `session/cancel` cancels the shared token for the parent turn, the current tool
+  call, and any in-flight subagents. Shutdown is cooperative: each operation
+  stops when it next observes the cancellation signal.
 - The tool loop checks the token between steps and between tool calls, so
   cancellation takes effect promptly at the next checkpoint rather than mid-LLM-
   stream only.
@@ -111,9 +113,9 @@ subagent**. Therefore:
 
 > **Contract for consumers:** cancellation is **all-or-nothing per prompt**.
 > There is no API to cancel a single lane while letting its siblings continue —
-> cancelling cancels the whole delegated set for that prompt.
+> cancelling signals the whole delegated set through the prompt's shared token.
 
-### Timeouts and bounded runtime
+### Timeout scopes and runtime controls
 
 | Knob | Default | Scope | Notes |
 |---|---|---|---|
@@ -122,20 +124,21 @@ subagent**. Therefore:
 | `--llm-stall-timeout-secs` | 60 | per LLM stream | After first progress, aborts a stream when the gap between meaningful chunks exceeds this timeout. Keepalives do not count. |
 | Shell command timeout | 60s | per `run_shell_command` | Optional `timeout` values are milliseconds, rounded up to seconds, and capped at 600s. Tool output reports when a request is clamped. |
 
-There is **no separate per-tool-call wall-clock timeout** beyond the LLM idle
-timeout and (when set) the turn ceiling. With the default unbounded
-`--max-turns`, a long-running non-shell tool is bounded only by cancellation and
-the LLM first-progress and stall timeouts; set a positive `--max-turns` to add
-a turn-count ceiling. The per-session `/idle-timeout N` override sets both LLM
-stream timeout phases to `N`, preserving its historical "tolerate gaps up to N"
-meaning.
+The LLM timeouts apply only while Anvil is waiting for an LLM stream; they do
+not bound a tool that is already executing. Likewise, `--max-turns` limits the
+number of agent-loop iterations, not the wall-clock duration of an individual
+tool call. Shell commands have their own timeout, but a non-shell tool without
+an internal timeout is bounded only by prompt cancellation. The per-session
+`/idle-timeout N` override sets both LLM stream timeout phases to `N`, preserving
+its historical "tolerate gaps up to N" meaning.
 
 > **Contract for consumers:** the turn loop terminates on the model's own
-> completion signal by default. To impose a hard cost ceiling on an unattended
-> or delegated workflow, set a positive `--max-turns` (total agent turns) and
-> `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs` (stream stall
-> detection). Do not rely on a per-lane
-> deadline — model an overall budget instead, and cancel if it is exceeded.
+> completion signal by default. To limit iterations for an unattended or
+> delegated workflow, set a positive `--max-turns` (total agent turns), plus
+> `--llm-idle-timeout-secs` and `--llm-stall-timeout-secs` for stream-stall
+> detection. These controls do not create a wall-clock deadline for arbitrary
+> tool execution or a token-denominated cost ceiling. Model an overall deadline
+> in the consumer and cancel the prompt if it is exceeded.
 
 ## 5. Observability
 
@@ -176,7 +179,15 @@ debugging/observing delegated work that is not surfaced over ACP.
 > orchestration layer (or in a final parent turn that requests structured
 > output over the collected lane results).
 
-## 7. What is intentionally *not* guaranteed yet
+## 7. Compatibility commitment
+
+For Anvil 1.x, consumers may rely on the concurrency, ordering, isolation,
+cancellation, observability, and result-collection guarantees documented here.
+Changes that invalidate one of these guarantees are compatibility changes and
+must be called out explicitly in release notes. Additive capabilities may
+extend the contract without changing the guarantees already documented.
+
+## 8. What is intentionally *not* guaranteed yet
 
 These are real limitations, not oversights — they are called out so consumers
 do not build on behavior that does not exist:
@@ -188,8 +199,17 @@ do not build on behavior that does not exist:
 - **No per-call runtime tool allowlist.** Subagents can narrow their catalog
   with `tools` frontmatter, but a single `task` call cannot dynamically choose
   a different tool list.
-- **No per-subagent token budget** beyond the turn cap
-  ([#30](https://github.com/BrokkAi/anvil/issues/30)).
-- **No nested-loop integration test coverage** for subagents
-  ([#31](https://github.com/BrokkAi/anvil/issues/31)).
+- **No token-denominated or wall-clock subagent budget.** A subagent can set a
+  lower `max_turns` value in its frontmatter, but there is no per-subagent token
+  allowance or elapsed-time deadline.
 - **No sub-lane observability over ACP** — sub-lane steps are silent by design.
+
+## 9. Validation coverage
+
+The task schema, read-only batching, permission-mode handling, tool allowlists,
+and turn-cap inheritance are covered by unit tests. Anvil does not currently
+have a full ACP integration test that drives a real nested subagent loop end to
+end. That gap is tracked as a validation limitation rather than a runtime
+behavior consumers must account for; the historical decision to rely on the
+surrounding unit coverage is recorded in closed issue
+[#31](https://github.com/BrokkAi/anvil/issues/31).

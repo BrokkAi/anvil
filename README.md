@@ -98,6 +98,21 @@ The first session shows setup guidance; use `/setup` to choose a model provider,
 log in, refresh model discovery, or adjust advanced settings. Change permission
 mode through the session `Permission` selector.
 
+`/setup` distinguishes three scopes:
+
+- **Global providers:** credentials and discovery for Codex, Bedrock, local
+  models, DeepSeek, and OpenRouter are shared by sessions in this Anvil install.
+- **Current session:** model, behavior, reasoning effort, service tier, timeout,
+  and permission mode are client-owned session controls and are not saved as
+  Anvil install defaults.
+- **Install defaults:** sandbox mode and automatic turn recaps are persisted and
+  seed future sessions.
+
+Clients that advertise ACP elicitation forms receive out-of-transcript
+credential fields for OpenRouter, Bedrock, and DeepSeek. Text-only clients
+retain inline command fallbacks, which explicitly warn that pasted credentials
+become part of the transcript.
+
 ## Editor Setup
 
 The repo includes `xtask` helpers that build a release binary and write an
@@ -188,9 +203,13 @@ Anvil is zero-config by default:
   `DS4_BASE_URL` (e.g. `http://127.0.0.1:9000`) to point at a non-default host,
   a remote box, or a reverse proxy instead. Discovered only while ds4-server
   is up; start it and `/setup local refresh` to bring it online.
+- **DeepSeek**: uses `DEEPSEEK_API_KEY` or credentials saved through
+  `/setup deepseek`. Hosted models use `deepseek::*` wire ids.
 - **OpenRouter**: uses `OPENROUTER_API_KEY` or credentials saved through
-  `/setup openrouter key <key>`.
-- **Bedrock**: uses `AWS_BEARER_TOKEN_BEDROCK` or `~/.secrets/bedrock_api_key`.
+  `/setup openrouter`.
+- **Bedrock**: uses `AWS_BEARER_TOKEN_BEDROCK` or credentials saved through
+  `/setup bedrock`. Anvil also recognizes the legacy
+  `~/.secrets/bedrock_api_key` fallback.
   Native Bedrock invoke remains in place for Anthropic-style model ids such as
   `bedrock::us.anthropic.claude-sonnet-4-6`. Bedrock-hosted `openai.*` models
   route through the OpenAI-compatible `Responses` API at
@@ -217,9 +236,9 @@ Anvil is zero-config by default:
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.
 
-Provider priority for `/setup choose` is Codex first, then local models (Ollama,
-then ds4), with OpenRouter last. You can also select a specific model with
-`/setup model <wire id>`.
+Provider priority for `/setup choose` is Bedrock first, then Codex, local models
+(Ollama, then ds4), hosted DeepSeek, and OpenRouter. You can also select a
+specific current-session model with `/setup model <wire id>`.
 
 ## Slash Commands
 
@@ -527,7 +546,7 @@ anvil [OPTIONS]
 | `--max-history-turns` | - | `50` | Maximum in-memory history turns per session. `0` disables the cap. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | Seconds to wait for first meaningful LLM stream progress. |
 | `--llm-stall-timeout-secs` | `ANVIL_LLM_STALL_TIMEOUT_SECS` | `60` | Seconds to wait between meaningful chunks after streaming starts. |
-| `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep setup preferences process-local; model/reasoning/behavior/permission/sandbox choices for this run do not read or update the global setup file. |
+| `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep sandbox, turn-recap, and first-run preferences process-local instead of reading or updating `setup.json`. Provider credentials and `/mcp` use separate stores and remain persistent. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 
 ## Build And Test
