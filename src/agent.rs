@@ -4466,6 +4466,7 @@ struct AsgardCandidate {
     model: String,
     outcome: crate::tool_loop::LoopOutcome,
     patch: Vec<u8>,
+    window_messages: Vec<ChatMessage>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4512,6 +4513,21 @@ async fn run_asgard_trajectory_loop(
         };
         registries.push(registry);
     }
+    let supervisor_roots: Vec<_> = worktrees
+        .iter()
+        .map(|worktree| worktree.root.clone())
+        .collect();
+    let Some(supervisor_registry) = sessions
+        .create_trajectory_registry_with_roots(
+            session_id,
+            parent_registry.cwd().to_path_buf(),
+            &supervisor_roots,
+        )
+        .await
+    else {
+        cleanup_asgard_worktrees(&worktrees);
+        return asgard_failure(anyhow::anyhow!("unknown Asgard parent session"));
+    };
 
     let mut common_messages = initial_messages;
     let mut common_patch = Vec::new();
@@ -4529,6 +4545,7 @@ async fn run_asgard_trajectory_loop(
             ),
         );
         let mut futures = Vec::with_capacity(worktrees.len());
+        let common_message_count = common_messages.len();
         for (index, ((model, worktree), registry)) in config
             .candidate_models
             .iter()
@@ -4577,11 +4594,18 @@ async fn run_asgard_trajectory_loop(
                 )
                 .await;
                 let patch = crate::asgard::capture_patch(&worktree_root);
-                (index, model, outcome, patch)
+                let window_messages = outcome
+                    .continuation_messages
+                    .get(common_message_count..)
+                    .unwrap_or(&outcome.continuation_messages)
+                    .to_vec();
+                (index, model, outcome, patch, window_messages)
             });
         }
         let mut candidates = Vec::with_capacity(futures.len());
-        for (index, model, outcome, patch) in futures::future::join_all(futures).await {
+        for (index, model, outcome, patch, window_messages) in
+            futures::future::join_all(futures).await
+        {
             aggregate_usage.add(outcome.usage);
             match patch {
                 Ok(patch) => candidates.push(AsgardCandidate {
@@ -4589,6 +4613,7 @@ async fn run_asgard_trajectory_loop(
                     model,
                     outcome,
                     patch,
+                    window_messages,
                 }),
                 Err(error) => {
                     cleanup_asgard_worktrees(&worktrees);
@@ -4602,12 +4627,15 @@ async fn run_asgard_trajectory_loop(
             sessions,
             session_id,
             llm,
-            parent_registry,
+            &supervisor_registry,
             supervisor_model,
             idle_timeout,
             cancel.clone(),
             window,
             &candidates,
+            &worktrees,
+            &common_messages,
+            &common_patch,
         )
         .await;
         aggregate_usage.add(supervisor.1);
@@ -4680,41 +4708,103 @@ async fn run_asgard_supervisor(
     cancel: tokio_util::sync::CancellationToken,
     window: usize,
     candidates: &[AsgardCandidate],
+    worktrees: &[crate::asgard::Worktree],
+    common_messages: &[ChatMessage],
+    common_patch: &[u8],
 ) -> (anyhow::Result<usize>, crate::llm_client::TokenUsage) {
-    let original_task = candidates
-        .first()
-        .and_then(|candidate| {
-            candidate
-                .outcome
-                .continuation_messages
-                .iter()
-                .find(|message| message.role == "user")
-        })
+    let original_task = common_messages
+        .iter()
+        .find(|message| message.role == "user")
         .map(asgard_message_text)
         .unwrap_or_default();
+    let baseline_root = &worktrees[0].root;
+    let baseline_patch_path = baseline_root.join(".asgard-supervisor-baseline.patch");
+    let baseline_history_path = baseline_root.join(".asgard-supervisor-baseline-history.json");
+    let baseline_history = match serde_json::to_vec_pretty(common_messages) {
+        Ok(history) => history,
+        Err(error) => {
+            return (
+                Err(anyhow::anyhow!(
+                    "failed to serialize Asgard baseline history: {error}"
+                )),
+                crate::llm_client::TokenUsage::default(),
+            );
+        }
+    };
+    if let Err(error) = std::fs::write(&baseline_patch_path, common_patch)
+        .and_then(|()| std::fs::write(&baseline_history_path, baseline_history))
+    {
+        return (
+            Err(anyhow::anyhow!(
+                "failed to prepare Asgard baseline dossier: {error}"
+            )),
+            crate::llm_client::TokenUsage::default(),
+        );
+    }
     let mut dossier = format!(
         "Select the single trajectory that made the most reliable progress in window {window}. \
          Consider implementation correctness, tests, errors, plan quality, and regressions. \
          Penalize unrelated build/configuration edits and attempts to evade tests. \
-         Return only JSON {{\"winner\":N}} with the zero-based lane index.\n\n\
-         ORIGINAL TASK:\n{}\n",
-        truncate_asgard(&original_task, 16 * 1024)
+         You have read-only tools. The files named below contain the COMPLETE, untruncated \
+         baseline, per-window trajectories, and patches; inspect them whenever the inline ledger \
+         is insufficient, especially for test failures or large diffs. \
+         Return JSON {{\"winner\":N}} with the zero-based lane index.\n\n\
+         ORIGINAL TASK (complete):\n{original_task}\n\n\
+         SHARED BASELINE BEFORE THIS WINDOW:\npatch={} ({} bytes)\nhistory={}\n",
+        baseline_patch_path.display(),
+        common_patch.len(),
+        baseline_history_path.display(),
     );
     for candidate in candidates {
-        let patch = String::from_utf8_lossy(&candidate.patch);
-        let transcript = asgard_recent_transcript(&candidate.outcome.continuation_messages);
+        let root = &worktrees[candidate.index].root;
+        let patch_path = root.join(format!(".asgard-supervisor-window-{window}.patch"));
+        let transcript_path = root.join(format!(
+            ".asgard-supervisor-window-{window}-trajectory.json"
+        ));
+        let trajectory = match serde_json::to_vec_pretty(&candidate.window_messages) {
+            Ok(trajectory) => trajectory,
+            Err(error) => {
+                return (
+                    Err(anyhow::anyhow!(
+                        "failed to serialize Asgard lane {} trajectory: {error}",
+                        candidate.index
+                    )),
+                    crate::llm_client::TokenUsage::default(),
+                );
+            }
+        };
+        let write_result = std::fs::write(&patch_path, &candidate.patch)
+            .and_then(|()| std::fs::write(&transcript_path, trajectory));
+        if let Err(error) = write_result {
+            return (
+                Err(anyhow::anyhow!(
+                    "failed to prepare Asgard lane dossier: {error}"
+                )),
+                crate::llm_client::TokenUsage::default(),
+            );
+        }
+        let files = asgard_patch_files(&candidate.patch);
+        let ledger = asgard_window_ledger(&candidate.window_messages);
         dossier.push_str(&format!(
-            "\nLANE {} model={} stop={:?}\nRESPONSE:\n{}\nRECENT TRAJECTORY (assistant tool calls and tool results included):\n{}\nPATCH:\n{}\n",
+            "\nLANE {} model={} stop={:?}\nroot={}\nchanged_files={:?}\npatch={} ({} bytes, complete)\ntrajectory={} (complete)\nRESPONSE:\n{}\nWINDOW LEDGER:\n{}\n",
             candidate.index,
             candidate.model,
             candidate.outcome.stop,
+            root.display(),
+            files,
+            patch_path.display(),
+            candidate.patch.len(),
+            transcript_path.display(),
             candidate.outcome.response,
-            transcript,
-            truncate_asgard(&patch, 16 * 1024)
+            ledger,
         ));
     }
     let messages = vec![
-        ChatMessage::system("You are the Asgard trajectory supervisor."),
+        ChatMessage::system(
+            "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
+             and shared baseline. Use the read-only dossier files instead of guessing when inline \
+             evidence is incomplete.",
+        ),
         ChatMessage::user(dossier),
     ];
     let sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
@@ -4727,7 +4817,7 @@ async fn run_asgard_supervisor(
         None,
         None,
         messages,
-        1,
+        8,
         idle_timeout,
         cancel,
         sink,
@@ -4738,7 +4828,11 @@ async fn run_asgard_supervisor(
         String::new(),
         crate::tool_loop::NotificationMode::Silent,
         0,
-        Some(Arc::new(HashSet::new())),
+        Some(Arc::new(HashSet::from([
+            "read_file".to_string(),
+            "list_directory".to_string(),
+            "grep_search".to_string(),
+        ]))),
         Some(PermissionMode::ReadOnly),
         false,
     )
@@ -4759,14 +4853,68 @@ fn asgard_message_text(message: &ChatMessage) -> String {
         .join("\n")
 }
 
-fn asgard_recent_transcript(messages: &[ChatMessage]) -> String {
-    // The supervisor needs evidence of failed commands and tool observations,
-    // not just the code delta. Keep the tail so the dossier remains bounded
-    // even after several windows have accumulated a long common trajectory.
-    let start = messages.len().saturating_sub(32);
-    let json = serde_json::to_string_pretty(&messages[start..])
-        .unwrap_or_else(|error| format!("<trajectory serialization failed: {error}>"));
-    truncate_asgard(&json, 16 * 1024).to_string()
+fn asgard_patch_files(patch: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(patch)
+        .lines()
+        .filter_map(|line| line.strip_prefix("diff --git a/"))
+        .filter_map(|line| line.split_once(" b/").map(|(path, _)| path.to_string()))
+        .collect()
+}
+
+fn asgard_window_ledger(messages: &[ChatMessage]) -> String {
+    let mut ledger = String::new();
+    for message in messages {
+        if message.role == "assistant" {
+            let text = asgard_message_text(message);
+            if !text.trim().is_empty() {
+                ledger.push_str("assistant: ");
+                ledger.push_str(text.trim());
+                ledger.push('\n');
+            }
+            if let Some(calls) = &message.tool_calls {
+                for call in calls {
+                    ledger.push_str(&format!(
+                        "tool_call {}({})\n",
+                        call.function.name,
+                        asgard_compact_tool_arguments(&call.function.arguments)
+                    ));
+                }
+            }
+        } else if message.role == "tool" {
+            let bytes: usize = message
+                .content
+                .iter()
+                .map(|part| match part {
+                    ChatContentPart::Text { text } => text.len(),
+                    ChatContentPart::Image { image_url } => image_url.len(),
+                })
+                .sum();
+            ledger.push_str(&format!(
+                "tool_result {}: {bytes} bytes (read complete trajectory file for content)\n",
+                message.name.as_deref().unwrap_or("unknown")
+            ));
+        }
+    }
+    ledger
+}
+
+fn asgard_compact_tool_arguments(arguments: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return arguments.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        for field in ["content", "old_string", "new_string"] {
+            if let Some(length) = object
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::len)
+            {
+                let replacement = format!("<{length} bytes; inspect candidate file or patch>");
+                object.insert(field.to_string(), serde_json::Value::String(replacement));
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| arguments.to_string())
 }
 
 fn parse_asgard_winner(text: &str, count: usize) -> anyhow::Result<usize> {
@@ -4837,17 +4985,6 @@ fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
             *reasoning = reasoning.replace(&from, &to);
         }
     }
-}
-
-fn truncate_asgard(text: &str, limit: usize) -> &str {
-    if text.len() <= limit {
-        return text;
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 fn cleanup_asgard_worktrees(worktrees: &[crate::asgard::Worktree]) {
@@ -14883,6 +15020,47 @@ mod tests {
         assert_eq!(
             message.reasoning_content.as_deref(),
             Some("check /work/repo")
+        );
+    }
+
+    #[test]
+    fn asgard_supervisor_ledger_points_to_complete_evidence_without_embedding_payloads() {
+        let mut assistant = ChatMessage::assistant("implemented the parser");
+        assistant.tool_calls = Some(vec![crate::llm_client::ToolCall {
+            id: "call-1".to_string(),
+            r#type: "function".to_string(),
+            function: crate::llm_client::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "file_path": "src/parser.rs",
+                    "content": "important source that belongs in the patch"
+                })
+                .to_string(),
+            },
+        }]);
+        let tool = ChatMessage::tool_result(
+            "call-1".to_string(),
+            "write_file".to_string(),
+            "complete tool result".to_string(),
+        );
+
+        let ledger = asgard_window_ledger(&[assistant, tool]);
+
+        assert!(ledger.contains("implemented the parser"));
+        assert!(ledger.contains("write_file"));
+        assert!(ledger.contains("inspect candidate file or patch"));
+        assert!(!ledger.contains("important source that belongs in the patch"));
+        assert!(!ledger.contains("complete tool result"));
+        assert!(ledger.contains("read complete trajectory file"));
+    }
+
+    #[test]
+    fn asgard_patch_file_inventory_keeps_every_changed_path() {
+        let patch = b"diff --git a/src/a.rs b/src/a.rs\n\
+                      diff --git a/docs/guide.md b/docs/guide.md\n";
+        assert_eq!(
+            asgard_patch_files(patch),
+            vec!["src/a.rs".to_string(), "docs/guide.md".to_string()]
         );
     }
 }

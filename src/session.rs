@@ -3189,6 +3189,18 @@ impl SessionStore {
         session_id: &str,
         cwd: PathBuf,
     ) -> Option<Arc<ToolRegistry>> {
+        self.create_trajectory_registry_with_roots(session_id, cwd, &[])
+            .await
+    }
+
+    /// As [`Self::create_trajectory_registry`], with extra read roots used by
+    /// an internal trajectory supervisor to inspect candidate worktrees.
+    pub async fn create_trajectory_registry_with_roots(
+        &self,
+        session_id: &str,
+        cwd: PathBuf,
+        extra_roots: &[PathBuf],
+    ) -> Option<Arc<ToolRegistry>> {
         let normalized_cwd = normalize_cwd(&cwd);
         let (skills, agents, mcp_servers, additional_directories) = {
             let sessions = self.sessions.read().await;
@@ -3202,10 +3214,12 @@ impl SessionStore {
         };
         let plugin_hooks =
             crate::plugins::discover(Some(&normalized_cwd), dirs::home_dir().as_deref()).hooks();
+        let mut roots = additional_directories;
+        roots.extend_from_slice(extra_roots);
         Some(Arc::new(
             ToolRegistry::new(
                 normalized_cwd,
-                normalize_additional_directories(&additional_directories),
+                normalize_additional_directories(&roots),
                 mcp_servers,
                 skills,
                 agents,
