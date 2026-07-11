@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -4460,6 +4461,415 @@ async fn recap_work_summary(
     }
 }
 
+struct AsgardCandidate {
+    index: usize,
+    model: String,
+    outcome: crate::tool_loop::LoopOutcome,
+    patch: Vec<u8>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_asgard_trajectory_loop(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    parent_registry: &Arc<crate::tools::ToolRegistry>,
+    selected_model: &str,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    initial_messages: Vec<ChatMessage>,
+    idle_timeout: IdleTimeouts,
+    cancel: tokio_util::sync::CancellationToken,
+    config: &crate::asgard::Config,
+) -> crate::tool_loop::LoopOutcome {
+    if let Err(error) = crate::asgard::ensure_compatible_checkout(parent_registry.cwd()) {
+        return asgard_failure(error);
+    }
+    let mut worktrees = Vec::with_capacity(config.candidate_models.len());
+    for (index, model) in config.candidate_models.iter().enumerate() {
+        match crate::asgard::create_worktree(parent_registry.cwd(), &format!("{index}-{model}")) {
+            Ok(worktree) => worktrees.push(worktree),
+            Err(error) => {
+                for worktree in &worktrees {
+                    crate::asgard::remove_worktree(worktree);
+                }
+                return asgard_failure(error);
+            }
+        }
+    }
+    let mut registries = Vec::with_capacity(worktrees.len());
+    for worktree in &worktrees {
+        let Some(registry) = sessions
+            .create_trajectory_registry(session_id, worktree.session_cwd.clone())
+            .await
+        else {
+            for worktree in &worktrees {
+                crate::asgard::remove_worktree(worktree);
+            }
+            return asgard_failure(anyhow::anyhow!("unknown Asgard parent session"));
+        };
+        registries.push(registry);
+    }
+
+    let mut common_messages = initial_messages;
+    let mut common_patch = Vec::new();
+    let mut aggregate_usage = crate::llm_client::TokenUsage::default();
+    let mut selected_outcome = None;
+    for window in 1..=config.max_windows {
+        send_thought(
+            cx,
+            session_id,
+            &format!(
+                "\n[Asgard window {window}/{}: {} candidates × {} steps]\n",
+                config.max_windows,
+                config.candidate_models.len(),
+                config.window_steps
+            ),
+        );
+        let mut futures = Vec::with_capacity(worktrees.len());
+        for (index, ((model, worktree), registry)) in config
+            .candidate_models
+            .iter()
+            .zip(&worktrees)
+            .zip(&registries)
+            .enumerate()
+        {
+            if let Err(error) = crate::asgard::install_patch(&worktree.root, &common_patch) {
+                cleanup_asgard_worktrees(&worktrees);
+                return asgard_failure(error);
+            }
+            let mut messages = common_messages.clone();
+            rewrite_asgard_cwd(&mut messages, parent_registry.cwd(), &worktree.session_cwd);
+            let model = model.clone();
+            let registry = registry.clone();
+            let worktree_root = worktree.root.clone();
+            let cancel = cancel.clone();
+            futures.push(async move {
+                let sink: crate::tool_loop::TextSink =
+                    Arc::new(std::sync::Mutex::new(|_: &str| {}));
+                let thought_sink: crate::tool_loop::TextSink =
+                    Arc::new(std::sync::Mutex::new(|_: &str| {}));
+                let spawned = crate::tool_loop::SpawnedCx::new(cx);
+                let outcome = crate::tool_loop::run(
+                    llm,
+                    &registry,
+                    &model,
+                    reasoning_effort,
+                    service_tier,
+                    structured_output,
+                    messages,
+                    config.window_steps,
+                    idle_timeout,
+                    cancel,
+                    sink,
+                    thought_sink,
+                    spawned,
+                    session_id.to_string(),
+                    sessions.clone(),
+                    String::new(),
+                    crate::tool_loop::NotificationMode::Silent,
+                    0,
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+                let patch = crate::asgard::capture_patch(&worktree_root);
+                (index, model, outcome, patch)
+            });
+        }
+        let mut candidates = Vec::with_capacity(futures.len());
+        for (index, model, outcome, patch) in futures::future::join_all(futures).await {
+            aggregate_usage.add(outcome.usage);
+            match patch {
+                Ok(patch) => candidates.push(AsgardCandidate {
+                    index,
+                    model,
+                    outcome,
+                    patch,
+                }),
+                Err(error) => {
+                    cleanup_asgard_worktrees(&worktrees);
+                    return asgard_failure(error);
+                }
+            }
+        }
+        let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
+        let supervisor = run_asgard_supervisor(
+            cx,
+            sessions,
+            session_id,
+            llm,
+            parent_registry,
+            supervisor_model,
+            idle_timeout,
+            cancel.clone(),
+            window,
+            &candidates,
+        )
+        .await;
+        aggregate_usage.add(supervisor.1);
+        let winner_index = supervisor.0.unwrap_or_else(|error| {
+            let fallback = fallback_asgard_winner(&candidates);
+            tracing::warn!(
+                window,
+                fallback_lane = fallback + 1,
+                "Asgard supervisor output was invalid ({error:#}); using deterministic fallback"
+            );
+            fallback
+        });
+        let Some(winner) = candidates.into_iter().find(|c| c.index == winner_index) else {
+            cleanup_asgard_worktrees(&worktrees);
+            return asgard_failure(anyhow::anyhow!(
+                "Asgard supervisor selected an unknown lane"
+            ));
+        };
+        send_thought(
+            cx,
+            session_id,
+            &format!(
+                "[Asgard selected lane {}: {}]\n",
+                winner.index + 1,
+                winner.model
+            ),
+        );
+        common_patch = winner.patch.clone();
+        common_messages = winner.outcome.continuation_messages.clone();
+        // Store the canonical history in terms of the live checkout. Each
+        // candidate window rewrites that canonical path to its own worktree.
+        // Without this normalization, window N+1 inherited window N's
+        // now-stale winning worktree path.
+        rewrite_asgard_cwd(
+            &mut common_messages,
+            &worktrees[winner.index].session_cwd,
+            parent_registry.cwd(),
+        );
+        let finished = matches!(
+            winner.outcome.stop,
+            crate::tool_loop::LoopStop::Completed { .. }
+                | crate::tool_loop::LoopStop::Failed(_)
+                | crate::tool_loop::LoopStop::Cancelled
+        );
+        selected_outcome = Some(winner.outcome);
+        if finished {
+            break;
+        }
+    }
+    let apply_result = crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
+    cleanup_asgard_worktrees(&worktrees);
+    if let Err(error) = apply_result {
+        return asgard_failure(error);
+    }
+    let mut outcome = selected_outcome
+        .unwrap_or_else(|| asgard_failure(anyhow::anyhow!("Asgard produced no candidate windows")));
+    outcome.usage = aggregate_usage;
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_asgard_supervisor(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    registry: &Arc<crate::tools::ToolRegistry>,
+    model: &str,
+    idle_timeout: IdleTimeouts,
+    cancel: tokio_util::sync::CancellationToken,
+    window: usize,
+    candidates: &[AsgardCandidate],
+) -> (anyhow::Result<usize>, crate::llm_client::TokenUsage) {
+    let original_task = candidates
+        .first()
+        .and_then(|candidate| {
+            candidate
+                .outcome
+                .continuation_messages
+                .iter()
+                .find(|message| message.role == "user")
+        })
+        .map(asgard_message_text)
+        .unwrap_or_default();
+    let mut dossier = format!(
+        "Select the single trajectory that made the most reliable progress in window {window}. \
+         Consider implementation correctness, tests, errors, plan quality, and regressions. \
+         Penalize unrelated build/configuration edits and attempts to evade tests. \
+         Return only JSON {{\"winner\":N}} with the zero-based lane index.\n\n\
+         ORIGINAL TASK:\n{}\n",
+        truncate_asgard(&original_task, 16 * 1024)
+    );
+    for candidate in candidates {
+        let patch = String::from_utf8_lossy(&candidate.patch);
+        let transcript = asgard_recent_transcript(&candidate.outcome.continuation_messages);
+        dossier.push_str(&format!(
+            "\nLANE {} model={} stop={:?}\nRESPONSE:\n{}\nRECENT TRAJECTORY (assistant tool calls and tool results included):\n{}\nPATCH:\n{}\n",
+            candidate.index,
+            candidate.model,
+            candidate.outcome.stop,
+            candidate.outcome.response,
+            transcript,
+            truncate_asgard(&patch, 16 * 1024)
+        ));
+    }
+    let messages = vec![
+        ChatMessage::system("You are the Asgard trajectory supervisor."),
+        ChatMessage::user(dossier),
+    ];
+    let sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
+    let thought_sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
+    let outcome = crate::tool_loop::run(
+        llm,
+        registry,
+        model,
+        None,
+        None,
+        None,
+        messages,
+        1,
+        idle_timeout,
+        cancel,
+        sink,
+        thought_sink,
+        crate::tool_loop::SpawnedCx::new(cx),
+        session_id.to_string(),
+        sessions.clone(),
+        String::new(),
+        crate::tool_loop::NotificationMode::Silent,
+        0,
+        Some(Arc::new(HashSet::new())),
+        Some(PermissionMode::ReadOnly),
+        false,
+    )
+    .await;
+    let parsed = parse_asgard_winner(&outcome.response, candidates.len());
+    (parsed, outcome.usage)
+}
+
+fn asgard_message_text(message: &ChatMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ChatContentPart::Text { text } => Some(text.as_str()),
+            ChatContentPart::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn asgard_recent_transcript(messages: &[ChatMessage]) -> String {
+    // The supervisor needs evidence of failed commands and tool observations,
+    // not just the code delta. Keep the tail so the dossier remains bounded
+    // even after several windows have accumulated a long common trajectory.
+    let start = messages.len().saturating_sub(32);
+    let json = serde_json::to_string_pretty(&messages[start..])
+        .unwrap_or_else(|error| format!("<trajectory serialization failed: {error}>"));
+    truncate_asgard(&json, 16 * 1024).to_string()
+}
+
+fn parse_asgard_winner(text: &str, count: usize) -> anyhow::Result<usize> {
+    for (start, _) in text.match_indices('{') {
+        let Some(relative_end) = text[start..].find('}') else {
+            continue;
+        };
+        let Ok(value) =
+            serde_json::from_str::<serde_json::Value>(&text[start..=start + relative_end])
+        else {
+            continue;
+        };
+        if let Some(winner) = value.get("winner").and_then(serde_json::Value::as_u64) {
+            let winner = winner as usize;
+            if winner < count {
+                return Ok(winner);
+            }
+        }
+    }
+    // Some otherwise capable judge models occasionally emit a one-character
+    // JSON typo such as {"winner":1"}. Recover the integer after the winner
+    // key rather than discarding every candidate trajectory.
+    if let Some(key) = text.find("winner") {
+        let tail = &text[key + "winner".len()..];
+        if let Some(start) = tail.find(|character: char| character.is_ascii_digit()) {
+            let digits: String = tail[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(winner) = digits.parse::<usize>()
+                && winner < count
+            {
+                return Ok(winner);
+            }
+        }
+    }
+    anyhow::bail!("Asgard supervisor returned no valid winner JSON")
+}
+
+fn fallback_asgard_winner(candidates: &[AsgardCandidate]) -> usize {
+    candidates
+        .iter()
+        .max_by_key(|candidate| {
+            let completion = usize::from(matches!(
+                candidate.outcome.stop,
+                crate::tool_loop::LoopStop::Completed { .. }
+            ));
+            (completion, candidate.patch.len())
+        })
+        .map_or(0, |candidate| candidate.index)
+}
+
+fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
+    let from = from.display().to_string();
+    let to = to.display().to_string();
+    for message in messages {
+        for part in &mut message.content {
+            if let ChatContentPart::Text { text } = part {
+                *text = text.replace(&from, &to);
+            }
+        }
+        if let Some(tool_calls) = &mut message.tool_calls {
+            for call in tool_calls {
+                call.function.arguments = call.function.arguments.replace(&from, &to);
+            }
+        }
+        if let Some(reasoning) = &mut message.reasoning_content {
+            *reasoning = reasoning.replace(&from, &to);
+        }
+    }
+}
+
+fn truncate_asgard(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn cleanup_asgard_worktrees(worktrees: &[crate::asgard::Worktree]) {
+    for worktree in worktrees {
+        crate::asgard::remove_worktree(worktree);
+    }
+}
+
+fn asgard_failure(error: anyhow::Error) -> crate::tool_loop::LoopOutcome {
+    crate::tool_loop::LoopOutcome {
+        response: format!("\n**Error:** Asgard failed: {error:#}\n"),
+        tool_exchanges: Vec::new(),
+        replay_events: Vec::new(),
+        usage: crate::llm_client::TokenUsage::default(),
+        stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
+            retryable: false,
+            message: format!("Asgard failed: {error:#}"),
+        }),
+        continuation_messages: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn_in_spawn(
     cx: &ConnectionTo<Client>,
@@ -4499,30 +4909,52 @@ async fn run_model_turn_in_spawn(
     let cancel_status = cancel.clone();
     let cx_for_gate = cx.clone();
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
-    let loop_result = AssertUnwindSafe(crate::tool_loop::run(
-        llm,
-        registry,
-        model,
-        reasoning_effort,
-        service_tier,
-        structured_output_request,
-        messages,
-        max_turns,
-        idle_timeout,
-        cancel,
-        text_sink,
-        thought_sink,
-        spawned_cx,
-        session_id.to_string(),
-        sessions.clone(),
-        prompt_text_for_turn.clone(),
-        crate::tool_loop::NotificationMode::Live,
-        0,
-        None,
-        None,
-    ))
-    .catch_unwind()
-    .await;
+    let loop_future = async {
+        if let Some(config) = crate::asgard::config() {
+            run_asgard_trajectory_loop(
+                cx,
+                sessions,
+                session_id,
+                llm,
+                registry,
+                model,
+                reasoning_effort,
+                service_tier,
+                structured_output_request,
+                messages,
+                idle_timeout,
+                cancel,
+                config,
+            )
+            .await
+        } else {
+            crate::tool_loop::run(
+                llm,
+                registry,
+                model,
+                reasoning_effort,
+                service_tier,
+                structured_output_request,
+                messages,
+                max_turns,
+                idle_timeout,
+                cancel,
+                text_sink,
+                thought_sink,
+                spawned_cx,
+                session_id.to_string(),
+                sessions.clone(),
+                prompt_text_for_turn.clone(),
+                crate::tool_loop::NotificationMode::Live,
+                0,
+                None,
+                None,
+                false,
+            )
+            .await
+        }
+    };
+    let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
 
     let crate::tool_loop::LoopOutcome {
         response: response_text,
@@ -4530,6 +4962,7 @@ async fn run_model_turn_in_spawn(
         replay_events,
         usage: turn_usage,
         stop,
+        continuation_messages: _,
     } = match loop_result {
         Ok(outcome) => outcome,
         Err(panic) => {
@@ -4546,6 +4979,7 @@ async fn run_model_turn_in_spawn(
                     retryable: false,
                     message: "agent loop panicked".to_string(),
                 }),
+                continuation_messages: Vec::new(),
             }
         }
     };
@@ -14414,5 +14848,41 @@ mod tests {
         // Unknown session id is surfaced rather than silently noop'd.
         let missing = handle_setup_sandbox(&store, "no-such", "off").await;
         assert!(missing.contains("unknown session"), "got: {missing}");
+    }
+
+    #[test]
+    fn asgard_winner_parser_recovers_common_judge_json_typo() {
+        assert_eq!(parse_asgard_winner(r#"{"winner":1"}"#, 3).unwrap(), 1);
+        assert_eq!(
+            parse_asgard_winner("```json\n{\"winner\":2}\n```", 3).unwrap(),
+            2
+        );
+        assert!(parse_asgard_winner(r#"{"winner":7}"#, 3).is_err());
+    }
+
+    #[test]
+    fn asgard_canonicalizes_worktree_paths_across_full_history() {
+        let old = Path::new("/tmp/asgard-old");
+        let live = Path::new("/work/repo");
+        let mut message = ChatMessage::assistant("worked in /tmp/asgard-old/src");
+        message.tool_calls = Some(vec![crate::llm_client::ToolCall {
+            id: "call-1".to_string(),
+            r#type: "function".to_string(),
+            function: crate::llm_client::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: r#"{\"path\":\"/tmp/asgard-old/src/main.rs\"}"#.to_string(),
+            },
+        }]);
+        message.reasoning_content = Some("check /tmp/asgard-old".to_string());
+
+        rewrite_asgard_cwd(std::slice::from_mut(&mut message), old, live);
+
+        assert!(asgard_message_text(&message).contains("/work/repo/src"));
+        let call = &message.tool_calls.as_ref().unwrap()[0];
+        assert!(call.function.arguments.contains("/work/repo/src/main.rs"));
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("check /work/repo")
+        );
     }
 }

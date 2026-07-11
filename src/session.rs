@@ -3180,6 +3180,41 @@ impl SessionStore {
         Some(registry)
     }
 
+    /// Build an uncached registry for an isolated trajectory workspace while
+    /// inheriting the parent session's tools, skills, subagents, MCP servers,
+    /// and additional roots. The parent session cwd and cached registry are
+    /// left untouched.
+    pub async fn create_trajectory_registry(
+        &self,
+        session_id: &str,
+        cwd: PathBuf,
+    ) -> Option<Arc<ToolRegistry>> {
+        let normalized_cwd = normalize_cwd(&cwd);
+        let (skills, agents, mcp_servers, additional_directories) = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(session_id)?;
+            (
+                session.skills.clone(),
+                session.agents.clone(),
+                effective_mcp_servers(&normalized_cwd, session.mcp_servers.clone()),
+                session.additional_directories.clone(),
+            )
+        };
+        let plugin_hooks =
+            crate::plugins::discover(Some(&normalized_cwd), dirs::home_dir().as_deref()).hooks();
+        Some(Arc::new(
+            ToolRegistry::new(
+                normalized_cwd,
+                normalize_additional_directories(&additional_directories),
+                mcp_servers,
+                skills,
+                agents,
+                plugin_hooks,
+            )
+            .await,
+        ))
+    }
+
     pub async fn invalidate_registry(&self, session_id: &str) {
         self.registries.write().await.remove(session_id);
     }

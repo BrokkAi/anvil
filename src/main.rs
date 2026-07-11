@@ -9,6 +9,7 @@ use clap::builder::RangedU64ValueParser;
 mod agent;
 mod agents;
 mod agents_md;
+mod asgard;
 mod bedrock_auth;
 mod bedrock_client;
 mod codex_auth;
@@ -81,6 +82,24 @@ struct Args {
     /// message (e.g. "continue") resumes the task from where it stopped.
     #[arg(long, default_value_t = 0)]
     max_turns: usize,
+
+    /// Candidate model for Asgard trajectory search. Repeat for arbitrary
+    /// candidate counts; all candidates currently require provider-qualified
+    /// model wire ids.
+    #[arg(long = "asgard-model")]
+    asgard_models: Vec<String>,
+
+    /// Supervisor model for Asgard. Defaults to the selected session model.
+    #[arg(long, requires = "asgard_models")]
+    asgard_supervisor: Option<String>,
+
+    /// Normal model/tool steps per Asgard trajectory window.
+    #[arg(long, default_value_t = 8)]
+    asgard_window_steps: usize,
+
+    /// Maximum supervisor-selection windows per prompt.
+    #[arg(long, default_value_t = 8)]
+    asgard_max_windows: usize,
 
     /// Maximum number of sessions to keep resident in memory before the
     /// least-recently-used session is evicted (the on-disk zip is unaffected
@@ -175,6 +194,10 @@ impl std::fmt::Debug for Args {
             .field("default_model", &self.default_model)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_turns", &self.max_turns)
+            .field("asgard_models", &self.asgard_models)
+            .field("asgard_supervisor", &self.asgard_supervisor)
+            .field("asgard_window_steps", &self.asgard_window_steps)
+            .field("asgard_max_windows", &self.asgard_max_windows)
             .field("max_sessions", &self.max_sessions)
             .field("max_history_turns", &self.max_history_turns)
             .field("bifrost_binary", &self.bifrost_binary)
@@ -654,6 +677,12 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
+    asgard::configure((!args.asgard_models.is_empty()).then(|| asgard::Config {
+        candidate_models: args.asgard_models,
+        supervisor_model: args.asgard_supervisor,
+        window_steps: args.asgard_window_steps.max(1),
+        max_windows: args.asgard_max_windows.max(1),
+    }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
     agent::run_agent(

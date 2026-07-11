@@ -23,6 +23,7 @@ use crate::llm_client::{
     rewrite_image_prompt_provider_error, stream_chat_no_visible_output_with_retry,
 };
 use crate::p2t::{self, P2tStopReason, StepTraceRecord};
+
 use crate::semantic_rerank;
 use crate::session::{
     PermissionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
@@ -523,6 +524,10 @@ pub(crate) struct LoopOutcome {
     pub replay_events: Vec<TurnReplayEvent>,
     pub usage: TokenUsage,
     pub stop: LoopStop,
+    /// Exact provider-neutral message state at the stop boundary. Asgard uses
+    /// this to snap every candidate to the selected trajectory without
+    /// reconstructing history through ACP.
+    pub continuation_messages: Vec<ChatMessage>,
 }
 
 impl LoopOutcome {
@@ -540,6 +545,7 @@ impl LoopOutcome {
             tool_exchanges: Vec::new(),
             replay_events: Vec::new(),
             usage: TokenUsage::default(),
+            continuation_messages: Vec::new(),
         }
     }
 }
@@ -1761,6 +1767,7 @@ pub(crate) async fn run(
     depth: usize,
     tool_allowlist: Option<Arc<HashSet<String>>>,
     permission_override: Option<PermissionMode>,
+    trajectory_window: bool,
 ) -> LoopOutcome {
     let train_bifrost = train_bifrost_enabled();
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
@@ -2087,7 +2094,8 @@ pub(crate) async fn run(
         // change has succeeded yet, keep tools available so a hard task does
         // not end with a false "I cannot edit" answer solely because the
         // harness withheld edit/write tools on the final turn.
-        let force_text_response = p2t_config.is_none()
+        let force_text_response = !trajectory_window
+            && p2t_config.is_none()
             && turn >= max_turns - 1
             && has_successful_file_change(&tool_exchanges);
         let turn_tools = if !force_text_response && !tools.is_empty() {
@@ -2557,7 +2565,8 @@ pub(crate) async fn run(
     //   (`Live`) turns do this; planning and subagent runs are `Silent` and must
     //   not splice the notice into the plan/`task` result, so they suppress it.
     let resolve_max_turns = !train_bifrost && p2t_config.is_none();
-    let surface_notice = resolve_max_turns && matches!(notifications, NotificationMode::Live);
+    let surface_notice =
+        resolve_max_turns && !trajectory_window && matches!(notifications, NotificationMode::Live);
     let stop = resolve_loop_stop(
         llm_failure,
         clean_exit,
@@ -2601,6 +2610,7 @@ pub(crate) async fn run(
         replay_events,
         usage: turn_usage,
         stop,
+        continuation_messages: messages,
     }
 }
 
@@ -5203,6 +5213,7 @@ async fn execute_subagent(
         depth,
         nested_tool_allowlist,
         child_permission_override,
+        false,
     ))
     .await;
 
