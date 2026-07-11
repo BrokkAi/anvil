@@ -4467,6 +4467,13 @@ struct AsgardCandidate {
     outcome: crate::tool_loop::LoopOutcome,
     patch: Vec<u8>,
     window_messages: Vec<ChatMessage>,
+    assigned_advice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsgardSupervisorDecision {
+    winner: usize,
+    advices: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4533,6 +4540,7 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
+    let mut next_advices: Option<Vec<String>> = None;
     for window in 1..=config.max_windows {
         send_thought(
             cx,
@@ -4559,6 +4567,14 @@ async fn run_asgard_trajectory_loop(
             }
             let mut messages = common_messages.clone();
             rewrite_asgard_cwd(&mut messages, parent_registry.cwd(), &worktree.session_cwd);
+            let assigned_advice = next_advices
+                .as_ref()
+                .and_then(|advices| advices.get(index))
+                .cloned();
+            if let Some(advice) = &assigned_advice {
+                messages.push(asgard_advice_message(index, advice));
+            }
+            let trajectory_message_start = messages.len();
             let model = model.clone();
             let registry = registry.clone();
             let worktree_root = worktree.root.clone();
@@ -4569,7 +4585,7 @@ async fn run_asgard_trajectory_loop(
                 let thought_sink: crate::tool_loop::TextSink =
                     Arc::new(std::sync::Mutex::new(|_: &str| {}));
                 let spawned = crate::tool_loop::SpawnedCx::new(cx);
-                let outcome = crate::tool_loop::run(
+                let mut outcome = crate::tool_loop::run(
                     llm,
                     &registry,
                     &model,
@@ -4594,16 +4610,24 @@ async fn run_asgard_trajectory_loop(
                 )
                 .await;
                 let patch = crate::asgard::capture_patch(&worktree_root);
-                let window_messages = outcome
-                    .continuation_messages
-                    .get(common_message_count..)
-                    .unwrap_or(&outcome.continuation_messages)
-                    .to_vec();
-                (index, model, outcome, patch, window_messages)
+                let window_messages = asgard_take_window_messages_and_strip_advice(
+                    &mut outcome.continuation_messages,
+                    common_message_count,
+                    trajectory_message_start,
+                    assigned_advice.is_some(),
+                );
+                (
+                    index,
+                    model,
+                    outcome,
+                    patch,
+                    window_messages,
+                    assigned_advice,
+                )
             });
         }
         let mut candidates = Vec::with_capacity(futures.len());
-        for (index, model, outcome, patch, window_messages) in
+        for (index, model, outcome, patch, window_messages, assigned_advice) in
             futures::future::join_all(futures).await
         {
             aggregate_usage.add(outcome.usage);
@@ -4614,6 +4638,7 @@ async fn run_asgard_trajectory_loop(
                     outcome,
                     patch,
                     window_messages,
+                    assigned_advice,
                 }),
                 Err(error) => {
                     cleanup_asgard_worktrees(&worktrees);
@@ -4639,15 +4664,33 @@ async fn run_asgard_trajectory_loop(
         )
         .await;
         aggregate_usage.add(supervisor.1);
-        let winner_index = supervisor.0.unwrap_or_else(|error| {
-            let fallback = fallback_asgard_winner(&candidates);
+        let decision = supervisor.0.unwrap_or_else(|error| {
+            let fallback = AsgardSupervisorDecision {
+                winner: fallback_asgard_winner(&candidates),
+                advices: fallback_asgard_advices(candidates.len()),
+            };
             tracing::warn!(
                 window,
-                fallback_lane = fallback + 1,
+                fallback_lane = fallback.winner + 1,
                 "Asgard supervisor output was invalid ({error:#}); using deterministic fallback"
             );
             fallback
         });
+        let winner_index = decision.winner;
+        next_advices = Some(decision.advices);
+        if let Some(advices) = &next_advices {
+            let rendered = advices
+                .iter()
+                .enumerate()
+                .map(|(lane, advice)| format!("  lane {}: {}", lane + 1, advice))
+                .collect::<Vec<_>>()
+                .join("\n");
+            send_thought(
+                cx,
+                session_id,
+                &format!("[Asgard next-window strategies]\n{rendered}\n"),
+            );
+        }
         let Some(winner) = candidates.into_iter().find(|c| c.index == winner_index) else {
             cleanup_asgard_worktrees(&worktrees);
             return asgard_failure(anyhow::anyhow!(
@@ -4711,7 +4754,10 @@ async fn run_asgard_supervisor(
     worktrees: &[crate::asgard::Worktree],
     common_messages: &[ChatMessage],
     common_patch: &[u8],
-) -> (anyhow::Result<usize>, crate::llm_client::TokenUsage) {
+) -> (
+    anyhow::Result<AsgardSupervisorDecision>,
+    crate::llm_client::TokenUsage,
+) {
     let original_task = common_messages
         .iter()
         .find(|message| message.role == "user")
@@ -4747,10 +4793,14 @@ async fn run_asgard_supervisor(
          Penalize unrelated build/configuration edits and attempts to evade tests. \
          You have read-only tools. The files named below contain the COMPLETE, untruncated \
          baseline, per-window trajectories, and patches; inspect them whenever the inline ledger \
-         is insufficient, especially for test failures or large diffs. \
-         Return JSON {{\"winner\":N}} with the zero-based lane index.\n\n\
-         ORIGINAL TASK (complete):\n{original_task}\n\n\
+         is insufficient, especially for test failures or large diffs. After choosing, produce \
+         exactly {} concise, actionable, mutually distinct strategies for the next candidate \
+         window, ordered by zero-based lane index. The strategies should explore different \
+         hypotheses or implementation/test approaches from the selected state. They are advice \
+         for normal continuing rollouts, not instructions to stop at a window boundary. \
+         Return JSON {{\"winner\":N,\"advices\":[\"lane 0 strategy\",...]}}.\n\n\
          SHARED BASELINE BEFORE THIS WINDOW:\npatch={} ({} bytes)\nhistory={}\n",
+        candidates.len(),
         baseline_patch_path.display(),
         common_patch.len(),
         baseline_history_path.display(),
@@ -4786,10 +4836,11 @@ async fn run_asgard_supervisor(
         let files = asgard_patch_files(&candidate.patch);
         let ledger = asgard_window_ledger(&candidate.window_messages);
         dossier.push_str(&format!(
-            "\nLANE {} model={} stop={:?}\nroot={}\nchanged_files={:?}\npatch={} ({} bytes, complete)\ntrajectory={} (complete)\nRESPONSE:\n{}\nWINDOW LEDGER:\n{}\n",
+            "\nLANE {} model={} stop={:?}\nassigned_advice={:?}\nroot={}\nchanged_files={:?}\npatch={} ({} bytes, complete)\ntrajectory={} (complete)\nRESPONSE:\n{}\nWINDOW LEDGER:\n{}\n",
             candidate.index,
             candidate.model,
             candidate.outcome.stop,
+            candidate.assigned_advice,
             root.display(),
             files,
             patch_path.display(),
@@ -4799,14 +4850,7 @@ async fn run_asgard_supervisor(
             ledger,
         ));
     }
-    let messages = vec![
-        ChatMessage::system(
-            "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
-             and shared baseline. Use the read-only dossier files instead of guessing when inline \
-             evidence is incomplete.",
-        ),
-        ChatMessage::user(dossier),
-    ];
+    let messages = asgard_supervisor_messages(&original_task, dossier);
     let sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
     let thought_sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
     let outcome = crate::tool_loop::run(
@@ -4837,8 +4881,70 @@ async fn run_asgard_supervisor(
         false,
     )
     .await;
-    let parsed = parse_asgard_winner(&outcome.response, candidates.len());
+    let parsed = match parse_asgard_supervisor_decision(&outcome.response, candidates.len()) {
+        Ok(decision) => Ok(decision),
+        Err(decision_error) => {
+            match parse_asgard_winner_only(&outcome.response, candidates.len()) {
+                Ok(winner) => {
+                    tracing::warn!(
+                        window,
+                        winner_lane = winner + 1,
+                        "Asgard supervisor advice was invalid ({decision_error:#}); preserving its winner and using fallback advice"
+                    );
+                    Ok(AsgardSupervisorDecision {
+                        winner,
+                        advices: fallback_asgard_advices(candidates.len()),
+                    })
+                }
+                Err(winner_error) => Err(anyhow::anyhow!(
+                    "{decision_error:#}; winner recovery also failed: {winner_error:#}"
+                )),
+            }
+        }
+    };
     (parsed, outcome.usage)
+}
+
+fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(
+            "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
+             and shared baseline. Use the read-only dossier files instead of guessing when inline \
+             evidence is incomplete. Your final response must contain the requested winner and one \
+             distinct next-window advice string per lane.",
+        ),
+        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
+        ChatMessage::user(dossier),
+    ]
+}
+
+fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
+    ChatMessage::user(format!(
+        "<asgard_next_window_advice lane=\"{lane}\">\n{advice}\n\
+         </asgard_next_window_advice>\n\
+         Treat this as advisory strategy for continuing the original task normally. \
+         Do not stop because of an Asgard window boundary; Anvil controls those boundaries."
+    ))
+}
+
+fn asgard_take_window_messages_and_strip_advice(
+    messages: &mut Vec<ChatMessage>,
+    common_message_count: usize,
+    trajectory_message_start: usize,
+    advice_expected: bool,
+) -> Vec<ChatMessage> {
+    let window_messages = messages
+        .get(trajectory_message_start..)
+        .unwrap_or_default()
+        .to_vec();
+    if advice_expected
+        && messages.get(common_message_count).is_some_and(|message| {
+            asgard_message_text(message).contains("<asgard_next_window_advice")
+        })
+    {
+        messages.remove(common_message_count);
+    }
+    window_messages
 }
 
 fn asgard_message_text(message: &ChatMessage) -> String {
@@ -4917,36 +5023,59 @@ fn asgard_compact_tool_arguments(arguments: &str) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| arguments.to_string())
 }
 
-fn parse_asgard_winner(text: &str, count: usize) -> anyhow::Result<usize> {
+fn parse_asgard_supervisor_decision(
+    text: &str,
+    count: usize,
+) -> anyhow::Result<AsgardSupervisorDecision> {
     for (start, _) in text.match_indices('{') {
-        let Some(relative_end) = text[start..].find('}') else {
+        let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<serde_json::Value>()
+            .next()
+        else {
             continue;
         };
-        let Ok(value) =
-            serde_json::from_str::<serde_json::Value>(&text[start..=start + relative_end])
+        let Some(winner) = value.get("winner").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let winner = winner as usize;
+        if winner >= count {
+            continue;
+        }
+        let Some(raw_advices) = value.get("advices").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if raw_advices.len() != count {
+            continue;
+        }
+        let advices: Vec<_> = raw_advices
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .map(str::to_string)
+            .collect();
+        if advices.len() != count || advices.iter().any(String::is_empty) {
+            continue;
+        }
+        let distinct: HashSet<_> = advices.iter().map(|advice| advice.to_lowercase()).collect();
+        if distinct.len() != count {
+            continue;
+        }
+        return Ok(AsgardSupervisorDecision { winner, advices });
+    }
+    anyhow::bail!("Asgard supervisor returned no valid winner plus {count} distinct advices")
+}
+
+fn parse_asgard_winner_only(text: &str, count: usize) -> anyhow::Result<usize> {
+    for (start, _) in text.match_indices('{') {
+        let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<serde_json::Value>()
+            .next()
         else {
             continue;
         };
         if let Some(winner) = value.get("winner").and_then(serde_json::Value::as_u64) {
             let winner = winner as usize;
             if winner < count {
-                return Ok(winner);
-            }
-        }
-    }
-    // Some otherwise capable judge models occasionally emit a one-character
-    // JSON typo such as {"winner":1"}. Recover the integer after the winner
-    // key rather than discarding every candidate trajectory.
-    if let Some(key) = text.find("winner") {
-        let tail = &text[key + "winner".len()..];
-        if let Some(start) = tail.find(|character: char| character.is_ascii_digit()) {
-            let digits: String = tail[start..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            if let Ok(winner) = digits.parse::<usize>()
-                && winner < count
-            {
                 return Ok(winner);
             }
         }
@@ -4965,6 +5094,18 @@ fn fallback_asgard_winner(candidates: &[AsgardCandidate]) -> usize {
             (completion, candidate.patch.len())
         })
         .map_or(0, |candidate| candidate.index)
+}
+
+fn fallback_asgard_advices(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|lane| {
+            format!(
+                "Lane {lane}: independently reassess the selected implementation, inspect the \
+                 most relevant remaining correctness risk, and pursue a concrete fix or test \
+                 that differs from the other candidate lanes."
+            )
+        })
+        .collect()
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -14988,13 +15129,81 @@ mod tests {
     }
 
     #[test]
-    fn asgard_winner_parser_recovers_common_judge_json_typo() {
-        assert_eq!(parse_asgard_winner(r#"{"winner":1"}"#, 3).unwrap(), 1);
-        assert_eq!(
-            parse_asgard_winner("```json\n{\"winner\":2}\n```", 3).unwrap(),
-            2
+    fn asgard_supervisor_parser_requires_exactly_n_distinct_advices() {
+        let parsed = parse_asgard_supervisor_decision(
+            "```json\n{\"winner\":2,\"advices\":[\"test the parser\",\"challenge the API\",\"inspect concurrency\"]}\n```",
+            3,
+        )
+        .unwrap();
+        assert_eq!(parsed.winner, 2);
+        assert_eq!(parsed.advices.len(), 3);
+
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"advices":["same","same","different"]}"#,
+                3
+            )
+            .is_err()
         );
-        assert!(parse_asgard_winner(r#"{"winner":7}"#, 3).is_err());
+        assert_eq!(
+            parse_asgard_winner_only(r#"{"winner":1,"advices":["same","same","different"]}"#, 3)
+                .unwrap(),
+            1
+        );
+        assert!(
+            parse_asgard_supervisor_decision(r#"{"winner":1,"advices":["only one"]}"#, 3).is_err()
+        );
+        assert!(
+            parse_asgard_supervisor_decision(r#"{"winner":7,"advices":["a","b","c"]}"#, 3).is_err()
+        );
+    }
+
+    #[test]
+    fn asgard_advice_is_explicitly_ephemeral_and_normal_rollout() {
+        let message = asgard_advice_message(2, "Focus on the concurrency invariant.");
+        let text = asgard_message_text(&message);
+        assert!(text.contains("lane=\"2\""));
+        assert!(text.contains("Focus on the concurrency invariant."));
+        assert!(text.contains("continuing the original task normally"));
+        assert!(text.contains("Do not stop"));
+    }
+
+    #[test]
+    fn asgard_advice_is_removed_from_canonical_history_after_window() {
+        let mut messages = vec![
+            ChatMessage::system("stable prefix"),
+            ChatMessage::user("original task"),
+            asgard_advice_message(0, "Try the parser path."),
+            ChatMessage::assistant("I will inspect the parser."),
+        ];
+
+        let window = asgard_take_window_messages_and_strip_advice(&mut messages, 2, 3, true);
+
+        assert_eq!(
+            window,
+            vec![ChatMessage::assistant("I will inspect the parser.")]
+        );
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages
+                .iter()
+                .all(|message| !asgard_message_text(message).contains("asgard_next_window_advice"))
+        );
+        assert_eq!(
+            messages[2],
+            ChatMessage::assistant("I will inspect the parser.")
+        );
+    }
+
+    #[test]
+    fn asgard_supervisor_keeps_stable_task_prefix_ahead_of_window_dossier() {
+        let first = asgard_supervisor_messages("fix the parser", "window one".to_string());
+        let second = asgard_supervisor_messages("fix the parser", "window two".to_string());
+
+        assert_eq!(&first[..2], &second[..2]);
+        assert_ne!(first[2], second[2]);
+        assert!(asgard_message_text(&first[1]).contains("fix the parser"));
+        assert!(!asgard_message_text(&first[0]).contains("window one"));
     }
 
     #[test]
