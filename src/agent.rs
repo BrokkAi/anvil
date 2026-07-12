@@ -4784,6 +4784,11 @@ async fn run_asgard_supervisor(
          merely because careful investigation produced fewer edits this window, and do not reward \
          patch size or superficial test motion. Consider implementation correctness, architectural \
          fit, evidence from tests and errors, remaining risks, recoverability, and regressions. \
+         When execution is blocked by an environmental or baseline failure, perform a skeptical \
+         static compilation audit using the supplied evidence: check introduced types, namespaces, \
+         method signatures, imports, and call contracts. Treat an unverified patch as high risk, \
+         never as correct merely because its tests look plausible, and prefer candidates that reduce \
+         or explicitly investigate those source-level risks. \
          Penalize unrelated build/configuration edits and attempts to evade tests. All evidence is \
          supplied inline below; make your best judgment from it without tools. Treat build or test \
          failures as evidence: distinguish failures caused by a candidate's patch from pre-existing, \
@@ -4898,7 +4903,10 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
              test selection, or expected outputs in response to a failure. Pre-existing, \
              environmental, dependency-audit, and harness failures are evidence to report or work \
              around with focused verification, not problems to hide. Any strategy that violates \
-             this constraint makes the entire answer invalid. Your final response must contain the \
+             this constraint makes the entire answer invalid. If execution is environmentally \
+             blocked, skeptically audit introduced symbols, types, namespaces, imports, signatures, \
+             and call contracts from the supplied evidence. Never describe an uncompiled patch as \
+             correct merely because its tests or structure look plausible. Your final response must contain the \
              requested winner, a sufficient rolling summary of the selected endpoint, and one \
              distinct, scope-grounded next-window advice object per lane.",
         ),
@@ -4957,7 +4965,8 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          Do not stop because of an Asgard window boundary; Anvil controls those boundaries. \
          Unless the original task requires it, do not change unrelated dependencies, build \
          configuration, warning policy, tests, or test selection to hide a pre-existing, \
-         environmental, dependency-audit, or harness failure."
+         environmental, dependency-audit, or harness failure, and do not chase it by changing SDKs, \
+         MSBuild properties, generated build directories, or checkout paths."
     ))
 }
 
@@ -5079,6 +5088,16 @@ fn filter_asgard_advice_scope(
     .any(|term| task.contains(term));
     let task_requests_cloning =
         task.contains("clone the repo") || task.contains("clone the repository");
+    let task_requests_build_environment_work = [
+        "build environment",
+        "build configuration",
+        "sdk version",
+        "msbuild",
+        "ci configuration",
+        "toolchain",
+    ]
+    .iter()
+    .any(|term| task.contains(term));
     let mut rejected = Vec::new();
 
     for (lane, advice) in decision.advices.iter_mut().enumerate() {
@@ -5141,6 +5160,33 @@ fn filter_asgard_advice_scope(
                 && (strategy.contains("clone the repo")
                     || strategy.contains("clone the repository")))
             .then(|| "out-of-scope repository clone".to_string())
+        })
+        .or_else(|| {
+            let build_environment_workarounds = [
+                "upgrade sdk",
+                "upgrade the sdk",
+                "update sdk",
+                "update the sdk",
+                "change sdk",
+                "change the sdk",
+                "importprojectextensionprops",
+                "clean obj",
+                "delete obj",
+                "delete the obj",
+                "path without colons",
+                "resolve the msbuild environment",
+                "fix the msbuild environment",
+                "work around the environment",
+                "workaround the environment",
+            ];
+            if !task_requests_build_environment_work {
+                build_environment_workarounds
+                    .iter()
+                    .find(|term| strategy.contains(**term))
+                    .map(|term| format!("out-of-scope build-environment phrase {term:?}"))
+            } else {
+                None
+            }
         });
 
         if let Some(reason) = violation {
@@ -15265,6 +15311,7 @@ mod tests {
             "Restore with /p:NuGetAudit=false and rebuild.",
             "Update the dependency to clear the unrelated warning.",
             "Clone the repository to a path without colons and retry.",
+            "Clean obj, upgrade the SDK, and set ImportProjectExtensionProps=false.",
         ] {
             let mut candidate = decision(strategy);
             let rejected =
@@ -15284,6 +15331,17 @@ mod tests {
             .is_empty()
         );
         assert!(requested_dependency.advices[0].is_some());
+
+        let mut requested_build_environment =
+            decision("Update the SDK and MSBuild property required by the task.");
+        assert!(
+            filter_asgard_advice_scope(
+                &mut requested_build_environment,
+                "Update the build environment to a new SDK version and adjust MSBuild.",
+            )
+            .is_empty()
+        );
+        assert!(requested_build_environment.advices[0].is_some());
 
         let mut focused =
             decision("Run the task's focused validator tests and fix candidate-caused errors.");
