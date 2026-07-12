@@ -4863,7 +4863,12 @@ async fn run_asgard_supervisor(
         false,
     )
     .await;
-    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len());
+    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).and_then(
+        |decision| {
+            validate_asgard_advice_scope(&decision, &original_task)?;
+            Ok(decision)
+        },
+    );
     (parsed, outcome.usage)
 }
 
@@ -5042,6 +5047,83 @@ fn parse_asgard_supervisor_decision(
         });
     }
     anyhow::bail!("Asgard supervisor returned no valid winner plus {count} distinct advices")
+}
+
+fn validate_asgard_advice_scope(
+    decision: &AsgardSupervisorDecision,
+    original_task: &str,
+) -> anyhow::Result<()> {
+    let task = original_task.to_lowercase();
+    let task_requests_dependency_work = [
+        "dependency",
+        "dependencies",
+        "package version",
+        "lockfile",
+        "lock file",
+    ]
+    .iter()
+    .any(|term| task.contains(term));
+    let task_requests_cloning =
+        task.contains("clone the repo") || task.contains("clone the repository");
+
+    for (lane, advice) in decision.advices.iter().enumerate() {
+        let advice = advice.to_lowercase();
+        let policy_bypasses = [
+            "nugetaudit=false",
+            "nugetaudit false",
+            "nowarn",
+            "suppress warning",
+            "suppress the warning",
+            "disable warning",
+            "disable the warning",
+            "disable audit",
+            "disable the audit",
+            "skip failing test",
+            "skip the failing test",
+            "skip tests",
+            "change test selection",
+            "modify test expectations",
+            "change test expectations",
+        ];
+        if let Some(term) = policy_bypasses.iter().find(|term| advice.contains(**term)) {
+            anyhow::bail!("lane {lane} advice violates the no-bypass policy with phrase {term:?}");
+        }
+
+        let dependency_changes = [
+            "update the dependency",
+            "update dependency",
+            "upgrade the dependency",
+            "upgrade dependency",
+            "change the dependency",
+            "change dependency",
+            "update the package",
+            "update package",
+            "upgrade the package",
+            "upgrade package",
+            "modify the lockfile",
+            "modify lockfile",
+            "update the lockfile",
+            "update lockfile",
+            "regenerate the lockfile",
+            "regenerate lockfile",
+        ];
+        if !task_requests_dependency_work
+            && let Some(term) = dependency_changes
+                .iter()
+                .find(|term| advice.contains(**term))
+        {
+            anyhow::bail!(
+                "lane {lane} advice proposes out-of-scope dependency work with phrase {term:?}"
+            );
+        }
+
+        if !task_requests_cloning
+            && (advice.contains("clone the repo") || advice.contains("clone the repository"))
+        {
+            anyhow::bail!("lane {lane} advice proposes an out-of-scope repository clone");
+        }
+    }
+    Ok(())
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -15144,6 +15226,53 @@ mod tests {
         assert!(text.contains("continuing the original task normally"));
         assert!(text.contains("Do not stop"));
         assert!(text.contains("do not change unrelated dependencies"));
+    }
+
+    #[test]
+    fn asgard_advice_scope_validation_rejects_bypasses_and_unrequested_dependency_work() {
+        let decision = |strategy: &str| AsgardSupervisorDecision {
+            winner: 0,
+            advices: vec![strategy.to_string()],
+            state_summary: "implementation is ready for focused verification".to_string(),
+        };
+
+        assert!(
+            validate_asgard_advice_scope(
+                &decision("Restore with /p:NuGetAudit=false and rebuild."),
+                "Implement the policy validator.",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_asgard_advice_scope(
+                &decision("Update the dependency to clear the unrelated warning."),
+                "Implement the policy validator.",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_asgard_advice_scope(
+                &decision("Clone the repository to a path without colons and retry."),
+                "Implement the policy validator.",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_asgard_advice_scope(
+                &decision("Update the dependency to the required secure version."),
+                "Update the parser dependency to the latest secure version.",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_asgard_advice_scope(
+                &decision(
+                    "Run the task's focused validator tests and fix candidate-caused errors."
+                ),
+                "Implement the policy validator.",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
