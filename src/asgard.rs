@@ -79,7 +79,11 @@ pub(crate) fn create_worktree(cwd: &Path, label: &str) -> Result<Worktree> {
     let relative = cwd.strip_prefix(&repo).unwrap_or(Path::new(""));
     let parent = std::env::temp_dir().join("anvil-asgard-worktrees");
     fs::create_dir_all(&parent)?;
-    let root = parent.join(format!("asgard-{label}-{}", uuid::Uuid::new_v4()));
+    let root = parent.join(format!(
+        "asgard-{}-{}",
+        safe_worktree_label(label),
+        uuid::Uuid::new_v4()
+    ));
     let status = Command::new("git")
         .args(["worktree", "add", "--detach"])
         .arg(&root)
@@ -99,6 +103,20 @@ pub(crate) fn create_worktree(cwd: &Path, label: &str) -> Result<Worktree> {
         return Err(error);
     }
     Ok(worktree)
+}
+
+fn safe_worktree_label(label: &str) -> String {
+    let sanitized: String = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('-').to_owned()
 }
 
 /// Detached Git worktrees omit ignored files that a harness may have provisioned
@@ -261,5 +279,14 @@ mod tests {
             b"tracked worktree copy"
         );
         assert!(!worktree.join("build/cache/large.bin").exists());
+    }
+
+    #[test]
+    fn worktree_labels_are_safe_for_build_tool_paths() {
+        assert_eq!(
+            safe_worktree_label("0-deepseek::deepseek-v4-flash"),
+            "0-deepseek--deepseek-v4-flash"
+        );
+        assert_eq!(safe_worktree_label("lane/model name"), "lane-model-name");
     }
 }
