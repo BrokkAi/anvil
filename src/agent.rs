@@ -4473,7 +4473,7 @@ struct AsgardCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AsgardSupervisorDecision {
     winner: usize,
-    advices: Vec<String>,
+    advices: Vec<Option<String>>,
     state_summary: String,
 }
 
@@ -4541,7 +4541,7 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
-    let mut next_advices: Option<Vec<String>> = None;
+    let mut next_advices: Option<Vec<Option<String>>> = None;
     let mut supervisor_state_summary: Option<String> = None;
     for window in 1usize.. {
         send_thought(
@@ -4571,7 +4571,8 @@ async fn run_asgard_trajectory_loop(
             let assigned_advice = next_advices
                 .as_ref()
                 .and_then(|advices| advices.get(index))
-                .cloned();
+                .cloned()
+                .flatten();
             if let Some(advice) = &assigned_advice {
                 messages.push(asgard_advice_message(index, advice));
             }
@@ -4683,7 +4684,13 @@ async fn run_asgard_trajectory_loop(
             let rendered = advices
                 .iter()
                 .enumerate()
-                .map(|(lane, advice)| format!("  lane {}: {}", lane + 1, advice))
+                .map(|(lane, advice)| match advice {
+                    Some(advice) => format!("  lane {}: {}", lane + 1, advice),
+                    None => format!(
+                        "  lane {}: <unadvised: supervisor strategy rejected as out of scope>",
+                        lane + 1
+                    ),
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             send_thought(
@@ -4863,10 +4870,17 @@ async fn run_asgard_supervisor(
         false,
     )
     .await;
-    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).and_then(
-        |decision| {
-            validate_asgard_advice_scope(&decision, &original_task)?;
-            Ok(decision)
+    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).map(
+        |mut decision| {
+            for (lane, reason) in filter_asgard_advice_scope(&mut decision, &original_task) {
+                tracing::warn!(
+                    window,
+                    lane = lane + 1,
+                    reason,
+                    "dropping out-of-scope Asgard supervisor strategy; lane will continue unadvised"
+                );
+            }
+            decision
         },
     );
     (parsed, outcome.usage)
@@ -5042,17 +5056,17 @@ fn parse_asgard_supervisor_decision(
         }
         return Ok(AsgardSupervisorDecision {
             winner,
-            advices,
+            advices: advices.into_iter().map(Some).collect(),
             state_summary: state_summary.to_string(),
         });
     }
     anyhow::bail!("Asgard supervisor returned no valid winner plus {count} distinct advices")
 }
 
-fn validate_asgard_advice_scope(
-    decision: &AsgardSupervisorDecision,
+fn filter_asgard_advice_scope(
+    decision: &mut AsgardSupervisorDecision,
     original_task: &str,
-) -> anyhow::Result<()> {
+) -> Vec<(usize, String)> {
     let task = original_task.to_lowercase();
     let task_requests_dependency_work = [
         "dependency",
@@ -5065,9 +5079,13 @@ fn validate_asgard_advice_scope(
     .any(|term| task.contains(term));
     let task_requests_cloning =
         task.contains("clone the repo") || task.contains("clone the repository");
+    let mut rejected = Vec::new();
 
-    for (lane, advice) in decision.advices.iter().enumerate() {
-        let advice = advice.to_lowercase();
+    for (lane, advice) in decision.advices.iter_mut().enumerate() {
+        let Some(strategy) = advice.as_deref() else {
+            continue;
+        };
+        let strategy = strategy.to_lowercase();
         let policy_bypasses = [
             "nugetaudit=false",
             "nugetaudit false",
@@ -5085,45 +5103,52 @@ fn validate_asgard_advice_scope(
             "modify test expectations",
             "change test expectations",
         ];
-        if let Some(term) = policy_bypasses.iter().find(|term| advice.contains(**term)) {
-            anyhow::bail!("lane {lane} advice violates the no-bypass policy with phrase {term:?}");
-        }
-
-        let dependency_changes = [
-            "update the dependency",
-            "update dependency",
-            "upgrade the dependency",
-            "upgrade dependency",
-            "change the dependency",
-            "change dependency",
-            "update the package",
-            "update package",
-            "upgrade the package",
-            "upgrade package",
-            "modify the lockfile",
-            "modify lockfile",
-            "update the lockfile",
-            "update lockfile",
-            "regenerate the lockfile",
-            "regenerate lockfile",
-        ];
-        if !task_requests_dependency_work
-            && let Some(term) = dependency_changes
-                .iter()
-                .find(|term| advice.contains(**term))
+        let violation = if let Some(term) = policy_bypasses
+            .iter()
+            .find(|term| strategy.contains(**term))
         {
-            anyhow::bail!(
-                "lane {lane} advice proposes out-of-scope dependency work with phrase {term:?}"
-            );
+            Some(format!("no-bypass policy phrase {term:?}"))
+        } else {
+            let dependency_changes = [
+                "update the dependency",
+                "update dependency",
+                "upgrade the dependency",
+                "upgrade dependency",
+                "change the dependency",
+                "change dependency",
+                "update the package",
+                "update package",
+                "upgrade the package",
+                "upgrade package",
+                "modify the lockfile",
+                "modify lockfile",
+                "update the lockfile",
+                "update lockfile",
+                "regenerate the lockfile",
+                "regenerate lockfile",
+            ];
+            if !task_requests_dependency_work {
+                dependency_changes
+                    .iter()
+                    .find(|term| strategy.contains(**term))
+                    .map(|term| format!("out-of-scope dependency phrase {term:?}"))
+            } else {
+                None
+            }
         }
+        .or_else(|| {
+            (!task_requests_cloning
+                && (strategy.contains("clone the repo")
+                    || strategy.contains("clone the repository")))
+            .then(|| "out-of-scope repository clone".to_string())
+        });
 
-        if !task_requests_cloning
-            && (advice.contains("clone the repo") || advice.contains("clone the repository"))
-        {
-            anyhow::bail!("lane {lane} advice proposes an out-of-scope repository clone");
+        if let Some(reason) = violation {
+            *advice = None;
+            rejected.push((lane, reason));
         }
     }
-    Ok(())
+    rejected
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -15232,47 +15257,40 @@ mod tests {
     fn asgard_advice_scope_validation_rejects_bypasses_and_unrequested_dependency_work() {
         let decision = |strategy: &str| AsgardSupervisorDecision {
             winner: 0,
-            advices: vec![strategy.to_string()],
+            advices: vec![Some(strategy.to_string())],
             state_summary: "implementation is ready for focused verification".to_string(),
         };
 
+        for strategy in [
+            "Restore with /p:NuGetAudit=false and rebuild.",
+            "Update the dependency to clear the unrelated warning.",
+            "Clone the repository to a path without colons and retry.",
+        ] {
+            let mut candidate = decision(strategy);
+            let rejected =
+                filter_asgard_advice_scope(&mut candidate, "Implement the policy validator.");
+            assert_eq!(rejected.len(), 1);
+            assert_eq!(candidate.winner, 0, "selection must remain intact");
+            assert_eq!(candidate.advices, vec![None]);
+        }
+
+        let mut requested_dependency =
+            decision("Update the dependency to the required secure version.");
         assert!(
-            validate_asgard_advice_scope(
-                &decision("Restore with /p:NuGetAudit=false and rebuild."),
-                "Implement the policy validator.",
-            )
-            .is_err()
-        );
-        assert!(
-            validate_asgard_advice_scope(
-                &decision("Update the dependency to clear the unrelated warning."),
-                "Implement the policy validator.",
-            )
-            .is_err()
-        );
-        assert!(
-            validate_asgard_advice_scope(
-                &decision("Clone the repository to a path without colons and retry."),
-                "Implement the policy validator.",
-            )
-            .is_err()
-        );
-        assert!(
-            validate_asgard_advice_scope(
-                &decision("Update the dependency to the required secure version."),
+            filter_asgard_advice_scope(
+                &mut requested_dependency,
                 "Update the parser dependency to the latest secure version.",
             )
-            .is_ok()
+            .is_empty()
         );
+        assert!(requested_dependency.advices[0].is_some());
+
+        let mut focused =
+            decision("Run the task's focused validator tests and fix candidate-caused errors.");
         assert!(
-            validate_asgard_advice_scope(
-                &decision(
-                    "Run the task's focused validator tests and fix candidate-caused errors."
-                ),
-                "Implement the policy validator.",
-            )
-            .is_ok()
+            filter_asgard_advice_scope(&mut focused, "Implement the policy validator.").is_empty()
         );
+        assert!(focused.advices[0].is_some());
     }
 
     #[test]
