@@ -4780,7 +4780,13 @@ async fn run_asgard_supervisor(
          patch size or superficial test motion. Consider implementation correctness, architectural \
          fit, evidence from tests and errors, remaining risks, recoverability, and regressions. \
          Penalize unrelated build/configuration edits and attempts to evade tests. All evidence is \
-         supplied inline below; make your best judgment from it without tools. After choosing, produce \
+         supplied inline below; make your best judgment from it without tools. Treat build or test \
+         failures as evidence: distinguish failures caused by a candidate's patch from pre-existing, \
+         environmental, dependency-audit, or harness failures. Unless the original task explicitly \
+         requires it, never advise changing dependencies, build configuration, warning policy, test \
+         selection, or test expectations merely to make an unrelated failure disappear. Instead advise \
+         focused verification or continued task work while preserving the failure as a reported \
+         limitation. After choosing, produce \
          exactly {} concise, actionable, mutually distinct strategies for the next candidate \
          window, ordered by zero-based lane index. The strategies should explore different \
          hypotheses or implementation/test approaches from the selected state. They are advice \
@@ -4904,7 +4910,10 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
         "<asgard_next_window_advice lane=\"{lane}\">\n{advice}\n\
          </asgard_next_window_advice>\n\
          Treat this as advisory strategy for continuing the original task normally. \
-         Do not stop because of an Asgard window boundary; Anvil controls those boundaries."
+         Do not stop because of an Asgard window boundary; Anvil controls those boundaries. \
+         Unless the original task requires it, do not change unrelated dependencies, build \
+         configuration, warning policy, tests, or test selection to hide a pre-existing, \
+         environmental, dependency-audit, or harness failure."
     ))
 }
 
