@@ -4565,25 +4565,6 @@ async fn run_asgard_trajectory_loop(
         };
         registries.push(registry);
     }
-    let supervisor_roots: Vec<_> = worktrees
-        .iter()
-        .map(|worktree| worktree.root.clone())
-        .collect();
-    let Some(supervisor_registry) = sessions
-        .create_trajectory_registry_with_roots(
-            session_id,
-            parent_registry.cwd().to_path_buf(),
-            &supervisor_roots,
-        )
-        .await
-    else {
-        cleanup_asgard_worktrees(&worktrees);
-        return (
-            asgard_failure(anyhow::anyhow!("unknown Asgard parent session")),
-            usage_by_model,
-        );
-    };
-
     let mut common_messages = initial_messages;
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
@@ -4705,7 +4686,7 @@ async fn run_asgard_trajectory_loop(
             sessions,
             session_id,
             llm,
-            &supervisor_registry,
+            parent_registry,
             supervisor_model,
             idle_timeout,
             cancel.clone(),
