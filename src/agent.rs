@@ -4963,7 +4963,9 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
              around with focused verification, not problems to hide or repair. Never recommend \
              changing or repairing a build environment, toolchain, classpath, build daemon, wrapper, \
              generated build tooling, or checkout layout unless the original task explicitly asks \
-             for that work. Any strategy that violates this constraint makes the entire answer \
+             for that work. Using an already-installed equivalent executable to run the same \
+             verification (for example, `gradle` when `./gradlew` is absent) is allowed and is not \
+             environment repair; installing, recreating, or changing it is forbidden. Any strategy that violates this constraint makes the entire answer \
              invalid. If execution is environmentally blocked, skeptically audit introduced symbols, \
              types, namespaces, imports, signatures, and call contracts from the supplied evidence. \
              Never describe an uncompiled patch as correct merely because its tests or structure look \
@@ -5031,7 +5033,9 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          configuration, warning policy, tests, or test selection to hide a pre-existing, \
          environmental, dependency-audit, or harness failure, and do not chase it by changing SDKs, \
          MSBuild or Gradle properties, toolchains, classpaths, build daemons, wrappers, generated build \
-         tooling, or checkout paths. If the implementation is complete and only such verification is \
+         tooling, or checkout paths. If a requested wrapper is absent but an equivalent build \
+         executable is already installed, use that executable to run the same checks without \
+         installing or changing anything. If the implementation is complete and only such verification is \
          blocked, perform at most one bounded task-relevant audit, then conclude normally."
     ))
 }
@@ -5238,10 +5242,7 @@ fn filter_asgard_advice_scope(
                 "change",
                 "upgrade",
                 "downgrade",
-                "install",
                 "switch to",
-                "use system",
-                "use a system",
                 "correct",
                 "modify",
             ];
@@ -5298,6 +5299,12 @@ fn filter_asgard_advice_scope(
                 "upgrade gradle",
                 "downgrade gradle",
                 "change the gradle version",
+                "install gradle",
+                "install a gradle",
+                "install the gradle",
+                "install a toolchain",
+                "install the toolchain",
+                "reinstall gradle",
                 "gradle daemon",
                 "restore the gradle wrapper",
                 "regenerate the gradle wrapper",
@@ -15520,6 +15527,18 @@ mod tests {
                 .is_empty()
         );
         assert!(static_audit.advices[0].is_some());
+
+        let mut installed_equivalent = decision(
+            "Use the already-installed system Gradle executable to run the same requested tasks because the wrapper is absent.",
+        );
+        assert!(
+            filter_asgard_advice_scope(
+                &mut installed_equivalent,
+                "Implement the policy validator.",
+            )
+            .is_empty()
+        );
+        assert!(installed_equivalent.advices[0].is_some());
     }
 
     #[test]
