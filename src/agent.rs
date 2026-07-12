@@ -5228,6 +5228,50 @@ fn filter_asgard_advice_scope(
             .then(|| "out-of-scope repository clone".to_string())
         })
         .or_else(|| {
+            let build_environment_actions = [
+                "repair",
+                "fix",
+                "resolve",
+                "recreate",
+                "regenerate",
+                "restore",
+                "change",
+                "upgrade",
+                "downgrade",
+                "install",
+                "switch to",
+                "use system",
+                "use a system",
+                "correct",
+                "modify",
+            ];
+            let build_environment_nouns = [
+                "build environment",
+                "gradle wrapper",
+                "system gradle",
+                "system-installed gradle",
+                "classpath",
+                "build daemon",
+                "gradle daemon",
+                "toolchain",
+                "wrapper jar",
+                "generated build tooling",
+                "generator module",
+            ];
+            if task_requests_build_environment_work {
+                return None;
+            }
+            let action = build_environment_actions
+                .iter()
+                .find(|term| strategy.contains(**term));
+            let noun = build_environment_nouns
+                .iter()
+                .find(|term| strategy.contains(**term));
+            action.zip(noun).map(|(action, noun)| {
+                format!("out-of-scope build-environment action {action:?} on {noun:?}")
+            })
+        })
+        .or_else(|| {
             let build_environment_workarounds = [
                 "upgrade sdk",
                 "upgrade the sdk",
@@ -15429,6 +15473,7 @@ mod tests {
             "Clone the repository to a path without colons and retry.",
             "Clean obj, upgrade the SDK, and set ImportProjectExtensionProps=false.",
             "Repair the Gradle build environment by correcting the classpath, changing the Gradle version, and building the generator module manually.",
+            "Resolve the Gradle wrapper issue by using system-installed Gradle or recreating the wrapper.",
         ] {
             let mut candidate = decision(strategy);
             let rejected =
@@ -15466,6 +15511,15 @@ mod tests {
             filter_asgard_advice_scope(&mut focused, "Implement the policy validator.").is_empty()
         );
         assert!(focused.advices[0].is_some());
+
+        let mut static_audit = decision(
+            "Perform a bounded static audit because the Gradle wrapper is unavailable, then conclude.",
+        );
+        assert!(
+            filter_asgard_advice_scope(&mut static_audit, "Implement the policy validator.")
+                .is_empty()
+        );
+        assert!(static_audit.advices[0].is_some());
     }
 
     #[test]
