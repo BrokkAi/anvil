@@ -4791,7 +4791,10 @@ async fn run_asgard_supervisor(
          window, ordered by zero-based lane index. The strategies should explore different \
          hypotheses or implementation/test approaches from the selected state. They are advice \
          for normal continuing rollouts, not instructions to stop at a window boundary. \
-         Return JSON {{\"winner\":N,\"advices\":[\"lane 0 strategy\",...]}}.\n\n\
+         For every strategy, provide a scope_basis that identifies either the original-task \
+         requirement it advances or a defect caused by the selected candidate patch that it \
+         corrects. Return JSON {{\"winner\":N,\"advices\":[{{\"strategy\":\"lane 0 strategy\",\
+         \"scope_basis\":\"task requirement or candidate-caused defect\"}},...]}}.\n\n\
          SHARED BASELINE BEFORE THIS WINDOW:\n<baseline_patch bytes=\"{}\">\n{}\n</baseline_patch>\n\
          <baseline_history>\n{}\n</baseline_history>\n",
         candidates.len(),
@@ -4867,8 +4870,14 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
             "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
              and shared baseline using only the complete evidence supplied in the prompt. Optimize \
              for the long-term probability of a correct final solution rather than greedy visible \
-             progress. Your final response must contain the requested winner and one \
-             distinct next-window advice string per lane.",
+             progress. HARD SCOPE CONSTRAINT: unless the original task explicitly requires it or \
+             the candidate patch itself changed that surface and must be corrected, never recommend \
+             changing dependencies, lockfiles, build configuration, warning/audit policy, tests, \
+             test selection, or expected outputs in response to a failure. Pre-existing, \
+             environmental, dependency-audit, and harness failures are evidence to report or work \
+             around with focused verification, not problems to hide. Any strategy that violates \
+             this constraint makes the entire answer invalid. Your final response must contain the \
+             requested winner and one distinct, scope-grounded next-window advice object per lane.",
         ),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
         ChatMessage::user(dossier),
@@ -4898,7 +4907,15 @@ fn asgard_supervisor_schema(candidate_count: usize) -> StructuredOutputRequest {
                     "minItems": candidate_count,
                     "maxItems": candidate_count,
                     "uniqueItems": true,
-                    "items": { "type": "string", "minLength": 1 },
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["strategy", "scope_basis"],
+                        "properties": {
+                            "strategy": { "type": "string", "minLength": 1 },
+                            "scope_basis": { "type": "string", "minLength": 1 },
+                        },
+                    },
                 },
             },
         }),
@@ -4983,6 +5000,14 @@ fn parse_asgard_supervisor_decision(
         }
         let advices: Vec<_> = raw_advices
             .iter()
+            .filter_map(serde_json::Value::as_object)
+            .filter(|advice| {
+                advice
+                    .get("scope_basis")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|basis| !basis.trim().is_empty())
+            })
+            .filter_map(|advice| advice.get("strategy"))
             .filter_map(serde_json::Value::as_str)
             .map(str::trim)
             .map(str::to_string)
@@ -15022,7 +15047,11 @@ mod tests {
     #[test]
     fn asgard_supervisor_parser_requires_exactly_n_distinct_advices() {
         let parsed = parse_asgard_supervisor_decision(
-            "```json\n{\"winner\":2,\"advices\":[\"test the parser\",\"challenge the API\",\"inspect concurrency\"]}\n```",
+            r#"{"winner":2,"advices":[
+                {"strategy":"test the parser","scope_basis":"the task requires parser behavior"},
+                {"strategy":"challenge the API","scope_basis":"the task requires API behavior"},
+                {"strategy":"inspect concurrency","scope_basis":"the candidate changed synchronization"}
+            ]}"#,
             3,
         )
         .unwrap();
@@ -15031,16 +15060,43 @@ mod tests {
 
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"advices":["same","same","different"]}"#,
+                r#"{"winner":1,"advices":[
+                    {"strategy":"same","scope_basis":"task"},
+                    {"strategy":"same","scope_basis":"task"},
+                    {"strategy":"different","scope_basis":"task"}
+                ]}"#,
                 3
             )
             .is_err()
         );
         assert!(
-            parse_asgard_supervisor_decision(r#"{"winner":1,"advices":["only one"]}"#, 3).is_err()
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
+                3
+            )
+            .is_err()
         );
         assert!(
-            parse_asgard_supervisor_decision(r#"{"winner":7,"advices":["a","b","c"]}"#, 3).is_err()
+            parse_asgard_supervisor_decision(
+                r#"{"winner":7,"advices":[
+                    {"strategy":"a","scope_basis":"task"},
+                    {"strategy":"b","scope_basis":"task"},
+                    {"strategy":"c","scope_basis":"task"}
+                ]}"#,
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"advices":[
+                    {"strategy":"a","scope_basis":""},
+                    {"strategy":"b","scope_basis":"task"},
+                    {"strategy":"c","scope_basis":"task"}
+                ]}"#,
+                3
+            )
+            .is_err()
         );
     }
 
@@ -15052,6 +15108,7 @@ mod tests {
         assert!(text.contains("Focus on the concurrency invariant."));
         assert!(text.contains("continuing the original task normally"));
         assert!(text.contains("Do not stop"));
+        assert!(text.contains("do not change unrelated dependencies"));
     }
 
     #[test]
@@ -15090,6 +15147,8 @@ mod tests {
         assert_ne!(first[2], second[2]);
         assert!(asgard_message_text(&first[1]).contains("fix the parser"));
         assert!(!asgard_message_text(&first[0]).contains("window one"));
+        assert!(asgard_message_text(&first[0]).contains("HARD SCOPE CONSTRAINT"));
+        assert!(asgard_message_text(&first[0]).contains("dependency-audit"));
     }
 
     #[test]
@@ -15126,6 +15185,10 @@ mod tests {
         assert_eq!(schema.schema["properties"]["advices"]["minItems"], 3);
         assert_eq!(schema.schema["properties"]["advices"]["maxItems"], 3);
         assert_eq!(schema.schema["properties"]["advices"]["uniqueItems"], true);
+        assert_eq!(
+            schema.schema["properties"]["advices"]["items"]["required"],
+            serde_json::json!(["strategy", "scope_basis"])
+        );
     }
 
     #[test]
