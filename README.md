@@ -353,9 +353,10 @@ the permission classifier without prompting the user; the classifier may approve
 one outside-sandbox shell run only when the user's task and the classifier's
 output explicitly justify leaving the sandbox. In other permission modes, an
 escalation request prompts the user with a **Run outside sandbox** choice. An
-outside-sandbox approval is never remembered as an **Always allow** rule, and
-Anvil rejects escalation deterministically when there is no active OS sandbox to
-escape or when the session is in read-only mode.
+outside-sandbox approval is never remembered as an **Always allow** rule. When
+there is no active OS sandbox to escape, Anvil treats the escalation request as
+a no-op and applies the normal permission policy; read-only mode still rejects
+the shell command.
 
 When a sandboxed shell command fails with output that looks like a sandbox
 boundary issue (for example `permission denied`, `operation not permitted`, a

@@ -3774,30 +3774,16 @@ async fn evaluate_pure_gate(
         shell_auto_allow,
     );
 
-    // Codex-style explicit escalation: the model may request an outside-sandbox
-    // run up front, with no prior failure required. We still reject it when
-    // there is no OS sandbox to escape -- otherwise "run outside the sandbox" is
-    // a meaningless prompt. A mode that forbids shell execution outright
-    // (read-only) already produced a `Reject` above and takes precedence:
-    // surfacing that more fundamental reason avoids sending the model down a
-    // "retry without sandbox_permissions" path that would also be rejected, and
-    // keeps the message host-independent (the no-OS-sandbox branch otherwise
-    // fires on platforms without an OS sandbox, e.g. Windows).
-    if shell_sandbox_escalation_requested
-        && !shell_sandboxed
-        && !matches!(decision.decision, PureGateDecision::Reject(_))
-    {
-        return Err("Tool use denied: outside-sandbox permission was requested, but this shell command is not running under an active OS sandbox. Retry without `sandbox_permissions`."
-            .to_string());
-    }
-
     Ok(PureGateEvaluation {
         mode,
         decision: decision.decision,
         rationale: decision.rationale,
         sandbox_mode,
         shell_sandboxed,
-        shell_sandbox_escalation_requested,
+        // Escalation only has meaning when there is an OS sandbox to leave.
+        // On unsupported hosts the command already follows the ordinary
+        // unsandboxed permission path, so treat the request as a no-op.
+        shell_sandbox_escalation_requested: sandbox_escalation_requested,
         safelist_credit,
     })
 }
@@ -3885,11 +3871,7 @@ async fn consult_gate(
                 !matches!(evaluation.mode, PermissionMode::Auto),
                 "auto mode must never reach the human permission prompt"
             );
-            // Mirror `evaluate_pure_gate`'s shell guard: a stray
-            // `sandbox_permissions` field on a non-shell tool must not be read
-            // as an escalation request.
-            let escalation_requested = request.tool_name == "run_shell_command"
-                && shell_sandbox_escalation_requested(request.raw_input);
+            let escalation_requested = evaluation.shell_sandbox_escalation_requested;
             GateOutcome::without_usage(
                 request_user_permission_or_reject(
                     sessions,
@@ -3912,7 +3894,7 @@ async fn classify_gate_or_reject(
     cancel: &CancellationToken,
 ) -> GateOutcome {
     let escalation_requested = evaluation.shell_sandbox_escalation_requested;
-    match classify_permission_scope_with_model(&request, cancel).await {
+    match classify_permission_scope_with_model(&request, escalation_requested, cancel).await {
         PermissionScopeClassifierOutcome::Classified {
             classification,
             usage,
@@ -3982,22 +3964,7 @@ async fn classify_gate_or_reject(
                             usage,
                         };
                     }
-                    if !evaluation.shell_sandboxed {
-                        let rationale = "outside-sandbox execution was approved, but this shell command is not running under an active OS sandbox.";
-                        return GateOutcome {
-                            decision: GateDecision::Reject {
-                                message: format!(
-                                    "Tool use denied by auto permissions: {rationale}"
-                                ),
-                                permission_notice: Some(auto_permission_notice(
-                                    "did not approve outside-sandbox execution",
-                                    rationale,
-                                )),
-                            },
-                            usage,
-                        };
-                    }
-                    Some(SandboxPolicy::None)
+                    evaluation.shell_sandboxed.then_some(SandboxPolicy::None)
                 }
             };
 
@@ -4199,8 +4166,24 @@ async fn request_user_permission_with_evaluation(
     })
 }
 
+fn permission_classifier_input(
+    tool_name: &str,
+    raw_input: &Value,
+    escalation_requested: bool,
+) -> Value {
+    let mut input = raw_input.clone();
+    if tool_name == "run_shell_command"
+        && !escalation_requested
+        && let Some(object) = input.as_object_mut()
+    {
+        object.remove(crate::tools::ShellSandboxPermissionArg::FIELD);
+    }
+    input
+}
+
 async fn classify_permission_scope_with_model(
     request: &GateCheck<'_>,
+    escalation_requested: bool,
     cancel: &CancellationToken,
 ) -> PermissionScopeClassifierOutcome {
     if request.original_user_request.trim().is_empty() {
@@ -4209,18 +4192,18 @@ async fn classify_permission_scope_with_model(
         );
     }
 
+    let classifier_input =
+        permission_classifier_input(request.tool_name, request.raw_input, escalation_requested);
     let raw_input = truncate_for_permission_classifier(
-        &serde_json::to_string_pretty(request.raw_input)
-            .unwrap_or_else(|_| request.raw_input.to_string()),
+        &serde_json::to_string_pretty(&classifier_input)
+            .unwrap_or_else(|_| classifier_input.to_string()),
     );
     let user_request = truncate_for_permission_classifier(request.original_user_request);
     let action_title = truncate_for_permission_classifier(&announce::permission_prompt_title(
         request.tool_name,
         request.raw_input,
     ));
-    let sandbox_request = if request.tool_name == "run_shell_command"
-        && shell_sandbox_escalation_requested(request.raw_input)
-    {
+    let sandbox_request = if request.tool_name == "run_shell_command" && escalation_requested {
         "The shell call explicitly requested outside-sandbox execution with sandbox_permissions=require_escalated. Return sandbox=\"outside\" only if leaving the sandbox is justified by the user's task; otherwise deny."
     } else if request.tool_name == "run_shell_command" {
         "The shell call did not request outside-sandbox execution. Return sandbox=\"outside\" only if the command itself needs network, host process access, credentials, or writes outside the workspace to satisfy the user's task; otherwise return sandbox=\"normal\"."
@@ -5987,6 +5970,23 @@ mod tests {
         assert!(reason.len() <= AUTO_PERMISSION_RATIONALE_MAX_CHARS);
     }
 
+    #[test]
+    fn permission_classifier_removes_ineffective_escalation() {
+        let input = serde_json::json!({
+            "command": "curl https://example.com",
+            "sandbox_permissions": "require_escalated",
+        });
+
+        let normal = permission_classifier_input("run_shell_command", &input, false);
+        assert_eq!(
+            normal,
+            serde_json::json!({"command": "curl https://example.com"})
+        );
+
+        let escalated = permission_classifier_input("run_shell_command", &input, true);
+        assert_eq!(escalated, input);
+    }
+
     #[tokio::test]
     async fn permission_auto_classifier_uses_model_and_returns_usage() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6015,7 +6015,7 @@ mod tests {
         let PermissionScopeClassifierOutcome::Classified {
             classification,
             usage,
-        } = classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+        } = classify_permission_scope_with_model(&request, false, &CancellationToken::new()).await
         else {
             panic!("classifier should parse valid model output");
         };
@@ -6056,7 +6056,7 @@ mod tests {
         };
 
         let PermissionScopeClassifierOutcome::Classified { classification, .. } =
-            classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+            classify_permission_scope_with_model(&request, false, &CancellationToken::new()).await
         else {
             panic!("retry should recover classifier output");
         };
@@ -6122,7 +6122,7 @@ mod tests {
         let request = gate_check_for(&llm, &raw_input);
 
         let PermissionScopeClassifierOutcome::Unavailable(rationale) =
-            classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+            classify_permission_scope_with_model(&request, false, &CancellationToken::new()).await
         else {
             panic!("hard transport error should yield Unavailable");
         };
@@ -6150,7 +6150,7 @@ mod tests {
         let request = gate_check_for(&llm, &raw_input);
 
         let PermissionScopeClassifierOutcome::Unavailable(rationale) =
-            classify_permission_scope_with_model(&request, &CancellationToken::new()).await
+            classify_permission_scope_with_model(&request, false, &CancellationToken::new()).await
         else {
             panic!("non-JSON model output should yield Unavailable");
         };
@@ -7334,12 +7334,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_rejects_shell_sandbox_escalation_when_os_sandbox_inactive() {
+    async fn preflight_ignores_shell_sandbox_escalation_when_os_sandbox_inactive() {
         use crate::sandbox_backend::SandboxMode;
 
-        // With the OS sandbox turned off there is nothing to escape, so an
-        // explicit escalation request is a deterministic error -- regardless of
-        // whether a prior command failed.
+        // With the OS sandbox turned off there is nothing to escape. Treat an
+        // explicit escalation request as a no-op so hosts without bwrap or
+        // seatbelt can still execute the command under their normal permission
+        // policy.
         let cwd = tempfile::tempdir().expect("temp cwd");
         let store = SessionStore::new("m".to_string());
         let session = store.create_session(cwd.path().to_path_buf()).await;
@@ -7348,25 +7349,43 @@ mod tests {
                 .set_sandbox_mode(&session.id, Some(SandboxMode::Off))
                 .await
         );
+        assert!(
+            store
+                .set_permission_mode(&session.id, PermissionMode::BypassPermissions)
+                .await
+        );
 
-        let rejection = deterministic_gate_rejection(
+        let input = serde_json::json!({
+            "command": "curl https://example.com",
+            "sandbox_permissions": "require_escalated",
+        });
+        let evaluation = evaluate_pure_gate(
             &store,
             &session.id,
             "run_shell_command",
             ToolRegistry::tool_kind("run_shell_command"),
-            &serde_json::json!({
-                "command": "echo ok",
-                "sandbox_permissions": "require_escalated",
-            }),
+            &input,
             WorkspaceRoots::new(cwd.path(), &[]),
             None,
         )
         .await
-        .expect("escalation without an active OS sandbox must be rejected");
+        .expect("an escalation request must not fail without an OS sandbox");
 
+        assert!(matches!(evaluation.decision, PureGateDecision::Allow));
+        assert!(!evaluation.shell_sandboxed);
+        assert!(!evaluation.shell_sandbox_escalation_requested);
         assert!(
-            rejection.contains("not running under an active OS sandbox"),
-            "unexpected rejection: {rejection}"
+            deterministic_gate_rejection(
+                &store,
+                &session.id,
+                "run_shell_command",
+                ToolRegistry::tool_kind("run_shell_command"),
+                &input,
+                WorkspaceRoots::new(cwd.path(), &[]),
+                None,
+            )
+            .await
+            .is_none()
         );
     }
 
