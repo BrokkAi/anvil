@@ -4960,11 +4960,17 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
              changing dependencies, lockfiles, build configuration, warning/audit policy, tests, \
              test selection, or expected outputs in response to a failure. Pre-existing, \
              environmental, dependency-audit, and harness failures are evidence to report or work \
-             around with focused verification, not problems to hide. Any strategy that violates \
-             this constraint makes the entire answer invalid. If execution is environmentally \
-             blocked, skeptically audit introduced symbols, types, namespaces, imports, signatures, \
-             and call contracts from the supplied evidence. Never describe an uncompiled patch as \
-             correct merely because its tests or structure look plausible. Your final response must contain the \
+             around with focused verification, not problems to hide or repair. Never recommend \
+             changing or repairing a build environment, toolchain, classpath, build daemon, wrapper, \
+             generated build tooling, or checkout layout unless the original task explicitly asks \
+             for that work. Any strategy that violates this constraint makes the entire answer \
+             invalid. If execution is environmentally blocked, skeptically audit introduced symbols, \
+             types, namespaces, imports, signatures, and call contracts from the supplied evidence. \
+             Never describe an uncompiled patch as correct merely because its tests or structure look \
+             plausible. Do not manufacture endless follow-up work: when the implementation appears \
+             complete and only environmental verification failures remain, give each lane one bounded, \
+             distinct high-risk audit or tell it to conclude and report if no task-relevant action \
+             remains. Your final response must contain the \
              requested winner, a sufficient rolling summary of the selected endpoint, and one \
              distinct, scope-grounded next-window advice object per lane.",
         ),
@@ -5024,7 +5030,9 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          Unless the original task requires it, do not change unrelated dependencies, build \
          configuration, warning policy, tests, or test selection to hide a pre-existing, \
          environmental, dependency-audit, or harness failure, and do not chase it by changing SDKs, \
-         MSBuild properties, generated build directories, or checkout paths."
+         MSBuild or Gradle properties, toolchains, classpaths, build daemons, wrappers, generated build \
+         tooling, or checkout paths. If the implementation is complete and only such verification is \
+         blocked, perform at most one bounded task-relevant audit, then conclude normally."
     ))
 }
 
@@ -5234,6 +5242,25 @@ fn filter_asgard_advice_scope(
                 "path without colons",
                 "resolve the msbuild environment",
                 "fix the msbuild environment",
+                "repair the build environment",
+                "fix the build environment",
+                "resolve the build environment",
+                "repair the gradle build environment",
+                "fix the gradle build environment",
+                "correct the classpath",
+                "fix the classpath",
+                "change the classpath",
+                "compatible gradle version",
+                "upgrade gradle",
+                "downgrade gradle",
+                "change the gradle version",
+                "gradle daemon",
+                "restore the gradle wrapper",
+                "regenerate the gradle wrapper",
+                "wrapper jar",
+                "build the generator module manually",
+                "repair the toolchain",
+                "change the toolchain",
                 "work around the environment",
                 "workaround the environment",
             ];
@@ -15401,6 +15428,7 @@ mod tests {
             "Update the dependency to clear the unrelated warning.",
             "Clone the repository to a path without colons and retry.",
             "Clean obj, upgrade the SDK, and set ImportProjectExtensionProps=false.",
+            "Repair the Gradle build environment by correcting the classpath, changing the Gradle version, and building the generator module manually.",
         ] {
             let mut candidate = decision(strategy);
             let rejected =
