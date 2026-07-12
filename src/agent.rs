@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -289,6 +289,29 @@ fn prompt_response_meta(
         );
     }
     if meta.is_empty() { None } else { Some(meta) }
+}
+
+fn usage_by_model_meta(
+    usage_by_model: &BTreeMap<String, crate::llm_client::TokenUsage>,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([(
+        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        serde_json::json!({
+            "usageByModel": usage_by_model
+                .iter()
+                .map(|(model, usage)| {
+                    (model.clone(), serde_json::json!({
+                        "inputTokens": usage.input_tokens,
+                        "outputTokens": usage.output_tokens,
+                        "thoughtTokens": usage.thought_tokens,
+                        "cachedReadTokens": usage.cached_read_tokens,
+                        "cachedWriteTokens": usage.cached_write_tokens,
+                        "totalTokens": usage.total_tokens(),
+                    }))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        }),
+    )])
 }
 
 /// Build the terminal `PromptResponse` for a finished turn, choosing the
@@ -1195,11 +1218,25 @@ async fn send_session_usage_update(
     session_id: &str,
     fallback_cwd: &Path,
 ) {
+    send_session_usage_update_with_breakdown(cx, sessions, session_id, fallback_cwd, None).await;
+}
+
+async fn send_session_usage_update_with_breakdown(
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    fallback_cwd: &Path,
+    usage_by_model: Option<&BTreeMap<String, crate::llm_client::TokenUsage>>,
+) {
     let Some(snap) = sessions.snapshot(session_id, fallback_cwd).await else {
         return;
     };
     let cost_usd = sessions.exact_usage_cost_usd(session_id).await;
-    let update = session_usage_update(&snap, &sessions.available_model_metadata().await, cost_usd);
+    let mut update =
+        session_usage_update(&snap, &sessions.available_model_metadata().await, cost_usd);
+    if let Some(usage_by_model) = usage_by_model {
+        update = update.meta(Some(usage_by_model_meta(usage_by_model)));
+    }
     let notification =
         SessionNotification::new(session_id.to_string(), SessionUpdate::UsageUpdate(update));
     if let Err(e) = cx.send_notification(notification) {
@@ -4492,9 +4529,13 @@ async fn run_asgard_trajectory_loop(
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
     config: &crate::asgard::Config,
-) -> crate::tool_loop::LoopOutcome {
+) -> (
+    crate::tool_loop::LoopOutcome,
+    BTreeMap<String, crate::llm_client::TokenUsage>,
+) {
+    let mut usage_by_model = BTreeMap::new();
     if let Err(error) = crate::asgard::ensure_compatible_checkout(parent_registry.cwd()) {
-        return asgard_failure(error);
+        return (asgard_failure(error), usage_by_model);
     }
     let mut worktrees = Vec::with_capacity(config.candidate_models.len());
     for (index, model) in config.candidate_models.iter().enumerate() {
@@ -4504,7 +4545,7 @@ async fn run_asgard_trajectory_loop(
                 for worktree in &worktrees {
                     crate::asgard::remove_worktree(worktree);
                 }
-                return asgard_failure(error);
+                return (asgard_failure(error), usage_by_model);
             }
         }
     }
@@ -4517,7 +4558,10 @@ async fn run_asgard_trajectory_loop(
             for worktree in &worktrees {
                 crate::asgard::remove_worktree(worktree);
             }
-            return asgard_failure(anyhow::anyhow!("unknown Asgard parent session"));
+            return (
+                asgard_failure(anyhow::anyhow!("unknown Asgard parent session")),
+                usage_by_model,
+            );
         };
         registries.push(registry);
     }
@@ -4534,7 +4578,10 @@ async fn run_asgard_trajectory_loop(
         .await
     else {
         cleanup_asgard_worktrees(&worktrees);
-        return asgard_failure(anyhow::anyhow!("unknown Asgard parent session"));
+        return (
+            asgard_failure(anyhow::anyhow!("unknown Asgard parent session")),
+            usage_by_model,
+        );
     };
 
     let mut common_messages = initial_messages;
@@ -4564,7 +4611,7 @@ async fn run_asgard_trajectory_loop(
         {
             if let Err(error) = crate::asgard::install_patch(&worktree.root, &common_patch) {
                 cleanup_asgard_worktrees(&worktrees);
-                return asgard_failure(error);
+                return (asgard_failure(error), usage_by_model);
             }
             let mut messages = common_messages.clone();
             rewrite_asgard_cwd(&mut messages, parent_registry.cwd(), &worktree.session_cwd);
@@ -4633,6 +4680,10 @@ async fn run_asgard_trajectory_loop(
             futures::future::join_all(futures).await
         {
             aggregate_usage.add(outcome.usage);
+            usage_by_model
+                .entry(model.clone())
+                .or_default()
+                .add(outcome.usage);
             match patch {
                 Ok(patch) => candidates.push(AsgardCandidate {
                     index,
@@ -4644,7 +4695,7 @@ async fn run_asgard_trajectory_loop(
                 }),
                 Err(error) => {
                     cleanup_asgard_worktrees(&worktrees);
-                    return asgard_failure(error);
+                    return (asgard_failure(error), usage_by_model);
                 }
             }
         }
@@ -4666,6 +4717,10 @@ async fn run_asgard_trajectory_loop(
         )
         .await;
         aggregate_usage.add(supervisor.1);
+        usage_by_model
+            .entry(supervisor_model.to_string())
+            .or_default()
+            .add(supervisor.1);
         let decision = match supervisor.0 {
             Ok(decision) => decision,
             Err(error) => {
@@ -4674,7 +4729,7 @@ async fn run_asgard_trajectory_loop(
                     "supervisor produced no valid decision for window {window}: {error:#}"
                 ));
                 outcome.usage = aggregate_usage;
-                return outcome;
+                return (outcome, usage_by_model);
             }
         };
         let winner_index = decision.winner;
@@ -4701,9 +4756,12 @@ async fn run_asgard_trajectory_loop(
         }
         let Some(winner) = candidates.into_iter().find(|c| c.index == winner_index) else {
             cleanup_asgard_worktrees(&worktrees);
-            return asgard_failure(anyhow::anyhow!(
-                "Asgard supervisor selected an unknown lane"
-            ));
+            return (
+                asgard_failure(anyhow::anyhow!(
+                    "Asgard supervisor selected an unknown lane"
+                )),
+                usage_by_model,
+            );
         };
         send_thought(
             cx,
@@ -4739,12 +4797,12 @@ async fn run_asgard_trajectory_loop(
     let apply_result = crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
     cleanup_asgard_worktrees(&worktrees);
     if let Err(error) = apply_result {
-        return asgard_failure(error);
+        return (asgard_failure(error), usage_by_model);
     }
     let mut outcome = selected_outcome
         .unwrap_or_else(|| asgard_failure(anyhow::anyhow!("Asgard produced no candidate windows")));
     outcome.usage = aggregate_usage;
-    outcome
+    (outcome, usage_by_model)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5237,6 +5295,21 @@ fn asgard_failure(error: anyhow::Error) -> crate::tool_loop::LoopOutcome {
     }
 }
 
+fn estimate_usage_by_model_cost(
+    metadata: &[crate::llm_client::ModelMetadata],
+    usage_by_model: &BTreeMap<String, crate::llm_client::TokenUsage>,
+) -> Option<f64> {
+    usage_by_model
+        .iter()
+        .try_fold(0.0, |total, (model, usage)| {
+            if usage.is_zero() {
+                return Some(total);
+            }
+            let model = metadata.iter().find(|metadata| metadata.id == *model)?;
+            Some(total + model.estimate_cost_usd(*usage)?)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_model_turn_in_spawn(
     cx: &ConnectionTo<Client>,
@@ -5278,7 +5351,7 @@ async fn run_model_turn_in_spawn(
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
     let loop_future = async {
         if let Some(config) = crate::asgard::config() {
-            run_asgard_trajectory_loop(
+            let (outcome, usage_by_model) = run_asgard_trajectory_loop(
                 cx,
                 sessions,
                 session_id,
@@ -5293,9 +5366,10 @@ async fn run_model_turn_in_spawn(
                 cancel,
                 config,
             )
-            .await
+            .await;
+            (outcome, Some(usage_by_model))
         } else {
-            crate::tool_loop::run(
+            let outcome = crate::tool_loop::run(
                 llm,
                 registry,
                 model,
@@ -5318,11 +5392,35 @@ async fn run_model_turn_in_spawn(
                 None,
                 false,
             )
-            .await
+            .await;
+            (outcome, None)
         }
     };
     let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
 
+    let (outcome, usage_by_model) = match loop_result {
+        Ok(result) => result,
+        Err(panic) => {
+            tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
+            // A panic is treated as fatal (non-retryable): retrying a
+            // deterministic crash would just spin, so an autonomous driver
+            // should stop and surface it rather than back off and retry.
+            (
+                crate::tool_loop::LoopOutcome {
+                    response: "Error: agent loop panicked. See server logs.".to_string(),
+                    tool_exchanges: Vec::new(),
+                    replay_events: Vec::new(),
+                    usage: crate::llm_client::TokenUsage::default(),
+                    stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
+                        retryable: false,
+                        message: "agent loop panicked".to_string(),
+                    }),
+                    continuation_messages: Vec::new(),
+                },
+                None,
+            )
+        }
+    };
     let crate::tool_loop::LoopOutcome {
         response: response_text,
         tool_exchanges,
@@ -5330,30 +5428,14 @@ async fn run_model_turn_in_spawn(
         usage: turn_usage,
         stop,
         continuation_messages: _,
-    } = match loop_result {
-        Ok(outcome) => outcome,
-        Err(panic) => {
-            tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
-            // A panic is treated as fatal (non-retryable): retrying a
-            // deterministic crash would just spin, so an autonomous driver
-            // should stop and surface it rather than back off and retry.
-            crate::tool_loop::LoopOutcome {
-                response: "Error: agent loop panicked. See server logs.".to_string(),
-                tool_exchanges: Vec::new(),
-                replay_events: Vec::new(),
-                usage: crate::llm_client::TokenUsage::default(),
-                stop: crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
-                    retryable: false,
-                    message: "agent loop panicked".to_string(),
-                }),
-                continuation_messages: Vec::new(),
-            }
-        }
-    };
+    } = outcome;
 
     let model_metadata = sessions.available_model_metadata().await;
     let model_meta = model_metadata.iter().find(|meta| meta.id == model);
-    let cost_delta_usd = model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage));
+    let cost_delta_usd = match usage_by_model.as_ref() {
+        Some(usage_by_model) => estimate_usage_by_model_cost(&model_metadata, usage_by_model),
+        None => model_meta.and_then(|meta| meta.estimate_cost_usd(turn_usage)),
+    };
     let context_length = model_meta.and_then(|meta| meta.context_length);
     let cumulative_usage = sessions
         .record_usage(session_id, turn_usage, cost_delta_usd)
@@ -5411,7 +5493,14 @@ async fn run_model_turn_in_spawn(
         }
     };
 
-    send_session_usage_update(cx, sessions, session_id, fallback_cwd).await;
+    send_session_usage_update_with_breakdown(
+        cx,
+        sessions,
+        session_id,
+        fallback_cwd,
+        usage_by_model.as_ref(),
+    )
+    .await;
     ModelTurnResult {
         structured_output: structured_output_result,
         cumulative_usage,
@@ -15442,6 +15531,51 @@ mod tests {
         assert_eq!(
             asgard_patch_files(patch),
             vec!["src/a.rs".to_string(), "docs/guide.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn asgard_usage_keeps_model_attribution_for_cost_and_acp_metadata() {
+        let flash_usage = crate::llm_client::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            thought_tokens: 2,
+            cached_read_tokens: 20,
+            cached_write_tokens: 0,
+        };
+        let pro_usage = crate::llm_client::TokenUsage {
+            input_tokens: 200,
+            output_tokens: 30,
+            thought_tokens: 4,
+            cached_read_tokens: 40,
+            cached_write_tokens: 0,
+        };
+        let usage_by_model = BTreeMap::from([
+            ("deepseek::deepseek-v4-flash".to_string(), flash_usage),
+            ("deepseek::deepseek-v4-pro".to_string(), pro_usage),
+        ]);
+        let priced = |id: &str, input, output| {
+            let mut metadata = crate::llm_client::ModelMetadata::id_only(id);
+            metadata.pricing = Some(crate::llm_client::ModelPricing {
+                input_cost_per_token_usd: input,
+                output_cost_per_token_usd: output,
+            });
+            metadata
+        };
+        let metadata = vec![
+            priced("deepseek::deepseek-v4-flash", 1.0e-7, 2.0e-7),
+            priced("deepseek::deepseek-v4-pro", 4.0e-7, 8.0e-7),
+        ];
+
+        let cost = estimate_usage_by_model_cost(&metadata, &usage_by_model)
+            .expect("both models have pricing");
+        let expected = (120.0 * 1.0e-7 + 12.0 * 2.0e-7) + (240.0 * 4.0e-7 + 34.0 * 8.0e-7);
+        assert_eq!(cost, expected);
+
+        let meta = usage_by_model_meta(&usage_by_model);
+        assert_eq!(
+            meta["anvil"]["usageByModel"]["deepseek::deepseek-v4-pro"]["totalTokens"],
+            pro_usage.total_tokens()
         );
     }
 }
