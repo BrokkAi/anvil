@@ -97,10 +97,6 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     asgard_window_steps: usize,
 
-    /// Maximum supervisor-selection windows per prompt.
-    #[arg(long, default_value_t = 8)]
-    asgard_max_windows: usize,
-
     /// Maximum number of sessions to keep resident in memory before the
     /// least-recently-used session is evicted (the on-disk zip is unaffected
     /// and can be reloaded). Set to `0` to disable the cap.
@@ -197,7 +193,6 @@ impl std::fmt::Debug for Args {
             .field("asgard_models", &self.asgard_models)
             .field("asgard_supervisor", &self.asgard_supervisor)
             .field("asgard_window_steps", &self.asgard_window_steps)
-            .field("asgard_max_windows", &self.asgard_max_windows)
             .field("max_sessions", &self.max_sessions)
             .field("max_history_turns", &self.max_history_turns)
             .field("bifrost_binary", &self.bifrost_binary)
@@ -681,7 +676,6 @@ async fn main() -> Result<()> {
         candidate_models: args.asgard_models,
         supervisor_model: args.asgard_supervisor,
         window_steps: args.asgard_window_steps.max(1),
-        max_windows: args.asgard_max_windows.max(1),
     }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.

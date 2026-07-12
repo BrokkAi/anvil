@@ -4541,13 +4541,12 @@ async fn run_asgard_trajectory_loop(
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
     let mut next_advices: Option<Vec<String>> = None;
-    for window in 1..=config.max_windows {
+    for window in 1usize.. {
         send_thought(
             cx,
             session_id,
             &format!(
-                "\n[Asgard window {window}/{}: {} candidates × {} steps]\n",
-                config.max_windows,
+                "\n[Asgard window {window}: {} candidates × {} steps]\n",
                 config.candidate_models.len(),
                 config.window_steps
             ),
@@ -4658,24 +4657,22 @@ async fn run_asgard_trajectory_loop(
             cancel.clone(),
             window,
             &candidates,
-            &worktrees,
             &common_messages,
             &common_patch,
         )
         .await;
         aggregate_usage.add(supervisor.1);
-        let decision = supervisor.0.unwrap_or_else(|error| {
-            let fallback = AsgardSupervisorDecision {
-                winner: fallback_asgard_winner(&candidates),
-                advices: fallback_asgard_advices(candidates.len()),
-            };
-            tracing::warn!(
-                window,
-                fallback_lane = fallback.winner + 1,
-                "Asgard supervisor output was invalid ({error:#}); using deterministic fallback"
-            );
-            fallback
-        });
+        let decision = match supervisor.0 {
+            Ok(decision) => decision,
+            Err(error) => {
+                cleanup_asgard_worktrees(&worktrees);
+                let mut outcome = asgard_failure(anyhow::anyhow!(
+                    "supervisor produced no valid decision for window {window}: {error:#}"
+                ));
+                outcome.usage = aggregate_usage;
+                return outcome;
+            }
+        };
         let winner_index = decision.winner;
         next_advices = Some(decision.advices);
         if let Some(advices) = &next_advices {
@@ -4751,7 +4748,6 @@ async fn run_asgard_supervisor(
     cancel: tokio_util::sync::CancellationToken,
     window: usize,
     candidates: &[AsgardCandidate],
-    worktrees: &[crate::asgard::Worktree],
     common_messages: &[ChatMessage],
     common_patch: &[u8],
 ) -> (
@@ -4763,10 +4759,7 @@ async fn run_asgard_supervisor(
         .find(|message| message.role == "user")
         .map(asgard_message_text)
         .unwrap_or_default();
-    let baseline_root = &worktrees[0].root;
-    let baseline_patch_path = baseline_root.join(".asgard-supervisor-baseline.patch");
-    let baseline_history_path = baseline_root.join(".asgard-supervisor-baseline-history.json");
-    let baseline_history = match serde_json::to_vec_pretty(common_messages) {
+    let baseline_history = match serde_json::to_string_pretty(common_messages) {
         Ok(history) => history,
         Err(error) => {
             return (
@@ -4777,41 +4770,31 @@ async fn run_asgard_supervisor(
             );
         }
     };
-    if let Err(error) = std::fs::write(&baseline_patch_path, common_patch)
-        .and_then(|()| std::fs::write(&baseline_history_path, baseline_history))
-    {
-        return (
-            Err(anyhow::anyhow!(
-                "failed to prepare Asgard baseline dossier: {error}"
-            )),
-            crate::llm_client::TokenUsage::default(),
-        );
-    }
     let mut dossier = format!(
-        "Select the single trajectory that made the most reliable progress in window {window}. \
-         Consider implementation correctness, tests, errors, plan quality, and regressions. \
-         Penalize unrelated build/configuration edits and attempts to evade tests. \
-         You have read-only tools. The files named below contain the COMPLETE, untruncated \
-         baseline, per-window trajectories, and patches; inspect them whenever the inline ledger \
-         is insufficient, especially for test failures or large diffs. After choosing, produce \
+        "Select the single trajectory with the highest probability of eventually producing a \
+         correct, complete solution if continued from its endpoint after window {window}. Judge \
+         long-term direction, not just immediate visible activity. Valuable progress includes \
+         discovering constraints, ruling out bad hypotheses, building the right abstraction, \
+         writing diagnostic tests, and preserving a recoverable path. Do not penalize a candidate \
+         merely because careful investigation produced fewer edits this window, and do not reward \
+         patch size or superficial test motion. Consider implementation correctness, architectural \
+         fit, evidence from tests and errors, remaining risks, recoverability, and regressions. \
+         Penalize unrelated build/configuration edits and attempts to evade tests. All evidence is \
+         supplied inline below; make your best judgment from it without tools. After choosing, produce \
          exactly {} concise, actionable, mutually distinct strategies for the next candidate \
          window, ordered by zero-based lane index. The strategies should explore different \
          hypotheses or implementation/test approaches from the selected state. They are advice \
          for normal continuing rollouts, not instructions to stop at a window boundary. \
          Return JSON {{\"winner\":N,\"advices\":[\"lane 0 strategy\",...]}}.\n\n\
-         SHARED BASELINE BEFORE THIS WINDOW:\npatch={} ({} bytes)\nhistory={}\n",
+         SHARED BASELINE BEFORE THIS WINDOW:\n<baseline_patch bytes=\"{}\">\n{}\n</baseline_patch>\n\
+         <baseline_history>\n{}\n</baseline_history>\n",
         candidates.len(),
-        baseline_patch_path.display(),
         common_patch.len(),
-        baseline_history_path.display(),
+        String::from_utf8_lossy(common_patch),
+        baseline_history,
     );
     for candidate in candidates {
-        let root = &worktrees[candidate.index].root;
-        let patch_path = root.join(format!(".asgard-supervisor-window-{window}.patch"));
-        let transcript_path = root.join(format!(
-            ".asgard-supervisor-window-{window}-trajectory.json"
-        ));
-        let trajectory = match serde_json::to_vec_pretty(&candidate.window_messages) {
+        let trajectory = match serde_json::to_string_pretty(&candidate.window_messages) {
             Ok(trajectory) => trajectory,
             Err(error) => {
                 return (
@@ -4823,34 +4806,25 @@ async fn run_asgard_supervisor(
                 );
             }
         };
-        let write_result = std::fs::write(&patch_path, &candidate.patch)
-            .and_then(|()| std::fs::write(&transcript_path, trajectory));
-        if let Err(error) = write_result {
-            return (
-                Err(anyhow::anyhow!(
-                    "failed to prepare Asgard lane dossier: {error}"
-                )),
-                crate::llm_client::TokenUsage::default(),
-            );
-        }
         let files = asgard_patch_files(&candidate.patch);
-        let ledger = asgard_window_ledger(&candidate.window_messages);
         dossier.push_str(&format!(
-            "\nLANE {} model={} stop={:?}\nassigned_advice={:?}\nroot={}\nchanged_files={:?}\npatch={} ({} bytes, complete)\ntrajectory={} (complete)\nRESPONSE:\n{}\nWINDOW LEDGER:\n{}\n",
+            "\n<lane index=\"{}\" model=\"{}\" stop=\"{:?}\">\nassigned_advice={:?}\nchanged_files={:?}\n\
+             <complete_patch bytes=\"{}\">\n{}\n</complete_patch>\n\
+             <complete_window_trajectory>\n{}\n</complete_window_trajectory>\n\
+             <final_response>\n{}\n</final_response>\n</lane>\n",
             candidate.index,
             candidate.model,
             candidate.outcome.stop,
             candidate.assigned_advice,
-            root.display(),
             files,
-            patch_path.display(),
             candidate.patch.len(),
-            transcript_path.display(),
+            String::from_utf8_lossy(&candidate.patch),
+            trajectory,
             candidate.outcome.response,
-            ledger,
         ));
     }
     let messages = asgard_supervisor_messages(&original_task, dossier);
+    let structured_output = asgard_supervisor_schema(candidates.len());
     let sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
     let thought_sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
     let outcome = crate::tool_loop::run(
@@ -4859,9 +4833,9 @@ async fn run_asgard_supervisor(
         model,
         None,
         None,
-        None,
+        Some(&structured_output),
         messages,
-        8,
+        1,
         idle_timeout,
         cancel,
         sink,
@@ -4872,36 +4846,12 @@ async fn run_asgard_supervisor(
         String::new(),
         crate::tool_loop::NotificationMode::Silent,
         0,
-        Some(Arc::new(HashSet::from([
-            "read_file".to_string(),
-            "list_directory".to_string(),
-            "grep_search".to_string(),
-        ]))),
+        Some(Arc::new(HashSet::new())),
         Some(PermissionMode::ReadOnly),
         false,
     )
     .await;
-    let parsed = match parse_asgard_supervisor_decision(&outcome.response, candidates.len()) {
-        Ok(decision) => Ok(decision),
-        Err(decision_error) => {
-            match parse_asgard_winner_only(&outcome.response, candidates.len()) {
-                Ok(winner) => {
-                    tracing::warn!(
-                        window,
-                        winner_lane = winner + 1,
-                        "Asgard supervisor advice was invalid ({decision_error:#}); preserving its winner and using fallback advice"
-                    );
-                    Ok(AsgardSupervisorDecision {
-                        winner,
-                        advices: fallback_asgard_advices(candidates.len()),
-                    })
-                }
-                Err(winner_error) => Err(anyhow::anyhow!(
-                    "{decision_error:#}; winner recovery also failed: {winner_error:#}"
-                )),
-            }
-        }
-    };
+    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len());
     (parsed, outcome.usage)
 }
 
@@ -4909,13 +4859,44 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
     vec![
         ChatMessage::system(
             "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
-             and shared baseline. Use the read-only dossier files instead of guessing when inline \
-             evidence is incomplete. Your final response must contain the requested winner and one \
+             and shared baseline using only the complete evidence supplied in the prompt. Optimize \
+             for the long-term probability of a correct final solution rather than greedy visible \
+             progress. Your final response must contain the requested winner and one \
              distinct next-window advice string per lane.",
         ),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
         ChatMessage::user(dossier),
     ]
+}
+
+fn asgard_supervisor_schema(candidate_count: usize) -> StructuredOutputRequest {
+    StructuredOutputRequest {
+        schema_name: "asgard_supervisor_decision".to_string(),
+        allow_coercion: false,
+        // OpenRouter provider support for strict JSON Schema is inconsistent.
+        // JSON mode still prevents a tool-seeking prose rollout; the parser
+        // below enforces the complete schema and fails closed.
+        prefer_json_object: true,
+        schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["winner", "advices"],
+            "properties": {
+                "winner": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": candidate_count.saturating_sub(1),
+                },
+                "advices": {
+                    "type": "array",
+                    "minItems": candidate_count,
+                    "maxItems": candidate_count,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "minLength": 1 },
+                },
+            },
+        }),
+    }
 }
 
 fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
@@ -4967,62 +4948,6 @@ fn asgard_patch_files(patch: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn asgard_window_ledger(messages: &[ChatMessage]) -> String {
-    let mut ledger = String::new();
-    for message in messages {
-        if message.role == "assistant" {
-            let text = asgard_message_text(message);
-            if !text.trim().is_empty() {
-                ledger.push_str("assistant: ");
-                ledger.push_str(text.trim());
-                ledger.push('\n');
-            }
-            if let Some(calls) = &message.tool_calls {
-                for call in calls {
-                    ledger.push_str(&format!(
-                        "tool_call {}({})\n",
-                        call.function.name,
-                        asgard_compact_tool_arguments(&call.function.arguments)
-                    ));
-                }
-            }
-        } else if message.role == "tool" {
-            let bytes: usize = message
-                .content
-                .iter()
-                .map(|part| match part {
-                    ChatContentPart::Text { text } => text.len(),
-                    ChatContentPart::Image { image_url } => image_url.len(),
-                })
-                .sum();
-            ledger.push_str(&format!(
-                "tool_result {}: {bytes} bytes (read complete trajectory file for content)\n",
-                message.name.as_deref().unwrap_or("unknown")
-            ));
-        }
-    }
-    ledger
-}
-
-fn asgard_compact_tool_arguments(arguments: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return arguments.to_string();
-    };
-    if let Some(object) = value.as_object_mut() {
-        for field in ["content", "old_string", "new_string"] {
-            if let Some(length) = object
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .map(str::len)
-            {
-                let replacement = format!("<{length} bytes; inspect candidate file or patch>");
-                object.insert(field.to_string(), serde_json::Value::String(replacement));
-            }
-        }
-    }
-    serde_json::to_string(&value).unwrap_or_else(|_| arguments.to_string())
-}
-
 fn parse_asgard_supervisor_decision(
     text: &str,
     count: usize,
@@ -5063,49 +4988,6 @@ fn parse_asgard_supervisor_decision(
         return Ok(AsgardSupervisorDecision { winner, advices });
     }
     anyhow::bail!("Asgard supervisor returned no valid winner plus {count} distinct advices")
-}
-
-fn parse_asgard_winner_only(text: &str, count: usize) -> anyhow::Result<usize> {
-    for (start, _) in text.match_indices('{') {
-        let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
-            .into_iter::<serde_json::Value>()
-            .next()
-        else {
-            continue;
-        };
-        if let Some(winner) = value.get("winner").and_then(serde_json::Value::as_u64) {
-            let winner = winner as usize;
-            if winner < count {
-                return Ok(winner);
-            }
-        }
-    }
-    anyhow::bail!("Asgard supervisor returned no valid winner JSON")
-}
-
-fn fallback_asgard_winner(candidates: &[AsgardCandidate]) -> usize {
-    candidates
-        .iter()
-        .max_by_key(|candidate| {
-            let completion = usize::from(matches!(
-                candidate.outcome.stop,
-                crate::tool_loop::LoopStop::Completed { .. }
-            ));
-            (completion, candidate.patch.len())
-        })
-        .map_or(0, |candidate| candidate.index)
-}
-
-fn fallback_asgard_advices(count: usize) -> Vec<String> {
-    (0..count)
-        .map(|lane| {
-            format!(
-                "Lane {lane}: independently reassess the selected implementation, inspect the \
-                 most relevant remaining correctness risk, and pursue a concrete fix or test \
-                 that differs from the other candidate lanes."
-            )
-        })
-        .collect()
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -15145,11 +15027,6 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(
-            parse_asgard_winner_only(r#"{"winner":1,"advices":["same","same","different"]}"#, 3)
-                .unwrap(),
-            1
-        );
         assert!(
             parse_asgard_supervisor_decision(r#"{"winner":1,"advices":["only one"]}"#, 3).is_err()
         );
@@ -15233,34 +15110,13 @@ mod tests {
     }
 
     #[test]
-    fn asgard_supervisor_ledger_points_to_complete_evidence_without_embedding_payloads() {
-        let mut assistant = ChatMessage::assistant("implemented the parser");
-        assistant.tool_calls = Some(vec![crate::llm_client::ToolCall {
-            id: "call-1".to_string(),
-            r#type: "function".to_string(),
-            function: crate::llm_client::FunctionCall {
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({
-                    "file_path": "src/parser.rs",
-                    "content": "important source that belongs in the patch"
-                })
-                .to_string(),
-            },
-        }]);
-        let tool = ChatMessage::tool_result(
-            "call-1".to_string(),
-            "write_file".to_string(),
-            "complete tool result".to_string(),
-        );
-
-        let ledger = asgard_window_ledger(&[assistant, tool]);
-
-        assert!(ledger.contains("implemented the parser"));
-        assert!(ledger.contains("write_file"));
-        assert!(ledger.contains("inspect candidate file or patch"));
-        assert!(!ledger.contains("important source that belongs in the patch"));
-        assert!(!ledger.contains("complete tool result"));
-        assert!(ledger.contains("read complete trajectory file"));
+    fn asgard_supervisor_schema_is_fail_closed_and_candidate_bounded() {
+        let schema = asgard_supervisor_schema(3);
+        assert!(schema.prefer_json_object);
+        assert_eq!(schema.schema["properties"]["winner"]["maximum"], 2);
+        assert_eq!(schema.schema["properties"]["advices"]["minItems"], 3);
+        assert_eq!(schema.schema["properties"]["advices"]["maxItems"], 3);
+        assert_eq!(schema.schema["properties"]["advices"]["uniqueItems"], true);
     }
 
     #[test]
