@@ -4474,6 +4474,7 @@ struct AsgardCandidate {
 struct AsgardSupervisorDecision {
     winner: usize,
     advices: Vec<String>,
+    state_summary: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4541,6 +4542,7 @@ async fn run_asgard_trajectory_loop(
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
     let mut next_advices: Option<Vec<String>> = None;
+    let mut supervisor_state_summary: Option<String> = None;
     for window in 1usize.. {
         send_thought(
             cx,
@@ -4659,6 +4661,7 @@ async fn run_asgard_trajectory_loop(
             &candidates,
             &common_messages,
             &common_patch,
+            supervisor_state_summary.as_deref(),
         )
         .await;
         aggregate_usage.add(supervisor.1);
@@ -4675,6 +4678,7 @@ async fn run_asgard_trajectory_loop(
         };
         let winner_index = decision.winner;
         next_advices = Some(decision.advices);
+        supervisor_state_summary = Some(decision.state_summary);
         if let Some(advices) = &next_advices {
             let rendered = advices
                 .iter()
@@ -4750,6 +4754,7 @@ async fn run_asgard_supervisor(
     candidates: &[AsgardCandidate],
     common_messages: &[ChatMessage],
     common_patch: &[u8],
+    prior_state_summary: Option<&str>,
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
@@ -4759,17 +4764,10 @@ async fn run_asgard_supervisor(
         .find(|message| message.role == "user")
         .map(asgard_message_text)
         .unwrap_or_default();
-    let baseline_history = match serde_json::to_string_pretty(common_messages) {
-        Ok(history) => history,
-        Err(error) => {
-            return (
-                Err(anyhow::anyhow!(
-                    "failed to serialize Asgard baseline history: {error}"
-                )),
-                crate::llm_client::TokenUsage::default(),
-            );
-        }
-    };
+    let prior_state_summary = prior_state_summary.unwrap_or(
+        "No prior supervisor summary: this is the first window and candidates branch directly \
+         from the original task.",
+    );
     let mut dossier = format!(
         "Select the single trajectory with the highest probability of eventually producing a \
          correct, complete solution if continued from its endpoint after window {window}. Judge \
@@ -4793,14 +4791,19 @@ async fn run_asgard_supervisor(
          for normal continuing rollouts, not instructions to stop at a window boundary. \
          For every strategy, provide a scope_basis that identifies either the original-task \
          requirement it advances or a defect caused by the selected candidate patch that it \
-         corrects. Return JSON {{\"winner\":N,\"advices\":[{{\"strategy\":\"lane 0 strategy\",\
+         corrects. Also produce state_summary: a concise but sufficient account of the selected \
+         endpoint for the next supervisor, including important discoveries, architectural decisions, \
+         implemented behavior, verification evidence and failures, and unresolved risks. Do not omit \
+         information merely because it reflects investigation rather than edits. Return JSON \
+         {{\"winner\":N,\"state_summary\":\"selected endpoint state\",\
+         \"advices\":[{{\"strategy\":\"lane 0 strategy\",\
          \"scope_basis\":\"task requirement or candidate-caused defect\"}},...]}}.\n\n\
-         SHARED BASELINE BEFORE THIS WINDOW:\n<baseline_patch bytes=\"{}\">\n{}\n</baseline_patch>\n\
-         <baseline_history>\n{}\n</baseline_history>\n",
+         SHARED BASELINE BEFORE THIS WINDOW:\n<prior_state_summary>\n{}\n</prior_state_summary>\n\
+         <baseline_patch bytes=\"{}\">\n{}\n</baseline_patch>\n",
         candidates.len(),
+        prior_state_summary,
         common_patch.len(),
         String::from_utf8_lossy(common_patch),
-        baseline_history,
     );
     for candidate in candidates {
         let trajectory = match serde_json::to_string_pretty(&candidate.window_messages) {
@@ -4877,7 +4880,8 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
              environmental, dependency-audit, and harness failures are evidence to report or work \
              around with focused verification, not problems to hide. Any strategy that violates \
              this constraint makes the entire answer invalid. Your final response must contain the \
-             requested winner and one distinct, scope-grounded next-window advice object per lane.",
+             requested winner, a sufficient rolling summary of the selected endpoint, and one \
+             distinct, scope-grounded next-window advice object per lane.",
         ),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
         ChatMessage::user(dossier),
@@ -4895,12 +4899,16 @@ fn asgard_supervisor_schema(candidate_count: usize) -> StructuredOutputRequest {
         schema: serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["winner", "advices"],
+            "required": ["winner", "state_summary", "advices"],
             "properties": {
                 "winner": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": candidate_count.saturating_sub(1),
+                },
+                "state_summary": {
+                    "type": "string",
+                    "minLength": 1,
                 },
                 "advices": {
                     "type": "array",
@@ -4992,6 +5000,14 @@ fn parse_asgard_supervisor_decision(
         if winner >= count {
             continue;
         }
+        let Some(state_summary) = value
+            .get("state_summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+        else {
+            continue;
+        };
         let Some(raw_advices) = value.get("advices").and_then(serde_json::Value::as_array) else {
             continue;
         };
@@ -5019,7 +5035,11 @@ fn parse_asgard_supervisor_decision(
         if distinct.len() != count {
             continue;
         }
-        return Ok(AsgardSupervisorDecision { winner, advices });
+        return Ok(AsgardSupervisorDecision {
+            winner,
+            advices,
+            state_summary: state_summary.to_string(),
+        });
     }
     anyhow::bail!("Asgard supervisor returned no valid winner plus {count} distinct advices")
 }
@@ -15047,7 +15067,7 @@ mod tests {
     #[test]
     fn asgard_supervisor_parser_requires_exactly_n_distinct_advices() {
         let parsed = parse_asgard_supervisor_decision(
-            r#"{"winner":2,"advices":[
+            r#"{"winner":2,"state_summary":"parser implemented; API and concurrency remain","advices":[
                 {"strategy":"test the parser","scope_basis":"the task requires parser behavior"},
                 {"strategy":"challenge the API","scope_basis":"the task requires API behavior"},
                 {"strategy":"inspect concurrency","scope_basis":"the candidate changed synchronization"}
@@ -15057,10 +15077,14 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.winner, 2);
         assert_eq!(parsed.advices.len(), 3);
+        assert_eq!(
+            parsed.state_summary,
+            "parser implemented; API and concurrency remain"
+        );
 
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"advices":[
+                r#"{"winner":1,"state_summary":"work remains","advices":[
                     {"strategy":"same","scope_basis":"task"},
                     {"strategy":"same","scope_basis":"task"},
                     {"strategy":"different","scope_basis":"task"}
@@ -15071,14 +15095,14 @@ mod tests {
         );
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
+                r#"{"winner":1,"state_summary":"work remains","advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
                 3
             )
             .is_err()
         );
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":7,"advices":[
+                r#"{"winner":7,"state_summary":"work remains","advices":[
                     {"strategy":"a","scope_basis":"task"},
                     {"strategy":"b","scope_basis":"task"},
                     {"strategy":"c","scope_basis":"task"}
@@ -15089,8 +15113,19 @@ mod tests {
         );
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"advices":[
+                r#"{"winner":1,"state_summary":"work remains","advices":[
                     {"strategy":"a","scope_basis":""},
+                    {"strategy":"b","scope_basis":"task"},
+                    {"strategy":"c","scope_basis":"task"}
+                ]}"#,
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"state_summary":"","advices":[
+                    {"strategy":"a","scope_basis":"task"},
                     {"strategy":"b","scope_basis":"task"},
                     {"strategy":"c","scope_basis":"task"}
                 ]}"#,
@@ -15182,6 +15217,10 @@ mod tests {
         let schema = asgard_supervisor_schema(3);
         assert!(schema.prefer_json_object);
         assert_eq!(schema.schema["properties"]["winner"]["maximum"], 2);
+        assert_eq!(
+            schema.schema["required"],
+            serde_json::json!(["winner", "state_summary", "advices"])
+        );
         assert_eq!(schema.schema["properties"]["advices"]["minItems"], 3);
         assert_eq!(schema.schema["properties"]["advices"]["maxItems"], 3);
         assert_eq!(schema.schema["properties"]["advices"]["uniqueItems"], true);
