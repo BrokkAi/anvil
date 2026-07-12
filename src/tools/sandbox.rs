@@ -733,6 +733,12 @@ pub const ENV_WHITELIST: &[&str] = &[
     "PYENV_ROOT",
     "BUN_INSTALL",
     "DENO_INSTALL",
+    // JVM build-tool configuration (benchmark/dev resource bounds and JDK selection)
+    "JAVA_HOME",
+    "JAVA_OPTS",
+    "GRADLE_HOME",
+    "GRADLE_OPTS",
+    "GRADLE_USER_HOME",
 ];
 
 /// Operator-supplied override that fully replaces the discovered PATH inside
@@ -2107,6 +2113,9 @@ mod tests {
             "PYENV_ROOT",
             "BUN_INSTALL",
             "DENO_INSTALL",
+            "JAVA_HOME",
+            "GRADLE_HOME",
+            "GRADLE_OPTS",
         ] {
             assert!(
                 ENV_WHITELIST.contains(&required),
