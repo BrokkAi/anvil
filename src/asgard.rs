@@ -89,58 +89,11 @@ pub(crate) fn create_worktree(cwd: &Path, label: &str) -> Result<Worktree> {
     if !status.success() {
         bail!("failed to create Asgard worktree {}", root.display());
     }
-    let worktree = Worktree {
+    Ok(Worktree {
         session_cwd: root.join(relative),
         root,
         repo,
-    };
-    if let Err(error) = seed_build_bootstrap_files(&worktree.repo, &worktree.root) {
-        remove_worktree(&worktree);
-        return Err(error);
-    }
-    Ok(worktree)
-}
-
-/// Detached Git worktrees omit ignored files that a harness may have provisioned
-/// after checkout. Keep small build-launcher payloads available to every lane so
-/// candidates have the same validation entry point as the parent checkout.
-fn seed_build_bootstrap_files(repo: &Path, worktree: &Path) -> Result<()> {
-    for relative in [Path::new("gradle/wrapper"), Path::new(".mvn/wrapper")] {
-        let source = repo.join(relative);
-        if source.is_dir() {
-            copy_missing_tree(&source, &worktree.join(relative))?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_missing_tree(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination).with_context(|| {
-        format!(
-            "create Asgard bootstrap directory {}",
-            destination.display()
-        )
-    })?;
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("read Asgard bootstrap directory {}", source.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_missing_tree(&source_path, &destination_path)?;
-        } else if file_type.is_file() && !destination_path.exists() {
-            fs::copy(&source_path, &destination_path).with_context(|| {
-                format!(
-                    "copy Asgard bootstrap file {} to {}",
-                    source_path.display(),
-                    destination_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
+    })
 }
 
 pub(crate) fn capture_patch(root: &Path) -> Result<Vec<u8>> {
@@ -217,49 +170,4 @@ fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
 
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(git(cwd, args)?.stdout).context("git output was not UTF-8")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bootstrap_seed_copies_missing_wrappers_without_copying_build_outputs() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        let worktree = temp.path().join("worktree");
-        fs::create_dir_all(repo.join("gradle/wrapper")).unwrap();
-        fs::create_dir_all(repo.join(".mvn/wrapper")).unwrap();
-        fs::create_dir_all(repo.join("build/cache")).unwrap();
-        fs::create_dir_all(worktree.join("gradle/wrapper")).unwrap();
-        fs::write(repo.join("gradle/wrapper/gradle-wrapper.jar"), b"gradle").unwrap();
-        fs::write(
-            repo.join("gradle/wrapper/gradle-wrapper.properties"),
-            b"parent",
-        )
-        .unwrap();
-        fs::write(
-            worktree.join("gradle/wrapper/gradle-wrapper.properties"),
-            b"tracked worktree copy",
-        )
-        .unwrap();
-        fs::write(repo.join(".mvn/wrapper/maven-wrapper.jar"), b"maven").unwrap();
-        fs::write(repo.join("build/cache/large.bin"), b"cache").unwrap();
-
-        seed_build_bootstrap_files(&repo, &worktree).unwrap();
-
-        assert_eq!(
-            fs::read(worktree.join("gradle/wrapper/gradle-wrapper.jar")).unwrap(),
-            b"gradle"
-        );
-        assert_eq!(
-            fs::read(worktree.join(".mvn/wrapper/maven-wrapper.jar")).unwrap(),
-            b"maven"
-        );
-        assert_eq!(
-            fs::read(worktree.join("gradle/wrapper/gradle-wrapper.properties")).unwrap(),
-            b"tracked worktree copy"
-        );
-        assert!(!worktree.join("build/cache/large.bin").exists());
-    }
 }
