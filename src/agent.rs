@@ -4849,17 +4849,6 @@ async fn run_asgard_supervisor(
         .find(|message| message.role == "user")
         .map(asgard_message_text)
         .unwrap_or_default();
-    let selected_trajectory = match serialize_asgard_selected_trajectory(common_messages) {
-        Ok(trajectory) => trajectory,
-        Err(error) => {
-            return (
-                Err(anyhow::anyhow!(
-                    "failed to serialize the selected Asgard trajectory: {error}"
-                )),
-                crate::llm_client::TokenUsage::default(),
-            );
-        }
-    };
     let mut dossier = format!(
         "Select the single trajectory with the highest probability of eventually producing a \
          correct, complete solution if continued from its endpoint after window {window}. Judge \
@@ -4934,7 +4923,17 @@ async fn run_asgard_supervisor(
             String::from_utf8_lossy(&candidate.delta_patch),
         ));
     }
-    let messages = asgard_supervisor_messages(&original_task, selected_trajectory, dossier);
+    let messages = match asgard_supervisor_messages(&original_task, common_messages, dossier) {
+        Ok(messages) => messages,
+        Err(error) => {
+            return (
+                Err(anyhow::anyhow!(
+                    "failed to serialize the selected Asgard trajectory: {error}"
+                )),
+                crate::llm_client::TokenUsage::default(),
+            );
+        }
+    };
     let structured_output = asgard_supervisor_schema(candidates.len());
     let sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
     let thought_sink: crate::tool_loop::TextSink = Arc::new(std::sync::Mutex::new(|_: &str| {}));
@@ -4978,21 +4977,12 @@ async fn run_asgard_supervisor(
     (parsed, outcome.usage)
 }
 
-fn serialize_asgard_selected_trajectory(messages: &[ChatMessage]) -> serde_json::Result<String> {
-    let mut trajectory = String::new();
-    for message in messages {
-        trajectory.push_str(&serde_json::to_string(message)?);
-        trajectory.push('\n');
-    }
-    Ok(trajectory)
-}
-
 fn asgard_supervisor_messages(
     original_task: &str,
-    selected_trajectory: String,
+    selected_trajectory: &[ChatMessage],
     dossier: String,
-) -> Vec<ChatMessage> {
-    vec![
+) -> serde_json::Result<Vec<ChatMessage>> {
+    let mut messages = vec![
         ChatMessage::system(
             "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
              and shared baseline using only the complete evidence supplied in the prompt. Optimize \
@@ -5020,11 +5010,15 @@ fn asgard_supervisor_messages(
              distinct, scope-grounded next-window advice object per lane.",
         ),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
-        ChatMessage::user(format!(
-            "SELECTED TRAJECTORY BEFORE THIS WINDOW (complete):\n{selected_trajectory}"
-        )),
-        ChatMessage::user(dossier),
-    ]
+    ];
+    for (index, message) in selected_trajectory.iter().enumerate() {
+        messages.push(ChatMessage::user(format!(
+            "<selected_trajectory_message index=\"{index}\">\n{}\n</selected_trajectory_message>",
+            serde_json::to_string(message)?,
+        )));
+    }
+    messages.push(ChatMessage::user(dossier));
+    Ok(messages)
 }
 
 fn asgard_supervisor_schema(candidate_count: usize) -> StructuredOutputRequest {
@@ -15599,41 +15593,33 @@ mod tests {
 
     #[test]
     fn asgard_supervisor_keeps_stable_task_prefix_ahead_of_window_dossier() {
-        let first = asgard_supervisor_messages(
-            "fix the parser",
-            "selected step one\n".to_string(),
-            "window one".to_string(),
-        );
+        let selected_first = vec![
+            ChatMessage::system("stable selected system"),
+            ChatMessage::user("selected step one"),
+        ];
+        let mut selected_second = selected_first.clone();
+        selected_second.push(ChatMessage::assistant("selected step two"));
+        let first =
+            asgard_supervisor_messages("fix the parser", &selected_first, "window one".to_string())
+                .unwrap();
         let second = asgard_supervisor_messages(
             "fix the parser",
-            "selected step one\nselected step two\n".to_string(),
+            &selected_second,
             "window two".to_string(),
-        );
+        )
+        .unwrap();
 
-        assert_eq!(&first[..2], &second[..2]);
-        assert!(asgard_message_text(&second[2]).starts_with(&asgard_message_text(&first[2])));
-        assert_ne!(first[3], second[3]);
+        assert_eq!(&first[..first.len() - 1], &second[..first.len() - 1]);
+        assert_ne!(first.last(), second.last());
         assert!(asgard_message_text(&first[1]).contains("fix the parser"));
         assert!(!asgard_message_text(&first[0]).contains("window one"));
         assert!(asgard_message_text(&first[0]).contains("HARD SCOPE CONSTRAINT"));
         assert!(asgard_message_text(&first[0]).contains("dependency-audit"));
         assert!(asgard_message_text(&first[0]).contains("named verifier"));
         assert!(asgard_message_text(&first[0]).contains("intentionally absent"));
-    }
-
-    #[test]
-    fn asgard_selected_trajectory_serialization_is_append_only() {
-        let first_messages = vec![
-            ChatMessage::system("stable prefix"),
-            ChatMessage::user("original task"),
-        ];
-        let mut second_messages = first_messages.clone();
-        second_messages.push(ChatMessage::assistant("selected work"));
-
-        let first = serialize_asgard_selected_trajectory(&first_messages).unwrap();
-        let second = serialize_asgard_selected_trajectory(&second_messages).unwrap();
-
-        assert!(second.starts_with(&first));
+        assert!(asgard_message_text(&first[2]).contains("stable selected system"));
+        assert!(asgard_message_text(&first[3]).contains("selected step one"));
+        assert!(asgard_message_text(&second[4]).contains("selected step two"));
     }
 
     #[test]
