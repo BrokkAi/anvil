@@ -4890,7 +4890,11 @@ async fn run_asgard_supervisor(
          requires it, never advise changing dependencies, build configuration, warning policy, test \
          selection, or test expectations merely to make an unrelated failure disappear. Instead advise \
          focused verification or continued task work while preserving the failure as a reported \
-         limitation. \
+         limitation. Test code is not categorically immutable: when task-mandated production API, \
+         contract, or call-path changes make existing mocks or test setup obsolete, update that setup \
+         rather than regressing required production behavior. Never add obsolete production calls or \
+         violate an explicit requirement merely to keep old mock stubs exercised or avoid a strict \
+         mocking failure. \
          A task may name a verifier that is deliberately absent from the candidate checkout. \
          Absence alone is unavailable verification, not an implicit requirement to recreate that \
          test. Unless the task explicitly asks for new tests, do not reward or recommend authoring a \
@@ -4996,17 +5000,24 @@ async fn run_asgard_supervisor(
         false,
     )
     .await;
-    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).map(
-        |mut decision| {
-            for (lane, reason) in filter_asgard_advice_scope(&mut decision, &original_task) {
+    let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).and_then(
+        |decision| {
+            let rejected = match enforce_asgard_advice_scope(decision, &original_task) {
+                Ok(decision) => return Ok(decision),
+                Err(rejected) => rejected,
+            };
+            for (lane, reason) in &rejected {
                 tracing::warn!(
                     window,
                     lane = lane + 1,
                     reason,
-                    "dropping out-of-scope Asgard supervisor strategy; lane will continue unadvised"
+                    "rejecting Asgard supervisor decision with an out-of-scope strategy"
                 );
             }
-            decision
+            anyhow::bail!(
+                "Asgard supervisor decision contains {} out-of-scope strategies",
+                rejected.len()
+            )
         },
     );
     (parsed, outcome.usage)
@@ -5042,6 +5053,10 @@ fn asgard_supervisor_messages(
              test selection, or expected outputs in response to a failure. Pre-existing, \
              environmental, dependency-audit, and harness failures are evidence to report or work \
              around with focused verification, not problems to hide or repair. Never recommend \
+             regressing task-mandated production behavior, restoring obsolete calls, or adding \
+             redundant calls merely to preserve old mock interactions or avoid strict-mocking errors. \
+             When a required API, contract, or call path changes, updating the affected mock setup is \
+             in scope. Never recommend \
              changing or repairing a build environment, toolchain, classpath, build daemon, wrapper, \
              generated build tooling, or checkout layout unless the original task explicitly asks \
              for that work. Any strategy that violates this constraint makes the entire answer \
@@ -5424,6 +5439,14 @@ fn filter_asgard_advice_scope(
             "excluding preexisting",
             "skip frontend",
             "exclude frontend",
+            "keep the existing mock stubs",
+            "keeps the existing mock stubs",
+            "keep old mock stubs",
+            "preserve existing mock stubs",
+            "preserve old mock interactions",
+            "avoid unnecessarystubbingexception",
+            "avoids unnecessarystubbingexception",
+            "preventing unnecessary-stubbing",
         ];
         let violation = if let Some(term) = policy_bypasses
             .iter()
@@ -5561,6 +5584,18 @@ fn filter_asgard_advice_scope(
         }
     }
     rejected
+}
+
+fn enforce_asgard_advice_scope(
+    mut decision: AsgardSupervisorDecision,
+    original_task: &str,
+) -> Result<AsgardSupervisorDecision, Vec<(usize, String)>> {
+    let rejected = filter_asgard_advice_scope(&mut decision, original_task);
+    if rejected.is_empty() {
+        Ok(decision)
+    } else {
+        Err(rejected)
+    }
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -15755,6 +15790,7 @@ mod tests {
             "Resolve the Gradle wrapper issue by using system-installed Gradle or recreating the wrapper.",
             "Apply Spotless selectively by temporarily suppressing the lint-error blocker.",
             "Run the focused Gradle tests with `-x :app:frontendBuild` to bypass the unrelated failure.",
+            "Invoke tasks.allTasks() solely to keep the existing mock stubs used and avoid UnnecessaryStubbingException.",
         ] {
             let mut candidate = decision(strategy);
             let rejected =
@@ -15801,6 +15837,18 @@ mod tests {
                 .is_empty()
         );
         assert!(static_audit.advices[0].is_some());
+
+        let mock_preservation = decision(
+            "Invoke tasks.allTasks() solely to keep the existing mock stubs used and avoid UnnecessaryStubbingException.",
+        );
+        assert!(
+            enforce_asgard_advice_scope(
+                mock_preservation,
+                "Return the supplied close set directly."
+            )
+            .is_err(),
+            "one forbidden lane must reject the whole supervisor decision"
+        );
     }
 
     #[test]
