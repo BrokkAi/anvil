@@ -86,11 +86,12 @@ struct Args {
 
     /// Candidate model for Asgard trajectory search. Repeat for arbitrary
     /// candidate counts; all candidates currently require provider-qualified
-    /// model wire ids.
+    /// model wire ids (for example `deepseek::deepseek-v4-flash`).
     #[arg(long = "asgard-model")]
     asgard_models: Vec<String>,
 
-    /// Supervisor model for Asgard. Defaults to the selected session model.
+    /// Supervisor model for Asgard (for example
+    /// `deepseek::deepseek-v4-pro`). Defaults to the selected session model.
     #[arg(long, requires = "asgard_models")]
     asgard_supervisor: Option<String>,
 

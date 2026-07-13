@@ -996,38 +996,7 @@ impl ToolRegistry {
             ));
         }
         if builtin_tools.contains("update_plan") {
-            defs.push(tool_def(
-                "update_plan",
-                "Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "explanation": {
-                            "type": "string",
-                            "description": "Optional explanation for this plan update."
-                        },
-                        "plan": {
-                            "type": "array",
-                            "description": "The list of steps.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "step": { "type": "string", "description": "Task step text." },
-                                    "status": {
-                                        "type": "string",
-                                        "enum": ["pending", "in_progress", "completed"],
-                                        "description": "Step status."
-                                    }
-                                },
-                                "required": ["step", "status"],
-                                "additionalProperties": false
-                            }
-                        }
-                    },
-                    "required": ["plan"],
-                    "additionalProperties": false
-                }),
-            ));
+            defs.push(update_plan_tool_definition());
         }
         let mut advertised_names: HashSet<String> =
             defs.iter().map(|def| def.function.name.clone()).collect();
@@ -1648,6 +1617,41 @@ fn tool_def(name: &str, description: &str, parameters: serde_json::Value) -> Too
             parameters,
         },
     }
+}
+
+pub(crate) fn update_plan_tool_definition() -> ToolDefinition {
+    tool_def(
+        "update_plan",
+        "Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time.",
+        json!({
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional explanation for this plan update."
+                },
+                "plan": {
+                    "type": "array",
+                    "description": "The list of steps.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string", "description": "Task step text." },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Step status."
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 /// Resolve a relative path against cwd and ensure it stays within cwd.
