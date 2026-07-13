@@ -5,6 +5,7 @@
 //! notices from persisted assistant text.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::session::{ToolExchange, ToolExchangeStatus};
 use crate::tool_loop::LoopStop;
@@ -68,11 +69,25 @@ fn describe_loop_stop_for_recap(stop: &LoopStop) -> String {
 /// turn so the final aggregate recap can report the whole run without
 /// keeping every exchange (diff bodies included) resident across turns.
 #[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceDelta {
+    changed_files: BTreeSet<PathBuf>,
+}
+
+impl WorkspaceDelta {
+    pub(crate) fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            changed_files: paths.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ToolCallStats {
     total: usize,
     failed: usize,
     by_name: BTreeMap<String, usize>,
-    changed_files: BTreeSet<String>,
+    tool_diff_files: BTreeSet<String>,
+    workspace_files: BTreeSet<String>,
 }
 
 impl ToolCallStats {
@@ -88,11 +103,25 @@ impl ToolCallStats {
                 && let Some(diff) = &exchange.diff
             {
                 stats
-                    .changed_files
+                    .tool_diff_files
                     .insert(recap_field_text(&diff.path.display().to_string()));
             }
         }
         stats
+    }
+
+    pub(crate) fn with_workspace_delta(mut self, delta: &WorkspaceDelta) -> Self {
+        self.add_workspace_delta(delta);
+        self
+    }
+
+    pub(crate) fn add_workspace_delta(&mut self, delta: &WorkspaceDelta) {
+        self.workspace_files.extend(
+            delta
+                .changed_files
+                .iter()
+                .map(|path| recap_path_text(path.as_path())),
+        );
     }
 
     pub(crate) fn merge(&mut self, other: &ToolCallStats) {
@@ -101,12 +130,14 @@ impl ToolCallStats {
         for (name, count) in &other.by_name {
             *self.by_name.entry(name.clone()).or_default() += count;
         }
-        self.changed_files
-            .extend(other.changed_files.iter().cloned());
+        self.tool_diff_files
+            .extend(other.tool_diff_files.iter().cloned());
+        self.workspace_files
+            .extend(other.workspace_files.iter().cloned());
     }
 
     pub(crate) fn has_changed_files(&self) -> bool {
-        !self.changed_files.is_empty()
+        !self.workspace_files.is_empty() || !self.tool_diff_files.is_empty()
     }
 }
 
@@ -144,18 +175,26 @@ fn render_tool_counts(stats: &ToolCallStats) -> String {
     )
 }
 
+fn recap_path_text(path: &Path) -> String {
+    recap_field_text(&path.display().to_string())
+}
+
 fn render_changed_files(stats: &ToolCallStats) -> String {
-    if stats.changed_files.is_empty() {
+    let files: BTreeSet<&String> = stats
+        .tool_diff_files
+        .iter()
+        .chain(&stats.workspace_files)
+        .collect();
+    if files.is_empty() {
         return "none".to_string();
     }
 
     const MAX_CHANGED_FILES_IN_RECAP: usize = 8;
-    let total = stats.changed_files.len();
-    let mut listed: Vec<String> = stats
-        .changed_files
+    let total = files.len();
+    let mut listed: Vec<String> = files
         .iter()
         .take(MAX_CHANGED_FILES_IN_RECAP)
-        .cloned()
+        .map(|path| (*path).clone())
         .collect();
     if total > MAX_CHANGED_FILES_IN_RECAP {
         listed.push(format!("+{} more", total - MAX_CHANGED_FILES_IN_RECAP));
@@ -183,13 +222,14 @@ fn sanitize_recap_summary(summary: &str) -> String {
 pub(crate) fn render_turn_recap(
     summary: Option<&str>,
     tool_exchanges: &[ToolExchange],
+    workspace_delta: Option<&WorkspaceDelta>,
     stop: &LoopStop,
 ) -> String {
-    render_recap_block(
-        &describe_loop_stop_for_recap(stop),
-        summary,
-        &ToolCallStats::from_exchanges(tool_exchanges),
-    )
+    let mut stats = ToolCallStats::from_exchanges(tool_exchanges);
+    if let Some(delta) = workspace_delta {
+        stats.add_workspace_delta(delta);
+    }
+    render_recap_block(&describe_loop_stop_for_recap(stop), summary, &stats)
 }
 
 /// Render the aggregate `/goal` recap: an optional detail paragraph (blocked
@@ -344,6 +384,7 @@ mod tests {
                     ..ToolExchange::default()
                 },
             ],
+            None,
             &LoopStop::Completed { had_text: true },
         );
 
@@ -367,6 +408,7 @@ mod tests {
                 status: ToolExchangeStatus::Completed,
                 ..ToolExchange::default()
             }],
+            None,
             &LoopStop::Completed { had_text: true },
         );
 
@@ -392,6 +434,7 @@ mod tests {
         let recap = render_turn_recap(
             Some(&evil_summary),
             &[],
+            None,
             &LoopStop::Completed { had_text: true },
         );
         let persisted = format!("answer{recap}");
@@ -413,6 +456,7 @@ mod tests {
                 }),
                 ..ToolExchange::default()
             }],
+            None,
             &LoopStop::Completed { had_text: true },
         );
 
@@ -431,6 +475,28 @@ mod tests {
 
         let persisted = format!("answer{recap}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
+    }
+
+    #[test]
+    fn changed_files_include_tool_and_workspace_sources() {
+        let delta = WorkspaceDelta::from_paths([PathBuf::from("src/from-shell.rs")]);
+        let stats = ToolCallStats::from_exchanges(&[ToolExchange {
+            call_id: "c1".into(),
+            tool_name: "edit".into(),
+            status: ToolExchangeStatus::Completed,
+            diff: Some(ToolExchangeDiff {
+                path: PathBuf::from("src/from-tool.rs"),
+                old_text: Some("old".into()),
+                new_text: "new".into(),
+            }),
+            ..ToolExchange::default()
+        }])
+        .with_workspace_delta(&delta);
+
+        assert_eq!(
+            render_changed_files(&stats),
+            "src/from-shell.rs, src/from-tool.rs"
+        );
     }
 
     #[test]
@@ -560,7 +626,7 @@ mod tests {
             "the model's real answer"
         );
 
-        let recap = render_turn_recap(None, &[], &LoopStop::Completed { had_text: true });
+        let recap = render_turn_recap(None, &[], None, &LoopStop::Completed { had_text: true });
         let persisted = format!("answer{recap}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
 
@@ -572,6 +638,7 @@ mod tests {
         let recap_with_summary = render_turn_recap(
             Some("- Looked at `a.rs`.\n- Edited `b.rs`."),
             &[],
+            None,
             &LoopStop::MaxTurns { max_turns: 3 },
         );
         let persisted = format!("answer{notice}{recap_with_summary}");

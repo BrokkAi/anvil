@@ -894,6 +894,7 @@ mod tests {
         let recap = crate::host_notice::render_turn_recap(
             Some("- Investigated the foo path and edited `bar.rs`."),
             &[],
+            None,
             &crate::tool_loop::LoopStop::Completed { had_text: true },
         );
         let t = turn("what happened?", &format!("The model answer.{recap}"));
