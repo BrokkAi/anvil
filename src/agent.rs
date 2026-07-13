@@ -9495,6 +9495,11 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn pr_create_commit_message(prompt_text: &str) -> String {
+    parse_pr_create_arg(prompt_text)
+        .unwrap_or_else(|| "Update changes for pull request".to_string())
+}
+
 /// Per-shell-call timeout for slash-command-driven `run_shell_command`
 /// invocations. Generous enough for `gh pr create` over a slow link
 /// without leaving a stuck child for minutes.
@@ -9530,15 +9535,15 @@ async fn run_or_report(
 /// Flow (each step short-circuits with a user-facing error on failure):
 ///   1. Refuse on `PermissionMode::ReadOnly` -- git push won't be allowed
 ///      under the resulting sandbox tier.
-///   2. Refuse if `git status --porcelain` is non-empty so we never push
-///      with uncommitted state.
-///   3. Refuse if the branch has no upstream and instruct the user to
+///   2. Refuse if the branch has no upstream and instruct the user to
 ///      push manually. We deliberately do NOT auto-push: the choice of
 ///      which remote to push to is meaningful in fork-based workflows
 ///      (`origin` may be the user's personal fork OR the upstream repo)
 ///      and a server-side handler should not make that call silently.
-///   4. Detect the repository's default branch via `gh repo view` and
+///   3. Detect the repository's default branch via `gh repo view` and
 ///      pass it explicitly to `--base`.
+///   4. If `git status --porcelain` is non-empty, stage the worktree and
+///      commit it before creating the PR.
 ///   5. Invoke `gh pr create --base <default> --fill [--title <user-arg>]`
 ///      and surface the resulting PR URL.
 ///
@@ -9577,13 +9582,7 @@ async fn handle_pr_create(
         Ok(o) => o,
         Err(e) => return e,
     };
-    let dirty = status.trim();
-    if !dirty.is_empty() {
-        return format!(
-            "Error: working tree is dirty. Commit or stash these paths before \
-             running `/pr-create`:\n\n{dirty}"
-        );
-    }
+    let dirty = !status.trim().is_empty();
 
     // No-upstream check. Failure of `git rev-parse @{u}` is the trigger
     // for the "no upstream" branch -- it can also fire for unrelated
@@ -9627,6 +9626,18 @@ async fn handle_pr_create(
     let base_branch = base.trim();
     if base_branch.is_empty() {
         return "Error: `gh repo view` returned an empty default branch name.".to_string();
+    }
+
+    if dirty {
+        if let Err(e) = run_or_report(registry, "git add -A", "git add -A", policy).await {
+            return e;
+        }
+
+        let commit_message = pr_create_commit_message(prompt_text);
+        let commit_cmd = format!("git commit -m {}", shell_single_quote(&commit_message));
+        if let Err(e) = run_or_report(registry, &commit_cmd, "git commit", policy).await {
+            return e;
+        }
     }
 
     let title_arg = match parse_pr_create_arg(prompt_text) {
@@ -10579,6 +10590,18 @@ mod tests {
         assert_eq!(
             parse_pr_create_arg("/pr-create feat(api): Add NewThing"),
             Some("feat(api): Add NewThing".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_create_commit_message_uses_title_or_default() {
+        assert_eq!(
+            pr_create_commit_message("/pr-create Fix the thing"),
+            "Fix the thing"
+        );
+        assert_eq!(
+            pr_create_commit_message("/pr-create"),
+            "Update changes for pull request"
         );
     }
 
