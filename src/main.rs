@@ -454,9 +454,18 @@ fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
-fn build_bedrock_backend() -> Option<Arc<dyn LlmBackend>> {
-    let backend = match bedrock_client::build_backend_from_config() {
-        Ok(Some(backend)) => backend,
+fn build_bedrock_backend(
+    catalog_mode: setup_state::BedrockCatalogMode,
+) -> Option<Arc<dyn LlmBackend>> {
+    let backend: Arc<dyn LlmBackend> = match bedrock_client::backend_config() {
+        Ok(Some((token, region, model))) => {
+            Arc::new(bedrock_client::BedrockClient::new_with_catalog_mode(
+                token,
+                region,
+                model,
+                catalog_mode,
+            ))
+        }
         Ok(None) => return None,
         Err(e) => {
             tracing::warn!("failed to read Bedrock credentials: {e:#}");
@@ -577,7 +586,12 @@ async fn main() -> Result<()> {
     // single secrets store before the backends read their credentials.
     secrets::migrate_legacy_files();
 
-    let bedrock_backend = build_bedrock_backend();
+    let bedrock_catalog_mode = if args.transient_setup {
+        setup_state::BedrockCatalogMode::default()
+    } else {
+        setup_state::bedrock_catalog_mode()
+    };
+    let bedrock_backend = build_bedrock_backend(bedrock_catalog_mode);
     let codex_backend = build_codex_backend().await;
     let deepseek_backend = build_deepseek_backend();
     let openrouter_backend = build_openrouter_backend();
