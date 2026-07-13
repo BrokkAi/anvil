@@ -2979,7 +2979,7 @@ pub async fn run_agent(
                     return responder.respond_with_error(unknown_session_error(&session_id));
                 };
 
-                let messages = build_prompt_messages_with_compression(
+                let prepared_prompt = build_prompt_messages_with_compression(
                     &mut snap,
                     &prompt_text,
                     &prompt_parts,
@@ -2991,6 +2991,10 @@ pub async fn run_agent(
                     context_length,
                 )
                 .await;
+                let messages = prepared_prompt.messages;
+                let compaction_usage = prepared_prompt.compaction_usage;
+                let context_prefix_len = prepared_prompt.prefix_len;
+                let current_plan = prepared_prompt.current_plan;
 
                 // Capture everything the spawned task needs before we move into it.
                 // The tool loop calls `block_task()` to await `session/request_permission`,
@@ -3046,6 +3050,10 @@ pub async fn run_agent(
                         service_tier_for_loop.as_deref(),
                         structured_output_request.as_ref(),
                         messages,
+                        compaction_usage,
+                        context_length,
+                        context_prefix_len,
+                        current_plan,
                         max_turns,
                         idle_timeout_for_loop,
                         cancel,
@@ -4218,25 +4226,16 @@ fn build_prompt_messages_with_parts(
     build_prompt_messages_with_mode_and_parts(snap, snap.mode, new_prompt_text, new_prompt_parts)
 }
 
-/// Wrap `build_prompt_messages` with per-turn LLM summarization.
-///
-/// When the projected prompt exceeds the model's budget, walk the
-/// history from the oldest *uncompressed* turn forward, asking the
-/// LLM to summarize each one in turn (Brokk's pattern from
-/// `ContextManager.compressHistory(TaskEntry)`). Each successful
-/// summary is persisted via [`SessionStore::set_turn_summary`] so a
-/// reload reproduces the same compressed prompt, and the in-memory
-/// `snap` is mutated so the rebuilt prompt sees the new state.
-///
-/// Stops when the prompt fits, when every turn already carries a
-/// summary, or when a summarization call fails. Persistence failures
-/// are logged but non-fatal -- the summary lives in memory for the
-/// current turn and the next session reload will recompress.
-///
-/// Turns that fail to summarize stay uncompressed; we never silently
-/// drop history. The prompt may still overrun budget after this runs
-/// -- the LLM/server is the final arbiter -- but we've done what we
-/// can without losing information.
+struct PreparedPrompt {
+    messages: Vec<ChatMessage>,
+    compaction_usage: crate::llm_client::TokenUsage,
+    prefix_len: usize,
+    current_plan: Option<crate::plan::UpdatePlanArgs>,
+}
+
+/// Build a prompt and, when necessary, replace all completed model history
+/// with one cumulative checkpoint. The canonical prefix and incoming user
+/// prompt are never summarized.
 #[allow(clippy::too_many_arguments)]
 async fn build_prompt_messages_with_compression(
     snap: &mut SessionSnapshot,
@@ -4248,71 +4247,71 @@ async fn build_prompt_messages_with_compression(
     cancel: tokio_util::sync::CancellationToken,
     idle_timeout: IdleTimeouts,
     context_length: Option<u32>,
-) -> Vec<ChatMessage> {
-    use crate::context_manager::{context_budget, summarize_turn};
+) -> PreparedPrompt {
+    use crate::context_manager::{compact_history, context_budget};
 
     let budget = context_budget(context_length);
+    let prefix_len = prompt_prefix_messages(snap, snap.mode).len();
+    let current_plan = snap.history.iter().rev().find_map(|turn| {
+        turn.current_plan.clone().or_else(|| {
+            turn.compaction_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.current_plan.clone())
+        })
+    });
     let mut messages = build_prompt_messages_with_parts(snap, prompt_text, prompt_parts);
-
-    loop {
-        let projected = crate::tokens::approximate_tokens_messages(&messages);
-        if projected <= budget {
-            return messages;
-        }
-        // Find the oldest uncompressed turn -- compressing in order
-        // mirrors how Brokk's `compressHistoryAsync(Context)` walks
-        // entries, and keeps the most recent (most semantically
-        // important) turns verbatim for the longest.
-        let Some(idx) = snap.history.iter().position(|t| t.summary.is_none()) else {
-            tracing::warn!(
-                session_id = %session_id,
-                projected_tokens = projected,
-                budget,
-                "prompt exceeds context budget but every turn is already summarized"
-            );
-            return messages;
+    if crate::tokens::approximate_tokens_messages(&messages) <= budget || snap.history.is_empty() {
+        return PreparedPrompt {
+            messages,
+            compaction_usage: crate::llm_client::TokenUsage::default(),
+            prefix_len,
+            current_plan,
         };
-        let turn_to_summarize = snap.history[idx].clone();
-        match summarize_turn(
-            llm,
-            &snap.model,
-            &turn_to_summarize,
-            context_length,
-            idle_timeout,
-            cancel.clone(),
-        )
-        .await
-        {
-            Ok(new_summary) => {
-                if let Err(e) = sessions
-                    .set_turn_summary(session_id, idx, new_summary.clone())
-                    .await
-                {
-                    // Persistence failure isn't fatal -- we still want
-                    // this turn's prompt to benefit from the summary.
-                    // The next reload will see the uncompressed turn
-                    // and try again.
-                    tracing::warn!(
-                        session_id = %session_id,
-                        turn_index = idx,
-                        "failed to persist turn summary, continuing with in-memory copy: {e:#}"
-                    );
-                }
-                snap.history[idx].summary = Some(new_summary);
-                messages = build_prompt_messages_with_parts(snap, prompt_text, prompt_parts);
-            }
-            Err(e) => {
+    }
+
+    let history_messages = model_history_messages(&snap.history);
+    match compact_history(
+        llm,
+        &snap.model,
+        &history_messages,
+        current_plan.as_ref(),
+        context_length,
+        idle_timeout,
+        cancel,
+    )
+    .await
+    {
+        Ok(compaction) => {
+            let anchor = snap.history.len() - 1;
+            let checkpoint = crate::session::CompactionCheckpoint {
+                messages: compaction.checkpoint_messages,
+                current_plan: current_plan.clone(),
+            };
+            if let Err(error) = sessions
+                .set_compaction_checkpoint(session_id, anchor, checkpoint.clone())
+                .await
+            {
                 tracing::warn!(
-                    session_id = %session_id,
-                    turn_index = idx,
-                    "summarization failed, leaving turn uncompressed: {e:#}"
+                    session_id,
+                    "failed to persist compaction checkpoint: {error:#}"
                 );
-                // Brokk's `ContextManager.compressHistory` returns the
-                // original on failure -- we mirror that by leaving the
-                // turn uncompressed and giving up further attempts on
-                // this prompt rather than retrying earlier turns and
-                // racking up cost.
-                return messages;
+            }
+            snap.history[anchor].compaction_checkpoint = Some(checkpoint);
+            messages = build_prompt_messages_with_parts(snap, prompt_text, prompt_parts);
+            PreparedPrompt {
+                messages,
+                compaction_usage: compaction.usage,
+                prefix_len,
+                current_plan,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(session_id, "history compaction failed: {error:#}");
+            PreparedPrompt {
+                messages,
+                compaction_usage: crate::llm_client::TokenUsage::default(),
+                prefix_len,
+                current_plan,
             }
         }
     }
@@ -4348,19 +4347,24 @@ fn build_prompt_messages_with_mode_and_parts(
     new_prompt_text: &str,
     new_prompt_parts: &[ChatContentPart],
 ) -> Vec<ChatMessage> {
-    let mut messages = Vec::with_capacity(snap.history.len() * 2 + 4);
-    messages.push(ChatMessage::system(build_system_prompt(
-        &mode,
-        &snap.cwd,
-        &snap.additional_directories,
-    )));
-    append_prompt_context_messages(&mut messages, snap);
+    let mut messages = prompt_prefix_messages(snap, mode);
     append_history_messages(&mut messages, &snap.history);
     if new_prompt_parts.is_empty() {
         messages.push(ChatMessage::user(new_prompt_text.to_string()));
     } else {
         messages.push(ChatMessage::user_parts(new_prompt_parts.to_vec()));
     }
+    messages
+}
+
+fn prompt_prefix_messages(snap: &SessionSnapshot, mode: SessionMode) -> Vec<ChatMessage> {
+    let mut messages = Vec::with_capacity(4);
+    messages.push(ChatMessage::system(build_system_prompt(
+        &mode,
+        &snap.cwd,
+        &snap.additional_directories,
+    )));
+    append_prompt_context_messages(&mut messages, snap);
     messages
 }
 
@@ -4378,6 +4382,31 @@ fn append_prompt_context_messages(messages: &mut Vec<ChatMessage>, snap: &Sessio
 }
 
 fn append_history_messages(messages: &mut Vec<ChatMessage>, history: &[ConversationTurn]) {
+    messages.extend(model_history_messages(history));
+}
+
+fn model_history_messages(history: &[ConversationTurn]) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    let start = history
+        .iter()
+        .rposition(|turn| turn.compaction_checkpoint.is_some())
+        .map(|index| {
+            messages.extend(
+                history[index]
+                    .compaction_checkpoint
+                    .as_ref()
+                    .expect("checkpoint index")
+                    .messages
+                    .clone(),
+            );
+            index + 1
+        })
+        .unwrap_or(0);
+    append_raw_history_messages(&mut messages, &history[start..]);
+    messages
+}
+
+fn append_raw_history_messages(messages: &mut Vec<ChatMessage>, history: &[ConversationTurn]) {
     for turn in history {
         if let Some(summary_text) = turn.summary.as_deref() {
             let trimmed = summary_text.trim();
@@ -4575,6 +4604,9 @@ async fn run_asgard_trajectory_loop(
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
     config: &crate::asgard::Config,
+    context_length: Option<u32>,
+    context_prefix_len: usize,
+    initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> (
     crate::tool_loop::LoopOutcome,
     BTreeMap<String, crate::llm_client::TokenUsage>,
@@ -4612,12 +4644,14 @@ async fn run_asgard_trajectory_loop(
         registries.push(registry);
     }
     let mut common_messages = initial_messages;
-    let selected_trajectory_initial = common_messages.clone();
+    let original_task = asgard_original_task(&common_messages);
+    let mut selected_trajectory_initial = common_messages.clone();
     let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
     let mut next_advices: Option<Vec<Option<String>>> = None;
+    let mut canonical_plan = initial_plan;
     for window in 1usize.. {
         send_thought(
             cx,
@@ -4656,6 +4690,7 @@ async fn run_asgard_trajectory_loop(
             let worktree_root = worktree.root.clone();
             let selected_patch = common_patch.clone();
             let cancel = cancel.clone();
+            let inherited_plan = canonical_plan.clone();
             futures.push(async move {
                 let sink: crate::tool_loop::TextSink =
                     Arc::new(std::sync::Mutex::new(|_: &str| {}));
@@ -4684,6 +4719,9 @@ async fn run_asgard_trajectory_loop(
                     None,
                     None,
                     true,
+                    context_length,
+                    context_prefix_len,
+                    inherited_plan,
                 )
                 .await;
                 let patches = crate::asgard::capture_patch(&worktree_root).and_then(|patch| {
@@ -4737,6 +4775,7 @@ async fn run_asgard_trajectory_loop(
                 cancel.clone(),
                 window,
                 &candidates,
+                &original_task,
                 &selected_trajectory_initial,
                 &selected_trajectory_windows,
             )
@@ -4840,6 +4879,9 @@ async fn run_asgard_trajectory_loop(
                 tracing::warn!("failed to publish selected Asgard plan: {error}");
             }
         }
+        if winner.outcome.current_plan.is_some() {
+            canonical_plan = winner.outcome.current_plan.clone();
+        }
         common_patch = winner.patch.clone();
         common_messages = winner.outcome.continuation_messages.clone();
         // Store the canonical history in terms of the live checkout. Each
@@ -4858,6 +4900,51 @@ async fn run_asgard_trajectory_loop(
             parent_registry.cwd(),
         );
         selected_trajectory_windows.push(selected_window);
+        if crate::tokens::approximate_tokens_messages(&common_messages)
+            > crate::context_manager::context_budget(context_length)
+        {
+            let dynamic = common_messages[context_prefix_len.min(common_messages.len())..].to_vec();
+            match crate::context_manager::compact_history(
+                llm.as_ref(),
+                &winner.model,
+                &dynamic,
+                canonical_plan.as_ref(),
+                context_length,
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await
+            {
+                Ok(compaction) => {
+                    aggregate_usage.add(compaction.usage);
+                    usage_by_model
+                        .entry(winner.model.clone())
+                        .or_default()
+                        .add(compaction.usage);
+                    common_messages.truncate(context_prefix_len.min(common_messages.len()));
+                    common_messages.extend(compaction.checkpoint_messages);
+                    winner.outcome.continuation_messages = common_messages.clone();
+                    winner.outcome.compaction_checkpoint =
+                        Some(crate::session::CompactionCheckpoint {
+                            messages: common_messages
+                                [context_prefix_len.min(common_messages.len())..]
+                                .to_vec(),
+                            current_plan: canonical_plan.clone(),
+                        });
+                    selected_trajectory_initial = common_messages.clone();
+                    selected_trajectory_windows.clear();
+                    tracing::info!(
+                        window,
+                        before_tokens = compaction.before_tokens,
+                        after_tokens = compaction.after_tokens,
+                        "compacted selected Asgard trajectory"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(window, "selected Asgard compaction failed: {error:#}");
+                }
+            }
+        }
         if supervisor_complete {
             send_thought(
                 cx,
@@ -4867,13 +4954,7 @@ async fn run_asgard_trajectory_loop(
             winner.outcome.response = supervisor_completion_summary;
             winner.outcome.stop = crate::tool_loop::LoopStop::Completed { had_text: true };
         }
-        let finished = supervisor_complete
-            || matches!(
-                winner.outcome.stop,
-                crate::tool_loop::LoopStop::Completed { .. }
-                    | crate::tool_loop::LoopStop::Failed(_)
-                    | crate::tool_loop::LoopStop::Cancelled
-            );
+        let finished = asgard_should_finish(supervisor_complete, &winner.outcome.stop);
         selected_outcome = Some(winner.outcome);
         if finished {
             break;
@@ -4890,6 +4971,14 @@ async fn run_asgard_trajectory_loop(
     (outcome, usage_by_model)
 }
 
+fn asgard_should_finish(supervisor_complete: bool, stop: &crate::tool_loop::LoopStop) -> bool {
+    supervisor_complete
+        || matches!(
+            stop,
+            crate::tool_loop::LoopStop::Failed(_) | crate::tool_loop::LoopStop::Cancelled
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_asgard_supervisor(
     cx: &ConnectionTo<Client>,
@@ -4902,13 +4991,13 @@ async fn run_asgard_supervisor(
     cancel: tokio_util::sync::CancellationToken,
     window: usize,
     candidates: &[AsgardCandidate],
+    original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
 ) {
-    let original_task = asgard_original_task(selected_trajectory_initial);
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
         let trajectory = match serde_json::to_string_pretty(&candidate.window_messages) {
@@ -4962,7 +5051,7 @@ async fn run_asgard_supervisor(
     }
     candidate_diffs.push_str("</candidate_diffs>");
     let messages = match asgard_supervisor_messages(
-        &original_task,
+        original_task,
         selected_trajectory_initial,
         selected_trajectory_windows,
         candidates.len(),
@@ -5004,11 +5093,14 @@ async fn run_asgard_supervisor(
         Some(Arc::new(HashSet::new())),
         Some(PermissionMode::ReadOnly),
         false,
+        None,
+        usize::MAX,
+        None,
     )
     .await;
     let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).and_then(
         |decision| {
-            let rejected = match enforce_asgard_advice_scope(decision, &original_task) {
+            let rejected = match enforce_asgard_advice_scope(decision, original_task) {
                 Ok(decision) => return Ok(decision),
                 Err(rejected) => rejected,
             };
@@ -5862,6 +5954,7 @@ fn asgard_failure(error: anyhow::Error) -> crate::tool_loop::LoopOutcome {
         }),
         continuation_messages: Vec::new(),
         current_plan: None,
+        compaction_checkpoint: None,
     }
 }
 
@@ -5893,6 +5986,10 @@ async fn run_model_turn_in_spawn(
     service_tier: Option<&str>,
     structured_output_request: Option<&StructuredOutputRequest>,
     messages: Vec<ChatMessage>,
+    initial_usage: crate::llm_client::TokenUsage,
+    context_length: Option<u32>,
+    context_prefix_len: usize,
+    initial_plan: Option<crate::plan::UpdatePlanArgs>,
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
@@ -5935,6 +6032,9 @@ async fn run_model_turn_in_spawn(
                 idle_timeout,
                 cancel,
                 config,
+                context_length,
+                context_prefix_len,
+                initial_plan.clone(),
             )
             .await;
             (outcome, Some(usage_by_model))
@@ -5961,6 +6061,9 @@ async fn run_model_turn_in_spawn(
                 None,
                 None,
                 false,
+                context_length,
+                context_prefix_len,
+                initial_plan,
             )
             .await;
             (outcome, None)
@@ -5968,7 +6071,7 @@ async fn run_model_turn_in_spawn(
     };
     let loop_result = AssertUnwindSafe(loop_future).catch_unwind().await;
 
-    let (outcome, usage_by_model) = match loop_result {
+    let (mut outcome, mut usage_by_model) = match loop_result {
         Ok(result) => result,
         Err(panic) => {
             tracing::error!(session_id = %session_id, "tool loop panicked: {:?}", panic);
@@ -5987,11 +6090,19 @@ async fn run_model_turn_in_spawn(
                     }),
                     continuation_messages: Vec::new(),
                     current_plan: None,
+                    compaction_checkpoint: None,
                 },
                 None,
             )
         }
     };
+    outcome.usage.add(initial_usage);
+    if let Some(usage_by_model) = usage_by_model.as_mut() {
+        usage_by_model
+            .entry(model.to_string())
+            .or_default()
+            .add(initial_usage);
+    }
     let crate::tool_loop::LoopOutcome {
         response: response_text,
         tool_exchanges,
@@ -5999,7 +6110,8 @@ async fn run_model_turn_in_spawn(
         usage: turn_usage,
         stop,
         continuation_messages: _,
-        current_plan: _,
+        current_plan,
+        compaction_checkpoint,
     } = outcome;
 
     let model_metadata = sessions.available_model_metadata().await;
@@ -6027,6 +6139,8 @@ async fn run_model_turn_in_spawn(
         tool_exchanges,
         structured_output: structured_output_result.clone(),
         summary: None,
+        current_plan,
+        compaction_checkpoint,
         fragment_id: None,
     };
 
@@ -6132,7 +6246,7 @@ async fn run_prepared_model_turn(
         default_idle_timeout_secs,
         default_stall_timeout_secs,
     );
-    let messages = build_prompt_messages_with_compression(
+    let prepared_prompt = build_prompt_messages_with_compression(
         snap,
         prompt_text,
         prompt_parts,
@@ -6162,7 +6276,11 @@ async fn run_prepared_model_turn(
         snap.reasoning_effort.as_deref(),
         snap.service_tier.as_deref(),
         structured_output_request,
-        messages,
+        prepared_prompt.messages,
+        prepared_prompt.compaction_usage,
+        context_length,
+        prepared_prompt.prefix_len,
+        prepared_prompt.current_plan,
         max_turns,
         idle_timeout,
         cancel,
@@ -6213,7 +6331,15 @@ fn build_system_prompt(
         }
     };
 
-    format!("{cwd_context}{mode_prompt}\n\n{CORE_GUIDANCE}")
+    let live_plan_guidance = match mode {
+        SessionMode::Lutz => {
+            "\n- For meaningful multi-step work, use update_plan to keep a short current plan. Keep exactly one \
+             step in_progress until the work is done, update the plan when the approach changes, and mark all \
+             steps completed before finishing. Skip plan overhead for simple tasks.\n"
+        }
+        SessionMode::Plan => "",
+    };
+    format!("{cwd_context}{mode_prompt}\n\n{CORE_GUIDANCE}{live_plan_guidance}")
 }
 
 /// Shared behavioral guidance appended to every mode's system prompt.
@@ -6248,9 +6374,6 @@ when changing strategy, write one short visible sentence explaining the current 
 the next tools help. After significant tool results, briefly state what was learned and the \
 next step. Do not reveal private chain-of-thought; provide concise intent/evidence summaries \
 only. Skip progress notes for trivial single-tool lookups.
-- For meaningful multi-step work, use update_plan to keep a short current plan. Keep exactly one \
-step in_progress until the work is done, update the plan when the approach changes, and mark all \
-steps completed before finishing. Skip plan overhead for simple tasks.
 - Before changing code, understand it: read the relevant files and see how the surrounding \
 project does things. Follow the project's existing conventions — style, naming, structure, \
 error handling, test framework. Never assume a library is available; verify the project \
@@ -10980,47 +11103,6 @@ async fn handle_pr_create(
     }
 }
 
-/// Run the `/compress` slash command: summarize every uncompressed
-/// turn in the session, one at a time, persisting each summary
-/// through `set_turn_summary` so a reload reproduces the same state.
-///
-/// Mirrors Brokk's user-triggered "Compress History" UI button
-/// (`ContextManager.compressHistoryAsync(Context)`), with two
-/// deliberate differences:
-///
-/// 1. Sequential rather than parallel. Anvil's tool loop already runs
-///    one prompt at a time per session (gated by `start_prompt`), so
-///    fanning out N parallel LLM calls here only adds rate-limit
-///    pressure without saving meaningful wall time -- the user is
-///    waiting on this command interactively.
-/// 2. Errors are non-fatal per turn. If summarizing turn 3 errors,
-///    turns 1, 2, 4... still get summarized; the failed turn just
-///    stays verbatim. Mirrors `ContextManager.compressHistory`
-///    returning the original on failure.
-///
-/// Streams per-turn progress notifications via `send_message` so the
-/// user sees what's happening on long sessions, and finishes with a
-/// summary tally.
-/// Indexes of turns that need compressing on a `/compress` run.
-/// Extracted as a pure helper so the planning logic is unit-testable
-/// without standing up a mock `ConnectionTo<Client>`.
-struct CompressPlan {
-    total: usize,
-    uncompressed: Vec<usize>,
-}
-
-fn plan_compress(snap: &SessionSnapshot) -> CompressPlan {
-    CompressPlan {
-        total: snap.history.len(),
-        uncompressed: snap
-            .history
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.summary.is_none().then_some(i))
-            .collect(),
-    }
-}
-
 fn rewind_turn_label(turn: &ConversationTurn) -> String {
     let source = if turn.user_prompt.trim().is_empty() {
         turn.agent_response.trim()
@@ -11068,138 +11150,69 @@ async fn handle_compress(
     context_length: Option<u32>,
     cx: &ConnectionTo<Client>,
 ) -> String {
-    let plan = plan_compress(snap);
-    let total_turns = plan.total;
-    let uncompressed = plan.uncompressed;
-    if uncompressed.is_empty() {
+    if snap.history.is_empty() {
+        return "Nothing to compress: this session has no completed turns.".to_string();
+    }
+    if snap
+        .history
+        .last()
+        .is_some_and(|turn| turn.compaction_checkpoint.is_some())
+    {
         return format!(
-            "Nothing to compress: {total_turns} turn(s) in history, all already summarized."
+            "Nothing to compress: the current {}-turn history is already checkpointed.",
+            snap.history.len()
         );
     }
-
-    send_message(
-        cx,
-        session_id,
-        &format!(
-            "Compressing {} of {} turn(s)...\n",
-            uncompressed.len(),
-            total_turns
-        ),
-    );
-
-    // Track aggregate token impact for the final report. Per-turn we
-    // measure verbatim cost (what the next prompt would have charged)
-    // vs. the produced summary's cost (what it'll charge after
-    // compression).
-    let mut verbatim_tokens_total = 0usize;
-    let mut summary_tokens_total = 0usize;
-    let mut succeeded = 0usize;
-    let mut failed: Vec<(usize, String)> = Vec::new();
-
-    for idx in uncompressed.iter().copied() {
-        if cancel.is_cancelled() {
-            send_message(cx, session_id, "Cancelled.\n");
-            break;
-        }
-        let turn = snap.history[idx].clone();
-        let display_idx = idx + 1;
-        let verbatim_cost = approximate_turn_tokens(&turn);
-        match crate::context_manager::summarize_turn(
-            llm,
-            &snap.model,
-            &turn,
-            context_length,
-            idle_timeout,
-            cancel.clone(),
-        )
+    send_message(cx, session_id, "Compacting cumulative model history...\n");
+    let history = model_history_messages(&snap.history);
+    let current_plan = snap.history.iter().rev().find_map(|turn| {
+        turn.current_plan.as_ref().or_else(|| {
+            turn.compaction_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.current_plan.as_ref())
+        })
+    });
+    let compaction = match crate::context_manager::compact_history(
+        llm,
+        &snap.model,
+        &history,
+        current_plan,
+        context_length,
+        idle_timeout,
+        cancel,
+    )
+    .await
+    {
+        Ok(compaction) => compaction,
+        Err(error) => return format!("Error: history compaction failed: {error:#}"),
+    };
+    let checkpoint = crate::session::CompactionCheckpoint {
+        messages: compaction.checkpoint_messages,
+        current_plan: current_plan.cloned(),
+    };
+    let anchor = snap.history.len() - 1;
+    match sessions
+        .set_compaction_checkpoint(session_id, anchor, checkpoint)
         .await
-        {
-            Ok(summary) => {
-                let summary_cost = crate::tokens::approximate_tokens(&summary);
-                match sessions.set_turn_summary(session_id, idx, summary).await {
-                    Ok(true) => {
-                        succeeded += 1;
-                        verbatim_tokens_total += verbatim_cost;
-                        summary_tokens_total += summary_cost;
-                        send_message(
-                            cx,
-                            session_id,
-                            &format!(
-                                "- Turn {display_idx}: compressed (~{verbatim_cost} -> ~{summary_cost} tokens)\n"
-                            ),
-                        );
-                    }
-                    Ok(false) => {
-                        // Setter refused (unknown session, out-of-range
-                        // index, or missing fragment_id). Treat as a
-                        // soft failure and keep going.
-                        failed.push((
-                            display_idx,
-                            "setter refused (turn not persisted?)".to_string(),
-                        ));
-                        send_message(
-                            cx,
-                            session_id,
-                            &format!("- Turn {display_idx}: persist refused -- skipped\n"),
-                        );
-                    }
-                    Err(e) => {
-                        failed.push((display_idx, format!("persist failed: {e}")));
-                        send_message(
-                            cx,
-                            session_id,
-                            &format!("- Turn {display_idx}: persist failed -- {e}\n"),
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                failed.push((display_idx, e.to_string()));
-                send_message(
-                    cx,
-                    session_id,
-                    &format!("- Turn {display_idx}: summarization failed -- {e}\n"),
-                );
-            }
-        }
+    {
+        Ok(true) => {}
+        Ok(false) => return "Error: could not anchor compaction to the latest turn.".to_string(),
+        Err(error) => return format!("Error: failed to persist compaction: {error:#}"),
     }
-
-    let mut out = String::new();
-    out.push_str("\n**Done.**\n\n");
-    out.push_str(&format!(
-        "- Compressed {succeeded}/{} turn(s).\n",
-        uncompressed.len()
-    ));
-    if succeeded > 0 {
-        let saved = verbatim_tokens_total.saturating_sub(summary_tokens_total);
-        out.push_str(&format!(
-            "- Approx tokens: {verbatim_tokens_total} (verbatim) -> {summary_tokens_total} (summary). \
-             Saved ~{saved}.\n"
-        ));
-    }
-    if !failed.is_empty() {
-        out.push_str(&format!("- Failed {}: \n", failed.len()));
-        for (turn, msg) in &failed {
-            out.push_str(&format!("  - Turn {turn}: {msg}\n"));
-        }
-    }
-    out
-}
-
-/// Approximate per-turn token cost when replayed verbatim (user
-/// prompt + assistant response + tool exchanges). Used by
-/// `handle_compress` to report "before vs. after" savings.
-fn approximate_turn_tokens(turn: &crate::session::ConversationTurn) -> usize {
-    let mut sum = crate::tokens::approximate_tokens(&turn.user_prompt);
-    sum += crate::tokens::approximate_tokens(crate::host_notice::model_visible_assistant_text(
-        &turn.agent_response,
-    ));
-    for exchange in &turn.tool_exchanges {
-        sum += crate::tokens::approximate_tokens(&exchange.tool_name);
-        sum += crate::tokens::approximate_tokens(&exchange.arguments);
-        sum += crate::tokens::approximate_tokens(&exchange.result);
-    }
-    sum
+    let metadata = sessions.available_model_metadata().await;
+    let cost = metadata
+        .iter()
+        .find(|item| item.id == snap.model)
+        .and_then(|item| item.estimate_cost_usd(compaction.usage));
+    let _ = sessions
+        .record_usage(session_id, compaction.usage, cost)
+        .await;
+    format!(
+        "Compacted {} turn(s): ~{} -> ~{} model-history tokens.",
+        snap.history.len(),
+        compaction.before_tokens,
+        compaction.after_tokens
+    )
 }
 
 /// Render the `/context` snapshot. Mirrors the Java executor's report at a
@@ -12471,127 +12484,6 @@ mod tests {
         assert!(wrap.contains("FINAL turn"), "wrap-up framing missing");
     }
 
-    /// `plan_compress` returns the indexes of every turn whose
-    /// `summary` is `None`, in chronological order. Already-summarized
-    /// turns must NOT appear -- `/compress` should be idempotent.
-    #[test]
-    fn plan_compress_returns_uncompressed_turn_indexes() {
-        use crate::session::{ConversationTurn, SessionSnapshot};
-        let snap = SessionSnapshot {
-            cwd: std::path::PathBuf::from("/tmp/cwd"),
-            additional_directories: Vec::new(),
-            mode: SessionMode::Lutz,
-            model: "m".into(),
-            history: vec![
-                ConversationTurn {
-                    user_prompt: "u0".into(),
-                    summary: Some("already done".into()),
-                    ..Default::default()
-                },
-                ConversationTurn {
-                    user_prompt: "u1".into(),
-                    ..Default::default()
-                },
-                ConversationTurn {
-                    user_prompt: "u2".into(),
-                    summary: Some("also done".into()),
-                    ..Default::default()
-                },
-                ConversationTurn {
-                    user_prompt: "u3".into(),
-                    ..Default::default()
-                },
-            ],
-            reasoning_effort: None,
-            service_tier: None,
-            idle_timeout_secs: None,
-            project_instructions: String::new(),
-            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-        };
-        let plan = plan_compress(&snap);
-        assert_eq!(plan.total, 4);
-        assert_eq!(plan.uncompressed, vec![1, 3]);
-    }
-
-    /// When every turn already carries a summary, `plan_compress`
-    /// must report zero work to do so `handle_compress` can short-
-    /// circuit before making any LLM calls. Idempotent re-runs are
-    /// the property the user relies on.
-    #[test]
-    fn plan_compress_reports_empty_when_all_summarized() {
-        use crate::session::{ConversationTurn, SessionSnapshot};
-        let snap = SessionSnapshot {
-            cwd: std::path::PathBuf::from("/tmp/cwd"),
-            additional_directories: Vec::new(),
-            mode: SessionMode::Lutz,
-            model: "m".into(),
-            history: vec![ConversationTurn {
-                user_prompt: "u".into(),
-                summary: Some("done".into()),
-                ..Default::default()
-            }],
-            reasoning_effort: None,
-            service_tier: None,
-            idle_timeout_secs: None,
-            project_instructions: String::new(),
-            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
-        };
-        assert!(plan_compress(&snap).uncompressed.is_empty());
-    }
-
-    /// `approximate_turn_tokens` charges tool exchanges as well as
-    /// user/assistant text, so a tool-heavy turn correctly looks
-    /// expensive when the user reads the "verbatim -> summary"
-    /// savings line in the report.
-    #[test]
-    fn approximate_turn_tokens_includes_tool_exchanges() {
-        use crate::session::{ConversationTurn, ToolExchange};
-        let plain = ConversationTurn {
-            user_prompt: "u".into(),
-            agent_response: "a".into(),
-            ..Default::default()
-        };
-        let toolful = ConversationTurn {
-            user_prompt: "u".into(),
-            agent_response: "a".into(),
-            tool_exchanges: vec![ToolExchange {
-                call_id: "c".into(),
-                tool_name: "search".into(),
-                arguments: r#"{"q":"x"}"#.into(),
-                result: "z".repeat(5_000),
-                ..ToolExchange::default()
-            }],
-            ..Default::default()
-        };
-        assert!(approximate_turn_tokens(&toolful) > approximate_turn_tokens(&plain));
-    }
-
-    #[test]
-    fn approximate_turn_tokens_excludes_host_notices_from_agent_response() {
-        use crate::session::ConversationTurn;
-
-        let recap = crate::host_notice::render_turn_recap(
-            None,
-            &[],
-            &crate::tool_loop::LoopStop::Completed { had_text: true },
-        );
-        let plain = ConversationTurn {
-            user_prompt: "u".into(),
-            agent_response: "answer".into(),
-            ..Default::default()
-        };
-        let with_recap = ConversationTurn {
-            user_prompt: "u".into(),
-            agent_response: format!("answer{recap}"),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            approximate_turn_tokens(&with_recap),
-            approximate_turn_tokens(&plain)
-        );
-    }
-
     #[test]
     fn shell_single_quote_escapes_embedded_quote() {
         assert_eq!(shell_single_quote("hello"), "'hello'");
@@ -13667,6 +13559,8 @@ mod tests {
                 ],
                 structured_output: None,
                 summary: None,
+                current_plan: None,
+                compaction_checkpoint: None,
                 fragment_id: None,
             }],
             reasoning_effort: None,
@@ -13768,6 +13662,8 @@ mod tests {
                 tool_exchanges: Vec::new(),
                 structured_output: None,
                 summary: None,
+                current_plan: None,
+                compaction_checkpoint: None,
                 fragment_id: None,
             }],
             reasoning_effort: None,
@@ -13845,6 +13741,8 @@ mod tests {
                 tool_exchanges: Vec::new(),
                 structured_output: None,
                 summary: None,
+                current_plan: None,
+                compaction_checkpoint: None,
                 fragment_id: None,
             }],
             reasoning_effort: None,
@@ -13895,6 +13793,8 @@ mod tests {
                 tool_exchanges: Vec::new(),
                 structured_output: None,
                 summary: None,
+                current_plan: None,
+                compaction_checkpoint: None,
                 fragment_id: None,
             }],
             reasoning_effort: None,
@@ -14001,6 +13901,8 @@ mod tests {
                 }],
                 structured_output: None,
                 summary: None,
+                current_plan: None,
+                compaction_checkpoint: None,
                 fragment_id: None,
             }],
             reasoning_effort: None,
@@ -16109,6 +16011,57 @@ mod tests {
             messages[3],
             ChatMessage::assistant("I will inspect the parser.")
         );
+    }
+
+    #[test]
+    fn asgard_candidate_completion_does_not_override_supervisor() {
+        let natural_stop = crate::tool_loop::LoopStop::Completed { had_text: true };
+        assert!(!asgard_should_finish(false, &natural_stop));
+        assert!(asgard_should_finish(true, &natural_stop));
+        assert!(asgard_should_finish(
+            false,
+            &crate::tool_loop::LoopStop::Cancelled
+        ));
+    }
+
+    #[test]
+    fn newest_compaction_checkpoint_replaces_covered_raw_history() {
+        use crate::session::CompactionCheckpoint;
+
+        let history = vec![
+            ConversationTurn {
+                user_prompt: "old raw request".into(),
+                agent_response: "old raw answer".into(),
+                ..Default::default()
+            },
+            ConversationTurn {
+                user_prompt: "anchor raw request".into(),
+                compaction_checkpoint: Some(CompactionCheckpoint {
+                    messages: vec![ChatMessage::user(
+                        "<state_snapshot>durable state</state_snapshot>",
+                    )],
+                    current_plan: None,
+                }),
+                ..Default::default()
+            },
+            ConversationTurn {
+                user_prompt: "exact tail request".into(),
+                agent_response: "exact tail answer".into(),
+                ..Default::default()
+            },
+        ];
+
+        let messages = model_history_messages(&history);
+        let text = messages
+            .iter()
+            .filter_map(ChatMessage::text_content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("durable state"));
+        assert!(text.contains("exact tail request"));
+        assert!(text.contains("exact tail answer"));
+        assert!(!text.contains("old raw request"));
+        assert!(!text.contains("anchor raw request"));
     }
 
     #[test]

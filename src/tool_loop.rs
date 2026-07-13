@@ -531,6 +531,9 @@ pub(crate) struct LoopOutcome {
     /// Most recently published task plan. This is model state rather than a
     /// completion gate; callers retain it across Asgard windows and compaction.
     pub current_plan: Option<crate::plan::UpdatePlanArgs>,
+    /// Present when this invocation compacted active model history. The
+    /// caller anchors it to the completed raw turn for reload.
+    pub compaction_checkpoint: Option<crate::session::CompactionCheckpoint>,
 }
 
 impl LoopOutcome {
@@ -550,6 +553,7 @@ impl LoopOutcome {
             usage: TokenUsage::default(),
             continuation_messages: Vec::new(),
             current_plan: None,
+            compaction_checkpoint: None,
         }
     }
 }
@@ -1772,9 +1776,13 @@ pub(crate) async fn run(
     tool_allowlist: Option<Arc<HashSet<String>>>,
     permission_override: Option<PermissionMode>,
     trajectory_window: bool,
+    context_length: Option<u32>,
+    context_prefix_len: usize,
+    initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> LoopOutcome {
     let train_bifrost = train_bifrost_enabled();
-    let mut current_plan = None;
+    let mut current_plan = initial_plan;
+    let mut history_compacted = false;
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
         Err(error) => {
@@ -1838,6 +1846,13 @@ pub(crate) async fn run(
         registry.set_builtin_tools(builtin_tools).await;
     }
     let mut tools: Vec<ToolDefinition> = registry.tool_definitions().await;
+    if sessions
+        .snapshot(&session_id, registry.cwd())
+        .await
+        .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan)
+    {
+        tools.retain(|tool| tool.function.name != "update_plan");
+    }
     // Nested runs (subagents) must not see the `task` tool themselves --
     // capping depth at `MAX_SUBAGENT_DEPTH` and stripping `task` from the
     // catalog at deeper levels prevents an unbounded recursion of
@@ -2045,6 +2060,41 @@ pub(crate) async fn run(
                 break;
             }
             continue;
+        }
+        if !trajectory_window
+            && p2t_config.is_none()
+            && context_prefix_len <= messages.len()
+            && crate::tokens::approximate_tokens_messages(&messages)
+                > crate::context_manager::context_budget(context_length)
+        {
+            let dynamic_history = messages[context_prefix_len..].to_vec();
+            match crate::context_manager::compact_history(
+                llm.as_ref(),
+                model,
+                &dynamic_history,
+                current_plan.as_ref(),
+                context_length,
+                idle_timeout,
+                cancel.clone(),
+            )
+            .await
+            {
+                Ok(compaction) => {
+                    tracing::info!(
+                        session_id,
+                        before_tokens = compaction.before_tokens,
+                        after_tokens = compaction.after_tokens,
+                        "compacted active model history"
+                    );
+                    turn_usage.add(compaction.usage);
+                    messages.truncate(context_prefix_len);
+                    messages.extend(compaction.checkpoint_messages);
+                    history_compacted = true;
+                }
+                Err(error) => {
+                    tracing::warn!(session_id, "active history compaction failed: {error:#}");
+                }
+            }
         }
         let permission_mode =
             effective_permission_mode(&sessions, &session_id, permission_override)
@@ -2294,8 +2344,9 @@ pub(crate) async fn run(
                 }
                 full_response.push_str(&text);
                 if !text.is_empty() && !replay_events.is_empty() {
-                    replay_events.push(TurnReplayEvent::AssistantText { text });
+                    replay_events.push(TurnReplayEvent::AssistantText { text: text.clone() });
                 }
+                messages.push(assistant_message);
                 // Final text response -- we're done. `had_text` reflects the
                 // whole turn's visible output, not just this message, so a turn
                 // that streamed text before an earlier tool call isn't reported
@@ -2611,6 +2662,10 @@ pub(crate) async fn run(
         full_response.push_str(&notice);
     }
 
+    let compaction_checkpoint = history_compacted.then(|| crate::session::CompactionCheckpoint {
+        messages: messages[context_prefix_len.min(messages.len())..].to_vec(),
+        current_plan: current_plan.clone(),
+    });
     LoopOutcome {
         response: full_response,
         tool_exchanges,
@@ -2619,6 +2674,7 @@ pub(crate) async fn run(
         stop,
         continuation_messages: messages,
         current_plan,
+        compaction_checkpoint,
     }
 }
 
@@ -5256,6 +5312,9 @@ async fn execute_subagent(
         nested_tool_allowlist,
         child_permission_override,
         false,
+        None,
+        usize::MAX,
+        None,
     ))
     .await;
 

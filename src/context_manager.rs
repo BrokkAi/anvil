@@ -1,31 +1,15 @@
-//! Per-turn conversation summarization, with hierarchical fallback
-//! for turns too large to fit in the summarizer's context window.
+//! Full-history model-context compaction and turn-recap summarization.
 //!
-//! Single-call path mirrors Brokk's `ContextManager.compressHistory`:
-//! one LLM call per turn, system prompt asks for a bulleted summary of
-//! a single task entry. Brokk relies on `ContextSizeGuard` (a UI-side
-//! pre-flight at file/content add time) to keep entries from growing
-//! large enough to trip up `compressHistory` downstream, which has no
-//! defense of its own.
+//! Model history is compacted cumulatively at completed tool-exchange
+//! boundaries. The canonical system/project/skill prefix stays verbatim; an
+//! older dynamic prefix becomes a structured `<state_snapshot>`, the recent
+//! tail stays exact, and the current `update_plan` value is pinned separately.
+//! The checkpoint is provider-neutral and persisted on its anchor turn, while
+//! raw turns remain untouched for ACP replay, rewind, and Brokk compatibility.
 //!
-//! Anvil takes the downstream-defense approach instead: when a turn
-//! exceeds the summarizer's input budget, split the turn into chunks,
-//! summarize each chunk independently, then run a meta-summarization
-//! pass over the chunk summaries to produce one coherent summary.
-//! Recursive if even the combined chunk summaries don't fit in one
-//! meta call. We could also gate at input time (ACP exposes
-//! `session/prompt` server-side, and tool output is already bounded
-//! per call by `MAX_TOOL_RESULT_BYTES`), but the hierarchical
-//! summarizer guarantees the wedge can't form regardless of what
-//! upstream gates exist -- so it's safe to skip them for now.
-//!
-//! The result is a guarantee: every turn we attempt to summarize
-//! either gets a summary (lossy if the turn was monstrous, but never
-//! silently dropped) or returns a clean `Err` that the caller
-//! (`handle_compress`) reports to the user. Combined with the fact
-//! that `set_turn_summary` only flips the in-memory + summaryContentId
-//! state and leaves the verbatim log on disk, the session is
-//! recoverable from any failure mode.
+//! Inputs too large for one compactor request are split, extracted, and folded
+//! until the final state-snapshot request fits. The same chunking machinery is
+//! retained for the independent user-facing recap feature.
 
 use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -34,15 +18,15 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm_client::{
-    ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
-    stream_chat_no_visible_output_with_retry,
+    ChatContentPart, ChatMessage, IdleTimeouts, LlmBackend, LlmResponse, StreamChatRequest,
+    TokenUsage, stream_chat_no_visible_output_with_retry,
 };
 use crate::session::ConversationTurn;
 use crate::tokens::{approximate_tokens, approximate_tokens_messages};
 
 /// Maximum number of summarization LLM calls in flight at one time.
-/// Keeps `/compress` and the auto-trigger from saturating provider
-/// rate limits when a turn fans out into many chunks. Two is a
+/// Keeps oversized recap summarization from saturating provider rate
+/// limits when a turn fans out into many chunks. Two is a
 /// conservative default that avoids `429`s on the common providers
 /// without forcing a per-backend rate-limit story; raise once Anvil
 /// has provider-aware throttling.
@@ -55,7 +39,7 @@ const MAX_CONCURRENT_CHUNK_REQUESTS: usize = 2;
 /// Fraction of declared context window we let the *prompt* portion of
 /// a regular chat request occupy. 75% leaves room for the model's
 /// response plus its own bookkeeping. Used by `/context` and the
-/// per-turn-summarization trigger threshold.
+/// full-history compaction trigger threshold.
 const BUDGET_FRACTION: f64 = 0.75;
 
 /// Conservative fallback when the backend doesn't publish a context
@@ -76,6 +60,260 @@ const SUMMARIZER_INPUT_FRACTION: f64 = 0.65;
 pub fn context_budget(declared_context_length: Option<u32>) -> usize {
     let raw = declared_context_length.unwrap_or(FALLBACK_CONTEXT_LENGTH) as f64;
     (raw * BUDGET_FRACTION) as usize
+}
+
+#[derive(Debug)]
+pub struct HistoryCompaction {
+    pub checkpoint_messages: Vec<ChatMessage>,
+    pub usage: TokenUsage,
+    pub before_tokens: usize,
+    pub after_tokens: usize,
+}
+
+const HISTORY_SNAPSHOT_PROMPT: &str = "You maintain the working memory of an AI coding agent. \
+Rewrite the supplied conversation history as a precise state snapshot that another agent can \
+continue from immediately. Preserve facts and evidence, not prose. Never claim work or \
+verification that the history does not show. Include every user message or request, explicit \
+requirements and preferences, decisions and rationale, important files/symbols/patch state, \
+commands and results, errors and attempted fixes, current work, pending work, and the best next \
+step. Distinguish verified facts from hypotheses. Tool calls may contain the only evidence, so \
+read them carefully. Omit private analysis/reasoning and redundant chatter.\n\n\
+Return only this XML structure:\n\
+<state_snapshot>\n\
+<primary_request_and_intent>...</primary_request_and_intent>\n\
+<explicit_requirements>...</explicit_requirements>\n\
+<all_user_messages>...</all_user_messages>\n\
+<decisions_and_rationale>...</decisions_and_rationale>\n\
+<files_and_code_state>...</files_and_code_state>\n\
+<commands_tests_and_evidence>...</commands_tests_and_evidence>\n\
+<errors_and_fixes>...</errors_and_fixes>\n\
+<pending_tasks>...</pending_tasks>\n\
+<current_work>...</current_work>\n\
+<next_step>...</next_step>\n\
+</state_snapshot>";
+
+const HISTORY_CHUNK_PROMPT: &str = "Extract durable working-memory facts from this fragment of \
+an AI coding-agent history. Preserve user requests, requirements, decisions, paths and symbols, \
+patch state, commands and their actual results, errors, unfinished work, and chronology. Do not \
+infer success. Omit private analysis and redundant chatter. Output concise labeled bullets only; \
+a later pass will assemble the final state snapshot.";
+
+/// Compact complete provider-neutral model history into one cumulative state
+/// checkpoint. The caller keeps the canonical system/instruction prefix and
+/// any post-checkpoint tail verbatim.
+pub async fn compact_history(
+    llm: &dyn LlmBackend,
+    model: &str,
+    history: &[ChatMessage],
+    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+    context_length: Option<u32>,
+    idle_timeout: IdleTimeouts,
+    cancel: CancellationToken,
+) -> Result<HistoryCompaction> {
+    if history.is_empty() {
+        anyhow::bail!("cannot compact empty history");
+    }
+    let before_tokens = approximate_tokens_messages(history);
+    let budget = summarizer_input_budget(context_length);
+    let mut usage = TokenUsage::default();
+    let tail_start = exact_tail_start(history, context_length);
+    let (history_to_summarize, exact_tail) = history.split_at(tail_start);
+    let history_to_summarize = if history_to_summarize.is_empty() {
+        history
+    } else {
+        history_to_summarize
+    };
+    let exact_tail = if history_to_summarize.len() == history.len() {
+        &[][..]
+    } else {
+        exact_tail
+    };
+    let mut body = render_history_for_compaction(history_to_summarize);
+
+    loop {
+        let final_messages = vec![
+            ChatMessage::system(HISTORY_SNAPSHOT_PROMPT),
+            ChatMessage::user(format!("History to compact:\n\n{body}")),
+        ];
+        if approximate_tokens_messages(&final_messages) <= budget {
+            let (snapshot, call_usage) =
+                run_compaction_request(llm, model, final_messages, idle_timeout, cancel.clone())
+                    .await?;
+            usage.add(call_usage);
+            let snapshot = normalize_state_snapshot(&snapshot)?;
+            let mut checkpoint_messages = vec![ChatMessage::user(snapshot)];
+            if let Some(plan) = current_plan {
+                checkpoint_messages.push(ChatMessage::user(format!(
+                    "<current_plan>\n{}\n</current_plan>",
+                    serde_json::to_string_pretty(plan)?
+                )));
+            }
+            checkpoint_messages.extend_from_slice(exact_tail);
+            let after_tokens = approximate_tokens_messages(&checkpoint_messages);
+            if after_tokens >= before_tokens {
+                anyhow::bail!(
+                    "compaction did not reduce history (~{before_tokens} -> ~{after_tokens} tokens)"
+                );
+            }
+            return Ok(HistoryCompaction {
+                checkpoint_messages,
+                usage,
+                before_tokens,
+                after_tokens,
+            });
+        }
+
+        let chunks = split_plain_text_to_chunks(&body, budget);
+        if chunks.len() <= 1 {
+            anyhow::bail!("history exceeds compaction budget and cannot be split further");
+        }
+        let prior_body_tokens = approximate_tokens(&body);
+        let mut summaries = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            if cancel.is_cancelled() {
+                anyhow::bail!("compaction cancelled");
+            }
+            let messages = vec![
+                ChatMessage::system(HISTORY_CHUNK_PROMPT),
+                ChatMessage::user(format!(
+                    "History fragment {} of {}:\n\n{}",
+                    index + 1,
+                    chunks.len(),
+                    chunk
+                )),
+            ];
+            let (summary, call_usage) =
+                run_compaction_request(llm, model, messages, idle_timeout, cancel.clone()).await?;
+            usage.add(call_usage);
+            summaries.push(summary);
+        }
+        let reduced = format_chunk_summaries(&summaries);
+        let reduced_tokens = approximate_tokens(&reduced);
+        if reduced_tokens >= prior_body_tokens {
+            anyhow::bail!(
+                "hierarchical compaction made no progress (~{prior_body_tokens} -> ~{reduced_tokens} tokens)"
+            );
+        }
+        body = reduced;
+    }
+}
+
+/// Retain a recent provider-neutral tail verbatim while summarizing the older
+/// prefix. The budget is token-based rather than message-count based, and the
+/// boundary backs up over tool results to keep an assistant tool-call batch
+/// paired with all of its results.
+fn exact_tail_start(history: &[ChatMessage], context_length: Option<u32>) -> usize {
+    let tail_budget = (context_length.unwrap_or(FALLBACK_CONTEXT_LENGTH) as usize / 10).max(1_000);
+    let mut start = history.len();
+    let mut tokens = 0usize;
+    while start > 0 {
+        let next = approximate_tokens_messages(&history[start - 1..start]);
+        if tokens > 0 && tokens.saturating_add(next) > tail_budget {
+            break;
+        }
+        start -= 1;
+        tokens = tokens.saturating_add(next);
+    }
+    if start == 0 {
+        return history.len();
+    }
+    while start > 0 && history[start].role == "tool" {
+        start -= 1;
+    }
+    start
+}
+
+fn render_history_for_compaction(history: &[ChatMessage]) -> String {
+    let mut rendered = String::new();
+    for (index, message) in history.iter().enumerate() {
+        rendered.push_str(&format!("Message {} [{}]:\n", index + 1, message.role));
+        for part in &message.content {
+            match part {
+                ChatContentPart::Text { text } => rendered.push_str(text),
+                ChatContentPart::Image { .. } => rendered.push_str("[image omitted]"),
+            }
+            rendered.push('\n');
+        }
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                rendered.push_str(&format!(
+                    "Tool call {} `{}` args={}\n",
+                    call.id, call.function.name, call.function.arguments
+                ));
+            }
+        }
+        if let Some(call_id) = &message.tool_call_id {
+            rendered.push_str(&format!("Tool result for {call_id}"));
+            if let Some(name) = &message.name {
+                rendered.push_str(&format!(" (`{name}`)"));
+            }
+            rendered.push('\n');
+        }
+        rendered.push('\n');
+    }
+    rendered
+}
+
+async fn run_compaction_request(
+    llm: &dyn LlmBackend,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    idle_timeout: IdleTimeouts,
+    cancel: CancellationToken,
+) -> Result<(String, TokenUsage)> {
+    let response = stream_chat_no_visible_output_with_retry(
+        llm,
+        "compacting conversation history",
+        &cancel,
+        || StreamChatRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            tools: None,
+            reasoning_effort: Some("low".to_string()),
+            service_tier: None,
+            temperature: None,
+            structured_output: None,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel.clone(),
+            idle_timeouts: idle_timeout,
+        },
+    )
+    .await?;
+    let usage = response.usage();
+    let text = match response {
+        LlmResponse::Text { text, .. } | LlmResponse::ToolCalls { text, .. } => text,
+    };
+    Ok((text, usage))
+}
+
+fn normalize_state_snapshot(text: &str) -> Result<String> {
+    let without_analysis = strip_xml_blocks(text, "analysis");
+    let trimmed = without_analysis.trim();
+    let start = trimmed.find("<state_snapshot>");
+    let end = trimmed.rfind("</state_snapshot>");
+    match (start, end) {
+        (Some(start), Some(end)) if end >= start => {
+            let end = end + "</state_snapshot>".len();
+            Ok(trimmed[start..end].to_string())
+        }
+        _ if !trimmed.is_empty() => Ok(format!("<state_snapshot>\n{}\n</state_snapshot>", trimmed)),
+        _ => anyhow::bail!("compactor returned an empty state snapshot"),
+    }
+}
+
+fn strip_xml_blocks(input: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut output = input.to_string();
+    while let Some(start) = output.find(&open) {
+        let end = output[start + open.len()..]
+            .find(&close)
+            .map(|offset| start + open.len() + offset + close.len())
+            .unwrap_or(output.len());
+        output.replace_range(start..end, "");
+    }
+    output
 }
 
 /// Token budget for one *summarization* LLM call's input. The actual
@@ -100,6 +338,7 @@ fn summarizer_input_budget(declared_context_length: Option<u32>) -> usize {
 /// uncompressed (matching Brokk's behavior in
 /// `ContextManager.compressHistory`) rather than silently dropping
 /// the turn. The persisted log is unaffected on every failure path.
+#[cfg(test)]
 pub async fn summarize_turn(
     llm: &dyn LlmBackend,
     model: &str,
@@ -366,6 +605,7 @@ pub fn strip_summary_tags(s: &str) -> String {
 
 /// System prompt for summarizing a single complete turn. Mirrors the
 /// directive style of Brokk's `SummarizerPrompts.compressHistory`.
+#[cfg(test)]
 const SYSTEM_PROMPT_TURN: &str = "You are a conversation summarizer for an AI coding assistant. \
 Your output replaces a single past turn (user prompt + assistant response + \
 any tool calls and results) in the assistant's working context on every \
@@ -416,6 +656,7 @@ no <conversation_summary> tags (those go on the final combined output).";
 /// summaries into one coherent turn summary. Emphasizes deduplication
 /// (the same file path might appear in multiple chunks) and
 /// preserving ordering of decisions/tool calls.
+#[cfg(test)]
 const SYSTEM_PROMPT_META: &str = "You will receive several bulleted summaries, each covering one \
 part of a single conversation turn that was too large to summarize at \
 once. Combine them into ONE coherent summary of the entire turn:\n\
@@ -474,6 +715,7 @@ points -- no preamble, no closing remark, no heading, and no surrounding tags.";
 /// user-facing recap (prose for the human).
 #[derive(Clone, Copy)]
 enum SummaryStyle {
+    #[cfg(test)]
     Compression,
     Recap,
 }
@@ -481,6 +723,7 @@ enum SummaryStyle {
 impl SummaryStyle {
     fn turn_prompt(self) -> &'static str {
         match self {
+            #[cfg(test)]
             SummaryStyle::Compression => SYSTEM_PROMPT_TURN,
             SummaryStyle::Recap => SYSTEM_PROMPT_TURN_RECAP,
         }
@@ -488,6 +731,7 @@ impl SummaryStyle {
 
     fn meta_prompt(self) -> &'static str {
         match self {
+            #[cfg(test)]
             SummaryStyle::Compression => SYSTEM_PROMPT_META,
             SummaryStyle::Recap => SYSTEM_PROMPT_META_RECAP,
         }
@@ -787,6 +1031,8 @@ mod tests {
             tool_exchanges: Vec::new(),
             structured_output: None,
             summary: None,
+            current_plan: None,
+            compaction_checkpoint: None,
             fragment_id: None,
         }
     }
@@ -811,6 +1057,8 @@ mod tests {
             }],
             structured_output: None,
             summary: None,
+            current_plan: None,
+            compaction_checkpoint: None,
             fragment_id: None,
         }
     }
@@ -921,6 +1169,54 @@ mod tests {
     fn strip_summary_tags_tolerates_missing_close() {
         let s = "<conversation_summary>\n- a\n- b\n";
         assert_eq!(strip_summary_tags(s), "- a\n- b");
+    }
+
+    #[test]
+    fn state_snapshot_normalization_removes_analysis_scratch() {
+        let normalized = normalize_state_snapshot(
+            "<analysis>private scratch</analysis>\n<state_snapshot>kept</state_snapshot>",
+        )
+        .unwrap();
+        assert_eq!(normalized, "<state_snapshot>kept</state_snapshot>");
+        assert!(!normalized.contains("private scratch"));
+    }
+
+    #[test]
+    fn compaction_render_omits_reasoning_and_image_payloads() {
+        let mut message = ChatMessage::assistant_with_reasoning(
+            "visible evidence",
+            Some("private reasoning".to_string()),
+        );
+        message.content.push(ChatContentPart::image_data(
+            "very-large-secret-base64",
+            "image/png",
+        ));
+        let rendered = render_history_for_compaction(&[message]);
+        assert!(rendered.contains("visible evidence"));
+        assert!(rendered.contains("[image omitted]"));
+        assert!(!rendered.contains("private reasoning"));
+        assert!(!rendered.contains("very-large-secret-base64"));
+    }
+
+    #[test]
+    fn exact_tail_keeps_tool_call_and_result_together() {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let messages = vec![
+            ChatMessage::user("old".repeat(8_000)),
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                },
+            }]),
+            ChatMessage::tool_result("c1", "read_file", "result"),
+        ];
+        let start = exact_tail_start(&messages, Some(8_000));
+        assert_eq!(start, 1);
+        assert_eq!(messages[start].role, "assistant");
     }
 
     /// A small turn produces exactly one chunk -- no split needed.
@@ -1133,6 +1429,54 @@ mod tests {
             "should use turn-level system prompt; got: {}",
             &prompts[0][..prompts[0].len().min(120)]
         );
+    }
+
+    #[tokio::test]
+    async fn compact_history_emits_snapshot_then_exact_tail() {
+        use crate::llm_client::{FunctionCall, ToolCall};
+
+        let (backend, _, _) = ScriptedBackend::new(
+            "<state_snapshot><pending_tasks>finish parser</pending_tasks></state_snapshot>",
+            "- extracted history",
+            "- combined history",
+        );
+        let history = vec![
+            ChatMessage::user("older evidence ".repeat(6_000)),
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                },
+            }]),
+            ChatMessage::tool_result("c1", "read_file", "exact recent result"),
+        ];
+        let compacted = compact_history(
+            &backend,
+            "mock",
+            &history,
+            None,
+            Some(8_000),
+            IdleTimeouts::uniform(Duration::from_secs(60)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction succeeds");
+
+        assert!(
+            compacted.checkpoint_messages[0]
+                .text_content()
+                .unwrap()
+                .contains("<state_snapshot>")
+        );
+        assert_eq!(compacted.checkpoint_messages[1].role, "assistant");
+        assert_eq!(compacted.checkpoint_messages[2].role, "tool");
+        assert_eq!(
+            compacted.checkpoint_messages[2].text_content(),
+            Some("exact recent result")
+        );
+        assert!(compacted.after_tokens < compacted.before_tokens);
     }
 
     /// The recap entry point reuses the same machinery but drives the

@@ -477,6 +477,14 @@ pub struct ConversationTurn {
     /// reproduces the same compressed prompt. Mirrors Brokk's
     /// `TaskEntry.summary` on the Java side.
     pub summary: Option<String>,
+    /// Latest plan published during this turn. Stored independently from the
+    /// transcript so compaction can pin it exactly rather than trusting a
+    /// summarizer to reconstruct task state.
+    pub current_plan: Option<crate::plan::UpdatePlanArgs>,
+    /// Cumulative model-history checkpoint covering every turn through this
+    /// one. Raw turns remain authoritative for ACP replay and rewind; Anvil
+    /// uses only the newest checkpoint when rebuilding model context.
+    pub compaction_checkpoint: Option<CompactionCheckpoint>,
     /// Stable identifier matching the fragment id under which this
     /// turn was persisted in the session zip (the `task.<id>` key in
     /// `fragments-v4.json` plus the `logId` value in
@@ -488,6 +496,12 @@ pub struct ConversationTurn {
     /// rewrite. Not persisted as a separate field -- it's just the
     /// in-memory shadow of the zip's existing id.
     pub fragment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionCheckpoint {
+    pub messages: Vec<crate::llm_client::ChatMessage>,
+    pub current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
 
 /// One tool invocation and its result, captured during a turn so the next
@@ -1584,6 +1598,16 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                 .and_then(|v| v.as_str())
                 .and_then(|sid| content_map.get(sid))
                 .and_then(|raw| serde_json::from_str::<StructuredOutputResult>(raw).ok());
+            let current_plan = task
+                .get("anvilPlanContentId")
+                .and_then(|v| v.as_str())
+                .and_then(|sid| content_map.get(sid))
+                .and_then(|raw| serde_json::from_str::<crate::plan::UpdatePlanArgs>(raw).ok());
+            let compaction_checkpoint = task
+                .get("anvilCompactionContentId")
+                .and_then(|v| v.as_str())
+                .and_then(|sid| content_map.get(sid))
+                .and_then(|raw| serde_json::from_str::<CompactionCheckpoint>(raw).ok());
 
             // Try markdownContentId first (newer format: pre-rendered markdown)
             if let Some(content_id) = task.get("markdownContentId").and_then(|v| v.as_str())
@@ -1608,6 +1632,8 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                     tool_exchanges: exchanges,
                     structured_output,
                     summary,
+                    current_plan,
+                    compaction_checkpoint,
                     fragment_id,
                 });
                 continue;
@@ -1643,6 +1669,8 @@ fn read_history_from_zip(zip_path: &Path) -> Vec<ConversationTurn> {
                         tool_exchanges: exchanges,
                         structured_output: structured_output.clone(),
                         summary: summary.clone(),
+                        current_plan: current_plan.clone(),
+                        compaction_checkpoint: compaction_checkpoint.clone(),
                         fragment_id: fragment_id.clone(),
                     });
                 }
@@ -2322,6 +2350,14 @@ fn append_turn_to_zip(
         .structured_output
         .as_ref()
         .map(|_| uuid::Uuid::new_v4().to_string());
+    let plan_content_id = turn
+        .current_plan
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
+    let compaction_content_id = turn
+        .compaction_checkpoint
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
 
     // Keep the Brokk-compatible visible messages in the legacy flat shape,
     // and store faithful model replay separately under `brokkReplayMessages`.
@@ -2427,6 +2463,8 @@ fn append_turn_to_zip(
             "taskDescription": null,
             "markdownContentId": response_content_id,
             "structuredOutputContentId": structured_output_content_id,
+            "anvilPlanContentId": plan_content_id,
+            "anvilCompactionContentId": compaction_content_id,
             "escapeHtml": false
         });
         if !replay_messages_json.is_empty()
@@ -2520,6 +2558,17 @@ fn append_turn_to_zip(
             writer.start_file(format!("content/{sid}.txt"), options)?;
             writer.write_all(serde_json::to_string(structured_output)?.as_bytes())?;
         }
+        if let (Some(sid), Some(plan)) = (plan_content_id.as_ref(), turn.current_plan.as_ref()) {
+            writer.start_file(format!("content/{sid}.txt"), options)?;
+            writer.write_all(serde_json::to_string(plan)?.as_bytes())?;
+        }
+        if let (Some(sid), Some(checkpoint)) = (
+            compaction_content_id.as_ref(),
+            turn.compaction_checkpoint.as_ref(),
+        ) {
+            writer.start_file(format!("content/{sid}.txt"), options)?;
+            writer.write_all(serde_json::to_string(checkpoint)?.as_bytes())?;
+        }
 
         Ok(())
     })?;
@@ -2579,6 +2628,7 @@ fn rewrite_history_zip(
 /// Atomic via `with_temp_zip_writer`: any failure leaves the on-disk
 /// zip unchanged, so the caller can roll back its in-memory mutation
 /// and keep `memory == disk`.
+#[cfg(test)]
 fn rewrite_turn_summary_in_zip(
     zip_path: &Path,
     fragment_id: &str,
@@ -2648,6 +2698,53 @@ fn rewrite_turn_summary_in_zip(
         writer.write_all(rewritten.as_bytes())?;
         writer.start_file(format!("content/{new_content_id}.txt"), options)?;
         writer.write_all(summary_text.as_bytes())?;
+        Ok(())
+    })
+}
+
+/// Attach or replace Anvil's cumulative model-history checkpoint on a task
+/// fragment. This is deliberately separate from Brokk's `summaryContentId`:
+/// the latter summarizes one task, while this checkpoint supersedes all model
+/// history through its anchor turn.
+fn rewrite_compaction_checkpoint_in_zip(
+    zip_path: &Path,
+    fragment_id: &str,
+    checkpoint: &CompactionCheckpoint,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let backend = crate::sandbox_backend::global();
+    let raw = backend
+        .read_zip_entry_text(
+            zip_path,
+            "fragments-v4.json",
+            MAX_SESSION_ARCHIVE_BYTES,
+            MAX_FRAGMENTS_BYTES,
+        )
+        .context("reading fragments-v4.json for compaction rewrite")?
+        .ok_or_else(|| anyhow::anyhow!("session archive has no fragments-v4.json"))?;
+    let mut fragments: serde_json::Value =
+        serde_json::from_str(&raw).context("parsing fragments-v4.json")?;
+    let task = fragments
+        .get_mut("task")
+        .and_then(|tasks| tasks.get_mut(fragment_id))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("no task fragment `{fragment_id}`"))?;
+    let content_id = uuid::Uuid::new_v4().to_string();
+    task.insert(
+        "anvilCompactionContentId".to_string(),
+        serde_json::Value::String(content_id.clone()),
+    );
+    let checkpoint_json = serde_json::to_string(checkpoint)?;
+
+    with_temp_zip_writer(zip_path, |writer, options| {
+        copy_zip_entries_via_sandbox(zip_path, writer, options, |name| {
+            name == "fragments-v4.json"
+        })?;
+        writer.start_file("fragments-v4.json", options)?;
+        writer.write_all(serde_json::to_string(&fragments)?.as_bytes())?;
+        writer.start_file(format!("content/{content_id}.txt"), options)?;
+        writer.write_all(checkpoint_json.as_bytes())?;
         Ok(())
     })
 }
@@ -4398,6 +4495,7 @@ impl SessionStore {
     ///   programming error rather than a runtime condition).
     /// - `Err` only when the disk rewrite fails. The in-memory
     ///   mutation is rolled back so `memory == disk`.
+    #[cfg(test)]
     pub async fn set_turn_summary(
         &self,
         id: &str,
@@ -4453,6 +4551,47 @@ impl SessionStore {
                 turn.summary = prev_summary;
             }
             return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Persist a cumulative model-history checkpoint on an already-written
+    /// turn. The mutation is atomic on disk and rolled back in memory if the
+    /// archive rewrite fails.
+    pub async fn set_compaction_checkpoint(
+        &self,
+        id: &str,
+        turn_index: usize,
+        checkpoint: CompactionCheckpoint,
+    ) -> anyhow::Result<bool> {
+        let snapshot = {
+            let mut sessions = self.sessions.write().await;
+            let Some(session) = sessions.get_mut(id) else {
+                return Ok(false);
+            };
+            let Some(turn) = session.history.get_mut(turn_index) else {
+                return Ok(false);
+            };
+            let Some(fragment_id) = turn.fragment_id.clone() else {
+                return Ok(false);
+            };
+            let previous = turn.compaction_checkpoint.replace(checkpoint.clone());
+            (session.cwd.clone(), fragment_id, previous)
+        };
+        let (cwd, fragment_id, previous) = snapshot;
+        let zip_path = session_zip_path(&cwd, id);
+        let checkpoint_for_zip = checkpoint.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            rewrite_compaction_checkpoint_in_zip(&zip_path, &fragment_id, &checkpoint_for_zip)
+        })
+        .await;
+        if let Err(error) = flatten_persist_join(result) {
+            if let Some(session) = self.sessions.write().await.get_mut(id)
+                && let Some(turn) = session.history.get_mut(turn_index)
+            {
+                turn.compaction_checkpoint = previous;
+            }
+            return Err(error);
         }
         Ok(true)
     }
@@ -8548,6 +8687,8 @@ done
                         }],
                         structured_output: None,
                         summary: None,
+                        current_plan: None,
+                        compaction_checkpoint: None,
                         fragment_id: None,
                     },
                 )
@@ -8626,6 +8767,8 @@ done
                     tool_exchanges: exchanges.clone(),
                     structured_output: None,
                     summary: None,
+                    current_plan: None,
+                    compaction_checkpoint: None,
                     fragment_id: None,
                 },
             )
@@ -8739,6 +8882,8 @@ done
                     tool_exchanges: vec![r1.clone(), r2.clone()],
                     structured_output: None,
                     summary: None,
+                    current_plan: None,
+                    compaction_checkpoint: None,
                     fragment_id: None,
                 },
             )
@@ -8823,6 +8968,8 @@ done
                         },
                     )),
                     summary: None,
+                    current_plan: None,
+                    compaction_checkpoint: None,
                     fragment_id: None,
                 },
             )
@@ -9369,5 +9516,53 @@ done
                 .expect("empty rewind"),
             RewindOutcome::Empty
         ));
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoint_round_trips_without_replacing_raw_turn() {
+        let store = SessionStore::with_limits(
+            "m".to_string(),
+            SessionLimits {
+                max_sessions: 0,
+                max_history_turns: 0,
+            },
+        );
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = store.create_session(cwd.path().to_path_buf()).await;
+        store
+            .add_turn(
+                &session.id,
+                ConversationTurn {
+                    user_prompt: "raw user".into(),
+                    agent_response: "raw assistant".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("turn persists");
+        let checkpoint = CompactionCheckpoint {
+            messages: vec![crate::llm_client::ChatMessage::user(
+                "<state_snapshot>compact</state_snapshot>",
+            )],
+            current_plan: None,
+        };
+        assert!(
+            store
+                .set_compaction_checkpoint(&session.id, 0, checkpoint.clone())
+                .await
+                .expect("checkpoint persists")
+        );
+
+        store.sessions.write().await.remove(&session.id);
+        let reloaded = store
+            .snapshot(&session.id, cwd.path())
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.history[0].user_prompt, "raw user");
+        assert_eq!(reloaded.history[0].agent_response, "raw assistant");
+        assert_eq!(
+            reloaded.history[0].compaction_checkpoint.as_ref(),
+            Some(&checkpoint)
+        );
     }
 }
