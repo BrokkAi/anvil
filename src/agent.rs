@@ -4532,7 +4532,6 @@ struct AsgardCandidate {
     patch: Vec<u8>,
     delta_patch: Vec<u8>,
     window_messages: Vec<ChatMessage>,
-    assigned_advice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4614,7 +4613,6 @@ async fn run_asgard_trajectory_loop(
             ),
         );
         let mut futures = Vec::with_capacity(worktrees.len());
-        let common_message_count = common_messages.len();
         for (index, ((model, worktree), registry)) in config
             .candidate_models
             .iter()
@@ -4633,10 +4631,10 @@ async fn run_asgard_trajectory_loop(
                 .and_then(|advices| advices.get(index))
                 .cloned()
                 .flatten();
+            let trajectory_message_start = messages.len();
             if let Some(advice) = &assigned_advice {
                 messages.push(asgard_advice_message(index, advice));
             }
-            let trajectory_message_start = messages.len();
             let model = model.clone();
             let registry = registry.clone();
             let worktree_root = worktree.root.clone();
@@ -4648,7 +4646,7 @@ async fn run_asgard_trajectory_loop(
                 let thought_sink: crate::tool_loop::TextSink =
                     Arc::new(std::sync::Mutex::new(|_: &str| {}));
                 let spawned = crate::tool_loop::SpawnedCx::new(cx);
-                let mut outcome = crate::tool_loop::run(
+                let outcome = crate::tool_loop::run(
                     llm,
                     &registry,
                     &model,
@@ -4676,24 +4674,15 @@ async fn run_asgard_trajectory_loop(
                     crate::asgard::capture_patch_since(&worktree_root, &selected_patch)
                         .map(|delta_patch| (patch, delta_patch))
                 });
-                let window_messages = asgard_take_window_messages_and_strip_advice(
-                    &mut outcome.continuation_messages,
-                    common_message_count,
+                let window_messages = asgard_take_window_messages(
+                    &outcome.continuation_messages,
                     trajectory_message_start,
-                    assigned_advice.is_some(),
                 );
-                (
-                    index,
-                    model,
-                    outcome,
-                    patches,
-                    window_messages,
-                    assigned_advice,
-                )
+                (index, model, outcome, patches, window_messages)
             });
         }
         let mut candidates = Vec::with_capacity(futures.len());
-        for (index, model, outcome, patches, window_messages, assigned_advice) in
+        for (index, model, outcome, patches, window_messages) in
             futures::future::join_all(futures).await
         {
             aggregate_usage.add(outcome.usage);
@@ -4709,7 +4698,6 @@ async fn run_asgard_trajectory_loop(
                     patch,
                     delta_patch,
                     window_messages,
-                    assigned_advice,
                 }),
                 Err(error) => {
                     cleanup_asgard_worktrees(&worktrees);
@@ -4911,13 +4899,9 @@ async fn run_asgard_supervisor(
             }
         };
         candidate_trajectories.push_str(&format!(
-            "\n<lane_trajectory index=\"{}\" model=\"{}\" stop=\"{:?}\">\nassigned_advice={:?}\n\
+            "\n<lane_trajectory index=\"{}\" model=\"{}\" stop=\"{:?}\">\n\
              <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
-            candidate.index,
-            candidate.model,
-            candidate.outcome.stop,
-            candidate.assigned_advice,
-            trajectory,
+            candidate.index, candidate.model, candidate.outcome.stop, trajectory,
         ));
     }
     candidate_trajectories.push_str("</candidate_trajectories>");
@@ -5039,10 +5023,14 @@ fn asgard_supervisor_messages(
              changing or repairing a build environment, toolchain, classpath, build daemon, wrapper, \
              generated build tooling, or checkout layout unless the original task explicitly asks \
              for that work. Any strategy that violates this constraint makes the entire answer \
-             invalid. If execution is environmentally blocked, skeptically audit introduced symbols, \
-             types, namespaces, imports, signatures, and call contracts from the supplied evidence. \
+             invalid. Treat execution as environmentally blocked only when a trajectory shows an \
+             attempted task-relevant verifier and its concrete environmental failure; never infer a \
+             blocker merely because no command was attempted. When a blocker is demonstrated, \
+             skeptically audit introduced symbols, types, namespaces, imports, signatures, and call \
+             contracts from the supplied evidence. \
              Never describe an uncompiled patch as correct merely because its tests or structure look \
-             plausible. A named verifier may be intentionally absent from the checkout; unless the \
+             plausible. A named verifier may be intentionally absent from the checkout, but that \
+             absence must be demonstrated by trajectory evidence rather than assumed; unless the \
              task explicitly requests new tests, do not infer an obligation to recreate it or favor a \
              candidate-authored substitute over a verified production patch. Do not manufacture \
              endless follow-up work. If the selected implementation satisfies the task and has \
@@ -5078,12 +5066,15 @@ fn asgard_supervisor_messages(
              environmental, dependency-audit, or harness failures. Decide whether the selected \
              endpoint is complete. Set complete=true when it satisfies every explicit task \
              requirement and no known candidate-caused defect or necessary task-relevant \
-             work remains. Exercise the judgment of a strong coding agent: verification is evidence, \
-             not a blanket stopping rule. A focused successful verifier can establish confidence, \
-             but its absence does not mechanically force either complete=true or complete=false. \
-             Weigh the task, the patch's integration risk, the available execution evidence, and any \
-             environmental limitation. Never claim a command ran when the trajectory does not show \
-             it, and never promote a merely plausible static review into stronger evidence than it \
+             work remains. Exercise the judgment of a strong coding agent rather than applying a \
+             mechanical stopping rule. Before complete=true, look for an actual task-relevant build, \
+             test, lint, typecheck, or equivalent verifier after the selected implementation's \
+             material changes. When the repository exposes an applicable verifier and no trajectory \
+             attempted it, normally keep complete=false and use the next-window advice to run focused \
+             verification. The exception is a genuinely non-executable task or a demonstrated blocker \
+             for which the supplied evidence makes residual risk acceptably low. Do not infer such an \
+             exception from silence. Never claim a command ran when the trajectory does not show it, \
+             and never promote a merely plausible static review into stronger evidence than it \
              provides. In particular, scrutinize visibility, imports, signatures, namespaces, and \
              cross-module call sites introduced by an uncompiled patch. Optional extra tests, broader \
              audits, cleanup, and nice-to-have coverage must not create endless work once the endpoint \
@@ -5175,29 +5166,21 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          configuration, warning policy, tests, or test selection to hide a pre-existing, \
          environmental, dependency-audit, or harness failure, and do not chase it by changing SDKs, \
          MSBuild or Gradle properties, toolchains, classpaths, build daemons, wrappers, generated build \
-         tooling, or checkout paths. If the implementation is complete and only such verification is \
-         blocked, perform at most one bounded task-relevant audit, then conclude normally."
+         tooling, or checkout paths. Do not assume verification is blocked merely because it has not \
+         been attempted. Run an available focused verifier; if an attempted verifier demonstrates an \
+         environmental blocker, try an already-available equivalent or perform a bounded audit and \
+         report the exact evidence without changing infrastructure."
     ))
 }
 
-fn asgard_take_window_messages_and_strip_advice(
-    messages: &mut Vec<ChatMessage>,
-    common_message_count: usize,
+fn asgard_take_window_messages(
+    messages: &[ChatMessage],
     trajectory_message_start: usize,
-    advice_expected: bool,
 ) -> Vec<ChatMessage> {
-    let window_messages = messages
+    messages
         .get(trajectory_message_start..)
         .unwrap_or_default()
-        .to_vec();
-    if advice_expected
-        && messages.get(common_message_count).is_some_and(|message| {
-            asgard_message_text(message).contains("<asgard_next_window_advice")
-        })
-    {
-        messages.remove(common_message_count);
-    }
-    window_messages
+        .to_vec()
 }
 
 fn asgard_message_text(message: &ChatMessage) -> String {
@@ -15715,7 +15698,7 @@ mod tests {
     }
 
     #[test]
-    fn asgard_advice_is_explicitly_ephemeral_and_normal_rollout() {
+    fn asgard_advice_continues_the_normal_rollout() {
         let message = asgard_advice_message(2, "Focus on the concurrency invariant.");
         let text = asgard_message_text(&message);
         assert!(text.contains("lane=\"2\""));
@@ -15807,28 +15790,27 @@ mod tests {
     }
 
     #[test]
-    fn asgard_advice_is_removed_from_canonical_history_after_window() {
-        let mut messages = vec![
+    fn asgard_advice_remains_in_canonical_history_after_window() {
+        let messages = vec![
             ChatMessage::system("stable prefix"),
             ChatMessage::user("original task"),
             asgard_advice_message(0, "Try the parser path."),
             ChatMessage::assistant("I will inspect the parser."),
         ];
 
-        let window = asgard_take_window_messages_and_strip_advice(&mut messages, 2, 3, true);
+        let window = asgard_take_window_messages(&messages, 2);
 
         assert_eq!(
             window,
-            vec![ChatMessage::assistant("I will inspect the parser.")]
+            vec![
+                asgard_advice_message(0, "Try the parser path."),
+                ChatMessage::assistant("I will inspect the parser."),
+            ]
         );
-        assert_eq!(messages.len(), 3);
-        assert!(
-            messages
-                .iter()
-                .all(|message| !asgard_message_text(message).contains("asgard_next_window_advice"))
-        );
+        assert_eq!(messages.len(), 4);
+        assert!(asgard_message_text(&messages[2]).contains("asgard_next_window_advice"));
         assert_eq!(
-            messages[2],
+            messages[3],
             ChatMessage::assistant("I will inspect the parser.")
         );
     }
@@ -15839,7 +15821,10 @@ mod tests {
             ChatMessage::system("stable selected system"),
             ChatMessage::user("selected step one"),
         ];
-        let selected_windows = vec![vec![ChatMessage::assistant("selected step two")]];
+        let selected_windows = vec![vec![
+            asgard_advice_message(1, "Verify the selected implementation."),
+            ChatMessage::assistant("selected step two"),
+        ]];
         let first = asgard_supervisor_messages(
             "fix the parser",
             &selected_first,
@@ -15868,11 +15853,14 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("dependency-audit"));
         assert!(asgard_message_text(&first[0]).contains("named verifier"));
         assert!(asgard_message_text(&first[0]).contains("intentionally absent"));
+        assert!(asgard_message_text(&first[0]).contains("no command was attempted"));
+        assert!(asgard_message_text(&first[0]).contains("normally keep complete=false"));
         assert!(asgard_message_text(&first[2]).contains("stable selected system"));
         assert_eq!(first[2].role, "assistant");
         assert_eq!(second[3].role, "user");
         assert!(asgard_message_text(&second[3]).contains("window_boundary"));
         assert_eq!(second[4].role, "assistant");
+        assert!(asgard_message_text(&second[4]).contains("Verify the selected implementation."));
         assert!(asgard_message_text(&second[4]).contains("selected step two"));
         assert_eq!(second[5].role, "user");
         assert!(asgard_message_text(&second[5]).contains("candidate window two"));
