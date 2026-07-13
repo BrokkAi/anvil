@@ -7379,7 +7379,8 @@ async fn run_setup_bedrock_catalog_elicitation(
     cancel: &tokio_util::sync::CancellationToken,
 ) {
     let cx = spawned_cx.cx();
-    let request = build_bedrock_catalog_elicitation_request(session_id);
+    let request =
+        build_bedrock_catalog_elicitation_request(session_id, sessions.bedrock_catalog_mode());
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return,
@@ -7426,8 +7427,11 @@ async fn run_setup_bedrock_catalog_elicitation(
     send_message(cx, session_id, &message);
 }
 
-fn build_bedrock_catalog_elicitation_request(session_id: &str) -> CreateElicitationRequest {
-    let current = crate::setup_state::bedrock_catalog_mode().as_str();
+fn build_bedrock_catalog_elicitation_request(
+    session_id: &str,
+    current: crate::setup_state::BedrockCatalogMode,
+) -> CreateElicitationRequest {
+    let current = current.as_str();
     let field = StringPropertySchema::new()
         .title("Bedrock model catalog")
         .description("Choose which Bedrock model discovery APIs are used and which source wins duplicate model ids.")
@@ -8324,27 +8328,55 @@ async fn handle_setup_bedrock(
         let Ok(mode) = crate::setup_state::BedrockCatalogMode::from_str(&mode) else {
             return "Unknown Bedrock catalog mode. Try `mantle-only`, `native-only`, `mantle-preferred`, or `native-preferred`.".to_string();
         };
-        match crate::setup_state::remember_bedrock_catalog_mode(mode) {
-            Ok(()) => {
-                match crate::bedrock_client::build_backend_from_config() {
-                    Ok(Some(backend)) => llm.install_bedrock(backend),
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            "failed to reload Bedrock after catalog mode change: {err:#}"
-                        )
+        let _guard = refresh_lock.lock().await;
+        match sessions.remember_bedrock_catalog_mode(mode) {
+            Ok(()) => match crate::bedrock_client::backend_config() {
+                Ok(Some((token, region, model))) => {
+                    llm.install_bedrock(Arc::new(
+                        crate::bedrock_client::BedrockClient::new_with_catalog_mode(
+                            token, region, model, mode,
+                        ),
+                    ));
+                    match refresh_model_catalog_after_lock(
+                        Some(cx),
+                        Some(session_id),
+                        llm,
+                        sessions,
+                    )
+                    .await
+                    {
+                        Ok(_) => format!("Bedrock catalog mode set to `{}`.", mode.as_str()),
+                        Err(err) => format!(
+                            "Bedrock catalog mode set to `{}`, but model refresh failed: {err:#}",
+                            mode.as_str()
+                        ),
                     }
                 }
-                refresh_catalog_after(
-                    cx,
-                    session_id,
-                    sessions,
-                    llm,
-                    refresh_lock,
-                    "Refreshing model catalog after Bedrock catalog mode change...",
-                );
-                format!("Bedrock catalog mode set to `{}`.", mode.as_str())
-            }
+                Ok(None) => {
+                    llm.uninstall_bedrock();
+                    match refresh_model_catalog_after_lock(
+                        Some(cx),
+                        Some(session_id),
+                        llm,
+                        sessions,
+                    )
+                    .await
+                    {
+                        Ok(_) => format!(
+                            "Bedrock catalog mode set to `{}`. No Bedrock credentials are currently configured.",
+                            mode.as_str()
+                        ),
+                        Err(err) => format!(
+                            "Bedrock catalog mode set to `{}`, but model refresh failed: {err:#}",
+                            mode.as_str()
+                        ),
+                    }
+                }
+                Err(err) => format!(
+                    "Bedrock catalog mode set to `{}`, but the Bedrock backend could not be reloaded: {err:#}",
+                    mode.as_str()
+                ),
+            },
             Err(err) => format!("Failed to save Bedrock catalog mode: {err:#}"),
         }
     } else if let Some(model) = rest.strip_prefix("model ") {
@@ -8396,7 +8428,7 @@ async fn handle_setup_bedrock(
                         crate::bedrock_client::BEDROCK_API_KEY_ENV,
                         crate::bedrock_auth::region_from_any_source(),
                         crate::bedrock_auth::model_from_any_source(),
-                        crate::setup_state::bedrock_catalog_mode().as_str(),
+                        sessions.bedrock_catalog_mode().as_str(),
                     )
                 } else {
                     match crate::bedrock_auth::read() {
@@ -8406,7 +8438,7 @@ async fn handle_setup_bedrock(
                             format!(
                                 "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}\n  Catalog: {}",
                                 auth.bearer_token.len(),
-                                crate::setup_state::bedrock_catalog_mode().as_str()
+                                sessions.bedrock_catalog_mode().as_str()
                             )
                         }
                         Ok(None) if state.legacy_secrets_present => format!(
@@ -9229,7 +9261,7 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     ));
     out.push_str(&format!(
         "- Bedrock catalog mode: `{}`\n\n",
-        crate::setup_state::bedrock_catalog_mode().as_str()
+        sessions.bedrock_catalog_mode().as_str()
     ));
     out.push_str("Current-session commands:\n");
     out.push_str("- `/setup model` - list model ids.\n");
@@ -14738,7 +14770,10 @@ mod tests {
 
     #[test]
     fn bedrock_catalog_elicitation_request_shape() {
-        let req = build_bedrock_catalog_elicitation_request("sess-bedrock");
+        let req = build_bedrock_catalog_elicitation_request(
+            "sess-bedrock",
+            crate::setup_state::BedrockCatalogMode::MantlePreferred,
+        );
         let json = serde_json::to_value(&req).unwrap();
 
         assert_eq!(json["mode"], "form");

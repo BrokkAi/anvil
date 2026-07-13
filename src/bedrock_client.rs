@@ -394,6 +394,20 @@ impl std::fmt::Debug for BedrockClient {
 
 impl BedrockClient {
     pub fn new(bearer_token: String, region: String, default_model: String) -> Self {
+        Self::new_with_catalog_mode(
+            bearer_token,
+            region,
+            default_model,
+            crate::setup_state::bedrock_catalog_mode(),
+        )
+    }
+
+    pub fn new_with_catalog_mode(
+        bearer_token: String,
+        region: String,
+        default_model: String,
+        catalog_mode: crate::setup_state::BedrockCatalogMode,
+    ) -> Self {
         let http = OpenAiClient::apply_runtime_tls_workarounds(
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -410,7 +424,7 @@ impl BedrockClient {
             runtime_base_url: BEDROCK_RUNTIME_BASE_URL.to_string(),
             mantle_base_url: mantle_base_url(&region),
             control_base_url: BEDROCK_CONTROL_BASE_URL.to_string(),
-            catalog_mode: crate::setup_state::bedrock_catalog_mode(),
+            catalog_mode,
             thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1104,15 +1118,11 @@ pub fn model_from_config() -> Option<String> {
     })
 }
 
-pub fn build_backend_from_config() -> Result<Option<Arc<dyn LlmBackend>>> {
+pub fn backend_config() -> Result<Option<(String, String, String)>> {
     let Some(token) = bearer_token_from_env_or_secrets()? else {
         return Ok(None);
     };
-    Ok(Some(Arc::new(BedrockClient::new(
-        token,
-        region_from_env(),
-        model_from_env(),
-    ))))
+    Ok(Some((token, region_from_env(), model_from_env())))
 }
 
 fn needs_inference_profile_retry(status: reqwest::StatusCode, body: &str) -> bool {
