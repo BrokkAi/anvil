@@ -4533,6 +4533,7 @@ struct AsgardCandidate {
     delta_patch: Vec<u8>,
     window_messages: Vec<ChatMessage>,
     assigned_advice: Option<String>,
+    verified_endpoint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4603,6 +4604,7 @@ async fn run_asgard_trajectory_loop(
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
     let mut next_advices: Option<Vec<Option<String>>> = None;
+    let mut common_verified = false;
     for window in 1usize.. {
         send_thought(
             cx,
@@ -4702,15 +4704,22 @@ async fn run_asgard_trajectory_loop(
                 .or_default()
                 .add(outcome.usage);
             match patches {
-                Ok((patch, delta_patch)) => candidates.push(AsgardCandidate {
-                    index,
-                    model,
-                    outcome,
-                    patch,
-                    delta_patch,
-                    window_messages,
-                    assigned_advice,
-                }),
+                Ok((patch, delta_patch)) => {
+                    let verified_endpoint = asgard_endpoint_verification_status(
+                        common_verified,
+                        &outcome.tool_exchanges,
+                    );
+                    candidates.push(AsgardCandidate {
+                        index,
+                        model,
+                        outcome,
+                        patch,
+                        delta_patch,
+                        window_messages,
+                        assigned_advice,
+                        verified_endpoint,
+                    });
+                }
                 Err(error) => {
                     cleanup_asgard_worktrees(&worktrees);
                     return (asgard_failure(error), usage_by_model);
@@ -4828,6 +4837,7 @@ async fn run_asgard_trajectory_loop(
             ),
         );
         common_patch = winner.patch.clone();
+        common_verified = winner.verified_endpoint;
         common_messages = winner.outcome.continuation_messages.clone();
         // Store the canonical history in terms of the live checkout. Each
         // candidate window rewrites that canonical path to its own worktree.
@@ -4979,6 +4989,17 @@ async fn run_asgard_supervisor(
     .await;
     let parsed = parse_asgard_supervisor_decision(&outcome.response, candidates.len()).and_then(
         |decision| {
+            if decision.complete {
+                let winner = candidates
+                    .iter()
+                    .find(|candidate| candidate.index == decision.winner)
+                    .ok_or_else(|| anyhow::anyhow!("supervisor selected an unknown lane"))?;
+                if !winner.verified_endpoint {
+                    anyhow::bail!(
+                        "Asgard supervisor claimed completion without a successful verifier in the selected trajectory"
+                    );
+                }
+            }
             let rejected = match enforce_asgard_advice_scope(decision, &original_task) {
                 Ok(decision) => return Ok(decision),
                 Err(rejected) => rejected,
@@ -5083,10 +5104,11 @@ fn asgard_supervisor_messages(
              must not keep complete=false. When complete=true, return advices=[] and do not invent \
              more work. For complete=true, state_summary must affirm which task-relevant build, \
              compilation, test, lint, or equivalent verification actually ran and passed. Omission \
-             of affirmative verification evidence makes the answer invalid. The only exception is \
-             a genuinely unavailable verifier, which state_summary must identify together with a \
-             skeptical static compilation audit of introduced symbols and call contracts. It is \
-             also invalid if state_summary discloses any remaining \
+             of affirmative verification evidence makes the answer invalid. Static review is useful \
+             for selecting a direction, but it never substitutes for an actually executed verifier \
+             when complete=true. If verification cannot run, keep complete=false and use the next \
+             advices to pursue bounded, task-relevant alternatives without changing infrastructure. \
+             It is also invalid if state_summary discloses any remaining \
              candidate-caused defect, including formatting, lint, compilation, or test failures in \
              candidate-modified files. Otherwise produce exactly {candidate_count} concise, \
              actionable, mutually distinct strategies for the next candidate window, ordered by \
@@ -5174,8 +5196,9 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          configuration, warning policy, tests, or test selection to hide a pre-existing, \
          environmental, dependency-audit, or harness failure, and do not chase it by changing SDKs, \
          MSBuild or Gradle properties, toolchains, classpaths, build daemons, wrappers, generated build \
-         tooling, or checkout paths. If the implementation is complete and only such verification is \
-         blocked, perform at most one bounded task-relevant audit, then conclude normally."
+         tooling, or checkout paths. If the implementation appears complete but verification is \
+         blocked, perform a bounded task-relevant audit and seek an already-available equivalent \
+         verifier; do not claim completion until an actual verifier runs successfully."
     ))
 }
 
@@ -5301,6 +5324,129 @@ fn parse_asgard_supervisor_decision(
     )
 }
 
+fn asgard_endpoint_verification_status(
+    baseline_verified: bool,
+    exchanges: &[crate::session::ToolExchange],
+) -> bool {
+    let mut verified = baseline_verified;
+    for exchange in exchanges {
+        let completed = exchange.status == crate::session::ToolExchangeStatus::Completed;
+        if exchange.diff.is_some()
+            || (completed && matches!(exchange.tool_name.as_str(), "edit" | "write_file" | "task"))
+        {
+            verified = false;
+        }
+        if exchange.tool_name != "run_shell_command" {
+            continue;
+        }
+        let command = serde_json::from_str::<serde_json::Value>(&exchange.arguments)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let Some(command) = command else {
+            continue;
+        };
+        if asgard_shell_command_may_modify_sources(&command) {
+            // A formatter or compound shell command may have changed the
+            // endpoint even when it later failed. A successful verifier in
+            // the same command re-establishes the invariant below.
+            verified = false;
+        }
+        if completed && asgard_shell_command_is_verifier(&command) {
+            verified = true;
+        }
+    }
+    verified
+}
+
+fn asgard_shell_command_is_verifier(command: &str) -> bool {
+    let command = command.to_lowercase();
+    if ["|| true", "|| :", "; true", "; exit 0", "|| exit 0"]
+        .iter()
+        .any(|mask| command.contains(mask))
+    {
+        return false;
+    }
+    [
+        "gradlew",
+        " gradle ",
+        "mvnw",
+        "mvn ",
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo build",
+        "go test",
+        "go build",
+        "go vet",
+        "dotnet test",
+        "dotnet build",
+        "pytest",
+        "unittest",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "pnpm test",
+        "pnpm run test",
+        "pnpm run build",
+        "yarn test",
+        "yarn build",
+        "bazel test",
+        "bazel build",
+        "buck test",
+        "buck build",
+        "cmake --build",
+        "ctest",
+        "ninja",
+        "make ",
+        "make\n",
+        "javac",
+        "tsc ",
+        "eslint",
+        "ruff check",
+        "ruff format --check",
+        "mypy",
+        "pyright",
+        "phpunit",
+        "rspec",
+        "swift test",
+        "swift build",
+        "xcodebuild",
+        "mix test",
+        "sbt test",
+        "ant test",
+    ]
+    .iter()
+    .any(|verifier| command.contains(verifier))
+        || command.trim() == "make"
+}
+
+fn asgard_shell_command_may_modify_sources(command: &str) -> bool {
+    let command = command.to_lowercase();
+    [
+        "sed -i",
+        "perl -pi",
+        "gofmt -w",
+        "rustfmt ",
+        "prettier --write",
+        "ruff format",
+        "git apply",
+        "apply_patch",
+        "patch -p",
+        " rm ",
+        " mv ",
+        " cp ",
+        " touch ",
+        " tee ",
+    ]
+    .iter()
+    .any(|mutator| command.contains(mutator))
+}
+
 fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
     let summary = state_summary.to_lowercase();
     let candidate_defect_anchor = [
@@ -5382,36 +5528,16 @@ fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
         "testing was not run",
         "not tested",
         "untested",
+        "does not permit running",
+        "did not permit running",
+        "cannot run",
+        "could not run",
+        "unable to run",
     ]
     .iter()
     .any(|phrase| summary.contains(phrase));
-    // A genuinely unavailable verifier can be replaced by the skeptical
-    // static compilation audit required by the supervisor prompt. Merely
-    // saying an uncompiled patch "appears" correct is self-contradictory
-    // evidence for complete=true and must make the structured answer invalid.
-    let verifier_unavailable = [
-        "environmental",
-        "environment is unavailable",
-        "environment was unavailable",
-        "execution is unavailable",
-        "execution was unavailable",
-        "build is blocked",
-        "build was blocked",
-        "verifier is unavailable",
-        "verifier was unavailable",
-        "wrapper is unavailable",
-        "wrapper was unavailable",
-        "pre-existing build failure",
-        "preexisting build failure",
-        "harness failure",
-    ]
-    .iter()
-    .any(|phrase| summary.contains(phrase));
-    let reports_static_audit = summary.contains("static audit")
-        || summary.contains("statically audited")
-        || summary.contains("static compilation audit");
     if reports_missing_build_verification {
-        return verifier_unavailable && reports_static_audit;
+        return false;
     }
 
     // Fail closed on omission. A completion claim must name affirmative
@@ -15791,12 +15917,13 @@ mod tests {
             )
             .is_err()
         );
-        let statically_verified = parse_asgard_supervisor_decision(
-            r#"{"winner":1,"complete":true,"state_summary":"Compilation was not run because the wrapper was unavailable; a static compilation audit verified all introduced symbols, imports, signatures, and call contracts.","advices":[]}"#,
-            3,
-        )
-        .unwrap();
-        assert!(statically_verified.complete);
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"complete":true,"state_summary":"Compilation was not run because the wrapper was unavailable; a static compilation audit verified all introduced symbols, imports, signatures, and call contracts.","advices":[]}"#,
+                3,
+            )
+            .is_err()
+        );
         assert!(
             parse_asgard_supervisor_decision(
                 r#"{"winner":2,"complete":true,"state_summary":"Lane 2 completed all required changes and matches the task. No known defects. A static audit found the structure plausible.","advices":[]}"#,
@@ -15892,6 +16019,61 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn asgard_completion_requires_a_successful_verifier_after_changes() {
+        let exchange = |tool_name: &str,
+                        arguments: serde_json::Value,
+                        status: crate::session::ToolExchangeStatus| {
+            crate::session::ToolExchange {
+                tool_name: tool_name.to_string(),
+                arguments: arguments.to_string(),
+                status,
+                ..Default::default()
+            }
+        };
+        let edit = exchange(
+            "edit",
+            serde_json::json!({"file_path":"src/lib.rs"}),
+            crate::session::ToolExchangeStatus::Completed,
+        );
+        let passed = exchange(
+            "run_shell_command",
+            serde_json::json!({"command":"./gradlew test"}),
+            crate::session::ToolExchangeStatus::Completed,
+        );
+        let failed = exchange(
+            "run_shell_command",
+            serde_json::json!({"command":"./gradlew test"}),
+            crate::session::ToolExchangeStatus::Failed,
+        );
+
+        assert!(asgard_endpoint_verification_status(
+            false,
+            &[edit.clone(), passed.clone()]
+        ));
+        assert!(!asgard_endpoint_verification_status(
+            false,
+            std::slice::from_ref(&edit)
+        ));
+        assert!(!asgard_endpoint_verification_status(
+            false,
+            &[edit.clone(), failed]
+        ));
+        assert!(!asgard_endpoint_verification_status(
+            true,
+            std::slice::from_ref(&edit)
+        ));
+        assert!(!asgard_endpoint_verification_status(
+            false,
+            &[exchange(
+                "run_shell_command",
+                serde_json::json!({"command":"./gradlew test || true"}),
+                crate::session::ToolExchangeStatus::Completed,
+            )]
+        ));
+        assert!(!asgard_endpoint_verification_status(false, &[passed, edit]));
     }
 
     #[test]
