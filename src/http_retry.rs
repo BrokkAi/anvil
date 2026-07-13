@@ -304,6 +304,20 @@ mod tests {
     }
 
     #[test]
+    fn stream_error_context_preserves_retry_marker() {
+        let err = retryable_llm_context(
+            anyhow::anyhow!("connection reset"),
+            "Codex stream read error",
+            RetryableLlmError::fast("Codex stream read error"),
+        );
+
+        assert!(
+            crate::llm_client::is_retryable_llm_error(&err),
+            "retry marker was lost from error chain: {err:#}"
+        );
+    }
+
+    #[test]
     fn shared_attempt_budget_uses_four_total_attempts() {
         assert_eq!(LLM_MAX_ATTEMPTS, 4);
     }
