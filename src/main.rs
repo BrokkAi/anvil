@@ -192,7 +192,7 @@ impl std::fmt::Debug for Args {
 /// the picker stays honest.
 ///
 /// Shared by the startup path (`build_codex_backend`) and the
-/// post-`/codex-login` install path in `agent.rs`. Keeps the
+/// post-`/setup codex` install path in `agent.rs`. Keeps the
 /// `auth.auth_mode + tokens` decision tree in one place so the two
 /// callers can't drift.
 pub fn codex_backend_from_auth(auth: &codex_auth::AuthDotJson) -> Option<Arc<dyn LlmBackend>> {
