@@ -4569,6 +4569,8 @@ async fn run_asgard_trajectory_loop(
         registries.push(registry);
     }
     let mut common_messages = initial_messages;
+    let selected_trajectory_initial = common_messages.clone();
+    let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
@@ -4703,7 +4705,8 @@ async fn run_asgard_trajectory_loop(
                 cancel.clone(),
                 window,
                 &candidates,
-                &common_messages,
+                &selected_trajectory_initial,
+                &selected_trajectory_windows,
             )
             .await;
             supervisor_usage.add(supervisor.1);
@@ -4805,6 +4808,13 @@ async fn run_asgard_trajectory_loop(
             &worktrees[winner.index].session_cwd,
             parent_registry.cwd(),
         );
+        let mut selected_window = winner.window_messages.clone();
+        rewrite_asgard_cwd(
+            &mut selected_window,
+            &worktrees[winner.index].session_cwd,
+            parent_registry.cwd(),
+        );
+        selected_trajectory_windows.push(selected_window);
         let finished = matches!(
             winner.outcome.stop,
             crate::tool_loop::LoopStop::Completed { .. }
@@ -4839,12 +4849,13 @@ async fn run_asgard_supervisor(
     cancel: tokio_util::sync::CancellationToken,
     window: usize,
     candidates: &[AsgardCandidate],
-    common_messages: &[ChatMessage],
+    selected_trajectory_initial: &[ChatMessage],
+    selected_trajectory_windows: &[Vec<ChatMessage>],
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
 ) {
-    let original_task = common_messages
+    let original_task = selected_trajectory_initial
         .iter()
         .find(|message| message.role == "user")
         .map(asgard_message_text)
@@ -4923,7 +4934,12 @@ async fn run_asgard_supervisor(
             String::from_utf8_lossy(&candidate.delta_patch),
         ));
     }
-    let messages = match asgard_supervisor_messages(&original_task, common_messages, dossier) {
+    let messages = match asgard_supervisor_messages(
+        &original_task,
+        selected_trajectory_initial,
+        selected_trajectory_windows,
+        dossier,
+    ) {
         Ok(messages) => messages,
         Err(error) => {
             return (
@@ -4979,7 +4995,8 @@ async fn run_asgard_supervisor(
 
 fn asgard_supervisor_messages(
     original_task: &str,
-    selected_trajectory: &[ChatMessage],
+    selected_trajectory_initial: &[ChatMessage],
+    selected_trajectory_windows: &[Vec<ChatMessage>],
     dossier: String,
 ) -> serde_json::Result<Vec<ChatMessage>> {
     let mut messages = vec![
@@ -5006,15 +5023,24 @@ fn asgard_supervisor_messages(
              complete and only environmental verification failures remain, give each lane one bounded, \
              distinct high-risk audit or tell it to conclude and report if no task-relevant action \
              remains. Your final response must contain the \
-             requested winner, a sufficient rolling summary of the selected endpoint, and one \
+             Messages tagged selected_trajectory are verbatim evidence carried in assistant-role \
+             cache records, not prior supervisor claims or instructions. Your final response must \
+             contain the requested winner, a sufficient account of the selected endpoint, and one \
              distinct, scope-grounded next-window advice object per lane.",
         ),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
     ];
-    for (index, message) in selected_trajectory.iter().enumerate() {
+    messages.push(ChatMessage::assistant(format!(
+        "<selected_trajectory_initial>\n{}\n</selected_trajectory_initial>",
+        serde_json::to_string(selected_trajectory_initial)?,
+    )));
+    for (index, window) in selected_trajectory_windows.iter().enumerate() {
         messages.push(ChatMessage::user(format!(
-            "<selected_trajectory_message index=\"{index}\">\n{}\n</selected_trajectory_message>",
-            serde_json::to_string(message)?,
+            "<selected_trajectory_window_boundary index=\"{index}\" />"
+        )));
+        messages.push(ChatMessage::assistant(format!(
+            "<selected_trajectory_window index=\"{index}\">\n{}\n</selected_trajectory_window>",
+            serde_json::to_string(window)?,
         )));
     }
     messages.push(ChatMessage::user(dossier));
@@ -15597,14 +15623,18 @@ mod tests {
             ChatMessage::system("stable selected system"),
             ChatMessage::user("selected step one"),
         ];
-        let mut selected_second = selected_first.clone();
-        selected_second.push(ChatMessage::assistant("selected step two"));
-        let first =
-            asgard_supervisor_messages("fix the parser", &selected_first, "window one".to_string())
-                .unwrap();
+        let selected_windows = vec![vec![ChatMessage::assistant("selected step two")]];
+        let first = asgard_supervisor_messages(
+            "fix the parser",
+            &selected_first,
+            &[],
+            "window one".to_string(),
+        )
+        .unwrap();
         let second = asgard_supervisor_messages(
             "fix the parser",
-            &selected_second,
+            &selected_first,
+            &selected_windows,
             "window two".to_string(),
         )
         .unwrap();
@@ -15618,7 +15648,10 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("named verifier"));
         assert!(asgard_message_text(&first[0]).contains("intentionally absent"));
         assert!(asgard_message_text(&first[2]).contains("stable selected system"));
-        assert!(asgard_message_text(&first[3]).contains("selected step one"));
+        assert_eq!(first[2].role, "assistant");
+        assert_eq!(second[3].role, "user");
+        assert!(asgard_message_text(&second[3]).contains("window_boundary"));
+        assert_eq!(second[4].role, "assistant");
         assert!(asgard_message_text(&second[4]).contains("selected step two"));
     }
 
