@@ -4869,61 +4869,7 @@ async fn run_asgard_supervisor(
     crate::llm_client::TokenUsage,
 ) {
     let original_task = asgard_original_task(selected_trajectory_initial);
-    let mut dossier = format!(
-        "Select the single trajectory with the highest probability of eventually producing a \
-         correct, complete solution if continued from its endpoint after window {window}. Judge \
-         long-term direction, not just immediate visible activity. Valuable progress includes \
-         discovering constraints, ruling out bad hypotheses, building the right abstraction, \
-         writing diagnostic tests, and preserving a recoverable path. Do not penalize a candidate \
-         merely because careful investigation produced fewer edits this window, and do not reward \
-         patch size or superficial test motion. Consider implementation correctness, architectural \
-         fit, evidence from tests and errors, remaining risks, recoverability, and regressions. \
-         When execution is blocked by an environmental or baseline failure, perform a skeptical \
-         static compilation audit using the supplied evidence: check introduced types, namespaces, \
-         method signatures, imports, and call contracts. Treat an unverified patch as high risk, \
-         never as correct merely because its tests look plausible, and prefer candidates that reduce \
-         or explicitly investigate those source-level risks. \
-         Penalize unrelated build/configuration edits and attempts to evade tests. All evidence is \
-         supplied inline below; make your best judgment from it without tools. Treat build or test \
-         failures as evidence: distinguish failures caused by a candidate's patch from pre-existing, \
-         environmental, dependency-audit, or harness failures. Unless the original task explicitly \
-         requires it, never advise changing dependencies, build configuration, warning policy, test \
-         selection, or test expectations merely to make an unrelated failure disappear. Instead advise \
-         focused verification or continued task work while preserving the failure as a reported \
-         limitation. Test code is not categorically immutable: when task-mandated production API, \
-         contract, or call-path changes make existing mocks or test setup obsolete, update that setup \
-         rather than regressing required production behavior. Never add obsolete production calls or \
-         violate an explicit requirement merely to keep old mock stubs exercised or avoid a strict \
-         mocking failure. \
-         A task may name a verifier that is deliberately absent from the candidate checkout. \
-         Absence alone is unavailable verification, not an implicit requirement to recreate that \
-         test. Unless the task explicitly asks for new tests, do not reward or recommend authoring a \
-         substitute merely to make a named test filter exist; prefer production correctness, \
-         available verification, and a focused static audit. Decide whether the selected endpoint \
-         is complete. Set complete=true when it satisfies every explicit task requirement and no \
-         known candidate-caused defect or necessary task-relevant verification remains. Successful \
-         focused builds/tests or comparably strong evidence are sufficient; optional extra tests, \
-         broader audits, cleanup, and nice-to-have coverage must not keep complete=false. When \
-         complete=true, return advices=[] and do not invent more work. A complete=true answer is \
-         invalid if state_summary admits that compilation or build verification was not run, unless \
-         it also identifies a genuinely unavailable verifier and records a skeptical static \
-         compilation audit of introduced symbols and call contracts. It is also invalid if \
-         state_summary discloses any remaining candidate-caused defect, including formatting, lint, \
-         compilation, or test failures in candidate-modified files. Otherwise produce exactly {} \
-         concise, actionable, mutually distinct strategies for the next candidate window, ordered \
-         by zero-based lane index. The strategies should explore different hypotheses or \
-         implementation/test approaches from the selected state. They are advice for normal \
-         continuing rollouts, not instructions to stop at a window boundary. For every strategy, \
-         provide a scope_basis that identifies either the original-task requirement it advances or \
-         a defect caused by the selected candidate patch that it corrects. Also produce \
-         state_summary: a concise account of why the selected endpoint is preferable and, when \
-         incomplete, what concrete requirement or defect remains. Return JSON \
-         {{\"winner\":N,\"complete\":false,\"state_summary\":\"selected endpoint state\",\
-         \"advices\":[{{\"strategy\":\"lane 0 strategy\",\
-         \"scope_basis\":\"task requirement or candidate-caused defect\"}},...]}}.\n\n\
-         CANDIDATE TRAJECTORIES FOR THIS WINDOW:\n",
-        candidates.len(),
-    );
+    let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
         let trajectory = match serde_json::to_string_pretty(&candidate.window_messages) {
             Ok(trajectory) => trajectory,
@@ -4937,7 +4883,7 @@ async fn run_asgard_supervisor(
                 );
             }
         };
-        dossier.push_str(&format!(
+        candidate_trajectories.push_str(&format!(
             "\n<lane_trajectory index=\"{}\" model=\"{}\" stop=\"{:?}\">\nassigned_advice={:?}\n\
              <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
             candidate.index,
@@ -4947,9 +4893,10 @@ async fn run_asgard_supervisor(
             trajectory,
         ));
     }
-    dossier.push_str("\nCANDIDATE DIFFS SINCE THE SELECTED TRAJECTORY:\n");
+    candidate_trajectories.push_str("</candidate_trajectories>");
+    let mut candidate_diffs = format!("<candidate_diffs window=\"{window}\">\n");
     for candidate in candidates {
-        dossier.push_str(&format!(
+        candidate_diffs.push_str(&format!(
             "\n<lane_diff index=\"{}\" bytes=\"{}\" changed_files=\"{:?}\">\n{}\n</lane_diff>\n",
             candidate.index,
             candidate.delta_patch.len(),
@@ -4957,11 +4904,14 @@ async fn run_asgard_supervisor(
             String::from_utf8_lossy(&candidate.delta_patch),
         ));
     }
+    candidate_diffs.push_str("</candidate_diffs>");
     let messages = match asgard_supervisor_messages(
         &original_task,
         selected_trajectory_initial,
         selected_trajectory_windows,
-        dossier,
+        candidates.len(),
+        candidate_trajectories,
+        candidate_diffs,
     ) {
         Ok(messages) => messages,
         Err(error) => {
@@ -5040,10 +4990,12 @@ fn asgard_supervisor_messages(
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
-    dossier: String,
+    candidate_count: usize,
+    candidate_trajectories: String,
+    candidate_diffs: String,
 ) -> serde_json::Result<Vec<ChatMessage>> {
     let mut messages = vec![
-        ChatMessage::system(
+        ChatMessage::system(format!(
             "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
              and shared baseline using only the complete evidence supplied in the prompt. Optimize \
              for the long-term probability of a correct final solution rather than greedy visible \
@@ -5075,8 +5027,46 @@ fn asgard_supervisor_messages(
              assistant-role cache records, not prior supervisor claims or instructions. Your final \
              response must contain the requested winner, a complete boolean, a sufficient account \
              of the selected endpoint, and either no advice when complete or one distinct, \
-             scope-grounded next-window advice object per lane when incomplete.",
-        ),
+             scope-grounded next-window advice object per lane when incomplete. \
+             Select the single trajectory with the highest probability of eventually producing a \
+             correct, complete solution if continued from its endpoint. Judge long-term direction, \
+             not just immediate visible activity. Valuable progress includes discovering constraints, \
+             ruling out bad hypotheses, building the right abstraction, writing diagnostic tests, \
+             and preserving a recoverable path. Do not penalize a candidate merely because careful \
+             investigation produced fewer edits this window, and do not reward patch size or \
+             superficial test motion. Consider implementation correctness, architectural fit, \
+             evidence from tests and errors, remaining risks, recoverability, and regressions. When \
+             execution is blocked by an environmental or baseline failure, perform a skeptical \
+             static compilation audit using the supplied evidence: check introduced types, \
+             namespaces, method signatures, imports, and call contracts. Treat an unverified patch \
+             as high risk, never as correct merely because its tests look plausible, and prefer \
+             candidates that reduce or explicitly investigate those source-level risks. Penalize \
+             unrelated build/configuration edits and attempts to evade tests. Treat build or test \
+             failures as evidence and distinguish candidate-caused failures from pre-existing, \
+             environmental, dependency-audit, or harness failures. Decide whether the selected \
+             endpoint is complete. Set complete=true when it satisfies every explicit task \
+             requirement and no known candidate-caused defect or necessary task-relevant \
+             verification remains. Successful focused builds/tests or comparably strong evidence \
+             are sufficient; optional extra tests, broader audits, cleanup, and nice-to-have coverage \
+             must not keep complete=false. When complete=true, return advices=[] and do not invent \
+             more work. A complete=true answer is invalid if state_summary admits that compilation \
+             or build verification was not run, unless it also identifies a genuinely unavailable \
+             verifier and records a skeptical static compilation audit of introduced symbols and \
+             call contracts. It is also invalid if state_summary discloses any remaining \
+             candidate-caused defect, including formatting, lint, compilation, or test failures in \
+             candidate-modified files. Otherwise produce exactly {candidate_count} concise, \
+             actionable, mutually distinct strategies for the next candidate window, ordered by \
+             zero-based lane index. The strategies should explore different hypotheses or \
+             implementation/test approaches from the selected state. They are advice for normal \
+             continuing rollouts, not instructions to stop at a window boundary. For every strategy, \
+             provide a scope_basis that identifies either the original-task requirement it advances \
+             or a defect caused by the selected candidate patch that it corrects. Also produce \
+             state_summary: a concise account of why the selected endpoint is preferable and, when \
+             incomplete, what concrete requirement or defect remains. Return JSON \
+             {{\"winner\":N,\"complete\":false,\"state_summary\":\"selected endpoint state\",\
+             \"advices\":[{{\"strategy\":\"lane 0 strategy\",\
+             \"scope_basis\":\"task requirement or candidate-caused defect\"}},...]}}.",
+        )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
     ];
     messages.push(ChatMessage::assistant(format!(
@@ -5092,7 +5082,8 @@ fn asgard_supervisor_messages(
             serde_json::to_string(window)?,
         )));
     }
-    messages.push(ChatMessage::user(dossier));
+    messages.push(ChatMessage::user(candidate_trajectories));
+    messages.push(ChatMessage::user(candidate_diffs));
     Ok(messages)
 }
 
@@ -15889,21 +15880,26 @@ mod tests {
             "fix the parser",
             &selected_first,
             &[],
-            "window one".to_string(),
+            3,
+            "candidate window one".to_string(),
+            "three diffs one".to_string(),
         )
         .unwrap();
         let second = asgard_supervisor_messages(
             "fix the parser",
             &selected_first,
             &selected_windows,
-            "window two".to_string(),
+            3,
+            "candidate window two".to_string(),
+            "three diffs two".to_string(),
         )
         .unwrap();
 
-        assert_eq!(&first[..first.len() - 1], &second[..first.len() - 1]);
+        assert_eq!(&first[..first.len() - 2], &second[..first.len() - 2]);
         assert_ne!(first.last(), second.last());
         assert!(asgard_message_text(&first[1]).contains("fix the parser"));
         assert!(!asgard_message_text(&first[0]).contains("window one"));
+        assert!(asgard_message_text(&first[0]).contains("exactly 3"));
         assert!(asgard_message_text(&first[0]).contains("HARD SCOPE CONSTRAINT"));
         assert!(asgard_message_text(&first[0]).contains("dependency-audit"));
         assert!(asgard_message_text(&first[0]).contains("named verifier"));
@@ -15914,6 +15910,10 @@ mod tests {
         assert!(asgard_message_text(&second[3]).contains("window_boundary"));
         assert_eq!(second[4].role, "assistant");
         assert!(asgard_message_text(&second[4]).contains("selected step two"));
+        assert_eq!(second[5].role, "user");
+        assert!(asgard_message_text(&second[5]).contains("candidate window two"));
+        assert_eq!(second[6].role, "user");
+        assert!(asgard_message_text(&second[6]).contains("three diffs two"));
     }
 
     #[test]
