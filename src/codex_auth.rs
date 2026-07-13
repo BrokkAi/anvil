@@ -419,18 +419,10 @@ async fn post_token_form_at(
 }
 
 /// Run the browser OAuth flow: open/present the authorization URL, capture the
-/// callback on localhost, then exchange the code and persist credentials.
-pub async fn interactive_browser_login_with<F, Fut>(present: F) -> Result<AuthDotJson>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    interactive_browser_login_with_cancel(None, present).await
-}
-
-/// Like [`interactive_browser_login_with`], but lets callers abort the wait for
-/// the localhost callback instead of relying on the callback timeout.
-pub async fn interactive_browser_login_with_cancel<F, Fut>(
+/// callback on localhost, then exchange the code and persist credentials. A
+/// cancellation token lets callers abort the wait for the localhost callback
+/// instead of relying on the callback timeout.
+pub async fn interactive_browser_login_with<F, Fut>(
     cancel: Option<&CancellationToken>,
     present: F,
 ) -> Result<AuthDotJson>

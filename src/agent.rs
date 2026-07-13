@@ -5178,7 +5178,7 @@ async fn handle_setup_codex(
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
         },
         "" | "login" | "browser" | "login browser" => {
-            match crate::codex_auth::interactive_browser_login_with_cancel(cancel, |auth_url| async move {
+            match crate::codex_auth::interactive_browser_login_with(cancel, |auth_url| async move {
                 let opened = webbrowser::open(&auth_url).is_ok();
                 let prefix = if opened {
                     "Codex browser sign-in started. Waiting for the localhost callback."
@@ -6711,23 +6711,19 @@ async fn run_setup_codex_login_elicitation(
 
     let result = match method {
         CodexLoginMethod::Browser => {
-            crate::codex_auth::interactive_browser_login_with_cancel(
-                Some(cancel),
-                |auth_url| async move {
-                    let request =
-                        build_codex_browser_login_elicitation_request(session_id, auth_url);
-                    match cx.send_request(request).block_task().await {
-                        Ok(resp) => match resp.action {
-                            ElicitationAction::Accept(_) => Ok(()),
-                            ElicitationAction::Decline | ElicitationAction::Cancel => {
-                                Err(anyhow::anyhow!("sign-in was cancelled"))
-                            }
-                            _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
-                        },
-                        Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
-                    }
-                },
-            )
+            crate::codex_auth::interactive_browser_login_with(Some(cancel), |auth_url| async move {
+                let request = build_codex_browser_login_elicitation_request(session_id, auth_url);
+                match cx.send_request(request).block_task().await {
+                    Ok(resp) => match resp.action {
+                        ElicitationAction::Accept(_) => Ok(()),
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            Err(anyhow::anyhow!("sign-in was cancelled"))
+                        }
+                        _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+                }
+            })
             .await
         }
         CodexLoginMethod::Device => {
