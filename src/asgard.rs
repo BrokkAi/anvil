@@ -185,6 +185,72 @@ pub(crate) fn capture_patch(root: &Path) -> Result<Vec<u8>> {
     .stdout)
 }
 
+/// Captures only the candidate's changes relative to the selected state at the
+/// start of the window. The selected state is represented by a patch from
+/// `HEAD`; a temporary index materializes that state without changing either
+/// the candidate worktree or the live checkout.
+pub(crate) fn capture_patch_since(root: &Path, selected_patch: &[u8]) -> Result<Vec<u8>> {
+    let index_path =
+        std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
+    let _index_guard = TemporaryIndex::new(index_path.clone());
+
+    git_with_index(root, &index_path, &["read-tree", "HEAD"])?;
+    if !selected_patch.is_empty() {
+        let mut child = Command::new("git")
+            .args(["apply", "--cached", "--binary", "-"])
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", &index_path)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .context("git apply selected state to temporary index")?
+            .write_all(selected_patch)?;
+        if !child.wait()?.success() {
+            bail!(
+                "failed to materialize selected Asgard state in {}",
+                root.display()
+            );
+        }
+    }
+    git_with_index(root, &index_path, &["add", "-N", "--all"])?;
+    Ok(git_with_index(
+        root,
+        &index_path,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?
+    .stdout)
+}
+
+struct TemporaryIndex {
+    path: PathBuf,
+}
+
+impl TemporaryIndex {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryIndex {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), "failed to remove temporary Asgard index: {error}");
+        }
+    }
+}
+
 pub(crate) fn install_patch(root: &Path, patch: &[u8]) -> Result<()> {
     for args in [["reset", "--hard", "HEAD"], ["clean", "-fd", "--"]] {
         let status = Command::new("git").args(args).current_dir(root).status()?;
@@ -233,6 +299,18 @@ fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     Ok(output)
 }
 
+fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_INDEX_FILE", index)
+        .output()?;
+    if !output.status.success() {
+        bail!("git {} failed in {}", args.join(" "), cwd.display());
+    }
+    Ok(output)
+}
+
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(git(cwd, args)?.stdout).context("git output was not UTF-8")
 }
@@ -240,6 +318,19 @@ fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_git(root: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success(),
+            "git {} failed",
+            args.join(" ")
+        );
+    }
 
     #[test]
     fn bootstrap_seed_copies_missing_wrappers_without_copying_build_outputs() {
@@ -288,5 +379,47 @@ mod tests {
             "0-deepseek--deepseek-v4-flash"
         );
         assert_eq!(safe_worktree_label("lane/model name"), "lane-model-name");
+    }
+
+    #[test]
+    fn candidate_delta_is_relative_to_selected_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("tracked.txt"), "head\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        fs::write(repo.join("tracked.txt"), "selected\n").unwrap();
+        fs::write(repo.join("selected-only.txt"), "selected file\n").unwrap();
+        let selected = capture_patch(repo).unwrap();
+
+        fs::write(repo.join("tracked.txt"), "candidate\n").unwrap();
+        fs::write(repo.join("candidate-only.txt"), "candidate file\n").unwrap();
+        let delta = capture_patch_since(repo, &selected).unwrap();
+        let delta_text = String::from_utf8_lossy(&delta);
+        assert!(delta_text.contains("-selected"));
+        assert!(delta_text.contains("+candidate"));
+        assert!(delta_text.contains("candidate-only.txt"));
+        assert!(!delta_text.contains("selected-only.txt"));
+
+        run_git(repo, &["reset", "--hard", "HEAD"]);
+        run_git(repo, &["clean", "-fd"]);
+        install_patch(repo, &selected).unwrap();
+        apply_selected_patch(repo, &delta).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "candidate\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("selected-only.txt")).unwrap(),
+            "selected file\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("candidate-only.txt")).unwrap(),
+            "candidate file\n"
+        );
     }
 }
