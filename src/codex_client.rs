@@ -22,8 +22,8 @@
 //! a pragmatic compatibility choice, not impersonation: the user *is*
 //! authenticating with their own OAuth tokens.
 
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use futures::Stream;
@@ -97,6 +97,23 @@ const FALLBACK_CODEX_COMPAT_CLIENT_VERSION: &str = "0.144.0";
 /// depending on a locally installed Codex CLI.
 const CODEX_MODELS_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
+const CODEX_MODELS_MANIFEST_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_MODELS_MANIFEST_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone)]
+struct CodexCompatClientVersionCacheEntry {
+    version: String,
+    fetched_at: Instant,
+}
+
+static CODEX_COMPAT_CLIENT_VERSION_CACHE: OnceLock<
+    StdMutex<Option<CodexCompatClientVersionCacheEntry>>,
+> = OnceLock::new();
+
+fn codex_compat_client_version_cache()
+-> &'static StdMutex<Option<CodexCompatClientVersionCacheEntry>> {
+    CODEX_COMPAT_CLIENT_VERSION_CACHE.get_or_init(|| StdMutex::new(None))
+}
 
 /// LLM backend that proxies to the ChatGPT subscription via the
 /// Responses API. Reads `~/.codex/auth.json` on every request and
@@ -507,41 +524,80 @@ fn body_excerpt(body: &[u8], limit: usize) -> String {
 }
 
 async fn resolve_codex_compat_client_version(http: &reqwest::Client) -> (String, Option<String>) {
-    match fetch_codex_models_manifest_client_version(http).await {
-        Ok(Some(version)) => {
+    if let Some(version) = cached_codex_compat_client_version() {
+        tracing::debug!(
+            client_version = %version,
+            "using cached Codex models manifest client_version for ChatGPT model discovery"
+        );
+        return (version, None);
+    }
+
+    match tokio::time::timeout(
+        CODEX_MODELS_MANIFEST_TIMEOUT,
+        fetch_codex_models_manifest_client_version(http),
+    )
+    .await
+    {
+        Ok(Ok(Some(version))) => {
+            store_codex_compat_client_version(version.clone());
             tracing::info!(
                 client_version = %version,
                 "using Codex models manifest client_version for ChatGPT model discovery"
             );
             (version, None)
         }
-        Ok(None) => {
-            let message = format!(
-                "Codex models manifest did not advertise any visible minimal_client_version; \
-                 using fallback client_version {FALLBACK_CODEX_COMPAT_CLIENT_VERSION}."
-            );
-            tracing::warn!(message);
-            (
-                FALLBACK_CODEX_COMPAT_CLIENT_VERSION.to_string(),
-                Some(message),
-            )
-        }
-        Err(e) => {
-            let message = format!(
-                "Could not fetch Codex models manifest; using fallback client_version \
-                 {FALLBACK_CODEX_COMPAT_CLIENT_VERSION}."
-            );
+        Ok(Ok(None)) => fallback_codex_compat_client_version(Some(
+            "Codex models manifest did not advertise any visible minimal_client_version",
+        )),
+        Ok(Err(e)) => {
             tracing::warn!(
                 ?e,
                 fallback = FALLBACK_CODEX_COMPAT_CLIENT_VERSION,
                 "failed to fetch Codex models manifest; using fallback client_version"
             );
-            (
-                FALLBACK_CODEX_COMPAT_CLIENT_VERSION.to_string(),
-                Some(message),
-            )
+            fallback_codex_compat_client_version(Some("Could not fetch Codex models manifest"))
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CODEX_MODELS_MANIFEST_TIMEOUT.as_secs_f32(),
+                fallback = FALLBACK_CODEX_COMPAT_CLIENT_VERSION,
+                "timed out fetching Codex models manifest; using fallback client_version"
+            );
+            fallback_codex_compat_client_version(Some("Timed out fetching Codex models manifest"))
         }
     }
+}
+
+fn cached_codex_compat_client_version() -> Option<String> {
+    let cache = codex_compat_client_version_cache()
+        .lock()
+        .expect("Codex compat client version cache lock poisoned");
+    let entry = cache.as_ref()?;
+    if entry.fetched_at.elapsed() < CODEX_MODELS_MANIFEST_CACHE_TTL {
+        Some(entry.version.clone())
+    } else {
+        None
+    }
+}
+
+fn store_codex_compat_client_version(version: String) {
+    *codex_compat_client_version_cache()
+        .lock()
+        .expect("Codex compat client version cache lock poisoned") =
+        Some(CodexCompatClientVersionCacheEntry {
+            version,
+            fetched_at: Instant::now(),
+        });
+}
+
+fn fallback_codex_compat_client_version(reason: Option<&str>) -> (String, Option<String>) {
+    let message = reason.map(|reason| {
+        format!("{reason}; using fallback client_version {FALLBACK_CODEX_COMPAT_CLIENT_VERSION}.")
+    });
+    if let Some(message) = &message {
+        tracing::warn!(message);
+    }
+    (FALLBACK_CODEX_COMPAT_CLIENT_VERSION.to_string(), message)
 }
 
 async fn fetch_codex_models_manifest_client_version(
@@ -577,9 +633,24 @@ async fn fetch_codex_models_manifest_client_version(
 }
 
 fn latest_visible_minimal_client_version(models: &[CodexManifestModelEntry]) -> Option<String> {
-    models
+    let mut listed_versions = models
         .iter()
         .filter(|m| m.visibility.as_deref() == Some("list"))
+        .filter_map(|m| m.minimal_client_version.as_deref())
+        .filter_map(parse_version_triple)
+        .peekable();
+    if listed_versions.peek().is_some() {
+        return listed_versions.max().map(format_version_triple);
+    }
+
+    // Be tolerant if Codex changes the manifest's visibility vocabulary: a
+    // newer gate on an unknown visible-looking entry is safer than silently
+    // falling back to an older hardcoded client_version.
+    models
+        .iter()
+        .filter(|m| {
+            m.visibility.as_deref() != Some("hide") && m.visibility.as_deref() != Some("none")
+        })
         .filter_map(|m| m.minimal_client_version.as_deref())
         .filter_map(parse_version_triple)
         .max()
@@ -2216,6 +2287,47 @@ mod tests {
             latest_visible_minimal_client_version(&models),
             Some("0.144.0".to_string())
         );
+    }
+
+    #[test]
+    fn manifest_version_tolerates_unknown_visible_states_when_list_is_absent() {
+        let models = vec![
+            CodexManifestModelEntry {
+                visibility: Some("public".to_string()),
+                minimal_client_version: Some("0.145.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("hide".to_string()),
+                minimal_client_version: Some("0.200.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("none".to_string()),
+                minimal_client_version: Some("0.300.0".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            latest_visible_minimal_client_version(&models),
+            Some("0.145.0".to_string())
+        );
+    }
+
+    #[test]
+    fn manifest_version_cache_expires_old_entries() {
+        let stale = Instant::now() - CODEX_MODELS_MANIFEST_CACHE_TTL - Duration::from_secs(1);
+        *codex_compat_client_version_cache().lock().unwrap() =
+            Some(CodexCompatClientVersionCacheEntry {
+                version: "0.999.0".to_string(),
+                fetched_at: stale,
+            });
+        assert_eq!(cached_codex_compat_client_version(), None);
+
+        store_codex_compat_client_version("0.145.0".to_string());
+        assert_eq!(
+            cached_codex_compat_client_version(),
+            Some("0.145.0".to_string())
+        );
+        *codex_compat_client_version_cache().lock().unwrap() = None;
     }
 
     #[test]
