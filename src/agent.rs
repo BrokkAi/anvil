@@ -5299,6 +5299,27 @@ fn filter_asgard_advice_scope(
             "change test selection",
             "modify test expectations",
             "change test expectations",
+            "suppress lint",
+            "suppress the lint",
+            "suppressing lint",
+            "suppressing the lint",
+            "disable lint",
+            "disable the lint",
+            "skip lint",
+            "skip the lint",
+            "ignore lint",
+            "ignore the lint",
+            "bypass lint",
+            "bypass the lint",
+            "suppress checkstyle",
+            "disable checkstyle",
+            "skip checkstyle",
+            "suppress spotless",
+            "disable spotless",
+            "skip spotless",
+            "suppress formatting check",
+            "disable formatting check",
+            "skip formatting check",
         ];
         let violation = if let Some(term) = policy_bypasses
             .iter()
@@ -15602,6 +15623,7 @@ mod tests {
             "Clean obj, upgrade the SDK, and set ImportProjectExtensionProps=false.",
             "Repair the Gradle build environment by correcting the classpath, changing the Gradle version, and building the generator module manually.",
             "Resolve the Gradle wrapper issue by using system-installed Gradle or recreating the wrapper.",
+            "Apply Spotless selectively by temporarily suppressing the lint-error blocker.",
         ] {
             let mut candidate = decision(strategy);
             let rejected =
