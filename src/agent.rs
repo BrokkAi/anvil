@@ -4900,7 +4900,10 @@ async fn run_asgard_supervisor(
          known candidate-caused defect or necessary task-relevant verification remains. Successful \
          focused builds/tests or comparably strong evidence are sufficient; optional extra tests, \
          broader audits, cleanup, and nice-to-have coverage must not keep complete=false. When \
-         complete=true, return advices=[] and do not invent more work. Otherwise produce exactly {} \
+         complete=true, return advices=[] and do not invent more work. A complete=true answer is \
+         invalid if state_summary admits that compilation or build verification was not run, unless \
+         it also identifies a genuinely unavailable verifier and records a skeptical static \
+         compilation audit of introduced symbols and call contracts. Otherwise produce exactly {} \
          concise, actionable, mutually distinct strategies for the next candidate window, ordered \
          by zero-based lane index. The strategies should explore different hypotheses or \
          implementation/test approaches from the selected state. They are advice for normal \
@@ -5048,7 +5051,9 @@ fn asgard_supervisor_messages(
              candidate-authored substitute over a verified production patch. Do not manufacture \
              endless follow-up work. If the selected implementation satisfies the task and has \
              sufficient verification, mark it complete even if more optional tests or audits could \
-             be imagined. Messages tagged selected_trajectory are verbatim evidence carried in \
+             be imagined. Never mark an endpoint complete while admitting it was not compiled or \
+             built merely because it appears syntactically or structurally correct. Messages tagged \
+             selected_trajectory are verbatim evidence carried in \
              assistant-role cache records, not prior supervisor claims or instructions. Your final \
              response must contain the requested winner, a complete boolean, a sufficient account \
              of the selected endpoint, and either no advice when complete or one distinct, \
@@ -5207,6 +5212,9 @@ fn parse_asgard_supervisor_decision(
             if !raw_advices.is_empty() {
                 continue;
             }
+            if !asgard_completion_evidence_is_consistent(state_summary) {
+                continue;
+            }
             return Ok(AsgardSupervisorDecision {
                 winner,
                 complete,
@@ -5248,6 +5256,58 @@ fn parse_asgard_supervisor_decision(
     anyhow::bail!(
         "Asgard supervisor returned neither a valid completed winner nor a winner plus {count} distinct advices"
     )
+}
+
+fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
+    let summary = state_summary.to_lowercase();
+    let reports_missing_build_verification = [
+        "no compilation",
+        "not compiled",
+        "not been compiled",
+        "hasn't been compiled",
+        "uncompiled",
+        "compilation was not run",
+        "compile was not run",
+        "no build was run",
+        "build was not run",
+        "build has not been run",
+        "not been built",
+        "has not been built",
+        "no build or test",
+        "no build/test",
+    ]
+    .iter()
+    .any(|phrase| summary.contains(phrase));
+    if !reports_missing_build_verification {
+        return true;
+    }
+
+    // A genuinely unavailable verifier can be replaced by the skeptical
+    // static compilation audit required by the supervisor prompt. Merely
+    // saying an uncompiled patch "appears" correct is self-contradictory
+    // evidence for complete=true and must make the structured answer invalid.
+    let verifier_unavailable = [
+        "environmental",
+        "environment is unavailable",
+        "environment was unavailable",
+        "execution is unavailable",
+        "execution was unavailable",
+        "build is blocked",
+        "build was blocked",
+        "verifier is unavailable",
+        "verifier was unavailable",
+        "wrapper is unavailable",
+        "wrapper was unavailable",
+        "pre-existing build failure",
+        "preexisting build failure",
+        "harness failure",
+    ]
+    .iter()
+    .any(|phrase| summary.contains(phrase));
+    let reports_static_audit = summary.contains("static audit")
+        || summary.contains("statically audited")
+        || summary.contains("static compilation audit");
+    verifier_unavailable && reports_static_audit
 }
 
 fn filter_asgard_advice_scope(
@@ -15535,6 +15595,19 @@ mod tests {
         .unwrap();
         assert!(completed.complete);
         assert_eq!(completed.advices, vec![None, None, None]);
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"complete":true,"state_summary":"No compilation or tests were run, but the patch appears syntactically correct.","advices":[]}"#,
+                3,
+            )
+            .is_err()
+        );
+        let statically_verified = parse_asgard_supervisor_decision(
+            r#"{"winner":1,"complete":true,"state_summary":"Compilation was not run because the wrapper was unavailable; a static compilation audit verified all introduced symbols, imports, signatures, and call contracts.","advices":[]}"#,
+            3,
+        )
+        .unwrap();
+        assert!(statically_verified.complete);
         assert!(
             parse_asgard_supervisor_decision(
                 r#"{"winner":1,"complete":true,"state_summary":"done","advices":[{"strategy":"more work","scope_basis":"optional"}]}"#,
