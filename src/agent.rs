@@ -4705,9 +4705,18 @@ async fn run_asgard_trajectory_loop(
         let decision = match supervisor.0 {
             Ok(decision) => decision,
             Err(error) => {
+                let apply_result =
+                    crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
                 cleanup_asgard_worktrees(&worktrees);
+                if let Err(apply_error) = apply_result {
+                    let mut outcome = asgard_failure(anyhow::anyhow!(
+                        "supervisor failed in window {window} ({error:#}) and applying the last accepted incumbent also failed: {apply_error:#}"
+                    ));
+                    outcome.usage = aggregate_usage;
+                    return (outcome, usage_by_model);
+                }
                 let mut outcome = asgard_failure(anyhow::anyhow!(
-                    "supervisor produced no valid decision for window {window}: {error:#}"
+                    "supervisor produced no valid decision for window {window}; preserved the last accepted incumbent: {error:#}"
                 ));
                 outcome.usage = aggregate_usage;
                 return (outcome, usage_by_model);
