@@ -739,6 +739,10 @@ pub const ENV_WHITELIST: &[&str] = &[
     "GRADLE_HOME",
     "GRADLE_OPTS",
     "GRADLE_USER_HOME",
+    // Non-secret MSBuild properties supplied by benchmark/dev harnesses
+    "NuGetAudit",
+    "GenerateRuntimeConfigurationFiles",
+    "GenerateRuntimeConfigDevFile",
 ];
 
 /// Operator-supplied override that fully replaces the discovered PATH inside
@@ -2116,6 +2120,9 @@ mod tests {
             "JAVA_HOME",
             "GRADLE_HOME",
             "GRADLE_OPTS",
+            "NuGetAudit",
+            "GenerateRuntimeConfigurationFiles",
+            "GenerateRuntimeConfigDevFile",
         ] {
             assert!(
                 ENV_WHITELIST.contains(&required),
