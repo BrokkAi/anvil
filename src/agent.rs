@@ -4868,11 +4868,7 @@ async fn run_asgard_supervisor(
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
 ) {
-    let original_task = selected_trajectory_initial
-        .iter()
-        .find(|message| message.role == "user")
-        .map(asgard_message_text)
-        .unwrap_or_default();
+    let original_task = asgard_original_task(selected_trajectory_initial);
     let mut dossier = format!(
         "Select the single trajectory with the highest probability of eventually producing a \
          correct, complete solution if continued from its endpoint after window {window}. Judge \
@@ -5009,6 +5005,19 @@ async fn run_asgard_supervisor(
         },
     );
     (parsed, outcome.usage)
+}
+
+fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
+    // Session bootstrap can contribute user-role instruction messages (for
+    // example AGENTS.md) before the actual prompt. The last user message is
+    // the prompt that started this trajectory; treating the first one as the
+    // task gives the supervisor an authoritative-looking but incorrect task
+    // and also poisons advice scope validation.
+    initial_messages
+        .iter()
+        .rfind(|message| message.role == "user")
+        .map(asgard_message_text)
+        .unwrap_or_default()
 }
 
 fn asgard_supervisor_messages(
@@ -15704,6 +15713,20 @@ mod tests {
         assert!(asgard_message_text(&second[3]).contains("window_boundary"));
         assert_eq!(second[4].role, "assistant");
         assert!(asgard_message_text(&second[4]).contains("selected step two"));
+    }
+
+    #[test]
+    fn asgard_supervisor_uses_prompt_after_bootstrap_instructions_as_task() {
+        let messages = vec![
+            ChatMessage::system("agent system prompt"),
+            ChatMessage::user("# AGENTS.md instructions\nFollow repository policy."),
+            ChatMessage::user("Implement resolved Go imports and preserve nested declarations."),
+        ];
+
+        assert_eq!(
+            asgard_original_task(&messages),
+            "Implement resolved Go imports and preserve nested declarations."
+        );
     }
 
     #[test]
