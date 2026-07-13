@@ -574,36 +574,15 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
         }),
     );
     assert_response_ok(&case, "initialize", &initialize, &client);
-    // Anvil advertises stdio-only MCP support (#159).
     assert_eq!(
-        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["http"], false,
-        "{}: should advertise mcpCapabilities.http=false: {initialize}",
+        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["http"], true,
+        "{}: should advertise mcpCapabilities.http=true: {initialize}",
         case.name
     );
     assert_eq!(
-        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["sse"], false,
-        "{}: should advertise mcpCapabilities.sse=false: {initialize}",
+        initialize["result"]["agentCapabilities"]["mcpCapabilities"]["sse"], true,
+        "{}: should advertise mcpCapabilities.sse=true: {initialize}",
         case.name
-    );
-
-    let http_server = json!({
-        "type": "http",
-        "name": "remote",
-        "url": "https://example.com/mcp",
-        "headers": []
-    });
-
-    // session/new with an HTTP transport is rejected, not silently dropped (#159).
-    let new_http = client.request(
-        "session/new",
-        json!({ "cwd": cwd, "mcpServers": [http_server] }),
-    );
-    assert_response_invalid_params_contains(
-        &case,
-        "session/new (http mcp)",
-        &new_http,
-        "unsupported 'http' transport",
-        &client,
     );
 
     let new_session = client.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
@@ -612,30 +591,6 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
         .as_str()
         .unwrap_or_else(|| panic!("{}: missing sessionId in {new_session}", case.name))
         .to_string();
-
-    // session/load and session/resume also reject unsupported transports (#159).
-    let load_http = client.request(
-        "session/load",
-        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [http_server] }),
-    );
-    assert_response_invalid_params_contains(
-        &case,
-        "session/load (http mcp)",
-        &load_http,
-        "unsupported 'http' transport",
-        &client,
-    );
-    let resume_http = client.request(
-        "session/resume",
-        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [http_server] }),
-    );
-    assert_response_invalid_params_contains(
-        &case,
-        "session/resume (http mcp)",
-        &resume_http,
-        "unsupported 'http' transport",
-        &client,
-    );
 
     // session/load with a stdio MCP server applies it; the next prompt builds a
     // registry that spawns the server, leaving a spawn-log entry (#145).

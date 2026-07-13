@@ -269,6 +269,9 @@ mod tests {
             last_sandbox_mode: Some(SandboxMode::Wasm),
             mcp_servers: Some(vec![crate::mcp::McpServerConfig {
                 name: "bifrost".to_string(),
+                transport: crate::mcp::McpTransport::Stdio,
+                url: None,
+                headers: Vec::new(),
                 command: "bifrost".to_string(),
                 args: Vec::new(),
                 env: Vec::new(),
@@ -352,6 +355,9 @@ mod tests {
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: "bifrost".to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -387,6 +393,9 @@ mod tests {
         let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
         remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: "/tmp/custom-bifrost".to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
