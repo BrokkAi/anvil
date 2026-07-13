@@ -123,7 +123,6 @@ const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
 /// advertise `priority`, rendered as Fast, for increased throughput.
 const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
 const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
-const CODEX_FAST_SERVICE_TIER_ID: &str = "priority";
 const WORKSPACE_DELTA_MAX_TEXT_BYTES: u64 = 1_048_576;
 
 fn negotiate_protocol_version(requested: ProtocolVersion) -> ProtocolVersion {
@@ -774,9 +773,8 @@ struct ConfigApplyOutcome {
     cleared_service_tier: Option<String>,
 }
 
-/// Validation / dispatch errors from `apply_config_option`. The request
-/// handler maps these into JSON error data; the slash command formats them
-/// into a one-line user message via `human_message`.
+/// Validation / dispatch errors from `apply_config_option`. The ACP request
+/// handler maps these into JSON error data.
 #[derive(Debug)]
 enum ConfigApplyError {
     UnknownConfigId,
@@ -787,30 +785,9 @@ enum ConfigApplyError {
     UnknownSession,
 }
 
-impl ConfigApplyError {
-    fn human_message(&self) -> String {
-        match self {
-            ConfigApplyError::UnknownConfigId => format!(
-                "unknown config key. Supported: {}",
-                CONFIGURE_KNOWN_KEYS.join(", ")
-            ),
-            ConfigApplyError::InvalidValue { reason, supported } => {
-                if supported.is_empty() {
-                    reason.clone()
-                } else {
-                    format!("{reason}. Supported: {}", supported.join(", "))
-                }
-            }
-            ConfigApplyError::UnknownSession => "unknown session".to_string(),
-        }
-    }
-}
-
-/// Apply a single `configOptions` change. Single source of truth shared by
-/// the `setSessionConfigOption` ACP request and `/setup`: validates the
-/// value, mutates session state, and returns the full re-derived options
-/// list so the caller can emit a `ConfigOptionUpdate` notification with
-/// the spec-required complete state.
+/// Apply a single ACP `configOptions` change: validate the value, mutate
+/// session state, and return the full re-derived option list so the caller can
+/// emit a `ConfigOptionUpdate` notification with the spec-required state.
 /// Re-fetch the session and build the complete current `SessionConfigOption`
 /// list. ACP config-option responses and `config_option_update` notifications
 /// carry the full set (not just the changed selector), so both the
@@ -1063,9 +1040,9 @@ async fn apply_config_option(
     })
 }
 
-/// `/setup` remains the model/provider and advanced configuration entry point.
-/// Permission mode is exposed through the ACP session config selector; the
-/// `/permissions` slash command only manages remembered Always allow entries.
+/// `/setup` remains the provider and install-default configuration entry point.
+/// Current-agent session options are advertised dynamically through ACP for the
+/// client's `/mjconfig` panel; `/permissions` only manages remembered approvals.
 fn builtin_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::new("context", "Show current session context snapshot"),
@@ -1080,11 +1057,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
         ),
         AvailableCommand::new(
             "setup",
-            "Set up models, login, behavior, sandboxing, and advanced options",
-        ),
-        AvailableCommand::new(
-            "fast",
-            "Use the fast Codex service tier for this session when available",
+            "Set up providers, sandboxing, recaps, and advanced install options",
         ),
         AvailableCommand::new(
             "permissions",
@@ -2509,13 +2482,6 @@ pub async fn run_agent(
                     return responder.respond(prompt_end_turn_response());
                 }
 
-                if is_slash_command(&raw_prompt_text, "fast") {
-                    let report =
-                        handle_fast(&cx, &sessions_prompt, &session_id, &raw_prompt_text).await;
-                    send_message(&cx, &session_id, &report);
-                    return responder.respond(prompt_end_turn_response());
-                }
-
                 if is_slash_command(&raw_prompt_text, "permissions") {
                     let report =
                         handle_permissions(&sessions_prompt, &session_id, &raw_prompt_text).await;
@@ -3019,7 +2985,7 @@ pub async fn run_agent(
                             Ok(catalog) => {
                                 let count = source_count(&catalog, ModelSource::OpenRouter);
                                 if count > 0 {
-                                    "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
+                                    "OpenRouter models are ready. Choose a session model in `/mjconfig`.".to_string()
                                 } else {
                                     format!(
                                         "OpenRouter is not showing models yet.\n\n{}",
@@ -3828,15 +3794,6 @@ async fn run_loop_iteration(
             cx,
             session_id,
             &handle_setup(&setup_ctx, target, session_id).await,
-        );
-        return Ok(LoopIterationOutcome::without_usage());
-    }
-
-    if is_slash_command(target, "fast") {
-        send_message(
-            cx,
-            session_id,
-            &handle_fast(cx, sessions, session_id, target).await,
         );
         return Ok(LoopIterationOutcome::without_usage());
     }
@@ -7359,8 +7316,6 @@ async fn apply_sandbox_elicitation_outcome(
 /// fallback, including their scope labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupHomeRoute {
-    /// Pick a ready model automatically (`/setup choose`).
-    Choose,
     /// Interactive Codex / ChatGPT sign-in (`/setup codex`).
     Codex,
     /// AWS Bedrock setup (`/setup bedrock`).
@@ -7381,7 +7336,6 @@ impl SetupHomeRoute {
     /// The stable `oneOf` value used on the wire for this route.
     fn value(self) -> &'static str {
         match self {
-            Self::Choose => "choose",
             Self::Codex => "codex",
             Self::Bedrock => "bedrock",
             Self::Local => "local",
@@ -7402,7 +7356,6 @@ impl SetupHomeRoute {
     /// Human-readable option label shown in the menu.
     fn label(self) -> &'static str {
         match self {
-            Self::Choose => "Choose a model for me",
             Self::Codex => "Sign in to Codex / ChatGPT",
             Self::Bedrock => "Use AWS Bedrock",
             Self::Local => "Use local models (Ollama / ds4)",
@@ -7418,7 +7371,6 @@ impl SetupHomeRoute {
             Self::Codex | Self::Bedrock | Self::Local | Self::DeepSeek | Self::OpenRouter => {
                 "global provider"
             }
-            Self::Choose => "current session",
             Self::Recap => "install default",
             Self::Advanced => "all scopes",
         }
@@ -7426,7 +7378,6 @@ impl SetupHomeRoute {
 
     fn command(self) -> &'static str {
         match self {
-            Self::Choose => "/setup choose",
             Self::Codex => "/setup codex",
             Self::Bedrock => "/setup bedrock",
             Self::Local => "/setup local",
@@ -7450,11 +7401,10 @@ impl SetupHomeRoute {
         )
     }
 
-    /// The menu in display order. `choose` leads because it is the fastest path
-    /// to a working model.
-    fn menu() -> [Self; 8] {
+    /// Provider and install-default routes in display order. Session options
+    /// are deliberately absent because the client renders them in `/mjconfig`.
+    fn menu() -> [Self; 7] {
         [
-            Self::Choose,
             Self::Codex,
             Self::Bedrock,
             Self::Local,
@@ -7484,7 +7434,7 @@ fn parse_setup_home_choice(action: &ElicitationAction) -> Option<SetupHomeRoute>
         .and_then(SetupHomeRoute::from_value)
 }
 
-/// Build the single-select home-menu form, pre-selecting `choose`.
+/// Build the single-select provider/install-settings home menu.
 fn build_setup_home_elicitation_request(session_id: &str) -> CreateElicitationRequest {
     let options = SetupHomeRoute::menu()
         .into_iter()
@@ -7493,9 +7443,11 @@ fn build_setup_home_elicitation_request(session_id: &str) -> CreateElicitationRe
 
     let field = StringPropertySchema::new()
         .title("Set up Anvil")
-        .description("Pick how to get a model ready, or open advanced settings.")
+        .description(
+            "Connect a provider or open install settings. Use /mjconfig for current-agent session settings.",
+        )
         .one_of(options)
-        .default_value(SetupHomeRoute::Choose.value());
+        .default_value(SetupHomeRoute::Codex.value());
 
     let schema = ElicitationSchema::new()
         .title("Anvil setup")
@@ -7542,10 +7494,6 @@ async fn run_setup_home_elicitation(
     match parse_setup_home_choice(&action) {
         // Text/streaming sub-flows: run the same handler the slash path uses and
         // surface its Markdown result.
-        Some(SetupHomeRoute::Choose) => {
-            let message = handle_setup_choose(cx, sessions, session_id, llm, refresh_lock).await;
-            send_message(cx, session_id, &message);
-        }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
             send_message(cx, session_id, &message);
@@ -7622,11 +7570,10 @@ struct SetupContext<'a> {
     current_session_idle_timeout: Option<u64>,
 }
 
-/// Handle `/setup`, the model/provider and advanced configuration surface.
-/// The command is intentionally task-oriented: it offers "choose for me",
-/// Codex sign-in, local models, OpenRouter, sandbox/behavior settings, and an
-/// advanced page. Permission mode lives in the ACP session config selector.
-/// Internal config ids stay hidden unless the user explicitly enters `advanced`.
+/// Handle `/setup`, the provider and install-default configuration surface.
+/// Current-agent session controls are advertised dynamically as ACP config
+/// options so the client can render them in `/mjconfig` without duplicating
+/// another agent's controls here.
 async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &str) -> String {
     let trimmed = slash_command_args(prompt_text);
     if trimmed.is_empty() {
@@ -7638,9 +7585,6 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
     let rest = parts.next().unwrap_or("").trim();
 
     match command.as_str() {
-        "choose" | "choose-for-me" | "chooseforme" => {
-            handle_setup_choose(ctx.cx, ctx.sessions, session_id, ctx.llm, ctx.refresh_lock).await
-        }
         "refresh" | "try-again" => {
             match refresh_model_catalog_now(
                 Some(ctx.cx),
@@ -7669,7 +7613,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
                 None,
             )
             .await;
-            out.push_str("\n\nRun `/setup choose` after sign-in completes.");
+            out.push_str("\n\nChoose a session model in `/mjconfig` after sign-in completes.");
             out
         }
         "local" | "ollama" => {
@@ -7717,7 +7661,6 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             .await
         }
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
-        "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
         "recap" => handle_setup_recap(ctx.sessions, session_id, rest).await,
         "timeout" => {
             let prompt = if rest.is_empty() {
@@ -7735,95 +7678,12 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             )
             .await
         }
-        "model" => {
-            if rest.is_empty() {
-                render_setup_models(ctx.sessions.available_model_metadata().await.as_slice())
-            } else {
-                apply_setup_config(ctx.cx, ctx.sessions, session_id, MODEL_CONFIG_ID, rest).await
-            }
-        }
-        "reasoning" | "reasoning-effort" => {
-            if rest.is_empty() {
-                "Current-session setting. Use `/setup reasoning default`, `/setup reasoning off`, or `/setup reasoning <level>`.\n\
-                 This is an advanced setting; most users should leave it alone."
-                    .to_string()
-            } else {
-                let value = if rest.eq_ignore_ascii_case("default") {
-                    REASONING_EFFORT_DEFAULT_VALUE
-                } else if rest.eq_ignore_ascii_case(REASONING_EFFORT_OFF_VALUE) {
-                    REASONING_EFFORT_OFF_VALUE
-                } else {
-                    rest
-                };
-                apply_setup_config(
-                    ctx.cx,
-                    ctx.sessions,
-                    session_id,
-                    REASONING_EFFORT_CONFIG_ID,
-                    value,
-                )
-                .await
-            }
-        }
-        "fast" | "service-tier" | "service_tier" => {
-            if rest.is_empty() {
-                "Current-session setting. Use `/setup fast on` to select the fast Codex service tier, \
-                 `/setup fast off` to clear it, or `/setup service-tier <tier id>`."
-                    .to_string()
-            } else {
-                let lower = rest.to_ascii_lowercase();
-                let value = match lower.as_str() {
-                    "on" | "fast" | "priority" => CODEX_FAST_SERVICE_TIER_ID,
-                    "off" | "default" | "provider-default" => SERVICE_TIER_DEFAULT_VALUE,
-                    _ => rest,
-                };
-                apply_setup_config(
-                    ctx.cx,
-                    ctx.sessions,
-                    session_id,
-                    SERVICE_TIER_CONFIG_ID,
-                    value,
-                )
-                .await
-            }
-        }
         "advanced" => render_setup_advanced(ctx.sessions, session_id).await,
         other => format!(
             "Unknown setup option `{other}`.\n\n{}",
             render_current_setup(ctx.sessions, session_id).await
         ),
     }
-}
-
-async fn handle_fast(
-    cx: &ConnectionTo<Client>,
-    sessions: &SessionStore,
-    session_id: &str,
-    prompt_text: &str,
-) -> String {
-    let rest = slash_command_args(prompt_text);
-    if rest.eq_ignore_ascii_case("status") {
-        let fallback_cwd = std::env::current_dir().unwrap_or_default();
-        let Some(session) = sessions.get_session(session_id, &fallback_cwd).await else {
-            return "Error: unknown session.".to_string();
-        };
-        return format!(
-            "Fast mode is `{}` for `{}`.",
-            session
-                .selected_service_tier
-                .as_deref()
-                .unwrap_or(SERVICE_TIER_DEFAULT_VALUE),
-            session.model
-        );
-    }
-
-    let lower = rest.to_ascii_lowercase();
-    let value = match lower.as_str() {
-        "" | "on" | "fast" | "priority" => CODEX_FAST_SERVICE_TIER_ID,
-        "off" | "default" | "provider-default" => SERVICE_TIER_DEFAULT_VALUE,
-        _ => rest.as_str(),
-    };
-    apply_setup_config(cx, sessions, session_id, SERVICE_TIER_CONFIG_ID, value).await
 }
 
 fn is_streamed_setup_openrouter_refresh(prompt_text: &str) -> bool {
@@ -7945,39 +7805,6 @@ async fn refresh_model_catalog_after_lock(
     Ok(models)
 }
 
-async fn handle_setup_choose(
-    cx: &ConnectionTo<Client>,
-    sessions: &SessionStore,
-    session_id: &str,
-    llm: &Arc<MultiBackend>,
-    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
-) -> String {
-    let catalog =
-        match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock)
-            .await
-        {
-            Ok(models) => models,
-            Err(e) => {
-                return format!(
-                    "Anvil could not find a working model yet: {e}\n\n\
-                 Try `/setup codex` if you use Codex, or `/setup local` for free local models."
-                );
-            }
-        };
-    let Some(model) = preferred_model(&catalog) else {
-        return format!(
-            "Anvil could not find a working model yet.\n\n{}",
-            render_setup_home_for_model("", &catalog)
-        );
-    };
-    match apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, &model).await {
-        msg if msg.starts_with("Error:") => msg,
-        _ => format!(
-            "Current-session model set to `{model}`. Anvil is ready. Run `/setup` anytime to change or repair setup."
-        ),
-    }
-}
-
 async fn handle_setup_local(
     cx: &ConnectionTo<Client>,
     sessions: &SessionStore,
@@ -7987,21 +7814,6 @@ async fn handle_setup_local(
     rest: &str,
 ) -> String {
     match rest.to_ascii_lowercase().as_str() {
-        "use" | "choose" => {
-            let catalog = sessions.available_model_metadata().await;
-            if let Some(model) = [ModelSource::Ollama, ModelSource::Ds4]
-                .into_iter()
-                .find_map(|source| {
-                    catalog
-                        .iter()
-                        .find(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
-                        .map(|m| m.id.clone())
-                })
-            {
-                return apply_setup_config(cx, sessions, session_id, MODEL_CONFIG_ID, &model).await;
-            }
-            "No local model is ready yet. Start Ollama or ds4-server, then run `/setup local refresh`.".to_string()
-        }
         "refresh" | "try-again" => {
             match refresh_model_catalog_now(Some(cx), Some(session_id), llm, sessions, refresh_lock)
                 .await
@@ -8010,7 +7822,8 @@ async fn handle_setup_local(
                     let local_count = source_count(&catalog, ModelSource::Ollama)
                         + source_count(&catalog, ModelSource::Ds4);
                     if local_count > 0 {
-                        "Local models are ready. Run `/setup local use` to use them, or `/setup choose` to let Anvil pick.".to_string()
+                        "Local models are ready. Choose one for this session in `/mjconfig`."
+                            .to_string()
                     } else {
                         render_local_setup_help()
                     }
@@ -8031,7 +7844,7 @@ fn render_local_setup_help() -> String {
      Anvil automatically discovers Ollama and a running ds4-server.\n\n\
      1. Start Ollama (https://ollama.com) or ds4-server.\n\
      2. Run `/setup local refresh`.\n\
-     3. Run `/setup local use`.\n\n\
+     3. Choose a local model for this session in `/mjconfig`.\n\n\
      Set `DS4_BASE_URL` for a remote ds4 endpoint. Other custom OpenAI-compatible \
      servers require explicit server configuration."
         .to_string()
@@ -8056,7 +7869,7 @@ async fn handle_provider_setup_refresh(
             let count = source_count(&catalog, source);
             if count > 0 {
                 format!(
-                    "{provider} models are ready ({count} found). Run `/setup choose`, or use `/setup model` for advanced selection."
+                    "{provider} models are ready ({count} found). Choose a session model in `/mjconfig`."
                 )
             } else {
                 format!("{provider} is not showing models yet.\n\n{}", render_help())
@@ -8163,7 +7976,7 @@ async fn handle_setup_bedrock(
                      Token: saved (length {})\n\
                      Region: {region}\n\
                      Model: {default_model}\n\n\
-                     Run `/setup choose` or `/setup model` to pick a Bedrock model.\n\n\
+                     Choose a Bedrock session model in `/mjconfig`.\n\n\
                      Tip: change region with `/setup bedrock region <region>`\n\
                      Tip: change model with `/setup bedrock model <model_id>`",
                     key.len()
@@ -8359,7 +8172,7 @@ fn render_bedrock_setup_help() -> String {
          - `/setup bedrock status`\n\
          - `/setup bedrock disconnect`\n\
          - `/setup bedrock refresh`\n\n\
-         Choose for me: `/setup choose`."
+         Choose the session model in `/mjconfig`."
     )
 }
 
@@ -8426,7 +8239,7 @@ async fn handle_setup_deepseek(
                 );
                 format!(
                     "DeepSeek API key saved (length {}).\n\n\
-                     Run `/setup choose` or `/setup model` to pick a DeepSeek model.",
+                     Choose a DeepSeek session model in `/mjconfig`.",
                     key.len()
                 )
             }
@@ -8513,7 +8326,7 @@ fn render_deepseek_setup_help() -> String {
          - `/setup deepseek status`\n\
          - `/setup deepseek disconnect`\n\
          - `/setup deepseek refresh`\n\n\
-         Choose for me: `/setup choose`."
+         Choose the session model in `/mjconfig`."
     )
 }
 
@@ -8567,7 +8380,7 @@ async fn handle_setup_openrouter(
         Some(session_id),
     )
     .await;
-    out.push_str("\n\nRun `/setup choose` after OpenRouter is connected.");
+    out.push_str("\n\nChoose a session model in `/mjconfig` after OpenRouter is connected.");
     out
 }
 
@@ -8596,7 +8409,7 @@ fn render_openrouter_setup_help() -> String {
          - `/setup openrouter status`\n\
          - `/setup openrouter disconnect`\n\
          - `/setup openrouter refresh`\n\n\
-         Choose for me: `/setup choose`."
+         Choose the session model in `/mjconfig`."
     )
 }
 
@@ -8833,26 +8646,6 @@ fn describe_sandbox_mode(mode: crate::sandbox_backend::SandboxMode, is_default: 
     }
 }
 
-async fn handle_setup_mode(
-    cx: &ConnectionTo<Client>,
-    sessions: &SessionStore,
-    session_id: &str,
-    rest: &str,
-) -> String {
-    if rest.is_empty() {
-        return "Current-session behavior\n\n\
-                - `/setup mode agent` - General coding assistant.\n\
-                - `/setup mode plan` - Plan only."
-            .to_string();
-    }
-    let value = match rest.to_ascii_lowercase().as_str() {
-        "agent" | "default" | "lutz" => "LUTZ",
-        "plan" => "PLAN",
-        _ => return "Unknown mode. Try `/setup mode agent` or `plan`.".to_string(),
-    };
-    apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
-}
-
 async fn handle_setup_recap(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
     if rest.is_empty() {
         let state = sessions
@@ -8877,118 +8670,6 @@ async fn handle_setup_recap(sessions: &SessionStore, session_id: &str, rest: &st
     } else {
         "Error: unknown session".to_string()
     }
-}
-
-async fn apply_setup_config(
-    cx: &ConnectionTo<Client>,
-    sessions: &SessionStore,
-    session_id: &str,
-    key: &str,
-    value: &str,
-) -> String {
-    match apply_config_option(sessions, session_id, key, value).await {
-        Ok(outcome) => {
-            // Route through the shared helper so a `/setup mode` change also
-            // emits current_mode_update for the legacy modes surface (#157),
-            // matching the session/set_config_option request path.
-            send_config_option_change_updates(cx, session_id, key, value, outcome.updated_options);
-            let fallback_cwd = std::env::current_dir().unwrap_or_default();
-            send_session_usage_update(cx, sessions, session_id, &fallback_cwd).await;
-            let mut msg = match key {
-                MODEL_CONFIG_ID => "Current-session model updated.".to_string(),
-                PERMISSION_CONFIG_ID => "Current-session permission mode updated.".to_string(),
-                BEHAVIOR_CONFIG_ID => "Current-session behavior updated.".to_string(),
-                REASONING_EFFORT_CONFIG_ID => {
-                    "Current-session reasoning effort updated.".to_string()
-                }
-                SERVICE_TIER_CONFIG_ID => "Current-session service tier updated.".to_string(),
-                _ => "Setup updated.".to_string(),
-            };
-            if let Some(prev) = outcome.cleared_reasoning {
-                msg.push_str(&format!(
-                    "\nReasoning effort reset: `{prev}` is not supported by the new model."
-                ));
-            }
-            if let Some(prev) = outcome.cleared_service_tier {
-                msg.push_str(&format!(
-                    "\nService tier reset: `{prev}` is not supported by the new model."
-                ));
-            }
-            msg
-        }
-        Err(e) => format!("Error: {}", e.human_message()),
-    }
-}
-
-fn render_setup_models(catalog: &[ModelMetadata]) -> String {
-    if catalog.is_empty() {
-        return "No models are in the catalog yet. Run `/setup refresh`.".to_string();
-    }
-    let mut out = String::from("Advanced model selection\n\nUse `/setup model <model id>`.\n\n");
-
-    {
-        let mut write_group = |title: &str, models: Vec<String>, empty: &str| {
-            out.push_str(title);
-            out.push('\n');
-            if models.is_empty() {
-                out.push_str(empty);
-                out.push('\n');
-            } else {
-                for id in models {
-                    out.push_str(&format!("- `{id}`\n"));
-                }
-            }
-            out.push('\n');
-        };
-
-        write_group(
-            "Bedrock",
-            source_model_ids(catalog, ModelSource::Bedrock, 12),
-            "No Bedrock models found. Run `/setup bedrock` to configure your token and region.",
-        );
-        write_group(
-            "Codex",
-            source_model_ids(catalog, ModelSource::Codex, 12),
-            "No Codex models found. Run `/setup codex`.",
-        );
-        write_group(
-            "Local models",
-            source_model_ids(catalog, ModelSource::Ollama, 12),
-            "No local models found. Run `/setup local`.",
-        );
-        write_group(
-            "ds4 (DeepSeek V4)",
-            source_model_ids(catalog, ModelSource::Ds4, 12),
-            "No ds4 models found. Start `ds4-server` (antirez/ds4), or set DS4_BASE_URL.",
-        );
-        write_group(
-            "DeepSeek",
-            source_model_ids(catalog, ModelSource::DeepSeek, 12),
-            "No hosted DeepSeek models found. Export DEEPSEEK_API_KEY and refresh.",
-        );
-        write_group(
-            "OpenRouter",
-            filtered_openrouter_models(catalog),
-            "No OpenRouter coding candidates found. Run `/setup openrouter`.",
-        );
-    }
-
-    let openrouter_total = source_count(catalog, ModelSource::OpenRouter);
-    if openrouter_total > 0 {
-        out.push_str(&format!(
-            "OpenRouter list is filtered for chat and coding models ({openrouter_total} total in the raw catalog).\n"
-        ));
-    }
-    out
-}
-
-fn source_model_ids(catalog: &[ModelMetadata], source: ModelSource, limit: usize) -> Vec<String> {
-    catalog
-        .iter()
-        .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
-        .take(limit)
-        .map(|m| m.id.clone())
-        .collect()
 }
 
 fn filtered_openrouter_models(catalog: &[ModelMetadata]) -> Vec<String> {
@@ -9033,37 +8714,11 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
     let catalog = sessions.available_model_metadata().await;
     let openrouter_picks = filtered_openrouter_models(&catalog);
     let mut out = String::from(
-        "Advanced setup\n\nCurrent session (client-owned; not saved as Anvil install defaults)\n\n",
+        "Advanced setup\n\nCurrent-agent session settings\n\n\
+         Open `/mjconfig` to change the ACP options advertised by the current agent. For Thor these currently include behavior, permission mode, model, reasoning effort, and service tier.\n\n",
     );
     out.push_str(&format!(
-        "- Selected model: `{}`\n",
-        if session.model.is_empty() {
-            "(none)"
-        } else {
-            &session.model
-        }
-    ));
-    out.push_str(&format!(
-        "- Permission mode: `{}`\n",
-        session.permission_mode.as_str()
-    ));
-    out.push_str(&format!("- Behavior mode: `{}`\n", session.mode.as_str()));
-    out.push_str(&format!(
-        "- Reasoning effort: `{}`\n",
-        session
-            .selected_reasoning_effort
-            .as_deref()
-            .unwrap_or(REASONING_EFFORT_DEFAULT_VALUE)
-    ));
-    out.push_str(&format!(
-        "- Service tier: `{}`\n",
-        session
-            .selected_service_tier
-            .as_deref()
-            .unwrap_or(SERVICE_TIER_DEFAULT_VALUE)
-    ));
-    out.push_str(&format!(
-        "- LLM idle timeout: `{}`\n",
+        "- LLM idle timeout: `{}` (use `/setup timeout <seconds>`)\n",
         session
             .idle_timeout_secs
             .map(|s| format!("{s}s"))
@@ -9083,16 +8738,9 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         }
     ));
     out.push_str("Current-session commands:\n");
-    out.push_str("- `/setup model` - list model ids.\n");
-    out.push_str("- `/setup model <model id>` - choose a specific model.\n");
-    out.push_str("- Permission selector - change edit/command approval mode.\n");
+    out.push_str("- `/mjconfig` - change the current agent's advertised session options.\n");
     out.push_str("- `/permissions` - list or revoke remembered Always allow approvals.\n");
-    out.push_str("- `/setup mode` - change assistant behavior.\n");
     out.push_str("- `/setup timeout <seconds>` - change stream idle timeout.\n");
-    out.push_str("- `/setup reasoning default|off|<level>` - advanced reasoning setting.\n");
-    out.push_str(
-        "- `/setup fast on|off` - use or clear the fast Codex service tier when available.\n",
-    );
     out.push_str("\nInstall-default commands:\n");
     out.push_str(
         "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
@@ -9132,7 +8780,6 @@ fn loop_target_runs_without_model(target: &str) -> bool {
         || is_slash_command(target, "mcp")
         || is_slash_command(target, "pr-create")
         || is_slash_command(target, "usage")
-        || is_slash_command(target, "fast")
         || is_slash_command(target, "rewind")
 }
 
@@ -13106,7 +12753,6 @@ mod tests {
                 "loop",
                 "goal",
                 "setup",
-                "fast",
                 "permissions",
                 "compress",
                 "rewind",
@@ -13404,25 +13050,6 @@ mod tests {
             !path.exists(),
             "env-owned mode must not persist a key on disk; file at {path:?} should not exist"
         );
-    }
-
-    #[test]
-    fn render_setup_models_filters_openrouter_catalog() {
-        let catalog = vec![
-            ModelMetadata::id_only("codex::chatgpt-latest"),
-            ModelMetadata::id_only("ollama::llama3.1:latest"),
-            ModelMetadata::id_only("openrouter::anthropic/claude-sonnet-4.5"),
-            ModelMetadata::id_only("openrouter::openai/text-embedding-3-large"),
-            ModelMetadata::id_only("openrouter::black-forest-labs/flux-image"),
-        ];
-
-        let out = render_setup_models(&catalog);
-        assert!(out.contains("codex::chatgpt-latest"));
-        assert!(out.contains("ollama::llama3.1:latest"));
-        assert!(out.contains("openrouter::anthropic/claude-sonnet-4.5"));
-        assert!(!out.contains("text-embedding"));
-        assert!(!out.contains("flux-image"));
-        assert!(out.contains("OpenRouter list is filtered"));
     }
 
     #[test]
@@ -14014,7 +13641,7 @@ mod tests {
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
                 service_tiers: vec![ModelServiceTier {
-                    id: CODEX_FAST_SERVICE_TIER_ID.into(),
+                    id: "priority".into(),
                     name: "Fast".into(),
                     description: "Higher throughput".into(),
                 }],
@@ -14024,40 +13651,26 @@ mod tests {
             }])
             .await;
 
-        let outcome = apply_config_option(
-            &store,
-            &id,
-            SERVICE_TIER_CONFIG_ID,
-            CODEX_FAST_SERVICE_TIER_ID,
-        )
-        .await
-        .expect("supported service tier should be accepted");
+        let outcome = apply_config_option(&store, &id, SERVICE_TIER_CONFIG_ID, "priority")
+            .await
+            .expect("supported service tier should be accepted");
         let session = store
             .get_session(&id, &std::env::temp_dir())
             .await
             .expect("session present");
-        assert_eq!(
-            session.selected_service_tier.as_deref(),
-            Some(CODEX_FAST_SERVICE_TIER_ID)
-        );
+        assert_eq!(session.selected_service_tier.as_deref(), Some("priority"));
         let snap = store
             .snapshot(&id, &std::env::temp_dir())
             .await
             .expect("session present");
-        assert_eq!(
-            snap.service_tier.as_deref(),
-            Some(CODEX_FAST_SERVICE_TIER_ID)
-        );
+        assert_eq!(snap.service_tier.as_deref(), Some("priority"));
         let service_option = outcome
             .updated_options
             .iter()
             .find(|opt| opt.id.to_string() == SERVICE_TIER_CONFIG_ID)
             .expect("service tier option should be advertised");
-        assert_eq!(
-            select_current_value(service_option),
-            CODEX_FAST_SERVICE_TIER_ID
-        );
-        assert_select_option_values(service_option, &["(default)", CODEX_FAST_SERVICE_TIER_ID]);
+        assert_eq!(select_current_value(service_option), "priority");
+        assert_select_option_values(service_option, &["(default)", "priority"]);
 
         apply_config_option(
             &store,
@@ -14081,14 +13694,9 @@ mod tests {
             .set_available_models(vec![ModelMetadata::id_only("plain-model")])
             .await;
 
-        let err = apply_config_option(
-            &store,
-            &id,
-            SERVICE_TIER_CONFIG_ID,
-            CODEX_FAST_SERVICE_TIER_ID,
-        )
-        .await
-        .expect_err("known model without tiers cannot accept fast mode");
+        let err = apply_config_option(&store, &id, SERVICE_TIER_CONFIG_ID, "priority")
+            .await
+            .expect_err("known model without tiers cannot accept fast mode");
 
         match err {
             ConfigApplyError::InvalidValue { reason, supported } => {
@@ -14150,15 +13758,6 @@ mod tests {
             .await
             .expect_err("session does not exist");
         assert!(matches!(err, ConfigApplyError::UnknownSession));
-    }
-
-    #[test]
-    fn setup_unknown_config_key_error_lists_supported_ids() {
-        let out = ConfigApplyError::UnknownConfigId.human_message();
-        assert!(out.contains("unknown config key"));
-        for key in CONFIGURE_KNOWN_KEYS {
-            assert!(out.contains(key), "missing key `{key}` in error: {out}");
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -14283,7 +13882,7 @@ mod tests {
         );
         // A sub-command with no elicitation equivalent keeps the text flow, and
         // an unknown sub-command is not the bare home menu.
-        assert_eq!(setup_elicitation_target("/setup mode"), None);
+        assert_eq!(setup_elicitation_target("/setup timeout"), None);
         assert_eq!(setup_elicitation_target("/setup nope"), None);
         assert_eq!(setup_elicitation_target("/permissions"), None);
     }
@@ -14306,7 +13905,7 @@ mod tests {
     }
 
     /// The home request is a session-scoped single-select form listing every
-    /// actionable provider/action, pre-selecting `choose`.
+    /// provider/install action, pre-selecting Codex.
     #[test]
     fn setup_home_elicitation_request_shape() {
         let req = build_setup_home_elicitation_request("sess-home");
@@ -14316,7 +13915,7 @@ mod tests {
         assert_eq!(json["sessionId"].as_str(), Some("sess-home"));
         let choice = &json["requestedSchema"]["properties"]["choice"];
         assert_eq!(choice["type"], "string");
-        assert_eq!(choice["default"], "choose");
+        assert_eq!(choice["default"], "codex");
         let values: Vec<&str> = choice["oneOf"]
             .as_array()
             .unwrap()
@@ -14326,7 +13925,6 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                "choose",
                 "codex",
                 "bedrock",
                 "local",
@@ -14371,10 +13969,6 @@ mod tests {
             )])))
         };
 
-        assert_eq!(
-            parse_setup_home_choice(&accept("choose")),
-            Some(SetupHomeRoute::Choose)
-        );
         assert_eq!(
             parse_setup_home_choice(&accept("codex")),
             Some(SetupHomeRoute::Codex)

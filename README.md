@@ -94,17 +94,20 @@ Run it directly if you want to see the stdio server start:
 ```
 
 Most users connect Anvil through an ACP client rather than running it directly.
-The first session shows setup guidance; use `/setup` to choose a model provider,
-log in, refresh model discovery, or adjust advanced settings. Change permission
-mode through the session `Permission` selector.
+The first session shows setup guidance; use `/setup` to connect a model provider,
+log in, refresh model discovery, or adjust install settings. Use the client's
+`/mjconfig` panel for the current agent's dynamically advertised ACP session
+options. For Thor, these currently include model, behavior, permission mode,
+reasoning effort, and service tier.
 
 `/setup` distinguishes three scopes:
 
 - **Global providers:** credentials and discovery for Codex, Bedrock, local
   models, DeepSeek, and OpenRouter are shared by sessions in this Anvil install.
-- **Current session:** model, behavior, reasoning effort, service tier, timeout,
-  and permission mode are client-owned session controls and are not saved as
-  Anvil install defaults.
+- **Current agent/session:** model, behavior, reasoning effort, service tier,
+  and permission mode are agent-advertised ACP options shown by the client in
+  `/mjconfig`; the available options can vary when the selected agent changes.
+  Timeout remains an Anvil session control under `/setup timeout`.
 - **Install defaults:** sandbox mode and automatic turn recaps are persisted and
   seed future sessions.
 
@@ -191,10 +194,9 @@ Anvil is zero-config by default:
 
 - **Codex / ChatGPT**: reads `~/.codex/auth.json` when present and can refresh
   stale credentials. Run `/setup codex` from a session to sign in. When the
-  ChatGPT model catalog advertises service tiers, use `/fast` or `/setup fast on`
-  to select the fast tier for the current session, and `/fast off` or
-  `/setup fast off` to clear it. Fast mode can respond sooner but consumes
-  subscription quota more aggressively.
+  ChatGPT model catalog advertises service tiers, select the fast tier in
+  `/mjconfig`. Fast mode can respond sooner but consumes subscription quota more
+  aggressively.
 - **Ollama**: probes `http://localhost:11434/v1/models`. Run Ollama on the
   default port, then use `/setup local refresh`.
 - **ds4** (antirez/ds4): when a `ds4-server` process is running, Anvil detects
@@ -226,8 +228,8 @@ Anvil is zero-config by default:
   manual extended-thinking Claude models expose `low`/`medium`/`high` budget
   presets. Other Bedrock entries retain the generic `low`/`medium`/`high`
   fallback.
-  Choose `Off` in that picker (or `/setup reasoning off`) to omit reasoning
-  controls for a session. Native Anthropic requests send the corresponding
+  Choose `Off` in that `/mjconfig` picker to omit reasoning controls for a
+  session. Native Anthropic requests send the corresponding
   `thinking`/`output_config.effort` shape for the selected model family.
   If a manual-thinking model responds that it requires
   `thinking.type=adaptive` + `output_config.effort`, Anvil retries with that
@@ -236,18 +238,15 @@ Anvil is zero-config by default:
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.
 
-Provider priority for `/setup choose` is Bedrock first, then Codex, local models
-(Ollama, then ds4), hosted DeepSeek, and OpenRouter. You can also select a
-specific current-session model with `/setup model <wire id>`.
+After connecting or refreshing providers through `/setup`, select a model for
+the current Thor session in `/mjconfig`.
 
 ## Slash Commands
 
 Built-in commands:
 
-- `/setup`: model login, provider selection, behavior mode, sandbox mode,
-  turn recaps, timeout, and advanced settings.
-- `/fast [on|off|status]`: use, clear, or inspect the fast Codex service tier
-  for the current session when the selected model supports it.
+- `/setup`: provider login/discovery, sandbox mode, turn recaps, timeout, and
+  advanced install settings. Current-agent ACP options belong in `/mjconfig`.
 - `/permissions`: list or revoke remembered Always allow entries.
 - `/context`: show the current session context snapshot and token estimate.
 - `/loop <seconds> <slash-command-or-prompt>`: repeat a slash command or

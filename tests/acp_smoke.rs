@@ -1598,33 +1598,6 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
         case.name
     );
 
-    // The `/setup mode` slash command is a third surface that changes the
-    // behavior mode; it must also emit current_mode_update so the legacy modes
-    // surface stays in sync (#157), via the same shared helper.
-    let _ = client.take_update_kinds();
-    let setup_mode = client.request(
-        "session/prompt",
-        json!({
-            "sessionId": session_id,
-            "prompt": [ { "type": "text", "text": "/setup mode plan" } ]
-        }),
-    );
-    assert_response_ok(&case, "session/prompt (/setup mode)", &setup_mode, &client);
-    let slash_mode_update = client
-        .take_update_of_kind("current_mode_update")
-        .unwrap_or_else(|| {
-            panic!(
-                "{}: /setup mode did not emit current_mode_update (#157)",
-                case.name
-            )
-        });
-    assert_eq!(
-        slash_mode_update["currentModeId"].as_str(),
-        Some("PLAN"),
-        "{}: /setup mode emitted the wrong current_mode_update: {slash_mode_update}",
-        case.name
-    );
-
     assert!(
         !client.exited(),
         "{}: anvil exited during mode/config sync checks; stderr:\n{}\ntrace:\n{}",
