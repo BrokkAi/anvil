@@ -236,6 +236,76 @@ pub struct FunctionDef {
     pub parameters: serde_json::Value,
 }
 
+fn provider_compatible_tools(
+    model: &str,
+    mut tools: Option<Vec<ToolDefinition>>,
+) -> Option<Vec<ToolDefinition>> {
+    let remove_required = model.starts_with("google/gemini-");
+    let remove_combiners = remove_required || model.starts_with("moonshotai/kimi-");
+    if !remove_combiners {
+        return tools;
+    }
+
+    fn project_schema(value: &mut serde_json::Value, remove_required: bool) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+
+        for child in object.values_mut() {
+            if let serde_json::Value::Array(values) = child {
+                for value in values {
+                    project_schema(value, remove_required);
+                }
+            } else if child.is_object() {
+                project_schema(child, remove_required);
+            }
+        }
+
+        // Gemini's function-declaration schema is a strict OpenAPI subset. In
+        // particular it rejects JSON Schema conditionals such as
+        // `anyOf: [{required: [...]}, ...]`, even though they are valid JSON
+        // Schema and are emitted by MCP servers such as Bifrost.
+        object.remove("anyOf");
+        object.remove("oneOf");
+        object.remove("allOf");
+
+        if remove_required {
+            // Google's adapter can also reject a direct required property that
+            // is visibly present (notably Bifrost's `match` argument). Runtime
+            // validation remains authoritative, so omit the constraint.
+            object.remove("required");
+        } else if let Some(mut required) = object.remove("required") {
+            let property_names = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                });
+            if let (serde_json::Value::Array(names), Some(property_names)) =
+                (&mut required, property_names)
+            {
+                names.retain(|name| {
+                    name.as_str()
+                        .is_some_and(|name| property_names.contains(name))
+                });
+                if !names.is_empty() {
+                    object.insert("required".into(), required);
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = &mut tools {
+        for tool in tools {
+            project_schema(&mut tool.function.parameters, remove_required);
+        }
+    }
+    tools
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -1663,6 +1733,8 @@ impl OpenAiClient {
         } = request;
         let url = self.api_url("/chat/completions");
 
+        let tools = provider_compatible_tools(&model, tools);
+
         let tool_choice = tools.as_ref().map(|_| "auto".to_string());
 
         // Spell reasoning effort in this client's dialect. `stream_chat` has
@@ -1970,6 +2042,72 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn gemini_tool_projection_accepts_bifrost_conditional_schemas() {
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDef {
+                name: "scan_usages".into(),
+                description: "Find usages".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbols": {"type": "array", "items": {"type": "string"}},
+                        "targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "line": {"type": "integer"},
+                                    "start_byte": {"type": "integer"}
+                                },
+                                "required": ["path", "not_a_property"],
+                                "anyOf": [
+                                    {"required": ["line"]},
+                                    {"required": ["start_byte"]}
+                                ]
+                            }
+                        }
+                    },
+                    "anyOf": [
+                        {"required": ["symbols"]},
+                        {"required": ["targets"]}
+                    ]
+                }),
+            },
+        }];
+
+        let original_tools = tools.clone();
+        let projected =
+            provider_compatible_tools("google/gemini-3-flash-preview", Some(tools)).expect("tools");
+        let schema = &projected[0].function.parameters;
+        assert!(schema.get("anyOf").is_none());
+        assert!(
+            schema["properties"]["targets"]["items"]
+                .get("anyOf")
+                .is_none()
+        );
+        assert!(
+            schema["properties"]["targets"]["items"]
+                .get("required")
+                .is_none()
+        );
+
+        let kimi =
+            provider_compatible_tools("moonshotai/kimi-k2.7-code", Some(original_tools.clone()))
+                .expect("tools");
+        assert!(kimi[0].function.parameters.get("anyOf").is_none());
+        assert_eq!(
+            kimi[0].function.parameters["properties"]["targets"]["items"]["required"],
+            serde_json::json!(["path"])
+        );
+
+        let unchanged =
+            provider_compatible_tools("minimax/minimax-m3", Some(original_tools)).expect("tools");
+        assert!(unchanged[0].function.parameters.get("anyOf").is_some());
+    }
 
     fn collect_tokens() -> (TokenSink, Arc<Mutex<Vec<String>>>) {
         let collected = Arc::new(Mutex::new(Vec::<String>::new()));

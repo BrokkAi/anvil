@@ -1100,6 +1100,19 @@ pub(crate) struct SessionMetadata {
 // ---------------------------------------------------------------------------
 
 fn session_storage_root(cwd: &Path) -> PathBuf {
+    let configured = std::env::var_os("BROKK_SESSION_STORAGE_ROOT");
+    session_storage_root_with_override(cwd, configured.as_deref())
+}
+
+fn session_storage_root_with_override(cwd: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(configured);
+        return if root.is_absolute() {
+            root
+        } else {
+            cwd.join(root)
+        };
+    }
     let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     for ancestor in start.ancestors() {
         let git_marker = ancestor.join(".git");
@@ -7789,6 +7802,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn configured_session_storage_root_is_independent_of_workspace() {
+        let cwd = Path::new("/work/repo");
+        assert_eq!(
+            session_storage_root_with_override(
+                cwd,
+                Some(std::ffi::OsStr::new("/run/anvil-session")),
+            ),
+            PathBuf::from("/run/anvil-session")
+        );
+        assert_eq!(
+            session_storage_root_with_override(cwd, Some(std::ffi::OsStr::new("../session-state")),),
+            PathBuf::from("/work/repo/../session-state")
+        );
     }
 
     /// `list_sessions_from_disk` ignores non-zip files in the sessions
