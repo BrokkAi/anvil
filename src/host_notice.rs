@@ -180,11 +180,11 @@ fn recap_path_text(path: &Path) -> String {
 }
 
 fn render_changed_files(stats: &ToolCallStats) -> String {
-    let files = if stats.workspace_files.is_empty() {
-        &stats.tool_diff_files
-    } else {
-        &stats.workspace_files
-    };
+    let files: BTreeSet<&String> = stats
+        .tool_diff_files
+        .iter()
+        .chain(&stats.workspace_files)
+        .collect();
     if files.is_empty() {
         return "none".to_string();
     }
@@ -194,7 +194,7 @@ fn render_changed_files(stats: &ToolCallStats) -> String {
     let mut listed: Vec<String> = files
         .iter()
         .take(MAX_CHANGED_FILES_IN_RECAP)
-        .cloned()
+        .map(|path| (*path).clone())
         .collect();
     if total > MAX_CHANGED_FILES_IN_RECAP {
         listed.push(format!("+{} more", total - MAX_CHANGED_FILES_IN_RECAP));
@@ -475,6 +475,28 @@ mod tests {
 
         let persisted = format!("answer{recap}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
+    }
+
+    #[test]
+    fn changed_files_include_tool_and_workspace_sources() {
+        let delta = WorkspaceDelta::from_paths([PathBuf::from("src/from-shell.rs")]);
+        let stats = ToolCallStats::from_exchanges(&[ToolExchange {
+            call_id: "c1".into(),
+            tool_name: "edit".into(),
+            status: ToolExchangeStatus::Completed,
+            diff: Some(ToolExchangeDiff {
+                path: PathBuf::from("src/from-tool.rs"),
+                old_text: Some("old".into()),
+                new_text: "new".into(),
+            }),
+            ..ToolExchange::default()
+        }])
+        .with_workspace_delta(&delta);
+
+        assert_eq!(
+            render_changed_files(&stats),
+            "src/from-shell.rs, src/from-tool.rs"
+        );
     }
 
     #[test]

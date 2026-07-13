@@ -138,8 +138,7 @@ pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
     }
 
     error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<RetryableLlmError>())
+        .downcast_ref::<RetryableLlmError>()
         .map(RetryableLlmError::tier)
 }
 
