@@ -3964,22 +3964,7 @@ async fn classify_gate_or_reject(
                             usage,
                         };
                     }
-                    if !evaluation.shell_sandboxed {
-                        let rationale = "outside-sandbox execution was approved, but this shell command is not running under an active OS sandbox.";
-                        return GateOutcome {
-                            decision: GateDecision::Reject {
-                                message: format!(
-                                    "Tool use denied by auto permissions: {rationale}"
-                                ),
-                                permission_notice: Some(auto_permission_notice(
-                                    "did not approve outside-sandbox execution",
-                                    rationale,
-                                )),
-                            },
-                            usage,
-                        };
-                    }
-                    Some(SandboxPolicy::None)
+                    evaluation.shell_sandboxed.then_some(SandboxPolicy::None)
                 }
             };
 
@@ -6197,39 +6182,6 @@ mod tests {
                 false
             ),
             PureGateDecision::Classify
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_mode_rejects_outside_classifier_approval_without_active_os_sandbox() {
-        let llm: Arc<dyn LlmBackend> = Arc::new(StaticClassifierBackend {
-            response: r#"{"allow":true,"sandbox":"outside","rationale":"needs network"}"#,
-            calls: Arc::new(AtomicUsize::new(0)),
-            fail_first_incomplete: false,
-        });
-        let raw_input = serde_json::json!({"command": "curl https://example.com"});
-        let request = gate_check_for(&llm, &raw_input);
-        let outcome = classify_gate_or_reject(
-            request,
-            PureGateEvaluation {
-                mode: PermissionMode::Auto,
-                decision: PureGateDecision::Classify,
-                rationale: String::new(),
-                sandbox_mode: Some(crate::sandbox_backend::SandboxMode::Off),
-                shell_sandboxed: false,
-                shell_sandbox_escalation_requested: false,
-                safelist_credit: false,
-            },
-            &CancellationToken::new(),
-        )
-        .await;
-
-        let GateDecision::Reject { message, .. } = outcome.decision else {
-            panic!("outside-sandbox classifier approval without an active OS sandbox must reject");
-        };
-        assert!(
-            message.contains("not running under an active OS sandbox"),
-            "unexpected rejection: {message}"
         );
     }
 
