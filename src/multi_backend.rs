@@ -31,7 +31,8 @@ use crate::discovery::{
 #[cfg(test)]
 use crate::llm_client::IdleTimeouts;
 use crate::llm_client::{
-    LlmBackend, LlmResponse, ModelMetadata, ResolvedModelInfo, StreamChatRequest,
+    LlmBackend, LlmResponse, ModelDiscoveryNotice, ModelMetadata, ResolvedModelInfo,
+    StreamChatRequest,
 };
 
 const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -403,6 +404,24 @@ impl MultiBackend {
         progress: Option<UnboundedSender<String>>,
     ) -> Result<Vec<ModelMetadata>> {
         self.list_model_metadata_inner(progress).await
+    }
+
+    pub fn take_model_discovery_notices(&self) -> Vec<ModelDiscoveryNotice> {
+        let mut notices = Vec::new();
+        for backend in [
+            self.bedrock_snapshot(),
+            self.codex_snapshot(),
+            self.deepseek_snapshot(),
+            self.openrouter_snapshot(),
+            self.ollama.clone(),
+            self.ds4_snapshot(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            notices.extend(backend.take_model_discovery_notices());
+        }
+        notices
     }
 
     fn pick(&self, source: ModelSource) -> Option<Arc<dyn LlmBackend>> {

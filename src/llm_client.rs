@@ -670,6 +670,12 @@ impl ModelPricing {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDiscoveryNotice {
+    pub source: String,
+    pub message: String,
+}
+
 /// Richer model descriptor surfaced through `LlmBackend::list_model_metadata`.
 /// The `id` is the wire identifier the backend expects in `stream_chat`;
 /// the optional reasoning fields are populated only for backends whose
@@ -744,6 +750,10 @@ pub trait LlmBackend: Send + Sync {
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         let fut = self.list_models();
         Box::pin(async move { Ok(fut.await?.into_iter().map(ModelMetadata::id_only).collect()) })
+    }
+
+    fn take_model_discovery_notices(&self) -> Vec<ModelDiscoveryNotice> {
+        Vec::new()
     }
 
     /// Stream a chat completion. `reasoning_effort` is honored only by

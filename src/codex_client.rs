@@ -22,7 +22,7 @@
 //! a pragmatic compatibility choice, not impersonation: the user *is*
 //! authenticating with their own OAuth tokens.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -37,8 +37,9 @@ use crate::codex_auth::{AuthDotJson, is_stale, read_auth_dot_json, refresh_if_st
 use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, IdleTimeouts, IncompleteStreamError, LlmBackend,
-    LlmResponse, ModelMetadata, ModelServiceTier, OpenAiClient, OutputBudgetExhaustedError,
-    ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    LlmResponse, ModelDiscoveryNotice, ModelMetadata, ModelServiceTier, OpenAiClient,
+    OutputBudgetExhaustedError, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use crate::structured_output::{
     NativeResponseFormat, StructuredOutputRequest, native_response_format,
@@ -77,24 +78,25 @@ const ORIGINATOR: &str = "codex_cli_rs";
 /// `/config` prompt and the server forwards it verbatim.
 const FALLBACK_CHATGPT_MODEL: &str = "gpt-5-codex";
 
-/// `client_version` we report to the ChatGPT backend. The server uses
-/// it to gate per-model rollout via each `ModelInfo.minimal_client_version`:
-/// any model whose minimum exceeds the value we send is filtered out
-/// of `/models` before it reaches us. Sending our own crate version
-/// (e.g. `0.1.0`) signals we're a primitive client and the server
-/// hands back only the lowest-common-denominator entry, which is what
-/// produced the "single old model" picker.
+/// Fallback `client_version` we report to the ChatGPT backend if Codex's
+/// published model catalog cannot be fetched. The server uses this to gate
+/// per-model rollout via each `ModelInfo.minimal_client_version`: any model
+/// whose minimum exceeds the value we send is filtered out of `/models`
+/// before it reaches us. Sending Anvil's own crate version signals we're a
+/// primitive client and the server hands back only older models.
 ///
-/// We pin this to a recent Codex CLI release tag so we get the same
-/// model list the official client gets. Bump it when the picker starts
-/// hiding new models that codex itself shows. (Spec lives at
-/// `codex-rs/Cargo.toml#workspace.package.version`; current GitHub
-/// releases tag e.g. `rust-v0.129.0-alpha.10` resolve to a
-/// `client_version_to_whole()` of `0.129.0`.) This is a shim, not
-/// impersonation: the user *is* authenticating with their own OAuth
-/// tokens, we're just declaring "I can handle any model Codex CLI
-/// at this version can handle."
-const CODEX_COMPAT_CLIENT_VERSION: &str = "0.129.0";
+/// This is a compatibility floor, not impersonation: the user *is*
+/// authenticating with their own OAuth tokens, we're just declaring "I can
+/// handle any model Codex CLI at this version can handle." Keep it at or
+/// above the newest model gate we have verified.
+const FALLBACK_CODEX_COMPAT_CLIENT_VERSION: &str = "0.144.0";
+
+/// Codex's checked-in model catalog. We use the maximum visible
+/// `minimal_client_version` from this manifest as the `/codex/models`
+/// client version so Anvil tracks newly published Codex model gates without
+/// depending on a locally installed Codex CLI.
+const CODEX_MODELS_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
 
 /// LLM backend that proxies to the ChatGPT subscription via the
 /// Responses API. Reads `~/.codex/auth.json` on every request and
@@ -106,6 +108,7 @@ pub struct CodexClient {
     /// endpoint and one of the resulting `refresh_token` values gets
     /// invalidated by the server's rotation policy.
     refresh_lock: Arc<Mutex<()>>,
+    discovery_notices: Arc<StdMutex<Vec<ModelDiscoveryNotice>>>,
 }
 
 impl std::fmt::Debug for CodexClient {
@@ -156,6 +159,7 @@ impl CodexClient {
         Self {
             http,
             refresh_lock: Arc::new(Mutex::new(())),
+            discovery_notices: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -326,6 +330,7 @@ impl CodexClient {
     /// *something*; the user can override via `--default-model` or the
     /// `/config` model picker.
     async fn list_model_metadata_impl(&self) -> Result<Vec<ModelMetadata>> {
+        self.clear_discovery_notices();
         let creds = match self.load_credentials().await {
             Ok(c) => c,
             Err(e) => {
@@ -334,7 +339,12 @@ impl CodexClient {
             }
         };
         match fetch_chatgpt_models(&self.http, &creds).await {
-            Ok(models) if !models.is_empty() => Ok(models),
+            Ok((models, notice)) if !models.is_empty() => {
+                if let Some(notice) = notice {
+                    self.push_discovery_notice(notice);
+                }
+                Ok(models)
+            }
             Ok(_) => {
                 tracing::warn!(
                     "ChatGPT /models endpoint returned no slugs; falling back to {FALLBACK_CHATGPT_MODEL}"
@@ -348,6 +358,23 @@ impl CodexClient {
                 Ok(vec![ModelMetadata::id_only(FALLBACK_CHATGPT_MODEL)])
             }
         }
+    }
+
+    fn clear_discovery_notices(&self) {
+        self.discovery_notices
+            .lock()
+            .expect("Codex discovery notice lock poisoned")
+            .clear();
+    }
+
+    fn push_discovery_notice(&self, message: impl Into<String>) {
+        self.discovery_notices
+            .lock()
+            .expect("Codex discovery notice lock poisoned")
+            .push(ModelDiscoveryNotice {
+                source: "Codex".to_string(),
+                message: message.into(),
+            });
     }
 }
 
@@ -365,10 +392,11 @@ impl CodexClient {
 async fn fetch_chatgpt_models(
     http: &reqwest::Client,
     creds: &ChatGptCredentials,
-) -> Result<Vec<ModelMetadata>> {
+) -> Result<(Vec<ModelMetadata>, Option<String>)> {
+    let (client_version, notice) = resolve_codex_compat_client_version(http).await;
     let url = format!(
         "{CHATGPT_MODELS_URL}?client_version={}",
-        urlencode(CODEX_COMPAT_CLIENT_VERSION)
+        urlencode(&client_version)
     );
     let resp = crate::http_retry::send_with_retries(
         "GET /models",
@@ -435,7 +463,7 @@ async fn fetch_chatgpt_models(
         models.len(),
         models.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>()
     );
-    Ok(models
+    let metadata = models
         .into_iter()
         .map(|m| ModelMetadata {
             id: m.slug,
@@ -456,7 +484,8 @@ async fn fetch_chatgpt_models(
             context_length: None,
             pricing: None,
         })
-        .collect())
+        .collect();
+    Ok((metadata, notice))
 }
 
 /// Render up to `limit` bytes of `body` as a debug-safe string. Used
@@ -477,10 +506,124 @@ fn body_excerpt(body: &[u8], limit: usize) -> String {
     }
 }
 
+async fn resolve_codex_compat_client_version(http: &reqwest::Client) -> (String, Option<String>) {
+    match fetch_codex_models_manifest_client_version(http).await {
+        Ok(Some(version)) => {
+            tracing::info!(
+                client_version = %version,
+                "using Codex models manifest client_version for ChatGPT model discovery"
+            );
+            (version, None)
+        }
+        Ok(None) => {
+            let message = format!(
+                "Codex models manifest did not advertise any visible minimal_client_version; \
+                 using fallback client_version {FALLBACK_CODEX_COMPAT_CLIENT_VERSION}."
+            );
+            tracing::warn!(message);
+            (
+                FALLBACK_CODEX_COMPAT_CLIENT_VERSION.to_string(),
+                Some(message),
+            )
+        }
+        Err(e) => {
+            let message = format!(
+                "Could not fetch Codex models manifest; using fallback client_version \
+                 {FALLBACK_CODEX_COMPAT_CLIENT_VERSION}."
+            );
+            tracing::warn!(
+                ?e,
+                fallback = FALLBACK_CODEX_COMPAT_CLIENT_VERSION,
+                "failed to fetch Codex models manifest; using fallback client_version"
+            );
+            (
+                FALLBACK_CODEX_COMPAT_CLIENT_VERSION.to_string(),
+                Some(message),
+            )
+        }
+    }
+}
+
+async fn fetch_codex_models_manifest_client_version(
+    http: &reqwest::Client,
+) -> Result<Option<String>> {
+    let resp = crate::http_retry::send_with_retries(
+        "GET Codex models manifest",
+        || {
+            http.get(CODEX_MODELS_MANIFEST_URL)
+                .header("Accept", "application/json")
+        },
+        None,
+    )
+    .await?;
+    let status = resp.status();
+    let body_bytes = resp
+        .bytes()
+        .await
+        .context("reading Codex models manifest response body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "Codex models manifest returned HTTP {status}: {}",
+            body_excerpt(&body_bytes, 256)
+        );
+    }
+    let parsed: CodexModelsManifest = serde_json::from_slice(&body_bytes).with_context(|| {
+        format!(
+            "parsing Codex models manifest JSON (excerpt: {})",
+            body_excerpt(&body_bytes, 256)
+        )
+    })?;
+    Ok(latest_visible_minimal_client_version(&parsed.models))
+}
+
+fn latest_visible_minimal_client_version(models: &[CodexManifestModelEntry]) -> Option<String> {
+    models
+        .iter()
+        .filter(|m| m.visibility.as_deref() == Some("list"))
+        .filter_map(|m| m.minimal_client_version.as_deref())
+        .filter_map(parse_version_triple)
+        .max()
+        .map(format_version_triple)
+}
+
+fn parse_version_triple(input: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = input.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch_part = parts.next()?;
+    let patch_digits = patch_part
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if patch_digits.is_empty() {
+        return None;
+    }
+    let patch = patch_digits.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn format_version_triple((major, minor, patch): (u64, u64, u64)) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatGptModelsResponse {
     #[serde(default)]
     models: Vec<ChatGptModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelsManifest {
+    #[serde(default)]
+    models: Vec<CodexManifestModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexManifestModelEntry {
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    minimal_client_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,6 +702,15 @@ impl LlmBackend for CodexClient {
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         Box::pin(self.list_model_metadata_impl())
+    }
+
+    fn take_model_discovery_notices(&self) -> Vec<ModelDiscoveryNotice> {
+        std::mem::take(
+            &mut *self
+                .discovery_notices
+                .lock()
+                .expect("Codex discovery notice lock poisoned"),
+        )
     }
 
     fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
@@ -2030,6 +2182,40 @@ mod tests {
 
         assert_eq!(text.lock().unwrap().as_str(), "hello");
         assert_eq!(thought.lock().unwrap().as_str(), "weigh options");
+    }
+
+    #[test]
+    fn fallback_codex_compat_client_version_meets_current_model_gate() {
+        // Keep this at or above the newest `minimal_client_version` we
+        // have verified. If manifest fetch fails and this drifts low,
+        // ChatGPT /codex/models silently hides newly rolled-out models.
+        assert_eq!(FALLBACK_CODEX_COMPAT_CLIENT_VERSION, "0.144.0");
+    }
+
+    #[test]
+    fn extracts_latest_visible_minimal_client_version_from_manifest() {
+        let models = vec![
+            CodexManifestModelEntry {
+                visibility: Some("list".to_string()),
+                minimal_client_version: Some("0.143.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("hide".to_string()),
+                minimal_client_version: Some("0.200.0".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("list".to_string()),
+                minimal_client_version: Some("0.144.0-alpha.10".to_string()),
+            },
+            CodexManifestModelEntry {
+                visibility: Some("none".to_string()),
+                minimal_client_version: Some("0.300.0".to_string()),
+            },
+        ];
+        assert_eq!(
+            latest_visible_minimal_client_version(&models),
+            Some("0.144.0".to_string())
+        );
     }
 
     #[test]
