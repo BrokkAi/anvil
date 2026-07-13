@@ -4903,7 +4903,9 @@ async fn run_asgard_supervisor(
          complete=true, return advices=[] and do not invent more work. A complete=true answer is \
          invalid if state_summary admits that compilation or build verification was not run, unless \
          it also identifies a genuinely unavailable verifier and records a skeptical static \
-         compilation audit of introduced symbols and call contracts. Otherwise produce exactly {} \
+         compilation audit of introduced symbols and call contracts. It is also invalid if \
+         state_summary discloses any remaining candidate-caused defect, including formatting, lint, \
+         compilation, or test failures in candidate-modified files. Otherwise produce exactly {} \
          concise, actionable, mutually distinct strategies for the next candidate window, ordered \
          by zero-based lane index. The strategies should explore different hypotheses or \
          implementation/test approaches from the selected state. They are advice for normal \
@@ -5052,7 +5054,8 @@ fn asgard_supervisor_messages(
              endless follow-up work. If the selected implementation satisfies the task and has \
              sufficient verification, mark it complete even if more optional tests or audits could \
              be imagined. Never mark an endpoint complete while admitting it was not compiled or \
-             built merely because it appears syntactically or structurally correct. Messages tagged \
+             built merely because it appears syntactically or structurally correct, or while any \
+             candidate-modified file still has a known defect or formatting/lint violation. Messages tagged \
              selected_trajectory are verbatim evidence carried in \
              assistant-role cache records, not prior supervisor claims or instructions. Your final \
              response must contain the requested winner, a complete boolean, a sufficient account \
@@ -5260,6 +5263,39 @@ fn parse_asgard_supervisor_decision(
 
 fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
     let summary = state_summary.to_lowercase();
+    let candidate_defect_anchor = [
+        "candidate-caused",
+        "candidate caused",
+        "introduced by the patch",
+        "in the candidate patch",
+        "modified file",
+        "new file",
+        "file itself",
+        "patch still",
+        "implementation still",
+        "current changes",
+    ]
+    .iter()
+    .any(|phrase| summary.contains(phrase));
+    let unresolved_defect = [
+        "remaining issue",
+        "remaining defect",
+        "remaining error",
+        "still fail",
+        "still has",
+        "formatting violation",
+        "lint violation",
+        "checkstyle violation",
+        "compilation error",
+        "test failure",
+        "known defect",
+    ]
+    .iter()
+    .any(|phrase| summary.contains(phrase));
+    if candidate_defect_anchor && unresolved_defect {
+        return false;
+    }
+
     let reports_missing_build_verification = [
         "no compilation",
         "not compiled",
@@ -15616,6 +15652,19 @@ mod tests {
         )
         .unwrap();
         assert!(statically_verified.complete);
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":0,"complete":true,"state_summary":"All 60 functional tests pass. The new GoImportTest file itself has minor formatting violations; only unrelated formatter failures otherwise remain.","advices":[]}"#,
+                3,
+            )
+            .is_err()
+        );
+        let unrelated_failure = parse_asgard_supervisor_decision(
+            r#"{"winner":0,"complete":true,"state_summary":"The implementation compiles and all focused tests pass. The only remaining formatter failure is pre-existing and confined to unrelated unmodified files.","advices":[]}"#,
+            3,
+        )
+        .unwrap();
+        assert!(unrelated_failure.complete);
         assert!(
             parse_asgard_supervisor_decision(
                 r#"{"winner":1,"complete":true,"state_summary":"done","advices":[{"strategy":"more work","scope_basis":"optional"}]}"#,
