@@ -5054,10 +5054,12 @@ fn asgard_supervisor_messages(
              verification remains. Successful focused builds/tests or comparably strong evidence \
              are sufficient; optional extra tests, broader audits, cleanup, and nice-to-have coverage \
              must not keep complete=false. When complete=true, return advices=[] and do not invent \
-             more work. A complete=true answer is invalid if state_summary admits that compilation \
-             or build verification was not run, unless it also identifies a genuinely unavailable \
-             verifier and records a skeptical static compilation audit of introduced symbols and \
-             call contracts. It is also invalid if state_summary discloses any remaining \
+             more work. For complete=true, state_summary must affirm which task-relevant build, \
+             compilation, test, lint, or equivalent verification actually ran and passed. Omission \
+             of affirmative verification evidence makes the answer invalid. The only exception is \
+             a genuinely unavailable verifier, which state_summary must identify together with a \
+             skeptical static compilation audit of introduced symbols and call contracts. It is \
+             also invalid if state_summary discloses any remaining \
              candidate-caused defect, including formatting, lint, compilation, or test failures in \
              candidate-modified files. Otherwise produce exactly {candidate_count} concise, \
              actionable, mutually distinct strategies for the next candidate window, ordered by \
@@ -5307,6 +5309,32 @@ fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
         return false;
     }
 
+    if [
+        "test failed",
+        "tests failed",
+        "test fails",
+        "tests fail",
+        "test did not pass",
+        "tests did not pass",
+        "test does not pass",
+        "tests do not pass",
+        "build failed",
+        "build fails",
+        "compilation failed",
+        "compilation fails",
+        "compile failed",
+        "compile fails",
+        "lint failed",
+        "lint fails",
+        "verification failed",
+        "verification fails",
+    ]
+    .iter()
+    .any(|phrase| summary.contains(phrase))
+    {
+        return false;
+    }
+
     let reports_missing_build_verification = [
         "no compilation",
         "not compiled",
@@ -5325,10 +5353,6 @@ fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
     ]
     .iter()
     .any(|phrase| summary.contains(phrase));
-    if !reports_missing_build_verification {
-        return true;
-    }
-
     // A genuinely unavailable verifier can be replaced by the skeptical
     // static compilation audit required by the supervisor prompt. Merely
     // saying an uncompiled patch "appears" correct is self-contradictory
@@ -5354,7 +5378,67 @@ fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
     let reports_static_audit = summary.contains("static audit")
         || summary.contains("statically audited")
         || summary.contains("static compilation audit");
-    verifier_unavailable && reports_static_audit
+    if reports_missing_build_verification {
+        return verifier_unavailable && reports_static_audit;
+    }
+
+    // Fail closed on omission. A completion claim must name affirmative
+    // verification evidence, rather than forcing the parser to infer success
+    // from the absence of an admitted failure. This also prevents a generic
+    // "static audit looks correct" from silently replacing an available
+    // compiler or test suite.
+    [
+        "test passes",
+        "tests pass",
+        "test passed",
+        "tests passed",
+        "test passing",
+        "tests passing",
+        "test suite passes",
+        "test suite passed",
+        "all tests pass",
+        "all tests passed",
+        "tests all pass",
+        "tests all passed",
+        "tests, which all pass",
+        "tests, which all passed",
+        "tests are complete",
+        "focused tests are complete",
+        "build succeeds",
+        "build succeeded",
+        "build passes",
+        "build passed",
+        "build successfully",
+        "builds successfully",
+        "build is successful",
+        "built successfully",
+        "clean build",
+        "compiles successfully",
+        "compiled successfully",
+        "compiles cleanly",
+        "compilation succeeds",
+        "compilation succeeded",
+        "compilation passes",
+        "compilation passed",
+        "zero compile errors",
+        "zero compilation errors",
+        "lint passes",
+        "lint passed",
+        "linter passes",
+        "linter passed",
+        "gofmt passed",
+        "go vet passed",
+        "cargo check passed",
+        "typecheck passed",
+        "type-check passed",
+        "checkstyle passed",
+        "verification succeeds",
+        "verification succeeded",
+        "verified by running",
+        "verified with",
+    ]
+    .iter()
+    .any(|phrase| summary.contains(phrase))
 }
 
 fn filter_asgard_advice_scope(
@@ -15698,6 +15782,13 @@ mod tests {
         )
         .unwrap();
         assert!(statically_verified.complete);
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":2,"complete":true,"state_summary":"Lane 2 completed all required changes and matches the task. No known defects. A static audit found the structure plausible.","advices":[]}"#,
+                3,
+            )
+            .is_err()
+        );
         assert!(
             parse_asgard_supervisor_decision(
                 r#"{"winner":0,"complete":true,"state_summary":"All 60 functional tests pass. The new GoImportTest file itself has minor formatting violations; only unrelated formatter failures otherwise remain.","advices":[]}"#,
