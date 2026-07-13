@@ -4835,7 +4835,12 @@ async fn run_asgard_supervisor(
          requires it, never advise changing dependencies, build configuration, warning policy, test \
          selection, or test expectations merely to make an unrelated failure disappear. Instead advise \
          focused verification or continued task work while preserving the failure as a reported \
-         limitation. After choosing, produce \
+         limitation. \
+         A task may name a verifier that is deliberately absent from the candidate checkout. \
+         Absence alone is unavailable verification, not an implicit requirement to recreate that \
+         test. Unless the task explicitly asks for new tests, do not reward or recommend authoring a \
+         substitute merely to make a named test filter exist; prefer production correctness, \
+         available verification, and a focused static audit. After choosing, produce \
          exactly {} concise, actionable, mutually distinct strategies for the next candidate \
          window, ordered by zero-based lane index. The strategies should explore different \
          hypotheses or implementation/test approaches from the selected state. They are advice \
@@ -4948,7 +4953,10 @@ fn asgard_supervisor_messages(original_task: &str, dossier: String) -> Vec<ChatM
              invalid. If execution is environmentally blocked, skeptically audit introduced symbols, \
              types, namespaces, imports, signatures, and call contracts from the supplied evidence. \
              Never describe an uncompiled patch as correct merely because its tests or structure look \
-             plausible. Do not manufacture endless follow-up work: when the implementation appears \
+             plausible. A named verifier may be intentionally absent from the checkout; unless the \
+             task explicitly requests new tests, do not infer an obligation to recreate it or favor a \
+             candidate-authored substitute over a verified production patch. Do not manufacture \
+             endless follow-up work: when the implementation appears \
              complete and only environmental verification failures remain, give each lane one bounded, \
              distinct high-risk audit or tell it to conclude and report if no task-relevant action \
              remains. Your final response must contain the \
@@ -15541,6 +15549,8 @@ mod tests {
         assert!(!asgard_message_text(&first[0]).contains("window one"));
         assert!(asgard_message_text(&first[0]).contains("HARD SCOPE CONSTRAINT"));
         assert!(asgard_message_text(&first[0]).contains("dependency-audit"));
+        assert!(asgard_message_text(&first[0]).contains("named verifier"));
+        assert!(asgard_message_text(&first[0]).contains("intentionally absent"));
     }
 
     #[test]
