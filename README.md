@@ -269,7 +269,9 @@ Built-in commands:
 - `/mcp`: list and configure stdio MCP servers.
 - `/plugin`: list, install, update, enable, disable, or remove Claude
   Code-format plugins.
-- `/pr-create [title]`: create a GitHub pull request from the current branch.
+- `/pr-create [title]`: create a GitHub pull request from the current branch. If
+  the working tree is dirty, Anvil stages all changes and commits them first
+  (using the title as the commit message when provided).
 
 Skill slash commands are discovered from `SKILL.md` files under
 `$CODEX_HOME/skills` (or `~/.codex/skills`), `~/.claude/skills`,
