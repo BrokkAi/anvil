@@ -1494,7 +1494,7 @@ pub async fn run_agent(
     // hold this owned Mutex via try_lock_owned: when a refresh is already
     // in flight, the next try_lock returns None and we skip the spawn.
     //
-    // The same lock is shared with the `/codex-login` post-install
+    // The same lock is shared with the `/setup codex` post-install
     // refresh below so an immediate session/new after login doesn't race
     // a second probe through the discovery path.
     let refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -5032,7 +5032,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// Post-login bookkeeping shared by the browser and elicitation Codex login
+/// Post-login bookkeeping shared by the text and elicitation Codex login
 /// paths: install the freshly-built backend, kick a background catalog
 /// refresh, and return the user-facing message. Pure aside from those two
 /// side effects, so both entry points stay byte-for-byte identical.
@@ -5092,33 +5092,24 @@ fn finish_codex_login(
     }
 }
 
-/// Handle the `/codex-login` slash command and its subcommands.
-/// Subcommands: bare = start interactive login, `status` = report what's
-/// stored, `disconnect` = wipe the local credentials.
+/// Handle `/setup codex` and its subcommands.
+/// Subcommands: bare/`login` = start device-code login, `status` = report
+/// what's stored, `disconnect` = wipe the local credentials.
 ///
-/// On a successful bare login we install the freshly-built Codex
-/// backend into `MultiBackend` so the next `session/new` (and any
-/// subsequent `codex::*` route) picks it up without a server restart.
-/// Without this, the empty-at-startup `Option` captured at
-/// construction would remain `None` forever and the new credentials
-/// would be unreachable until restart -- the behaviour issue #3555
-/// reported.
-async fn handle_codex_login(
-    prompt_text: &str,
+/// On a successful login we install the freshly-built Codex backend into
+/// `MultiBackend` so the next `session/new` (and any subsequent `codex::*`
+/// route) picks it up without a server restart. Without this, the
+/// empty-at-startup `Option` captured at construction would remain `None`
+/// forever and the new credentials would be unreachable until restart.
+async fn handle_setup_codex(
+    rest: &str,
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
-    cx: Option<&ConnectionTo<Client>>,
-    session_id: Option<&str>,
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
 ) -> String {
-    let arg = prompt_text
-        .trim()
-        .strip_prefix('/')
-        .unwrap_or("")
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let arg = rest.trim().to_ascii_lowercase();
 
     match arg.as_str() {
         "status" => match crate::codex_auth::read_auth_dot_json() {
@@ -5171,13 +5162,11 @@ async fn handle_codex_login(
                     refresh_lock.clone(),
                     llm.clone(),
                     sessions.clone(),
-                    cx.zip(session_id).map(|(cx, session_id)| {
-                        (
-                            cx.clone(),
-                            session_id.to_string(),
-                            "Refreshing model catalog after Codex disconnect...",
-                        )
-                    }),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Codex disconnect...",
+                    )),
                     None,
                 );
                 "Codex credentials cleared and the in-memory backend was unloaded; \
@@ -5186,12 +5175,54 @@ async fn handle_codex_login(
             }
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
         },
-        "" => match crate::codex_auth::interactive_login().await {
-            Ok(auth) => finish_codex_login(auth, llm, sessions, refresh_lock, cx, session_id),
-            Err(e) => format!("Codex login failed: {e:#}"),
-        },
+        "" | "login" | "browser" | "login browser" => {
+            match crate::codex_auth::interactive_browser_login_with(|auth_url| async move {
+                let opened = webbrowser::open(&auth_url).is_ok();
+                let prefix = if opened {
+                    "Codex browser sign-in started. Waiting for the localhost callback."
+                } else {
+                    "Codex browser sign-in started, but Anvil could not open a browser automatically."
+                };
+                send_message(
+                    cx,
+                    session_id,
+                    &format!(
+                        "{prefix}\n\nOpen this URL on this machine to sign in:\n\n  {auth_url}\n\nIf localhost callbacks do not work for this client, run `/setup codex device` instead."
+                    ),
+                );
+                Ok(())
+            })
+            .await
+            {
+                Ok(auth) => {
+                    finish_codex_login(auth, llm, sessions, refresh_lock, Some(cx), Some(session_id))
+                }
+                Err(e) => format!("Codex login failed: {e:#}"),
+            }
+        }
+        "device" | "login device" => {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            match crate::codex_auth::interactive_device_login_with(&cancel, |prompt| async move {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!(
+                        "Codex device sign-in started. Open this link on any device and enter the one-time code.\n\n  URL: {}\n  Code: `{}`\n\nThis flow does not use a localhost callback, so it works from SSH and remote clients.",
+                        prompt.verification_url, prompt.user_code
+                    ),
+                );
+                Ok(())
+            })
+            .await
+            {
+                Ok(auth) => {
+                    finish_codex_login(auth, llm, sessions, refresh_lock, Some(cx), Some(session_id))
+                }
+                Err(e) => format!("Codex login failed: {e:#}"),
+            }
+        }
         other => format!(
-            "Unknown subcommand `{other}`. Try: /setup codex | /setup codex status | /setup codex disconnect"
+            "Unknown subcommand `{other}`. Try: /setup codex | /setup codex browser | /setup codex device | /setup codex status | /setup codex disconnect"
         ),
     }
 }
@@ -5251,7 +5282,7 @@ async fn handle_openrouter_login(
     // ASCII with no spaces in practice, but we trim defensively so a
     // user who pasted with trailing spaces doesn't see a "key was empty"
     // bounce. `status` and `disconnect` are case-insensitive to match
-    // the `/codex-login` ergonomics.
+    // the `/setup codex` ergonomics.
     let after_cmd = prompt_text
         .trim()
         .strip_prefix('/')
@@ -6505,7 +6536,7 @@ enum SetupElicitTarget {
     Home,
     /// `/setup sandbox` with no explicit value -> single-select form menu.
     Sandbox,
-    /// `/setup codex` (or `/setup codex login`) -> URL-mode sign-in prompt.
+    /// `/setup codex` (or `/setup codex login`) -> form-mode auth-method menu.
     CodexLogin,
     /// `/setup openrouter` with no explicit value -> form-mode key entry.
     OpenRouterLogin,
@@ -6523,8 +6554,9 @@ impl SetupElicitTarget {
             Self::Home => caps.form,
             // Sandbox is a form-mode (menu) elicitation.
             Self::Sandbox => caps.form,
-            // Codex sign-in is a url-mode (open-this-link) elicitation.
-            Self::CodexLogin => caps.url,
+            // Good clients get a form menu to choose browser vs device auth,
+            // then a URL prompt for the selected auth URL.
+            Self::CodexLogin => caps.form && caps.url,
             // OpenRouter key entry is a form-mode (text field) elicitation.
             Self::OpenRouterLogin => caps.form,
             // Hosted-provider secrets use form fields so they never enter the
@@ -6552,8 +6584,8 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
         // Bare `/setup` (no sub-command) -> the single interactive entry point.
         "" => Some(SetupElicitTarget::Home),
         "sandbox" if rest.is_empty() => Some(SetupElicitTarget::Sandbox),
-        // Bare `/setup codex` / `/setup codex login` start interactive sign-in;
-        // `status` / `disconnect` are not prompts and keep the text flow.
+        // Bare `/setup codex` / `/setup codex login` open a method menu;
+        // explicit methods and status/disconnect keep the text flow.
         "codex" if rest.is_empty() || rest == "login" => Some(SetupElicitTarget::CodexLogin),
         // Bare `/setup openrouter` collects the API key via a form field;
         // `key <k>` / `status` / `disconnect` keep the text flow.
@@ -6634,12 +6666,16 @@ async fn run_setup_elicitation(
 /// Stable id for the Codex sign-in elicitation. The ACP request is additionally
 /// scoped by `sessionId`, so this id can safely be reused by concurrent sessions
 /// while pairing each request with its `elicitation/complete` notification.
-const CODEX_LOGIN_ELICITATION_ID: &str = "codex-login";
+const CODEX_LOGIN_ELICITATION_ID: &str = "setup-codex";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLoginMethod {
+    Browser,
+    Device,
+}
 
-/// `/setup codex` as a URL-mode device sign-in prompt. The short verification
-/// URL and one-time code are usable from SSH without a loopback callback or
-/// port forwarding. Decline/Cancel (or a transport error) abort the login and
-/// leave credentials untouched.
+/// `/setup codex` as a form-mode auth-method menu. Good clients let the user
+/// choose browser OAuth or device authorization; text fallback clients still use
+/// the default browser path via `handle_setup_codex`.
 async fn run_setup_codex_login_elicitation(
     spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
     sessions: &SessionStore,
@@ -6650,28 +6686,66 @@ async fn run_setup_codex_login_elicitation(
 ) {
     let cx = spawned_cx.cx();
 
-    let result = crate::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
-        let request = build_codex_login_elicitation_request(
-            session_id,
-            prompt.verification_url,
-            &prompt.user_code,
-        );
-        match cx.send_request(request).block_task().await {
-            Ok(resp) => match resp.action {
-                ElicitationAction::Accept(_) => Ok(()),
-                ElicitationAction::Decline | ElicitationAction::Cancel => {
-                    Err(anyhow::anyhow!("sign-in was cancelled"))
-                }
-                // `ElicitationAction` is `#[non_exhaustive]`.
-                _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
-            },
-            Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+    let method = match request_codex_login_method(cx, session_id, cancel).await {
+        Ok(Some(method)) => method,
+        Ok(None) => {
+            send_message(
+                cx,
+                session_id,
+                "Codex setup cancelled; credentials are unchanged.",
+            );
+            return;
         }
-    })
-    .await;
+        Err(e) => {
+            tracing::warn!("/setup codex method elicitation failed: {e}");
+            send_message(
+                cx,
+                session_id,
+                "Setup could not show the Codex sign-in method menu; credentials are unchanged.",
+            );
+            return;
+        }
+    };
 
-    // URL elicitations remain open while device authorization is polling.
-    // Always dismiss the client surface, including timeout/cancel/error paths.
+    let result = match method {
+        CodexLoginMethod::Browser => {
+            crate::codex_auth::interactive_browser_login_with(|auth_url| async move {
+                let request = build_codex_browser_login_elicitation_request(session_id, auth_url);
+                match cx.send_request(request).block_task().await {
+                    Ok(resp) => match resp.action {
+                        ElicitationAction::Accept(_) => Ok(()),
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            Err(anyhow::anyhow!("sign-in was cancelled"))
+                        }
+                        _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+                }
+            })
+            .await
+        }
+        CodexLoginMethod::Device => {
+            crate::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
+                let request = build_codex_device_login_elicitation_request(
+                    session_id,
+                    prompt.verification_url,
+                    &prompt.user_code,
+                );
+                match cx.send_request(request).block_task().await {
+                    Ok(resp) => match resp.action {
+                        ElicitationAction::Accept(_) => Ok(()),
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            Err(anyhow::anyhow!("sign-in was cancelled"))
+                        }
+                        _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+                }
+            })
+            .await
+        }
+    };
+
     notify_elicitation_complete(cx, CODEX_LOGIN_ELICITATION_ID);
 
     match result {
@@ -6698,9 +6772,76 @@ async fn run_setup_codex_login_elicitation(
     }
 }
 
+async fn request_codex_login_method(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<CodexLoginMethod>> {
+    let request = build_codex_login_method_elicitation_request(session_id);
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(None),
+        response = cx.send_request(request).block_task() => response,
+    }
+    .map_err(|e| anyhow::anyhow!("could not show the Codex sign-in method menu: {e}"))?;
+    Ok(parse_codex_login_method(&response.action))
+}
+
+fn parse_codex_login_method(action: &ElicitationAction) -> Option<CodexLoginMethod> {
+    let ElicitationAction::Accept(accept) = action else {
+        return None;
+    };
+    accept
+        .content
+        .as_ref()
+        .and_then(|content| content.get("method"))
+        .and_then(|value| match value {
+            ElicitationContentValue::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .and_then(|method| match method {
+            "browser" => Some(CodexLoginMethod::Browser),
+            "device" => Some(CodexLoginMethod::Device),
+            _ => None,
+        })
+}
+
+fn build_codex_login_method_elicitation_request(session_id: &str) -> CreateElicitationRequest {
+    let field = StringPropertySchema::new()
+        .title("Codex sign-in method")
+        .description("Browser is usually easiest. Device code is best for SSH, remote, or browser-hostile clients.")
+        .one_of(vec![
+            EnumOption::new("browser", "Browser sign-in (localhost callback)"),
+            EnumOption::new("device", "Device code (works from any device)"),
+        ])
+        .default_value("browser");
+
+    let schema = ElicitationSchema::new()
+        .title("Codex sign-in")
+        .property("method", field, true);
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "How do you want to sign in to Codex / ChatGPT?")
+}
+
+fn build_codex_browser_login_elicitation_request(
+    session_id: &str,
+    auth_url: String,
+) -> CreateElicitationRequest {
+    let mode = ElicitationUrlMode::new(
+        ElicitationSessionScope::new(session_id.to_string()),
+        CODEX_LOGIN_ELICITATION_ID,
+        auth_url,
+    );
+    CreateElicitationRequest::new(
+        mode,
+        "Open this link to sign in to ChatGPT. The browser will return to Anvil on localhost when complete.".to_string(),
+    )
+}
+
 /// Build the URL-mode `elicitation/create` request carrying the ChatGPT
-/// authorize URL for the client to open.
-fn build_codex_login_elicitation_request(
+/// device verification URL for the client to open.
+fn build_codex_device_login_elicitation_request(
     session_id: &str,
     verification_url: String,
     user_code: &str,
@@ -7352,18 +7493,13 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             }
         }
         "codex" => {
-            let codex_prompt = if rest.is_empty() || rest == "login" {
-                "/codex-login".to_string()
-            } else {
-                format!("/codex-login {rest}")
-            };
-            let mut out = handle_codex_login(
-                &codex_prompt,
+            let mut out = handle_setup_codex(
+                rest,
                 ctx.llm,
                 ctx.login_sessions,
                 ctx.refresh_lock,
-                Some(ctx.cx),
-                Some(session_id),
+                ctx.cx,
+                session_id,
             )
             .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
@@ -14016,8 +14152,8 @@ mod tests {
         }));
     }
 
-    /// `/setup codex` and `/setup codex login` start an interactive sign-in;
-    /// `status` / `disconnect` are not prompts and keep the text flow.
+    /// `/setup codex` and `/setup codex login` open the auth-method menu;
+    /// explicit methods, `status`, and `disconnect` keep the text flow.
     #[test]
     fn setup_elicitation_target_recognizes_codex_login() {
         assert_eq!(
@@ -14028,14 +14164,15 @@ mod tests {
             setup_elicitation_target("/setup codex login"),
             Some(SetupElicitTarget::CodexLogin)
         );
+        assert_eq!(setup_elicitation_target("/setup codex browser"), None);
+        assert_eq!(setup_elicitation_target("/setup codex device"), None);
         assert_eq!(setup_elicitation_target("/setup codex status"), None);
         assert_eq!(setup_elicitation_target("/setup codex disconnect"), None);
     }
 
-    /// Codex sign-in is a url-mode elicitation, so it needs the client's `url`
-    /// capability; `form` alone is not enough.
+    /// Codex sign-in needs both form (method menu) and url (auth link) support.
     #[test]
-    fn codex_login_target_requires_url_capability() {
+    fn codex_login_target_requires_form_and_url_capabilities() {
         use crate::session::ClientElicitationCaps;
         let t = SetupElicitTarget::CodexLogin;
         assert!(!t.is_supported(ClientElicitationCaps::default()));
@@ -14043,18 +14180,66 @@ mod tests {
             form: true,
             url: false,
         }));
-        assert!(t.is_supported(ClientElicitationCaps {
+        assert!(!t.is_supported(ClientElicitationCaps {
             form: false,
+            url: true,
+        }));
+        assert!(t.is_supported(ClientElicitationCaps {
+            form: true,
             url: true,
         }));
     }
 
-    /// The Codex login request is a session-scoped url-mode elicitation
-    /// carrying the authorize URL and the stable completion id.
     #[test]
-    fn codex_login_elicitation_request_shape() {
+    fn codex_login_method_elicitation_request_shape() {
+        let req = build_codex_login_method_elicitation_request("sess-1");
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-1"));
+        let method = &json["requestedSchema"]["properties"]["method"];
+        assert_eq!(method["default"], "browser");
+        let values: Vec<&str> = method["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["browser", "device"]);
+    }
+
+    #[test]
+    fn parse_codex_login_method_maps_values_and_dismissals() {
+        use agent_client_protocol::schema::v1::ElicitationAcceptAction;
+        use std::collections::BTreeMap;
+
+        let accept = |value: &str| {
+            ElicitationAction::Accept(ElicitationAcceptAction::new().content(BTreeMap::from([(
+                "method".to_string(),
+                ElicitationContentValue::from(value),
+            )])))
+        };
+
+        assert_eq!(
+            parse_codex_login_method(&accept("browser")),
+            Some(CodexLoginMethod::Browser)
+        );
+        assert_eq!(
+            parse_codex_login_method(&accept("device")),
+            Some(CodexLoginMethod::Device)
+        );
+        assert_eq!(parse_codex_login_method(&accept("bogus")), None);
+        assert_eq!(parse_codex_login_method(&ElicitationAction::Decline), None);
+        assert_eq!(parse_codex_login_method(&ElicitationAction::Cancel), None);
+    }
+
+    /// The Codex device login request is a session-scoped url-mode elicitation
+    /// carrying the device verification URL and the stable completion id.
+    #[test]
+    fn codex_device_login_elicitation_request_shape() {
         let url = "https://auth.openai.com/codex/device";
-        let req = build_codex_login_elicitation_request("sess-1", url.to_string(), "ABCD-EFGH");
+        let req =
+            build_codex_device_login_elicitation_request("sess-1", url.to_string(), "ABCD-EFGH");
         let json = serde_json::to_value(&req).unwrap();
 
         assert_eq!(json["mode"], "url");
@@ -14067,6 +14252,23 @@ mod tests {
                 .is_some_and(|m| m.contains("ABCD-EFGH") && m.contains("sign in")),
             "got: {}",
             json["message"]
+        );
+    }
+
+    #[test]
+    fn codex_browser_login_elicitation_request_shape() {
+        let url = "https://auth.openai.com/oauth/authorize?state=abc";
+        let req = build_codex_browser_login_elicitation_request("sess-1", url.to_string());
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "url");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-1"));
+        assert_eq!(json["elicitationId"], CODEX_LOGIN_ELICITATION_ID);
+        assert_eq!(json["url"], url);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("localhost"))
         );
     }
 

@@ -102,8 +102,8 @@ impl MultiBackend {
     }
 
     /// Install (or replace) the Codex backend at runtime. Called from
-    /// the `/codex-login` handler so the next discovery refresh and any
-    /// subsequent `codex::*` route picks it up without a server restart.
+    /// `/setup codex` so the next discovery refresh and any subsequent
+    /// `codex::*` route picks it up without a server restart.
     ///
     /// Replacing an existing backend is safe: any in-flight request
     /// holding a clone of the old `Arc<CodexClient>` finishes against
@@ -120,7 +120,7 @@ impl MultiBackend {
     }
 
     /// Drop the currently-installed Codex backend, if any. Called from
-    /// `/codex-login disconnect` after the on-disk credentials are
+    /// `/setup codex disconnect` after the on-disk credentials are
     /// wiped so a subsequent `codex::*` request fails with the same
     /// "backend not configured" error a fresh-no-auth.json startup
     /// would give, instead of firing requests with credentials that
@@ -812,7 +812,7 @@ mod tests {
 
     /// When neither backend is configured, every chat request errors
     /// rather than panics. `MultiBackend` is constructible empty (the
-    /// server still starts -- the user can run `/codex-login` mid-session
+    /// server still starts -- the user can run `/setup codex` mid-session
     /// or start Ollama and re-discover) but no model can be routed.
     #[tokio::test]
     async fn empty_multi_backend_errors_on_chat() {
@@ -828,9 +828,9 @@ mod tests {
         );
     }
 
-    /// Regression for the `/codex-login` lifecycle (issue #3555): the
+    /// Regression for the `/setup codex` lifecycle (issue #3555): the
     /// server starts with no Codex backend (auth.json absent), the user
-    /// runs `/codex-login`, and the new backend is installed at
+    /// runs `/setup codex`, and the new backend is installed at
     /// runtime. Subsequent `codex::*` routing must succeed -- previously
     /// it kept returning the "backend not configured" error because the
     /// `None` was captured permanently at construction.
@@ -846,7 +846,7 @@ mod tests {
             .expect_err("codex route must fail before install");
         assert!(format!("{err:#}").contains("codex"));
 
-        // User runs `/codex-login` successfully -- the handler installs
+        // User runs `/setup codex` successfully -- the handler installs
         // a freshly-built Codex backend.
         let (codex_backend, codex_handles) = recording("codex");
         multi.install_codex(codex_backend);
@@ -888,7 +888,7 @@ mod tests {
 
     /// `list_models` must consult the currently-installed Codex backend,
     /// not the one captured at construction. Without this, a successful
-    /// `/codex-login` followed by a discovery refresh (e.g. on
+    /// `/setup codex` followed by a discovery refresh (e.g. on
     /// `session/new`) would keep returning an empty Codex list and the
     /// model picker would never show Codex models.
     #[tokio::test]
@@ -911,7 +911,7 @@ mod tests {
         );
     }
 
-    /// `/codex-login disconnect` calls `uninstall_codex` after wiping
+    /// `/setup codex disconnect` calls `uninstall_codex` after wiping
     /// auth.json. Subsequent `codex::*` routing must fail with the same
     /// "backend not configured" error a fresh-no-auth.json startup
     /// gives -- otherwise a wire id picked from a stale `availableModels`

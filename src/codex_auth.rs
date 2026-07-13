@@ -1,17 +1,17 @@
-//! "Sign in with ChatGPT" support using OpenAI's PKCE OAuth flow.
+//! "Sign in with ChatGPT" support using OpenAI's browser and device authorization flows.
 //!
 //! On-disk format (`~/.codex/auth.json`) is intentionally compatible with
 //! Codex CLI: a user who logs in here can use `codex` in the same terminal
 //! and vice versa.
 //!
-//! Trust posture: we use `oauth2` (32M+ downloads, depended on by Servo
-//! among others) for the standard PKCE + refresh state machine. The one
-//! step `oauth2` doesn't cover -- RFC 8693 token exchange that converts
-//! the ChatGPT id_token into a regular `OPENAI_API_KEY` -- is a single
-//! POST written by hand below. JWT decoding for `chatgpt_account_id`
-//! is also inline (~15 lines): we trust the token because we just
-//! received it over HTTPS from auth.openai.com, and we only need an
-//! unverified claim.
+//! Trust posture: browser login uses `oauth2` for PKCE/CSRF and a short-lived
+//! loopback listener for the callback; device login uses OpenAI's device
+//! authorization endpoints. Token exchange and refresh are issued via `reqwest`.
+//! The RFC 8693 token exchange that converts the ChatGPT id_token into a
+//! regular `OPENAI_API_KEY` is a single POST written by hand below. JWT decoding
+//! for `chatgpt_account_id` is also inline (~15 lines): we trust the token
+//! because we just received it over HTTPS from auth.openai.com, and we only need
+//! an unverified claim.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -21,9 +21,6 @@ use std::{future::Future, time::Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use chrono::{DateTime, Utc};
-// oauth2 supplies the PKCE + CSRF primitives only -- the actual token
-// exchanges are issued via `reqwest` below so we don't have to dance
-// with `oauth2::ExtraTokenFields` generics just to read `id_token`.
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -38,12 +35,8 @@ const CALLBACK_PORT: u16 = 1455;
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
 /// OAuth scopes Codex CLI requests during ChatGPT login. The two
-/// `api.connectors.*` scopes plus `id_token_add_organizations` /
-/// `codex_cli_simplified_flow` flags below are what flips the consent
-/// page from the legacy "API organization access" screen (the one that
-/// says "Codex will receive a token to generate API keys") to the
-/// ChatGPT-subscription consent screen. Drop any of them and OpenAI
-/// silently routes us back to the API-key flow.
+/// `api.connectors.*` scopes are required for the ChatGPT-subscription
+/// Codex gateway.
 const SCOPES: &[&str] = &[
     "openid",
     "profile",
@@ -54,17 +47,13 @@ const SCOPES: &[&str] = &[
 ];
 
 /// Identifies our requests as Codex CLI to OpenAI's auth and Responses
-/// servers. The ChatGPT-subscription consent UI and the
-/// `chatgpt.com/backend-api/codex/responses` gateway both gate on this
-/// value -- using anything else (or omitting it) is what produced the
-/// "API organization access" screen reported in #3540's review.
+/// servers.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 /// Refresh proactively if the stored credentials are older than this.
 /// Codex CLI uses an 8-day window; we follow suit.
 const REFRESH_AFTER: chrono::Duration = chrono::Duration::days(8);
 
-/// Wait at most this long for the user to complete sign-in in the browser.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -281,20 +270,6 @@ struct OidcTokenResponse {
 }
 
 fn build_authorize_url(challenge: &PkceCodeChallenge, state: &str) -> String {
-    // OAuth2 RFC 6749 + PKCE RFC 7636 plus three Codex-specific flags
-    // that Codex CLI passes verbatim:
-    //   * `id_token_add_organizations=true` -> the auth server includes
-    //     the user's organization claim in the issued id_token, which
-    //     downstream code uses to derive `chatgpt_account_id`.
-    //   * `codex_cli_simplified_flow=true` -> tells OpenAI to render the
-    //     ChatGPT-subscription consent screen ("Sign in with ChatGPT")
-    //     instead of the legacy API-organization screen. Omitting this
-    //     was the bug behind the "Codex requests access to your API
-    //     organization" page users were seeing.
-    //   * `originator=codex_cli_rs` -> identifies us as Codex CLI both
-    //     to the consent UI and to the chatgpt.com/backend-api gateway.
-    // Scopes already cover `api.connectors.*`; see SCOPES above for why
-    // those are required for the simplified flow.
     let scopes_encoded = SCOPES
         .iter()
         .map(|s| urlencode(s))
@@ -318,9 +293,8 @@ fn build_authorize_url(challenge: &PkceCodeChallenge, state: &str) -> String {
     )
 }
 
-/// Minimal percent-encoder for the handful of characters that show up
-/// in our query values (`/`, `:`, `=`, etc.). Avoids pulling in `url`
-/// just to call `Url::parse`/`form_urlencoded::byte_serialize`.
+/// Minimal percent-encoder for token form fields that need stable CLI-compatible
+/// encoding outside reqwest's form serializer.
 pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -444,30 +418,12 @@ async fn post_token_form_at(
     serde_json::from_slice::<OidcTokenResponse>(&body).context("parsing token endpoint response")
 }
 
-/// Run the full ChatGPT login flow using the default presenter (open the
-/// system browser): PKCE in the browser, capture the callback locally,
-/// exchange the `id_token` for an API key, and persist.
-pub async fn interactive_login() -> Result<AuthDotJson> {
-    interactive_login_with(|auth_url| async move {
-        if let Err(err) = webbrowser::open(&auth_url) {
-            eprintln!("Could not open a browser automatically ({err}). Visit:\n  {auth_url}");
-        } else {
-            eprintln!("Opened browser for ChatGPT sign-in. Waiting for callback...");
-        }
-        Ok(())
-    })
-    .await
-}
-
-/// Like [`interactive_login`], but the caller decides how to present the
-/// authorize URL to the user (open a browser, hand it to a client UI via ACP
-/// URL-mode elicitation, ...). `present` is awaited before the loopback
-/// listener begins; returning `Err` aborts the login (e.g. the user declined)
-/// and leaves stored credentials untouched.
-pub async fn interactive_login_with<F, Fut>(present: F) -> Result<AuthDotJson>
+/// Run the browser OAuth flow: open/present the authorization URL, capture the
+/// callback on localhost, then exchange the code and persist credentials.
+pub async fn interactive_browser_login_with<F, Fut>(present: F) -> Result<AuthDotJson>
 where
     F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let csrf = CsrfToken::new_random();
@@ -541,6 +497,93 @@ where
         Some(cancel),
     )
     .await
+}
+
+/// Spin up `tiny_http` on `port`, wait for `GET /auth/callback?code=...&state=...`,
+/// validate `state`, return the `code`. Times out after `timeout`.
+fn loopback_capture_code(port: u16, expected_state: String, timeout: Duration) -> Result<String> {
+    let server = tiny_http::Server::http(("127.0.0.1", port))
+        .map_err(|e| anyhow!("binding loopback port {port}: {e}"))?;
+    let (tx, rx) = mpsc::channel::<Result<String>>();
+
+    std::thread::spawn(move || {
+        if let Some(req) = server.incoming_requests().next() {
+            let url = req.url().to_string();
+            let result = parse_callback_url(&url, &expected_state);
+            let body = match &result {
+                Ok(_) => "Sign-in complete. You can close this tab and return to Anvil.",
+                Err(e) => {
+                    tracing::warn!("codex browser callback rejected: {e:#}");
+                    "Sign-in failed. Check the Anvil console for details."
+                }
+            };
+            let _ = req.respond(tiny_http::Response::from_string(body));
+            let _ = tx.send(result);
+        }
+    });
+
+    rx.recv_timeout(timeout)
+        .map_err(|_| anyhow!("OAuth callback timed out after {timeout:?}"))?
+}
+
+/// Parse `/auth/callback?code=...&state=...` (or `?error=...`) by hand
+/// to avoid pulling in the `url` crate just for query-string splitting.
+fn parse_callback_url(url: &str, expected_state: &str) -> Result<String> {
+    let query = url.split('?').nth(1).unwrap_or("");
+    let mut code: Option<String> = None;
+    let mut state: Option<String> = None;
+    let mut error: Option<String> = None;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
+        let v = url_decode(raw_v);
+        match raw_k {
+            "code" => code = Some(v),
+            "state" => state = Some(v),
+            "error" => error = Some(v),
+            _ => {}
+        }
+    }
+    if let Some(err) = error {
+        bail!("authorization server returned error: {err}");
+    }
+    let state = state.ok_or_else(|| anyhow!("callback missing state param"))?;
+    if state != expected_state {
+        bail!("callback state did not match (CSRF guard)");
+    }
+    code.ok_or_else(|| anyhow!("callback missing code param"))
+}
+
+/// Inverse of `urlencode`: decode `%XX` escapes and `+` to space.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn request_device_code(
@@ -867,95 +910,6 @@ pub fn extract_chatgpt_account_id(access_token: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("JWT missing https://api.openai.com/auth.chatgpt_account_id claim"))
 }
 
-/// Spin up `tiny_http` on `port`, wait for `GET /auth/callback?code=...&state=...`,
-/// validate `state`, return the `code`. Times out after `timeout`.
-fn loopback_capture_code(port: u16, expected_state: String, timeout: Duration) -> Result<String> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| anyhow!("binding loopback port {port}: {e}"))?;
-    let (tx, rx) = mpsc::channel::<Result<String>>();
-
-    std::thread::spawn(move || {
-        // One callback is all we expect; pull the first request only and
-        // drop the server when the closure returns.
-        if let Some(req) = server.incoming_requests().next() {
-            let url = req.url().to_string();
-            let result = parse_callback_url(&url, &expected_state);
-            let body = match &result {
-                Ok(_) => "Sign-in complete. You can close this tab and return to brokk.",
-                Err(e) => {
-                    tracing::warn!("codex-login callback rejected: {e:#}");
-                    "Sign-in failed. Check the brokk console for details."
-                }
-            };
-            let _ = req.respond(tiny_http::Response::from_string(body));
-            let _ = tx.send(result);
-        }
-    });
-
-    rx.recv_timeout(timeout)
-        .map_err(|_| anyhow!("OAuth callback timed out after {timeout:?}"))?
-}
-
-/// Parse `/auth/callback?code=...&state=...` (or `?error=...`) by hand
-/// to avoid pulling in the `url` crate just for query-string splitting.
-fn parse_callback_url(url: &str, expected_state: &str) -> Result<String> {
-    let query = url.split('?').nth(1).unwrap_or("");
-    let mut code: Option<String> = None;
-    let mut state: Option<String> = None;
-    let mut error: Option<String> = None;
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-        let v = url_decode(raw_v);
-        match raw_k {
-            "code" => code = Some(v),
-            "state" => state = Some(v),
-            "error" => error = Some(v),
-            _ => {}
-        }
-    }
-    if let Some(err) = error {
-        bail!("authorization server returned error: {err}");
-    }
-    let state = state.ok_or_else(|| anyhow!("callback missing state param"))?;
-    if state != expected_state {
-        bail!("callback state did not match (CSRF guard)");
-    }
-    code.ok_or_else(|| anyhow!("callback missing code param"))
-}
-
-/// Inverse of `urlencode`: decode `%XX` escapes and `+` to space.
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,33 +1058,13 @@ mod tests {
 
     #[test]
     fn authorize_url_carries_codex_simplified_flow_flags() {
-        // These three params + the connectors scopes are exactly what
-        // flips OpenAI's consent screen from "API organization access"
-        // to "Sign in with ChatGPT". Regression-guard them: dropping
-        // any one silently routes the user back to the API-key flow.
         let (challenge, _verifier) = oauth2::PkceCodeChallenge::new_random_sha256();
         let url = build_authorize_url(&challenge, "test-state");
-        assert!(
-            url.contains("codex_cli_simplified_flow=true"),
-            "missing codex_cli_simplified_flow flag in {url}"
-        );
-        assert!(
-            url.contains("id_token_add_organizations=true"),
-            "missing id_token_add_organizations flag in {url}"
-        );
-        assert!(
-            url.contains("originator=codex_cli_rs"),
-            "missing originator=codex_cli_rs in {url}"
-        );
-        assert!(
-            url.contains("api.connectors.read"),
-            "missing api.connectors.read scope in {url}"
-        );
-        assert!(
-            url.contains("api.connectors.invoke"),
-            "missing api.connectors.invoke scope in {url}"
-        );
-        // Sanity: still PKCE + CSRF.
+        assert!(url.contains("codex_cli_simplified_flow=true"));
+        assert!(url.contains("id_token_add_organizations=true"));
+        assert!(url.contains("originator=codex_cli_rs"));
+        assert!(url.contains("api.connectors.read"));
+        assert!(url.contains("api.connectors.invoke"));
         assert!(url.contains("code_challenge="));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("state=test-state"));
