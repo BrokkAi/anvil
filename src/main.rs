@@ -20,6 +20,7 @@ mod discovery;
 mod host_notice;
 mod http_retry;
 mod llm_client;
+mod lsp;
 mod mcp;
 mod multi_backend;
 mod openrouter_auth;

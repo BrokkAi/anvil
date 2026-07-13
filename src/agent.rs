@@ -7064,6 +7064,8 @@ enum SetupHomeRoute {
     DeepSeek,
     /// Interactive OpenRouter key entry (`/setup openrouter`).
     OpenRouter,
+    /// LSP diagnostics preferences and server commands (`/setup lsp`).
+    Lsp,
     /// Turn recap preference (`/setup recap`).
     Recap,
     /// Advanced page: model ids, sandbox, behavior (`/setup advanced`).
@@ -7080,6 +7082,7 @@ impl SetupHomeRoute {
             Self::Local => "local",
             Self::DeepSeek => "deepseek",
             Self::OpenRouter => "openrouter",
+            Self::Lsp => "lsp",
             Self::Recap => "recap",
             Self::Advanced => "advanced",
         }
@@ -7101,6 +7104,7 @@ impl SetupHomeRoute {
             Self::Local => "Use local models (Ollama / ds4)",
             Self::DeepSeek => "Use hosted DeepSeek",
             Self::OpenRouter => "Use OpenRouter",
+            Self::Lsp => "Configure LSP diagnostics",
             Self::Recap => "Configure automatic turn recaps",
             Self::Advanced => "Review all settings",
         }
@@ -7112,7 +7116,7 @@ impl SetupHomeRoute {
                 "global provider"
             }
             Self::Choose => "current session",
-            Self::Recap => "install default",
+            Self::Lsp | Self::Recap => "install default",
             Self::Advanced => "all scopes",
         }
     }
@@ -7125,6 +7129,7 @@ impl SetupHomeRoute {
             Self::Local => "/setup local",
             Self::DeepSeek => "/setup deepseek",
             Self::OpenRouter => "/setup openrouter",
+            Self::Lsp => "/setup lsp",
             Self::Recap => "/setup recap",
             Self::Advanced => "/setup advanced",
         }
@@ -7145,7 +7150,7 @@ impl SetupHomeRoute {
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 8] {
+    fn menu() -> [Self; 9] {
         [
             Self::Choose,
             Self::Codex,
@@ -7153,6 +7158,7 @@ impl SetupHomeRoute {
             Self::Local,
             Self::DeepSeek,
             Self::OpenRouter,
+            Self::Lsp,
             Self::Recap,
             Self::Advanced,
         ]
@@ -7241,6 +7247,10 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::Local) => {
             let message = handle_setup_local(cx, sessions, session_id, llm, refresh_lock, "").await;
+            send_message(cx, session_id, &message);
+        }
+        Some(SetupHomeRoute::Lsp) => {
+            let message = handle_setup_lsp(sessions, session_id, "").await;
             send_message(cx, session_id, &message);
         }
         Some(SetupHomeRoute::Recap) => {
@@ -7415,6 +7425,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
         }
         "sandbox" => handle_setup_sandbox(ctx.sessions, session_id, rest).await,
         "mode" | "behavior" => handle_setup_mode(ctx.cx, ctx.sessions, session_id, rest).await,
+        "lsp" => handle_setup_lsp(ctx.sessions, session_id, rest).await,
         "recap" => handle_setup_recap(ctx.sessions, session_id, rest).await,
         "timeout" => {
             let prompt = if rest.is_empty() {
@@ -8538,6 +8549,176 @@ async fn handle_setup_mode(
         _ => return "Unknown mode. Try `/setup mode agent` or `plan`.".to_string(),
     };
     apply_setup_config(cx, sessions, session_id, BEHAVIOR_CONFIG_ID, value).await
+}
+
+async fn handle_setup_lsp(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
+    let mut settings = sessions.setup_state_snapshot().lsp.unwrap_or_default();
+    let trimmed = rest.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("status")
+        || trimmed.eq_ignore_ascii_case("list")
+    {
+        return render_lsp_settings(&settings);
+    }
+
+    let words = match parse_shell_words(trimmed) {
+        Ok(words) => words,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let command = words
+        .first()
+        .map(|w| w.to_ascii_lowercase())
+        .unwrap_or_default();
+    let result = match command.as_str() {
+        "read" | "on-read" | "diagnostics-on-read" => {
+            let Some(value) = words.get(1).and_then(|v| parse_setup_bool(v)) else {
+                return "Use `/setup lsp read on` or `/setup lsp read off`.".to_string();
+            };
+            settings.diagnostics_on_read = value;
+            sessions.remember_lsp_settings(settings).map(|_| {
+                format!(
+                    "LSP diagnostics on read {}.",
+                    if value { "enabled" } else { "disabled" }
+                )
+            })
+        }
+        "write" | "on-write" | "diagnostics-on-write" => {
+            let Some(value) = words.get(1).and_then(|v| parse_setup_bool(v)) else {
+                return "Use `/setup lsp write on` or `/setup lsp write off`.".to_string();
+            };
+            settings.diagnostics_on_write = value;
+            sessions.remember_lsp_settings(settings).map(|_| {
+                format!(
+                    "LSP diagnostics on write {}.",
+                    if value { "enabled" } else { "disabled" }
+                )
+            })
+        }
+        "add" | "set" => {
+            if words.len() < 3 {
+                return lsp_usage();
+            }
+            let name = &words[1];
+            if !valid_mcp_name(name) {
+                return "LSP server names may contain only letters, numbers, `_`, `-`, and `.`."
+                    .to_string();
+            }
+            let server = crate::lsp::LspServerConfig {
+                name: name.to_string(),
+                command: words[2].clone(),
+                args: words[3..].to_vec(),
+                enabled: true,
+            };
+            if let Some(existing) = settings.servers.iter_mut().find(|s| s.name == *name) {
+                *existing = server;
+            } else {
+                settings.servers.push(server);
+            }
+            sessions
+                .remember_lsp_settings(settings)
+                .map(|_| format!("LSP server `{name}` saved and enabled."))
+        }
+        "remove" | "delete" | "rm" => {
+            let Some(name) = words.get(1) else {
+                return lsp_usage();
+            };
+            let before = settings.servers.len();
+            settings.servers.retain(|s| s.name != *name);
+            if settings.servers.len() == before {
+                return format!("No LSP server named `{name}` is configured.");
+            }
+            sessions
+                .remember_lsp_settings(settings)
+                .map(|_| format!("LSP server `{name}` removed."))
+        }
+        "enable" | "disable" => {
+            let Some(name) = words.get(1) else {
+                return lsp_usage();
+            };
+            let enabled = command == "enable";
+            let Some(server) = settings.servers.iter_mut().find(|s| s.name == *name) else {
+                return format!("No LSP server named `{name}` is configured.");
+            };
+            server.enabled = enabled;
+            sessions.remember_lsp_settings(settings).map(|_| {
+                format!(
+                    "LSP server `{name}` {}.",
+                    if enabled { "enabled" } else { "disabled" }
+                )
+            })
+        }
+        "help" => return lsp_usage(),
+        _ => return format!("Unknown LSP command `{command}`.\n\n{}", lsp_usage()),
+    };
+
+    match result {
+        Ok(message) => {
+            sessions.invalidate_registry(session_id).await;
+            format!("{message}\n\nChanges take effect on the next tool-capable prompt.")
+        }
+        Err(e) => format!("Error: failed to save LSP configuration: {e:#}"),
+    }
+}
+
+fn render_lsp_settings(settings: &crate::lsp::LspSettings) -> String {
+    let mut out = format!(
+        "LSP diagnostics\n\n- On read: `{}`\n- On write: `{}`\n\nServers\n",
+        if settings.diagnostics_on_read {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if settings.diagnostics_on_write {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    if settings.servers.is_empty() {
+        out.push_str("No LSP servers are configured.\n\n");
+    } else {
+        for server in &settings.servers {
+            let status = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let args = if server.args.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {}",
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| shell_quote(arg))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+            out.push_str(&format!(
+                "- `{}` ({status}): `{}{args}`\n",
+                server.name,
+                shell_quote(&server.command)
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str(&lsp_usage());
+    out
+}
+
+fn lsp_usage() -> String {
+    "Commands:\n\
+     - `/setup lsp`\n\
+     - `/setup lsp read on|off`\n\
+     - `/setup lsp write on|off`\n\
+     - `/setup lsp add <name> <command> [args...]`\n\
+     - `/setup lsp enable <name>`\n\
+     - `/setup lsp disable <name>`\n\
+     - `/setup lsp remove <name>`\n\n\
+     Example: `/setup lsp add rust rust-analyzer`. Write diagnostics are enabled by default; read diagnostics are opt-in."
+        .to_string()
 }
 
 async fn handle_setup_recap(sessions: &SessionStore, session_id: &str, rest: &str) -> String {
@@ -13383,6 +13564,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_setup_lsp_toggles_read_and_write_preferences() {
+        let store = SessionStore::with_limits_and_transient_setup(
+            "m".to_string(),
+            crate::session::SessionLimits::default(),
+            true,
+        );
+        let cwd = std::env::temp_dir().join(format!("brokk-acp-lsp-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd).await;
+        let id = session.id;
+        assert_eq!(store.setup_state_snapshot().lsp, None);
+
+        let read_on = handle_setup_lsp(&store, &id, "read on").await;
+        assert!(read_on.contains("LSP diagnostics on read enabled."));
+        let settings = store.setup_state_snapshot().lsp.expect("lsp settings");
+        assert!(settings.diagnostics_on_read);
+        assert!(
+            settings.diagnostics_on_write,
+            "write diagnostics default on"
+        );
+
+        let write_off = handle_setup_lsp(&store, &id, "write off").await;
+        assert!(write_off.contains("LSP diagnostics on write disabled."));
+        let settings = store.setup_state_snapshot().lsp.expect("lsp settings");
+        assert!(settings.diagnostics_on_read);
+        assert!(!settings.diagnostics_on_write);
+
+        let status = handle_setup_lsp(&store, &id, "").await;
+        assert!(status.contains("- On read: `enabled`"));
+        assert!(status.contains("- On write: `disabled`"));
+    }
+
+    #[tokio::test]
+    async fn handle_setup_lsp_manages_server_lifecycle() {
+        let store = SessionStore::with_limits_and_transient_setup(
+            "m".to_string(),
+            crate::session::SessionLimits::default(),
+            true,
+        );
+        let cwd = std::env::temp_dir().join(format!("brokk-acp-lsp-{}", uuid::Uuid::new_v4()));
+        let session = store.create_session(cwd).await;
+        let id = session.id;
+
+        let add = handle_setup_lsp(&store, &id, "add rust rust-analyzer --stdio").await;
+        assert!(add.contains("LSP server `rust` saved and enabled."));
+        let settings = store.setup_state_snapshot().lsp.expect("lsp settings");
+        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.servers[0].name, "rust");
+        assert_eq!(settings.servers[0].command, "rust-analyzer");
+        assert_eq!(settings.servers[0].args, vec!["--stdio"]);
+        assert!(settings.servers[0].enabled);
+
+        let disable = handle_setup_lsp(&store, &id, "disable rust").await;
+        assert!(disable.contains("LSP server `rust` disabled."));
+        assert!(
+            !store
+                .setup_state_snapshot()
+                .lsp
+                .expect("lsp settings")
+                .servers[0]
+                .enabled
+        );
+
+        let enable = handle_setup_lsp(&store, &id, "enable rust").await;
+        assert!(enable.contains("LSP server `rust` enabled."));
+        assert!(
+            store
+                .setup_state_snapshot()
+                .lsp
+                .expect("lsp settings")
+                .servers[0]
+                .enabled
+        );
+
+        let remove = handle_setup_lsp(&store, &id, "remove rust").await;
+        assert!(remove.contains("LSP server `rust` removed."));
+        assert!(
+            store
+                .setup_state_snapshot()
+                .lsp
+                .expect("lsp settings")
+                .servers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn handle_setup_recap_toggles_turn_recap_preference() {
         let store = SessionStore::with_limits_and_transient_setup(
             "m".to_string(),
@@ -13929,6 +14196,7 @@ mod tests {
                 "local",
                 "deepseek",
                 "openrouter",
+                "lsp",
                 "recap",
                 "advanced"
             ]

@@ -3037,6 +3037,22 @@ impl SessionStore {
         }
     }
 
+    pub(crate) fn remember_lsp_settings(
+        &self,
+        settings: crate::lsp::LspSettings,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .lsp = Some(settings);
+                Ok(())
+            }
+            None => crate::setup_state::remember_lsp_settings(settings),
+        }
+    }
+
     async fn remove_resident_sessions(&self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -3121,7 +3137,7 @@ impl SessionStore {
         cwd: PathBuf,
     ) -> Option<Arc<ToolRegistry>> {
         let normalized_cwd = normalize_cwd(&cwd);
-        let (skills, agents, mcp_servers, additional_directories) = {
+        let (skills, agents, mcp_servers, additional_directories, lsp_settings) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if self.closed_sessions.read().await.contains(session_id) {
                 return None;
@@ -3133,6 +3149,7 @@ impl SessionStore {
                 session.agents.clone(),
                 effective_mcp_servers(&normalized_cwd, session.mcp_servers.clone()),
                 session.additional_directories.clone(),
+                self.setup_state_snapshot().lsp.unwrap_or_default(),
             )
         };
         let normalized_additional_directories =
@@ -3162,6 +3179,7 @@ impl SessionStore {
                 skills,
                 agents,
                 plugin_hooks,
+                lsp_settings,
             )
             .await,
         );

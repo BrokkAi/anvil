@@ -35,6 +35,8 @@ pub struct SetupState {
     pub always_allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<crate::lsp::LspSettings>,
 }
 
 /// Deserialize an optional enum field leniently: a value this build does not
@@ -153,6 +155,10 @@ pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
 
 pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result<()> {
     update(|state| state.mcp_servers = Some(servers))
+}
+
+pub fn remember_lsp_settings(settings: crate::lsp::LspSettings) -> Result<()> {
+    update(|state| state.lsp = Some(settings))
 }
 
 fn update(mutator: impl FnOnce(&mut SetupState)) -> Result<()> {

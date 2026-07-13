@@ -7334,6 +7334,7 @@ mod tests {
                 command: command.to_string(),
                 timeout: Duration::from_secs(5),
             }],
+            crate::lsp::LspSettings::default(),
         )
         .await;
         (cwd, registry)

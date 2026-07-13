@@ -24,6 +24,7 @@ pub struct ToolResult {
     pub output: String,
 }
 
+#[derive(PartialEq, Eq)]
 pub enum ToolStatus {
     Success,
     RequestError,
@@ -120,6 +121,12 @@ impl ShellSandboxPermissionArg {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiagnosticsArgs {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    file_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RunShellCommandArgs {
     command: String,
     #[serde(default = "default_shell_timeout_ms")]
@@ -206,6 +213,12 @@ impl BuiltinArgsContract for WebSearchArgs {
     const REQUIRED_FIELDS: &'static [&'static str] = &["query"];
     const PROPERTY_TYPES: &'static [(&'static str, &'static str)] =
         &[("query", "string"), ("max_results", "integer")];
+}
+
+#[cfg(test)]
+impl BuiltinArgsContract for DiagnosticsArgs {
+    const REQUIRED_FIELDS: &'static [&'static str] = &[];
+    const PROPERTY_TYPES: &'static [(&'static str, &'static str)] = &[("file_path", "string")];
 }
 
 #[cfg(test)]
@@ -299,6 +312,11 @@ const TOOLS: &[ToolMeta] = &[
         name: "web_search",
         kind: ToolKind::Search,
         display_name: "Searching the web",
+    },
+    ToolMeta {
+        name: "diagnostics",
+        kind: ToolKind::Read,
+        display_name: "Getting diagnostics",
     },
     ToolMeta {
         name: "run_shell_command",
@@ -611,6 +629,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_directory",
     "grep_search",
     "web_search",
+    "diagnostics",
     "run_shell_command",
 ];
 
@@ -657,6 +676,7 @@ pub struct ToolRegistry {
     /// time. Ordered; executed by `tool_loop::execute_tool` around each
     /// tool call.
     plugin_hooks: Vec<crate::plugins::HookCommand>,
+    lsp: Option<Arc<crate::lsp::LspManager>>,
 }
 
 impl ToolRegistry {
@@ -713,6 +733,7 @@ impl ToolRegistry {
         skills: Arc<SkillRegistry>,
         agents: Arc<AgentRegistry>,
         plugin_hooks: Vec<crate::plugins::HookCommand>,
+        lsp_settings: crate::lsp::LspSettings,
     ) -> Self {
         // Best-effort sweep of any stale seatbelt policy files left by a
         // previous SIGKILL/panic. Bounded by file age so we don't yank a
@@ -766,6 +787,11 @@ impl ToolRegistry {
                 }
             }
         }
+        let lsp = if lsp_settings.servers.iter().any(|server| server.enabled) {
+            Some(crate::lsp::LspManager::start(cwd.clone(), lsp_settings).await)
+        } else {
+            None
+        };
         Self {
             cwd,
             additional_roots,
@@ -780,6 +806,7 @@ impl ToolRegistry {
             skills: RwLock::new(skills),
             agents: RwLock::new(agents),
             plugin_hooks,
+            lsp,
         }
     }
 
@@ -944,6 +971,21 @@ impl ToolRegistry {
                         }
                     },
                     "required": ["query"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("diagnostics") {
+            defs.push(tool_def(
+                "diagnostics",
+                "Get cached language-server diagnostics for a file or the project. Opens the requested file in configured LSP servers before reading diagnostics. Requires LSP servers configured in `/setup lsp`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Optional file path to check. If omitted, returns cached project diagnostics."
+                        }
+                    }
                 }),
             ));
         }
@@ -1265,12 +1307,14 @@ impl ToolRegistry {
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
                 let path = args.file_path;
+                let diagnostics_path = path.clone();
                 let offset = args.offset;
                 let limit = args.limit;
-                run_blocking_filesystem_tool(move || {
+                let result = run_blocking_filesystem_tool(move || {
                     filesystem::read_file_in_roots(&cwd, &additional_roots, &path, offset, limit)
                 })
-                .await
+                .await;
+                self.with_read_diagnostics(result, &diagnostics_path).await
             }
             "write_file" => {
                 let args: WriteFileArgs = match parse_builtin_args(name, args) {
@@ -1278,16 +1322,18 @@ impl ToolRegistry {
                     Err(result) => return result,
                 };
                 let path = args.file_path;
+                let diagnostics_path = path.clone();
                 let content = args.content;
                 if content.len() > filesystem::WRITE_MAX_BYTES {
                     return filesystem::oversized_write_payload_result(&path, content.len());
                 }
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                run_blocking_filesystem_tool(move || {
+                let result = run_blocking_filesystem_tool(move || {
                     filesystem::write_file_in_roots(&cwd, &additional_roots, &path, &content)
                 })
-                .await
+                .await;
+                self.with_write_diagnostics(result, &diagnostics_path).await
             }
             "edit" => {
                 let args: EditFileArgs = match parse_builtin_args(name, args) {
@@ -1296,7 +1342,8 @@ impl ToolRegistry {
                 };
                 let cwd = self.cwd.clone();
                 let additional_roots = self.additional_roots.clone();
-                run_blocking_filesystem_tool(move || {
+                let path = args.file_path.clone();
+                let result = run_blocking_filesystem_tool(move || {
                     filesystem::edit_file_in_roots(
                         &cwd,
                         &additional_roots,
@@ -1306,7 +1353,8 @@ impl ToolRegistry {
                         args.replace_all,
                     )
                 })
-                .await
+                .await;
+                self.with_write_diagnostics(result, &path).await
             }
             "list_directory" => {
                 let args: ListDirectoryArgs = match parse_builtin_args(name, args) {
@@ -1342,6 +1390,13 @@ impl ToolRegistry {
                     Err(result) => return result,
                 };
                 web_search::web_search(&args.query, args.max_results).await
+            }
+            "diagnostics" => {
+                let args: DiagnosticsArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                self.execute_diagnostics(args).await
             }
             "run_shell_command" => {
                 let args: RunShellCommandArgs = match parse_builtin_args(name, args) {
@@ -1385,6 +1440,90 @@ impl ToolRegistry {
             // server. This avoids a hardcoded list of server tool names
             // drifting out of sync with what each server actually exposes.
             _ => self.execute_mcp(name, args, cancel).await,
+        }
+    }
+
+    async fn with_read_diagnostics(&self, mut result: ToolResult, path: &str) -> ToolResult {
+        let Some(lsp) = &self.lsp else {
+            return result;
+        };
+        if result.status != ToolStatus::Success || !lsp.diagnostics_on_read() {
+            return result;
+        }
+        let Ok(resolved) = safe_resolve_in_roots(&self.cwd, &self.additional_roots, path) else {
+            return result;
+        };
+        lsp.open_file(&resolved).await;
+        let diagnostics = lsp.diagnostics_for_file(&resolved).await;
+        result.output.push_str(&crate::lsp::format_diagnostics(
+            Some(&resolved),
+            &diagnostics,
+        ));
+        result
+    }
+
+    async fn with_write_diagnostics(&self, mut result: ToolResult, path: &str) -> ToolResult {
+        let Some(lsp) = &self.lsp else {
+            return result;
+        };
+        if result.status != ToolStatus::Success || !lsp.diagnostics_on_write() {
+            return result;
+        }
+        let Ok(resolved) = safe_resolve_in_roots(&self.cwd, &self.additional_roots, path) else {
+            return result;
+        };
+        lsp.change_file(&resolved).await;
+        let diagnostics = lsp
+            .wait_for_file_diagnostics(&resolved, std::time::Duration::from_secs(5))
+            .await;
+        result.output.push_str(&crate::lsp::format_diagnostics(
+            Some(&resolved),
+            &diagnostics,
+        ));
+        result
+    }
+
+    async fn execute_diagnostics(&self, args: DiagnosticsArgs) -> ToolResult {
+        let Some(lsp) = &self.lsp else {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: "No LSP servers are configured. Use `/setup lsp add <name> <command> [args...]`.".to_string(),
+            };
+        };
+        if !lsp.has_clients() {
+            return ToolResult {
+                status: ToolStatus::RequestError,
+                output: "No LSP clients are running. Check `/setup lsp`.".to_string(),
+            };
+        }
+        let (file_path, diagnostics) = if let Some(path) =
+            args.file_path.as_deref().filter(|p| !p.trim().is_empty())
+        {
+            let resolved = match safe_resolve_in_roots(&self.cwd, &self.additional_roots, path) {
+                Ok(path) => path,
+                Err(e) => {
+                    return ToolResult {
+                        status: ToolStatus::RequestError,
+                        output: e,
+                    };
+                }
+            };
+            lsp.open_file(&resolved).await;
+            let diagnostics = lsp
+                .wait_for_file_diagnostics(&resolved, std::time::Duration::from_secs(2))
+                .await;
+            (Some(resolved), diagnostics)
+        } else {
+            (None, lsp.all_diagnostics().await)
+        };
+        let output = crate::lsp::format_diagnostics(file_path.as_deref(), &diagnostics);
+        ToolResult {
+            status: ToolStatus::Success,
+            output: if output.is_empty() {
+                "No LSP diagnostics.".to_string()
+            } else {
+                output
+            },
         }
     }
 
@@ -1880,6 +2019,7 @@ mod tests {
             skills: RwLock::new(Arc::new(reg)),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
+            lsp: None,
         }
     }
 
@@ -1903,6 +2043,7 @@ mod tests {
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(reg)),
             plugin_hooks: Vec::new(),
+            lsp: None,
         }
     }
 
@@ -2094,6 +2235,7 @@ mod tests {
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
+            lsp: None,
         };
         let advertised: Vec<String> = registry
             .tool_definitions()
@@ -2101,6 +2243,22 @@ mod tests {
             .into_iter()
             .map(|d| d.function.name)
             .collect();
+
+        assert_eq!(ToolRegistry::tool_kind("diagnostics"), ToolKind::Read);
+        let diagnostics = registry
+            .tool_definitions()
+            .await
+            .into_iter()
+            .find(|def| def.function.name == "diagnostics")
+            .expect("diagnostics tool advertised");
+        assert_eq!(
+            diagnostics
+                .function
+                .parameters
+                .pointer("/properties/file_path/type")
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
 
         for name in BUILTIN_TOOL_NAMES {
             assert!(
