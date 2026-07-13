@@ -4514,6 +4514,8 @@ struct AsgardSupervisorDecision {
     state_summary: String,
 }
 
+const ASGARD_SUPERVISOR_MAX_ATTEMPTS: usize = 2;
+
 #[allow(clippy::too_many_arguments)]
 async fn run_asgard_trajectory_loop(
     cx: &ConnectionTo<Client>,
@@ -4681,30 +4683,58 @@ async fn run_asgard_trajectory_loop(
             }
         }
         let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
-        let supervisor = run_asgard_supervisor(
-            cx,
-            sessions,
-            session_id,
-            llm,
-            parent_registry,
-            supervisor_model,
-            idle_timeout,
-            cancel.clone(),
-            window,
-            &candidates,
-            &common_messages,
-            &common_patch,
-            supervisor_state_summary.as_deref(),
-        )
-        .await;
-        aggregate_usage.add(supervisor.1);
+        let mut supervisor_usage = crate::llm_client::TokenUsage::default();
+        let mut decision = None;
+        let mut supervisor_error = None;
+        for attempt in 1..=ASGARD_SUPERVISOR_MAX_ATTEMPTS {
+            let supervisor = run_asgard_supervisor(
+                cx,
+                sessions,
+                session_id,
+                llm,
+                parent_registry,
+                supervisor_model,
+                idle_timeout,
+                cancel.clone(),
+                window,
+                &candidates,
+                &common_messages,
+                &common_patch,
+                supervisor_state_summary.as_deref(),
+            )
+            .await;
+            supervisor_usage.add(supervisor.1);
+            match supervisor.0 {
+                Ok(value) => {
+                    decision = Some(value);
+                    break;
+                }
+                Err(error)
+                    if attempt < ASGARD_SUPERVISOR_MAX_ATTEMPTS && !cancel.is_cancelled() =>
+                {
+                    tracing::warn!(
+                        window,
+                        attempt,
+                        max_attempts = ASGARD_SUPERVISOR_MAX_ATTEMPTS,
+                        "retrying failed Asgard supervisor decision: {error:#}"
+                    );
+                }
+                Err(error) => {
+                    supervisor_error = Some(error);
+                    break;
+                }
+            }
+        }
+        aggregate_usage.add(supervisor_usage);
         usage_by_model
             .entry(supervisor_model.to_string())
             .or_default()
-            .add(supervisor.1);
-        let decision = match supervisor.0 {
-            Ok(decision) => decision,
-            Err(error) => {
+            .add(supervisor_usage);
+        let decision = match decision {
+            Some(decision) => decision,
+            None => {
+                let error = supervisor_error
+                    .unwrap_or_else(|| anyhow::anyhow!("supervisor produced no decision"));
                 let apply_result =
                     crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
                 cleanup_asgard_worktrees(&worktrees);
