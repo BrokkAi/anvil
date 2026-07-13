@@ -7610,6 +7610,16 @@ async fn refresh_model_catalog_after_lock(
             .await
             .map_err(|e| format!("{e:#}"))?
     };
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        for notice in llm.take_model_discovery_notices() {
+            let message = format!("{}: {}\n", notice.source, notice.message);
+            trace_openrouter_refresh(message.trim_end());
+            send_message(cx, session_id, &message);
+        }
+    } else {
+        // Avoid showing stale discovery notices during the next interactive refresh.
+        let _ = llm.take_model_discovery_notices();
+    }
     // Discovery refreshes the shared catalog but must not silently replace an
     // existing process default: model selection is a client-owned per-session
     // control. Seed a fallback only when the server has no default at all.
