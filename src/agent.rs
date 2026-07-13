@@ -5380,6 +5380,14 @@ fn filter_asgard_advice_scope(
             "suppress formatting check",
             "disable formatting check",
             "skip formatting check",
+            "`-x ",
+            " -x :",
+            "exclude the failing",
+            "exclude failing",
+            "excluding pre-existing",
+            "excluding preexisting",
+            "skip frontend",
+            "exclude frontend",
         ];
         let violation = if let Some(term) = policy_bypasses
             .iter()
@@ -15697,6 +15705,7 @@ mod tests {
             "Repair the Gradle build environment by correcting the classpath, changing the Gradle version, and building the generator module manually.",
             "Resolve the Gradle wrapper issue by using system-installed Gradle or recreating the wrapper.",
             "Apply Spotless selectively by temporarily suppressing the lint-error blocker.",
+            "Run the focused Gradle tests with `-x :app:frontendBuild` to bypass the unrelated failure.",
         ] {
             let mut candidate = decision(strategy);
             let rejected =
