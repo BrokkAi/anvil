@@ -5428,6 +5428,10 @@ fn filter_asgard_advice_scope(
             "exclude failing",
             "excluding pre-existing",
             "excluding preexisting",
+            "skip failing pnpm",
+            "skip the failing pnpm",
+            "skip pnpm",
+            "skip the pnpm",
             "skip frontend",
             "exclude frontend",
             "keep the existing mock stubs",
@@ -5498,6 +5502,7 @@ fn filter_asgard_advice_scope(
             ];
             let build_environment_nouns = [
                 "build environment",
+                "build-environment",
                 "gradle wrapper",
                 "system gradle",
                 "system-installed gradle",
@@ -5508,6 +5513,10 @@ fn filter_asgard_advice_scope(
                 "wrapper jar",
                 "generated build tooling",
                 "generator module",
+                "workspace configuration",
+                "misconfigured workspace",
+                "correct workspace",
+                "checkout layout",
             ];
             if task_requests_build_environment_work {
                 return None;
@@ -15781,6 +15790,7 @@ mod tests {
             "Resolve the Gradle wrapper issue by using system-installed Gradle or recreating the wrapper.",
             "Apply Spotless selectively by temporarily suppressing the lint-error blocker.",
             "Run the focused Gradle tests with `-x :app:frontendBuild` to bypass the unrelated failure.",
+            "Resolve the build-environment issues in the correct workspace, skip the failing pnpm tasks, and run the focused tests.",
             "Invoke tasks.allTasks() solely to keep the existing mock stubs used and avoid UnnecessaryStubbingException.",
         ] {
             let mut candidate = decision(strategy);
