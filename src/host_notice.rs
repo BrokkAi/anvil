@@ -104,6 +104,10 @@ impl ToolCallStats {
         self.changed_files
             .extend(other.changed_files.iter().cloned());
     }
+
+    pub(crate) fn has_changed_files(&self) -> bool {
+        !self.changed_files.is_empty()
+    }
 }
 
 fn render_tool_counts(stats: &ToolCallStats) -> String {
@@ -427,6 +431,30 @@ mod tests {
 
         let persisted = format!("answer{recap}");
         assert_eq!(model_visible_assistant_text(&persisted), "answer");
+    }
+
+    #[test]
+    fn tool_call_stats_tracks_whether_files_changed() {
+        let read_only = ToolCallStats::from_exchanges(&[ToolExchange {
+            call_id: "c1".into(),
+            tool_name: "read_file".into(),
+            status: ToolExchangeStatus::Completed,
+            ..ToolExchange::default()
+        }]);
+        assert!(!read_only.has_changed_files());
+
+        let write = ToolCallStats::from_exchanges(&[ToolExchange {
+            call_id: "c1".into(),
+            tool_name: "edit".into(),
+            status: ToolExchangeStatus::Completed,
+            diff: Some(ToolExchangeDiff {
+                path: PathBuf::from("src/lib.rs"),
+                old_text: Some("old".into()),
+                new_text: "new".into(),
+            }),
+            ..ToolExchange::default()
+        }]);
+        assert!(write.has_changed_files());
     }
 
     #[test]

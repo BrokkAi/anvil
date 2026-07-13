@@ -4576,7 +4576,10 @@ async fn run_model_turn_in_spawn(
     };
 
     let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges);
-    let visible_response = if turn_recap_enabled && !cancel_status.is_cancelled() {
+    let visible_response = if turn_recap_enabled
+        && !cancel_status.is_cancelled()
+        && tool_stats.has_changed_files()
+    {
         let summary = recap_work_summary(
             llm.as_ref(),
             model,
