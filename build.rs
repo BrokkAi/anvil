@@ -45,15 +45,15 @@ fn main() {
         return;
     }
 
-    let sandbox_manifest = find_dependency_manifest(SANDBOX_CRATE);
+    let metadata = cargo_metadata();
+    let sandbox_manifest = find_dependency_manifest(&metadata, SANDBOX_CRATE);
     if let Some(parent) = sandbox_manifest.parent() {
         println!("cargo:rerun-if-changed={}", parent.join("src").display());
     }
 
-    // Build to a dedicated target dir under OUT_DIR so the registry source
-    // remains read-only and the artifact cannot collide with the host build.
-    let target_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"))
-        .join("sandbox-target");
+    // Build to a dedicated, stable target dir under Cargo's target directory so
+    // CI caches can reuse the nested wasm build across build-script OUT_DIRs.
+    let target_dir = PathBuf::from(&metadata.target_directory).join("brokk-acp-sandbox-wasm");
 
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
         .args([
@@ -104,7 +104,7 @@ fn main() {
     );
 }
 
-fn find_dependency_manifest(name: &str) -> PathBuf {
+fn cargo_metadata() -> CargoMetadata {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(cargo)
         .args(["metadata", "--format-version", "1"])
@@ -122,20 +122,23 @@ fn find_dependency_manifest(name: &str) -> PathBuf {
         panic!("cargo metadata failed");
     }
 
-    let metadata: CargoMetadata =
-        serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
+    serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON")
+}
+
+fn find_dependency_manifest(metadata: &CargoMetadata, name: &str) -> PathBuf {
     let package = metadata
         .packages
-        .into_iter()
+        .iter()
         .find(|package| package.name == name && package.source.is_some())
         .unwrap_or_else(|| panic!("could not find resolved dependency package `{name}`"));
 
-    PathBuf::from(package.manifest_path)
+    PathBuf::from(&package.manifest_path)
 }
 
 #[derive(Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
+    target_directory: String,
 }
 
 #[derive(Deserialize)]
