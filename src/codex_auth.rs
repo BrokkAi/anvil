@@ -425,23 +425,43 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    interactive_browser_login_with_cancel(None, present).await
+}
+
+/// Like [`interactive_browser_login_with`], but lets callers abort the wait for
+/// the localhost callback instead of relying on the callback timeout.
+pub async fn interactive_browser_login_with_cancel<F, Fut>(
+    cancel: Option<&CancellationToken>,
+    present: F,
+) -> Result<AuthDotJson>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let csrf = CsrfToken::new_random();
     let auth_url = build_authorize_url(&challenge, csrf.secret());
 
-    present(auth_url).await?;
+    await_or_cancel(cancel, present(auth_url)).await?;
 
     let expected_state = csrf.secret().clone();
-    let code = tokio::task::spawn_blocking(move || {
-        loopback_capture_code(CALLBACK_PORT, expected_state, CALLBACK_TIMEOUT)
+    let code = await_or_cancel(cancel, async move {
+        tokio::task::spawn_blocking(move || {
+            loopback_capture_code(CALLBACK_PORT, expected_state, CALLBACK_TIMEOUT)
+        })
+        .await
+        .context("loopback capture task panicked")?
     })
-    .await
-    .context("loopback capture task panicked")??;
+    .await?;
 
     let http = http_client()?;
-    let token = exchange_code_for_tokens(&http, &code, verifier.secret()).await?;
+    let token = await_or_cancel(
+        cancel,
+        exchange_code_for_tokens(&http, &code, verifier.secret()),
+    )
+    .await?;
 
-    finalize_chatgpt_login(&http, TOKEN_URL, CLIENT_ID, token, None).await
+    finalize_chatgpt_login(&http, TOKEN_URL, CLIENT_ID, token, cancel).await
 }
 
 /// Run the official Codex device authorization flow used for headless and

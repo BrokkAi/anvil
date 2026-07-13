@@ -5093,8 +5093,9 @@ fn finish_codex_login(
 }
 
 /// Handle `/setup codex` and its subcommands.
-/// Subcommands: bare/`login` = start device-code login, `status` = report
-/// what's stored, `disconnect` = wipe the local credentials.
+/// Subcommands: bare/`login`/`browser` = start browser login, `device` = start
+/// device-code login, `status` = report what's stored, `disconnect` = wipe the
+/// local credentials.
 ///
 /// On a successful login we install the freshly-built Codex backend into
 /// `MultiBackend` so the next `session/new` (and any subsequent `codex::*`
@@ -5108,6 +5109,7 @@ async fn handle_setup_codex(
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     cx: &ConnectionTo<Client>,
     session_id: &str,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> String {
     let arg = rest.trim().to_ascii_lowercase();
 
@@ -5176,7 +5178,7 @@ async fn handle_setup_codex(
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
         },
         "" | "login" | "browser" | "login browser" => {
-            match crate::codex_auth::interactive_browser_login_with(|auth_url| async move {
+            match crate::codex_auth::interactive_browser_login_with_cancel(cancel, |auth_url| async move {
                 let opened = webbrowser::open(&auth_url).is_ok();
                 let prefix = if opened {
                     "Codex browser sign-in started. Waiting for the localhost callback."
@@ -5187,7 +5189,7 @@ async fn handle_setup_codex(
                     cx,
                     session_id,
                     &format!(
-                        "{prefix}\n\nOpen this URL on this machine to sign in:\n\n  {auth_url}\n\nIf localhost callbacks do not work for this client, run `/setup codex device` instead."
+                        "{prefix}\n\nOpen this URL on this machine to sign in:\n\n  {auth_url}\n\nIf localhost callbacks do not work for this client, run `/setup codex device` instead. Run `session/cancel` to stop waiting without changing credentials."
                     ),
                 );
                 Ok(())
@@ -6709,19 +6711,23 @@ async fn run_setup_codex_login_elicitation(
 
     let result = match method {
         CodexLoginMethod::Browser => {
-            crate::codex_auth::interactive_browser_login_with(|auth_url| async move {
-                let request = build_codex_browser_login_elicitation_request(session_id, auth_url);
-                match cx.send_request(request).block_task().await {
-                    Ok(resp) => match resp.action {
-                        ElicitationAction::Accept(_) => Ok(()),
-                        ElicitationAction::Decline | ElicitationAction::Cancel => {
-                            Err(anyhow::anyhow!("sign-in was cancelled"))
-                        }
-                        _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
-                    },
-                    Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
-                }
-            })
+            crate::codex_auth::interactive_browser_login_with_cancel(
+                Some(cancel),
+                |auth_url| async move {
+                    let request =
+                        build_codex_browser_login_elicitation_request(session_id, auth_url);
+                    match cx.send_request(request).block_task().await {
+                        Ok(resp) => match resp.action {
+                            ElicitationAction::Accept(_) => Ok(()),
+                            ElicitationAction::Decline | ElicitationAction::Cancel => {
+                                Err(anyhow::anyhow!("sign-in was cancelled"))
+                            }
+                            _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+                        },
+                        Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+                    }
+                },
+            )
             .await
         }
         CodexLoginMethod::Device => {
@@ -6835,7 +6841,7 @@ fn build_codex_browser_login_elicitation_request(
     );
     CreateElicitationRequest::new(
         mode,
-        "Open this link to sign in to ChatGPT. The browser will return to Anvil on localhost when complete.".to_string(),
+        "Open this link to sign in to ChatGPT. The browser must be able to reach Anvil on localhost; cancel the prompt to stop waiting without changing credentials.".to_string(),
     )
 }
 
@@ -7500,6 +7506,7 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
                 ctx.refresh_lock,
                 ctx.cx,
                 session_id,
+                None,
             )
             .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
