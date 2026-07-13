@@ -314,6 +314,27 @@ fn usage_by_model_meta(
     )])
 }
 
+fn insert_turn_failure_meta(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    failure: &crate::tool_loop::TurnFailure,
+) {
+    let mut namespace = meta
+        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    namespace.insert(
+        "turnFailure".to_string(),
+        serde_json::json!({
+            "retryable": failure.retryable,
+            "message": failure.message,
+        }),
+    );
+    meta.insert(
+        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        serde_json::Value::Object(namespace),
+    );
+}
+
 /// Build the terminal `PromptResponse` for a finished turn, choosing the
 /// stop reason from whether the prompt's cancellation token fired.
 ///
@@ -1218,7 +1239,8 @@ async fn send_session_usage_update(
     session_id: &str,
     fallback_cwd: &Path,
 ) {
-    send_session_usage_update_with_breakdown(cx, sessions, session_id, fallback_cwd, None).await;
+    send_session_usage_update_with_breakdown(cx, sessions, session_id, fallback_cwd, None, None)
+        .await;
 }
 
 async fn send_session_usage_update_with_breakdown(
@@ -1227,6 +1249,7 @@ async fn send_session_usage_update_with_breakdown(
     session_id: &str,
     fallback_cwd: &Path,
     usage_by_model: Option<&BTreeMap<String, crate::llm_client::TokenUsage>>,
+    turn_failure: Option<&crate::tool_loop::TurnFailure>,
 ) {
     let Some(snap) = sessions.snapshot(session_id, fallback_cwd).await else {
         return;
@@ -1234,8 +1257,12 @@ async fn send_session_usage_update_with_breakdown(
     let cost_usd = sessions.exact_usage_cost_usd(session_id).await;
     let mut update =
         session_usage_update(&snap, &sessions.available_model_metadata().await, cost_usd);
-    if let Some(usage_by_model) = usage_by_model {
-        update = update.meta(Some(usage_by_model_meta(usage_by_model)));
+    let mut meta = usage_by_model.map(usage_by_model_meta).unwrap_or_default();
+    if let Some(failure) = turn_failure {
+        insert_turn_failure_meta(&mut meta, failure);
+    }
+    if !meta.is_empty() {
+        update = update.meta(Some(meta));
     }
     let notification =
         SessionNotification::new(session_id.to_string(), SessionUpdate::UsageUpdate(update));
@@ -5350,6 +5377,11 @@ fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
         "has not been built",
         "no build or test",
         "no build/test",
+        "tests were not run",
+        "tests not run",
+        "testing was not run",
+        "not tested",
+        "untested",
     ]
     .iter()
     .any(|phrase| summary.contains(phrase));
@@ -5387,58 +5419,37 @@ fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
     // from the absence of an admitted failure. This also prevents a generic
     // "static audit looks correct" from silently replacing an available
     // compiler or test suite.
-    [
-        "test passes",
-        "tests pass",
-        "test passed",
-        "tests passed",
-        "test passing",
-        "tests passing",
-        "test suite passes",
-        "test suite passed",
-        "all tests pass",
-        "all tests passed",
-        "tests all pass",
-        "tests all passed",
-        "tests, which all pass",
-        "tests, which all passed",
-        "tests are complete",
-        "focused tests are complete",
-        "build succeeds",
-        "build succeeded",
-        "build passes",
-        "build passed",
-        "build successfully",
-        "builds successfully",
-        "build is successful",
-        "built successfully",
-        "clean build",
-        "compiles successfully",
-        "compiled successfully",
-        "compiles cleanly",
-        "compilation succeeds",
-        "compilation succeeded",
-        "compilation passes",
-        "compilation passed",
-        "zero compile errors",
-        "zero compilation errors",
-        "lint passes",
-        "lint passed",
-        "linter passes",
-        "linter passed",
-        "gofmt passed",
-        "go vet passed",
-        "cargo check passed",
-        "typecheck passed",
-        "type-check passed",
-        "checkstyle passed",
-        "verification succeeds",
-        "verification succeeded",
-        "verified by running",
-        "verified with",
+    asgard_text_reports_successful_verification(&summary)
+}
+
+fn asgard_text_reports_successful_verification(text: &str) -> bool {
+    let verifier = [
+        "test",
+        "build",
+        "compil",
+        "lint",
+        "gofmt",
+        "go vet",
+        "cargo check",
+        "typecheck",
+        "type-check",
+        "checkstyle",
+        "verification",
     ]
     .iter()
-    .any(|phrase| summary.contains(phrase))
+    .any(|term| text.contains(term));
+    let success = [
+        "pass",
+        "succeed",
+        "success",
+        "complete",
+        "clean",
+        "zero error",
+        "0 error",
+    ]
+    .iter()
+    .any(|term| text.contains(term));
+    verifier && success
 }
 
 fn filter_asgard_advice_scope(
@@ -5937,6 +5948,10 @@ async fn run_model_turn_in_spawn(
         session_id,
         fallback_cwd,
         usage_by_model.as_ref(),
+        match &stop {
+            crate::tool_loop::LoopStop::Failed(failure) => Some(failure),
+            _ => None,
+        },
     )
     .await;
     ModelTurnResult {
@@ -15802,6 +15817,22 @@ mod tests {
         )
         .unwrap();
         assert!(unrelated_failure.complete);
+        for summary in [
+            "Both dotnet build src/Core/Core.csproj and dotnet build src/Api/Api.csproj succeeded with zero errors after all required changes.",
+            "Both Core and Api projects compile with zero errors after implementing all required changes.",
+        ] {
+            let response = serde_json::json!({
+                "winner": 0,
+                "complete": true,
+                "state_summary": summary,
+                "advices": [],
+            });
+            assert!(
+                parse_asgard_supervisor_decision(&response.to_string(), 3)
+                    .unwrap()
+                    .complete
+            );
+        }
         assert!(
             parse_asgard_supervisor_decision(
                 r#"{"winner":1,"complete":true,"state_summary":"done","advices":[{"strategy":"more work","scope_basis":"optional"}]}"#,
@@ -16138,6 +16169,23 @@ mod tests {
         let meta = usage_by_model_meta(&usage_by_model);
         assert_eq!(
             meta["anvil"]["usageByModel"]["deepseek::deepseek-v4-pro"]["totalTokens"],
+            pro_usage.total_tokens()
+        );
+
+        let mut failure_meta = meta;
+        insert_turn_failure_meta(
+            &mut failure_meta,
+            &crate::tool_loop::TurnFailure {
+                retryable: false,
+                message: "supervisor produced no valid decision".to_string(),
+            },
+        );
+        assert_eq!(
+            failure_meta["anvil"]["turnFailure"]["message"],
+            "supervisor produced no valid decision"
+        );
+        assert_eq!(
+            failure_meta["anvil"]["usageByModel"]["deepseek::deepseek-v4-pro"]["totalTokens"],
             pro_usage.total_tokens()
         );
     }

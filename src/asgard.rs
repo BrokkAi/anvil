@@ -162,15 +162,14 @@ fn copy_missing_tree(source: &Path, destination: &Path) -> Result<()> {
 }
 
 pub(crate) fn capture_patch(root: &Path) -> Result<Vec<u8>> {
-    let status = Command::new("git")
-        .args(["add", "-N", "--all"])
-        .current_dir(root)
-        .status()?;
-    if !status.success() {
-        bail!("git add -N failed in {}", root.display());
-    }
-    Ok(git(
+    let index_path =
+        std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
+    let _index_guard = TemporaryIndex::new(index_path.clone());
+    git_with_index(root, &index_path, &["read-tree", "HEAD"])?;
+    add_intent_to_add_untracked(root, &index_path)?;
+    Ok(git_with_index(
         root,
+        &index_path,
         &[
             "diff",
             "--binary",
@@ -214,7 +213,7 @@ pub(crate) fn capture_patch_since(root: &Path, selected_patch: &[u8]) -> Result<
             );
         }
     }
-    git_with_index(root, &index_path, &["add", "-N", "--all"])?;
+    add_intent_to_add_untracked(root, &index_path)?;
     Ok(git_with_index(
         root,
         &index_path,
@@ -229,6 +228,43 @@ pub(crate) fn capture_patch_since(root: &Path, selected_patch: &[u8]) -> Result<
         ],
     )?
     .stdout)
+}
+
+fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
+    let untracked = git_with_index(
+        root,
+        index,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+        ],
+    )?
+    .stdout;
+    if untracked.is_empty() {
+        return Ok(());
+    }
+    let mut child = Command::new("git")
+        .args(["add", "-N", "--pathspec-from-file=-", "--pathspec-file-nul"])
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .context("write untracked paths to temporary Asgard index")?
+        .write_all(&untracked)?;
+    if !child.wait()?.success() {
+        bail!(
+            "git add -N for untracked files failed in {}",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 struct TemporaryIndex {
@@ -389,7 +425,8 @@ mod tests {
         run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
         run_git(repo, &["config", "user.name", "Asgard Test"]);
         fs::write(repo.join("tracked.txt"), "head\n").unwrap();
-        run_git(repo, &["add", "tracked.txt"]);
+        fs::write(repo.join("removed.txt"), "remove in candidate\n").unwrap();
+        run_git(repo, &["add", "tracked.txt", "removed.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
 
         fs::write(repo.join("tracked.txt"), "selected\n").unwrap();
@@ -397,12 +434,15 @@ mod tests {
         let selected = capture_patch(repo).unwrap();
 
         fs::write(repo.join("tracked.txt"), "candidate\n").unwrap();
+        fs::remove_file(repo.join("removed.txt")).unwrap();
         fs::write(repo.join("candidate-only.txt"), "candidate file\n").unwrap();
         let delta = capture_patch_since(repo, &selected).unwrap();
         let delta_text = String::from_utf8_lossy(&delta);
         assert!(delta_text.contains("-selected"));
         assert!(delta_text.contains("+candidate"));
         assert!(delta_text.contains("candidate-only.txt"));
+        assert!(delta_text.contains("deleted file mode"));
+        assert!(delta_text.contains("removed.txt"));
         assert!(!delta_text.contains("selected-only.txt"));
 
         run_git(repo, &["reset", "--hard", "HEAD"]);
@@ -420,6 +460,61 @@ mod tests {
         assert_eq!(
             fs::read_to_string(repo.join("candidate-only.txt")).unwrap(),
             "candidate file\n"
+        );
+        assert!(!repo.join("removed.txt").exists());
+    }
+
+    #[test]
+    fn captured_patch_round_trips_tracked_deletions() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("deleted.txt"), "remove me\n").unwrap();
+        run_git(repo, &["add", "deleted.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        fs::remove_file(repo.join("deleted.txt")).unwrap();
+        fs::write(repo.join("added.txt"), "keep me\n").unwrap();
+        let patch = capture_patch(repo).unwrap();
+        let patch_text = String::from_utf8_lossy(&patch);
+        assert!(patch_text.contains("deleted file mode"));
+        assert!(patch_text.contains("added.txt"));
+
+        run_git(repo, &["reset", "--hard", "HEAD"]);
+        run_git(repo, &["clean", "-fd"]);
+        apply_selected_patch(repo, &patch).unwrap();
+        assert!(!repo.join("deleted.txt").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("added.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_patch_applies_tracked_deletions_to_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("deleted.txt"), "remove me\n").unwrap();
+        run_git(repo, &["add", "deleted.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        let worktree = create_worktree(repo, "deletion-test").unwrap();
+        fs::remove_file(worktree.root.join("deleted.txt")).unwrap();
+        fs::write(worktree.root.join("added.txt"), "keep me\n").unwrap();
+        let patch = capture_patch(&worktree.root).unwrap();
+        assert!(String::from_utf8_lossy(&patch).contains("deleted file mode"));
+
+        apply_selected_patch(repo, &patch).unwrap();
+        remove_worktree(&worktree);
+        assert!(!repo.join("deleted.txt").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("added.txt")).unwrap(),
+            "keep me\n"
         );
     }
 }
