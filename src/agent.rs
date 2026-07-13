@@ -6702,6 +6702,8 @@ enum SetupElicitTarget {
     Home,
     /// `/setup sandbox` with no explicit value -> single-select form menu.
     Sandbox,
+    /// `/setup bedrock catalog` -> single-select catalog-source menu.
+    BedrockCatalog,
     /// `/setup codex` (or `/setup codex login`) -> form-mode auth-method menu.
     CodexLogin,
     /// `/setup openrouter` with no explicit value -> form-mode key entry.
@@ -6719,7 +6721,7 @@ impl SetupElicitTarget {
             // The home menu is a form-mode (single-select) elicitation.
             Self::Home => caps.form,
             // Sandbox is a form-mode (menu) elicitation.
-            Self::Sandbox => caps.form,
+            Self::Sandbox | Self::BedrockCatalog => caps.form,
             // Good clients get a form menu to choose browser vs device auth,
             // then a URL prompt for the selected auth URL.
             Self::CodexLogin => caps.form && caps.url,
@@ -6750,6 +6752,9 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
         // Bare `/setup` (no sub-command) -> the single interactive entry point.
         "" => Some(SetupElicitTarget::Home),
         "sandbox" if rest.is_empty() => Some(SetupElicitTarget::Sandbox),
+        "bedrock" if rest.eq_ignore_ascii_case("catalog") => {
+            Some(SetupElicitTarget::BedrockCatalog)
+        }
         // Bare `/setup codex` / `/setup codex login` open a method menu;
         // explicit methods and status/disconnect keep the text flow.
         "codex" if rest.is_empty() || rest == "login" => Some(SetupElicitTarget::CodexLogin),
@@ -6781,6 +6786,17 @@ async fn run_setup_elicitation(
         }
         SetupElicitTarget::Sandbox => {
             run_setup_sandbox_elicitation(spawned_cx, sessions, session_id, cancel).await;
+        }
+        SetupElicitTarget::BedrockCatalog => {
+            run_setup_bedrock_catalog_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
         }
         SetupElicitTarget::CodexLogin => {
             run_setup_codex_login_elicitation(
@@ -7354,6 +7370,82 @@ async fn apply_sandbox_elicitation_outcome(
     }
 }
 
+async fn run_setup_bedrock_catalog_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    let cx = spawned_cx.cx();
+    let request = build_bedrock_catalog_elicitation_request(session_id);
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        response = cx.send_request(request).block_task() => response,
+    };
+    let message = match response {
+        Ok(resp) => match resp.action {
+            ElicitationAction::Accept(accept) => {
+                let choice = accept
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get("catalog"))
+                    .and_then(|value| match value {
+                        ElicitationContentValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+                match choice {
+                    Some(choice) => {
+                        handle_setup_bedrock(
+                            cx,
+                            sessions,
+                            session_id,
+                            llm,
+                            refresh_lock,
+                            &format!("catalog {choice}"),
+                        )
+                        .await
+                    }
+                    None => {
+                        "No Bedrock catalog mode selected; configuration is unchanged.".to_string()
+                    }
+                }
+            }
+            ElicitationAction::Decline | ElicitationAction::Cancel => {
+                "Bedrock catalog setup cancelled; configuration is unchanged.".to_string()
+            }
+            _ => "Bedrock catalog setup did not complete; configuration is unchanged.".to_string(),
+        },
+        Err(err) => {
+            tracing::warn!("/setup bedrock catalog elicitation failed: {err}");
+            "Setup could not show the Bedrock catalog menu; configuration is unchanged.".to_string()
+        }
+    };
+    send_message(cx, session_id, &message);
+}
+
+fn build_bedrock_catalog_elicitation_request(session_id: &str) -> CreateElicitationRequest {
+    let current = crate::setup_state::bedrock_catalog_mode().as_str();
+    let field = StringPropertySchema::new()
+        .title("Bedrock model catalog")
+        .description("Choose which Bedrock model discovery APIs are used and which source wins duplicate model ids.")
+        .one_of(vec![
+            EnumOption::new("mantle-only", "Mantle only"),
+            EnumOption::new("native-only", "Native Bedrock only"),
+            EnumOption::new("mantle-preferred", "Merge; prefer Mantle on conflicts"),
+            EnumOption::new("native-preferred", "Merge; prefer native Bedrock on conflicts"),
+        ])
+        .default_value(current);
+    let schema = ElicitationSchema::new()
+        .title("Bedrock model catalog")
+        .property("catalog", field, true);
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "Choose how Bedrock models are discovered")
+}
+
 /// A choice from the `/setup` home, mapped to the sub-flow it dispatches into.
 /// This registry is the source for both the interactive menu and Markdown
 /// fallback, including their scope labels.
@@ -7363,8 +7455,10 @@ enum SetupHomeRoute {
     Choose,
     /// Interactive Codex / ChatGPT sign-in (`/setup codex`).
     Codex,
-    /// AWS Bedrock setup (`/setup bedrock`).
+    /// AWS Bedrock credential setup (`/setup bedrock`).
     Bedrock,
+    /// Bedrock model catalog source (`/setup bedrock catalog`).
+    BedrockCatalog,
     /// Local Ollama models (`/setup local`).
     Local,
     /// Hosted DeepSeek key entry (`/setup deepseek`).
@@ -7384,6 +7478,7 @@ impl SetupHomeRoute {
             Self::Choose => "choose",
             Self::Codex => "codex",
             Self::Bedrock => "bedrock",
+            Self::BedrockCatalog => "bedrock-catalog",
             Self::Local => "local",
             Self::DeepSeek => "deepseek",
             Self::OpenRouter => "openrouter",
@@ -7404,7 +7499,8 @@ impl SetupHomeRoute {
         match self {
             Self::Choose => "Choose a model for me",
             Self::Codex => "Sign in to Codex / ChatGPT",
-            Self::Bedrock => "Use AWS Bedrock",
+            Self::Bedrock => "Connect AWS Bedrock",
+            Self::BedrockCatalog => "Configure Bedrock model catalog",
             Self::Local => "Use local models (Ollama / ds4)",
             Self::DeepSeek => "Use hosted DeepSeek",
             Self::OpenRouter => "Use OpenRouter",
@@ -7419,7 +7515,7 @@ impl SetupHomeRoute {
                 "global provider"
             }
             Self::Choose => "current session",
-            Self::Recap => "install default",
+            Self::Recap | Self::BedrockCatalog => "install default",
             Self::Advanced => "all scopes",
         }
     }
@@ -7429,6 +7525,7 @@ impl SetupHomeRoute {
             Self::Choose => "/setup choose",
             Self::Codex => "/setup codex",
             Self::Bedrock => "/setup bedrock",
+            Self::BedrockCatalog => "/setup bedrock catalog",
             Self::Local => "/setup local",
             Self::DeepSeek => "/setup deepseek",
             Self::OpenRouter => "/setup openrouter",
@@ -7452,11 +7549,12 @@ impl SetupHomeRoute {
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 8] {
+    fn menu() -> [Self; 9] {
         [
             Self::Choose,
             Self::Codex,
             Self::Bedrock,
+            Self::BedrockCatalog,
             Self::Local,
             Self::DeepSeek,
             Self::OpenRouter,
@@ -7584,6 +7682,17 @@ async fn run_setup_home_elicitation(
         }
         Some(SetupHomeRoute::Bedrock) => {
             run_setup_bedrock_login_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
+        }
+        Some(SetupHomeRoute::BedrockCatalog) => {
+            run_setup_bedrock_catalog_elicitation(
                 spawned_cx,
                 sessions,
                 session_id,
@@ -8208,6 +8317,36 @@ async fn handle_setup_bedrock(
             }
             Err(e) => format!("Failed to save Bedrock region: {e:#}"),
         }
+    } else if let Some(mode) = rest.strip_prefix("catalog ") {
+        use std::str::FromStr;
+
+        let mode = mode.trim().to_ascii_lowercase();
+        let Ok(mode) = crate::setup_state::BedrockCatalogMode::from_str(&mode) else {
+            return "Unknown Bedrock catalog mode. Try `mantle-only`, `native-only`, `mantle-preferred`, or `native-preferred`.".to_string();
+        };
+        match crate::setup_state::remember_bedrock_catalog_mode(mode) {
+            Ok(()) => {
+                match crate::bedrock_client::build_backend_from_config() {
+                    Ok(Some(backend)) => llm.install_bedrock(backend),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to reload Bedrock after catalog mode change: {err:#}"
+                        )
+                    }
+                }
+                refresh_catalog_after(
+                    cx,
+                    session_id,
+                    sessions,
+                    llm,
+                    refresh_lock,
+                    "Refreshing model catalog after Bedrock catalog mode change...",
+                );
+                format!("Bedrock catalog mode set to `{}`.", mode.as_str())
+            }
+            Err(err) => format!("Failed to save Bedrock catalog mode: {err:#}"),
+        }
     } else if let Some(model) = rest.strip_prefix("model ") {
         let model = model.trim();
         if model.is_empty() {
@@ -8252,10 +8391,12 @@ async fn handle_setup_bedrock(
                     format!(
                         "Bedrock is configured via {} environment variable.\n\
                          Region: {}\n\
-                         Model: {}",
+                         Model: {}\n\
+                         Catalog: {}",
                         crate::bedrock_client::BEDROCK_API_KEY_ENV,
                         crate::bedrock_auth::region_from_any_source(),
                         crate::bedrock_auth::model_from_any_source(),
+                        crate::setup_state::bedrock_catalog_mode().as_str(),
                     )
                 } else {
                     match crate::bedrock_auth::read() {
@@ -8263,8 +8404,9 @@ async fn handle_setup_bedrock(
                             let region = auth.region.as_deref().unwrap_or("(default)");
                             let model = auth.default_model.as_deref().unwrap_or("(default)");
                             format!(
-                                "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}",
-                                auth.bearer_token.len()
+                                "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}\n  Catalog: {}",
+                                auth.bearer_token.len(),
+                                crate::setup_state::bedrock_catalog_mode().as_str()
                             )
                         }
                         Ok(None) if state.legacy_secrets_present => format!(
@@ -8354,12 +8496,15 @@ fn render_bedrock_setup_help() -> String {
          {key_help}\n\n\
          You also need:\n\
          - A region (default: us-east-1): `/setup bedrock region <region>`\n\
-         - A model (default: us.anthropic.claude-sonnet-4-6): `/setup bedrock model <id>`\n\n\
+         - A model (default: us.anthropic.claude-sonnet-4-6): `/setup bedrock model <id>`\n\
+         - A catalog mode (current: {}): `/setup bedrock catalog`\n\n\
          Other commands:\n\
+         - `/setup bedrock catalog mantle-only|native-only|mantle-preferred|native-preferred`\n\
          - `/setup bedrock status`\n\
          - `/setup bedrock disconnect`\n\
          - `/setup bedrock refresh`\n\n\
-         Choose for me: `/setup choose`."
+         Choose for me: `/setup choose`.",
+        crate::setup_state::bedrock_catalog_mode().as_str()
     )
 }
 
@@ -9075,12 +9220,16 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         crate::sandbox_backend::resolve_mode(session.sandbox_mode).as_str()
     ));
     out.push_str(&format!(
-        "- Turn recap: `{}`\n\n",
+        "- Turn recap: `{}`\n",
         if session.turn_recap_enabled {
             "enabled"
         } else {
             "disabled"
         }
+    ));
+    out.push_str(&format!(
+        "- Bedrock catalog mode: `{}`\n\n",
+        crate::setup_state::bedrock_catalog_mode().as_str()
     ));
     out.push_str("Current-session commands:\n");
     out.push_str("- `/setup model` - list model ids.\n");
@@ -9098,6 +9247,9 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
     );
     out.push_str("- `/setup recap on|off` - toggle automatic turn recaps.\n");
+    out.push_str(
+        "- `/setup bedrock catalog` - choose Bedrock model discovery and conflict precedence.\n",
+    );
     if !openrouter_picks.is_empty() {
         out.push_str("\nFiltered OpenRouter coding candidates:\n");
         for id in openrouter_picks {
@@ -14329,6 +14481,7 @@ mod tests {
                 "choose",
                 "codex",
                 "bedrock",
+                "bedrock-catalog",
                 "local",
                 "deepseek",
                 "openrouter",
@@ -14568,14 +14721,45 @@ mod tests {
             setup_elicitation_target("/setup deepseek"),
             Some(SetupElicitTarget::DeepSeekLogin)
         );
+        assert_eq!(
+            setup_elicitation_target("/setup bedrock catalog"),
+            Some(SetupElicitTarget::BedrockCatalog)
+        );
         for prompt in [
             "/setup bedrock key token",
             "/setup bedrock status",
+            "/setup bedrock catalog native-only",
             "/setup deepseek key secret",
             "/setup deepseek disconnect",
         ] {
             assert_eq!(setup_elicitation_target(prompt), None, "prompt: {prompt}");
         }
+    }
+
+    #[test]
+    fn bedrock_catalog_elicitation_request_shape() {
+        let req = build_bedrock_catalog_elicitation_request("sess-bedrock");
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"], "sess-bedrock");
+        let catalog = &json["requestedSchema"]["properties"]["catalog"];
+        assert_eq!(catalog["default"], "mantle-preferred");
+        let values: Vec<&str> = catalog["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "mantle-only",
+                "native-only",
+                "mantle-preferred",
+                "native-preferred"
+            ]
+        );
     }
 
     #[test]
