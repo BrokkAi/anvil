@@ -5028,6 +5028,11 @@ fn asgard_supervisor_messages(
              response must contain the requested winner, a complete boolean, a sufficient account \
              of the selected endpoint, and either no advice when complete or one distinct, \
              scope-grounded next-window advice object per lane when incomplete. \
+             Every strategy must independently comply with every explicit task requirement. \
+             Diversity means different valid routes to the same required outcome; it is never \
+             permission to relax a contract, substitute a broader or weaker behavior, or offer a \
+             knowingly noncompliant fallback. Never propose a strategy that admits it deviates \
+             from the task or specification. \
              Select the single trajectory with the highest probability of eventually producing a \
              correct, complete solution if continued from its endpoint. Judge long-term direction, \
              not just immediate visible activity. Valuable progress includes discovering constraints, \
@@ -5385,6 +5390,10 @@ fn filter_asgard_advice_scope(
             continue;
         };
         let strategy = strategy.to_lowercase();
+        let self_admitted_task_deviation = strategy.contains("deviates from")
+            && ["requirement", "specification", "task", "contract"]
+                .iter()
+                .any(|term| strategy.contains(term));
         let policy_bypasses = [
             "nugetaudit=false",
             "nugetaudit false",
@@ -5443,7 +5452,9 @@ fn filter_asgard_advice_scope(
             "avoids unnecessarystubbingexception",
             "preventing unnecessary-stubbing",
         ];
-        let violation = if let Some(term) = policy_bypasses
+        let violation = if self_admitted_task_deviation {
+            Some("strategy admits that it deviates from the task".to_string())
+        } else if let Some(term) = policy_bypasses
             .iter()
             .find(|term| strategy.contains(**term))
         {
@@ -15791,6 +15802,7 @@ mod tests {
             "Apply Spotless selectively by temporarily suppressing the lint-error blocker.",
             "Run the focused Gradle tests with `-x :app:frontendBuild` to bypass the unrelated failure.",
             "Resolve the build-environment issues in the correct workspace, skip the failing pnpm tasks, and run the focused tests.",
+            "Catch broad Exception as a safer fallback, although this deviates from the exact JsonQueryException catch requirement.",
             "Invoke tasks.allTasks() solely to keep the existing mock stubs used and avoid UnnecessaryStubbingException.",
         ] {
             let mut candidate = decision(strategy);
