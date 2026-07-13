@@ -5078,17 +5078,18 @@ fn asgard_supervisor_messages(
              environmental, dependency-audit, or harness failures. Decide whether the selected \
              endpoint is complete. Set complete=true when it satisfies every explicit task \
              requirement and no known candidate-caused defect or necessary task-relevant \
-             verification remains. Successful focused builds/tests or comparably strong evidence \
-             are sufficient; optional extra tests, broader audits, cleanup, and nice-to-have coverage \
-             must not keep complete=false. When complete=true, return advices=[] and do not invent \
-             more work. For complete=true, state_summary must affirm which task-relevant build, \
-             compilation, test, lint, or equivalent verification actually ran and passed. Omission \
-             of affirmative verification evidence makes the answer invalid. The only exception is \
-             a genuinely unavailable verifier, which state_summary must identify together with a \
-             skeptical static compilation audit of introduced symbols and call contracts. It is \
-             also invalid if state_summary discloses any remaining \
-             candidate-caused defect, including formatting, lint, compilation, or test failures in \
-             candidate-modified files. Otherwise produce exactly {candidate_count} concise, \
+             work remains. Exercise the judgment of a strong coding agent: verification is evidence, \
+             not a blanket stopping rule. A focused successful verifier can establish confidence, \
+             but its absence does not mechanically force either complete=true or complete=false. \
+             Weigh the task, the patch's integration risk, the available execution evidence, and any \
+             environmental limitation. Never claim a command ran when the trajectory does not show \
+             it, and never promote a merely plausible static review into stronger evidence than it \
+             provides. In particular, scrutinize visibility, imports, signatures, namespaces, and \
+             cross-module call sites introduced by an uncompiled patch. Optional extra tests, broader \
+             audits, cleanup, and nice-to-have coverage must not create endless work once the endpoint \
+             is genuinely complete. When complete=true, return advices=[] and state_summary must give \
+             your candid evidence-based account of why stopping is the best judgment, including any \
+             meaningful residual uncertainty. Otherwise produce exactly {candidate_count} concise, \
              actionable, mutually distinct strategies for the next candidate window, ordered by \
              zero-based lane index. The strategies should explore different hypotheses or \
              implementation/test approaches from the selected state. They are advice for normal \
@@ -5255,9 +5256,6 @@ fn parse_asgard_supervisor_decision(
             if !raw_advices.is_empty() {
                 continue;
             }
-            if !asgard_completion_evidence_is_consistent(state_summary) {
-                continue;
-            }
             return Ok(AsgardSupervisorDecision {
                 winner,
                 complete,
@@ -5299,157 +5297,6 @@ fn parse_asgard_supervisor_decision(
     anyhow::bail!(
         "Asgard supervisor returned neither a valid completed winner nor a winner plus {count} distinct advices"
     )
-}
-
-fn asgard_completion_evidence_is_consistent(state_summary: &str) -> bool {
-    let summary = state_summary.to_lowercase();
-    let candidate_defect_anchor = [
-        "candidate-caused",
-        "candidate caused",
-        "introduced by the patch",
-        "in the candidate patch",
-        "modified file",
-        "new file",
-        "file itself",
-        "patch still",
-        "implementation still",
-        "current changes",
-    ]
-    .iter()
-    .any(|phrase| summary.contains(phrase));
-    let unresolved_defect = [
-        "remaining issue",
-        "remaining defect",
-        "remaining error",
-        "still fail",
-        "still has",
-        "formatting violation",
-        "lint violation",
-        "checkstyle violation",
-        "compilation error",
-        "test failure",
-        "known defect",
-    ]
-    .iter()
-    .any(|phrase| summary.contains(phrase));
-    if candidate_defect_anchor && unresolved_defect {
-        return false;
-    }
-
-    if [
-        "test failed",
-        "tests failed",
-        "test fails",
-        "tests fail",
-        "test did not pass",
-        "tests did not pass",
-        "test does not pass",
-        "tests do not pass",
-        "build failed",
-        "build fails",
-        "compilation failed",
-        "compilation fails",
-        "compile failed",
-        "compile fails",
-        "lint failed",
-        "lint fails",
-        "verification failed",
-        "verification fails",
-    ]
-    .iter()
-    .any(|phrase| summary.contains(phrase))
-    {
-        return false;
-    }
-
-    let reports_missing_build_verification = [
-        "no compilation",
-        "not compiled",
-        "not been compiled",
-        "hasn't been compiled",
-        "uncompiled",
-        "compilation was not run",
-        "compile was not run",
-        "no build was run",
-        "build was not run",
-        "build has not been run",
-        "not been built",
-        "has not been built",
-        "no build or test",
-        "no build/test",
-        "tests were not run",
-        "tests not run",
-        "testing was not run",
-        "not tested",
-        "untested",
-    ]
-    .iter()
-    .any(|phrase| summary.contains(phrase));
-    // A genuinely unavailable verifier can be replaced by the skeptical
-    // static compilation audit required by the supervisor prompt. Merely
-    // saying an uncompiled patch "appears" correct is self-contradictory
-    // evidence for complete=true and must make the structured answer invalid.
-    let verifier_unavailable = [
-        "environmental",
-        "environment is unavailable",
-        "environment was unavailable",
-        "execution is unavailable",
-        "execution was unavailable",
-        "build is blocked",
-        "build was blocked",
-        "verifier is unavailable",
-        "verifier was unavailable",
-        "wrapper is unavailable",
-        "wrapper was unavailable",
-        "pre-existing build failure",
-        "preexisting build failure",
-        "harness failure",
-    ]
-    .iter()
-    .any(|phrase| summary.contains(phrase));
-    let reports_static_audit = summary.contains("static audit")
-        || summary.contains("statically audited")
-        || summary.contains("static compilation audit");
-    if reports_missing_build_verification {
-        return verifier_unavailable && reports_static_audit;
-    }
-
-    // Fail closed on omission. A completion claim must name affirmative
-    // verification evidence, rather than forcing the parser to infer success
-    // from the absence of an admitted failure. This also prevents a generic
-    // "static audit looks correct" from silently replacing an available
-    // compiler or test suite.
-    asgard_text_reports_successful_verification(&summary)
-}
-
-fn asgard_text_reports_successful_verification(text: &str) -> bool {
-    let verifier = [
-        "test",
-        "build",
-        "compil",
-        "lint",
-        "gofmt",
-        "go vet",
-        "cargo check",
-        "typecheck",
-        "type-check",
-        "checkstyle",
-        "verification",
-    ]
-    .iter()
-    .any(|term| text.contains(term));
-    let success = [
-        "pass",
-        "succeed",
-        "success",
-        "complete",
-        "clean",
-        "zero error",
-        "0 error",
-    ]
-    .iter()
-    .any(|term| text.contains(term));
-    verifier && success
 }
 
 fn filter_asgard_advice_scope(
@@ -15784,40 +15631,13 @@ mod tests {
         .unwrap();
         assert!(completed.complete);
         assert_eq!(completed.advices, vec![None, None, None]);
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":true,"state_summary":"No compilation or tests were run, but the patch appears syntactically correct.","advices":[]}"#,
-                3,
-            )
-            .is_err()
-        );
-        let statically_verified = parse_asgard_supervisor_decision(
-            r#"{"winner":1,"complete":true,"state_summary":"Compilation was not run because the wrapper was unavailable; a static compilation audit verified all introduced symbols, imports, signatures, and call contracts.","advices":[]}"#,
-            3,
-        )
-        .unwrap();
-        assert!(statically_verified.complete);
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":2,"complete":true,"state_summary":"Lane 2 completed all required changes and matches the task. No known defects. A static audit found the structure plausible.","advices":[]}"#,
-                3,
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":0,"complete":true,"state_summary":"All 60 functional tests pass. The new GoImportTest file itself has minor formatting violations; only unrelated formatter failures otherwise remain.","advices":[]}"#,
-                3,
-            )
-            .is_err()
-        );
-        let unrelated_failure = parse_asgard_supervisor_decision(
-            r#"{"winner":0,"complete":true,"state_summary":"The implementation compiles and all focused tests pass. The only remaining formatter failure is pre-existing and confined to unrelated unmodified files.","advices":[]}"#,
-            3,
-        )
-        .unwrap();
-        assert!(unrelated_failure.complete);
+        // Completion is the supervisor model's judgment. The parser enforces
+        // the wire shape, not a handcrafted policy about which evidence is
+        // sufficient to stop.
         for summary in [
+            "No compilation or tests were run, but the patch appears syntactically correct.",
+            "Compilation was not run because the wrapper was unavailable; a static compilation audit covered introduced symbols and call contracts.",
+            "All 60 functional tests pass, with a disclosed residual formatting concern.",
             "Both dotnet build src/Core/Core.csproj and dotnet build src/Api/Api.csproj succeeded with zero errors after all required changes.",
             "Both Core and Api projects compile with zero errors after implementing all required changes.",
         ] {
