@@ -305,6 +305,11 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Execute,
         display_name: "Running shell command",
     },
+    ToolMeta {
+        name: "update_plan",
+        kind: ToolKind::Read,
+        display_name: "Updating plan",
+    },
     // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
     // Listed here so the permission gate can classify them; their actual
     // execution is delegated to the configured MCP server. The cross-check
@@ -612,6 +617,7 @@ const BUILTIN_TOOL_NAMES: &[&str] = &[
     "grep_search",
     "web_search",
     "run_shell_command",
+    "update_plan",
 ];
 
 fn is_builtin_tool(name: &str) -> bool {
@@ -986,6 +992,40 @@ impl ToolRegistry {
                     "type": "object",
                     "properties": shell_properties,
                     "required": ["command"]
+                }),
+            ));
+        }
+        if builtin_tools.contains("update_plan") {
+            defs.push(tool_def(
+                "update_plan",
+                "Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "explanation": {
+                            "type": "string",
+                            "description": "Optional explanation for this plan update."
+                        },
+                        "plan": {
+                            "type": "array",
+                            "description": "The list of steps.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": { "type": "string", "description": "Task step text." },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "Step status."
+                                    }
+                                },
+                                "required": ["step", "status"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["plan"],
+                    "additionalProperties": false
                 }),
             ));
         }
@@ -1379,6 +1419,16 @@ impl ToolRegistry {
                     cancel,
                 )
                 .await
+            }
+            "update_plan" => {
+                let _: crate::plan::UpdatePlanArgs = match parse_builtin_args(name, args) {
+                    Ok(args) => args,
+                    Err(result) => return result,
+                };
+                ToolResult {
+                    status: ToolStatus::Success,
+                    output: "Plan updated".to_string(),
+                }
             }
             "activate_skill" => self.execute_activate_skill(args).await,
             // Any name not handled above is delegated to a configured MCP

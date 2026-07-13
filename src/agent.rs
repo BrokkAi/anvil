@@ -4831,6 +4831,15 @@ async fn run_asgard_trajectory_loop(
                 winner.model
             ),
         );
+        if let Some(plan) = winner.outcome.current_plan.as_ref() {
+            let notification = SessionNotification::new(
+                session_id.to_string(),
+                SessionUpdate::Plan(plan.to_acp()),
+            );
+            if let Err(error) = cx.send_notification(notification) {
+                tracing::warn!("failed to publish selected Asgard plan: {error}");
+            }
+        }
         common_patch = winner.patch.clone();
         common_messages = winner.outcome.continuation_messages.clone();
         // Store the canonical history in terms of the live checkout. Each
@@ -5852,6 +5861,7 @@ fn asgard_failure(error: anyhow::Error) -> crate::tool_loop::LoopOutcome {
             message: format!("Asgard failed: {error:#}"),
         }),
         continuation_messages: Vec::new(),
+        current_plan: None,
     }
 }
 
@@ -5976,6 +5986,7 @@ async fn run_model_turn_in_spawn(
                         message: "agent loop panicked".to_string(),
                     }),
                     continuation_messages: Vec::new(),
+                    current_plan: None,
                 },
                 None,
             )
@@ -5988,6 +5999,7 @@ async fn run_model_turn_in_spawn(
         usage: turn_usage,
         stop,
         continuation_messages: _,
+        current_plan: _,
     } = outcome;
 
     let model_metadata = sessions.available_model_metadata().await;
@@ -6236,6 +6248,9 @@ when changing strategy, write one short visible sentence explaining the current 
 the next tools help. After significant tool results, briefly state what was learned and the \
 next step. Do not reveal private chain-of-thought; provide concise intent/evidence summaries \
 only. Skip progress notes for trivial single-tool lookups.
+- For meaningful multi-step work, use update_plan to keep a short current plan. Keep exactly one \
+step in_progress until the work is done, update the plan when the approach changes, and mark all \
+steps completed before finishing. Skip plan overhead for simple tasks.
 - Before changing code, understand it: read the relevant files and see how the surrounding \
 project does things. Follow the project's existing conventions — style, naming, structure, \
 error handling, test framework. Never assume a library is available; verify the project \

@@ -26,7 +26,7 @@ use crate::p2t::{self, P2tStopReason, StepTraceRecord};
 
 use crate::semantic_rerank;
 use crate::session::{
-    PermissionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
+    PermissionMode, SessionMode, SessionStore, ToolCallReplay, ToolExchange, ToolExchangeDiff,
     ToolExchangeStatus, TurnReplayEvent,
 };
 use crate::structured_output::StructuredOutputRequest;
@@ -528,6 +528,9 @@ pub(crate) struct LoopOutcome {
     /// this to snap every candidate to the selected trajectory without
     /// reconstructing history through ACP.
     pub continuation_messages: Vec<ChatMessage>,
+    /// Most recently published task plan. This is model state rather than a
+    /// completion gate; callers retain it across Asgard windows and compaction.
+    pub current_plan: Option<crate::plan::UpdatePlanArgs>,
 }
 
 impl LoopOutcome {
@@ -546,6 +549,7 @@ impl LoopOutcome {
             replay_events: Vec::new(),
             usage: TokenUsage::default(),
             continuation_messages: Vec::new(),
+            current_plan: None,
         }
     }
 }
@@ -1770,6 +1774,7 @@ pub(crate) async fn run(
     trajectory_window: bool,
 ) -> LoopOutcome {
     let train_bifrost = train_bifrost_enabled();
+    let mut current_plan = None;
     let p2t_config = match p2t::load_config_from_env(train_bifrost) {
         Ok(config) => config,
         Err(error) => {
@@ -1990,6 +1995,7 @@ pub(crate) async fn run(
                 &mut tool_exchanges,
                 &mut replay_events,
                 &mut turn_usage,
+                &mut current_plan,
                 max_turns,
                 idle_timeout,
                 cancel.clone(),
@@ -2358,6 +2364,7 @@ pub(crate) async fn run(
                     &mut tool_exchanges,
                     &mut replay_events,
                     &mut turn_usage,
+                    &mut current_plan,
                     max_turns,
                     idle_timeout,
                     cancel.clone(),
@@ -2611,6 +2618,7 @@ pub(crate) async fn run(
         usage: turn_usage,
         stop,
         continuation_messages: messages,
+        current_plan,
     }
 }
 
@@ -2720,6 +2728,7 @@ async fn execute_step_tool_calls(
     tool_exchanges: &mut Vec<ToolExchange>,
     replay_events: &mut Vec<TurnReplayEvent>,
     turn_usage: &mut TokenUsage,
+    current_plan: &mut Option<crate::plan::UpdatePlanArgs>,
     max_turns: usize,
     idle_timeout: IdleTimeouts,
     cancel: CancellationToken,
@@ -3153,6 +3162,39 @@ async fn execute_step_tool_calls(
                         .await;
                         turn_usage.add(nested_usage);
                         exec
+                    } else if tool_name == "update_plan" {
+                        match serde_json::from_value::<crate::plan::UpdatePlanArgs>(
+                            parsed_input.clone(),
+                        ) {
+                            Err(error) => ToolExecution {
+                                output: format!("Invalid update_plan arguments: {error}"),
+                                failed: true,
+                            },
+                            Ok(_plan)
+                                if sessions
+                                    .snapshot(session_id, registry.cwd())
+                                    .await
+                                    .is_some_and(|snapshot| snapshot.mode == SessionMode::Plan) =>
+                            {
+                                ToolExecution {
+                                    output: "update_plan is unavailable in Plan mode.".to_string(),
+                                    failed: true,
+                                }
+                            }
+                            Ok(plan) => {
+                                maybe_send_session_update(
+                                    notifications,
+                                    spawned_cx.cx(),
+                                    session_id,
+                                    SessionUpdate::Plan(plan.to_acp()),
+                                );
+                                *current_plan = Some(plan);
+                                ToolExecution {
+                                    output: "Plan updated".to_string(),
+                                    failed: false,
+                                }
+                            }
+                        }
                     } else if tool_name == "semantic_search"
                         && registry.is_bifrost_tool("semantic_search")
                     {

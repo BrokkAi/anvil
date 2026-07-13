@@ -26,6 +26,7 @@ mod multi_backend;
 mod openrouter_auth;
 mod openrouter_credits;
 mod p2t;
+mod plan;
 mod plugins;
 mod responses_api;
 mod sandbox_backend;
