@@ -5085,8 +5085,6 @@ async fn run_asgard_supervisor(
         AsgardSupervisorToolContext {
             model,
             candidate_count: candidates.len(),
-            original_task,
-            window,
             idle_timeout,
         },
         cancel,
@@ -5097,8 +5095,6 @@ async fn run_asgard_supervisor(
 struct AsgardSupervisorToolContext<'a> {
     model: &'a str,
     candidate_count: usize,
-    original_task: &'a str,
-    window: usize,
     idle_timeout: IdleTimeouts,
 }
 
@@ -5236,29 +5232,6 @@ async fn run_asgard_supervisor_tool_steps(
                 }
 
                 if let Some(decision) = decision {
-                    let decision = match enforce_asgard_advice_scope(
-                        decision,
-                        context.original_task,
-                    ) {
-                        Ok(decision) => decision,
-                        Err(rejected) => {
-                            for (lane, reason) in &rejected {
-                                tracing::warn!(
-                                    window = context.window,
-                                    lane = lane + 1,
-                                    reason,
-                                    "rejecting Asgard supervisor decision with an out-of-scope strategy"
-                                );
-                            }
-                            return (
-                                Err(anyhow::anyhow!(
-                                    "Asgard supervisor decision contains {} out-of-scope strategies",
-                                    rejected.len()
-                                )),
-                                usage,
-                            );
-                        }
-                    };
                     return (Ok(AsgardSupervisorChoice { decision, plan }), usage);
                 }
 
@@ -5843,258 +5816,6 @@ fn parse_asgard_supervisor_decision(
     anyhow::bail!(
         "Asgard supervisor returned neither a valid completed winner nor a winner plus {count} distinct advices"
     )
-}
-
-fn filter_asgard_advice_scope(
-    decision: &mut AsgardSupervisorDecision,
-    original_task: &str,
-) -> Vec<(usize, String)> {
-    let task = original_task.to_lowercase();
-    let task_requests_dependency_work = [
-        "dependency",
-        "dependencies",
-        "package version",
-        "lockfile",
-        "lock file",
-    ]
-    .iter()
-    .any(|term| task.contains(term));
-    let task_requests_cloning =
-        task.contains("clone the repo") || task.contains("clone the repository");
-    let task_requests_build_environment_work = [
-        "build environment",
-        "build configuration",
-        "sdk version",
-        "msbuild",
-        "ci configuration",
-        "toolchain",
-    ]
-    .iter()
-    .any(|term| task.contains(term));
-    let mut rejected = Vec::new();
-
-    for (lane, advice) in decision.advices.iter_mut().enumerate() {
-        let Some(strategy) = advice.as_deref() else {
-            continue;
-        };
-        let strategy = strategy.to_lowercase();
-        let self_admitted_task_deviation = strategy.contains("deviates from")
-            && ["requirement", "specification", "task", "contract"]
-                .iter()
-                .any(|term| strategy.contains(term));
-        let policy_bypasses = [
-            "nugetaudit=false",
-            "nugetaudit false",
-            "nowarn",
-            "suppress warning",
-            "suppress the warning",
-            "disable warning",
-            "disable the warning",
-            "disable audit",
-            "disable the audit",
-            "skip failing test",
-            "skip the failing test",
-            "skip tests",
-            "change test selection",
-            "modify test expectations",
-            "change test expectations",
-            "suppress lint",
-            "suppress the lint",
-            "suppressing lint",
-            "suppressing the lint",
-            "disable lint",
-            "disable the lint",
-            "skip lint",
-            "skip the lint",
-            "ignore lint",
-            "ignore the lint",
-            "bypass lint",
-            "bypass the lint",
-            "suppress checkstyle",
-            "disable checkstyle",
-            "skip checkstyle",
-            "suppress spotless",
-            "disable spotless",
-            "skip spotless",
-            "suppress formatting check",
-            "disable formatting check",
-            "skip formatting check",
-            "`-x ",
-            " -x :",
-            "exclude the failing",
-            "exclude failing",
-            "excluding pre-existing",
-            "excluding preexisting",
-            "skip failing pnpm",
-            "skip the failing pnpm",
-            "skip pnpm",
-            "skip the pnpm",
-            "skip frontend",
-            "exclude frontend",
-            "keep the existing mock stubs",
-            "keeps the existing mock stubs",
-            "keep old mock stubs",
-            "preserve existing mock stubs",
-            "preserve old mock interactions",
-            "avoid unnecessarystubbingexception",
-            "avoids unnecessarystubbingexception",
-            "preventing unnecessary-stubbing",
-        ];
-        let violation = if self_admitted_task_deviation {
-            Some("strategy admits that it deviates from the task".to_string())
-        } else if let Some(term) = policy_bypasses
-            .iter()
-            .find(|term| strategy.contains(**term))
-        {
-            Some(format!("no-bypass policy phrase {term:?}"))
-        } else {
-            let dependency_changes = [
-                "update the dependency",
-                "update dependency",
-                "upgrade the dependency",
-                "upgrade dependency",
-                "change the dependency",
-                "change dependency",
-                "update the package",
-                "update package",
-                "upgrade the package",
-                "upgrade package",
-                "modify the lockfile",
-                "modify lockfile",
-                "update the lockfile",
-                "update lockfile",
-                "regenerate the lockfile",
-                "regenerate lockfile",
-            ];
-            if !task_requests_dependency_work {
-                dependency_changes
-                    .iter()
-                    .find(|term| strategy.contains(**term))
-                    .map(|term| format!("out-of-scope dependency phrase {term:?}"))
-            } else {
-                None
-            }
-        }
-        .or_else(|| {
-            (!task_requests_cloning
-                && (strategy.contains("clone the repo")
-                    || strategy.contains("clone the repository")))
-            .then(|| "out-of-scope repository clone".to_string())
-        })
-        .or_else(|| {
-            let build_environment_actions = [
-                "repair",
-                "fix",
-                "resolve",
-                "recreate",
-                "regenerate",
-                "restore",
-                "change",
-                "upgrade",
-                "downgrade",
-                "install",
-                "switch to",
-                "use system",
-                "use a system",
-                "correct",
-                "modify",
-            ];
-            let build_environment_nouns = [
-                "build environment",
-                "build-environment",
-                "gradle wrapper",
-                "system gradle",
-                "system-installed gradle",
-                "classpath",
-                "build daemon",
-                "gradle daemon",
-                "toolchain",
-                "wrapper jar",
-                "generated build tooling",
-                "generator module",
-                "workspace configuration",
-                "misconfigured workspace",
-                "correct workspace",
-                "checkout layout",
-            ];
-            if task_requests_build_environment_work {
-                return None;
-            }
-            let action = build_environment_actions
-                .iter()
-                .find(|term| strategy.contains(**term));
-            let noun = build_environment_nouns
-                .iter()
-                .find(|term| strategy.contains(**term));
-            action.zip(noun).map(|(action, noun)| {
-                format!("out-of-scope build-environment action {action:?} on {noun:?}")
-            })
-        })
-        .or_else(|| {
-            let build_environment_workarounds = [
-                "upgrade sdk",
-                "upgrade the sdk",
-                "update sdk",
-                "update the sdk",
-                "change sdk",
-                "change the sdk",
-                "importprojectextensionprops",
-                "clean obj",
-                "delete obj",
-                "delete the obj",
-                "path without colons",
-                "resolve the msbuild environment",
-                "fix the msbuild environment",
-                "repair the build environment",
-                "fix the build environment",
-                "resolve the build environment",
-                "repair the gradle build environment",
-                "fix the gradle build environment",
-                "correct the classpath",
-                "fix the classpath",
-                "change the classpath",
-                "compatible gradle version",
-                "upgrade gradle",
-                "downgrade gradle",
-                "change the gradle version",
-                "gradle daemon",
-                "restore the gradle wrapper",
-                "regenerate the gradle wrapper",
-                "wrapper jar",
-                "build the generator module manually",
-                "repair the toolchain",
-                "change the toolchain",
-                "work around the environment",
-                "workaround the environment",
-            ];
-            if !task_requests_build_environment_work {
-                build_environment_workarounds
-                    .iter()
-                    .find(|term| strategy.contains(**term))
-                    .map(|term| format!("out-of-scope build-environment phrase {term:?}"))
-            } else {
-                None
-            }
-        });
-
-        if let Some(reason) = violation {
-            *advice = None;
-            rejected.push((lane, reason));
-        }
-    }
-    rejected
-}
-
-fn enforce_asgard_advice_scope(
-    mut decision: AsgardSupervisorDecision,
-    original_task: &str,
-) -> Result<AsgardSupervisorDecision, Vec<(usize, String)>> {
-    let rejected = filter_asgard_advice_scope(&mut decision, original_task);
-    if rejected.is_empty() {
-        Ok(decision)
-    } else {
-        Err(rejected)
-    }
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -16161,87 +15882,6 @@ mod tests {
     }
 
     #[test]
-    fn asgard_advice_scope_validation_rejects_bypasses_and_unrequested_dependency_work() {
-        let decision = |strategy: &str| AsgardSupervisorDecision {
-            winner: 0,
-            complete: false,
-            advices: vec![Some(strategy.to_string())],
-            state_summary: "implementation is ready for focused verification".to_string(),
-        };
-
-        for strategy in [
-            "Restore with /p:NuGetAudit=false and rebuild.",
-            "Update the dependency to clear the unrelated warning.",
-            "Clone the repository to a path without colons and retry.",
-            "Clean obj, upgrade the SDK, and set ImportProjectExtensionProps=false.",
-            "Repair the Gradle build environment by correcting the classpath, changing the Gradle version, and building the generator module manually.",
-            "Resolve the Gradle wrapper issue by using system-installed Gradle or recreating the wrapper.",
-            "Apply Spotless selectively by temporarily suppressing the lint-error blocker.",
-            "Run the focused Gradle tests with `-x :app:frontendBuild` to bypass the unrelated failure.",
-            "Resolve the build-environment issues in the correct workspace, skip the failing pnpm tasks, and run the focused tests.",
-            "Catch broad Exception as a safer fallback, although this deviates from the exact JsonQueryException catch requirement.",
-            "Invoke tasks.allTasks() solely to keep the existing mock stubs used and avoid UnnecessaryStubbingException.",
-        ] {
-            let mut candidate = decision(strategy);
-            let rejected =
-                filter_asgard_advice_scope(&mut candidate, "Implement the policy validator.");
-            assert_eq!(rejected.len(), 1);
-            assert_eq!(candidate.winner, 0, "selection must remain intact");
-            assert_eq!(candidate.advices, vec![None]);
-        }
-
-        let mut requested_dependency =
-            decision("Update the dependency to the required secure version.");
-        assert!(
-            filter_asgard_advice_scope(
-                &mut requested_dependency,
-                "Update the parser dependency to the latest secure version.",
-            )
-            .is_empty()
-        );
-        assert!(requested_dependency.advices[0].is_some());
-
-        let mut requested_build_environment =
-            decision("Update the SDK and MSBuild property required by the task.");
-        assert!(
-            filter_asgard_advice_scope(
-                &mut requested_build_environment,
-                "Update the build environment to a new SDK version and adjust MSBuild.",
-            )
-            .is_empty()
-        );
-        assert!(requested_build_environment.advices[0].is_some());
-
-        let mut focused =
-            decision("Run the task's focused validator tests and fix candidate-caused errors.");
-        assert!(
-            filter_asgard_advice_scope(&mut focused, "Implement the policy validator.").is_empty()
-        );
-        assert!(focused.advices[0].is_some());
-
-        let mut static_audit = decision(
-            "Perform a bounded static audit because the Gradle wrapper is unavailable, then conclude.",
-        );
-        assert!(
-            filter_asgard_advice_scope(&mut static_audit, "Implement the policy validator.")
-                .is_empty()
-        );
-        assert!(static_audit.advices[0].is_some());
-
-        let mock_preservation = decision(
-            "Invoke tasks.allTasks() solely to keep the existing mock stubs used and avoid UnnecessaryStubbingException.",
-        );
-        assert!(
-            enforce_asgard_advice_scope(
-                mock_preservation,
-                "Return the supplied close set directly."
-            )
-            .is_err(),
-            "one forbidden lane must reject the whole supervisor decision"
-        );
-    }
-
-    #[test]
     fn asgard_advice_remains_in_canonical_history_after_window() {
         let messages = vec![
             ChatMessage::system("stable prefix"),
@@ -16499,8 +16139,6 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 2,
-                original_task: "Fix the parser.",
-                window: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             },
             tokio_util::sync::CancellationToken::new(),
@@ -16559,8 +16197,6 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
-                original_task: "Fix the parser.",
-                window: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             },
             tokio_util::sync::CancellationToken::new(),
@@ -16595,8 +16231,6 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
-                original_task: "Fix the parser.",
-                window: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             },
             tokio_util::sync::CancellationToken::new(),
