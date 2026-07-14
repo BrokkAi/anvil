@@ -13,6 +13,8 @@ cargo clippy --all-targets -- -D warnings
 
 Prerequisite: `rustup target add wasm32-wasip2` (needed by `build.rs` when the default `wasm-sandbox` feature is enabled).
 
+**Run the full `cargo test` suite with localhost-bind permission / outside any restricted execution sandbox.** Wiremock-based tests start local HTTP servers; a sandbox that denies socket binds causes dozens of unrelated failures with `Failed to bind an OS port for a mock server` / `PermissionDenied: Operation not permitted`. Do not treat those as product failures and do not first run the full suite in a sandbox known to deny localhost binds. Targeted tests that do not use Wiremock may still run sandboxed.
+
 On Linux, `bubblewrap` (`bwrap`) must be installed for `runShellCommand` OS-level sandboxing.
 
 ## Key conventions

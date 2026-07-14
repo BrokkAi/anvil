@@ -22,10 +22,10 @@ pub(crate) fn config() -> Option<&'static Config> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Worktree {
+pub(crate) struct CandidateRepository {
     pub root: PathBuf,
     pub session_cwd: PathBuf,
-    repo: PathBuf,
+    pub base_commit: String,
 }
 
 pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
@@ -40,7 +40,7 @@ pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
         .collect();
     if !unexpected.is_empty() {
         bail!(
-            "Asgard worktree prototype requires code files to be clean (dirty: {})",
+            "Asgard clone prototype requires code files to be clean (dirty: {})",
             unexpected.join(", ")
         );
     }
@@ -73,40 +73,52 @@ pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn create_worktree(cwd: &Path, label: &str) -> Result<Worktree> {
+pub(crate) fn create_candidate_repository(cwd: &Path, label: &str) -> Result<CandidateRepository> {
     let repo = git_text(cwd, &["rev-parse", "--show-toplevel"])?;
     let repo = PathBuf::from(repo.trim());
+    let base_commit = git_text(&repo, &["rev-parse", "HEAD"])?;
+    let base_commit = base_commit.trim().to_string();
     let relative = cwd.strip_prefix(&repo).unwrap_or(Path::new(""));
-    let parent = std::env::temp_dir().join("anvil-asgard-worktrees");
+    let parent = std::env::temp_dir().join("anvil-asgard-clones");
     fs::create_dir_all(&parent)?;
     let root = parent.join(format!(
         "asgard-{}-{}",
-        safe_worktree_label(label),
+        safe_repository_label(label),
         uuid::Uuid::new_v4()
     ));
     let status = Command::new("git")
-        .args(["worktree", "add", "--detach"])
+        .args(["clone", "--shared", "--no-checkout", "--quiet", "--"])
+        .arg(&repo)
         .arg(&root)
-        .arg("HEAD")
-        .current_dir(&repo)
         .stdout(Stdio::null())
         .status()?;
     if !status.success() {
-        bail!("failed to create Asgard worktree {}", root.display());
+        remove_directory(&root, "incomplete Asgard clone");
+        bail!("failed to create Asgard clone {}", root.display());
     }
-    let worktree = Worktree {
+    let checkout = Command::new("git")
+        .args(["checkout", "--detach", "--quiet", "--force"])
+        .arg(&base_commit)
+        .current_dir(&root)
+        .stdout(Stdio::null())
+        .status()?;
+    if !checkout.success() {
+        remove_directory(&root, "incomplete Asgard clone");
+        bail!("failed to check out Asgard clone {}", root.display());
+    }
+    let repository = CandidateRepository {
         session_cwd: root.join(relative),
         root,
-        repo,
+        base_commit,
     };
-    if let Err(error) = seed_build_bootstrap_files(&worktree.repo, &worktree.root) {
-        remove_worktree(&worktree);
+    if let Err(error) = seed_build_bootstrap_files(&repo, &repository.root) {
+        remove_candidate_repository(&repository);
         return Err(error);
     }
-    Ok(worktree)
+    Ok(repository)
 }
 
-fn safe_worktree_label(label: &str) -> String {
+fn safe_repository_label(label: &str) -> String {
     let sanitized: String = label
         .chars()
         .map(|character| {
@@ -120,14 +132,14 @@ fn safe_worktree_label(label: &str) -> String {
     sanitized.trim_matches('-').to_owned()
 }
 
-/// Detached Git worktrees omit ignored files that a harness may have provisioned
+/// Fresh Git clones omit ignored files that a harness may have provisioned
 /// after checkout. Keep small build-launcher payloads available to every lane so
 /// candidates have the same validation entry point as the parent checkout.
-fn seed_build_bootstrap_files(repo: &Path, worktree: &Path) -> Result<()> {
+fn seed_build_bootstrap_files(repo: &Path, clone: &Path) -> Result<()> {
     for relative in [Path::new("gradle/wrapper"), Path::new(".mvn/wrapper")] {
         let source = repo.join(relative);
         if source.is_dir() {
-            copy_missing_tree(&source, &worktree.join(relative))?;
+            copy_missing_tree(&source, &clone.join(relative))?;
         }
     }
     Ok(())
@@ -162,11 +174,11 @@ fn copy_missing_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn capture_patch(root: &Path) -> Result<Vec<u8>> {
+pub(crate) fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
     let index_path =
         std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
     let _index_guard = TemporaryIndex::new(index_path.clone());
-    git_with_index(root, &index_path, &["read-tree", "HEAD"])?;
+    git_with_index(root, &index_path, &["read-tree", base_commit])?;
     add_intent_to_add_untracked(root, &index_path)?;
     Ok(git_with_index(
         root,
@@ -175,7 +187,7 @@ pub(crate) fn capture_patch(root: &Path) -> Result<Vec<u8>> {
             "diff",
             "--binary",
             "--no-ext-diff",
-            "HEAD",
+            base_commit,
             "--",
             ".",
             ":(exclude).brokk/**",
@@ -243,49 +255,177 @@ impl Drop for TemporaryIndex {
     }
 }
 
-pub(crate) fn install_patch(root: &Path, patch: &[u8]) -> Result<()> {
-    for args in [["reset", "--hard", "HEAD"], ["clean", "-fd", "--"]] {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .stdout(Stdio::null())
-            .status()?;
-        if !status.success() {
-            bail!("failed to reset Asgard workspace {}", root.display());
+pub(crate) fn synchronize_candidate_repositories(
+    repositories: &[CandidateRepository],
+    selected_index: usize,
+) -> Result<()> {
+    let selected = repositories
+        .get(selected_index)
+        .context("selected Asgard repository index is out of range")?;
+    for (index, repository) in repositories.iter().enumerate() {
+        if index != selected_index {
+            replace_repository_contents(&selected.root, &repository.root)?;
         }
-    }
-    if patch.is_empty() {
-        return Ok(());
-    }
-    let mut child = Command::new("git")
-        .args(["apply", "--binary", "-"])
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .context("git apply stdin")?
-        .write_all(patch)?;
-    if !child.wait()?.success() {
-        bail!(
-            "failed to apply selected Asgard patch in {}",
-            root.display()
-        );
     }
     Ok(())
 }
 
-pub(crate) fn remove_worktree(worktree: &Worktree) {
-    let result = Command::new("git")
-        .args(["worktree", "remove", "--force"])
-        .arg(&worktree.root)
-        .current_dir(&worktree.repo)
+fn replace_repository_contents(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("Asgard candidate repository has no parent directory")?;
+    let staging = parent.join(format!(".asgard-sync-{}", uuid::Uuid::new_v4()));
+    let _staging_guard = TemporaryDirectory::new(staging.clone());
+    copy_repository(source, &staging)?;
+
+    clear_directory(destination)?;
+    for entry in fs::read_dir(&staging)
+        .with_context(|| format!("read staged Asgard snapshot {}", staging.display()))?
+    {
+        let entry = entry?;
+        fs::rename(entry.path(), destination.join(entry.file_name())).with_context(|| {
+            format!(
+                "install staged Asgard snapshot from {} into {}",
+                staging.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn copy_repository(source: &Path, destination: &Path) -> Result<()> {
+    if try_reflink_copy_repository(source, destination)? {
+        return Ok(());
+    }
+    remove_directory(destination, "failed reflink staging directory");
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "create Asgard repository copy destination {}",
+            destination.display()
+        )
+    })?;
+    copy_directory_contents(source, destination)
+}
+
+#[cfg(unix)]
+fn try_reflink_copy_repository(source: &Path, destination: &Path) -> Result<bool> {
+    let source_contents = source.join(".");
+    let status = Command::new("cp")
+        .args(["-a", "--reflink=auto", "--"])
+        .arg(&source_contents)
+        .arg(destination)
         .stdout(Stdio::null())
-        .status();
-    if let Err(error) = result {
-        tracing::warn!(path = %worktree.root.display(), "failed to remove Asgard worktree: {error}");
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
+#[cfg(not(unix))]
+fn try_reflink_copy_repository(_source: &Path, _destination: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("read Asgard repository {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination_path).with_context(|| {
+                format!(
+                    "create Asgard repository directory {}",
+                    destination_path.display()
+                )
+            })?;
+            copy_directory_contents(&source_path, &destination_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copy Asgard repository file {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(source)?, destination).with_context(|| {
+        format!(
+            "copy Asgard repository symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    let target = fs::read_link(source)?;
+    let result = if source.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+        std::os::windows::fs::symlink_dir(&target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(&target, destination)
+    };
+    result.with_context(|| {
+        format!(
+            "copy Asgard repository symlink {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+fn clear_directory(path: &Path) -> Result<()> {
+    for entry in
+        fs::read_dir(path).with_context(|| format!("read Asgard repository {}", path.display()))?
+    {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(&entry_path)?;
+        } else {
+            fs::remove_file(&entry_path)?;
+        }
+    }
+    Ok(())
+}
+
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryDirectory {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        remove_directory(&self.path, "temporary Asgard directory");
+    }
+}
+
+pub(crate) fn remove_candidate_repository(repository: &CandidateRepository) {
+    remove_directory(&repository.root, "Asgard candidate repository");
+}
+
+fn remove_directory(path: &Path, description: &str) {
+    if let Err(error) = fs::remove_dir_all(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), "failed to remove {description}: {error}");
     }
 }
 
@@ -371,12 +511,12 @@ mod tests {
     }
 
     #[test]
-    fn worktree_labels_are_safe_for_build_tool_paths() {
+    fn repository_labels_are_safe_for_build_tool_paths() {
         assert_eq!(
-            safe_worktree_label("0-deepseek::deepseek-v4-flash"),
+            safe_repository_label("0-deepseek::deepseek-v4-flash"),
             "0-deepseek--deepseek-v4-flash"
         );
-        assert_eq!(safe_worktree_label("lane/model name"), "lane-model-name");
+        assert_eq!(safe_repository_label("lane/model name"), "lane-model-name");
     }
 
     #[test]
@@ -392,7 +532,8 @@ mod tests {
 
         fs::remove_file(repo.join("deleted.txt")).unwrap();
         fs::write(repo.join("added.txt"), "keep me\n").unwrap();
-        let patch = capture_patch(repo).unwrap();
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let patch = capture_patch(repo, base_commit.trim()).unwrap();
         let patch_text = String::from_utf8_lossy(&patch);
         assert!(patch_text.contains("deleted file mode"));
         assert!(patch_text.contains("added.txt"));
@@ -408,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_worktree_patch_applies_tracked_deletions_to_parent() {
+    fn candidate_clone_patch_applies_tracked_deletions_to_parent() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -418,18 +559,131 @@ mod tests {
         run_git(repo, &["add", "deleted.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
 
-        let worktree = create_worktree(repo, "deletion-test").unwrap();
-        fs::remove_file(worktree.root.join("deleted.txt")).unwrap();
-        fs::write(worktree.root.join("added.txt"), "keep me\n").unwrap();
-        let patch = capture_patch(&worktree.root).unwrap();
+        let candidate = create_candidate_repository(repo, "deletion-test").unwrap();
+        fs::remove_file(candidate.root.join("deleted.txt")).unwrap();
+        fs::write(candidate.root.join("added.txt"), "keep me\n").unwrap();
+        let patch = capture_patch(&candidate.root, &candidate.base_commit).unwrap();
         assert!(String::from_utf8_lossy(&patch).contains("deleted file mode"));
 
         apply_selected_patch(repo, &patch).unwrap();
-        remove_worktree(&worktree);
+        remove_candidate_repository(&candidate);
         assert!(!repo.join("deleted.txt").exists());
         assert_eq!(
             fs::read_to_string(repo.join("added.txt")).unwrap(),
             "keep me\n"
         );
+    }
+
+    #[test]
+    fn candidate_patch_includes_changes_committed_after_the_task_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        let candidate = create_candidate_repository(repo, "committed-test").unwrap();
+        run_git(
+            &candidate.root,
+            &["config", "user.email", "candidate@example.invalid"],
+        );
+        run_git(&candidate.root, &["config", "user.name", "Candidate"]);
+        run_git(&candidate.root, &["checkout", "-b", "solution"]);
+        fs::write(candidate.root.join("tracked.txt"), "committed solution\n").unwrap();
+        fs::write(candidate.root.join("added.txt"), "committed addition\n").unwrap();
+        run_git(&candidate.root, &["add", "tracked.txt", "added.txt"]);
+        run_git(&candidate.root, &["commit", "-m", "solution"]);
+
+        let patch = capture_patch(&candidate.root, &candidate.base_commit).unwrap();
+        apply_selected_patch(repo, &patch).unwrap();
+        remove_candidate_repository(&candidate);
+
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "committed solution\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("added.txt")).unwrap(),
+            "committed addition\n"
+        );
+    }
+
+    #[test]
+    fn repository_sync_copies_branch_index_worktree_and_untracked_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", ".gitignore", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        let selected = create_candidate_repository(repo, "selected").unwrap();
+        let losing = create_candidate_repository(repo, "losing").unwrap();
+        for candidate in [&selected, &losing] {
+            run_git(
+                &candidate.root,
+                &["config", "user.email", "candidate@example.invalid"],
+            );
+            run_git(&candidate.root, &["config", "user.name", "Candidate"]);
+            // This succeeds in both independent clones. Linked worktrees cannot
+            // safely give every lane the same checked-out branch.
+            run_git(&candidate.root, &["checkout", "-b", "solution"]);
+        }
+
+        fs::write(selected.root.join("tracked.txt"), "committed\n").unwrap();
+        run_git(&selected.root, &["add", "tracked.txt"]);
+        run_git(&selected.root, &["commit", "-m", "selected commit"]);
+        fs::write(selected.root.join("staged.txt"), "index version\n").unwrap();
+        run_git(&selected.root, &["add", "staged.txt"]);
+        fs::write(
+            selected.root.join("staged.txt"),
+            "index version\nworktree version\n",
+        )
+        .unwrap();
+        fs::write(selected.root.join("untracked.txt"), "untracked\n").unwrap();
+        fs::write(selected.root.join("ignored.log"), "ignored state\n").unwrap();
+        run_git(&selected.root, &["config", "asgard.selected", "winner"]);
+
+        fs::write(losing.root.join("tracked.txt"), "losing state\n").unwrap();
+        fs::write(losing.root.join("loser-only.txt"), "remove me\n").unwrap();
+
+        let selected_root = selected.root.clone();
+        let losing_root = losing.root.clone();
+        let repositories = vec![selected, losing];
+        synchronize_candidate_repositories(&repositories, 0).unwrap();
+
+        for args in [
+            &["symbolic-ref", "--short", "HEAD"][..],
+            &["rev-parse", "HEAD"],
+            &["status", "--porcelain", "--ignored"],
+            &["diff", "--cached", "--binary"],
+            &["diff", "--binary"],
+        ] {
+            assert_eq!(
+                git(&selected_root, args).unwrap().stdout,
+                git(&losing_root, args).unwrap().stdout
+            );
+        }
+        assert_eq!(
+            git_text(&losing_root, &["config", "--get", "asgard.selected"])
+                .unwrap()
+                .trim(),
+            "winner"
+        );
+        assert_eq!(
+            fs::read_to_string(losing_root.join("ignored.log")).unwrap(),
+            "ignored state\n"
+        );
+        assert!(!losing_root.join("loser-only.txt").exists());
+
+        for repository in &repositories {
+            remove_candidate_repository(repository);
+        }
     }
 }

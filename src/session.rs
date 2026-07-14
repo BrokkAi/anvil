@@ -3355,7 +3355,7 @@ impl SessionStore {
     }
 
     /// As [`Self::create_trajectory_registry`], with extra read roots used by
-    /// an internal trajectory supervisor to inspect candidate worktrees.
+    /// an internal trajectory supervisor to inspect candidate repositories.
     pub async fn create_trajectory_registry_with_roots(
         &self,
         session_id: &str,

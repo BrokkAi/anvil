@@ -4841,26 +4841,29 @@ async fn run_asgard_trajectory_loop(
     if let Err(error) = crate::asgard::ensure_compatible_checkout(parent_registry.cwd()) {
         return (asgard_failure(error), usage_by_model);
     }
-    let mut worktrees = Vec::with_capacity(config.candidate_models.len());
+    let mut repositories = Vec::with_capacity(config.candidate_models.len());
     for (index, model) in config.candidate_models.iter().enumerate() {
-        match crate::asgard::create_worktree(parent_registry.cwd(), &format!("{index}-{model}")) {
-            Ok(worktree) => worktrees.push(worktree),
+        match crate::asgard::create_candidate_repository(
+            parent_registry.cwd(),
+            &format!("{index}-{model}"),
+        ) {
+            Ok(repository) => repositories.push(repository),
             Err(error) => {
-                for worktree in &worktrees {
-                    crate::asgard::remove_worktree(worktree);
+                for repository in &repositories {
+                    crate::asgard::remove_candidate_repository(repository);
                 }
                 return (asgard_failure(error), usage_by_model);
             }
         }
     }
-    let mut registries = Vec::with_capacity(worktrees.len());
-    for worktree in &worktrees {
+    let mut registries = Vec::with_capacity(repositories.len());
+    for repository in &repositories {
         let Some(registry) = sessions
-            .create_trajectory_registry(session_id, worktree.session_cwd.clone())
+            .create_trajectory_registry(session_id, repository.session_cwd.clone())
             .await
         else {
-            for worktree in &worktrees {
-                crate::asgard::remove_worktree(worktree);
+            for repository in &repositories {
+                crate::asgard::remove_candidate_repository(repository);
             }
             return (
                 asgard_failure(anyhow::anyhow!("unknown Asgard parent session")),
@@ -4889,7 +4892,6 @@ async fn run_asgard_trajectory_loop(
             cancel.clone(),
             config.candidate_models.len(),
             &original_task,
-            &selected_trajectory_initial,
             &live_output,
         )
         .await;
@@ -4919,7 +4921,7 @@ async fn run_asgard_trajectory_loop(
     let initial_advice = match initial_advice {
         Some(value) => value,
         None => {
-            cleanup_asgard_worktrees(&worktrees);
+            cleanup_asgard_repositories(&repositories);
             let error = initial_advice_error
                 .unwrap_or_else(|| anyhow::anyhow!("supervisor produced no initial advice"));
             let mut outcome = asgard_failure(anyhow::anyhow!(
@@ -4952,20 +4954,20 @@ async fn run_asgard_trajectory_loop(
                 current_window_steps
             ),
         );
-        let mut futures = Vec::with_capacity(worktrees.len());
-        for (index, ((model, worktree), registry)) in config
+        let mut futures = Vec::with_capacity(repositories.len());
+        for (index, ((model, repository), registry)) in config
             .candidate_models
             .iter()
-            .zip(&worktrees)
+            .zip(&repositories)
             .zip(&registries)
             .enumerate()
         {
-            if let Err(error) = crate::asgard::install_patch(&worktree.root, &common_patch) {
-                cleanup_asgard_worktrees(&worktrees);
-                return (asgard_failure(error), usage_by_model);
-            }
             let mut messages = common_messages.clone();
-            rewrite_asgard_cwd(&mut messages, parent_registry.cwd(), &worktree.session_cwd);
+            rewrite_asgard_cwd(
+                &mut messages,
+                parent_registry.cwd(),
+                &repository.session_cwd,
+            );
             let assigned_advice = next_advices
                 .as_ref()
                 .and_then(|advices| advices.get(index))
@@ -4977,7 +4979,8 @@ async fn run_asgard_trajectory_loop(
             }
             let model = model.clone();
             let registry = registry.clone();
-            let worktree_root = worktree.root.clone();
+            let repository_root = repository.root.clone();
+            let base_commit = repository.base_commit.clone();
             let cancel = cancel.clone();
             let inherited_plan = canonical_plan.clone();
             let window_steps = current_window_steps;
@@ -5013,7 +5016,7 @@ async fn run_asgard_trajectory_loop(
                     inherited_plan,
                 )
                 .await;
-                let patch = crate::asgard::capture_patch(&worktree_root);
+                let patch = crate::asgard::capture_patch(&repository_root, &base_commit);
                 let window_messages = asgard_take_window_messages(
                     &outcome.continuation_messages,
                     trajectory_message_start,
@@ -5039,7 +5042,7 @@ async fn run_asgard_trajectory_loop(
                     window_messages,
                 }),
                 Err(error) => {
-                    cleanup_asgard_worktrees(&worktrees);
+                    cleanup_asgard_repositories(&repositories);
                     return (asgard_failure(error), usage_by_model);
                 }
             }
@@ -5096,7 +5099,7 @@ async fn run_asgard_trajectory_loop(
                     .unwrap_or_else(|| anyhow::anyhow!("supervisor produced no decision"));
                 let apply_result =
                     crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
-                cleanup_asgard_worktrees(&worktrees);
+                cleanup_asgard_repositories(&repositories);
                 if let Err(apply_error) = apply_result {
                     let mut outcome = asgard_failure(anyhow::anyhow!(
                         "supervisor failed in window {window} ({error:#}) and applying the last accepted incumbent also failed: {apply_error:#}"
@@ -5130,7 +5133,7 @@ async fn run_asgard_trajectory_loop(
             );
         }
         let Some(mut winner) = candidates.into_iter().find(|c| c.index == winner_index) else {
-            cleanup_asgard_worktrees(&worktrees);
+            cleanup_asgard_repositories(&repositories);
             return (
                 asgard_failure(anyhow::anyhow!(
                     "Asgard supervisor selected an unknown lane"
@@ -5164,18 +5167,18 @@ async fn run_asgard_trajectory_loop(
         common_patch = winner.patch.clone();
         common_messages = winner.outcome.continuation_messages.clone();
         // Store the canonical history in terms of the live checkout. Each
-        // candidate window rewrites that canonical path to its own worktree.
+        // candidate window rewrites that canonical path to its own clone.
         // Without this normalization, window N+1 inherited window N's
-        // now-stale winning worktree path.
+        // now-stale winning clone path.
         rewrite_asgard_cwd(
             &mut common_messages,
-            &worktrees[winner.index].session_cwd,
+            &repositories[winner.index].session_cwd,
             parent_registry.cwd(),
         );
         let mut selected_window = winner.window_messages.clone();
         rewrite_asgard_cwd(
             &mut selected_window,
-            &worktrees[winner.index].session_cwd,
+            &repositories[winner.index].session_cwd,
             parent_registry.cwd(),
         );
         selected_trajectory_windows.push(selected_window);
@@ -5241,9 +5244,20 @@ async fn run_asgard_trajectory_loop(
         if finished {
             break;
         }
+        send_thought(
+            cx,
+            session_id,
+            "[Asgard synchronizing selected repository state]\n",
+        );
+        if let Err(error) =
+            crate::asgard::synchronize_candidate_repositories(&repositories, winner_index)
+        {
+            cleanup_asgard_repositories(&repositories);
+            return (asgard_failure(error), usage_by_model);
+        }
     }
     let apply_result = crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
-    cleanup_asgard_worktrees(&worktrees);
+    cleanup_asgard_repositories(&repositories);
     if let Err(error) = apply_result {
         return (asgard_failure(error), usage_by_model);
     }
@@ -5269,14 +5283,12 @@ async fn run_asgard_initial_advice(
     cancel: tokio_util::sync::CancellationToken,
     candidate_count: usize,
     original_task: &str,
-    selected_trajectory_initial: &[ChatMessage],
     live_output: &AsgardLiveOutput,
 ) -> (
     anyhow::Result<AsgardSupervisorInitialAdvice>,
     crate::llm_client::TokenUsage,
 ) {
-    let messages =
-        asgard_initial_advice_messages(original_task, selected_trajectory_initial, candidate_count);
+    let messages = asgard_initial_advice_messages(original_task, candidate_count);
     run_asgard_initial_advice_tool_steps(
         llm.as_ref(),
         messages,
@@ -5411,6 +5423,7 @@ async fn run_asgard_initial_advice_tool_steps(
     const MAX_STEPS: usize = 2;
     let tools = vec![asgard_advise_trajectories_tool(context.candidate_count)];
     let mut usage = crate::llm_client::TokenUsage::default();
+    let mut last_invalid_response = None;
 
     for step in 1..=MAX_STEPS {
         let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
@@ -5472,8 +5485,8 @@ async fn run_asgard_initial_advice_tool_steps(
                 ));
             }
             LlmResponse::ToolCalls {
-                text: _,
-                reasoning_content: _,
+                text,
+                reasoning_content,
                 calls,
                 ..
             } => {
@@ -5484,40 +5497,34 @@ async fn run_asgard_initial_advice_tool_steps(
                     ) {
                         Ok(arguments) => arguments.value,
                         Err(error) => {
-                            return (
-                                Err(anyhow::anyhow!(
-                                    "Asgard supervisor emitted invalid `{}` arguments: {error}",
-                                    call.function.name
-                                )),
-                                usage,
-                            );
+                            last_invalid_response = Some(anyhow::anyhow!(
+                                "Asgard supervisor emitted invalid `{}` arguments: {error}",
+                                call.function.name
+                            ));
+                            continue;
                         }
                     };
                     match call.function.name.as_str() {
                         "advise_trajectories" => {
                             if advice.is_some() {
-                                return (
-                                    Err(anyhow::anyhow!(
-                                        "Asgard supervisor called advise_trajectories more than once"
-                                    )),
-                                    usage,
-                                );
+                                advice = None;
+                                last_invalid_response = Some(anyhow::anyhow!(
+                                    "Asgard supervisor called advise_trajectories more than once"
+                                ));
+                                break;
                             }
                             let serialized = serde_json::to_string(&normalized)
                                 .expect("normalized tool arguments serialize");
                             match parse_asgard_initial_advice(&serialized, context.candidate_count)
                             {
                                 Ok(value) => advice = Some(value),
-                                Err(error) => return (Err(error), usage),
+                                Err(error) => last_invalid_response = Some(error),
                             }
                         }
                         other => {
-                            return (
-                                Err(anyhow::anyhow!(
-                                    "Asgard supervisor called unexpected tool `{other}`"
-                                )),
-                                usage,
-                            );
+                            last_invalid_response = Some(anyhow::anyhow!(
+                                "Asgard supervisor called unexpected tool `{other}`"
+                            ));
                         }
                     }
                 }
@@ -5525,20 +5532,32 @@ async fn run_asgard_initial_advice_tool_steps(
                 if let Some(advice) = advice {
                     return (Ok(advice), usage);
                 }
+                if !text.is_empty() || reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
+                    messages.push(ChatMessage::assistant_with_reasoning(
+                        text,
+                        reasoning_content,
+                    ));
+                }
             }
         }
 
         if step < MAX_STEPS {
-            messages.push(ChatMessage::user(
-                "You have not advised the trajectories. Call advise_trajectories now. Do not answer in prose.",
-            ));
+            let detail = last_invalid_response
+                .as_ref()
+                .map(|error| format!(" Your previous response was invalid: {error}."))
+                .unwrap_or_default();
+            messages.push(ChatMessage::user(format!(
+                "You have not advised the trajectories.{detail} Only advise_trajectories is available. Call advise_trajectories now. Do not answer in prose."
+            )));
         }
     }
 
     (
-        Err(anyhow::anyhow!(
-            "Asgard supervisor did not call advise_trajectories after {MAX_STEPS} steps"
-        )),
+        Err(last_invalid_response.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "Asgard supervisor did not call advise_trajectories after {MAX_STEPS} steps"
+            )
+        })),
         usage,
     )
 }
@@ -5556,6 +5575,7 @@ async fn run_asgard_supervisor_tool_steps(
     const MAX_STEPS: usize = 2;
     let tools = vec![asgard_select_trajectory_tool(context.candidate_count)];
     let mut usage = crate::llm_client::TokenUsage::default();
+    let mut last_invalid_response = None;
 
     for step in 1..=MAX_STEPS {
         let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
@@ -5620,8 +5640,8 @@ async fn run_asgard_supervisor_tool_steps(
                 ));
             }
             LlmResponse::ToolCalls {
-                text: _,
-                reasoning_content: _,
+                text,
+                reasoning_content,
                 calls,
                 ..
             } => {
@@ -5632,24 +5652,21 @@ async fn run_asgard_supervisor_tool_steps(
                     ) {
                         Ok(arguments) => arguments.value,
                         Err(error) => {
-                            return (
-                                Err(anyhow::anyhow!(
-                                    "Asgard supervisor emitted invalid `{}` arguments: {error}",
-                                    call.function.name
-                                )),
-                                usage,
-                            );
+                            last_invalid_response = Some(anyhow::anyhow!(
+                                "Asgard supervisor emitted invalid `{}` arguments: {error}",
+                                call.function.name
+                            ));
+                            continue;
                         }
                     };
                     match call.function.name.as_str() {
                         "select_trajectory" => {
                             if decision.is_some() {
-                                return (
-                                    Err(anyhow::anyhow!(
-                                        "Asgard supervisor called select_trajectory more than once"
-                                    )),
-                                    usage,
-                                );
+                                decision = None;
+                                last_invalid_response = Some(anyhow::anyhow!(
+                                    "Asgard supervisor called select_trajectory more than once"
+                                ));
+                                break;
                             }
                             let serialized = serde_json::to_string(&normalized)
                                 .expect("normalized tool arguments serialize");
@@ -5658,16 +5675,13 @@ async fn run_asgard_supervisor_tool_steps(
                                 context.candidate_count,
                             ) {
                                 Ok(value) => decision = Some(value),
-                                Err(error) => return (Err(error), usage),
+                                Err(error) => last_invalid_response = Some(error),
                             }
                         }
                         other => {
-                            return (
-                                Err(anyhow::anyhow!(
-                                    "Asgard supervisor called unexpected tool `{other}`"
-                                )),
-                                usage,
-                            );
+                            last_invalid_response = Some(anyhow::anyhow!(
+                                "Asgard supervisor called unexpected tool `{other}`"
+                            ));
                         }
                     }
                 }
@@ -5675,20 +5689,32 @@ async fn run_asgard_supervisor_tool_steps(
                 if let Some(decision) = decision {
                     return (Ok(decision), usage);
                 }
+                if !text.is_empty() || reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
+                    messages.push(ChatMessage::assistant_with_reasoning(
+                        text,
+                        reasoning_content,
+                    ));
+                }
             }
         }
 
         if step < MAX_STEPS {
-            messages.push(ChatMessage::user(
-                "You have not selected a trajectory. Call select_trajectory now. Do not answer in prose.",
-            ));
+            let detail = last_invalid_response
+                .as_ref()
+                .map(|error| format!(" Your previous response was invalid: {error}."))
+                .unwrap_or_default();
+            messages.push(ChatMessage::user(format!(
+                "You have not selected a trajectory.{detail} Only select_trajectory is available. Call select_trajectory now. Do not answer in prose."
+            )));
         }
     }
 
     (
-        Err(anyhow::anyhow!(
-            "Asgard supervisor did not call select_trajectory after {MAX_STEPS} steps"
-        )),
+        Err(last_invalid_response.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "Asgard supervisor did not call select_trajectory after {MAX_STEPS} steps"
+            )
+        })),
         usage,
     )
 }
@@ -5710,11 +5736,7 @@ fn asgard_window_horizon_policy() -> &'static str {
     "Choose next_window_steps as one shared horizon for all candidate lanes, from 3 to 12 inclusive. The governing question is how long lanes can productively diverge before another comparison becomes valuable. Use 3-5 when direction is uncertain, evidence conflicts, changes are risky, active exploration is needed, or the selected path may be near completion. Use 6-9 for ordinary implementation with a reasonably clear plan. Use 10-12 only for high-confidence mechanically involved execution where interruption would add little value, such as a broad straightforward refactor or an established verification sequence."
 }
 
-fn asgard_initial_advice_messages(
-    original_task: &str,
-    selected_trajectory_initial: &[ChatMessage],
-    candidate_count: usize,
-) -> Vec<ChatMessage> {
+fn asgard_initial_advice_messages(original_task: &str, candidate_count: usize) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(format!(
             r#"You are directing the first Asgard coding window. The candidate lanes will all start from the same canonical task history and disk state. Your job is to choose one shared window length and give the next {candidate_count} lanes concise, actionable, mutually distinct strategies for beginning the original task.
@@ -5726,13 +5748,11 @@ The original task is authoritative. Every strategy must independently remain com
 Call advise_trajectories exactly once. Do not call another tool or answer in prose. If you omit advise_trajectories, you will receive one reminder."#,
             asgard_window_horizon_policy()
         )),
-        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
-        ChatMessage::assistant(format!(
-            "<selected_trajectory_initial>\n{}\n</selected_trajectory_initial>",
-            render_asgard_dossier_messages(selected_trajectory_initial),
-        )),
         ChatMessage::user(format!(
-            r#"<initial_advice_procedure>
+            r#"ORIGINAL TASK (complete):
+{original_task}
+
+<initial_advice_procedure>
 Before calling advise_trajectories:
 1. Re-read the original task. Identify the main required behaviors, explicit implementation constraints, and prohibitions.
 2. Choose next_window_steps based on when the next comparison should be valuable, not on a fixed rollout habit.
@@ -6294,9 +6314,9 @@ fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
     }
 }
 
-fn cleanup_asgard_worktrees(worktrees: &[crate::asgard::Worktree]) {
-    for worktree in worktrees {
-        crate::asgard::remove_worktree(worktree);
+fn cleanup_asgard_repositories(repositories: &[crate::asgard::CandidateRepository]) {
+    for repository in repositories {
+        crate::asgard::remove_candidate_repository(repository);
     }
 }
 
@@ -17120,7 +17140,7 @@ mod tests {
     }
 
     #[test]
-    fn asgard_canonicalizes_worktree_paths_across_full_history() {
+    fn asgard_canonicalizes_candidate_paths_across_full_history() {
         let old = Path::new("/tmp/asgard-old/");
         let live = Path::new("/work/repo");
         let mut message = ChatMessage::assistant("worked in /tmp/asgard-old/src");
@@ -17208,6 +17228,78 @@ mod tests {
                 2,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn asgard_initial_advice_prompt_contains_no_candidate_bootstrap() {
+        let messages = asgard_initial_advice_messages("Implement the requested API.", 3);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        let prompt = asgard_message_text(&messages[1]);
+        assert!(prompt.contains("Implement the requested API."));
+        assert!(prompt.contains("<initial_advice_procedure>"));
+        assert!(!prompt.contains("selected_trajectory_initial"));
+    }
+
+    #[tokio::test]
+    async fn asgard_initial_advice_reminds_after_an_unadvertised_tool() {
+        let valid_call = supervisor_tool_call(
+            "advice-call",
+            "advise_trajectories",
+            serde_json::json!({
+                "next_window_steps": 4,
+                "state_summary": "Begin with implementation, contract discovery, and falsification lanes.",
+                "advices": [
+                    {"strategy":"Inspect and implement the narrow path.","scope_basis":"The task requests the behavior."},
+                    {"strategy":"Locate existing contracts and tests before editing.","scope_basis":"The task requests compatibility."},
+                    {"strategy":"Probe the riskiest assumption, then implement from evidence.","scope_basis":"The task requires correct boundary behavior."}
+                ]
+            }),
+        );
+        let backend = ScriptedSupervisorBackend::new(vec![
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("I should inspect the repository.".to_string()),
+                calls: vec![supervisor_tool_call(
+                    "wrong-call",
+                    "bash",
+                    serde_json::json!({"command":"ls"}),
+                )],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![valid_call],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+        ]);
+
+        let (advice, _) = run_asgard_initial_advice_tool_steps(
+            &backend,
+            asgard_initial_advice_messages("Implement the requested API.", 3),
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 3,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            advice.expect("valid reminder recovery").next_window_steps,
+            4
+        );
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tool_names, vec!["advise_trajectories"]);
+        assert!(
+            asgard_message_text(requests[1].messages.last().expect("reminder"))
+                .contains("Only advise_trajectories is available")
         );
     }
 
@@ -17338,7 +17430,7 @@ mod tests {
 
     #[tokio::test]
     async fn asgard_supervisor_rejects_unadvertised_plan_call() {
-        let backend = ScriptedSupervisorBackend::new(vec![LlmResponse::ToolCalls {
+        let wrong_response = || LlmResponse::ToolCalls {
             text: String::new(),
             reasoning_content: None,
             calls: vec![supervisor_tool_call(
@@ -17349,7 +17441,8 @@ mod tests {
                 }),
             )],
             usage: crate::llm_client::TokenUsage::default(),
-        }]);
+        };
+        let backend = ScriptedSupervisorBackend::new(vec![wrong_response(), wrong_response()]);
 
         let (decision, _) = run_asgard_supervisor_tool_steps(
             &backend,
@@ -17371,7 +17464,12 @@ mod tests {
                 .contains("called unexpected tool `update_plan`")
         );
         let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
+        assert!(
+            asgard_message_text(requests[1].messages.last().expect("reminder"))
+                .contains("Only select_trajectory is available")
+        );
     }
     #[test]
     fn asgard_test_file_inventory_surfaces_candidate_authorship() {
