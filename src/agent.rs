@@ -5013,6 +5013,20 @@ async fn run_asgard_supervisor(
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
         let trajectory = render_asgard_dossier_messages(&candidate.window_messages);
+        let terminal_patch =
+            asgard_terminal_non_test_patch(&candidate.outcome.stop, &candidate.patch)
+                .map(|patch| {
+                    format!(
+                        "<terminal_non_test_patch cumulative_from_task_baseline=\"true\">\n{}\n\
+                     </terminal_non_test_patch>\n",
+                        if patch.trim().is_empty() {
+                            "(no non-test changes)"
+                        } else {
+                            patch.as_str()
+                        }
+                    )
+                })
+                .unwrap_or_default();
         let (candidate_created_test_files, candidate_modified_test_files) =
             asgard_patch_test_inventory(&candidate.patch);
         let candidate_test_edits = match serde_json::to_string_pretty(&AsgardCandidateTestEdits {
@@ -5034,11 +5048,13 @@ async fn run_asgard_supervisor(
             "\n<lane_trajectory index=\"{}\" model=\"{}\" stop=\"{:?}\">\n\
              <candidate_test_file_edits derived_from_full_patch=\"true\">\n{}\n\
              </candidate_test_file_edits>\n\
+             {}\
              <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
             candidate.index,
             candidate.model,
             candidate.outcome.stop,
             candidate_test_edits,
+            terminal_patch,
             trajectory,
         ));
     }
@@ -5242,6 +5258,8 @@ The selected trajectory is the shared canonical history. Candidate trajectories 
 Read the actual model messages, tool calls, commands, and tool results in every trajectory. Decide what each call establishes from its command and output; do not assume that a successful shell status means the relevant behavior ran or passed, especially through filters, pipelines, wrappers, timeouts, or zero-test selections. Never claim a check ran when the trajectory does not show it. A build demonstrates compilation, not necessarily behavior. A still-unexplained failure on a changed surface is evidence against completion.
 
 The candidate_test_file_edits inventory is derived from the full candidate patch only to make test authorship visible. Candidate-written or candidate-modified tests can be useful diagnostics, and legitimate contract changes may require updating tests or mocks. But a green run after changing its own tests is not independent confirmation: inspect whether the tests were strengthened to express the task or merely adapted to accept the implementation. Do not mechanically reject test edits, and do not let self-confirming checks outweigh contradictory pre-existing or boundary-level evidence.
+
+A lane that ended naturally also includes terminal_non_test_patch: the cumulative current production patch from the task baseline with test-file sections removed. Use it as the authoritative final-code surface when deciding whether that endpoint is actually complete. Compare it directly with every explicit task requirement and with the trajectory's claims and checks. Its absence only means the lane reached an Asgard window boundary rather than a natural endpoint; ordinary lane selection should continue to use the trajectory evidence.
 
 Stay within scope. Do not repair dependencies, lockfiles, build configuration, toolchains, wrappers, generated build machinery, warning policy, test selection, or expected outputs merely to hide a failure, unless the original task requires that surface or the candidate changed it and must correct the resulting defect. Treat a failure as environmental, pre-existing, flaky, or unrelated only when the trajectories provide concrete evidence. Do not weaken task-mandated behavior to preserve obsolete mocks or callers; updating genuinely affected tests and mocks is in scope.
 
@@ -5470,6 +5488,38 @@ fn asgard_patch_test_inventory(patch: &[u8]) -> (Vec<String>, Vec<String>) {
         &mut modified,
     );
     (created, modified)
+}
+
+fn asgard_terminal_non_test_patch(
+    stop: &crate::tool_loop::LoopStop,
+    patch: &[u8],
+) -> Option<String> {
+    matches!(stop, crate::tool_loop::LoopStop::Completed { .. })
+        .then(|| asgard_non_test_patch(patch))
+}
+
+fn asgard_non_test_patch(patch: &[u8]) -> String {
+    let patch = String::from_utf8_lossy(patch);
+    let mut rendered = String::new();
+    let mut section = String::new();
+    let mut include_section = false;
+
+    for line in patch.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if include_section {
+                rendered.push_str(&section);
+            }
+            section.clear();
+            include_section = rest.split_once(" b/").is_some_and(|(old_path, new_path)| {
+                !asgard_is_test_path(old_path) && !asgard_is_test_path(new_path.trim_end())
+            });
+        }
+        section.push_str(line);
+    }
+    if include_section {
+        rendered.push_str(&section);
+    }
+    rendered
 }
 
 fn asgard_flush_patch_test_path(
@@ -16101,6 +16151,43 @@ mod tests {
 
         assert_eq!(created, vec!["test/Core/NewValidatorTests.cs"]);
         assert_eq!(modified, vec!["test/Core/ExistingTests.cs"]);
+    }
+
+    #[test]
+    fn asgard_terminal_patch_includes_only_non_test_sections() {
+        let patch = b"diff --git a/src/Parser.java b/src/Parser.java\n\
+                      --- a/src/Parser.java\n\
+                      +++ b/src/Parser.java\n\
+                      @@ -1 +1 @@\n\
+                      -old\n\
+                      +new\n\
+                      diff --git a/src/ParserTest.java b/src/ParserTest.java\n\
+                      --- a/src/ParserTest.java\n\
+                      +++ b/src/ParserTest.java\n\
+                      @@ -1 +1 @@\n\
+                      -old test\n\
+                      +new test\n";
+
+        let natural = crate::tool_loop::LoopStop::Completed { had_text: true };
+        let rendered = asgard_terminal_non_test_patch(&natural, patch)
+            .expect("natural completion should expose its production patch");
+        assert!(rendered.contains("src/Parser.java"));
+        assert!(rendered.contains("+new"));
+        assert!(!rendered.contains("ParserTest.java"));
+        assert!(!rendered.contains("new test"));
+
+        let window_boundary = crate::tool_loop::LoopStop::MaxTurns { max_turns: 8 };
+        assert!(asgard_terminal_non_test_patch(&window_boundary, patch).is_none());
+    }
+
+    #[test]
+    fn asgard_terminal_patch_excludes_renames_across_test_boundary() {
+        let patch = b"diff --git a/src/Parser.java b/tests/ParserTest.java\n\
+                      similarity index 90%\n\
+                      rename from src/Parser.java\n\
+                      rename to tests/ParserTest.java\n";
+
+        assert!(asgard_non_test_patch(patch).is_empty());
     }
 
     #[test]
