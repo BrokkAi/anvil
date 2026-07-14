@@ -58,6 +58,7 @@ pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
         .args(["apply", "--binary", "-"])
         .current_dir(root)
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .spawn()?;
     child
         .stdin
@@ -89,6 +90,7 @@ pub(crate) fn create_worktree(cwd: &Path, label: &str) -> Result<Worktree> {
         .arg(&root)
         .arg("HEAD")
         .current_dir(&repo)
+        .stdout(Stdio::null())
         .status()?;
     if !status.success() {
         bail!("failed to create Asgard worktree {}", root.display());
@@ -200,6 +202,7 @@ pub(crate) fn capture_patch_since(root: &Path, selected_patch: &[u8]) -> Result<
             .current_dir(root)
             .env("GIT_INDEX_FILE", &index_path)
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()?;
         child
             .stdin
@@ -252,6 +255,7 @@ fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
         .current_dir(root)
         .env("GIT_INDEX_FILE", index)
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .spawn()?;
     child
         .stdin
@@ -289,7 +293,11 @@ impl Drop for TemporaryIndex {
 
 pub(crate) fn install_patch(root: &Path, patch: &[u8]) -> Result<()> {
     for args in [["reset", "--hard", "HEAD"], ["clean", "-fd", "--"]] {
-        let status = Command::new("git").args(args).current_dir(root).status()?;
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .status()?;
         if !status.success() {
             bail!("failed to reset Asgard workspace {}", root.display());
         }
@@ -301,6 +309,7 @@ pub(crate) fn install_patch(root: &Path, patch: &[u8]) -> Result<()> {
         .args(["apply", "--binary", "-"])
         .current_dir(root)
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .spawn()?;
     child
         .stdin
@@ -321,6 +330,7 @@ pub(crate) fn remove_worktree(worktree: &Worktree) {
         .args(["worktree", "remove", "--force"])
         .arg(&worktree.root)
         .current_dir(&worktree.repo)
+        .stdout(Stdio::null())
         .status();
     if let Err(error) = result {
         tracing::warn!(path = %worktree.root.display(), "failed to remove Asgard worktree: {error}");
