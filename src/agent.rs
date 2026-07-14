@@ -3811,6 +3811,61 @@ fn send_thought(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
     }
 }
 
+#[derive(Clone)]
+struct AsgardLiveOutput {
+    cx: ConnectionTo<Client>,
+    session_id: String,
+    last_source: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl AsgardLiveOutput {
+    fn new(cx: &ConnectionTo<Client>, session_id: &str) -> Self {
+        Self {
+            cx: cx.clone(),
+            session_id: session_id.to_string(),
+            last_source: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn sink(&self, source: impl Into<String>) -> crate::tool_loop::TextSink {
+        let output = self.clone();
+        let source = source.into();
+        Arc::new(std::sync::Mutex::new(move |text: &str| {
+            if text.is_empty() {
+                return;
+            }
+            let mut last_source = output
+                .last_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last_source.as_deref() != Some(source.as_str()) {
+                send_thought(
+                    &output.cx,
+                    &output.session_id,
+                    &format!("\n[Asgard {source}]\n"),
+                );
+                *last_source = Some(source.clone());
+            }
+            send_thought(&output.cx, &output.session_id, text);
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct AsgardStreamSinks {
+    text: crate::tool_loop::TextSink,
+    thought: crate::tool_loop::TextSink,
+}
+
+impl AsgardStreamSinks {
+    fn new(output: &AsgardLiveOutput, source: &str) -> Self {
+        Self {
+            text: output.sink(format!("{source} output")),
+            thought: output.sink(format!("{source} reasoning")),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum LoopIterationError {
     Terminal(String),
@@ -4822,6 +4877,7 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
+    let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
     let mut initial_advice = None;
     let mut initial_advice_error = None;
@@ -4834,6 +4890,7 @@ async fn run_asgard_trajectory_loop(
             config.candidate_models.len(),
             &original_task,
             &selected_trajectory_initial,
+            &live_output,
         )
         .await;
         aggregate_usage.add(supervisor.1);
@@ -4924,11 +4981,10 @@ async fn run_asgard_trajectory_loop(
             let cancel = cancel.clone();
             let inherited_plan = canonical_plan.clone();
             let window_steps = current_window_steps;
+            let candidate_output = live_output.clone();
             futures.push(async move {
-                let sink: crate::tool_loop::TextSink =
-                    Arc::new(std::sync::Mutex::new(|_: &str| {}));
-                let thought_sink: crate::tool_loop::TextSink =
-                    Arc::new(std::sync::Mutex::new(|_: &str| {}));
+                let sinks =
+                    AsgardStreamSinks::new(&candidate_output, &format!("Candidate {}", index + 1));
                 let spawned = crate::tool_loop::SpawnedCx::new(cx);
                 let outcome = crate::tool_loop::run(
                     llm,
@@ -4941,8 +4997,8 @@ async fn run_asgard_trajectory_loop(
                     window_steps,
                     idle_timeout,
                     cancel,
-                    sink,
-                    thought_sink,
+                    sinks.text,
+                    sinks.thought,
                     spawned,
                     session_id.to_string(),
                     sessions.clone(),
@@ -5003,6 +5059,7 @@ async fn run_asgard_trajectory_loop(
                 &selected_trajectory_initial,
                 &selected_trajectory_windows,
                 &supervisor_history,
+                &live_output,
             )
             .await;
             supervisor_usage.add(supervisor.1);
@@ -5213,6 +5270,7 @@ async fn run_asgard_initial_advice(
     candidate_count: usize,
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
+    live_output: &AsgardLiveOutput,
 ) -> (
     anyhow::Result<AsgardSupervisorInitialAdvice>,
     crate::llm_client::TokenUsage,
@@ -5228,6 +5286,7 @@ async fn run_asgard_initial_advice(
             idle_timeout,
         },
         cancel,
+        Some(AsgardStreamSinks::new(live_output, "Supervisor")),
     )
     .await
 }
@@ -5244,6 +5303,7 @@ async fn run_asgard_supervisor(
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
     supervisor_history: &AsgardSupervisorHistory,
+    live_output: &AsgardLiveOutput,
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
@@ -5327,6 +5387,7 @@ async fn run_asgard_supervisor(
             idle_timeout,
         },
         cancel,
+        Some(AsgardStreamSinks::new(live_output, "Supervisor")),
     )
     .await
 }
@@ -5342,6 +5403,7 @@ async fn run_asgard_initial_advice_tool_steps(
     mut messages: Vec<ChatMessage>,
     context: AsgardSupervisorToolContext<'_>,
     cancel: tokio_util::sync::CancellationToken,
+    stream_sinks: Option<AsgardStreamSinks>,
 ) -> (
     anyhow::Result<AsgardSupervisorInitialAdvice>,
     crate::llm_client::TokenUsage,
@@ -5351,22 +5413,44 @@ async fn run_asgard_initial_advice_tool_steps(
     let mut usage = crate::llm_client::TokenUsage::default();
 
     for step in 1..=MAX_STEPS {
+        let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
+        let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
         let response = stream_chat_no_visible_output_with_retry(
             llm,
             "planning initial Asgard trajectories",
             &cancel,
-            || StreamChatRequest {
-                model: context.model.to_string(),
-                messages: messages.clone(),
-                tools: Some(tools.clone()),
-                reasoning_effort: None,
-                service_tier: None,
-                temperature: None,
-                structured_output: None,
-                on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
-                cancel: cancel.clone(),
-                idle_timeouts: context.idle_timeout,
+            || {
+                let text_sink = text_sink.clone();
+                let thought_sink = thought_sink.clone();
+                StreamChatRequest {
+                    model: context.model.to_string(),
+                    messages: messages.clone(),
+                    tools: Some(tools.clone()),
+                    reasoning_effort: None,
+                    service_tier: None,
+                    temperature: None,
+                    structured_output: None,
+                    on_token: Box::new(move |token| {
+                        if let Some(sink) = &text_sink {
+                            (sink
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner))(
+                                token
+                            );
+                        }
+                    }),
+                    on_thought: Box::new(move |token| {
+                        if let Some(sink) = &thought_sink {
+                            (sink
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner))(
+                                token
+                            );
+                        }
+                    }),
+                    cancel: cancel.clone(),
+                    idle_timeouts: context.idle_timeout,
+                }
             },
         )
         .await;
@@ -5464,6 +5548,7 @@ async fn run_asgard_supervisor_tool_steps(
     mut messages: Vec<ChatMessage>,
     context: AsgardSupervisorToolContext<'_>,
     cancel: tokio_util::sync::CancellationToken,
+    stream_sinks: Option<AsgardStreamSinks>,
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
@@ -5473,25 +5558,47 @@ async fn run_asgard_supervisor_tool_steps(
     let mut usage = crate::llm_client::TokenUsage::default();
 
     for step in 1..=MAX_STEPS {
+        let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
+        let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
         let response = stream_chat_no_visible_output_with_retry(
             llm,
             "selecting an Asgard trajectory",
             &cancel,
-            || StreamChatRequest {
-                model: context.model.to_string(),
-                messages: messages.clone(),
-                tools: Some(tools.clone()),
-                // DeepSeek's reasoning mode cannot be combined with forced
-                // tool choice. Leave reasoning enabled and remind it once if
-                // the first step does not call the terminal selector.
-                reasoning_effort: None,
-                service_tier: None,
-                temperature: None,
-                structured_output: None,
-                on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
-                cancel: cancel.clone(),
-                idle_timeouts: context.idle_timeout,
+            || {
+                let text_sink = text_sink.clone();
+                let thought_sink = thought_sink.clone();
+                StreamChatRequest {
+                    model: context.model.to_string(),
+                    messages: messages.clone(),
+                    tools: Some(tools.clone()),
+                    // DeepSeek's reasoning mode cannot be combined with forced
+                    // tool choice. Leave reasoning enabled and remind it once if
+                    // the first step does not call the terminal selector.
+                    reasoning_effort: None,
+                    service_tier: None,
+                    temperature: None,
+                    structured_output: None,
+                    on_token: Box::new(move |token| {
+                        if let Some(sink) = &text_sink {
+                            (sink
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner))(
+                                token
+                            );
+                        }
+                    }),
+                    on_thought: Box::new(move |token| {
+                        if let Some(sink) = &thought_sink {
+                            (sink
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner))(
+                                token
+                            );
+                        }
+                    }),
+                    cancel: cancel.clone(),
+                    idle_timeouts: context.idle_timeout,
+                }
             },
         )
         .await;
@@ -17158,6 +17265,7 @@ mod tests {
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             },
             tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -17216,6 +17324,7 @@ mod tests {
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             },
             tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -17251,6 +17360,7 @@ mod tests {
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             },
             tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await;
 
