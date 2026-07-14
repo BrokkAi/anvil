@@ -4588,11 +4588,6 @@ struct AsgardSupervisorDecision {
     state_summary: String,
 }
 
-struct AsgardSupervisorChoice {
-    decision: AsgardSupervisorDecision,
-    plan: Option<crate::plan::UpdatePlanArgs>,
-}
-
 const ASGARD_SUPERVISOR_MAX_ATTEMPTS: usize = 2;
 
 #[allow(clippy::too_many_arguments)]
@@ -4831,10 +4826,6 @@ async fn run_asgard_trajectory_loop(
                 return (outcome, usage_by_model);
             }
         };
-        let AsgardSupervisorChoice {
-            decision,
-            plan: supervisor_plan,
-        } = decision;
         let winner_index = decision.winner;
         let supervisor_complete = decision.complete;
         let supervisor_completion_summary = decision.state_summary.clone();
@@ -4843,12 +4834,12 @@ async fn run_asgard_trajectory_loop(
             let rendered = advices
                 .iter()
                 .enumerate()
-                .map(|(lane, advice)| match advice {
-                    Some(advice) => format!("  lane {}: {}", lane + 1, advice),
-                    None => format!(
-                        "  lane {}: <unadvised: supervisor strategy rejected as out of scope>",
-                        lane + 1
-                    ),
+                .map(|(lane, advice)| {
+                    format!(
+                        "  lane {}: {}",
+                        lane + 1,
+                        advice.as_deref().unwrap_or("<missing advice>")
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -4876,8 +4867,7 @@ async fn run_asgard_trajectory_loop(
                 winner.model
             ),
         );
-        let supervisor_supplied_plan = supervisor_plan.is_some();
-        let selected_plan = supervisor_plan.or_else(|| winner.outcome.current_plan.clone());
+        let selected_plan = winner.outcome.current_plan.clone();
         if let Some(plan) = selected_plan.as_ref() {
             let notification = SessionNotification::new(
                 session_id.to_string(),
@@ -4908,11 +4898,6 @@ async fn run_asgard_trajectory_loop(
             &worktrees[winner.index].session_cwd,
             parent_registry.cwd(),
         );
-        if supervisor_supplied_plan && let Some(plan) = selected_plan.as_ref() {
-            let message = asgard_supervisor_plan_message(plan);
-            common_messages.push(message.clone());
-            selected_window.push(message);
-        }
         selected_trajectory_windows.push(selected_window);
         if crate::tokens::approximate_tokens_messages(&common_messages)
             > crate::context_manager::context_budget(context_length)
@@ -5006,7 +4991,7 @@ async fn run_asgard_supervisor(
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
 ) -> (
-    anyhow::Result<AsgardSupervisorChoice>,
+    anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
 ) {
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
@@ -5104,16 +5089,12 @@ async fn run_asgard_supervisor_tool_steps(
     context: AsgardSupervisorToolContext<'_>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> (
-    anyhow::Result<AsgardSupervisorChoice>,
+    anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
 ) {
     const MAX_STEPS: usize = 2;
-    let tools = vec![
-        crate::tools::update_plan_tool_definition(),
-        asgard_select_trajectory_tool(context.candidate_count),
-    ];
+    let tools = vec![asgard_select_trajectory_tool(context.candidate_count)];
     let mut usage = crate::llm_client::TokenUsage::default();
-    let mut plan = None;
 
     for step in 1..=MAX_STEPS {
         let response = stream_chat_no_visible_output_with_retry(
@@ -5156,13 +5137,12 @@ async fn run_asgard_supervisor_tool_steps(
                 ));
             }
             LlmResponse::ToolCalls {
-                text,
-                reasoning_content,
+                text: _,
+                reasoning_content: _,
                 calls,
                 ..
             } => {
                 let mut decision = None;
-                let mut result_calls = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let normalized = match crate::tool_arguments::normalize_tool_arguments(
                         &call.function.arguments,
@@ -5179,27 +5159,6 @@ async fn run_asgard_supervisor_tool_steps(
                         }
                     };
                     match call.function.name.as_str() {
-                        "update_plan" => {
-                            if plan.is_some() {
-                                return (
-                                    Err(anyhow::anyhow!(
-                                        "Asgard supervisor called update_plan more than once"
-                                    )),
-                                    usage,
-                                );
-                            }
-                            match serde_json::from_value(normalized.clone()) {
-                                Ok(value) => plan = Some(value),
-                                Err(error) => {
-                                    return (
-                                        Err(anyhow::anyhow!(
-                                            "Asgard supervisor emitted invalid update_plan arguments: {error}"
-                                        )),
-                                        usage,
-                                    );
-                                }
-                            }
-                        }
                         "select_trajectory" => {
                             if decision.is_some() {
                                 return (
@@ -5228,33 +5187,17 @@ async fn run_asgard_supervisor_tool_steps(
                             );
                         }
                     }
-                    result_calls.push((call.id.clone(), call.function.name.clone()));
                 }
 
                 if let Some(decision) = decision {
-                    return (Ok(AsgardSupervisorChoice { decision, plan }), usage);
-                }
-
-                messages.push(
-                    ChatMessage::assistant_tool_calls_with_content_and_reasoning(
-                        text,
-                        calls,
-                        reasoning_content,
-                    ),
-                );
-                for (call_id, tool_name) in result_calls {
-                    messages.push(ChatMessage::tool_result(
-                        &call_id,
-                        &tool_name,
-                        "Plan recorded. You must now call select_trajectory.",
-                    ));
+                    return (Ok(decision), usage);
                 }
             }
         }
 
         if step < MAX_STEPS {
             messages.push(ChatMessage::user(
-                "You have not selected a trajectory. Call select_trajectory now. You may also call update_plan if you have not already done so. Do not answer in prose.",
+                "You have not selected a trajectory. Call select_trajectory now. Do not answer in prose.",
             ));
         }
     }
@@ -5401,8 +5344,9 @@ fn asgard_supervisor_messages(
              or a defect caused by the selected candidate patch that it corrects. Also produce \
              state_summary: a concise account of why the selected endpoint is preferable and, when \
              incomplete, what concrete requirement or defect remains. Call select_trajectory exactly \
-             once. You may also call update_plan at most once to replace the canonical shared plan. \
-             Do not call any other tool and do not answer in prose. If you omit select_trajectory, \
+             once. You do not update the shared plan yourself. If a lane would benefit from revising \
+             task tracking, say so in that lane's strategy; the candidate can call update_plan during \
+             its normal rollout. Do not call any other tool and do not answer in prose. If you omit select_trajectory, \
              you will receive one reminder.",
         )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
@@ -5473,6 +5417,7 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          </asgard_next_window_advice>\n\
          Treat this as advisory strategy for continuing the original task normally. \
          Do not stop because of an Asgard window boundary; Anvil controls those boundaries. \
+         You may call update_plan if this strategy changes or clarifies the best plan for the task. \
          Unless the original task requires it, do not change unrelated dependencies, build \
          configuration, warning policy, tests, or test selection to hide a pre-existing, \
          environmental, dependency-audit, or harness failure, and do not chase it by changing SDKs, \
@@ -5487,15 +5432,6 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          boundary-level verification. Do not dismiss a failing existing \
          test as pre-existing, flaky, or unrelated without concrete baseline or subsequent passing \
          evidence, especially when it exercises code changed by this trajectory."
-    ))
-}
-
-fn asgard_supervisor_plan_message(plan: &crate::plan::UpdatePlanArgs) -> ChatMessage {
-    ChatMessage::user(format!(
-        "<asgard_supervisor_plan>\n{}\n</asgard_supervisor_plan>\n\
-         This is the shared current plan selected by the supervisor. Continue the original task; \
-         lane-specific advice may choose a different valid route through this plan.",
-        serde_json::to_string_pretty(plan).expect("plan serializes")
     ))
 }
 
@@ -16078,18 +16014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asgard_supervisor_preserves_plan_call_then_reminds_for_selection() {
-        let plan_call = supervisor_tool_call(
-            "plan-call",
-            "update_plan",
-            serde_json::json!({
-                "explanation": "The selected endpoint still needs verification.",
-                "plan": [
-                    {"step": "Inspect the selected implementation", "status": "completed"},
-                    {"step": "Run focused verification", "status": "in_progress"}
-                ]
-            }),
-        );
+    async fn asgard_supervisor_reminds_once_and_only_advertises_selector() {
         let selection_call = supervisor_tool_call(
             "selection-call",
             "select_trajectory",
@@ -16099,7 +16024,7 @@ mod tests {
                 "state_summary": "Lane 2 has the strongest implementation but lacks verification.",
                 "advices": [
                     {
-                        "strategy": "Run the focused parser tests.",
+                        "strategy": "Run the focused parser tests and update_plan with the remaining work.",
                         "scope_basis": "Verify the requested parser behavior."
                     },
                     {
@@ -16110,10 +16035,9 @@ mod tests {
             }),
         );
         let backend = ScriptedSupervisorBackend::new(vec![
-            LlmResponse::ToolCalls {
-                text: String::new(),
-                reasoning_content: Some("I should record the remaining work first.".to_string()),
-                calls: vec![plan_call],
+            LlmResponse::Text {
+                text: "I should choose carefully.".to_string(),
+                reasoning_content: Some("Compare the evidence first.".to_string()),
                 usage: crate::llm_client::TokenUsage {
                     input_tokens: 10,
                     ..Default::default()
@@ -16130,7 +16054,7 @@ mod tests {
             },
         ]);
 
-        let (choice, usage) = run_asgard_supervisor_tool_steps(
+        let (decision, usage) = run_asgard_supervisor_tool_steps(
             &backend,
             vec![
                 ChatMessage::system("supervise"),
@@ -16145,35 +16069,34 @@ mod tests {
         )
         .await;
 
-        let choice = choice.expect("supervisor choice");
-        assert_eq!(choice.decision.winner, 1);
-        assert!(!choice.decision.complete);
-        assert_eq!(choice.plan.expect("supervisor plan").plan.len(), 2);
+        let decision = decision.expect("supervisor decision");
+        assert_eq!(decision.winner, 1);
+        assert!(!decision.complete);
+        assert!(
+            decision.advices[0]
+                .as_deref()
+                .is_some_and(|advice| advice.contains("update_plan"))
+        );
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 3);
 
         let requests = backend.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].model, "deepseek::deepseek-v4-pro");
-        assert_eq!(
-            requests[0].tool_names,
-            vec!["update_plan", "select_trajectory"]
-        );
+        assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
         assert_eq!(requests[0].reasoning_effort, None);
         let replay = &requests[1].messages;
         assert_eq!(replay[2].role, "assistant");
         assert_eq!(
             replay[2].reasoning_content.as_deref(),
-            Some("I should record the remaining work first.")
+            Some("Compare the evidence first.")
         );
-        assert_eq!(replay[3].role, "tool");
-        assert_eq!(replay[3].name.as_deref(), Some("update_plan"));
-        assert_eq!(replay[4].role, "user");
-        assert!(asgard_message_text(&replay[4]).contains("select_trajectory now"));
+        assert_eq!(replay[3].role, "user");
+        assert!(asgard_message_text(&replay[3]).contains("select_trajectory now"));
     }
 
     #[tokio::test]
-    async fn asgard_supervisor_accepts_selection_without_forcing_a_plan() {
+    async fn asgard_supervisor_accepts_selection_directly() {
         let selection_call = supervisor_tool_call(
             "selection-call",
             "select_trajectory",
@@ -16191,7 +16114,7 @@ mod tests {
             usage: crate::llm_client::TokenUsage::default(),
         }]);
 
-        let (choice, _) = run_asgard_supervisor_tool_steps(
+        let (decision, _) = run_asgard_supervisor_tool_steps(
             &backend,
             vec![ChatMessage::user("dossier")],
             AsgardSupervisorToolContext {
@@ -16203,29 +16126,30 @@ mod tests {
         )
         .await;
 
-        let choice = choice.expect("supervisor choice");
-        assert_eq!(choice.decision.winner, 0);
-        assert!(choice.decision.complete);
-        assert!(choice.plan.is_none());
-        assert_eq!(backend.requests.lock().expect("request lock").len(), 1);
+        let decision = decision.expect("supervisor decision");
+        assert_eq!(decision.winner, 0);
+        assert!(decision.complete);
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
     }
 
     #[tokio::test]
-    async fn asgard_supervisor_rejects_multiple_plan_calls() {
-        let plan_arguments = serde_json::json!({
-            "plan": [{"step": "Verify the implementation", "status": "in_progress"}]
-        });
+    async fn asgard_supervisor_rejects_unadvertised_plan_call() {
         let backend = ScriptedSupervisorBackend::new(vec![LlmResponse::ToolCalls {
             text: String::new(),
             reasoning_content: None,
-            calls: vec![
-                supervisor_tool_call("plan-one", "update_plan", plan_arguments.clone()),
-                supervisor_tool_call("plan-two", "update_plan", plan_arguments),
-            ],
+            calls: vec![supervisor_tool_call(
+                "plan-call",
+                "update_plan",
+                serde_json::json!({
+                    "plan": [{"step": "Verify the implementation", "status": "in_progress"}]
+                }),
+            )],
             usage: crate::llm_client::TokenUsage::default(),
         }]);
 
-        let (choice, _) = run_asgard_supervisor_tool_steps(
+        let (decision, _) = run_asgard_supervisor_tool_steps(
             &backend,
             vec![ChatMessage::user("dossier")],
             AsgardSupervisorToolContext {
@@ -16237,17 +16161,15 @@ mod tests {
         )
         .await;
 
-        let error = match choice {
-            Ok(_) => panic!("duplicate plan calls must fail"),
-            Err(error) => error,
-        };
+        let error = decision.expect_err("update_plan is not a supervisor tool");
         assert!(
             error
                 .to_string()
-                .contains("called update_plan more than once")
+                .contains("called unexpected tool `update_plan`")
         );
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
     }
-
     #[test]
     fn asgard_patch_file_inventory_keeps_every_changed_path() {
         let patch = b"diff --git a/src/a.rs b/src/a.rs\n\
