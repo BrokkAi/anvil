@@ -4564,19 +4564,36 @@ struct AsgardCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-struct AsgardShellEvidence {
-    command: String,
-    kind: String,
-    status: String,
-    zero_tests_discovered: bool,
-    summary_lines: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-struct AsgardVerificationEvidence {
-    shell_commands: Vec<AsgardShellEvidence>,
+struct AsgardCandidateTestEdits {
     candidate_created_test_files: Vec<String>,
     candidate_modified_test_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsgardSupervisorHistoryEntry {
+    window: usize,
+    winner: usize,
+    state_summary: String,
+}
+
+#[derive(Debug, Default)]
+struct AsgardSupervisorHistory {
+    checkpointed: Vec<AsgardSupervisorHistoryEntry>,
+    selected_windows: Vec<AsgardSupervisorHistoryEntry>,
+}
+
+impl AsgardSupervisorHistory {
+    fn push(&mut self, window: usize, decision: &AsgardSupervisorDecision) {
+        self.selected_windows.push(AsgardSupervisorHistoryEntry {
+            window,
+            winner: decision.winner,
+            state_summary: decision.state_summary.clone(),
+        });
+    }
+
+    fn checkpoint_selected_windows(&mut self) {
+        self.checkpointed.append(&mut self.selected_windows);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4647,6 +4664,7 @@ async fn run_asgard_trajectory_loop(
     let original_task = asgard_original_task(&common_messages);
     let mut selected_trajectory_initial = common_messages.clone();
     let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
+    let mut supervisor_history = AsgardSupervisorHistory::default();
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
@@ -4769,6 +4787,7 @@ async fn run_asgard_trajectory_loop(
                 &original_task,
                 &selected_trajectory_initial,
                 &selected_trajectory_windows,
+                &supervisor_history,
             )
             .await;
             supervisor_usage.add(supervisor.1);
@@ -4823,7 +4842,7 @@ async fn run_asgard_trajectory_loop(
         let winner_index = decision.winner;
         let supervisor_complete = decision.complete;
         let supervisor_completion_summary = decision.state_summary.clone();
-        next_advices = Some(decision.advices);
+        next_advices = Some(decision.advices.clone());
         if !supervisor_complete && let Some(advices) = &next_advices {
             let rendered = advices
                 .iter()
@@ -4893,6 +4912,7 @@ async fn run_asgard_trajectory_loop(
             parent_registry.cwd(),
         );
         selected_trajectory_windows.push(selected_window);
+        supervisor_history.push(window, &decision);
         if crate::tokens::approximate_tokens_messages(&common_messages)
             > crate::context_manager::context_budget(context_length)
         {
@@ -4926,6 +4946,7 @@ async fn run_asgard_trajectory_loop(
                         });
                     selected_trajectory_initial = common_messages.clone();
                     selected_trajectory_windows.clear();
+                    supervisor_history.checkpoint_selected_windows();
                     tracing::info!(
                         window,
                         before_tokens = compaction.before_tokens,
@@ -4984,6 +5005,7 @@ async fn run_asgard_supervisor(
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
+    supervisor_history: &AsgardSupervisorHistory,
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
@@ -4991,14 +5013,17 @@ async fn run_asgard_supervisor(
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
         let trajectory = render_asgard_dossier_messages(&candidate.window_messages);
-        let verification_evidence = match serde_json::to_string_pretty(
-            &asgard_verification_evidence(&candidate.window_messages, &candidate.patch),
-        ) {
+        let (candidate_created_test_files, candidate_modified_test_files) =
+            asgard_patch_test_inventory(&candidate.patch);
+        let candidate_test_edits = match serde_json::to_string_pretty(&AsgardCandidateTestEdits {
+            candidate_created_test_files,
+            candidate_modified_test_files,
+        }) {
             Ok(evidence) => evidence,
             Err(error) => {
                 return (
                     Err(anyhow::anyhow!(
-                        "failed to serialize Asgard lane {} verification evidence: {error}",
+                        "failed to serialize Asgard lane {} test-file edits: {error}",
                         candidate.index
                     )),
                     crate::llm_client::TokenUsage::default(),
@@ -5007,13 +5032,13 @@ async fn run_asgard_supervisor(
         };
         candidate_trajectories.push_str(&format!(
             "\n<lane_trajectory index=\"{}\" model=\"{}\" stop=\"{:?}\">\n\
-             <verification_evidence derived_before_dossier_compaction=\"true\">\n{}\n\
-             </verification_evidence>\n\
+             <candidate_test_file_edits derived_from_full_patch=\"true\">\n{}\n\
+             </candidate_test_file_edits>\n\
              <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
             candidate.index,
             candidate.model,
             candidate.outcome.stop,
-            verification_evidence,
+            candidate_test_edits,
             trajectory,
         ));
     }
@@ -5022,6 +5047,7 @@ async fn run_asgard_supervisor(
         original_task,
         selected_trajectory_initial,
         selected_trajectory_windows,
+        supervisor_history,
         candidates.len(),
         candidate_trajectories,
     );
@@ -5201,127 +5227,29 @@ fn asgard_supervisor_messages(
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
+    supervisor_history: &AsgardSupervisorHistory,
     candidate_count: usize,
     candidate_trajectories: String,
 ) -> Vec<ChatMessage> {
     let mut messages = vec![
         ChatMessage::system(format!(
-            "You are the Asgard trajectory supervisor. Compare candidates against the exact task \
-             and shared baseline using the trajectory evidence supplied in the prompt. Optimize \
-             for the long-term probability of a correct final solution rather than greedy visible \
-             progress. HARD SCOPE CONSTRAINT: unless the original task explicitly requires it or \
-             the candidate patch itself changed that surface and must be corrected, never recommend \
-             changing dependencies, lockfiles, build configuration, warning/audit policy, tests, \
-             test selection, or expected outputs in response to a failure. Pre-existing, \
-             environmental, dependency-audit, and harness failures are evidence to report or work \
-             around with focused verification, not problems to hide or repair. Never recommend \
-             regressing task-mandated production behavior, restoring obsolete calls, or adding \
-             redundant calls merely to preserve old mock interactions or avoid strict-mocking errors. \
-             When a required API, contract, or call path changes, updating the affected mock setup is \
-             in scope. Never recommend \
-             changing or repairing a build environment, toolchain, classpath, build daemon, wrapper, \
-             generated build tooling, or checkout layout unless the original task explicitly asks \
-             for that work. Any strategy that violates this constraint makes the entire answer \
-             invalid. Treat execution as environmentally blocked only when a trajectory shows an \
-             attempted task-relevant verifier and its concrete environmental failure; never infer a \
-             blocker merely because no command was attempted. When a blocker is demonstrated, \
-             skeptically audit introduced symbols, types, namespaces, imports, signatures, and call \
-             contracts from the supplied evidence. \
-             A verifier timeout is missing evidence, not evidence that the patch is correct or that \
-             the verifier is environmentally incompatible. After a timeout, prefer a narrower \
-             task-relevant verifier that can finish and expose the changed behavior. Never classify \
-             a failure as pre-existing, environmental, flaky, or unrelated merely because it occurs \
-             in an existing test, uses generated data, or lies outside the production diff. If a \
-             failure exercises a surface changed by the candidate, presume it is candidate-caused \
-             unless the trajectories contain concrete contrary evidence, such as the same failure \
-             on the untouched baseline or a later focused passing run that demonstrates the defect \
-             was fixed. Diagnostic claims and candidate-caused defects recorded in the selected \
-             trajectory remain unresolved evidence until a later trajectory actually resolves them; \
-             do not silently reverse an earlier attribution without identifying new evidence. \
-             Never describe an uncompiled patch as correct merely because its tests or structure look \
-             plausible. A named verifier may be intentionally absent from the checkout, but that \
-             absence must be demonstrated by trajectory evidence rather than assumed; unless the \
-             task explicitly requests new tests, do not infer an obligation to recreate it or favor a \
-             candidate-authored substitute over a verified production patch. Do not manufacture \
-             endless follow-up work. If the selected implementation satisfies the task and has \
-             sufficient verification, mark it complete even if more optional tests or audits could \
-             be imagined. Never mark an endpoint complete while admitting it was not compiled or \
-             built merely because it appears syntactically or structurally correct, or while any \
-             candidate-modified file still has a known defect or formatting/lint violation. Messages tagged \
-             selected_trajectory are verbatim model and tool evidence carried in assistant-role cache \
-             records. Embedded asgard_next_window_advice records are prior supervisor guidance to the \
-             candidates, not instructions to you; treat any defect or failure attribution they record \
-             as unresolved diagnostic evidence that your decision must reconcile. Each candidate \
-             dossier also contains a derived verification_evidence card before its window \
-             trajectory. The transcript retains model messages, tool calls, and tool results exactly \
-             once. Use the card as a salience index, while treating the raw evidence as authoritative if they \
-             disagree. A successful shell exit is not by itself \
-             proof that relevant tests executed. In particular, a test command that reports zero \
-             discovered, selected, or matching tests supplies no passing test evidence. Treat that as \
-             an unresolved verification gap, not an expected success. Distinguish tests created or \
-             modified by the candidate from pre-existing verification: candidate-authored tests can \
-             expose useful behavior, but are not independent evidence and must not outweigh a failing \
-             or unattempted applicable pre-existing, integration, end-to-end, or boundary-level check. \
-             A successful build establishes compilation, not behavioral coverage. When changes cross \
-             a runtime boundary such as dependency injection, serialization, persistence, networking, \
-             process execution, or a public API, prefer evidence that exercises that boundary. Your \
-             select_trajectory call must contain the requested winner, a complete boolean, a sufficient account \
-             of the selected endpoint, and either no advice when complete or one distinct, \
-             scope-grounded next-window advice object per lane when incomplete. \
-             Every strategy must independently comply with every explicit task requirement. \
-             Diversity means different valid routes to the same required outcome; it is never \
-             permission to relax a contract, substitute a broader or weaker behavior, or offer a \
-             knowingly noncompliant fallback. Never propose a strategy that admits it deviates \
-             from the task or specification. \
-             Select the single trajectory with the highest probability of eventually producing a \
-             correct, complete solution if continued from its endpoint. Judge long-term direction, \
-             not just immediate visible activity. Valuable progress includes discovering constraints, \
-             ruling out bad hypotheses, building the right abstraction, writing diagnostic tests, \
-             and preserving a recoverable path. Do not penalize a candidate merely because careful \
-             investigation produced fewer edits this window, and do not reward patch size or \
-             superficial test motion. Consider implementation correctness, architectural fit, \
-             evidence from tests and errors, remaining risks, recoverability, and regressions. When \
-             execution is blocked by an environmental or baseline failure, perform a skeptical \
-             static compilation audit using the supplied evidence: check introduced types, \
-             namespaces, method signatures, imports, and call contracts. Treat an unverified patch \
-             as high risk, never as correct merely because its tests look plausible, and prefer \
-             candidates that reduce or explicitly investigate those source-level risks. Penalize \
-             unrelated build/configuration edits and attempts to evade tests. Treat build or test \
-             failures as evidence and distinguish candidate-caused failures from pre-existing, \
-             environmental, dependency-audit, or harness failures. Decide whether the selected \
-             endpoint is complete. Set complete=true when it satisfies every explicit task \
-             requirement and no known candidate-caused defect or necessary task-relevant \
-             work remains. Exercise the judgment of a strong coding agent rather than applying a \
-             mechanical stopping rule. Before complete=true, look for an actual task-relevant build, \
-             test, lint, typecheck, or equivalent verifier after the selected implementation's \
-             material changes. When the repository exposes an applicable verifier and no trajectory \
-             attempted it, normally keep complete=false and use the next-window advice to run focused \
-             verification. The exception is a genuinely non-executable task or a demonstrated blocker \
-             for which the supplied evidence makes residual risk acceptably low. Do not infer such an \
-             exception from silence. Never claim a command ran when the trajectory does not show it, \
-             and never promote a merely plausible static review into stronger evidence than it \
-             provides. In particular, scrutinize visibility, imports, signatures, namespaces, and \
-             cross-module call sites introduced by an uncompiled patch. Optional extra tests, broader \
-             audits, cleanup, and nice-to-have coverage must not create endless work once the endpoint \
-             is genuinely complete. A still-failing applicable verifier is not optional follow-up: \
-             keep complete=false while its causal relationship to the candidate remains unresolved. \
-             When complete=true, return advices=[] and state_summary must give \
-             your candid evidence-based account of why stopping is the best judgment, including any \
-             meaningful residual uncertainty. Otherwise produce exactly {candidate_count} concise, \
-             actionable, mutually distinct strategies for the next candidate window, ordered by \
-             zero-based lane index. The strategies should explore different hypotheses or \
-             implementation/test approaches from the selected state. When verification confidence is \
-             the principal remaining risk, include at least one adversarial or independent verification \
-             strategy rather than several variants of candidate-authored tests. They are advice for normal \
-             continuing rollouts, not instructions to stop at a window boundary. For every strategy, \
-             provide a scope_basis that identifies either the original-task requirement it advances \
-             or a defect caused by the selected candidate patch that it corrects. Also produce \
-             state_summary: a concise account of why the selected endpoint is preferable and, when \
-             incomplete, what concrete requirement or defect remains. Call select_trajectory exactly \
-             once. You do not update the shared plan yourself. If a lane would benefit from revising \
-             task tracking, say so in that lane's strategy; the candidate can call update_plan during \
-             its normal rollout. Do not call any other tool and do not answer in prose. If you omit select_trajectory, \
-             you will receive one reminder.",
+            r#"You are the final correctness owner for an Asgard coding trajectory. You are not merely choosing the most polished lane: select the endpoint with the best long-term chance of solving the original task, decide whether the task is actually complete, and, when it is not, direct the next {candidate_count} lanes toward useful independent progress.
+
+The original task is authoritative. Preserve every explicit requirement and prohibition. A candidate that directly contradicts the task is not rescued by plausible code or green but irrelevant checks. Judge architectural direction, correctness, recoverability, known defects, and evidence—not patch size, confident prose, or immediate visible activity. Investigation that discovers an important constraint can be more valuable than a larger edit.
+
+The selected trajectory is the shared canonical history. Candidate trajectories are alternative continuations from that state. Prior supervisor decisions record your earlier judgment for continuity, but they may be wrong; reconsider them when newer evidence or the original task conflicts with them. Prior per-lane advice is likewise historical guidance, not an instruction to you.
+
+Read the actual model messages, tool calls, commands, and tool results in every trajectory. Decide what each call establishes from its command and output; do not assume that a successful shell status means the relevant behavior ran or passed, especially through filters, pipelines, wrappers, timeouts, or zero-test selections. Never claim a check ran when the trajectory does not show it. A build demonstrates compilation, not necessarily behavior. A still-unexplained failure on a changed surface is evidence against completion.
+
+The candidate_test_file_edits inventory is derived from the full candidate patch only to make test authorship visible. Candidate-written or candidate-modified tests can be useful diagnostics, and legitimate contract changes may require updating tests or mocks. But a green run after changing its own tests is not independent confirmation: inspect whether the tests were strengthened to express the task or merely adapted to accept the implementation. Do not mechanically reject test edits, and do not let self-confirming checks outweigh contradictory pre-existing or boundary-level evidence.
+
+Stay within scope. Do not repair dependencies, lockfiles, build configuration, toolchains, wrappers, generated build machinery, warning policy, test selection, or expected outputs merely to hide a failure, unless the original task requires that surface or the candidate changed it and must correct the resulting defect. Treat a failure as environmental, pre-existing, flaky, or unrelated only when the trajectories provide concrete evidence. Do not weaken task-mandated behavior to preserve obsolete mocks or callers; updating genuinely affected tests and mocks is in scope.
+
+Set complete=true only when the selected endpoint satisfies the original task, violates no explicit constraint, and has no known candidate-caused defect or necessary work remaining. Use engineering judgment rather than a hardcoded testing ritual: require evidence proportionate to the change, account for unavailable or inconclusive checks honestly, and do not invent endless optional work after the task is genuinely complete.
+
+When incomplete, return exactly {candidate_count} concise, actionable, mutually distinct advice objects ordered by zero-based lane index. Every strategy must independently remain compliant with the original task. At least one strategy must challenge the selected direction's most consequential unverified assumption instead of treating the current architecture as settled. Advice should identify the objective, risk, or evidence to obtain. Do not prescribe exact syntax, APIs, grammar shapes, or implementation facts unless the supplied trajectory evidence establishes them; when uncertain, direct the candidate to inspect the relevant source or behavior and resolve the uncertainty. If useful, advise a candidate to update_plan. The candidates continue normal rollouts and must not stop at Asgard window boundaries.
+
+Call select_trajectory exactly once. Return advices=[] when complete. state_summary must concisely record why the endpoint was selected, the decisive evidence, and any unresolved risk. Do not call another tool or answer in prose. If you omit select_trajectory, you will receive one reminder."#,
         )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
     ];
@@ -5329,17 +5257,63 @@ fn asgard_supervisor_messages(
         "<selected_trajectory_initial>\n{}\n</selected_trajectory_initial>",
         render_asgard_dossier_messages(selected_trajectory_initial),
     )));
+    if !supervisor_history.checkpointed.is_empty() {
+        messages.push(ChatMessage::assistant(format!(
+            "<supervisor_decision_history checkpointed=\"true\">\n{}\n\
+             </supervisor_decision_history>",
+            render_asgard_supervisor_history(&supervisor_history.checkpointed),
+        )));
+    }
+    debug_assert_eq!(
+        selected_trajectory_windows.len(),
+        supervisor_history.selected_windows.len()
+    );
     for (index, window) in selected_trajectory_windows.iter().enumerate() {
         messages.push(ChatMessage::user(format!(
             "<selected_trajectory_window_boundary index=\"{index}\" />"
         )));
+        let decision = supervisor_history
+            .selected_windows
+            .get(index)
+            .map(render_asgard_supervisor_history_entry)
+            .unwrap_or_default();
         messages.push(ChatMessage::assistant(format!(
-            "<selected_trajectory_window index=\"{index}\">\n{}\n</selected_trajectory_window>",
+            "<selected_trajectory_window index=\"{index}\">\n{}\n</selected_trajectory_window>\n{}",
             render_asgard_dossier_messages(window),
+            decision,
         )));
     }
-    messages.push(ChatMessage::user(candidate_trajectories));
+    messages.push(ChatMessage::user(format!(
+        r#"{candidate_trajectories}
+
+<decision_procedure>
+Before calling select_trajectory:
+1. Re-read the original task. Identify its required behaviors, explicit implementation constraints, and prohibitions.
+2. For each lane, identify its actual direction, known defects, contradictions with the task, and most consequential uncertainty. Treat prior supervisor advice as fallible.
+3. Inspect the calls and results in each trajectory. Decide whether the evidence exercises the changed behavior, whether later edits undermine it, and whether candidate test edits make a green result self-confirming.
+4. Select the endpoint most likely to produce a correct final solution if continued. Relative superiority does not imply correctness.
+5. Decide completion independently: complete only if the selected endpoint satisfies the task and no required work or known candidate-caused defect remains.
+6. If incomplete, produce exactly {candidate_count} task-compliant strategies. Make them genuinely different, include one that tries to falsify the leading unverified assumption, and avoid asserting implementation details not established by the evidence.
+Then call select_trajectory exactly once.
+</decision_procedure>"#,
+    )));
     messages
+}
+
+fn render_asgard_supervisor_history(entries: &[AsgardSupervisorHistoryEntry]) -> String {
+    entries
+        .iter()
+        .map(render_asgard_supervisor_history_entry)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_asgard_supervisor_history_entry(entry: &AsgardSupervisorHistoryEntry) -> String {
+    format!(
+        "<supervisor_decision window=\"{}\" selected_lane=\"{}\">\n{}\n\
+         </supervisor_decision>",
+        entry.window, entry.winner, entry.state_summary,
+    )
 }
 
 fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String {
@@ -5467,157 +5441,6 @@ fn asgard_message_text(message: &ChatMessage) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn asgard_verification_evidence(
-    messages: &[ChatMessage],
-    full_patch: &[u8],
-) -> AsgardVerificationEvidence {
-    let mut commands = Vec::<(String, String)>::new();
-    for message in messages {
-        for call in message.tool_calls.iter().flatten() {
-            if call.function.name != "run_shell_command" {
-                continue;
-            }
-            let command = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                .ok()
-                .and_then(|arguments| {
-                    arguments
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| call.function.arguments.clone());
-            commands.push((call.id.clone(), command));
-        }
-    }
-
-    let shell_commands = commands
-        .into_iter()
-        .map(|(call_id, command)| {
-            let result = messages
-                .iter()
-                .find(|message| {
-                    message.role == "tool"
-                        && message.name.as_deref() == Some("run_shell_command")
-                        && message.tool_call_id.as_deref() == Some(call_id.as_str())
-                })
-                .map(asgard_message_text)
-                .unwrap_or_default();
-            AsgardShellEvidence {
-                kind: asgard_shell_command_kind(&command).to_string(),
-                status: asgard_shell_result_status(&result).to_string(),
-                zero_tests_discovered: asgard_zero_tests_discovered(&result),
-                summary_lines: asgard_shell_summary_lines(&result),
-                command,
-            }
-        })
-        .collect();
-
-    let (candidate_created_test_files, candidate_modified_test_files) =
-        asgard_patch_test_inventory(full_patch);
-    AsgardVerificationEvidence {
-        shell_commands,
-        candidate_created_test_files,
-        candidate_modified_test_files,
-    }
-}
-
-fn asgard_shell_command_kind(command: &str) -> &'static str {
-    let command = command.to_ascii_lowercase();
-    let test_command = command.contains("dotnet test")
-        || command.contains("cargo test")
-        || command.contains("go test")
-        || command.contains("pytest")
-        || command.contains("npm test")
-        || command.contains("pnpm test")
-        || command.contains("yarn test")
-        || (command.contains("gradlew") && command.contains("test"))
-        || (command.contains("mvn") && command.contains("test"));
-    if test_command {
-        "test"
-    } else if command.contains("lint")
-        || command.contains("clippy")
-        || command.contains("spotless")
-        || command.contains("typecheck")
-        || command.contains("type-check")
-    {
-        "lint_or_static_check"
-    } else if command.contains(" build")
-        || command.starts_with("build")
-        || command.contains("compile")
-        || command.contains("cargo check")
-    {
-        "build_or_compile"
-    } else {
-        "other"
-    }
-}
-
-fn asgard_shell_result_status(result: &str) -> &'static str {
-    let lower = result.to_ascii_lowercase();
-    if lower.contains("command timed out after") {
-        "timed_out"
-    } else if lower.contains("command was cancelled before it completed") {
-        "cancelled"
-    } else if lower.contains("build failed")
-        || lower.contains("tests failed")
-        || lower.contains("test run failed")
-        || lower.contains("failed!")
-        || lower.contains("\n\nexit code:")
-        || lower.starts_with("failed to execute command:")
-        || lower.starts_with("internal error:")
-    {
-        "failed"
-    } else if result.is_empty() {
-        "missing_result"
-    } else {
-        "succeeded"
-    }
-}
-
-fn asgard_zero_tests_discovered(result: &str) -> bool {
-    let lower = result.to_ascii_lowercase();
-    [
-        "no test matches",
-        "no tests match",
-        "no matching test",
-        "no tests found",
-        "no test is available",
-        "no tests were found",
-        "0 tests completed",
-        "total tests: 0",
-        "total:     0",
-        "total: 0",
-        "tests run: 0",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn asgard_shell_summary_lines(result: &str) -> Vec<String> {
-    result
-        .lines()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower.contains("build successful")
-                || lower.contains("build failed")
-                || lower.contains("tests completed")
-                || lower.contains("tests run:")
-                || lower.contains("passed!")
-                || lower.contains("failed!")
-                || lower.contains("no test matches")
-                || lower.contains("no tests match")
-                || lower.contains("no matching test")
-                || lower.contains("no tests found")
-                || lower.contains("no test is available")
-                || lower.contains("command timed out")
-                || lower.starts_with("exit code:")
-        })
-        .take(16)
-        .map(str::trim)
-        .map(str::to_string)
-        .collect()
 }
 
 fn asgard_patch_test_inventory(patch: &[u8]) -> (Vec<String>, Vec<String>) {
@@ -15864,6 +15687,32 @@ mod tests {
     }
 
     #[test]
+    fn asgard_supervisor_summary_is_kept_in_supervisor_history_only() {
+        let decision = AsgardSupervisorDecision {
+            winner: 2,
+            complete: false,
+            advices: vec![Some("independent strategy".to_string())],
+            state_summary: "The selected parser still has an unresolved wildcard assumption."
+                .to_string(),
+        };
+        let mut history = AsgardSupervisorHistory::default();
+        history.push(4, &decision);
+
+        assert_eq!(history.selected_windows.len(), 1);
+        assert!(
+            render_asgard_supervisor_history(&history.selected_windows)
+                .contains("unresolved wildcard assumption")
+        );
+
+        let candidate_advice = asgard_advice_message(0, "independent strategy");
+        assert!(!asgard_message_text(&candidate_advice).contains("wildcard assumption"));
+
+        history.checkpoint_selected_windows();
+        assert!(history.selected_windows.is_empty());
+        assert_eq!(history.checkpointed.len(), 1);
+    }
+
+    #[test]
     fn asgard_candidate_completion_does_not_override_supervisor() {
         let natural_stop = crate::tool_loop::LoopStop::Completed { had_text: true };
         assert!(!asgard_should_finish(false, &natural_stop));
@@ -15924,10 +15773,22 @@ mod tests {
             asgard_advice_message(1, "Verify the selected implementation."),
             ChatMessage::assistant("selected step two"),
         ]];
+        let first_history = AsgardSupervisorHistory::default();
+        let second_history = AsgardSupervisorHistory {
+            checkpointed: Vec::new(),
+            selected_windows: vec![AsgardSupervisorHistoryEntry {
+                window: 1,
+                winner: 1,
+                state_summary:
+                    "Selected the parser implementation; boundary behavior remains uncertain."
+                        .to_string(),
+            }],
+        };
         let first = asgard_supervisor_messages(
             "fix the parser",
             &selected_first,
             &[],
+            &first_history,
             3,
             "candidate window one".to_string(),
         );
@@ -15935,6 +15796,7 @@ mod tests {
             "fix the parser",
             &selected_first,
             &selected_windows,
+            &second_history,
             3,
             "candidate window two".to_string(),
         );
@@ -15943,18 +15805,14 @@ mod tests {
         assert_ne!(first.last(), second.last());
         assert!(asgard_message_text(&first[1]).contains("fix the parser"));
         assert!(!asgard_message_text(&first[0]).contains("window one"));
+        assert!(asgard_message_text(&first[0]).contains("final correctness owner"));
         assert!(asgard_message_text(&first[0]).contains("exactly 3"));
-        assert!(asgard_message_text(&first[0]).contains("HARD SCOPE CONSTRAINT"));
-        assert!(asgard_message_text(&first[0]).contains("dependency-audit"));
-        assert!(asgard_message_text(&first[0]).contains("named verifier"));
-        assert!(asgard_message_text(&first[0]).contains("intentionally absent"));
-        assert!(asgard_message_text(&first[0]).contains("no command was attempted"));
-        assert!(asgard_message_text(&first[0]).contains("normally keep complete=false"));
-        assert!(asgard_message_text(&first[0]).contains("timeout is missing evidence"));
-        assert!(asgard_message_text(&first[0]).contains("presume it is candidate-caused"));
-        assert!(asgard_message_text(&first[0]).contains("do not silently reverse"));
-        assert!(asgard_message_text(&first[0]).contains("still-failing applicable verifier"));
-        assert!(asgard_message_text(&first[0]).contains("unresolved diagnostic evidence"));
+        assert!(asgard_message_text(&first[0]).contains("actual model messages, tool calls"));
+        assert!(asgard_message_text(&first[0]).contains("green run after changing its own tests"));
+        assert!(
+            asgard_message_text(&first[0]).contains("most consequential unverified assumption")
+        );
+        assert!(asgard_message_text(&first[0]).contains("Do not prescribe exact syntax"));
         assert!(!asgard_message_text(&first[0]).contains("Tool choice is not forced"));
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
         assert!(asgard_message_text(&first[2]).contains("stable selected system"));
@@ -15964,8 +15822,14 @@ mod tests {
         assert_eq!(second[4].role, "assistant");
         assert!(asgard_message_text(&second[4]).contains("Verify the selected implementation."));
         assert!(asgard_message_text(&second[4]).contains("selected step two"));
+        assert!(asgard_message_text(&second[4]).contains("boundary behavior remains uncertain"));
         assert_eq!(second[5].role, "user");
         assert!(asgard_message_text(&second[5]).contains("candidate window two"));
+        assert!(asgard_message_text(&second[5]).contains("<decision_procedure>"));
+        assert!(
+            asgard_message_text(&second[5])
+                .contains("Relative superiority does not imply correctness")
+        );
     }
 
     #[test]
@@ -16224,40 +16088,7 @@ mod tests {
         assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
     }
     #[test]
-    fn asgard_verification_evidence_surfaces_zero_tests_and_test_authorship() {
-        let test_call = crate::llm_client::ToolCall {
-            id: "test-call".to_string(),
-            r#type: "function".to_string(),
-            function: crate::llm_client::FunctionCall {
-                name: "run_shell_command".to_string(),
-                arguments: serde_json::json!({
-                    "command": "dotnet test Api.Test.csproj --filter MissingTests"
-                })
-                .to_string(),
-            },
-        };
-        let build_call = crate::llm_client::ToolCall {
-            id: "build-call".to_string(),
-            r#type: "function".to_string(),
-            function: crate::llm_client::FunctionCall {
-                name: "run_shell_command".to_string(),
-                arguments: serde_json::json!({"command": "./gradlew :app:compileJava"}).to_string(),
-            },
-        };
-        let messages = vec![
-            ChatMessage::assistant_tool_calls(vec![test_call]),
-            ChatMessage::tool_result(
-                "test-call",
-                "run_shell_command",
-                "No test matches the given testcase filter.",
-            ),
-            ChatMessage::assistant_tool_calls(vec![build_call]),
-            ChatMessage::tool_result(
-                "build-call",
-                "run_shell_command",
-                "BUILD FAILED\n\nCommand completed with exit code 0",
-            ),
-        ];
+    fn asgard_test_file_inventory_surfaces_candidate_authorship() {
         let patch = b"diff --git a/test/Core/ExistingTests.cs b/test/Core/ExistingTests.cs\n\
                       --- a/test/Core/ExistingTests.cs\n\
                       +++ b/test/Core/ExistingTests.cs\n\
@@ -16266,22 +16097,10 @@ mod tests {
                       --- /dev/null\n\
                       +++ b/test/Core/NewValidatorTests.cs\n";
 
-        let evidence = asgard_verification_evidence(&messages, patch);
+        let (created, modified) = asgard_patch_test_inventory(patch);
 
-        assert_eq!(evidence.shell_commands.len(), 2);
-        assert_eq!(evidence.shell_commands[0].kind, "test");
-        assert_eq!(evidence.shell_commands[0].status, "succeeded");
-        assert!(evidence.shell_commands[0].zero_tests_discovered);
-        assert_eq!(evidence.shell_commands[1].kind, "build_or_compile");
-        assert_eq!(evidence.shell_commands[1].status, "failed");
-        assert_eq!(
-            evidence.candidate_created_test_files,
-            vec!["test/Core/NewValidatorTests.cs"]
-        );
-        assert_eq!(
-            evidence.candidate_modified_test_files,
-            vec!["test/Core/ExistingTests.cs"]
-        );
+        assert_eq!(created, vec!["test/Core/NewValidatorTests.cs"]);
+        assert_eq!(modified, vec!["test/Core/ExistingTests.cs"]);
     }
 
     #[test]
