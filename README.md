@@ -269,7 +269,9 @@ Built-in commands:
 - `/mcp`: list and configure stdio MCP servers.
 - `/plugin`: list, install, update, enable, disable, or remove Claude
   Code-format plugins.
-- `/pr-create [title]`: create a GitHub pull request from the current branch.
+- `/pr-create [title]`: create a GitHub pull request from the current branch. If
+  the working tree is dirty, Anvil stages all changes and commits them first
+  (using the title as the commit message when provided).
 
 Skill slash commands are discovered from `SKILL.md` files under
 `$CODEX_HOME/skills` (or `~/.codex/skills`), `~/.claude/skills`,
@@ -353,9 +355,10 @@ the permission classifier without prompting the user; the classifier may approve
 one outside-sandbox shell run only when the user's task and the classifier's
 output explicitly justify leaving the sandbox. In other permission modes, an
 escalation request prompts the user with a **Run outside sandbox** choice. An
-outside-sandbox approval is never remembered as an **Always allow** rule, and
-Anvil rejects escalation deterministically when there is no active OS sandbox to
-escape or when the session is in read-only mode.
+outside-sandbox approval is never remembered as an **Always allow** rule. When
+there is no active OS sandbox to escape, Anvil treats the escalation request as
+a no-op and applies the normal permission policy; read-only mode still rejects
+the shell command.
 
 When a sandboxed shell command fails with output that looks like a sandbox
 boundary issue (for example `permission denied`, `operation not permitted`, a

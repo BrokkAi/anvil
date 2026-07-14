@@ -364,6 +364,7 @@ pub struct BedrockClient {
     runtime_base_url: String,
     mantle_base_url: String,
     control_base_url: String,
+    catalog_mode: crate::setup_state::BedrockCatalogMode,
     /// Per-resolved-model record of which Anthropic thinking wire shape the
     /// model actually accepts. Most shapes are selected from the documented
     /// model family, but this cache preserves the provider-directed adaptive
@@ -393,6 +394,20 @@ impl std::fmt::Debug for BedrockClient {
 
 impl BedrockClient {
     pub fn new(bearer_token: String, region: String, default_model: String) -> Self {
+        Self::new_with_catalog_mode(
+            bearer_token,
+            region,
+            default_model,
+            crate::setup_state::bedrock_catalog_mode(),
+        )
+    }
+
+    pub fn new_with_catalog_mode(
+        bearer_token: String,
+        region: String,
+        default_model: String,
+        catalog_mode: crate::setup_state::BedrockCatalogMode,
+    ) -> Self {
         let http = OpenAiClient::apply_runtime_tls_workarounds(
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -409,6 +424,7 @@ impl BedrockClient {
             runtime_base_url: BEDROCK_RUNTIME_BASE_URL.to_string(),
             mantle_base_url: mantle_base_url(&region),
             control_base_url: BEDROCK_CONTROL_BASE_URL.to_string(),
+            catalog_mode,
             thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -435,6 +451,7 @@ impl BedrockClient {
             runtime_base_url,
             mantle_base_url,
             control_base_url,
+            catalog_mode: crate::setup_state::BedrockCatalogMode::MantlePreferred,
             thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -899,25 +916,51 @@ impl LlmBackend for BedrockClient {
 
     fn list_model_metadata(&self) -> BoxFuture<'_, Result<Vec<ModelMetadata>>> {
         Box::pin(async move {
-            let mut models = match self.list_mantle_model_metadata().await {
-                Ok(models) => models,
-                Err(err) => {
-                    tracing::info!("Bedrock Mantle model discovery skipped: {err:#}");
-                    Vec::new()
+            use crate::setup_state::BedrockCatalogMode;
+
+            let discover_mantle = || async {
+                match self.list_mantle_model_metadata().await {
+                    Ok(models) => models,
+                    Err(err) => {
+                        tracing::info!("Bedrock Mantle model discovery skipped: {err:#}");
+                        Vec::new()
+                    }
                 }
             };
-            match self.discover_model_metadata().await {
-                Ok(native_models) => models.extend(native_models),
-                Err(err) => {
-                    tracing::info!("Bedrock foundation-model discovery skipped: {err:#}");
+            let discover_native = || async {
+                match self.discover_model_metadata().await {
+                    Ok(models) => models,
+                    Err(err) => {
+                        tracing::info!("Bedrock foundation-model discovery skipped: {err:#}");
+                        Vec::new()
+                    }
                 }
-            }
-            let inference_profiles = match self.list_inference_profiles().await {
-                Ok(profiles) => profiles,
-                Err(err) => {
-                    tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-                    Vec::new()
+            };
+
+            let (mut models, uses_native) = match self.catalog_mode {
+                BedrockCatalogMode::MantleOnly => (discover_mantle().await, false),
+                BedrockCatalogMode::NativeOnly => (discover_native().await, true),
+                BedrockCatalogMode::MantlePreferred => {
+                    let mut models = discover_mantle().await;
+                    models.extend(discover_native().await);
+                    (models, true)
                 }
+                BedrockCatalogMode::NativePreferred => {
+                    let mut models = discover_native().await;
+                    models.extend(discover_mantle().await);
+                    (models, true)
+                }
+            };
+            let inference_profiles = if uses_native {
+                match self.list_inference_profiles().await {
+                    Ok(profiles) => profiles,
+                    Err(err) => {
+                        tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
             };
             let default_model = normalize_default_bedrock_model(
                 &self.default_model,
@@ -1076,15 +1119,11 @@ pub fn model_from_config() -> Option<String> {
     })
 }
 
-pub fn build_backend_from_config() -> Result<Option<Arc<dyn LlmBackend>>> {
+pub fn backend_config() -> Result<Option<(String, String, String)>> {
     let Some(token) = bearer_token_from_env_or_secrets()? else {
         return Ok(None);
     };
-    Ok(Some(Arc::new(BedrockClient::new(
-        token,
-        region_from_env(),
-        model_from_env(),
-    ))))
+    Ok(Some((token, region_from_env(), model_from_env())))
 }
 
 fn needs_inference_profile_retry(status: reqwest::StatusCode, body: &str) -> bool {
@@ -3251,6 +3290,74 @@ mod tests {
                 .and_then(|m| m.supports_images),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_mode_controls_sources_and_duplicate_precedence() {
+        use crate::setup_state::BedrockCatalogMode;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "id": "anthropic.shared-model",
+                    "context_length": 400000
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "modelSummaries": [{
+                    "modelId": "anthropic.shared-model",
+                    "inputModalities": ["TEXT"],
+                    "outputModalities": ["TEXT"],
+                    "responseStreamingSupported": true
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-profiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "inferenceProfileSummaries": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "anthropic.shared-model".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+
+        for (mode, expected_context) in [
+            (BedrockCatalogMode::MantleOnly, Some(400_000)),
+            (BedrockCatalogMode::NativeOnly, None),
+            (BedrockCatalogMode::MantlePreferred, Some(400_000)),
+            (BedrockCatalogMode::NativePreferred, None),
+        ] {
+            client.catalog_mode = mode;
+            let models = client.list_model_metadata().await.expect("list models");
+            let shared = models
+                .iter()
+                .find(|model| model.id == "anthropic.shared-model")
+                .expect("shared model");
+            assert_eq!(shared.context_length, expected_context, "mode: {mode:?}");
+            assert_eq!(
+                models
+                    .iter()
+                    .filter(|model| model.id == "anthropic.shared-model")
+                    .count(),
+                1,
+                "mode: {mode:?}"
+            );
+        }
     }
 
     #[tokio::test]

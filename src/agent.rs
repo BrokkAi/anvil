@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,6 +125,7 @@ const REASONING_EFFORT_DEFAULT_VALUE: &str = "(default)";
 const SERVICE_TIER_CONFIG_ID: &str = "service_tier";
 const SERVICE_TIER_DEFAULT_VALUE: &str = "(default)";
 const CODEX_FAST_SERVICE_TIER_ID: &str = "priority";
+const WORKSPACE_DELTA_MAX_TEXT_BYTES: u64 = 1_048_576;
 
 fn negotiate_protocol_version(requested: ProtocolVersion) -> ProtocolVersion {
     if requested == SUPPORTED_ACP_PROTOCOL_VERSION {
@@ -144,6 +145,152 @@ fn invalid_lifecycle_cwd_error(method: &str, cwd: &Path) -> agent_client_protoco
     agent_client_protocol::Error::invalid_params().data(serde_json::json!({
         "reason": format!("{method} cwd must be absolute: {}", cwd.display()),
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceTextState {
+    Present(String),
+    Absent,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceDeltaTracker {
+    root: PathBuf,
+    pre_turn: HashMap<PathBuf, WorkspaceTextState>,
+}
+
+impl WorkspaceDeltaTracker {
+    async fn snapshot(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        let mut pre_turn = HashMap::new();
+        for rel_path in git_status_paths(&root).await.unwrap_or_default() {
+            let path = root.join(&rel_path);
+            if let Some(state) = read_workspace_text_state(&path).await {
+                pre_turn.insert(rel_path, state);
+            }
+        }
+        Self { root, pre_turn }
+    }
+
+    async fn changed_files(&self) -> Vec<PathBuf> {
+        let post_paths = git_status_paths(&self.root).await.unwrap_or_default();
+        let mut candidates = BTreeSet::new();
+        candidates.extend(self.pre_turn.keys().cloned());
+        candidates.extend(post_paths);
+
+        let mut changed = Vec::new();
+        for rel_path in candidates {
+            let path = self.root.join(&rel_path);
+            let Some(new_state) = read_workspace_text_state(&path).await else {
+                continue;
+            };
+            let old_state = match self.pre_turn.get(&rel_path) {
+                Some(state) => state.clone(),
+                None => read_head_text_state(&self.root, &rel_path)
+                    .await
+                    .unwrap_or(WorkspaceTextState::Absent),
+            };
+            if old_state != new_state {
+                changed.push(rel_path);
+            }
+        }
+        changed
+    }
+}
+
+async fn workspace_delta_for_turn(
+    root: &Path,
+    tracker: WorkspaceDeltaTracker,
+) -> crate::host_notice::WorkspaceDelta {
+    let paths = tracker
+        .changed_files()
+        .await
+        .into_iter()
+        .map(|path| path_relative_to(root, &path));
+    crate::host_notice::WorkspaceDelta::from_paths(paths)
+}
+
+fn path_relative_to(_root: &Path, rel_path: &Path) -> PathBuf {
+    rel_path.to_path_buf()
+}
+
+async fn git_status_paths(root: &Path) -> Option<BTreeSet<PathBuf>> {
+    let output = tokio::process::Command::new("git")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_git_status_paths(&output.stdout))
+}
+
+fn parse_git_status_paths(output: &[u8]) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut entries = output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = &entry[3..];
+        if !path.is_empty() {
+            paths.insert(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
+        }
+        if matches!(status.first(), Some(b'R' | b'C')) || matches!(status.get(1), Some(b'R' | b'C'))
+        {
+            let _ = entries.next();
+        }
+    }
+    paths
+}
+
+async fn read_workspace_text_state(path: &Path) -> Option<WorkspaceTextState> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(WorkspaceTextState::Absent);
+        }
+        Err(_) => return None,
+    };
+    if !metadata.is_file() || metadata.len() > WORKSPACE_DELTA_MAX_TEXT_BYTES {
+        return None;
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(WorkspaceTextState::Present)
+}
+
+async fn read_head_text_state(root: &Path, rel_path: &Path) -> Option<WorkspaceTextState> {
+    let output = tokio::process::Command::new("git")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-C")
+        .arg(root)
+        .arg("show")
+        .arg(git_head_object_spec(rel_path)?)
+        .output()
+        .await
+        .ok()?;
+    if output.status.success() {
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(WorkspaceTextState::Present)
+    } else {
+        Some(WorkspaceTextState::Absent)
+    }
+}
+
+fn git_head_object_spec(path: &Path) -> Option<String> {
+    path.to_str().map(|path| format!("HEAD:{path}"))
 }
 
 /// Build the protocol error returned when a request names a session Anvil
@@ -1560,7 +1707,7 @@ pub async fn run_agent(
     // hold this owned Mutex via try_lock_owned: when a refresh is already
     // in flight, the next try_lock returns None and we skip the spawn.
     //
-    // The same lock is shared with the `/codex-login` post-install
+    // The same lock is shared with the `/setup codex` post-install
     // refresh below so an immediate session/new after login doesn't race
     // a second probe through the discovery path.
     let refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -5745,6 +5892,11 @@ async fn run_model_turn_in_spawn(
         }));
 
     let cancel_status = cancel.clone();
+    let workspace_delta_tracker = if turn_recap_enabled {
+        Some(WorkspaceDeltaTracker::snapshot(fallback_cwd).await)
+    } else {
+        None
+    };
     let cx_for_gate = cx.clone();
     let spawned_cx = crate::tool_loop::SpawnedCx::new(&cx_for_gate);
     let loop_future = async {
@@ -5875,24 +6027,35 @@ async fn run_model_turn_in_spawn(
         fragment_id: None,
     };
 
-    let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges);
-    let visible_response = if turn_recap_enabled && !cancel_status.is_cancelled() {
-        let summary = recap_work_summary(
-            llm.as_ref(),
-            model,
-            &turn,
-            context_length,
-            idle_timeout,
-            cancel_status.clone(),
-        )
-        .await;
-        let recap =
-            crate::host_notice::render_turn_recap(summary.as_deref(), &turn.tool_exchanges, &stop);
-        send_message(cx, session_id, &recap);
-        format!("{response_text}{recap}")
+    let workspace_delta = if let Some(tracker) = workspace_delta_tracker {
+        workspace_delta_for_turn(fallback_cwd, tracker).await
     } else {
-        response_text.clone()
+        crate::host_notice::WorkspaceDelta::default()
     };
+    let tool_stats = crate::host_notice::ToolCallStats::from_exchanges(&turn.tool_exchanges)
+        .with_workspace_delta(&workspace_delta);
+    let visible_response =
+        if turn_recap_enabled && !cancel_status.is_cancelled() && tool_stats.has_changed_files() {
+            let summary = recap_work_summary(
+                llm.as_ref(),
+                model,
+                &turn,
+                context_length,
+                idle_timeout,
+                cancel_status.clone(),
+            )
+            .await;
+            let recap = crate::host_notice::render_turn_recap(
+                summary.as_deref(),
+                &turn.tool_exchanges,
+                Some(&workspace_delta),
+                &stop,
+            );
+            send_message(cx, session_id, &recap);
+            format!("{response_text}{recap}")
+        } else {
+            response_text.clone()
+        };
     turn.agent_response = visible_response;
 
     let persisted_fragment_id = match sessions.add_turn(session_id, turn).await {
@@ -6355,7 +6518,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// Post-login bookkeeping shared by the browser and elicitation Codex login
+/// Post-login bookkeeping shared by the text and elicitation Codex login
 /// paths: install the freshly-built backend, kick a background catalog
 /// refresh, and return the user-facing message. Pure aside from those two
 /// side effects, so both entry points stay byte-for-byte identical.
@@ -6415,33 +6578,26 @@ fn finish_codex_login(
     }
 }
 
-/// Handle the `/codex-login` slash command and its subcommands.
-/// Subcommands: bare = start interactive login, `status` = report what's
-/// stored, `disconnect` = wipe the local credentials.
+/// Handle `/setup codex` and its subcommands.
+/// Subcommands: bare/`login`/`browser` = start browser login, `device` = start
+/// device-code login, `status` = report what's stored, `disconnect` = wipe the
+/// local credentials.
 ///
-/// On a successful bare login we install the freshly-built Codex
-/// backend into `MultiBackend` so the next `session/new` (and any
-/// subsequent `codex::*` route) picks it up without a server restart.
-/// Without this, the empty-at-startup `Option` captured at
-/// construction would remain `None` forever and the new credentials
-/// would be unreachable until restart -- the behaviour issue #3555
-/// reported.
-async fn handle_codex_login(
-    prompt_text: &str,
+/// On a successful login we install the freshly-built Codex backend into
+/// `MultiBackend` so the next `session/new` (and any subsequent `codex::*`
+/// route) picks it up without a server restart. Without this, the
+/// empty-at-startup `Option` captured at construction would remain `None`
+/// forever and the new credentials would be unreachable until restart.
+async fn handle_setup_codex(
+    rest: &str,
     llm: &Arc<MultiBackend>,
     sessions: &SessionStore,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
-    cx: Option<&ConnectionTo<Client>>,
-    session_id: Option<&str>,
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> String {
-    let arg = prompt_text
-        .trim()
-        .strip_prefix('/')
-        .unwrap_or("")
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let arg = rest.trim().to_ascii_lowercase();
 
     match arg.as_str() {
         "status" => match crate::codex_auth::read_auth_dot_json() {
@@ -6494,13 +6650,11 @@ async fn handle_codex_login(
                     refresh_lock.clone(),
                     llm.clone(),
                     sessions.clone(),
-                    cx.zip(session_id).map(|(cx, session_id)| {
-                        (
-                            cx.clone(),
-                            session_id.to_string(),
-                            "Refreshing model catalog after Codex disconnect...",
-                        )
-                    }),
+                    Some((
+                        cx.clone(),
+                        session_id.to_string(),
+                        "Refreshing model catalog after Codex disconnect...",
+                    )),
                     None,
                 );
                 "Codex credentials cleared and the in-memory backend was unloaded; \
@@ -6509,12 +6663,54 @@ async fn handle_codex_login(
             }
             Err(e) => format!("Failed to remove ~/.codex/auth.json: {e:#}"),
         },
-        "" => match crate::codex_auth::interactive_login().await {
-            Ok(auth) => finish_codex_login(auth, llm, sessions, refresh_lock, cx, session_id),
-            Err(e) => format!("Codex login failed: {e:#}"),
-        },
+        "" | "login" | "browser" | "login browser" => {
+            match crate::codex_auth::interactive_browser_login_with(cancel, |auth_url| async move {
+                let opened = webbrowser::open(&auth_url).is_ok();
+                let prefix = if opened {
+                    "Codex browser sign-in started. Waiting for the localhost callback."
+                } else {
+                    "Codex browser sign-in started, but Anvil could not open a browser automatically."
+                };
+                send_message(
+                    cx,
+                    session_id,
+                    &format!(
+                        "{prefix}\n\nOpen this URL on this machine to sign in:\n\n  {auth_url}\n\nIf localhost callbacks do not work for this client, run `/setup codex device` instead. Run `session/cancel` to stop waiting without changing credentials."
+                    ),
+                );
+                Ok(())
+            })
+            .await
+            {
+                Ok(auth) => {
+                    finish_codex_login(auth, llm, sessions, refresh_lock, Some(cx), Some(session_id))
+                }
+                Err(e) => format!("Codex login failed: {e:#}"),
+            }
+        }
+        "device" | "login device" => {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            match crate::codex_auth::interactive_device_login_with(&cancel, |prompt| async move {
+                send_message(
+                    cx,
+                    session_id,
+                    &format!(
+                        "Codex device sign-in started. Open this link on any device and enter the one-time code.\n\n  URL: {}\n  Code: `{}`\n\nThis flow does not use a localhost callback, so it works from SSH and remote clients.",
+                        prompt.verification_url, prompt.user_code
+                    ),
+                );
+                Ok(())
+            })
+            .await
+            {
+                Ok(auth) => {
+                    finish_codex_login(auth, llm, sessions, refresh_lock, Some(cx), Some(session_id))
+                }
+                Err(e) => format!("Codex login failed: {e:#}"),
+            }
+        }
         other => format!(
-            "Unknown subcommand `{other}`. Try: /setup codex | /setup codex status | /setup codex disconnect"
+            "Unknown subcommand `{other}`. Try: /setup codex | /setup codex browser | /setup codex device | /setup codex status | /setup codex disconnect"
         ),
     }
 }
@@ -6574,7 +6770,7 @@ async fn handle_openrouter_login(
     // ASCII with no spaces in practice, but we trim defensively so a
     // user who pasted with trailing spaces doesn't see a "key was empty"
     // bounce. `status` and `disconnect` are case-insensitive to match
-    // the `/codex-login` ergonomics.
+    // the `/setup codex` ergonomics.
     let after_cmd = prompt_text
         .trim()
         .strip_prefix('/')
@@ -7828,7 +8024,9 @@ enum SetupElicitTarget {
     Home,
     /// `/setup sandbox` with no explicit value -> single-select form menu.
     Sandbox,
-    /// `/setup codex` (or `/setup codex login`) -> URL-mode sign-in prompt.
+    /// `/setup bedrock catalog` -> single-select catalog-source menu.
+    BedrockCatalog,
+    /// `/setup codex` (or `/setup codex login`) -> form-mode auth-method menu.
     CodexLogin,
     /// `/setup openrouter` with no explicit value -> form-mode key entry.
     OpenRouterLogin,
@@ -7845,9 +8043,10 @@ impl SetupElicitTarget {
             // The home menu is a form-mode (single-select) elicitation.
             Self::Home => caps.form,
             // Sandbox is a form-mode (menu) elicitation.
-            Self::Sandbox => caps.form,
-            // Codex sign-in is a url-mode (open-this-link) elicitation.
-            Self::CodexLogin => caps.url,
+            Self::Sandbox | Self::BedrockCatalog => caps.form,
+            // Good clients get a form menu to choose browser vs device auth,
+            // then a URL prompt for the selected auth URL.
+            Self::CodexLogin => caps.form && caps.url,
             // OpenRouter key entry is a form-mode (text field) elicitation.
             Self::OpenRouterLogin => caps.form,
             // Hosted-provider secrets use form fields so they never enter the
@@ -7875,8 +8074,11 @@ fn setup_elicitation_target(prompt_text: &str) -> Option<SetupElicitTarget> {
         // Bare `/setup` (no sub-command) -> the single interactive entry point.
         "" => Some(SetupElicitTarget::Home),
         "sandbox" if rest.is_empty() => Some(SetupElicitTarget::Sandbox),
-        // Bare `/setup codex` / `/setup codex login` start interactive sign-in;
-        // `status` / `disconnect` are not prompts and keep the text flow.
+        "bedrock" if rest.eq_ignore_ascii_case("catalog") => {
+            Some(SetupElicitTarget::BedrockCatalog)
+        }
+        // Bare `/setup codex` / `/setup codex login` open a method menu;
+        // explicit methods and status/disconnect keep the text flow.
         "codex" if rest.is_empty() || rest == "login" => Some(SetupElicitTarget::CodexLogin),
         // Bare `/setup openrouter` collects the API key via a form field;
         // `key <k>` / `status` / `disconnect` keep the text flow.
@@ -7906,6 +8108,17 @@ async fn run_setup_elicitation(
         }
         SetupElicitTarget::Sandbox => {
             run_setup_sandbox_elicitation(spawned_cx, sessions, session_id, cancel).await;
+        }
+        SetupElicitTarget::BedrockCatalog => {
+            run_setup_bedrock_catalog_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
         }
         SetupElicitTarget::CodexLogin => {
             run_setup_codex_login_elicitation(
@@ -7957,12 +8170,16 @@ async fn run_setup_elicitation(
 /// Stable id for the Codex sign-in elicitation. The ACP request is additionally
 /// scoped by `sessionId`, so this id can safely be reused by concurrent sessions
 /// while pairing each request with its `elicitation/complete` notification.
-const CODEX_LOGIN_ELICITATION_ID: &str = "codex-login";
+const CODEX_LOGIN_ELICITATION_ID: &str = "setup-codex";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLoginMethod {
+    Browser,
+    Device,
+}
 
-/// `/setup codex` as a URL-mode device sign-in prompt. The short verification
-/// URL and one-time code are usable from SSH without a loopback callback or
-/// port forwarding. Decline/Cancel (or a transport error) abort the login and
-/// leave credentials untouched.
+/// `/setup codex` as a form-mode auth-method menu. Good clients let the user
+/// choose browser OAuth or device authorization; text fallback clients still use
+/// the default browser path via `handle_setup_codex`.
 async fn run_setup_codex_login_elicitation(
     spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
     sessions: &SessionStore,
@@ -7973,28 +8190,66 @@ async fn run_setup_codex_login_elicitation(
 ) {
     let cx = spawned_cx.cx();
 
-    let result = crate::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
-        let request = build_codex_login_elicitation_request(
-            session_id,
-            prompt.verification_url,
-            &prompt.user_code,
-        );
-        match cx.send_request(request).block_task().await {
-            Ok(resp) => match resp.action {
-                ElicitationAction::Accept(_) => Ok(()),
-                ElicitationAction::Decline | ElicitationAction::Cancel => {
-                    Err(anyhow::anyhow!("sign-in was cancelled"))
-                }
-                // `ElicitationAction` is `#[non_exhaustive]`.
-                _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
-            },
-            Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+    let method = match request_codex_login_method(cx, session_id, cancel).await {
+        Ok(Some(method)) => method,
+        Ok(None) => {
+            send_message(
+                cx,
+                session_id,
+                "Codex setup cancelled; credentials are unchanged.",
+            );
+            return;
         }
-    })
-    .await;
+        Err(e) => {
+            tracing::warn!("/setup codex method elicitation failed: {e}");
+            send_message(
+                cx,
+                session_id,
+                "Setup could not show the Codex sign-in method menu; credentials are unchanged.",
+            );
+            return;
+        }
+    };
 
-    // URL elicitations remain open while device authorization is polling.
-    // Always dismiss the client surface, including timeout/cancel/error paths.
+    let result = match method {
+        CodexLoginMethod::Browser => {
+            crate::codex_auth::interactive_browser_login_with(Some(cancel), |auth_url| async move {
+                let request = build_codex_browser_login_elicitation_request(session_id, auth_url);
+                match cx.send_request(request).block_task().await {
+                    Ok(resp) => match resp.action {
+                        ElicitationAction::Accept(_) => Ok(()),
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            Err(anyhow::anyhow!("sign-in was cancelled"))
+                        }
+                        _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+                }
+            })
+            .await
+        }
+        CodexLoginMethod::Device => {
+            crate::codex_auth::interactive_device_login_with(cancel, |prompt| async move {
+                let request = build_codex_device_login_elicitation_request(
+                    session_id,
+                    prompt.verification_url,
+                    &prompt.user_code,
+                );
+                match cx.send_request(request).block_task().await {
+                    Ok(resp) => match resp.action {
+                        ElicitationAction::Accept(_) => Ok(()),
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            Err(anyhow::anyhow!("sign-in was cancelled"))
+                        }
+                        _ => Err(anyhow::anyhow!("sign-in prompt was dismissed")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("could not show the sign-in prompt: {e}")),
+                }
+            })
+            .await
+        }
+    };
+
     notify_elicitation_complete(cx, CODEX_LOGIN_ELICITATION_ID);
 
     match result {
@@ -8021,9 +8276,76 @@ async fn run_setup_codex_login_elicitation(
     }
 }
 
+async fn request_codex_login_method(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<CodexLoginMethod>> {
+    let request = build_codex_login_method_elicitation_request(session_id);
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(None),
+        response = cx.send_request(request).block_task() => response,
+    }
+    .map_err(|e| anyhow::anyhow!("could not show the Codex sign-in method menu: {e}"))?;
+    Ok(parse_codex_login_method(&response.action))
+}
+
+fn parse_codex_login_method(action: &ElicitationAction) -> Option<CodexLoginMethod> {
+    let ElicitationAction::Accept(accept) = action else {
+        return None;
+    };
+    accept
+        .content
+        .as_ref()
+        .and_then(|content| content.get("method"))
+        .and_then(|value| match value {
+            ElicitationContentValue::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .and_then(|method| match method {
+            "browser" => Some(CodexLoginMethod::Browser),
+            "device" => Some(CodexLoginMethod::Device),
+            _ => None,
+        })
+}
+
+fn build_codex_login_method_elicitation_request(session_id: &str) -> CreateElicitationRequest {
+    let field = StringPropertySchema::new()
+        .title("Codex sign-in method")
+        .description("Browser is usually easiest. Device code is best for SSH, remote, or browser-hostile clients.")
+        .one_of(vec![
+            EnumOption::new("browser", "Browser sign-in (localhost callback)"),
+            EnumOption::new("device", "Device code (works from any device)"),
+        ])
+        .default_value("browser");
+
+    let schema = ElicitationSchema::new()
+        .title("Codex sign-in")
+        .property("method", field, true);
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "How do you want to sign in to Codex / ChatGPT?")
+}
+
+fn build_codex_browser_login_elicitation_request(
+    session_id: &str,
+    auth_url: String,
+) -> CreateElicitationRequest {
+    let mode = ElicitationUrlMode::new(
+        ElicitationSessionScope::new(session_id.to_string()),
+        CODEX_LOGIN_ELICITATION_ID,
+        auth_url,
+    );
+    CreateElicitationRequest::new(
+        mode,
+        "Open this link to sign in to ChatGPT. The browser must be able to reach Anvil on localhost; cancel the prompt to stop waiting without changing credentials.".to_string(),
+    )
+}
+
 /// Build the URL-mode `elicitation/create` request carrying the ChatGPT
-/// authorize URL for the client to open.
-fn build_codex_login_elicitation_request(
+/// device verification URL for the client to open.
+fn build_codex_device_login_elicitation_request(
     session_id: &str,
     verification_url: String,
     user_code: &str,
@@ -8370,6 +8692,86 @@ async fn apply_sandbox_elicitation_outcome(
     }
 }
 
+async fn run_setup_bedrock_catalog_elicitation(
+    spawned_cx: &crate::tool_loop::SpawnedCx<'_>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<MultiBackend>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    let cx = spawned_cx.cx();
+    let request =
+        build_bedrock_catalog_elicitation_request(session_id, sessions.bedrock_catalog_mode());
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        response = cx.send_request(request).block_task() => response,
+    };
+    let message = match response {
+        Ok(resp) => match resp.action {
+            ElicitationAction::Accept(accept) => {
+                let choice = accept
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get("catalog"))
+                    .and_then(|value| match value {
+                        ElicitationContentValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+                match choice {
+                    Some(choice) => {
+                        handle_setup_bedrock(
+                            cx,
+                            sessions,
+                            session_id,
+                            llm,
+                            refresh_lock,
+                            &format!("catalog {choice}"),
+                        )
+                        .await
+                    }
+                    None => {
+                        "No Bedrock catalog mode selected; configuration is unchanged.".to_string()
+                    }
+                }
+            }
+            ElicitationAction::Decline | ElicitationAction::Cancel => {
+                "Bedrock catalog setup cancelled; configuration is unchanged.".to_string()
+            }
+            _ => "Bedrock catalog setup did not complete; configuration is unchanged.".to_string(),
+        },
+        Err(err) => {
+            tracing::warn!("/setup bedrock catalog elicitation failed: {err}");
+            "Setup could not show the Bedrock catalog menu; configuration is unchanged.".to_string()
+        }
+    };
+    send_message(cx, session_id, &message);
+}
+
+fn build_bedrock_catalog_elicitation_request(
+    session_id: &str,
+    current: crate::setup_state::BedrockCatalogMode,
+) -> CreateElicitationRequest {
+    let current = current.as_str();
+    let field = StringPropertySchema::new()
+        .title("Bedrock model catalog")
+        .description("Choose which Bedrock model discovery APIs are used and which source wins duplicate model ids.")
+        .one_of(vec![
+            EnumOption::new("mantle-only", "Mantle only"),
+            EnumOption::new("native-only", "Native Bedrock only"),
+            EnumOption::new("mantle-preferred", "Merge; prefer Mantle on conflicts"),
+            EnumOption::new("native-preferred", "Merge; prefer native Bedrock on conflicts"),
+        ])
+        .default_value(current);
+    let schema = ElicitationSchema::new()
+        .title("Bedrock model catalog")
+        .property("catalog", field, true);
+    let mode =
+        ElicitationFormMode::new(ElicitationSessionScope::new(session_id.to_string()), schema);
+    CreateElicitationRequest::new(mode, "Choose how Bedrock models are discovered")
+}
+
 /// A choice from the `/setup` home, mapped to the sub-flow it dispatches into.
 /// This registry is the source for both the interactive menu and Markdown
 /// fallback, including their scope labels.
@@ -8379,8 +8781,10 @@ enum SetupHomeRoute {
     Choose,
     /// Interactive Codex / ChatGPT sign-in (`/setup codex`).
     Codex,
-    /// AWS Bedrock setup (`/setup bedrock`).
+    /// AWS Bedrock credential setup (`/setup bedrock`).
     Bedrock,
+    /// Bedrock model catalog source (`/setup bedrock catalog`).
+    BedrockCatalog,
     /// Local Ollama models (`/setup local`).
     Local,
     /// Hosted DeepSeek key entry (`/setup deepseek`).
@@ -8400,6 +8804,7 @@ impl SetupHomeRoute {
             Self::Choose => "choose",
             Self::Codex => "codex",
             Self::Bedrock => "bedrock",
+            Self::BedrockCatalog => "bedrock-catalog",
             Self::Local => "local",
             Self::DeepSeek => "deepseek",
             Self::OpenRouter => "openrouter",
@@ -8420,7 +8825,8 @@ impl SetupHomeRoute {
         match self {
             Self::Choose => "Choose a model for me",
             Self::Codex => "Sign in to Codex / ChatGPT",
-            Self::Bedrock => "Use AWS Bedrock",
+            Self::Bedrock => "Connect AWS Bedrock",
+            Self::BedrockCatalog => "Configure Bedrock model catalog",
             Self::Local => "Use local models (Ollama / ds4)",
             Self::DeepSeek => "Use hosted DeepSeek",
             Self::OpenRouter => "Use OpenRouter",
@@ -8435,7 +8841,7 @@ impl SetupHomeRoute {
                 "global provider"
             }
             Self::Choose => "current session",
-            Self::Recap => "install default",
+            Self::Recap | Self::BedrockCatalog => "install default",
             Self::Advanced => "all scopes",
         }
     }
@@ -8445,6 +8851,7 @@ impl SetupHomeRoute {
             Self::Choose => "/setup choose",
             Self::Codex => "/setup codex",
             Self::Bedrock => "/setup bedrock",
+            Self::BedrockCatalog => "/setup bedrock catalog",
             Self::Local => "/setup local",
             Self::DeepSeek => "/setup deepseek",
             Self::OpenRouter => "/setup openrouter",
@@ -8468,11 +8875,12 @@ impl SetupHomeRoute {
 
     /// The menu in display order. `choose` leads because it is the fastest path
     /// to a working model.
-    fn menu() -> [Self; 8] {
+    fn menu() -> [Self; 9] {
         [
             Self::Choose,
             Self::Codex,
             Self::Bedrock,
+            Self::BedrockCatalog,
             Self::Local,
             Self::DeepSeek,
             Self::OpenRouter,
@@ -8609,6 +9017,17 @@ async fn run_setup_home_elicitation(
             )
             .await;
         }
+        Some(SetupHomeRoute::BedrockCatalog) => {
+            run_setup_bedrock_catalog_elicitation(
+                spawned_cx,
+                sessions,
+                session_id,
+                llm,
+                refresh_lock,
+                cancel,
+            )
+            .await;
+        }
         Some(SetupHomeRoute::DeepSeek) => {
             run_setup_deepseek_login_elicitation(
                 spawned_cx,
@@ -8675,18 +9094,14 @@ async fn handle_setup(ctx: &SetupContext<'_>, prompt_text: &str, session_id: &st
             }
         }
         "codex" => {
-            let codex_prompt = if rest.is_empty() || rest == "login" {
-                "/codex-login".to_string()
-            } else {
-                format!("/codex-login {rest}")
-            };
-            let mut out = handle_codex_login(
-                &codex_prompt,
+            let mut out = handle_setup_codex(
+                rest,
                 ctx.llm,
                 ctx.login_sessions,
                 ctx.refresh_lock,
-                Some(ctx.cx),
-                Some(session_id),
+                ctx.cx,
+                session_id,
+                None,
             )
             .await;
             out.push_str("\n\nRun `/setup choose` after sign-in completes.");
@@ -8933,6 +9348,16 @@ async fn refresh_model_catalog_after_lock(
             .await
             .map_err(|e| format!("{e:#}"))?
     };
+    if let Some((cx, session_id)) = cx.zip(session_id) {
+        for notice in llm.take_model_discovery_notices() {
+            let message = format!("{}: {}\n", notice.source, notice.message);
+            trace_openrouter_refresh(message.trim_end());
+            send_message(cx, session_id, &message);
+        }
+    } else {
+        // Avoid showing stale discovery notices during the next interactive refresh.
+        let _ = llm.take_model_discovery_notices();
+    }
     // Discovery refreshes the shared catalog but must not silently replace an
     // existing process default: model selection is a client-owned per-session
     // control. Seed a fallback only when the server has no default at all.
@@ -9218,6 +9643,64 @@ async fn handle_setup_bedrock(
             }
             Err(e) => format!("Failed to save Bedrock region: {e:#}"),
         }
+    } else if let Some(mode) = rest.strip_prefix("catalog ") {
+        use std::str::FromStr;
+
+        let mode = mode.trim().to_ascii_lowercase();
+        let Ok(mode) = crate::setup_state::BedrockCatalogMode::from_str(&mode) else {
+            return "Unknown Bedrock catalog mode. Try `mantle-only`, `native-only`, `mantle-preferred`, or `native-preferred`.".to_string();
+        };
+        let _guard = refresh_lock.lock().await;
+        match sessions.remember_bedrock_catalog_mode(mode) {
+            Ok(()) => match crate::bedrock_client::backend_config() {
+                Ok(Some((token, region, model))) => {
+                    llm.install_bedrock(Arc::new(
+                        crate::bedrock_client::BedrockClient::new_with_catalog_mode(
+                            token, region, model, mode,
+                        ),
+                    ));
+                    match refresh_model_catalog_after_lock(
+                        Some(cx),
+                        Some(session_id),
+                        llm,
+                        sessions,
+                    )
+                    .await
+                    {
+                        Ok(_) => format!("Bedrock catalog mode set to `{}`.", mode.as_str()),
+                        Err(err) => format!(
+                            "Bedrock catalog mode set to `{}`, but model refresh failed: {err:#}",
+                            mode.as_str()
+                        ),
+                    }
+                }
+                Ok(None) => {
+                    llm.uninstall_bedrock();
+                    match refresh_model_catalog_after_lock(
+                        Some(cx),
+                        Some(session_id),
+                        llm,
+                        sessions,
+                    )
+                    .await
+                    {
+                        Ok(_) => format!(
+                            "Bedrock catalog mode set to `{}`. No Bedrock credentials are currently configured.",
+                            mode.as_str()
+                        ),
+                        Err(err) => format!(
+                            "Bedrock catalog mode set to `{}`, but model refresh failed: {err:#}",
+                            mode.as_str()
+                        ),
+                    }
+                }
+                Err(err) => format!(
+                    "Bedrock catalog mode set to `{}`, but the Bedrock backend could not be reloaded: {err:#}",
+                    mode.as_str()
+                ),
+            },
+            Err(err) => format!("Failed to save Bedrock catalog mode: {err:#}"),
+        }
     } else if let Some(model) = rest.strip_prefix("model ") {
         let model = model.trim();
         if model.is_empty() {
@@ -9262,10 +9745,12 @@ async fn handle_setup_bedrock(
                     format!(
                         "Bedrock is configured via {} environment variable.\n\
                          Region: {}\n\
-                         Model: {}",
+                         Model: {}\n\
+                         Catalog: {}",
                         crate::bedrock_client::BEDROCK_API_KEY_ENV,
                         crate::bedrock_auth::region_from_any_source(),
                         crate::bedrock_auth::model_from_any_source(),
+                        sessions.bedrock_catalog_mode().as_str(),
                     )
                 } else {
                     match crate::bedrock_auth::read() {
@@ -9273,8 +9758,9 @@ async fn handle_setup_bedrock(
                             let region = auth.region.as_deref().unwrap_or("(default)");
                             let model = auth.default_model.as_deref().unwrap_or("(default)");
                             format!(
-                                "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}",
-                                auth.bearer_token.len()
+                                "Bedrock credentials:\n  Token: saved (length {})\n  Region: {region}\n  Model: {model}\n  Catalog: {}",
+                                auth.bearer_token.len(),
+                                sessions.bedrock_catalog_mode().as_str()
                             )
                         }
                         Ok(None) if state.legacy_secrets_present => format!(
@@ -9364,12 +9850,15 @@ fn render_bedrock_setup_help() -> String {
          {key_help}\n\n\
          You also need:\n\
          - A region (default: us-east-1): `/setup bedrock region <region>`\n\
-         - A model (default: us.anthropic.claude-sonnet-4-6): `/setup bedrock model <id>`\n\n\
+         - A model (default: us.anthropic.claude-sonnet-4-6): `/setup bedrock model <id>`\n\
+         - A catalog mode (current: {}): `/setup bedrock catalog`\n\n\
          Other commands:\n\
+         - `/setup bedrock catalog mantle-only|native-only|mantle-preferred|native-preferred`\n\
          - `/setup bedrock status`\n\
          - `/setup bedrock disconnect`\n\
          - `/setup bedrock refresh`\n\n\
-         Choose for me: `/setup choose`."
+         Choose for me: `/setup choose`.",
+        crate::setup_state::bedrock_catalog_mode().as_str()
     )
 }
 
@@ -10085,12 +10574,16 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         crate::sandbox_backend::resolve_mode(session.sandbox_mode).as_str()
     ));
     out.push_str(&format!(
-        "- Turn recap: `{}`\n\n",
+        "- Turn recap: `{}`\n",
         if session.turn_recap_enabled {
             "enabled"
         } else {
             "disabled"
         }
+    ));
+    out.push_str(&format!(
+        "- Bedrock catalog mode: `{}`\n\n",
+        sessions.bedrock_catalog_mode().as_str()
     ));
     out.push_str("Current-session commands:\n");
     out.push_str("- `/setup model` - list model ids.\n");
@@ -10108,6 +10601,9 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         "- `/setup sandbox default|os|wasm|off` - choose the sandbox strategy for this and future sessions.\n",
     );
     out.push_str("- `/setup recap on|off` - toggle automatic turn recaps.\n");
+    out.push_str(
+        "- `/setup bedrock catalog` - choose Bedrock model discovery and conflict precedence.\n",
+    );
     if !openrouter_picks.is_empty() {
         out.push_str("\nFiltered OpenRouter coding candidates:\n");
         for id in openrouter_picks {
@@ -10669,6 +11165,11 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn pr_create_commit_message(prompt_text: &str) -> String {
+    parse_pr_create_arg(prompt_text)
+        .unwrap_or_else(|| "Update changes for pull request".to_string())
+}
+
 /// Per-shell-call timeout for slash-command-driven `run_shell_command`
 /// invocations. Generous enough for `gh pr create` over a slow link
 /// without leaving a stuck child for minutes.
@@ -10704,15 +11205,15 @@ async fn run_or_report(
 /// Flow (each step short-circuits with a user-facing error on failure):
 ///   1. Refuse on `PermissionMode::ReadOnly` -- git push won't be allowed
 ///      under the resulting sandbox tier.
-///   2. Refuse if `git status --porcelain` is non-empty so we never push
-///      with uncommitted state.
-///   3. Refuse if the branch has no upstream and instruct the user to
+///   2. Refuse if the branch has no upstream and instruct the user to
 ///      push manually. We deliberately do NOT auto-push: the choice of
 ///      which remote to push to is meaningful in fork-based workflows
 ///      (`origin` may be the user's personal fork OR the upstream repo)
 ///      and a server-side handler should not make that call silently.
-///   4. Detect the repository's default branch via `gh repo view` and
+///   3. Detect the repository's default branch via `gh repo view` and
 ///      pass it explicitly to `--base`.
+///   4. If `git status --porcelain` is non-empty, stage the worktree and
+///      commit it before creating the PR.
 ///   5. Invoke `gh pr create --base <default> --fill [--title <user-arg>]`
 ///      and surface the resulting PR URL.
 ///
@@ -10751,13 +11252,7 @@ async fn handle_pr_create(
         Ok(o) => o,
         Err(e) => return e,
     };
-    let dirty = status.trim();
-    if !dirty.is_empty() {
-        return format!(
-            "Error: working tree is dirty. Commit or stash these paths before \
-             running `/pr-create`:\n\n{dirty}"
-        );
-    }
+    let dirty = !status.trim().is_empty();
 
     // No-upstream check. Failure of `git rev-parse @{u}` is the trigger
     // for the "no upstream" branch -- it can also fire for unrelated
@@ -10801,6 +11296,18 @@ async fn handle_pr_create(
     let base_branch = base.trim();
     if base_branch.is_empty() {
         return "Error: `gh repo view` returned an empty default branch name.".to_string();
+    }
+
+    if dirty {
+        if let Err(e) = run_or_report(registry, "git add -A", "git add -A", policy).await {
+            return e;
+        }
+
+        let commit_message = pr_create_commit_message(prompt_text);
+        let commit_cmd = format!("git commit -m {}", shell_single_quote(&commit_message));
+        if let Err(e) = run_or_report(registry, &commit_cmd, "git commit", policy).await {
+            return e;
+        }
     }
 
     let title_arg = match parse_pr_create_arg(prompt_text) {
@@ -11393,6 +11900,71 @@ mod tests {
         }
     }
 
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git_repo(cwd: &Path) {
+        run_git(cwd, &["init"]);
+        run_git(cwd, &["config", "user.email", "test@example.com"]);
+        run_git(cwd, &["config", "user.name", "Test User"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_delta_tracker_reports_shell_written_tracked_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        let path = temp.path().join("notes.txt");
+        tokio::fs::write(&path, "before\n")
+            .await
+            .expect("seed file");
+        run_git(temp.path(), &["add", "notes.txt"]);
+        run_git(temp.path(), &["commit", "-m", "seed"]);
+
+        let tracker = WorkspaceDeltaTracker::snapshot(temp.path()).await;
+        tokio::fs::write(&path, "after\n").await.expect("edit file");
+
+        assert_eq!(
+            tracker.changed_files().await,
+            vec![PathBuf::from("notes.txt")]
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_delta_tracker_uses_dirty_pre_turn_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+        let path = temp.path().join("notes.txt");
+        tokio::fs::write(&path, "committed\n")
+            .await
+            .expect("seed file");
+        run_git(temp.path(), &["add", "notes.txt"]);
+        run_git(temp.path(), &["commit", "-m", "seed"]);
+
+        tokio::fs::write(&path, "dirty before\n")
+            .await
+            .expect("dirty file");
+        let tracker = WorkspaceDeltaTracker::snapshot(temp.path()).await;
+        tokio::fs::write(&path, "after\n").await.expect("edit file");
+
+        assert_eq!(
+            tracker.changed_files().await,
+            vec![PathBuf::from("notes.txt")]
+        );
+    }
+
     #[test]
     fn negotiate_protocol_version_accepts_supported_version() {
         assert_eq!(
@@ -11716,6 +12288,18 @@ mod tests {
         assert_eq!(
             parse_pr_create_arg("/pr-create feat(api): Add NewThing"),
             Some("feat(api): Add NewThing".to_string())
+        );
+    }
+
+    #[test]
+    fn pr_create_commit_message_uses_title_or_default() {
+        assert_eq!(
+            pr_create_commit_message("/pr-create Fix the thing"),
+            "Fix the thing"
+        );
+        assert_eq!(
+            pr_create_commit_message("/pr-create"),
+            "Update changes for pull request"
         );
     }
 
@@ -12766,6 +13350,7 @@ mod tests {
         let recap = crate::host_notice::render_turn_recap(
             None,
             &[],
+            None,
             &crate::tool_loop::LoopStop::Completed { had_text: true },
         );
         let snapshot = |agent_response: String| SessionSnapshot {
@@ -15101,6 +15686,7 @@ mod tests {
                 "choose",
                 "codex",
                 "bedrock",
+                "bedrock-catalog",
                 "local",
                 "deepseek",
                 "openrouter",
@@ -15191,8 +15777,8 @@ mod tests {
         }));
     }
 
-    /// `/setup codex` and `/setup codex login` start an interactive sign-in;
-    /// `status` / `disconnect` are not prompts and keep the text flow.
+    /// `/setup codex` and `/setup codex login` open the auth-method menu;
+    /// explicit methods, `status`, and `disconnect` keep the text flow.
     #[test]
     fn setup_elicitation_target_recognizes_codex_login() {
         assert_eq!(
@@ -15203,14 +15789,15 @@ mod tests {
             setup_elicitation_target("/setup codex login"),
             Some(SetupElicitTarget::CodexLogin)
         );
+        assert_eq!(setup_elicitation_target("/setup codex browser"), None);
+        assert_eq!(setup_elicitation_target("/setup codex device"), None);
         assert_eq!(setup_elicitation_target("/setup codex status"), None);
         assert_eq!(setup_elicitation_target("/setup codex disconnect"), None);
     }
 
-    /// Codex sign-in is a url-mode elicitation, so it needs the client's `url`
-    /// capability; `form` alone is not enough.
+    /// Codex sign-in needs both form (method menu) and url (auth link) support.
     #[test]
-    fn codex_login_target_requires_url_capability() {
+    fn codex_login_target_requires_form_and_url_capabilities() {
         use crate::session::ClientElicitationCaps;
         let t = SetupElicitTarget::CodexLogin;
         assert!(!t.is_supported(ClientElicitationCaps::default()));
@@ -15218,18 +15805,66 @@ mod tests {
             form: true,
             url: false,
         }));
-        assert!(t.is_supported(ClientElicitationCaps {
+        assert!(!t.is_supported(ClientElicitationCaps {
             form: false,
+            url: true,
+        }));
+        assert!(t.is_supported(ClientElicitationCaps {
+            form: true,
             url: true,
         }));
     }
 
-    /// The Codex login request is a session-scoped url-mode elicitation
-    /// carrying the authorize URL and the stable completion id.
     #[test]
-    fn codex_login_elicitation_request_shape() {
+    fn codex_login_method_elicitation_request_shape() {
+        let req = build_codex_login_method_elicitation_request("sess-1");
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-1"));
+        let method = &json["requestedSchema"]["properties"]["method"];
+        assert_eq!(method["default"], "browser");
+        let values: Vec<&str> = method["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["browser", "device"]);
+    }
+
+    #[test]
+    fn parse_codex_login_method_maps_values_and_dismissals() {
+        use agent_client_protocol::schema::v1::ElicitationAcceptAction;
+        use std::collections::BTreeMap;
+
+        let accept = |value: &str| {
+            ElicitationAction::Accept(ElicitationAcceptAction::new().content(BTreeMap::from([(
+                "method".to_string(),
+                ElicitationContentValue::from(value),
+            )])))
+        };
+
+        assert_eq!(
+            parse_codex_login_method(&accept("browser")),
+            Some(CodexLoginMethod::Browser)
+        );
+        assert_eq!(
+            parse_codex_login_method(&accept("device")),
+            Some(CodexLoginMethod::Device)
+        );
+        assert_eq!(parse_codex_login_method(&accept("bogus")), None);
+        assert_eq!(parse_codex_login_method(&ElicitationAction::Decline), None);
+        assert_eq!(parse_codex_login_method(&ElicitationAction::Cancel), None);
+    }
+
+    /// The Codex device login request is a session-scoped url-mode elicitation
+    /// carrying the device verification URL and the stable completion id.
+    #[test]
+    fn codex_device_login_elicitation_request_shape() {
         let url = "https://auth.openai.com/codex/device";
-        let req = build_codex_login_elicitation_request("sess-1", url.to_string(), "ABCD-EFGH");
+        let req =
+            build_codex_device_login_elicitation_request("sess-1", url.to_string(), "ABCD-EFGH");
         let json = serde_json::to_value(&req).unwrap();
 
         assert_eq!(json["mode"], "url");
@@ -15242,6 +15877,23 @@ mod tests {
                 .is_some_and(|m| m.contains("ABCD-EFGH") && m.contains("sign in")),
             "got: {}",
             json["message"]
+        );
+    }
+
+    #[test]
+    fn codex_browser_login_elicitation_request_shape() {
+        let url = "https://auth.openai.com/oauth/authorize?state=abc";
+        let req = build_codex_browser_login_elicitation_request("sess-1", url.to_string());
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "url");
+        assert_eq!(json["sessionId"].as_str(), Some("sess-1"));
+        assert_eq!(json["elicitationId"], CODEX_LOGIN_ELICITATION_ID);
+        assert_eq!(json["url"], url);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("localhost"))
         );
     }
 
@@ -15274,14 +15926,48 @@ mod tests {
             setup_elicitation_target("/setup deepseek"),
             Some(SetupElicitTarget::DeepSeekLogin)
         );
+        assert_eq!(
+            setup_elicitation_target("/setup bedrock catalog"),
+            Some(SetupElicitTarget::BedrockCatalog)
+        );
         for prompt in [
             "/setup bedrock key token",
             "/setup bedrock status",
+            "/setup bedrock catalog native-only",
             "/setup deepseek key secret",
             "/setup deepseek disconnect",
         ] {
             assert_eq!(setup_elicitation_target(prompt), None, "prompt: {prompt}");
         }
+    }
+
+    #[test]
+    fn bedrock_catalog_elicitation_request_shape() {
+        let req = build_bedrock_catalog_elicitation_request(
+            "sess-bedrock",
+            crate::setup_state::BedrockCatalogMode::MantlePreferred,
+        );
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["mode"], "form");
+        assert_eq!(json["sessionId"], "sess-bedrock");
+        let catalog = &json["requestedSchema"]["properties"]["catalog"];
+        assert_eq!(catalog["default"], "mantle-preferred");
+        let values: Vec<&str> = catalog["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "mantle-only",
+                "native-only",
+                "mantle-preferred",
+                "native-preferred"
+            ]
+        );
     }
 
     #[test]

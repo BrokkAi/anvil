@@ -3147,6 +3147,28 @@ impl SessionStore {
         }
     }
 
+    pub(crate) fn bedrock_catalog_mode(&self) -> crate::setup_state::BedrockCatalogMode {
+        self.setup_state_snapshot()
+            .bedrock_catalog_mode
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn remember_bedrock_catalog_mode(
+        &self,
+        mode: crate::setup_state::BedrockCatalogMode,
+    ) -> anyhow::Result<()> {
+        match &self.transient_setup_state {
+            Some(state) => {
+                state
+                    .lock()
+                    .expect("transient setup state mutex poisoned")
+                    .bedrock_catalog_mode = Some(mode);
+                Ok(())
+            }
+            None => crate::setup_state::remember_bedrock_catalog_mode(mode),
+        }
+    }
+
     async fn remove_resident_sessions(&self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -6223,6 +6245,13 @@ mod tests {
                 .await
         );
         assert!(store.set_mode(&first.id, SessionMode::Lutz).await);
+        store
+            .remember_bedrock_catalog_mode(crate::setup_state::BedrockCatalogMode::NativeOnly)
+            .expect("set transient Bedrock catalog mode");
+        assert_eq!(
+            store.bedrock_catalog_mode(),
+            crate::setup_state::BedrockCatalogMode::NativeOnly
+        );
         assert_no_legacy_session_config_keys(&setup_state_json());
         assert!(store.set_mode(&first.id, SessionMode::Plan).await);
         assert!(
@@ -6255,6 +6284,11 @@ mod tests {
             crate::setup_state::read().last_sandbox_mode,
             Some(SandboxMode::Wasm),
             "transient choices must not overwrite setup.json sandbox preference"
+        );
+        assert_eq!(
+            crate::setup_state::bedrock_catalog_mode(),
+            crate::setup_state::BedrockCatalogMode::MantlePreferred,
+            "transient choices must not overwrite setup.json Bedrock catalog preference"
         );
 
         store.sessions.write().await.remove(&first.id);

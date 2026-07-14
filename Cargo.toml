@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "brokk-anvil"
-version = "0.21.1"
+version = "0.21.3"
 edition = "2024"
 description = "Anvil: Rust ACP server with first-run setup for Codex, Ollama, and OpenRouter"
 license = "LGPL-3.0"
@@ -59,14 +59,11 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 rustls-native-certs = "0.8"
 sha2 = "0.11"
-# Codex login. We deliberately avoid single-maintainer credential crates:
-# `oauth2` is the de-facto Rust OAuth2 implementation (~32M downloads,
-# depended on by Servo etc.) and gives us PKCE + refresh. The RFC 8693
-# Token Exchange step that converts the id_token into the OPENAI_API_KEY
-# is one POST written by hand in `codex_auth.rs`. JWT decoding for the
-# account_id is also inline (no `jsonwebtoken` dep) since we trust the
-# issuer over HTTPS and only need the unverified `chatgpt_account_id`
-# claim. `tiny_http` runs the loopback callback for ~30s during login.
+# Codex login. Browser login uses PKCE + a localhost loopback callback; device
+# authorization covers SSH/remote clients. RFC 8693 token exchange and refresh
+# are direct `reqwest` calls in `codex_auth.rs`. JWT decoding for the account_id
+# is inline (no `jsonwebtoken` dep) since we trust the issuer over HTTPS and only
+# need the unverified `chatgpt_account_id` claim.
 oauth2 = { version = "5", default-features = false }
 tiny_http = "0.12"
 webbrowser = "1"

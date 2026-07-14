@@ -16,6 +16,41 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BedrockCatalogMode {
+    MantleOnly,
+    NativeOnly,
+    #[default]
+    MantlePreferred,
+    NativePreferred,
+}
+
+impl BedrockCatalogMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MantleOnly => "mantle-only",
+            Self::NativeOnly => "native-only",
+            Self::MantlePreferred => "mantle-preferred",
+            Self::NativePreferred => "native-preferred",
+        }
+    }
+}
+
+impl std::str::FromStr for BedrockCatalogMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "mantle-only" => Ok(Self::MantleOnly),
+            "native-only" => Ok(Self::NativeOnly),
+            "mantle-preferred" => Ok(Self::MantlePreferred),
+            "native-preferred" => Ok(Self::NativePreferred),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SetupState {
     #[serde(default)]
@@ -28,6 +63,12 @@ pub struct SetupState {
     pub last_sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_recap_enabled: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_optional"
+    )]
+    pub bedrock_catalog_mode: Option<BedrockCatalogMode>,
     /// Legacy install-wide approvals from older builds. Current builds use
     /// repo-local `.brokk/permissions.json` instead, but we still deserialize
     /// this field for backward compatibility.
@@ -137,6 +178,14 @@ pub fn remember_turn_recap_enabled(enabled: bool) -> Result<()> {
     update(|state| state.turn_recap_enabled = Some(enabled))
 }
 
+pub fn bedrock_catalog_mode() -> BedrockCatalogMode {
+    read().bedrock_catalog_mode.unwrap_or_default()
+}
+
+pub fn remember_bedrock_catalog_mode(mode: BedrockCatalogMode) -> Result<()> {
+    update(|state| state.bedrock_catalog_mode = Some(mode))
+}
+
 pub fn read_mcp_servers() -> Vec<crate::mcp::McpServerConfig> {
     #[cfg(test)]
     if path().is_err() {
@@ -236,6 +285,23 @@ mod tests {
         assert!(parsed.first_run_seen);
         assert_eq!(parsed.last_sandbox_mode, None);
         assert_eq!(parsed.mcp_servers.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn bedrock_catalog_mode_round_trips_and_defaults_to_mantle_preferred() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = TestConfigHomeScope::set(config_dir.path().to_path_buf());
+
+        assert_eq!(bedrock_catalog_mode(), BedrockCatalogMode::MantlePreferred);
+        remember_bedrock_catalog_mode(BedrockCatalogMode::NativeOnly)
+            .expect("remember catalog mode");
+        assert_eq!(bedrock_catalog_mode(), BedrockCatalogMode::NativeOnly);
+
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path().expect("setup path")).expect("read setup"),
+        )
+        .expect("setup json");
+        assert_eq!(json["bedrock_catalog_mode"], "native-only");
     }
 
     #[test]
