@@ -5256,7 +5256,11 @@ fn asgard_supervisor_messages(
              trajectory. The transcript retains model messages, tool calls, and tool results exactly \
              once. Use the card as a salience index, while treating the raw evidence as authoritative if they \
              disagree. A successful shell exit is not by itself \
-             proof that relevant tests executed. In particular, a test command that reports zero \
+             proof that relevant tests executed. Treat verification commands piped through filters \
+             such as grep, head, or tail as weak evidence unless the trajectory independently shows \
+             that the upstream verifier itself passed; without pipefail, the pipeline status can hide \
+             an upstream build or test failure, and filtering can hide its diagnostics. In particular, \
+             a test command that reports zero \
              discovered, selected, or matching tests supplies no passing test evidence. Treat that as \
              an unresolved verification gap, not an expected success. Distinguish tests created or \
              modified by the candidate from pre-existing verification: candidate-authored tests can \
@@ -15951,6 +15955,7 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("no command was attempted"));
         assert!(asgard_message_text(&first[0]).contains("normally keep complete=false"));
         assert!(asgard_message_text(&first[0]).contains("timeout is missing evidence"));
+        assert!(asgard_message_text(&first[0]).contains("without pipefail"));
         assert!(asgard_message_text(&first[0]).contains("presume it is candidate-caused"));
         assert!(asgard_message_text(&first[0]).contains("do not silently reverse"));
         assert!(asgard_message_text(&first[0]).contains("still-failing applicable verifier"));
