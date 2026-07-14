@@ -4745,10 +4745,20 @@ struct AsgardSupervisorDecision {
     winner: usize,
     complete: bool,
     advices: Vec<Option<String>>,
+    next_window_steps: Option<usize>,
     state_summary: String,
 }
 
 const ASGARD_SUPERVISOR_MAX_ATTEMPTS: usize = 2;
+const ASGARD_MIN_WINDOW_STEPS: usize = 3;
+const ASGARD_MAX_WINDOW_STEPS: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsgardSupervisorInitialAdvice {
+    advices: Vec<Option<String>>,
+    next_window_steps: usize,
+    state_summary: String,
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_asgard_trajectory_loop(
@@ -4812,7 +4822,68 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
-    let mut next_advices: Option<Vec<Option<String>>> = None;
+    let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
+    let mut initial_advice = None;
+    let mut initial_advice_error = None;
+    for attempt in 1..=ASGARD_SUPERVISOR_MAX_ATTEMPTS {
+        let supervisor = run_asgard_initial_advice(
+            llm,
+            supervisor_model,
+            idle_timeout,
+            cancel.clone(),
+            config.candidate_models.len(),
+            &original_task,
+            &selected_trajectory_initial,
+        )
+        .await;
+        aggregate_usage.add(supervisor.1);
+        usage_by_model
+            .entry(supervisor_model.to_string())
+            .or_default()
+            .add(supervisor.1);
+        match supervisor.0 {
+            Ok(value) => {
+                initial_advice = Some(value);
+                break;
+            }
+            Err(error) if attempt < ASGARD_SUPERVISOR_MAX_ATTEMPTS && !cancel.is_cancelled() => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = ASGARD_SUPERVISOR_MAX_ATTEMPTS,
+                    "retrying failed initial Asgard supervisor advice: {error:#}"
+                );
+            }
+            Err(error) => {
+                initial_advice_error = Some(error);
+                break;
+            }
+        }
+    }
+    let initial_advice = match initial_advice {
+        Some(value) => value,
+        None => {
+            cleanup_asgard_worktrees(&worktrees);
+            let error = initial_advice_error
+                .unwrap_or_else(|| anyhow::anyhow!("supervisor produced no initial advice"));
+            let mut outcome = asgard_failure(anyhow::anyhow!(
+                "supervisor produced no valid initial Asgard advice: {error:#}"
+            ));
+            outcome.usage = aggregate_usage;
+            return (outcome, usage_by_model);
+        }
+    };
+    let mut current_window_steps = initial_advice.next_window_steps;
+    let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
+    send_thought(
+        cx,
+        session_id,
+        &format!(
+            "[Asgard initial strategies: next window = {} steps]\n{}\n{}\n",
+            current_window_steps,
+            initial_advice.state_summary,
+            render_asgard_lane_advices(&initial_advice.advices)
+        ),
+    );
     let mut canonical_plan = initial_plan;
     for window in 1usize.. {
         send_thought(
@@ -4821,7 +4892,7 @@ async fn run_asgard_trajectory_loop(
             &format!(
                 "\n[Asgard window {window}: {} candidates × {} steps]\n",
                 config.candidate_models.len(),
-                config.window_steps
+                current_window_steps
             ),
         );
         let mut futures = Vec::with_capacity(worktrees.len());
@@ -4852,6 +4923,7 @@ async fn run_asgard_trajectory_loop(
             let worktree_root = worktree.root.clone();
             let cancel = cancel.clone();
             let inherited_plan = canonical_plan.clone();
+            let window_steps = current_window_steps;
             futures.push(async move {
                 let sink: crate::tool_loop::TextSink =
                     Arc::new(std::sync::Mutex::new(|_: &str| {}));
@@ -4866,7 +4938,7 @@ async fn run_asgard_trajectory_loop(
                     service_tier,
                     structured_output,
                     messages,
-                    config.window_steps,
+                    window_steps,
                     idle_timeout,
                     cancel,
                     sink,
@@ -4916,7 +4988,6 @@ async fn run_asgard_trajectory_loop(
                 }
             }
         }
-        let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
         let mut supervisor_usage = crate::llm_client::TokenUsage::default();
         let mut decision = None;
         let mut supervisor_error = None;
@@ -4988,22 +5059,17 @@ async fn run_asgard_trajectory_loop(
         let supervisor_completion_summary = decision.state_summary.clone();
         next_advices = Some(decision.advices.clone());
         if !supervisor_complete && let Some(advices) = &next_advices {
-            let rendered = advices
-                .iter()
-                .enumerate()
-                .map(|(lane, advice)| {
-                    format!(
-                        "  lane {}: {}",
-                        lane + 1,
-                        advice.as_deref().unwrap_or("<missing advice>")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            current_window_steps = decision
+                .next_window_steps
+                .expect("incomplete Asgard decision has next_window_steps");
             send_thought(
                 cx,
                 session_id,
-                &format!("[Asgard next-window strategies]\n{rendered}\n"),
+                &format!(
+                    "[Asgard next-window strategies: next window = {} steps]\n{}\n",
+                    current_window_steps,
+                    render_asgard_lane_advices(advices)
+                ),
             );
         }
         let Some(mut winner) = candidates.into_iter().find(|c| c.index == winner_index) else {
@@ -5139,6 +5205,34 @@ fn asgard_should_finish(supervisor_complete: bool, stop: &crate::tool_loop::Loop
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn run_asgard_initial_advice(
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    model: &str,
+    idle_timeout: IdleTimeouts,
+    cancel: tokio_util::sync::CancellationToken,
+    candidate_count: usize,
+    original_task: &str,
+    selected_trajectory_initial: &[ChatMessage],
+) -> (
+    anyhow::Result<AsgardSupervisorInitialAdvice>,
+    crate::llm_client::TokenUsage,
+) {
+    let messages =
+        asgard_initial_advice_messages(original_task, selected_trajectory_initial, candidate_count);
+    run_asgard_initial_advice_tool_steps(
+        llm.as_ref(),
+        messages,
+        AsgardSupervisorToolContext {
+            model,
+            candidate_count,
+            idle_timeout,
+        },
+        cancel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_asgard_supervisor(
     llm: &Arc<dyn crate::llm_client::LlmBackend>,
     model: &str,
@@ -5241,6 +5335,128 @@ struct AsgardSupervisorToolContext<'a> {
     model: &'a str,
     candidate_count: usize,
     idle_timeout: IdleTimeouts,
+}
+
+async fn run_asgard_initial_advice_tool_steps(
+    llm: &dyn crate::llm_client::LlmBackend,
+    mut messages: Vec<ChatMessage>,
+    context: AsgardSupervisorToolContext<'_>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (
+    anyhow::Result<AsgardSupervisorInitialAdvice>,
+    crate::llm_client::TokenUsage,
+) {
+    const MAX_STEPS: usize = 2;
+    let tools = vec![asgard_advise_trajectories_tool(context.candidate_count)];
+    let mut usage = crate::llm_client::TokenUsage::default();
+
+    for step in 1..=MAX_STEPS {
+        let response = stream_chat_no_visible_output_with_retry(
+            llm,
+            "planning initial Asgard trajectories",
+            &cancel,
+            || StreamChatRequest {
+                model: context.model.to_string(),
+                messages: messages.clone(),
+                tools: Some(tools.clone()),
+                reasoning_effort: None,
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeouts: context.idle_timeout,
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return (Err(error), usage),
+        };
+        usage.add(response.usage());
+
+        match response {
+            LlmResponse::Text {
+                text,
+                reasoning_content,
+                ..
+            } => {
+                messages.push(ChatMessage::assistant_with_reasoning(
+                    text,
+                    reasoning_content,
+                ));
+            }
+            LlmResponse::ToolCalls {
+                text: _,
+                reasoning_content: _,
+                calls,
+                ..
+            } => {
+                let mut advice = None;
+                for call in &calls {
+                    let normalized = match crate::tool_arguments::normalize_tool_arguments(
+                        &call.function.arguments,
+                    ) {
+                        Ok(arguments) => arguments.value,
+                        Err(error) => {
+                            return (
+                                Err(anyhow::anyhow!(
+                                    "Asgard supervisor emitted invalid `{}` arguments: {error}",
+                                    call.function.name
+                                )),
+                                usage,
+                            );
+                        }
+                    };
+                    match call.function.name.as_str() {
+                        "advise_trajectories" => {
+                            if advice.is_some() {
+                                return (
+                                    Err(anyhow::anyhow!(
+                                        "Asgard supervisor called advise_trajectories more than once"
+                                    )),
+                                    usage,
+                                );
+                            }
+                            let serialized = serde_json::to_string(&normalized)
+                                .expect("normalized tool arguments serialize");
+                            match parse_asgard_initial_advice(&serialized, context.candidate_count)
+                            {
+                                Ok(value) => advice = Some(value),
+                                Err(error) => return (Err(error), usage),
+                            }
+                        }
+                        other => {
+                            return (
+                                Err(anyhow::anyhow!(
+                                    "Asgard supervisor called unexpected tool `{other}`"
+                                )),
+                                usage,
+                            );
+                        }
+                    }
+                }
+
+                if let Some(advice) = advice {
+                    return (Ok(advice), usage);
+                }
+            }
+        }
+
+        if step < MAX_STEPS {
+            messages.push(ChatMessage::user(
+                "You have not advised the trajectories. Call advise_trajectories now. Do not answer in prose.",
+            ));
+        }
+    }
+
+    (
+        Err(anyhow::anyhow!(
+            "Asgard supervisor did not call advise_trajectories after {MAX_STEPS} steps"
+        )),
+        usage,
+    )
 }
 
 async fn run_asgard_supervisor_tool_steps(
@@ -5383,6 +5599,43 @@ fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
+fn asgard_window_horizon_policy() -> &'static str {
+    "Choose next_window_steps as one shared horizon for all candidate lanes, from 3 to 12 inclusive. The governing question is how long lanes can productively diverge before another comparison becomes valuable. Use 3-5 when direction is uncertain, evidence conflicts, changes are risky, active exploration is needed, or the selected path may be near completion. Use 6-9 for ordinary implementation with a reasonably clear plan. Use 10-12 only for high-confidence mechanically involved execution where interruption would add little value, such as a broad straightforward refactor or an established verification sequence."
+}
+
+fn asgard_initial_advice_messages(
+    original_task: &str,
+    selected_trajectory_initial: &[ChatMessage],
+    candidate_count: usize,
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(format!(
+            r#"You are directing the first Asgard coding window. The candidate lanes will all start from the same canonical task history and disk state. Your job is to choose one shared window length and give the next {candidate_count} lanes concise, actionable, mutually distinct strategies for beginning the original task.
+
+The original task is authoritative. Every strategy must independently remain compliant with the task. Do not prescribe exact syntax, APIs, grammar shapes, or implementation facts unless the supplied history establishes them; when uncertain, direct a candidate to inspect the relevant source or behavior and resolve the uncertainty. If useful, advise a candidate to update_plan. The candidates continue normal rollouts and must not stop at Asgard window boundaries.
+
+{}
+
+Call advise_trajectories exactly once. Do not call another tool or answer in prose. If you omit advise_trajectories, you will receive one reminder."#,
+            asgard_window_horizon_policy()
+        )),
+        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
+        ChatMessage::assistant(format!(
+            "<selected_trajectory_initial>\n{}\n</selected_trajectory_initial>",
+            render_asgard_dossier_messages(selected_trajectory_initial),
+        )),
+        ChatMessage::user(format!(
+            r#"<initial_advice_procedure>
+Before calling advise_trajectories:
+1. Re-read the original task. Identify the main required behaviors, explicit implementation constraints, and prohibitions.
+2. Choose next_window_steps based on when the next comparison should be valuable, not on a fixed rollout habit.
+3. Produce exactly {candidate_count} task-compliant strategies. Make them genuinely different. Include one strategy that quickly falsifies the most consequential assumption if the task direction is uncertain.
+Then call advise_trajectories exactly once.
+</initial_advice_procedure>"#
+        )),
+    ]
+}
+
 fn asgard_supervisor_messages(
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
@@ -5409,9 +5662,12 @@ Stay within scope. Do not repair dependencies, lockfiles, build configuration, t
 
 Set complete=true only when the selected endpoint satisfies the original task, violates no explicit constraint, and has no known candidate-caused defect or necessary work remaining. Use engineering judgment rather than a hardcoded testing ritual: require evidence proportionate to the change, account for unavailable or inconclusive checks honestly, and do not invent endless optional work after the task is genuinely complete.
 
-When incomplete, return exactly {candidate_count} concise, actionable, mutually distinct advice objects ordered by zero-based lane index. Every strategy must independently remain compliant with the original task. At least one strategy must challenge the selected direction's most consequential unverified assumption instead of treating the current architecture as settled. Advice should identify the objective, risk, or evidence to obtain. Do not prescribe exact syntax, APIs, grammar shapes, or implementation facts unless the supplied trajectory evidence establishes them; when uncertain, direct the candidate to inspect the relevant source or behavior and resolve the uncertainty. If useful, advise a candidate to update_plan. The candidates continue normal rollouts and must not stop at Asgard window boundaries.
+When incomplete, choose next_window_steps and return exactly {candidate_count} concise, actionable, mutually distinct advice objects ordered by zero-based lane index. Every strategy must independently remain compliant with the original task. At least one strategy must challenge the selected direction's most consequential unverified assumption instead of treating the current architecture as settled. Advice should identify the objective, risk, or evidence to obtain. Do not prescribe exact syntax, APIs, grammar shapes, or implementation facts unless the supplied trajectory evidence establishes them; when uncertain, direct the candidate to inspect the relevant source or behavior and resolve the uncertainty. If useful, advise a candidate to update_plan. The candidates continue normal rollouts and must not stop at Asgard window boundaries.
+
+{}
 
 Call select_trajectory exactly once. Return advices=[] when complete. state_summary must concisely record why the endpoint was selected, the decisive evidence, and any unresolved risk. Do not call another tool or answer in prose. If you omit select_trajectory, you will receive one reminder."#,
+            asgard_window_horizon_policy()
         )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
     ];
@@ -5455,7 +5711,7 @@ Before calling select_trajectory:
 3. Inspect the calls and results in each trajectory. Decide whether the evidence exercises the changed behavior, whether later edits undermine it, and whether candidate test edits make a green result self-confirming.
 4. Select the endpoint most likely to produce a correct final solution if continued. Relative superiority does not imply correctness.
 5. Decide completion independently: complete only if the selected endpoint satisfies the task and no required work or known candidate-caused defect remains.
-6. If incomplete, produce exactly {candidate_count} task-compliant strategies. Make them genuinely different, include one that tries to falsify the leading unverified assumption, and avoid asserting implementation details not established by the evidence.
+6. If incomplete, choose next_window_steps using the shared horizon policy, then produce exactly {candidate_count} task-compliant strategies. Make them genuinely different, include one that tries to falsify the leading unverified assumption, and avoid asserting implementation details not established by the evidence.
 Then call select_trajectory exactly once.
 </decision_procedure>"#,
     )));
@@ -5517,6 +5773,47 @@ fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String {
     rendered
 }
 
+fn asgard_advise_trajectories_tool(candidate_count: usize) -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".to_string(),
+        function: FunctionDef {
+            name: "advise_trajectories".to_string(),
+            description: "Choose the first shared Asgard window length and provide distinct advisory strategies for all candidate trajectories. This is the terminal initial supervisor action and must be called exactly once.".to_string(),
+            parameters: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["next_window_steps", "state_summary", "advices"],
+            "properties": {
+                "next_window_steps": {
+                    "type": "integer",
+                    "minimum": ASGARD_MIN_WINDOW_STEPS,
+                    "maximum": ASGARD_MAX_WINDOW_STEPS,
+                },
+                "state_summary": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "advices": {
+                    "type": "array",
+                    "minItems": candidate_count,
+                    "maxItems": candidate_count,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["strategy", "scope_basis"],
+                        "properties": {
+                            "strategy": { "type": "string", "minLength": 1 },
+                            "scope_basis": { "type": "string", "minLength": 1 },
+                        },
+                    },
+                },
+            },
+            }),
+        },
+    }
+}
+
 fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
     ToolDefinition {
         r#type: "function".to_string(),
@@ -5534,6 +5831,12 @@ fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
                     "maximum": candidate_count.saturating_sub(1),
                 },
                 "complete": { "type": "boolean" },
+                "next_window_steps": {
+                    "type": "integer",
+                    "minimum": ASGARD_MIN_WINDOW_STEPS,
+                    "maximum": ASGARD_MAX_WINDOW_STEPS,
+                    "description": "Required when complete=false; omitted or ignored when complete=true.",
+                },
                 "state_summary": {
                     "type": "string",
                     "minLength": 1,
@@ -5581,6 +5884,21 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          test as pre-existing, flaky, or unrelated without concrete baseline or subsequent passing \
          evidence, especially when it exercises code changed by this trajectory."
     ))
+}
+
+fn render_asgard_lane_advices(advices: &[Option<String>]) -> String {
+    advices
+        .iter()
+        .enumerate()
+        .map(|(lane, advice)| {
+            format!(
+                "  lane {}: {}",
+                lane + 1,
+                advice.as_deref().unwrap_or("<missing advice>")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn asgard_take_window_messages(
@@ -5736,43 +6054,101 @@ fn parse_asgard_supervisor_decision(
                 winner,
                 complete,
                 advices: vec![None; count],
+                next_window_steps: None,
                 state_summary: state_summary.to_string(),
             });
         }
-        if raw_advices.len() != count {
+        let Some(next_window_steps) = parse_asgard_next_window_steps(&value) else {
             continue;
-        }
-        let advices: Vec<_> = raw_advices
-            .iter()
-            .filter_map(serde_json::Value::as_object)
-            .filter(|advice| {
-                advice
-                    .get("scope_basis")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|basis| !basis.trim().is_empty())
-            })
-            .filter_map(|advice| advice.get("strategy"))
-            .filter_map(serde_json::Value::as_str)
-            .map(str::trim)
-            .map(str::to_string)
-            .collect();
-        if advices.len() != count || advices.iter().any(String::is_empty) {
+        };
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, count) else {
             continue;
-        }
-        let distinct: HashSet<_> = advices.iter().map(|advice| advice.to_lowercase()).collect();
-        if distinct.len() != count {
-            continue;
-        }
+        };
         return Ok(AsgardSupervisorDecision {
             winner,
             complete,
-            advices: advices.into_iter().map(Some).collect(),
+            advices,
+            next_window_steps: Some(next_window_steps),
             state_summary: state_summary.to_string(),
         });
     }
     anyhow::bail!(
-        "Asgard supervisor returned neither a valid completed winner nor a winner plus {count} distinct advices"
+        "Asgard supervisor returned neither a valid completed winner nor a winner plus {count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
     )
+}
+
+fn parse_asgard_initial_advice(
+    text: &str,
+    count: usize,
+) -> anyhow::Result<AsgardSupervisorInitialAdvice> {
+    for (start, _) in text.match_indices('{') {
+        let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<serde_json::Value>()
+            .next()
+        else {
+            continue;
+        };
+        let Some(next_window_steps) = parse_asgard_next_window_steps(&value) else {
+            continue;
+        };
+        let Some(state_summary) = value
+            .get("state_summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+        else {
+            continue;
+        };
+        let Some(raw_advices) = value.get("advices").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, count) else {
+            continue;
+        };
+        return Ok(AsgardSupervisorInitialAdvice {
+            advices,
+            next_window_steps,
+            state_summary: state_summary.to_string(),
+        });
+    }
+    anyhow::bail!(
+        "Asgard supervisor returned no valid initial advice with {count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
+    )
+}
+
+fn parse_asgard_next_window_steps(value: &serde_json::Value) -> Option<usize> {
+    let steps = value.get("next_window_steps")?.as_u64()? as usize;
+    (ASGARD_MIN_WINDOW_STEPS..=ASGARD_MAX_WINDOW_STEPS)
+        .contains(&steps)
+        .then_some(steps)
+}
+
+fn parse_asgard_incomplete_advices(
+    raw_advices: &[serde_json::Value],
+    count: usize,
+) -> Option<Vec<Option<String>>> {
+    if raw_advices.len() != count {
+        return None;
+    }
+    let advices: Vec<_> = raw_advices
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter(|advice| {
+            advice
+                .get("scope_basis")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|basis| !basis.trim().is_empty())
+        })
+        .filter_map(|advice| advice.get("strategy"))
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_string)
+        .collect();
+    if advices.len() != count || advices.iter().any(String::is_empty) {
+        return None;
+    }
+    let distinct: HashSet<_> = advices.iter().map(|advice| advice.to_lowercase()).collect();
+    (distinct.len() == count).then(|| advices.into_iter().map(Some).collect())
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -16280,7 +16656,7 @@ mod tests {
     #[test]
     fn asgard_supervisor_parser_requires_exactly_n_distinct_advices() {
         let parsed = parse_asgard_supervisor_decision(
-            r#"{"winner":2,"complete":false,"state_summary":"parser implemented; API and concurrency remain","advices":[
+            r#"{"winner":2,"complete":false,"next_window_steps":5,"state_summary":"parser implemented; API and concurrency remain","advices":[
                 {"strategy":"test the parser","scope_basis":"the task requires parser behavior"},
                 {"strategy":"challenge the API","scope_basis":"the task requires API behavior"},
                 {"strategy":"inspect concurrency","scope_basis":"the candidate changed synchronization"}
@@ -16289,6 +16665,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.winner, 2);
+        assert_eq!(parsed.next_window_steps, Some(5));
         assert_eq!(parsed.advices.len(), 3);
         assert_eq!(
             parsed.state_summary,
@@ -16334,7 +16711,7 @@ mod tests {
 
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"state_summary":"work remains","advices":[
+                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[
                     {"strategy":"same","scope_basis":"task"},
                     {"strategy":"same","scope_basis":"task"},
                     {"strategy":"different","scope_basis":"task"}
@@ -16345,14 +16722,36 @@ mod tests {
         );
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"state_summary":"work remains","advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
+                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
                 3
             )
             .is_err()
         );
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":7,"complete":false,"state_summary":"work remains","advices":[
+                r#"{"winner":7,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[
+                    {"strategy":"a","scope_basis":"task"},
+                    {"strategy":"b","scope_basis":"task"},
+                    {"strategy":"c","scope_basis":"task"}
+                ]}"#,
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[
+                    {"strategy":"a","scope_basis":""},
+                    {"strategy":"b","scope_basis":"task"},
+                    {"strategy":"c","scope_basis":"task"}
+                ]}"#,
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            parse_asgard_supervisor_decision(
+                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"","advices":[
                     {"strategy":"a","scope_basis":"task"},
                     {"strategy":"b","scope_basis":"task"},
                     {"strategy":"c","scope_basis":"task"}
@@ -16364,7 +16763,7 @@ mod tests {
         assert!(
             parse_asgard_supervisor_decision(
                 r#"{"winner":1,"complete":false,"state_summary":"work remains","advices":[
-                    {"strategy":"a","scope_basis":""},
+                    {"strategy":"a","scope_basis":"task"},
                     {"strategy":"b","scope_basis":"task"},
                     {"strategy":"c","scope_basis":"task"}
                 ]}"#,
@@ -16374,7 +16773,7 @@ mod tests {
         );
         assert!(
             parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"state_summary":"","advices":[
+                r#"{"winner":1,"complete":false,"next_window_steps":13,"state_summary":"work remains","advices":[
                     {"strategy":"a","scope_basis":"task"},
                     {"strategy":"b","scope_basis":"task"},
                     {"strategy":"c","scope_basis":"task"}
@@ -16428,6 +16827,7 @@ mod tests {
             winner: 2,
             complete: false,
             advices: vec![Some("independent strategy".to_string())],
+            next_window_steps: Some(4),
             state_summary: "The selected parser still has an unresolved wildcard assumption."
                 .to_string(),
         };
@@ -16657,12 +17057,50 @@ mod tests {
             schema["required"],
             serde_json::json!(["winner", "complete", "state_summary", "advices"])
         );
+        assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 3);
+        assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 12);
         assert_eq!(schema["properties"]["advices"]["minItems"], 0);
         assert_eq!(schema["properties"]["advices"]["maxItems"], 3);
         assert_eq!(schema["properties"]["advices"]["uniqueItems"], true);
         assert_eq!(
             schema["properties"]["advices"]["items"]["required"],
             serde_json::json!(["strategy", "scope_basis"])
+        );
+    }
+
+    #[test]
+    fn asgard_initial_advice_tool_requires_shared_horizon_and_exact_advices() {
+        let tool = asgard_advise_trajectories_tool(2);
+        assert_eq!(tool.function.name, "advise_trajectories");
+        let schema = tool.function.parameters;
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["next_window_steps", "state_summary", "advices"])
+        );
+        assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 3);
+        assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 12);
+        assert_eq!(schema["properties"]["advices"]["minItems"], 2);
+        assert_eq!(schema["properties"]["advices"]["maxItems"], 2);
+
+        let parsed = parse_asgard_initial_advice(
+            r#"{"next_window_steps":4,"state_summary":"Start with one implementation lane and one falsification lane.","advices":[
+                {"strategy":"Inspect the relevant parser and implement the narrow fix.","scope_basis":"The task asks for parser behavior."},
+                {"strategy":"Write or run the boundary check first, then implement from the observed contract.","scope_basis":"The task asks for parser behavior."}
+            ]}"#,
+            2,
+        )
+        .unwrap();
+        assert_eq!(parsed.next_window_steps, 4);
+        assert_eq!(parsed.advices.len(), 2);
+        assert!(
+            parse_asgard_initial_advice(
+                r#"{"next_window_steps":2,"state_summary":"too short","advices":[
+                    {"strategy":"a","scope_basis":"task"},
+                    {"strategy":"b","scope_basis":"task"}
+                ]}"#,
+                2,
+            )
+            .is_err()
         );
     }
 
@@ -16674,6 +17112,7 @@ mod tests {
             serde_json::json!({
                 "winner": 1,
                 "complete": false,
+                "next_window_steps": 4,
                 "state_summary": "Lane 2 has the strongest implementation but lacks verification.",
                 "advices": [
                     {
@@ -16725,6 +17164,7 @@ mod tests {
         let decision = decision.expect("supervisor decision");
         assert_eq!(decision.winner, 1);
         assert!(!decision.complete);
+        assert_eq!(decision.next_window_steps, Some(4));
         assert!(
             decision.advices[0]
                 .as_deref()

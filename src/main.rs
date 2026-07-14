@@ -95,7 +95,7 @@ struct Args {
     #[arg(long, requires = "asgard_models")]
     asgard_supervisor: Option<String>,
 
-    /// Normal model/tool steps per Asgard trajectory window.
+    /// Deprecated. Asgard supervisor now chooses each shared window length.
     #[arg(long, default_value_t = 8)]
     asgard_window_steps: usize,
 
@@ -688,10 +688,9 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
-    asgard::configure((!args.asgard_models.is_empty()).then(|| asgard::Config {
+    asgard::configure((!args.asgard_models.is_empty()).then_some(asgard::Config {
         candidate_models: args.asgard_models,
         supervisor_model: args.asgard_supervisor,
-        window_steps: args.asgard_window_steps.max(1),
     }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.

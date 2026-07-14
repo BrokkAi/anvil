@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail};
 pub(crate) struct Config {
     pub candidate_models: Vec<String>,
     pub supervisor_model: Option<String>,
-    pub window_steps: usize,
 }
 
 static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
