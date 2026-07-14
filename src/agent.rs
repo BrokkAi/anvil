@@ -5755,21 +5755,37 @@ fn parse_asgard_supervisor_decision(
 }
 
 fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
-    let from = from.display().to_string();
-    let to = to.display().to_string();
+    // `PathBuf::join("")` preserves a trailing separator. That is how an
+    // Asgard session rooted at the repository itself is represented, while
+    // tool results and model-authored commands normally omit the separator.
+    // Rewrite the path stem so both spellings are canonicalized.
+    let from_display = from.display().to_string();
+    let from = from_display.trim_end_matches(['/', '\\']);
+    let from = if from.is_empty() {
+        from_display.as_str()
+    } else {
+        from
+    };
+    let to_display = to.display().to_string();
+    let to = to_display.trim_end_matches(['/', '\\']);
+    let to = if to.is_empty() {
+        to_display.as_str()
+    } else {
+        to
+    };
     for message in messages {
         for part in &mut message.content {
             if let ChatContentPart::Text { text } = part {
-                *text = text.replace(&from, &to);
+                *text = text.replace(from, to);
             }
         }
         if let Some(tool_calls) = &mut message.tool_calls {
             for call in tool_calls {
-                call.function.arguments = call.function.arguments.replace(&from, &to);
+                call.function.arguments = call.function.arguments.replace(from, to);
             }
         }
         if let Some(reasoning) = &mut message.reasoning_content {
-            *reasoning = reasoning.replace(&from, &to);
+            *reasoning = reasoning.replace(from, to);
         }
     }
 }
@@ -15970,7 +15986,7 @@ mod tests {
 
     #[test]
     fn asgard_canonicalizes_worktree_paths_across_full_history() {
-        let old = Path::new("/tmp/asgard-old");
+        let old = Path::new("/tmp/asgard-old/");
         let live = Path::new("/work/repo");
         let mut message = ChatMessage::assistant("worked in /tmp/asgard-old/src");
         message.tool_calls = Some(vec![crate::llm_client::ToolCall {
@@ -15982,16 +15998,25 @@ mod tests {
             },
         }]);
         message.reasoning_content = Some("check /tmp/asgard-old".to_string());
+        let tool_result = ChatMessage::tool_result(
+            "call-2",
+            "get_active_workspace",
+            r#"{"workspace_path":"/tmp/asgard-old"}"#,
+        );
+        let mut messages = vec![message, tool_result];
 
-        rewrite_asgard_cwd(std::slice::from_mut(&mut message), old, live);
+        rewrite_asgard_cwd(&mut messages, old, live);
 
-        assert!(asgard_message_text(&message).contains("/work/repo/src"));
+        let message = &messages[0];
+        assert!(asgard_message_text(message).contains("/work/repo/src"));
         let call = &message.tool_calls.as_ref().unwrap()[0];
         assert!(call.function.arguments.contains("/work/repo/src/main.rs"));
         assert_eq!(
             message.reasoning_content.as_deref(),
             Some("check /work/repo")
         );
+        assert!(asgard_message_text(&messages[1]).contains("/work/repo"));
+        assert!(!asgard_message_text(&messages[1]).contains("asgard-old"));
     }
 
     #[test]
