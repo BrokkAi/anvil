@@ -27,8 +27,10 @@ use crate::structured_output::StructuredOutputRequest;
 /// the parser do NOT reset the inter-chunk timer -- otherwise a server
 /// or proxy could keep us alive forever by drip-feeding pings.
 ///
-/// Distinct from the reqwest client's overall `.timeout()` (wall-clock).
-pub const DEFAULT_IDLE_CHUNK_TIMEOUT_SECS: u64 = 300;
+/// Also used as the pre-stream HTTP send budget for streaming requests:
+/// if response headers do not arrive within this window, the request is
+/// retried instead of waiting for reqwest's last-resort wall-clock timeout.
+pub const DEFAULT_IDLE_CHUNK_TIMEOUT_SECS: u64 = 120;
 
 /// Default value for `--llm-stall-timeout-secs`: the maximum gap between
 /// meaningful chunks after the first progress event has arrived.
@@ -1805,6 +1807,7 @@ impl OpenAiClient {
                 req
             },
             Some(&cancel),
+            Some(idle_timeouts.first_progress),
         )
         .await
         {

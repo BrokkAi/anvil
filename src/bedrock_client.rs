@@ -708,6 +708,7 @@ impl BedrockClient {
                     .json(&body)
             },
             Some(&cancel),
+            Some(idle_timeouts.first_progress),
         )
         .await?;
         let status = resp.status();

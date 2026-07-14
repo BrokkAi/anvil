@@ -135,19 +135,42 @@ pub(crate) async fn send_with_retries(
     operation: &str,
     mut make_request: impl FnMut() -> reqwest::RequestBuilder,
     cancel: Option<&CancellationToken>,
+    request_timeout: Option<Duration>,
 ) -> Result<reqwest::Response> {
     for attempt in 1..=LLM_MAX_ATTEMPTS {
         let send = make_request().send();
-        let response = if let Some(cancel) = cancel {
+        let response = if let Some(timeout) = request_timeout {
+            if let Some(cancel) = cancel {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        anyhow::bail!("{operation} was cancelled while sending request");
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        Err(anyhow::anyhow!(
+                            "request produced no response headers within {timeout:?}"
+                        ))
+                    }
+                    response = send => response.with_context(|| operation.to_string()),
+                }
+            } else {
+                match tokio::time::timeout(timeout, send).await {
+                    Ok(response) => response.with_context(|| operation.to_string()),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "request produced no response headers within {timeout:?}"
+                    )),
+                }
+            }
+        } else if let Some(cancel) = cancel {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     anyhow::bail!("{operation} was cancelled while sending request");
                 }
-                response = send => response,
+                response = send => response.with_context(|| operation.to_string()),
             }
         } else {
-            send.await
+            send.await.with_context(|| operation.to_string())
         };
         match response {
             Ok(resp) if is_retryable_status(resp.status()) && attempt < LLM_MAX_ATTEMPTS => {
@@ -155,11 +178,11 @@ pub(crate) async fn send_with_retries(
                 sleep_before_retry(operation, attempt, format!("HTTP {status}"), cancel).await?;
             }
             Ok(resp) => return Ok(resp),
-            Err(err) if is_retryable_reqwest_error(&err) && attempt < LLM_MAX_ATTEMPTS => {
-                let reason = err.to_string();
+            Err(err) if is_retryable_send_error(&err) && attempt < LLM_MAX_ATTEMPTS => {
+                let reason = format!("{err:#}");
                 sleep_before_retry(operation, attempt, reason, cancel).await?;
             }
-            Err(err) => return Err(err).with_context(|| operation.to_string()),
+            Err(err) => return Err(err),
         }
     }
 
@@ -174,6 +197,15 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     !err.is_builder() && !err.is_redirect() && !err.is_status() && !err.is_decode()
+}
+
+fn is_retryable_send_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(is_retryable_reqwest_error)
+        || err
+            .to_string()
+            .contains("request produced no response headers within")
 }
 
 pub(crate) async fn sleep_before_retry(
@@ -336,7 +368,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            send_with_retries("slow HTTP test", || http.get(&url), Some(&cancel)),
+            send_with_retries("slow HTTP test", || http.get(&url), Some(&cancel), None),
         )
         .await
         .expect("cancelled HTTP request should return before test timeout")
@@ -349,6 +381,49 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "cancelled HTTP request waited too long"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_retries_honors_explicit_request_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("eventually")
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("build reqwest client");
+        let url = format!("{}/slow", server.uri());
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_with_retries(
+                "slow HTTP test",
+                || http.get(&url),
+                None,
+                Some(Duration::from_millis(10)),
+            ),
+        )
+        .await
+        .expect("explicit request timeout should return before test timeout")
+        .expect_err("slow request should fail");
+
+        assert!(
+            format!("{err:#}").contains("request produced no response headers within 10ms"),
+            "unexpected timeout error: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "explicit request timeout waited too long"
         );
     }
 }

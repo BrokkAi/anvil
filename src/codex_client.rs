@@ -301,6 +301,7 @@ impl CodexClient {
                     .json(body)
             },
             Some(&cancel),
+            Some(idle_timeouts.first_progress),
         )
         .await?;
         let status = resp.status();
@@ -379,6 +380,7 @@ async fn fetch_chatgpt_models(
                 .header("originator", ORIGINATOR)
                 .header("Accept", "application/json")
         },
+        None,
         None,
     )
     .await?;
