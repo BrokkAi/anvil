@@ -4779,7 +4779,6 @@ struct AsgardToolResultAssessment {
     summary: Option<String>,
 }
 
-const ASGARD_SLIM_TRAJECTORIES_ENV: &str = "ASGARD_SLIM_TRAJECTORIES";
 const ASGARD_ASSESS_TOOL_RESULTS_TOOL_NAME: &str = "assess_tool_results";
 const ASGARD_TERMINAL_AUDIT_BUILTIN_TOOLS: &[&str] =
     &["read_file", "grep_search", "list_directory"];
@@ -4909,7 +4908,6 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
-    let slim_trajectories = asgard_slim_trajectories_enabled();
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
     let mut initial_advice = None;
@@ -5051,50 +5049,39 @@ async fn run_asgard_trajectory_loop(
                     &outcome.continuation_messages,
                     trajectory_message_start,
                 );
-                let (supervisor_window_messages, grading_usage) = if slim_trajectories {
-                    let (assessments, usage) = run_asgard_candidate_result_assessment(
-                        llm.as_ref(),
-                        AsgardCandidateAssessmentContext {
-                            model: &model,
-                            reasoning_effort,
-                            service_tier,
-                            idle_timeout,
-                        },
-                        cancel,
-                        outcome.continuation_messages.clone(),
-                        &window_messages,
-                    )
-                    .await;
-                    let messages = match assessments {
-                        Ok(assessments) => {
-                            let messages = slim_asgard_window_messages(
-                                &window_messages,
-                                &assessments,
-                            );
-                            tracing::info!(
-                                lane = index + 1,
-                                model,
-                                original_bytes = render_asgard_dossier_messages(&window_messages).len(),
-                                slim_bytes = render_asgard_dossier_messages(&messages).len(),
-                                "slimmed Asgard candidate trajectory"
-                            );
-                            messages
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                lane = index + 1,
-                                model,
-                                "keeping full Asgard trajectory after tool-result assessment failed: {error:#}"
-                            );
-                            window_messages.clone()
-                        }
-                    };
-                    (messages, usage)
-                } else {
-                    (
-                        window_messages.clone(),
-                        crate::llm_client::TokenUsage::default(),
-                    )
+                let (assessments, grading_usage) = run_asgard_candidate_result_assessment(
+                    llm.as_ref(),
+                    AsgardCandidateAssessmentContext {
+                        model: &model,
+                        reasoning_effort,
+                        service_tier,
+                        idle_timeout,
+                    },
+                    cancel,
+                    outcome.continuation_messages.clone(),
+                    &window_messages,
+                )
+                .await;
+                let supervisor_window_messages = match assessments {
+                    Ok(assessments) => {
+                        let messages = slim_asgard_window_messages(&window_messages, &assessments);
+                        tracing::info!(
+                            lane = index + 1,
+                            model,
+                            original_bytes = render_asgard_dossier_messages(&window_messages).len(),
+                            slim_bytes = render_asgard_dossier_messages(&messages).len(),
+                            "slimmed Asgard candidate trajectory"
+                        );
+                        messages
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            lane = index + 1,
+                            model,
+                            "keeping full Asgard trajectory after tool-result assessment failed: {error:#}"
+                        );
+                        window_messages.clone()
+                    }
                 };
                 (
                     index,
@@ -6195,19 +6182,6 @@ fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String {
         rendered.push_str("</message>\n");
     }
     rendered
-}
-
-fn asgard_slim_trajectories_enabled() -> bool {
-    std::env::var(ASGARD_SLIM_TRAJECTORIES_ENV)
-        .ok()
-        .is_some_and(|value| asgard_slim_trajectories_value_enabled(&value))
-}
-
-fn asgard_slim_trajectories_value_enabled(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 fn asgard_window_tool_inventory(messages: &[ChatMessage]) -> Vec<(String, String)> {
@@ -17827,16 +17801,6 @@ mod tests {
         assert!(dossier.contains("END"));
         assert_eq!(dossier.matches(&"x".repeat(9_000)).count(), 1);
         assert!(dossier.contains("small exact result"));
-    }
-
-    #[test]
-    fn asgard_slim_trajectory_flag_accepts_only_explicit_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes", "On"] {
-            assert!(asgard_slim_trajectories_value_enabled(value));
-        }
-        for value in ["", "0", "false", "no", "enabled"] {
-            assert!(!asgard_slim_trajectories_value_enabled(value));
-        }
     }
 
     #[test]
