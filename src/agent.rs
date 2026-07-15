@@ -4780,6 +4780,8 @@ struct AsgardToolResultAssessment {
 }
 
 const ASGARD_ASSESS_TOOL_RESULTS_TOOL_NAME: &str = "assess_tool_results";
+const ASGARD_GET_CANDIDATE_DIFF_TOOL_NAME: &str = "get_candidate_diff";
+const ASGARD_MIN_TOOL_RESULT_BYTES_TO_ASSESS: usize = 8 * 1024;
 const ASGARD_TERMINAL_AUDIT_BUILTIN_TOOLS: &[&str] =
     &["read_file", "grep_search", "list_directory"];
 const ASGARD_TERMINAL_AUDIT_BIFROST_TOOLS: &[&str] = &[
@@ -4791,9 +4793,11 @@ const ASGARD_TERMINAL_AUDIT_BIFROST_TOOLS: &[&str] = &[
 const ASGARD_TERMINAL_AUDIT_MAX_STEPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-struct AsgardCandidateTestEdits {
+struct AsgardCandidatePatchManifest {
+    candidate_changed_production_files: Vec<String>,
     candidate_created_test_files: Vec<String>,
     candidate_modified_test_files: Vec<String>,
+    patch_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4961,6 +4965,7 @@ async fn run_asgard_trajectory_loop(
     };
     let mut current_window_steps = initial_advice.next_window_steps;
     let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
+    let mut current_supervisor_state_summary = initial_advice.state_summary.clone();
     send_thought(
         cx,
         session_id,
@@ -5011,6 +5016,8 @@ async fn run_asgard_trajectory_loop(
             let base_commit = repository.base_commit.clone();
             let cancel = cancel.clone();
             let inherited_plan = canonical_plan.clone();
+            let assessment_original_task = original_task.clone();
+            let assessment_state_summary = current_supervisor_state_summary.clone();
             let window_steps = current_window_steps;
             let candidate_output = live_output.clone();
             futures.push(async move {
@@ -5056,9 +5063,11 @@ async fn run_asgard_trajectory_loop(
                         reasoning_effort,
                         service_tier,
                         idle_timeout,
+                        original_task: &assessment_original_task,
+                        canonical_state_summary: &assessment_state_summary,
+                        current_plan: outcome.current_plan.as_ref(),
                     },
                     cancel,
-                    outcome.continuation_messages.clone(),
                     &window_messages,
                 )
                 .await;
@@ -5192,6 +5201,7 @@ async fn run_asgard_trajectory_loop(
         let winner_index = decision.winner;
         let supervisor_complete = decision.complete;
         let supervisor_completion_summary = decision.state_summary.clone();
+        current_supervisor_state_summary = decision.state_summary.clone();
         next_advices = Some(decision.advices.clone());
         if !supervisor_complete && let Some(advices) = &next_advices {
             current_window_steps = decision
@@ -5424,6 +5434,7 @@ async fn run_asgard_supervisor(
         };
         Some(AsgardTerminalAuditContext {
             registries,
+            candidates,
             terminal_lanes,
             definitions,
         })
@@ -5431,48 +5442,37 @@ async fn run_asgard_supervisor(
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
         let trajectory = render_asgard_dossier_messages(&candidate.supervisor_window_messages);
-        let terminal_patch =
-            asgard_terminal_non_test_patch(&candidate.outcome.stop, &candidate.patch)
-                .map(|patch| {
-                    format!(
-                        "<terminal_non_test_patch cumulative_from_task_baseline=\"true\">\n{}\n\
-                     </terminal_non_test_patch>\n",
-                        if patch.trim().is_empty() {
-                            "(no non-test changes)"
-                        } else {
-                            patch.as_str()
-                        }
-                    )
-                })
-                .unwrap_or_default();
+        let candidate_changed_production_files =
+            asgard_patch_production_inventory(&candidate.patch);
         let (candidate_created_test_files, candidate_modified_test_files) =
             asgard_patch_test_inventory(&candidate.patch);
-        let candidate_test_edits = match serde_json::to_string_pretty(&AsgardCandidateTestEdits {
-            candidate_created_test_files,
-            candidate_modified_test_files,
-        }) {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                return (
-                    Err(anyhow::anyhow!(
-                        "failed to serialize Asgard lane {} test-file edits: {error}",
-                        candidate.index
-                    )),
-                    crate::llm_client::TokenUsage::default(),
-                );
-            }
-        };
+        let candidate_patch_manifest =
+            match serde_json::to_string_pretty(&AsgardCandidatePatchManifest {
+                candidate_changed_production_files,
+                candidate_created_test_files,
+                candidate_modified_test_files,
+                patch_bytes: candidate.patch.len(),
+            }) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return (
+                        Err(anyhow::anyhow!(
+                            "failed to serialize Asgard lane {} patch manifest: {error}",
+                            candidate.index
+                        )),
+                        crate::llm_client::TokenUsage::default(),
+                    );
+                }
+            };
         candidate_trajectories.push_str(&format!(
             "\n<lane_trajectory index=\"{}\" model=\"{}\" stop=\"{:?}\">\n\
-             <candidate_test_file_edits derived_from_full_patch=\"true\">\n{}\n\
-             </candidate_test_file_edits>\n\
-             {}\
+             <candidate_patch_manifest derived_from_full_patch=\"true\">\n{}\n\
+             </candidate_patch_manifest>\n\
              <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
             candidate.index,
             candidate.model,
             candidate.outcome.stop,
-            candidate_test_edits,
-            terminal_patch,
+            candidate_patch_manifest,
             trajectory,
         ));
     }
@@ -5523,12 +5523,14 @@ struct AsgardSupervisorToolContext<'a> {
 
 struct AsgardTerminalAuditContext<'a> {
     registries: &'a [Arc<crate::tools::ToolRegistry>],
+    candidates: &'a [AsgardCandidate],
     terminal_lanes: Vec<usize>,
     definitions: Vec<ToolDefinition>,
 }
 
 fn asgard_is_terminal_audit_tool(name: &str) -> bool {
-    ASGARD_TERMINAL_AUDIT_BUILTIN_TOOLS.contains(&name)
+    name == ASGARD_GET_CANDIDATE_DIFF_TOOL_NAME
+        || ASGARD_TERMINAL_AUDIT_BUILTIN_TOOLS.contains(&name)
         || ASGARD_TERMINAL_AUDIT_BIFROST_TOOLS.contains(&name)
 }
 
@@ -5541,7 +5543,7 @@ fn asgard_terminal_audit_tool_definitions(
         .copied()
         .map(serde_json::Value::from)
         .collect::<Vec<_>>();
-    definitions
+    let mut definitions = definitions
         .into_iter()
         .filter(|definition| asgard_is_terminal_audit_tool(&definition.function.name))
         .filter_map(|mut definition| {
@@ -5568,7 +5570,31 @@ fn asgard_terminal_audit_tool_definitions(
             );
             Some(definition)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    definitions.push(asgard_get_candidate_diff_tool(terminal_lanes));
+    definitions
+}
+
+fn asgard_get_candidate_diff_tool(terminal_lanes: &[usize]) -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".to_string(),
+        function: FunctionDef {
+            name: ASGARD_GET_CANDIDATE_DIFF_TOOL_NAME.to_string(),
+            description: "Read the exact cumulative uncommitted patch from the task baseline for one naturally completed candidate lane. Use this after choosing a provisional winner when its trajectory and patch manifest do not establish what actually changed.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["lane"],
+                "properties": {
+                    "lane": {
+                        "type": "integer",
+                        "enum": terminal_lanes,
+                        "description": "Zero-based naturally completed candidate lane to inspect."
+                    }
+                }
+            }),
+        },
+    }
 }
 
 fn asgard_terminal_audit_arguments(
@@ -5601,6 +5627,20 @@ async fn execute_asgard_terminal_audit_tool(
         Ok(parsed) => parsed,
         Err(error) => return format!("Error: {error}"),
     };
+    if name == ASGARD_GET_CANDIDATE_DIFF_TOOL_NAME {
+        let Some(candidate) = audit
+            .candidates
+            .iter()
+            .find(|candidate| candidate.index == lane)
+        else {
+            return format!("Error: candidate lane {lane} has no captured patch");
+        };
+        return if candidate.patch.is_empty() {
+            "(no changes from task baseline)".to_string()
+        } else {
+            String::from_utf8_lossy(&candidate.patch).into_owned()
+        };
+    }
     let Some(registry) = audit.registries.get(lane) else {
         return format!("Error: candidate lane {lane} has no checkout registry");
     };
@@ -6043,7 +6083,7 @@ fn asgard_supervisor_messages(
     terminal_audit_available: bool,
 ) -> Vec<ChatMessage> {
     let terminal_audit_policy = if terminal_audit_available {
-        "One or more lanes ended naturally, so read-only terminal-audit tools are available for those lanes. First choose a provisional winner from the trajectories. If repository inspection could resolve a material completion uncertainty, use the lane-aware read_file, grep_search, list_directory, or Bifrost symbol tools against that naturally completed lane. These tools cannot modify the checkout and are for final correctness auditing, not another implementation rollout. When ready, call select_trajectory by itself."
+        "One or more lanes ended naturally, so read-only terminal-audit tools are available for those lanes. First choose a provisional winner from the trajectories. Use get_candidate_diff when the patch manifest and trajectory do not expose enough of the provisional winner's actual changes. If unchanged repository source could resolve a material completion uncertainty, use the lane-aware read_file, grep_search, list_directory, or Bifrost symbol tools. These tools cannot modify the checkout and are for final correctness auditing, not another implementation rollout. When ready, call select_trajectory by itself."
     } else {
         "No lane ended naturally in this window, so repository audit tools are intentionally unavailable. Call select_trajectory without attempting other tools."
     };
@@ -6062,9 +6102,7 @@ The selected trajectory is the shared canonical history. Candidate trajectories 
 
 Read the actual model messages, tool calls, commands, and tool results in every trajectory. Decide what each call establishes from its command and output; do not assume that a successful shell status means the relevant behavior ran or passed, especially through filters, pipelines, wrappers, timeouts, or zero-test selections. Never claim a check ran when the trajectory does not show it. A build demonstrates compilation, not necessarily behavior. A still-unexplained failure on a changed surface is evidence against completion.
 
-The candidate_test_file_edits inventory is derived from the full candidate patch only to make test authorship visible. Candidate-written or candidate-modified tests can be useful diagnostics, and legitimate contract changes may require updating tests or mocks. But a green run after changing its own tests is not independent confirmation: inspect whether the tests were strengthened to express the task or merely adapted to accept the implementation. Do not mechanically reject test edits, and do not let self-confirming checks outweigh contradictory pre-existing or boundary-level evidence.
-
-A lane that ended naturally also includes terminal_non_test_patch: the cumulative current production diff from the task baseline with test-file sections removed. It is authoritative for what changed, but it is not the full source tree and does not prove that unchanged code already implements a required behavior. Compare it directly with every explicit task requirement and with the trajectory's claims and checks. Its absence only means the lane reached an Asgard window boundary rather than a natural endpoint; ordinary lane selection should continue to use the trajectory evidence.
+The candidate_patch_manifest is derived from the full cumulative candidate patch. It identifies changed production files, candidate-created or modified test files, and patch size without automatically injecting patch hunks. Candidate-written or candidate-modified tests can be useful diagnostics, and legitimate contract changes may require updating tests or mocks. But a green run after changing its own tests is not independent confirmation: inspect whether the tests were strengthened to express the task or merely adapted to accept the implementation. Do not mechanically reject test edits, and do not let self-confirming checks outweigh contradictory pre-existing or boundary-level evidence. For a naturally completed provisional winner, get_candidate_diff returns the exact cumulative patch when the manifest and trajectory leave a consequential uncertainty about what changed.
 
 Stay within scope. Do not repair dependencies, lockfiles, build configuration, toolchains, wrappers, generated build machinery, warning policy, test selection, or expected outputs merely to hide a failure, unless the original task requires that surface or the candidate changed it and must correct the resulting defect. Treat a failure as environmental, pre-existing, flaky, or unrelated only when the trajectories provide concrete evidence. Do not weaken task-mandated behavior to preserve obsolete mocks or callers; updating genuinely affected tests and mocks is in scope.
 
@@ -6196,6 +6234,61 @@ fn asgard_window_tool_inventory(messages: &[ChatMessage]) -> Vec<(String, String
         .collect()
 }
 
+fn asgard_window_tool_result_bytes(
+    messages: &[ChatMessage],
+    inventory: &[(String, String)],
+) -> usize {
+    let ids = inventory
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| ids.contains(id))
+        })
+        .flat_map(|message| &message.content)
+        .map(|part| match part {
+            ChatContentPart::Text { text } => text.len(),
+            ChatContentPart::Image { image_url } => image_url.len(),
+        })
+        .sum()
+}
+
+fn asgard_tool_result_assessment_messages(
+    context: &AsgardCandidateAssessmentContext<'_>,
+    window_messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let plan = context
+        .current_plan
+        .and_then(|plan| serde_json::to_string_pretty(plan).ok())
+        .unwrap_or_else(|| "(no active plan)".to_string());
+    vec![
+        ChatMessage::system(
+            "You are preparing a compact, loss-aware view of one completed Asgard candidate \
+             window for a trajectory supervisor. Assess only the supplied window. Preserve \
+             adverse and verification evidence exactly enough for a correctness decision, and \
+             prefer full when uncertain whether details matter.",
+        ),
+        ChatMessage::user(format!(
+            "ORIGINAL TASK (complete):\n{}",
+            context.original_task
+        )),
+        ChatMessage::assistant(format!(
+            "<canonical_state_summary>\n{}\n</canonical_state_summary>\n\
+             <current_plan>\n{}\n</current_plan>",
+            context.canonical_state_summary, plan,
+        )),
+        ChatMessage::user(format!(
+            "<candidate_window>\n{}\n</candidate_window>",
+            render_asgard_dossier_messages(window_messages),
+        )),
+    ]
+}
+
 fn asgard_tool_result_assessment_prompt(inventory: &[(String, String)]) -> ChatMessage {
     let calls = inventory
         .iter()
@@ -6233,11 +6326,7 @@ Tool calls from this window:
     ))
 }
 
-fn asgard_assess_tool_results_tool(inventory: &[(String, String)]) -> ToolDefinition {
-    let ids = inventory
-        .iter()
-        .map(|(id, _)| serde_json::Value::String(id.clone()))
-        .collect::<Vec<_>>();
+fn asgard_assess_tool_results_tool() -> ToolDefinition {
     ToolDefinition {
         r#type: "function".to_string(),
         function: FunctionDef {
@@ -6250,14 +6339,13 @@ fn asgard_assess_tool_results_tool(inventory: &[(String, String)]) -> ToolDefini
                 "properties": {
                     "assessments": {
                         "type": "array",
-                        "minItems": inventory.len(),
-                        "maxItems": inventory.len(),
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
-                            "required": ["tool_call_id", "disposition", "explanation"],
+                            "required": ["tool_call_id", "disposition"],
                             "properties": {
-                                "tool_call_id": { "type": "string", "enum": ids },
+                                "tool_call_id": { "type": "string", "minLength": 1 },
                                 "disposition": {
                                     "type": "string",
                                     "enum": ["omit", "full", "summary"],
@@ -6290,70 +6378,74 @@ fn parse_asgard_tool_result_assessments(
         .get("assessments")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("assess_tool_results requires an assessments array"))?;
-    if raw.len() != inventory.len() {
-        anyhow::bail!(
-            "assess_tool_results returned {} assessments for {} tool calls",
-            raw.len(),
-            inventory.len()
-        );
-    }
     let expected: HashSet<&str> = inventory.iter().map(|(id, _)| id.as_str()).collect();
     if expected.len() != inventory.len() {
         anyhow::bail!("window contains duplicate tool call IDs");
     }
-    let mut parsed = HashMap::with_capacity(raw.len());
+    let retain_full = |id: &str, reason: &str| AsgardToolResultAssessment {
+        tool_call_id: id.to_string(),
+        disposition: AsgardToolResultDisposition::Full,
+        explanation: reason.to_string(),
+        summary: None,
+    };
+    let mut parsed = HashMap::with_capacity(inventory.len());
     for value in raw {
-        let mut assessment: AsgardToolResultAssessment = serde_json::from_value(value.clone())?;
-        assessment.explanation = assessment.explanation.trim().to_string();
-        if assessment.explanation.is_empty() {
-            anyhow::bail!(
-                "assessment for {:?} has an empty explanation",
-                assessment.tool_call_id
+        let Some(id) = value
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| expected.contains(*id))
+        else {
+            continue;
+        };
+        let explanation = value
+            .get("explanation")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("No candidate explanation supplied.")
+            .to_string();
+        let disposition = value
+            .get("disposition")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let assessment = match disposition {
+            Some(AsgardToolResultDisposition::Omit) => AsgardToolResultAssessment {
+                tool_call_id: id.to_string(),
+                disposition: AsgardToolResultDisposition::Omit,
+                explanation,
+                summary: None,
+            },
+            Some(AsgardToolResultDisposition::Summary) => value
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .map(|summary| AsgardToolResultAssessment {
+                    tool_call_id: id.to_string(),
+                    disposition: AsgardToolResultDisposition::Summary,
+                    explanation,
+                    summary: Some(summary.to_string()),
+                })
+                .unwrap_or_else(|| retain_full(id, "Candidate summary was missing or empty.")),
+            Some(AsgardToolResultDisposition::Full) => AsgardToolResultAssessment {
+                tool_call_id: id.to_string(),
+                disposition: AsgardToolResultDisposition::Full,
+                explanation,
+                summary: None,
+            },
+            None => retain_full(id, "Candidate disposition was missing or invalid."),
+        };
+        if parsed.insert(id.to_string(), assessment).is_some() {
+            parsed.insert(
+                id.to_string(),
+                retain_full(id, "Candidate assessed this result more than once."),
             );
-        }
-        if !expected.contains(assessment.tool_call_id.as_str()) {
-            anyhow::bail!(
-                "assessment names unknown tool call {:?}",
-                assessment.tool_call_id
-            );
-        }
-        match assessment.disposition {
-            AsgardToolResultDisposition::Summary => {
-                let summary = assessment.summary.as_mut().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "summary assessment for {:?} omitted its summary",
-                        assessment.tool_call_id
-                    )
-                })?;
-                *summary = summary.trim().to_string();
-                if summary.is_empty() {
-                    anyhow::bail!(
-                        "summary assessment for {:?} has an empty summary",
-                        assessment.tool_call_id
-                    );
-                }
-            }
-            AsgardToolResultDisposition::Omit | AsgardToolResultDisposition::Full => {
-                if assessment
-                    .summary
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                {
-                    anyhow::bail!(
-                        "non-summary assessment for {:?} included a summary",
-                        assessment.tool_call_id
-                    );
-                }
-                assessment.summary = None;
-            }
-        }
-        let id = assessment.tool_call_id.clone();
-        if parsed.insert(id.clone(), assessment).is_some() {
-            anyhow::bail!("tool call {id:?} was assessed more than once");
         }
     }
-    if parsed.len() != expected.len() {
-        anyhow::bail!("not every tool call was assessed exactly once");
+    for (id, _) in inventory {
+        parsed
+            .entry(id.clone())
+            .or_insert_with(|| retain_full(id, "Candidate omitted this result assessment."));
     }
     Ok(parsed)
 }
@@ -6362,7 +6454,6 @@ async fn run_asgard_candidate_result_assessment(
     llm: &dyn crate::llm_client::LlmBackend,
     context: AsgardCandidateAssessmentContext<'_>,
     cancel: tokio_util::sync::CancellationToken,
-    mut messages: Vec<ChatMessage>,
     window_messages: &[ChatMessage],
 ) -> (
     anyhow::Result<HashMap<String, AsgardToolResultAssessment>>,
@@ -6373,8 +6464,18 @@ async fn run_asgard_candidate_result_assessment(
     if inventory.is_empty() {
         return (Ok(HashMap::new()), Default::default());
     }
+    let result_bytes = asgard_window_tool_result_bytes(window_messages, &inventory);
+    if result_bytes < ASGARD_MIN_TOOL_RESULT_BYTES_TO_ASSESS {
+        tracing::debug!(
+            result_bytes,
+            threshold = ASGARD_MIN_TOOL_RESULT_BYTES_TO_ASSESS,
+            "keeping exact Asgard window below tool-result assessment threshold"
+        );
+        return (Ok(HashMap::new()), Default::default());
+    }
+    let mut messages = asgard_tool_result_assessment_messages(&context, window_messages);
     messages.push(asgard_tool_result_assessment_prompt(&inventory));
-    let tools = vec![asgard_assess_tool_results_tool(&inventory)];
+    let tools = vec![asgard_assess_tool_results_tool()];
     let mut usage = crate::llm_client::TokenUsage::default();
     let mut last_invalid_response = None;
 
@@ -6478,6 +6579,9 @@ struct AsgardCandidateAssessmentContext<'a> {
     reasoning_effort: Option<&'a str>,
     service_tier: Option<&'a str>,
     idle_timeout: IdleTimeouts,
+    original_task: &'a str,
+    canonical_state_summary: &'a str,
+    current_plan: Option<&'a crate::plan::UpdatePlanArgs>,
 }
 
 fn slim_asgard_window_messages(
@@ -6737,36 +6841,22 @@ fn asgard_patch_test_inventory(patch: &[u8]) -> (Vec<String>, Vec<String>) {
     (created, modified)
 }
 
-fn asgard_terminal_non_test_patch(
-    stop: &crate::tool_loop::LoopStop,
-    patch: &[u8],
-) -> Option<String> {
-    matches!(stop, crate::tool_loop::LoopStop::Completed { .. })
-        .then(|| asgard_non_test_patch(patch))
-}
-
-fn asgard_non_test_patch(patch: &[u8]) -> String {
+fn asgard_patch_production_inventory(patch: &[u8]) -> Vec<String> {
     let patch = String::from_utf8_lossy(patch);
-    let mut rendered = String::new();
-    let mut section = String::new();
-    let mut include_section = false;
-
-    for line in patch.split_inclusive('\n') {
+    let mut paths = BTreeSet::new();
+    for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if include_section {
-                rendered.push_str(&section);
+            let Some((old_path, new_path)) = rest.split_once(" b/") else {
+                continue;
+            };
+            for path in [old_path, new_path.trim_end()] {
+                if !asgard_is_test_path(path) {
+                    paths.insert(path.to_string());
+                }
             }
-            section.clear();
-            include_section = rest.split_once(" b/").is_some_and(|(old_path, new_path)| {
-                !asgard_is_test_path(old_path) && !asgard_is_test_path(new_path.trim_end())
-            });
         }
-        section.push_str(line);
     }
-    if include_section {
-        rendered.push_str(&section);
-    }
-    rendered
+    paths.into_iter().collect()
 }
 
 fn asgard_flush_patch_test_path(
@@ -17832,7 +17922,7 @@ mod tests {
     }
 
     #[test]
-    fn asgard_result_assessment_requires_every_call_and_summary_content() {
+    fn asgard_result_assessment_conservatively_retains_malformed_items() {
         let inventory = vec![
             ("call-read".to_string(), "read_file".to_string()),
             ("call-test".to_string(), "runShellCommand".to_string()),
@@ -17865,38 +17955,48 @@ mod tests {
             Some("Exit 1: parser_boundary failed at tests/parser.rs:42.")
         );
 
-        assert!(
-            parse_asgard_tool_result_assessments(
-                &serde_json::json!({
-                    "assessments": [{
-                        "tool_call_id": "call-read",
-                        "disposition": "full",
-                        "explanation": "Exact output matters."
-                    }]
-                }),
-                &inventory,
-            )
-            .is_err()
+        let missing_item = parse_asgard_tool_result_assessments(
+            &serde_json::json!({
+                "assessments": [{
+                    "tool_call_id": "call-read",
+                    "disposition": "full"
+                }]
+            }),
+            &inventory,
         );
-        assert!(
-            parse_asgard_tool_result_assessments(
-                &serde_json::json!({
-                    "assessments": [
-                        {
-                            "tool_call_id": "call-read",
-                            "disposition": "omit",
-                            "explanation": "Not useful."
-                        },
-                        {
-                            "tool_call_id": "call-test",
-                            "disposition": "summary",
-                            "explanation": "No summary supplied."
-                        }
-                    ]
-                }),
-                &inventory,
-            )
-            .is_err()
+        let missing_item = missing_item.expect("missing item should fail soft");
+        assert_eq!(
+            missing_item["call-test"].disposition,
+            AsgardToolResultDisposition::Full
+        );
+
+        let missing_summary = parse_asgard_tool_result_assessments(
+            &serde_json::json!({
+                "assessments": [
+                    {
+                        "tool_call_id": "call-read",
+                        "disposition": "omit"
+                    },
+                    {
+                        "tool_call_id": "call-test",
+                        "disposition": "summary"
+                    },
+                    {
+                        "tool_call_id": "unknown-call",
+                        "disposition": "omit"
+                    }
+                ]
+            }),
+            &inventory,
+        );
+        let missing_summary = missing_summary.expect("malformed items should fail soft");
+        assert_eq!(
+            missing_summary["call-read"].disposition,
+            AsgardToolResultDisposition::Omit
+        );
+        assert_eq!(
+            missing_summary["call-test"].disposition,
+            AsgardToolResultDisposition::Full
         );
     }
 
@@ -18094,9 +18194,11 @@ mod tests {
                 reasoning_effort: None,
                 service_tier: None,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                original_task: "Edit both files.",
+                canonical_state_summary: "The task has just started.",
+                current_plan: None,
             },
             tokio_util::sync::CancellationToken::new(),
-            window.clone(),
             &window,
         )
         .await;
@@ -18108,6 +18210,53 @@ mod tests {
         );
         assert!(usage.is_zero());
         assert!(backend.requests.lock().expect("request lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn asgard_small_tool_result_windows_skip_result_assessment_call() {
+        let backend = ScriptedSupervisorBackend::new(vec![]);
+        let mut assistant = ChatMessage::assistant("I inspected the focused file.");
+        assistant.tool_calls = Some(vec![supervisor_tool_call(
+            "call-read",
+            "read_file",
+            serde_json::json!({"file_path":"src/lib.rs"}),
+        )]);
+        let window = vec![
+            assistant,
+            ChatMessage::tool_result("call-read", "read_file", "small exact result"),
+        ];
+
+        let (assessments, usage) = run_asgard_candidate_result_assessment(
+            &backend,
+            AsgardCandidateAssessmentContext {
+                model: "deepseek::deepseek-v4-flash",
+                reasoning_effort: None,
+                service_tier: None,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                original_task: "Inspect the implementation.",
+                canonical_state_summary: "Inspection is in progress.",
+                current_plan: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            &window,
+        )
+        .await;
+
+        assert!(assessments.expect("small window should succeed").is_empty());
+        assert!(usage.is_zero());
+        assert!(backend.requests.lock().expect("request lock").is_empty());
+    }
+
+    #[test]
+    fn asgard_assessment_tool_schema_is_stable_across_windows() {
+        let tool = asgard_assess_tool_results_tool();
+        let assessments = &tool.function.parameters["properties"]["assessments"];
+        let id = &assessments["items"]["properties"]["tool_call_id"];
+
+        assert_eq!(assessments["minItems"], 1);
+        assert!(assessments.get("maxItems").is_none());
+        assert_eq!(id["type"], "string");
+        assert!(id.get("enum").is_none());
     }
 
     #[tokio::test]
@@ -18150,13 +18299,19 @@ mod tests {
         )]);
         let window = vec![
             assistant,
-            ChatMessage::tool_result("call-test", "runShellCommand", "long test output"),
+            ChatMessage::tool_result(
+                "call-test",
+                "runShellCommand",
+                format!("long test output {}", "x".repeat(9_000)),
+            ),
         ];
-        let mut history = vec![
-            ChatMessage::system("normal Anvil system prompt"),
-            ChatMessage::user("Fix the parser boundary."),
-        ];
-        history.extend(window.clone());
+        let plan = crate::plan::UpdatePlanArgs {
+            explanation: None,
+            plan: vec![crate::plan::PlanItem {
+                step: "Verify the parser boundary".to_string(),
+                status: crate::plan::StepStatus::InProgress,
+            }],
+        };
 
         let (assessments, usage) = run_asgard_candidate_result_assessment(
             &backend,
@@ -18165,9 +18320,11 @@ mod tests {
                 reasoning_effort: None,
                 service_tier: None,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                original_task: "Fix the parser boundary.",
+                canonical_state_summary: "The implementation exists but verification is pending.",
+                current_plan: Some(&plan),
             },
             tokio_util::sync::CancellationToken::new(),
-            history.clone(),
             &window,
         )
         .await;
@@ -18181,7 +18338,17 @@ mod tests {
         let requests = backend.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].tool_names, vec!["assess_tool_results"]);
-        assert_eq!(&requests[0].messages[..history.len()], history.as_slice());
+        let compact_context = requests[0]
+            .messages
+            .iter()
+            .map(asgard_message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(compact_context.contains("Fix the parser boundary."));
+        assert!(compact_context.contains("verification is pending"));
+        assert!(compact_context.contains("Verify the parser boundary"));
+        assert!(compact_context.contains("long test output"));
+        assert!(!compact_context.contains("normal Anvil system prompt"));
         let prompt = asgard_message_text(requests[0].messages.last().expect("assessment prompt"));
         assert!(prompt.contains("Rubric:"));
         assert!(prompt.contains("omit:"));
@@ -18530,7 +18697,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read_file", "search_symbols"]
+            vec!["read_file", "search_symbols", "get_candidate_diff"]
         );
         for tool in tools {
             assert_eq!(
@@ -18542,11 +18709,13 @@ mod tests {
                     .as_array()
                     .is_some_and(|required| required.iter().any(|value| value == "lane"))
             );
-            assert!(
-                tool.function
-                    .description
-                    .contains("Read-only terminal audit")
-            );
+            if tool.function.name != ASGARD_GET_CANDIDATE_DIFF_TOOL_NAME {
+                assert!(
+                    tool.function
+                        .description
+                        .contains("Read-only terminal audit")
+                );
+            }
         }
     }
 
@@ -18609,6 +18778,7 @@ mod tests {
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 terminal_audit: Some(AsgardTerminalAuditContext {
                     registries: &registries,
+                    candidates: &[],
                     terminal_lanes: vec![0],
                     definitions,
                 }),
@@ -18638,6 +18808,35 @@ mod tests {
             message.role == "tool"
                 && asgard_message_text(message).contains("decisive repository evidence")
         }));
+    }
+
+    #[tokio::test]
+    async fn asgard_terminal_diff_tool_returns_captured_candidate_patch() {
+        let candidates = vec![AsgardCandidate {
+            index: 0,
+            model: "deepseek::deepseek-v4-flash".to_string(),
+            outcome: asgard_failure(anyhow::anyhow!("unused test outcome")),
+            patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+fixed\n".to_vec(),
+            supervisor_window_messages: Vec::new(),
+        }];
+        let registries = Vec::new();
+        let audit = AsgardTerminalAuditContext {
+            registries: &registries,
+            candidates: &candidates,
+            terminal_lanes: vec![0],
+            definitions: vec![asgard_get_candidate_diff_tool(&[0])],
+        };
+
+        let output = execute_asgard_terminal_audit_tool(
+            &audit,
+            ASGARD_GET_CANDIDATE_DIFF_TOOL_NAME,
+            serde_json::json!({"lane": 0}),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(output.contains("diff --git a/src/lib.rs"));
+        assert!(output.contains("+fixed"));
     }
 
     #[tokio::test]
@@ -18701,7 +18900,7 @@ mod tests {
     }
 
     #[test]
-    fn asgard_terminal_patch_includes_only_non_test_sections() {
+    fn asgard_production_inventory_excludes_test_files() {
         let patch = b"diff --git a/src/Parser.java b/src/Parser.java\n\
                       --- a/src/Parser.java\n\
                       +++ b/src/Parser.java\n\
@@ -18715,26 +18914,23 @@ mod tests {
                       -old test\n\
                       +new test\n";
 
-        let natural = crate::tool_loop::LoopStop::Completed { had_text: true };
-        let rendered = asgard_terminal_non_test_patch(&natural, patch)
-            .expect("natural completion should expose its production patch");
-        assert!(rendered.contains("src/Parser.java"));
-        assert!(rendered.contains("+new"));
-        assert!(!rendered.contains("ParserTest.java"));
-        assert!(!rendered.contains("new test"));
-
-        let window_boundary = crate::tool_loop::LoopStop::MaxTurns { max_turns: 8 };
-        assert!(asgard_terminal_non_test_patch(&window_boundary, patch).is_none());
+        assert_eq!(
+            asgard_patch_production_inventory(patch),
+            vec!["src/Parser.java"]
+        );
     }
 
     #[test]
-    fn asgard_terminal_patch_excludes_renames_across_test_boundary() {
+    fn asgard_production_inventory_surfaces_renames_across_test_boundary() {
         let patch = b"diff --git a/src/Parser.java b/tests/ParserTest.java\n\
                       similarity index 90%\n\
                       rename from src/Parser.java\n\
                       rename to tests/ParserTest.java\n";
 
-        assert!(asgard_non_test_patch(patch).is_empty());
+        assert_eq!(
+            asgard_patch_production_inventory(patch),
+            vec!["src/Parser.java"]
+        );
     }
 
     #[test]
