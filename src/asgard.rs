@@ -197,6 +197,56 @@ pub(crate) fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
     .stdout)
 }
 
+/// Captures only the candidate changes made since the selected state at the
+/// start of the current window. The selected state is a cumulative patch from
+/// `base_commit`; a temporary index materializes it without changing the
+/// candidate checkout or its real index.
+pub(crate) fn capture_patch_since(
+    root: &Path,
+    base_commit: &str,
+    selected_patch: &[u8],
+) -> Result<Vec<u8>> {
+    let index_path =
+        std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
+    let _index_guard = TemporaryIndex::new(index_path.clone());
+
+    git_with_index(root, &index_path, &["read-tree", base_commit])?;
+    if !selected_patch.is_empty() {
+        let mut child = Command::new("git")
+            .args(["apply", "--cached", "--binary", "-"])
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", &index_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .context("git apply selected Asgard state to temporary index")?
+            .write_all(selected_patch)?;
+        if !child.wait()?.success() {
+            bail!(
+                "failed to materialize selected Asgard state in {}",
+                root.display()
+            );
+        }
+    }
+    add_intent_to_add_untracked(root, &index_path)?;
+    Ok(git_with_index(
+        root,
+        &index_path,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?
+    .stdout)
+}
+
 fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
     let untracked = git_with_index(
         root,
@@ -522,6 +572,37 @@ mod tests {
             "0-deepseek--deepseek-v4-flash"
         );
         assert_eq!(safe_repository_label("lane/model name"), "lane-model-name");
+    }
+
+    #[test]
+    fn captured_window_patch_excludes_the_selected_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        fs::write(repo.join("removed.txt"), "remove later\n").unwrap();
+        run_git(repo, &["add", "tracked.txt", "removed.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+
+        fs::write(repo.join("tracked.txt"), "selected\n").unwrap();
+        fs::write(repo.join("selected-only.txt"), "selected file\n").unwrap();
+        let selected = capture_patch(repo, base_commit.trim()).unwrap();
+
+        fs::write(repo.join("tracked.txt"), "candidate\n").unwrap();
+        fs::remove_file(repo.join("removed.txt")).unwrap();
+        fs::write(repo.join("candidate-only.txt"), "candidate file\n").unwrap();
+        let delta = capture_patch_since(repo, base_commit.trim(), &selected).unwrap();
+        let delta_text = String::from_utf8_lossy(&delta);
+
+        assert!(delta_text.contains("-selected"));
+        assert!(delta_text.contains("+candidate"));
+        assert!(delta_text.contains("candidate-only.txt"));
+        assert!(delta_text.contains("deleted file mode"));
+        assert!(delta_text.contains("removed.txt"));
+        assert!(!delta_text.contains("selected-only.txt"));
     }
 
     #[test]
