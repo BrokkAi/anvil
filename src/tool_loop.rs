@@ -2796,7 +2796,7 @@ async fn execute_step_tool_calls(
     permission_override: Option<PermissionMode>,
 ) -> ExecutedStepOutcome {
     let mut step_results = Vec::new();
-    let ordered_indices = ordered_tool_call_indices(calls, |name| registry.is_bifrost_tool(name));
+    let ordered_indices = ordered_tool_call_indices(calls, registry);
     let mut ordered_position = 0usize;
 
     while ordered_position < ordered_indices.len() {
@@ -5528,21 +5528,41 @@ fn build_editing_diff(
     Some(diff)
 }
 
-fn ordered_tool_call_indices(
-    calls: &[ToolCall],
-    is_bifrost_tool: impl Fn(&str) -> bool,
-) -> Vec<usize> {
-    let mut builtin_or_other = Vec::new();
-    let mut bifrost = Vec::new();
+/// Run same-turn mutations before reads so read/search calls observe fresh
+/// state consistently, regardless of whether a local or MCP tool handles them.
+fn ordered_tool_call_indices(calls: &[ToolCall], registry: &ToolRegistry) -> Vec<usize> {
+    let mut mutations = Vec::new();
+    let mut reads = Vec::new();
     for (index, call) in calls.iter().enumerate() {
-        if is_bifrost_tool(&call.function.name) {
-            bifrost.push(index);
+        if call_is_batch_safe(call, registry) {
+            reads.push(index);
         } else {
-            builtin_or_other.push(index);
+            mutations.push(index);
         }
     }
-    builtin_or_other.extend(bifrost);
-    builtin_or_other
+    mutations.extend(reads);
+    mutations
+}
+
+fn call_is_batch_safe(call: &ToolCall, registry: &ToolRegistry) -> bool {
+    if registry.is_concurrency_safe(&call.function.name) {
+        return true;
+    }
+    if call.function.name != "task" {
+        return false;
+    }
+    let Ok(raw_input) = serde_json::from_str::<Value>(&call.function.arguments) else {
+        return false;
+    };
+    // `task_permission_mode_from_input` already resolves a missing
+    // `permission_mode` field to `TaskPermissionMode::default()` (ReadOnly),
+    // matching how `TaskArgs` resolves it for actual subagent dispatch — a
+    // task call that omits the field really does run read-only, so it's
+    // batch-safe too. Do not require the field to be explicit here.
+    matches!(
+        task_permission_mode_from_input(&raw_input),
+        Ok(TaskPermissionMode::ReadOnly)
+    )
 }
 
 fn parallel_batch_len(
@@ -5555,19 +5575,7 @@ fn parallel_batch_len(
         .copied()
         .take_while(|index| {
             let call = &calls[*index];
-            if registry.is_concurrency_safe(&call.function.name) {
-                return true;
-            }
-            if call.function.name != "task" {
-                return false;
-            }
-            let Ok(raw_input) = serde_json::from_str::<Value>(&call.function.arguments) else {
-                return false;
-            };
-            matches!(
-                task_permission_mode_from_input(&raw_input),
-                Ok(TaskPermissionMode::ReadOnly)
-            )
+            call_is_batch_safe(call, registry)
         })
         .count()
 }
@@ -5599,6 +5607,25 @@ mod tests {
             function: FunctionCall {
                 name: name.to_string(),
                 arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    fn task_call_for_test(id: &str, permission_mode: Option<&str>) -> ToolCall {
+        let mut arguments = serde_json::json!({
+            "description": format!("task {id}"),
+            "prompt": format!("inspect {id}"),
+            "subagent_type": "reviewer",
+        });
+        if let Some(permission_mode) = permission_mode {
+            arguments["permission_mode"] = serde_json::json!(permission_mode);
+        }
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: "task".to_string(),
+                arguments: arguments.to_string(),
             },
         }
     }
@@ -5647,8 +5674,8 @@ mod tests {
         }
     }
 
-    fn ordered_names_for_test(calls: &[ToolCall], bifrost_names: &[&str]) -> Vec<String> {
-        ordered_tool_call_indices(calls, |name| bifrost_names.contains(&name))
+    fn ordered_names_for_test(calls: &[ToolCall], registry: &ToolRegistry) -> Vec<String> {
+        ordered_tool_call_indices(calls, registry)
             .into_iter()
             .map(|index| calls[index].function.name.clone())
             .collect()
@@ -5826,20 +5853,7 @@ mod tests {
         let (_cwd, registry) = empty_registry_for_test().await;
         let calls = vec![
             tool_call_for_test("read_file"),
-            ToolCall {
-                id: "b".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "review b",
-                        "prompt": "inspect b",
-                        "subagent_type": "reviewer",
-                        "permission_mode": "readOnly"
-                    })
-                    .to_string(),
-                },
-            },
+            task_call_for_test("b", Some("readOnly")),
         ];
         let ordered = [0, 1];
 
@@ -5868,51 +5882,15 @@ mod tests {
     async fn parallel_batch_len_groups_only_read_only_task_lanes() {
         let (_cwd, registry) = empty_registry_for_test().await;
         let calls = vec![
-            ToolCall {
-                id: "a".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "review a",
-                        "prompt": "inspect a",
-                        "subagent_type": "reviewer"
-                    })
-                    .to_string(),
-                },
-            },
-            ToolCall {
-                id: "b".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "review b",
-                        "prompt": "inspect b",
-                        "subagent_type": "reviewer",
-                        "permission_mode": "readOnly"
-                    })
-                    .to_string(),
-                },
-            },
-            ToolCall {
-                id: "c".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "task".to_string(),
-                    arguments: serde_json::json!({
-                        "description": "fix c",
-                        "prompt": "edit c",
-                        "subagent_type": "worker",
-                        "permission_mode": "inherit"
-                    })
-                    .to_string(),
-                },
-            },
+            task_call_for_test("a", None),
+            task_call_for_test("b", Some("readOnly")),
+            task_call_for_test("c", Some("inherit")),
             tool_call_for_test("read_file"),
         ];
         let ordered = [0, 1, 2, 3];
 
+        // A missing `permission_mode` defaults to ReadOnly (see
+        // `task_permission_mode_from_input`), so `a` batches alongside `b`.
         assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
         assert_eq!(parallel_batch_len(&registry, &calls, &ordered[2..]), 0);
         assert_eq!(parallel_batch_len(&registry, &calls, &ordered[3..]), 1);
@@ -6596,70 +6574,94 @@ mod tests {
         pure_gate_decision(mode, kind, tool_name, allowed, shell_auto_allow)
     }
 
-    #[test]
-    fn tool_call_order_runs_non_bifrost_before_bifrost() {
+    #[tokio::test]
+    async fn tool_call_order_runs_mutations_before_reads() {
+        let (_cwd, registry) = empty_registry_for_test().await;
         let calls = vec![
-            tool_call_for_test("search_symbols"),
-            tool_call_for_test("read_file"),
-            tool_call_for_test("get_summaries"),
-            tool_call_for_test("run_shell_command"),
-        ];
-
-        let names = ordered_names_for_test(&calls, &["search_symbols", "get_summaries"]);
-
-        assert_eq!(
-            names,
-            vec![
-                "read_file",
-                "run_shell_command",
-                "search_symbols",
-                "get_summaries"
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_call_order_preserves_relative_order_within_groups() {
-        let calls = vec![
-            tool_call_for_test("get_summaries"),
             tool_call_for_test("grep_search"),
-            tool_call_for_test("search_symbols"),
-            tool_call_for_test("read_file"),
-            tool_call_for_test("scan_usages_by_reference"),
-        ];
-
-        let names = ordered_names_for_test(
-            &calls,
-            &[
-                "get_summaries",
-                "search_symbols",
-                "scan_usages_by_reference",
-            ],
-        );
-
-        assert_eq!(
-            names,
-            vec![
-                "grep_search",
-                "read_file",
-                "get_summaries",
-                "search_symbols",
-                "scan_usages_by_reference"
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_call_order_leaves_non_bifrost_batch_unchanged() {
-        let calls = vec![
             tool_call_for_test("edit"),
             tool_call_for_test("read_file"),
+        ];
+
+        let names = ordered_names_for_test(&calls, &registry);
+
+        assert_eq!(names, vec!["edit", "grep_search", "read_file"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_leaves_read_only_batch_unchanged() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("grep_search"),
+            tool_call_for_test("read_file"),
+            task_call_for_test("review", Some("readOnly")),
+        ];
+
+        let names = ordered_names_for_test(&calls, &registry);
+
+        assert_eq!(names, vec!["grep_search", "read_file", "task"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_leaves_mutation_only_batch_unchanged() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("edit"),
+            tool_call_for_test("update_plan"),
             tool_call_for_test("run_shell_command"),
         ];
 
-        let names = ordered_names_for_test(&calls, &["search_symbols"]);
+        let names = ordered_names_for_test(&calls, &registry);
 
-        assert_eq!(names, vec!["edit", "read_file", "run_shell_command"]);
+        assert_eq!(names, vec!["edit", "update_plan", "run_shell_command"]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_places_read_only_tasks_in_read_group() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            task_call_for_test("default", None),
+            task_call_for_test("readonly", Some("readOnly")),
+            task_call_for_test("inherit", Some("inherit")),
+            task_call_for_test("invalid", Some("other")),
+            tool_call_for_test("read_file"),
+        ];
+
+        let ordered = ordered_tool_call_indices(&calls, &registry);
+        let ordered_ids: Vec<_> = ordered
+            .into_iter()
+            .map(|index| calls[index].id.as_str())
+            .collect();
+
+        // `default` omits `permission_mode`, which resolves to ReadOnly (see
+        // `task_permission_mode_from_input`), so it lands in the read group
+        // alongside the explicit `readonly` task. `inherit` and the
+        // unparseable `invalid` mode both stay in the mutation group.
+        assert_eq!(
+            ordered_ids,
+            vec![
+                "inherit",
+                "invalid",
+                "default",
+                "readonly",
+                "call-read_file"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_order_places_update_plan_in_mutation_group() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("read_file"),
+            tool_call_for_test("update_plan"),
+            tool_call_for_test("grep_search"),
+        ];
+
+        let names = ordered_names_for_test(&calls, &registry);
+
+        assert_eq!(names, vec!["update_plan", "read_file", "grep_search"]);
+        assert_eq!(ToolRegistry::tool_kind("update_plan"), ToolKind::Read);
     }
 
     #[test]
