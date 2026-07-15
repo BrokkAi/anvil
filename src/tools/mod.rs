@@ -266,6 +266,7 @@ struct ToolMeta {
     name: &'static str,
     kind: ToolKind,
     display_name: &'static str,
+    concurrency_safe: bool,
 }
 
 const TOOLS: &[ToolMeta] = &[
@@ -274,41 +275,49 @@ const TOOLS: &[ToolMeta] = &[
         name: "read_file",
         kind: ToolKind::Read,
         display_name: "Reading file",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "write_file",
         kind: ToolKind::Edit,
         display_name: "Writing file",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "edit",
         kind: ToolKind::Edit,
         display_name: "Editing file",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "list_directory",
         kind: ToolKind::Read,
         display_name: "Listing directory",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "grep_search",
         kind: ToolKind::Search,
         display_name: "Searching file contents",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "web_search",
         kind: ToolKind::Search,
         display_name: "Searching the web",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "run_shell_command",
         kind: ToolKind::Execute,
         display_name: "Running shell command",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "update_plan",
         kind: ToolKind::Read,
         display_name: "Updating plan",
+        concurrency_safe: false,
     },
     // --- MCP-loaded Bifrost tools (dispatched via `execute_mcp`) -----------
     // Listed here so the permission gate can classify them; their actual
@@ -319,56 +328,67 @@ const TOOLS: &[ToolMeta] = &[
         name: "get_summaries",
         kind: ToolKind::Read,
         display_name: "Getting code summaries",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_active_workspace",
         kind: ToolKind::Read,
         display_name: "Getting active workspace",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_symbols",
         kind: ToolKind::Search,
         display_name: "Searching for symbols",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_ast",
         kind: ToolKind::Search,
         display_name: "Searching AST",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "query_code",
         kind: ToolKind::Search,
         display_name: "Querying code structure",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_locations",
         kind: ToolKind::Search,
         display_name: "Finding symbol locations",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_ancestors",
         kind: ToolKind::Search,
         display_name: "Finding symbol ancestors",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_summaries",
         kind: ToolKind::Search,
         display_name: "Getting symbol summaries",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_symbol_sources",
         kind: ToolKind::Search,
         display_name: "Fetching symbol source",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "most_relevant_files",
         kind: ToolKind::Search,
         display_name: "Finding related files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "scan_usages_by_reference",
         kind: ToolKind::Search,
         display_name: "Scanning symbol usages",
+        concurrency_safe: true,
     },
     // Compatibility classification for Bifrost versions that advertise the
     // legacy unsplit reference name.
@@ -376,22 +396,26 @@ const TOOLS: &[ToolMeta] = &[
         name: "scan_usages",
         kind: ToolKind::Search,
         display_name: "Scanning symbol usages",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "usage_graph",
         kind: ToolKind::Search,
         display_name: "Building usage graph",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_definitions_by_reference",
         kind: ToolKind::Search,
         display_name: "Finding definition",
+        concurrency_safe: true,
     },
     // Compatibility classification for the legacy singular reference name.
     ToolMeta {
         name: "get_definition_by_reference",
         kind: ToolKind::Search,
         display_name: "Finding definition",
+        concurrency_safe: true,
     },
     ToolMeta {
         // bifrost returns the non-mutating rename edit set (it never writes),
@@ -400,142 +424,170 @@ const TOOLS: &[ToolMeta] = &[
         name: "rename_symbol",
         kind: ToolKind::Read,
         display_name: "Computing symbol rename",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "semantic_search",
         kind: ToolKind::Search,
         display_name: "Searching semantically",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_file_contents",
         kind: ToolKind::Read,
         display_name: "Reading file contents",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "classify_test_files",
         kind: ToolKind::Read,
         display_name: "Classifying test files",
+        concurrency_safe: true,
     },
     // Compatibility classification for the legacy test-classification name.
     ToolMeta {
         name: "contains_tests",
         kind: ToolKind::Read,
         display_name: "Checking for test files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "find_filenames",
         kind: ToolKind::Search,
         display_name: "Finding filenames",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "find_files_containing",
         kind: ToolKind::Search,
         display_name: "Finding files containing text",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_file_contents",
         kind: ToolKind::Search,
         display_name: "Searching file contents",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "list_files",
         kind: ToolKind::Read,
         display_name: "Listing files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "skim_files",
         kind: ToolKind::Read,
         display_name: "Skimming files",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "search_git_commit_messages",
         kind: ToolKind::Search,
         display_name: "Searching git commit messages",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_git_log",
         kind: ToolKind::Read,
         display_name: "Reading git log",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "get_commit_diff",
         kind: ToolKind::Read,
         display_name: "Reading commit diff",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "jq",
         kind: ToolKind::Search,
         display_name: "Querying JSON",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "xml_skim",
         kind: ToolKind::Read,
         display_name: "Skimming XML",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "xml_select",
         kind: ToolKind::Search,
         display_name: "Selecting XML",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "compute_cyclomatic_complexity",
         kind: ToolKind::Read,
         display_name: "Computing cyclomatic complexity",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "compute_cognitive_complexity",
         kind: ToolKind::Read,
         display_name: "Computing cognitive complexity",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_comment_density_for_code_unit",
         kind: ToolKind::Read,
         display_name: "Reporting comment density",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_comment_density_for_files",
         kind: ToolKind::Read,
         display_name: "Reporting file comment density",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_exception_handling_smells",
         kind: ToolKind::Read,
         display_name: "Reporting exception handling smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_test_assertion_smells",
         kind: ToolKind::Read,
         display_name: "Reporting test assertion smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_structural_clone_smells",
         kind: ToolKind::Read,
         display_name: "Reporting structural clone smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_long_method_and_god_object_smells",
         kind: ToolKind::Read,
         display_name: "Reporting long method and god object smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_dead_code_and_unused_abstraction_smells",
         kind: ToolKind::Read,
         display_name: "Reporting dead code smells",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "report_secret_like_code",
         kind: ToolKind::Read,
         display_name: "Reporting secret-like code",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "analyze_git_hotspots",
         kind: ToolKind::Read,
         display_name: "Analyzing git hotspots",
+        concurrency_safe: true,
     },
     ToolMeta {
         name: "analyze_commit",
         kind: ToolKind::Read,
         display_name: "Analyzing commit",
+        concurrency_safe: true,
     },
     // `activate_workspace` and `refresh` mutate analyzer state, so they
     // stay `Other` rather than `Read`: prompted in `default`, refused in
@@ -544,11 +596,13 @@ const TOOLS: &[ToolMeta] = &[
         name: "activate_workspace",
         kind: ToolKind::Other,
         display_name: "Activating workspace",
+        concurrency_safe: false,
     },
     ToolMeta {
         name: "refresh",
         kind: ToolKind::Other,
         display_name: "Refreshing analyzer index",
+        concurrency_safe: false,
     },
     // --- Agent Skills activation -------------------------------------------
     // The tool itself is registered dynamically in `tool_definitions()`
@@ -560,6 +614,7 @@ const TOOLS: &[ToolMeta] = &[
         name: "activate_skill",
         kind: ToolKind::Read,
         display_name: "Activating skill",
+        concurrency_safe: true,
     },
     // --- Subagent dispatch -------------------------------------------------
     // Like `activate_skill`, registered dynamically in `tool_definitions()`
@@ -574,6 +629,7 @@ const TOOLS: &[ToolMeta] = &[
         name: "task",
         kind: ToolKind::Other,
         display_name: "Running subagent",
+        concurrency_safe: false,
     },
 ];
 
@@ -1129,6 +1185,14 @@ impl ToolRegistry {
         self.mcp_tool_servers
             .get(name)
             .is_some_and(|client| client.name() == "bifrost")
+    }
+
+    /// Whether a tool's calls may run concurrently with adjacent safe calls.
+    ///
+    /// Unknown tools default to `false`; newly-added MCP tools must be
+    /// classified explicitly in `TOOLS` before they can use the parallel path.
+    pub(crate) fn is_concurrency_safe(&self, name: &str) -> bool {
+        tool_meta(name).is_some_and(|meta| meta.concurrency_safe)
     }
 
     /// Invoke a bifrost MCP tool and return its raw structured `Value`,

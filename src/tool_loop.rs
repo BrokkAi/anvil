@@ -42,7 +42,7 @@ const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
-const MAX_PARALLEL_READ_ONLY_SUBAGENTS: usize = 6;
+const MAX_PARALLEL_SAFE_TOOL_CALLS: usize = 6;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum TaskPermissionMode {
@@ -2809,9 +2809,9 @@ async fn execute_step_tool_calls(
             };
         }
 
-        let batch_len = read_only_task_batch_len(calls, &ordered_indices[ordered_position..]);
+        let batch_len = parallel_batch_len(registry, calls, &ordered_indices[ordered_position..]);
         if batch_len > 1 {
-            let outcome = execute_parallel_read_only_task_calls(
+            let outcome = execute_parallel_safe_calls(
                 llm,
                 registry,
                 model,
@@ -3364,16 +3364,19 @@ async fn execute_step_tool_calls(
     }
 }
 
-struct ParallelTaskReady {
+struct ParallelJobReady {
     call_id: String,
     tool_name: String,
     parsed_input: Value,
     normalized_arguments: String,
+    sandbox_policy_override: Option<SandboxPolicy>,
+    sandbox_mode: Option<crate::sandbox_backend::SandboxMode>,
+    shell_sandboxed: bool,
     permission_notice: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_parallel_read_only_task_calls(
+async fn execute_parallel_safe_calls(
     llm: &Arc<dyn LlmBackend>,
     registry: &ToolRegistry,
     model: &str,
@@ -3415,7 +3418,7 @@ async fn execute_parallel_read_only_task_calls(
                             session_id,
                             tool_call_id = %call.id,
                             tool_name = %tool_name,
-                            "repaired malformed tool-call arguments at parallel subagent dispatch"
+                            "repaired malformed tool-call arguments at parallel safe-tool dispatch"
                         );
                     }
                     normalized
@@ -3470,7 +3473,7 @@ async fn execute_parallel_read_only_task_calls(
                 title_chars = announce::permission_prompt_title(&tool_name, &parsed_input)
                     .chars()
                     .count(),
-                "rejecting parallel subagent call: rendered permission card would hide input",
+                "rejecting parallel safe-tool call: rendered permission card would hide input",
             );
             maybe_send_session_update(
                 notifications,
@@ -3628,7 +3631,10 @@ async fn execute_parallel_read_only_task_calls(
                 }));
             }
             GateDecision::Allow {
-                permission_notice, ..
+                sandbox_policy_override,
+                sandbox_mode,
+                shell_sandboxed,
+                permission_notice,
             } => {
                 maybe_send_session_update(
                     notifications,
@@ -3637,18 +3643,21 @@ async fn execute_parallel_read_only_task_calls(
                     SessionUpdate::ToolCallUpdate(announce::update_in_progress(&call.id)),
                 );
                 tracing::info!(
-                    "executing read-only subagent {} with args: {} (parallel_batch=true)",
+                    "executing concurrency-safe tool {} with args: {} (parallel_batch=true)",
                     tool_name,
                     normalized_arguments,
                 );
                 records.push(None);
                 ready_jobs.push((
                     slot_index,
-                    ParallelTaskReady {
+                    ParallelJobReady {
                         call_id: call.id.clone(),
                         tool_name,
                         parsed_input,
                         normalized_arguments,
+                        sandbox_policy_override,
+                        sandbox_mode,
+                        shell_sandboxed,
                         permission_notice,
                     },
                 ));
@@ -3656,38 +3665,94 @@ async fn execute_parallel_read_only_task_calls(
         }
     }
 
+    let prior_messages = messages.clone();
+    let prior_tool_exchanges = tool_exchanges.clone();
     let completed = futures::stream::iter(ready_jobs.into_iter().map(|(slot_index, ready)| {
         let cancel = cancel.clone();
+        let prior_messages = prior_messages.clone();
+        let prior_tool_exchanges = prior_tool_exchanges.clone();
         async move {
-            // Mirror the serial `task` dispatch path (see the `tool_name ==
-            // "task"` arm in `execute_step_tool_calls`): PreToolUse plugin
-            // hooks may veto the lane before the subagent runs, and PostToolUse
-            // hooks post-process its result. Skipping them here would let a
-            // batch of >=2 read-only `task` calls bypass a hook that a single
-            // (serially dispatched) `task` call honors.
             let (exec, nested_usage) = if let Some(blocked) =
                 run_pre_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input).await
             {
                 (blocked, TokenUsage::default())
             } else {
-                let (mut exec, nested_usage) = execute_subagent(
-                    llm,
-                    registry,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    structured_output,
-                    &ready.parsed_input,
-                    max_turns,
-                    idle_timeout,
-                    cancel,
-                    spawned_cx,
-                    session_id,
-                    sessions,
-                    depth + 1,
-                    permission_override,
-                )
-                .await;
+                let (mut exec, nested_usage) = if ready.tool_name == "task" {
+                    execute_subagent(
+                        llm,
+                        registry,
+                        model,
+                        reasoning_effort,
+                        service_tier,
+                        structured_output,
+                        &ready.parsed_input,
+                        max_turns,
+                        idle_timeout,
+                        cancel,
+                        spawned_cx,
+                        session_id,
+                        sessions,
+                        depth + 1,
+                        permission_override,
+                    )
+                    .await
+                } else if ready.tool_name == "semantic_search"
+                    && registry.is_bifrost_tool("semantic_search")
+                {
+                    let outcome = semantic_rerank::rerank_semantic_search(
+                        llm,
+                        model,
+                        registry,
+                        &prior_messages,
+                        &ready.parsed_input,
+                        idle_timeout,
+                        &cancel,
+                    )
+                    .await;
+                    (
+                        ToolExecution {
+                            output: outcome.output,
+                            failed: outcome.failed,
+                        },
+                        outcome.usage,
+                    )
+                } else {
+                    let permission_mode =
+                        effective_permission_mode(sessions, session_id, permission_override).await;
+                    if permission_mode.is_none() {
+                        tracing::warn!(
+                            session_id,
+                            tool_name = ready.tool_name,
+                            outside_sandbox_once = ready.sandbox_policy_override.is_some(),
+                            "session vanished between gate-accept and parallel exec; falling back to ReadOnly sandbox"
+                        );
+                    }
+                    let (policy, outside_sandbox_once) = resolve_execution_policy(
+                        permission_mode,
+                        ready.sandbox_mode,
+                        ready.sandbox_policy_override,
+                    );
+                    trace_bifrost_context_shadow(
+                        &ready.tool_name,
+                        &ready.parsed_input,
+                        &prior_tool_exchanges,
+                    );
+                    let exec = execute_tool(
+                        registry,
+                        ToolExecRequest {
+                            tool_name: &ready.tool_name,
+                            args: ready.parsed_input.clone(),
+                            policy,
+                            outside_sandbox_once,
+                            sandbox_mode: ready.sandbox_mode,
+                            shell_sandboxed: ready.sandbox_policy_override.is_none()
+                                && ready.shell_sandboxed,
+                            cancel: &cancel,
+                        },
+                    )
+                    .await;
+                    (exec, TokenUsage::default())
+                };
                 run_post_tool_use_hooks(registry, &ready.tool_name, &ready.parsed_input, &mut exec)
                     .await;
                 (exec, nested_usage)
@@ -3695,7 +3760,7 @@ async fn execute_parallel_read_only_task_calls(
             (slot_index, ready, exec, nested_usage)
         }
     }))
-    .buffered(MAX_PARALLEL_READ_ONLY_SUBAGENTS)
+    .buffered(MAX_PARALLEL_SAFE_TOOL_CALLS)
     .collect::<Vec<_>>()
     .await;
 
@@ -5480,12 +5545,19 @@ fn ordered_tool_call_indices(
     builtin_or_other
 }
 
-fn read_only_task_batch_len(calls: &[ToolCall], ordered_indices: &[usize]) -> usize {
+fn parallel_batch_len(
+    registry: &ToolRegistry,
+    calls: &[ToolCall],
+    ordered_indices: &[usize],
+) -> usize {
     ordered_indices
         .iter()
         .copied()
         .take_while(|index| {
             let call = &calls[*index];
+            if registry.is_concurrency_safe(&call.function.name) {
+                return true;
+            }
             if call.function.name != "task" {
                 return false;
             }
@@ -5529,6 +5601,20 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    async fn empty_registry_for_test() -> (tempfile::TempDir, ToolRegistry) {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let registry = ToolRegistry::new(
+            cwd.path().to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(crate::agents::AgentRegistry::default()),
+            Vec::new(),
+        )
+        .await;
+        (cwd, registry)
     }
 
     fn exchange_for_test(tool_name: &str) -> ToolExchange {
@@ -5723,8 +5809,64 @@ mod tests {
         assert_eq!(inherited.permission_mode, TaskPermissionMode::Inherit);
     }
 
-    #[test]
-    fn read_only_task_batch_len_groups_only_read_only_lanes() {
+    #[tokio::test]
+    async fn parallel_batch_len_groups_static_safe_tools() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("read_file"),
+            tool_call_for_test("grep_search"),
+        ];
+        let ordered = [0, 1];
+
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_len_groups_safe_tools_and_read_only_task_lanes() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("read_file"),
+            ToolCall {
+                id: "b".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "task".to_string(),
+                    arguments: serde_json::json!({
+                        "description": "review b",
+                        "prompt": "inspect b",
+                        "subagent_type": "reviewer",
+                        "permission_mode": "readOnly"
+                    })
+                    .to_string(),
+                },
+            },
+        ];
+        let ordered = [0, 1];
+
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_len_excludes_update_plan_and_edit() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let calls = vec![
+            tool_call_for_test("update_plan"),
+            tool_call_for_test("edit"),
+            tool_call_for_test("read_file"),
+            tool_call_for_test("update_plan"),
+            tool_call_for_test("edit"),
+        ];
+        let ordered = [0, 1, 2, 3, 4];
+
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 0);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[2..]), 1);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[3..]), 0);
+        assert_eq!(ToolRegistry::tool_kind("update_plan"), ToolKind::Read);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_len_groups_only_read_only_task_lanes() {
+        let (_cwd, registry) = empty_registry_for_test().await;
         let calls = vec![
             ToolCall {
                 id: "a".to_string(),
@@ -5771,8 +5913,100 @@ mod tests {
         ];
         let ordered = [0, 1, 2, 3];
 
-        assert_eq!(read_only_task_batch_len(&calls, &ordered), 2);
-        assert_eq!(read_only_task_batch_len(&calls, &ordered[2..]), 0);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[2..]), 0);
+        assert_eq!(parallel_batch_len(&registry, &calls, &ordered[3..]), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_batch_record_apply_preserves_submission_order_after_out_of_order_completion()
+     {
+        let ready = vec![
+            (
+                0usize,
+                ToolCallRecord {
+                    call_id: "call-read".to_string(),
+                    tool_name: "read_file".to_string(),
+                    arguments: serde_json::json!({"file_path":"slow.txt"}).to_string(),
+                    result: "slow read".to_string(),
+                    status: ToolExchangeStatus::Completed,
+                    diff: None,
+                    permission_notice: None,
+                },
+                Duration::from_millis(50),
+            ),
+            (
+                1usize,
+                ToolCallRecord {
+                    call_id: "call-grep".to_string(),
+                    tool_name: "grep_search".to_string(),
+                    arguments: serde_json::json!({"pattern":"needle"}).to_string(),
+                    result: "fast grep".to_string(),
+                    status: ToolExchangeStatus::Completed,
+                    diff: None,
+                    permission_notice: None,
+                },
+                Duration::from_millis(0),
+            ),
+        ];
+
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let completed = futures::stream::iter(ready.into_iter().map(|(slot, record, delay)| {
+            let completion_order = completion_order.clone();
+            async move {
+                tokio::time::sleep(delay).await;
+                completion_order
+                    .lock()
+                    .expect("completion order lock poisoned")
+                    .push(record.tool_name.clone());
+                (slot, record)
+            }
+        }))
+        .buffered(2)
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            *completion_order
+                .lock()
+                .expect("completion order lock poisoned"),
+            vec!["grep_search".to_string(), "read_file".to_string()]
+        );
+
+        let mut records: Vec<Option<ToolCallRecord>> = vec![None, None];
+        for (slot, record) in completed {
+            records[slot] = Some(record);
+        }
+
+        let mut messages = Vec::new();
+        let mut tool_exchanges = Vec::new();
+        let mut replay_events = Vec::new();
+        let mut step_results = Vec::new();
+        for record in records.into_iter().flatten() {
+            append_tool_call_record(
+                record,
+                &mut messages,
+                &mut tool_exchanges,
+                &mut replay_events,
+                &mut step_results,
+                true,
+            );
+        }
+
+        assert_eq!(
+            tool_exchanges
+                .iter()
+                .map(|exchange| exchange.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "grep_search"]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|message| message.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "grep_search"]
+        );
     }
 
     struct RetryBackend {
