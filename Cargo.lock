@@ -426,6 +426,7 @@ dependencies = [
  "base64",
  "brokk-acp-sandbox",
  "brokk-rtk",
+ "bytes",
  "chrono",
  "clap",
  "dirs 6.0.0",

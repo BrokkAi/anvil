@@ -1770,10 +1770,7 @@ pub async fn run_agent(
                     .prompt_capabilities(
                         PromptCapabilities::new().embedded_context(true).image(true),
                     )
-                    // Anvil only speaks to stdio MCP subprocesses, so advertise
-                    // http/sse as unsupported. Lifecycle requests carrying other
-                    // transports are rejected rather than silently dropped (#159).
-                    .mcp_capabilities(McpCapabilities::new())
+                    .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
                     .session_capabilities(
                         SessionCapabilities::new()
                             .list(SessionListCapabilities::new())
@@ -7074,6 +7071,9 @@ async fn handle_mcp(prompt_text: &str, sessions: &SessionStore, session_id: &str
             let mut servers = crate::setup_state::read_mcp_servers();
             let server = crate::mcp::McpServerConfig {
                 name: name.to_string(),
+                transport: crate::mcp::McpTransport::Stdio,
+                url: None,
+                headers: Vec::new(),
                 command: server_command.to_string(),
                 args: words[idx + 2..].to_vec(),
                 env: Vec::new(),

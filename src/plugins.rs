@@ -506,6 +506,9 @@ impl InstalledPlugin {
             .collect();
         Ok(crate::mcp::McpServerConfig {
             name: name.to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command,
             args,
             env,

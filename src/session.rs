@@ -299,20 +299,18 @@ fn discover_session_context(
 }
 
 /// An ACP lifecycle request referenced an MCP server transport Anvil does not
-/// support. Anvil only speaks to stdio MCP subprocesses, and it advertises
-/// `mcpCapabilities` (http=false, sse=false) accordingly, so a request that
-/// still carries an HTTP/SSE server is rejected rather than silently dropped --
-/// otherwise the session would look configured while the requested tools were
-/// missing.
+/// support. Stdio, HTTP, and SSE are supported; unknown future transports are
+/// rejected rather than silently dropped, which would leave the session looking
+/// configured while the requested tools were missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedMcpTransport {
     pub server: String,
     pub transport: &'static str,
 }
 
-/// Convert ACP `mcpServers` into Anvil's internal MCP configs, rejecting any
-/// transport other than stdio. Returns the offending server on the first
-/// unsupported entry so the caller can surface a protocol error.
+/// Convert ACP `mcpServers` into Anvil's internal MCP configs. Returns the
+/// offending server on the first unsupported entry so the caller can surface a
+/// protocol error.
 pub(crate) fn acp_mcp_servers_to_configs(
     servers: Vec<agent_client_protocol::schema::v1::McpServer>,
 ) -> Result<Vec<McpServerConfig>, UnsupportedMcpTransport> {
@@ -322,6 +320,9 @@ pub(crate) fn acp_mcp_servers_to_configs(
             agent_client_protocol::schema::v1::McpServer::Stdio(stdio) => {
                 configs.push(McpServerConfig {
                     name: stdio.name,
+                    transport: crate::mcp::McpTransport::Stdio,
+                    url: None,
+                    headers: Vec::new(),
                     command: stdio.command.display().to_string(),
                     args: stdio.args,
                     env: stdio
@@ -337,15 +338,43 @@ pub(crate) fn acp_mcp_servers_to_configs(
                 });
             }
             agent_client_protocol::schema::v1::McpServer::Http(http) => {
-                return Err(UnsupportedMcpTransport {
-                    server: http.name,
-                    transport: "http",
+                configs.push(McpServerConfig {
+                    name: http.name,
+                    transport: crate::mcp::McpTransport::Http,
+                    command: String::new(),
+                    url: Some(http.url),
+                    headers: http
+                        .headers
+                        .into_iter()
+                        .map(|header| McpEnvVar {
+                            name: header.name,
+                            value: header.value,
+                        })
+                        .collect(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    framing: McpFraming::ContentLength,
+                    enabled: true,
                 });
             }
             agent_client_protocol::schema::v1::McpServer::Sse(sse) => {
-                return Err(UnsupportedMcpTransport {
-                    server: sse.name,
-                    transport: "sse",
+                configs.push(McpServerConfig {
+                    name: sse.name,
+                    transport: crate::mcp::McpTransport::Sse,
+                    command: String::new(),
+                    url: Some(sse.url),
+                    headers: sse
+                        .headers
+                        .into_iter()
+                        .map(|header| McpEnvVar {
+                            name: header.name,
+                            value: header.value,
+                        })
+                        .collect(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    framing: McpFraming::ContentLength,
+                    enabled: true,
                 });
             }
             // `McpServer` is `#[non_exhaustive]`; reject unknown future
@@ -8284,6 +8313,9 @@ done
             configs,
             vec![crate::mcp::McpServerConfig {
                 name: "local".to_string(),
+                transport: crate::mcp::McpTransport::Stdio,
+                url: None,
+                headers: Vec::new(),
                 command: "/usr/bin/mcp".to_string(),
                 args: vec!["--flag".to_string(), "value".to_string()],
                 env: vec![crate::mcp::McpEnvVar {
@@ -8296,21 +8328,45 @@ done
         );
     }
 
-    /// Unsupported transports (http/sse) are rejected, not silently dropped, so
-    /// the caller can return a protocol error rather than appear configured
-    /// while the requested tools are missing (#159).
     #[test]
-    fn acp_http_mcp_server_is_rejected() {
-        let err =
+    fn acp_sse_mcp_server_converts_to_anvil_config() {
+        let configs =
+            acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Sse(
+                agent_client_protocol::schema::v1::McpServerSse::new(
+                    "events",
+                    "https://example.com/sse",
+                )
+                .headers(vec![agent_client_protocol::schema::v1::HttpHeader::new(
+                    "Authorization",
+                    "Bearer secret",
+                )]),
+            )])
+            .expect("sse servers convert");
+        let config = &configs[0];
+        assert_eq!(config.transport, crate::mcp::McpTransport::Sse);
+        assert_eq!(config.url.as_deref(), Some("https://example.com/sse"));
+        assert_eq!(config.headers[0].name, "Authorization");
+    }
+
+    #[test]
+    fn acp_http_mcp_server_converts_to_anvil_config() {
+        let configs =
             acp_mcp_servers_to_configs(vec![agent_client_protocol::schema::v1::McpServer::Http(
                 agent_client_protocol::schema::v1::McpServerHttp::new(
                     "remote",
                     "https://example.com/mcp",
-                ),
+                )
+                .headers(vec![agent_client_protocol::schema::v1::HttpHeader::new(
+                    "Authorization",
+                    "Bearer secret",
+                )]),
             )])
-            .expect_err("http transport must be rejected");
-        assert_eq!(err.server, "remote");
-        assert_eq!(err.transport, "http");
+            .expect("http servers convert");
+        let config = &configs[0];
+        assert_eq!(config.transport, crate::mcp::McpTransport::Http);
+        assert_eq!(config.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(config.headers[0].name, "Authorization");
+        assert_eq!(config.headers[0].value, "Bearer secret");
     }
 
     /// `session/load` and `session/resume` apply the client-supplied MCP server
@@ -8324,6 +8380,9 @@ done
 
         let servers = vec![crate::mcp::McpServerConfig {
             name: "extra".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: "/usr/bin/extra-mcp".to_string(),
             args: vec!["--flag".to_string()],
             env: vec![],
@@ -8387,6 +8446,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8426,6 +8488,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8471,6 +8536,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8486,6 +8554,9 @@ done
                 cwd.path().to_path_buf(),
                 Some(vec![crate::mcp::McpServerConfig {
                     name: "local".to_string(),
+                    transport: crate::mcp::McpTransport::Stdio,
+                    url: None,
+                    headers: Vec::new(),
                     command: extra_mcp.display().to_string(),
                     args: Vec::new(),
                     env: Vec::new(),
@@ -8527,6 +8598,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
@@ -8542,6 +8616,9 @@ done
                 cwd.path().to_path_buf(),
                 Some(vec![crate::mcp::McpServerConfig {
                     name: "bifrost".to_string(),
+                    transport: crate::mcp::McpTransport::Stdio,
+                    url: None,
+                    headers: Vec::new(),
                     command: extra_bifrost.display().to_string(),
                     args: vec![
                         "--root".to_string(),
@@ -8589,6 +8666,9 @@ done
         let fake_bifrost = make_fake_bifrost_binary(fake_bifrost_dir.path(), &bifrost_log);
         crate::setup_state::remember_mcp_servers(vec![crate::mcp::McpServerConfig {
             name: "bifrost".to_string(),
+            transport: crate::mcp::McpTransport::Stdio,
+            url: None,
+            headers: Vec::new(),
             command: fake_bifrost.display().to_string(),
             args: crate::mcp::McpServerConfig::bifrost().args,
             env: Vec::new(),
