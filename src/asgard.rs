@@ -470,6 +470,11 @@ mod tests {
         );
     }
 
+    fn assert_text_file_eq(path: &Path, expected: &str) {
+        let actual = fs::read_to_string(path).unwrap();
+        assert_eq!(actual.replace("\r\n", "\n"), expected);
+    }
+
     #[test]
     fn bootstrap_seed_copies_missing_wrappers_without_copying_build_outputs() {
         let temp = tempfile::tempdir().unwrap();
@@ -542,10 +547,7 @@ mod tests {
         run_git(repo, &["clean", "-fd"]);
         apply_selected_patch(repo, &patch).unwrap();
         assert!(!repo.join("deleted.txt").exists());
-        assert_eq!(
-            fs::read_to_string(repo.join("added.txt")).unwrap(),
-            "keep me\n"
-        );
+        assert_text_file_eq(&repo.join("added.txt"), "keep me\n");
     }
 
     #[test]
@@ -568,10 +570,7 @@ mod tests {
         apply_selected_patch(repo, &patch).unwrap();
         remove_candidate_repository(&candidate);
         assert!(!repo.join("deleted.txt").exists());
-        assert_eq!(
-            fs::read_to_string(repo.join("added.txt")).unwrap(),
-            "keep me\n"
-        );
+        assert_text_file_eq(&repo.join("added.txt"), "keep me\n");
     }
 
     #[test]
@@ -601,14 +600,8 @@ mod tests {
         apply_selected_patch(repo, &patch).unwrap();
         remove_candidate_repository(&candidate);
 
-        assert_eq!(
-            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
-            "committed solution\n"
-        );
-        assert_eq!(
-            fs::read_to_string(repo.join("added.txt")).unwrap(),
-            "committed addition\n"
-        );
+        assert_text_file_eq(&repo.join("tracked.txt"), "committed solution\n");
+        assert_text_file_eq(&repo.join("added.txt"), "committed addition\n");
     }
 
     #[test]
