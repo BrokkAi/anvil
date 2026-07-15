@@ -465,13 +465,7 @@ fn truncate(s: &str) -> String {
     if s.len() <= MAX_INLINE_OUTPUT_BYTES {
         s.to_string()
     } else {
-        // Truncate on a UTF-8 char boundary so we don't ship invalid
-        // strings; floor-search backwards from the cap.
-        let mut cut = MAX_INLINE_OUTPUT_BYTES;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let mut out = s[..cut].to_string();
+        let mut out = crate::text::truncate_utf8(s, MAX_INLINE_OUTPUT_BYTES).to_string();
         out.push_str("\n... output truncated");
         out
     }
@@ -541,9 +535,8 @@ fn brief_input_summary(raw_input: &Value) -> String {
         if let Some(s) = v.as_str() {
             let s = s.trim();
             if !s.is_empty() {
-                let mut out = s.to_string();
-                if out.len() > 80 {
-                    out.truncate(80);
+                let mut out = crate::text::truncate_utf8(s, 80).to_string();
+                if s.len() > 80 {
                     out.push_str("...");
                 }
                 return out;
@@ -554,9 +547,8 @@ fn brief_input_summary(raw_input: &Value) -> String {
         {
             let s = first.trim();
             if !s.is_empty() {
-                let mut out = s.to_string();
-                if out.len() > 80 {
-                    out.truncate(80);
+                let mut out = crate::text::truncate_utf8(s, 80).to_string();
+                if s.len() > 80 {
                     out.push_str("...");
                 }
                 return out;
@@ -1052,6 +1044,17 @@ mod tests {
         // No panic and the output is still valid UTF-8 (truncate already
         // returned a String).
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn brief_input_summary_respects_char_boundary() {
+        let mut input = "a".repeat(79);
+        input.push('\u{25cf}');
+        input.push_str("tail");
+
+        let summary = brief_input_summary(&json!({"query": input}));
+
+        assert_eq!(summary, format!("{}...", "a".repeat(79)));
     }
 
     fn tool_text(content: &ToolCallContent) -> &str {

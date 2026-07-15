@@ -371,7 +371,8 @@ fn format_shell_tool_result(
     }
 
     if combined.len() > MAX_OUTPUT_BYTES {
-        combined.truncate(MAX_OUTPUT_BYTES);
+        let end = crate::text::truncate_utf8(&combined, MAX_OUTPUT_BYTES).len();
+        combined.truncate(end);
         combined.push_str("\n... output truncated");
     }
 
@@ -951,6 +952,20 @@ mod tests {
         let clamped_inf =
             clamp_to_hard_limit(RLIMIT_NOFILE_ENV, libc::RLIMIT_NOFILE, libc::RLIM_INFINITY);
         assert_eq!(clamped_inf, hard);
+    }
+
+    #[test]
+    fn shell_output_truncation_preserves_utf8() {
+        let mut stdout = "a".repeat(MAX_OUTPUT_BYTES - 1);
+        stdout.push('\u{25cf}');
+        stdout.push_str("tail");
+
+        let result = format_shell_tool_result(&stdout, "", 0, true, false, false, None);
+
+        assert_eq!(
+            result.output,
+            format!("{}\n... output truncated", "a".repeat(MAX_OUTPUT_BYTES - 1))
+        );
     }
 
     /// End-to-end: a tight `BROKK_ACP_RLIMIT_FSIZE_BYTES` actually kills
