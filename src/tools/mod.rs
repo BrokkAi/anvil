@@ -370,8 +370,8 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Search,
         display_name: "Scanning symbol usages",
     },
-    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
-    // New guidance and local Bifrost builds advertise the split reference name.
+    // Compatibility classification for Bifrost versions that advertise the
+    // legacy unsplit reference name.
     ToolMeta {
         name: "scan_usages",
         kind: ToolKind::Search,
@@ -387,7 +387,7 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Search,
         display_name: "Finding definition",
     },
-    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
+    // Compatibility classification for the legacy singular reference name.
     ToolMeta {
         name: "get_definition_by_reference",
         kind: ToolKind::Search,
@@ -416,7 +416,7 @@ const TOOLS: &[ToolMeta] = &[
         kind: ToolKind::Read,
         display_name: "Classifying test files",
     },
-    // Compatibility classification for the bundled Bifrost 0.7.4 binary.
+    // Compatibility classification for the legacy test-classification name.
     ToolMeta {
         name: "contains_tests",
         kind: ToolKind::Read,

@@ -3199,7 +3199,7 @@ fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {
     let cache_dir = config_home
         .join("bifrost")
-        .join("0.7.4")
+        .join("0.8.2")
         .join(bifrost_target_triple_for_smoke());
     std::fs::create_dir_all(&cache_dir).expect("create fake managed bifrost cache");
     let target = cache_dir.join(bifrost_binary_name_for_smoke());
@@ -3235,7 +3235,7 @@ fn bifrost_target_triple_for_smoke() -> &'static str {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "x86_64-unknown-linux-gnu"
+        "x86_64-unknown-linux-musl"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {

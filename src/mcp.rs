@@ -17,14 +17,14 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.7.4";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.8.2";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "macos")]
 const BIFROST_TARGET_TRIPLE: &str = "universal-apple-darwin";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const BIFROST_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+const BIFROST_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const BIFROST_TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
