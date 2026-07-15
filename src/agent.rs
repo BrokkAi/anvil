@@ -521,6 +521,47 @@ fn is_bedrock_model(model_wire_id: &str) -> bool {
     split_wire_id(model_wire_id).map(|(source, _)| source) == Some(ModelSource::Bedrock)
 }
 
+fn insert_openrouter_balance_meta(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    model_wire_id: &str,
+    status: crate::openrouter_credits::Status,
+) {
+    if !is_openrouter_model(model_wire_id) {
+        return;
+    }
+    let mut namespace = meta
+        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    namespace.insert(
+        "openrouterBalance".to_string(),
+        serde_json::to_value(status).expect("OpenRouter balance status is serializable"),
+    );
+    meta.insert(
+        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        serde_json::Value::Object(namespace),
+    );
+}
+
+fn attach_openrouter_balance_meta<F>(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    model_wire_id: &str,
+    status: F,
+) where
+    F: FnOnce() -> crate::openrouter_credits::Status,
+{
+    if is_openrouter_model(model_wire_id) {
+        insert_openrouter_balance_meta(meta, model_wire_id, status());
+    }
+}
+
+fn is_openrouter_model(model_wire_id: &str) -> bool {
+    matches!(
+        split_wire_id(model_wire_id),
+        Some((ModelSource::OpenRouter, model_id)) if !model_id.is_empty()
+    )
+}
+
 /// Build the terminal `PromptResponse` for a finished turn, choosing the
 /// stop reason from whether the prompt's cancellation token fired.
 ///
@@ -1448,6 +1489,7 @@ async fn send_session_usage_update_with_breakdown(
         insert_turn_failure_meta(&mut meta, failure);
     }
     attach_bedrock_credits_meta(&mut meta, &snap.model, crate::bedrock_credits::status);
+    attach_openrouter_balance_meta(&mut meta, &snap.model, crate::openrouter_credits::status);
     if !meta.is_empty() {
         update = update.meta(Some(meta));
     }
@@ -18411,5 +18453,52 @@ mod tests {
 
         assert!(!looked_up);
         assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn openrouter_balance_metadata_attaches_and_preserves_existing_anvil_metadata() {
+        let mut meta = usage_by_model_meta(&BTreeMap::from([(
+            "openrouter::vendor/model".to_string(),
+            crate::llm_client::TokenUsage::default(),
+        )]));
+        insert_turn_failure_meta(
+            &mut meta,
+            &crate::tool_loop::TurnFailure {
+                retryable: true,
+                message: "retry".into(),
+            },
+        );
+        insert_openrouter_balance_meta(
+            &mut meta,
+            "openrouter::vendor/model",
+            crate::openrouter_credits::Status::Available {
+                remaining_usd: 0.0,
+                total_credits_usd: 10.0,
+                total_usage_usd: 10.0,
+                as_of: "2026-07-15T18:42:00Z".into(),
+            },
+        );
+        assert!(meta["anvil"]["usageByModel"].is_object());
+        assert_eq!(meta["anvil"]["turnFailure"]["message"], "retry");
+        assert_eq!(meta["anvil"]["openrouterBalance"]["status"], "available");
+        assert_eq!(meta["anvil"]["openrouterBalance"]["remainingUsd"], 0.0);
+    }
+
+    #[test]
+    fn openrouter_balance_metadata_is_lazy_for_other_providers() {
+        let mut meta = serde_json::Map::new();
+        let mut looked_up = false;
+
+        attach_openrouter_balance_meta(&mut meta, "bedrock::model", || {
+            looked_up = true;
+            crate::openrouter_credits::Status::Unavailable {
+                reason: "refresh pending".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            }
+        });
+
+        assert!(!looked_up);
+        assert!(meta.is_empty());
+        assert!(!is_openrouter_model("openrouter::"));
     }
 }
