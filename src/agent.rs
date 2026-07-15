@@ -6214,6 +6214,10 @@ fn asgard_window_tool_inventory(messages: &[ChatMessage]) -> Vec<(String, String
     messages
         .iter()
         .flat_map(|message| message.tool_calls.iter().flatten())
+        .filter(|call| {
+            crate::tools::ToolRegistry::tool_kind(&call.function.name)
+                != agent_client_protocol::schema::v1::ToolKind::Edit
+        })
         .map(|call| (call.id.clone(), call.function.name.clone()))
         .collect()
 }
@@ -6506,21 +6510,53 @@ fn slim_asgard_window_messages(
     messages: &[ChatMessage],
     assessments: &HashMap<String, AsgardToolResultAssessment>,
 ) -> Vec<ChatMessage> {
+    let fully_omitted_steps = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let calls = message.tool_calls.as_deref()?;
+            (!calls.is_empty()
+                && calls.iter().all(|call| {
+                    assessments.get(&call.id).is_some_and(|assessment| {
+                        assessment.disposition == AsgardToolResultDisposition::Omit
+                    })
+                }))
+            .then_some((index, calls))
+        })
+        .collect::<Vec<_>>();
+    let omitted_message_indices = fully_omitted_steps
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<HashSet<_>>();
+    let omitted_tool_call_ids = fully_omitted_steps
+        .iter()
+        .flat_map(|(_, calls)| calls.iter().map(|call| call.id.as_str()))
+        .collect::<HashSet<_>>();
+
     messages
         .iter()
         .cloned()
-        .map(|mut message| {
+        .enumerate()
+        .filter_map(|(index, mut message)| {
+            if omitted_message_indices.contains(&index)
+                || message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| omitted_tool_call_ids.contains(id))
+            {
+                return None;
+            }
             if message.role != "tool" {
-                return message;
+                return Some(message);
             }
             let Some(id) = message.tool_call_id.as_deref() else {
-                return message;
+                return Some(message);
             };
             let Some(assessment) = assessments.get(id) else {
-                return message;
+                return Some(message);
             };
             let replacement = match assessment.disposition {
-                AsgardToolResultDisposition::Full => return message,
+                AsgardToolResultDisposition::Full => return Some(message),
                 AsgardToolResultDisposition::Omit => format!(
                     "[Asgard candidate assessment: original tool result omitted. Reason: {}]",
                     assessment.explanation
@@ -6540,10 +6576,10 @@ fn slim_asgard_window_messages(
                 })
                 .sum::<usize>();
             if replacement.len() >= original_bytes {
-                return message;
+                return Some(message);
             }
             message.content = vec![ChatContentPart::text(replacement)];
-            message
+            Some(message)
         })
         .collect()
 }
@@ -17804,6 +17840,34 @@ mod tests {
     }
 
     #[test]
+    fn asgard_result_assessment_inventory_excludes_edits() {
+        let mut assistant =
+            ChatMessage::assistant("I changed the implementation and inspected it.");
+        assistant.tool_calls = Some(vec![
+            supervisor_tool_call(
+                "call-edit",
+                "edit",
+                serde_json::json!({"file_path":"src/lib.rs"}),
+            ),
+            supervisor_tool_call(
+                "call-write",
+                "write_file",
+                serde_json::json!({"file_path":"src/new.rs"}),
+            ),
+            supervisor_tool_call(
+                "call-read",
+                "read_file",
+                serde_json::json!({"file_path":"src/lib.rs"}),
+            ),
+        ]);
+
+        assert_eq!(
+            asgard_window_tool_inventory(&[assistant]),
+            vec![("call-read".to_string(), "read_file".to_string())]
+        );
+    }
+
+    #[test]
     fn asgard_result_assessment_requires_every_call_and_summary_content() {
         let inventory = vec![
             ("call-read".to_string(), "read_file".to_string()),
@@ -17963,6 +18027,123 @@ mod tests {
             "a replacement must not enlarge a result"
         );
         assert_eq!(slim[0], messages[0], "tool calls and arguments stay exact");
+    }
+
+    #[test]
+    fn asgard_slimming_removes_steps_when_every_tool_result_is_omitted() {
+        let mut omitted_step = ChatMessage::assistant("This entire step was irrelevant.");
+        omitted_step.tool_calls = Some(vec![
+            supervisor_tool_call("call-a", "read_file", serde_json::json!({"path":"a"})),
+            supervisor_tool_call("call-b", "read_file", serde_json::json!({"path":"b"})),
+        ]);
+        let retained = ChatMessage::assistant("The later step established useful evidence.");
+        let messages = vec![
+            omitted_step,
+            ChatMessage::tool_result("call-a", "read_file", "irrelevant a"),
+            ChatMessage::tool_result("call-b", "read_file", "irrelevant b"),
+            retained.clone(),
+        ];
+        let assessments = ["call-a", "call-b"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_string(),
+                    AsgardToolResultAssessment {
+                        tool_call_id: id.to_string(),
+                        disposition: AsgardToolResultDisposition::Omit,
+                        explanation: "No decision value.".to_string(),
+                        summary: None,
+                    },
+                )
+            })
+            .collect();
+
+        let slim = slim_asgard_window_messages(&messages, &assessments);
+
+        assert_eq!(slim, vec![retained]);
+    }
+
+    #[test]
+    fn asgard_slimming_keeps_steps_with_unassessed_edits() {
+        let mut mixed_step = ChatMessage::assistant("I edited the file, then reread it.");
+        mixed_step.tool_calls = Some(vec![
+            supervisor_tool_call(
+                "call-edit",
+                "edit",
+                serde_json::json!({"file_path":"src/lib.rs"}),
+            ),
+            supervisor_tool_call(
+                "call-read",
+                "read_file",
+                serde_json::json!({"file_path":"src/lib.rs"}),
+            ),
+        ]);
+        let edit_result = ChatMessage::tool_result("call-edit", "edit", "updated src/lib.rs");
+        let messages = vec![
+            mixed_step.clone(),
+            edit_result.clone(),
+            ChatMessage::tool_result("call-read", "read_file", "irrelevant reread ".repeat(100)),
+        ];
+        let assessments = HashMap::from([(
+            "call-read".to_string(),
+            AsgardToolResultAssessment {
+                tool_call_id: "call-read".to_string(),
+                disposition: AsgardToolResultDisposition::Omit,
+                explanation: "The edit result is the relevant evidence.".to_string(),
+                summary: None,
+            },
+        )]);
+
+        let slim = slim_asgard_window_messages(&messages, &assessments);
+
+        assert_eq!(slim[0], mixed_step);
+        assert_eq!(slim[1], edit_result);
+        assert_eq!(slim.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn asgard_edit_only_trajectory_windows_skip_result_assessment_call() {
+        let backend = ScriptedSupervisorBackend::new(vec![]);
+        let mut assistant = ChatMessage::assistant("I edited both files.");
+        assistant.tool_calls = Some(vec![
+            supervisor_tool_call(
+                "call-edit",
+                "edit",
+                serde_json::json!({"file_path":"src/lib.rs"}),
+            ),
+            supervisor_tool_call(
+                "call-write",
+                "write_file",
+                serde_json::json!({"file_path":"src/new.rs"}),
+            ),
+        ]);
+        let window = vec![
+            assistant,
+            ChatMessage::tool_result("call-edit", "edit", "updated src/lib.rs"),
+            ChatMessage::tool_result("call-write", "write_file", "wrote src/new.rs"),
+        ];
+
+        let (assessments, usage) = run_asgard_candidate_result_assessment(
+            &backend,
+            AsgardCandidateAssessmentContext {
+                model: "deepseek::deepseek-v4-flash",
+                reasoning_effort: None,
+                service_tier: None,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+            },
+            tokio_util::sync::CancellationToken::new(),
+            window.clone(),
+            &window,
+        )
+        .await;
+
+        assert!(
+            assessments
+                .expect("edit-only assessment should succeed")
+                .is_empty()
+        );
+        assert!(usage.is_zero());
+        assert!(backend.requests.lock().expect("request lock").is_empty());
     }
 
     #[tokio::test]
