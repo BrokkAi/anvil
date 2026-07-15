@@ -11,7 +11,6 @@ use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -66,28 +65,73 @@ impl QueryError {
 struct Cache {
     status: Option<Status>,
     refreshed: Option<Instant>,
+    refresh_in_flight: bool,
 }
 
 static CACHE: OnceLock<RwLock<Cache>> = OnceLock::new();
-static REFRESH: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn cache() -> &'static RwLock<Cache> {
     CACHE.get_or_init(|| RwLock::new(Cache::default()))
 }
-fn refresh_lock() -> &'static Mutex<()> {
-    REFRESH.get_or_init(|| Mutex::new(()))
+
+/// Return cached credit status immediately and refresh stale data in the background.
+///
+/// The prompt path must not wait for AWS credential resolution or Billing requests.
+pub fn status() -> Status {
+    let (status, start_refresh) = {
+        let mut cache = cache().write().expect("bedrock credit cache poisoned");
+        status_from_cache(&mut cache, Instant::now(), as_of())
+    };
+    if start_refresh {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async {
+                    let status = refreshed_status().await;
+                    let mut cache = cache().write().expect("bedrock credit cache poisoned");
+                    cache.status = Some(status);
+                    cache.refreshed = Some(Instant::now());
+                    cache.refresh_in_flight = false;
+                });
+            }
+            Err(_) => {
+                // This API is normally called from the ACP Tokio runtime. Do not leave
+                // the cache permanently in-flight if it is called during shutdown.
+                cache()
+                    .write()
+                    .expect("bedrock credit cache poisoned")
+                    .refresh_in_flight = false;
+            }
+        }
+    }
+    status
 }
 
-/// Return a fresh cached status, or perform one bounded shared refresh.
-pub async fn status() -> Status {
-    if let Some(status) = cached_status() {
-        return status;
+fn status_from_cache(cache: &mut Cache, now: Instant, as_of: String) -> (Status, bool) {
+    let fresh = cache
+        .refreshed
+        .is_some_and(|refreshed| now.duration_since(refreshed) < CACHE_TTL);
+    if let Some(status) = cache.status.clone() {
+        if fresh {
+            return (status, false);
+        }
+        let start_refresh = !cache.refresh_in_flight;
+        cache.refresh_in_flight = true;
+        return (status, start_refresh);
     }
-    let _refresh = refresh_lock().lock().await;
-    if let Some(status) = cached_status() {
-        return status;
-    }
-    let status = match query().await {
+
+    let start_refresh = !cache.refresh_in_flight;
+    cache.refresh_in_flight = true;
+    (
+        Status::Unavailable {
+            reason: "refresh pending".to_string(),
+            as_of,
+        },
+        start_refresh,
+    )
+}
+
+async fn refreshed_status() -> Status {
+    match query().await {
         Ok(report) => Status::Available {
             amounts: report.amounts,
             earliest_expiration: report.earliest_expiration,
@@ -103,18 +147,7 @@ pub async fn status() -> Status {
                 as_of: as_of(),
             }
         }
-    };
-    let mut cache = cache().write().expect("bedrock credit cache poisoned");
-    cache.status = Some(status.clone());
-    cache.refreshed = Some(Instant::now());
-    status
-}
-
-fn cached_status() -> Option<Status> {
-    let cache = cache().read().expect("bedrock credit cache poisoned");
-    (cache.refreshed?.elapsed() < CACHE_TTL)
-        .then(|| cache.status.clone())
-        .flatten()
+    }
 }
 
 fn as_of() -> String {
@@ -437,5 +470,82 @@ mod tests {
             serde_json::to_value(unavailable).unwrap()["status"],
             "unavailable"
         );
+    }
+
+    #[test]
+    fn cold_cache_returns_pending_and_starts_one_refresh() {
+        let now = Instant::now();
+        let mut cache = Cache::default();
+
+        let (status, start_refresh) =
+            status_from_cache(&mut cache, now, "2026-07-15T18:42:00Z".into());
+
+        assert_eq!(
+            status,
+            Status::Unavailable {
+                reason: "refresh pending".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            }
+        );
+        assert!(start_refresh);
+        assert!(cache.refresh_in_flight);
+    }
+
+    #[test]
+    fn in_flight_refresh_is_not_requested_twice() {
+        let now = Instant::now();
+        let mut cache = Cache {
+            refresh_in_flight: true,
+            ..Cache::default()
+        };
+
+        let (_, start_refresh) = status_from_cache(&mut cache, now, "as-of".into());
+
+        assert!(!start_refresh);
+        assert!(cache.refresh_in_flight);
+    }
+
+    #[test]
+    fn stale_cache_returns_status_while_starting_one_refresh() {
+        let now = Instant::now();
+        let stale_status = Status::Unavailable {
+            reason: "request timed out".into(),
+            as_of: "2026-07-15T18:00:00Z".into(),
+        };
+        let mut cache = Cache {
+            status: Some(stale_status.clone()),
+            refreshed: Some(now - CACHE_TTL),
+            refresh_in_flight: false,
+        };
+
+        let (status, start_refresh) = status_from_cache(&mut cache, now, "new-as-of".into());
+
+        assert_eq!(status, stale_status);
+        assert!(start_refresh);
+        assert!(cache.refresh_in_flight);
+    }
+
+    #[test]
+    fn fresh_cache_returns_status_without_refresh() {
+        let now = Instant::now();
+        let fresh_status = Status::Available {
+            amounts: vec![CreditAmount {
+                currency: "USD".into(),
+                amount: 1.0,
+            }],
+            earliest_expiration: None,
+            as_of: "2026-07-15T18:42:00Z".into(),
+        };
+        let mut cache = Cache {
+            status: Some(fresh_status.clone()),
+            refreshed: Some(now),
+            refresh_in_flight: false,
+        };
+
+        let (status, start_refresh) = status_from_cache(&mut cache, now, "new-as-of".into());
+
+        assert_eq!(status, fresh_status);
+        assert!(!start_refresh);
+        assert!(!cache.refresh_in_flight);
     }
 }

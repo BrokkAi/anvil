@@ -505,6 +505,18 @@ fn insert_bedrock_credits_meta(
     );
 }
 
+fn attach_bedrock_credits_meta<F>(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    model_wire_id: &str,
+    status: F,
+) where
+    F: FnOnce() -> crate::bedrock_credits::Status,
+{
+    if is_bedrock_model(model_wire_id) {
+        insert_bedrock_credits_meta(meta, model_wire_id, status());
+    }
+}
+
 fn is_bedrock_model(model_wire_id: &str) -> bool {
     split_wire_id(model_wire_id).map(|(source, _)| source) == Some(ModelSource::Bedrock)
 }
@@ -1435,10 +1447,7 @@ async fn send_session_usage_update_with_breakdown(
     if let Some(failure) = turn_failure {
         insert_turn_failure_meta(&mut meta, failure);
     }
-    if is_bedrock_model(&snap.model) {
-        let status = crate::bedrock_credits::status().await;
-        insert_bedrock_credits_meta(&mut meta, &snap.model, status);
-    }
+    attach_bedrock_credits_meta(&mut meta, &snap.model, crate::bedrock_credits::status);
     if !meta.is_empty() {
         update = update.meta(Some(meta));
     }
@@ -18384,6 +18393,23 @@ mod tests {
                 as_of: "2026-07-15T18:42:00Z".into(),
             },
         );
+        assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn non_bedrock_usage_metadata_does_not_lookup_bedrock_credits() {
+        let mut meta = serde_json::Map::new();
+        let mut looked_up = false;
+
+        attach_bedrock_credits_meta(&mut meta, "openrouter::model", || {
+            looked_up = true;
+            crate::bedrock_credits::Status::Unavailable {
+                reason: "refresh pending".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            }
+        });
+
+        assert!(!looked_up);
         assert!(meta.is_empty());
     }
 }
