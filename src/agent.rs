@@ -483,6 +483,32 @@ fn insert_turn_failure_meta(
     );
 }
 
+fn insert_bedrock_credits_meta(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    model_wire_id: &str,
+    status: crate::bedrock_credits::Status,
+) {
+    if !is_bedrock_model(model_wire_id) {
+        return;
+    }
+    let mut namespace = meta
+        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    namespace.insert(
+        "bedrockCredits".to_string(),
+        serde_json::to_value(status).expect("Bedrock credit status is serializable"),
+    );
+    meta.insert(
+        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        serde_json::Value::Object(namespace),
+    );
+}
+
+fn is_bedrock_model(model_wire_id: &str) -> bool {
+    split_wire_id(model_wire_id).map(|(source, _)| source) == Some(ModelSource::Bedrock)
+}
+
 /// Build the terminal `PromptResponse` for a finished turn, choosing the
 /// stop reason from whether the prompt's cancellation token fired.
 ///
@@ -1408,6 +1434,10 @@ async fn send_session_usage_update_with_breakdown(
     let mut meta = usage_by_model.map(usage_by_model_meta).unwrap_or_default();
     if let Some(failure) = turn_failure {
         insert_turn_failure_meta(&mut meta, failure);
+    }
+    if is_bedrock_model(&snap.model) {
+        let status = crate::bedrock_credits::status().await;
+        insert_bedrock_credits_meta(&mut meta, &snap.model, status);
     }
     if !meta.is_empty() {
         update = update.meta(Some(meta));
@@ -18315,5 +18345,45 @@ mod tests {
             failure_meta["anvil"]["usageByModel"]["deepseek::deepseek-v4-pro"]["totalTokens"],
             pro_usage.total_tokens()
         );
+    }
+
+    #[test]
+    fn bedrock_credit_metadata_attaches_and_preserves_existing_anvil_metadata() {
+        let mut meta = usage_by_model_meta(&BTreeMap::from([(
+            "bedrock::model".to_string(),
+            crate::llm_client::TokenUsage::default(),
+        )]));
+        insert_turn_failure_meta(
+            &mut meta,
+            &crate::tool_loop::TurnFailure {
+                retryable: true,
+                message: "retry".into(),
+            },
+        );
+        insert_bedrock_credits_meta(
+            &mut meta,
+            "bedrock::model",
+            crate::bedrock_credits::Status::Unavailable {
+                reason: "billing credentials are unavailable".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            },
+        );
+        assert!(meta["anvil"]["usageByModel"].is_object());
+        assert_eq!(meta["anvil"]["turnFailure"]["message"], "retry");
+        assert_eq!(meta["anvil"]["bedrockCredits"]["status"], "unavailable");
+    }
+
+    #[test]
+    fn bedrock_credit_metadata_does_not_attach_for_openrouter() {
+        let mut meta = serde_json::Map::new();
+        insert_bedrock_credits_meta(
+            &mut meta,
+            "openrouter::model",
+            crate::bedrock_credits::Status::Unavailable {
+                reason: "billing credentials are unavailable".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            },
+        );
+        assert!(meta.is_empty());
     }
 }
