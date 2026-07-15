@@ -4759,8 +4759,28 @@ struct AsgardCandidate {
     model: String,
     outcome: crate::tool_loop::LoopOutcome,
     patch: Vec<u8>,
-    window_messages: Vec<ChatMessage>,
+    supervisor_window_messages: Vec<ChatMessage>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AsgardToolResultDisposition {
+    Omit,
+    Full,
+    Summary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct AsgardToolResultAssessment {
+    tool_call_id: String,
+    disposition: AsgardToolResultDisposition,
+    explanation: String,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+const ASGARD_SLIM_TRAJECTORIES_ENV: &str = "ASGARD_SLIM_TRAJECTORIES";
+const ASGARD_ASSESS_TOOL_RESULTS_TOOL_NAME: &str = "assess_tool_results";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardCandidateTestEdits {
@@ -4880,6 +4900,7 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
+    let slim_trajectories = asgard_slim_trajectories_enabled();
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
     let mut initial_advice = None;
@@ -4999,7 +5020,7 @@ async fn run_asgard_trajectory_loop(
                     messages,
                     window_steps,
                     idle_timeout,
-                    cancel,
+                    cancel.clone(),
                     sinks.text,
                     sinks.thought,
                     spawned,
@@ -5021,25 +5042,82 @@ async fn run_asgard_trajectory_loop(
                     &outcome.continuation_messages,
                     trajectory_message_start,
                 );
-                (index, model, outcome, patch, window_messages)
+                let (supervisor_window_messages, grading_usage) = if slim_trajectories {
+                    let (assessments, usage) = run_asgard_candidate_result_assessment(
+                        llm.as_ref(),
+                        AsgardCandidateAssessmentContext {
+                            model: &model,
+                            reasoning_effort,
+                            service_tier,
+                            idle_timeout,
+                        },
+                        cancel,
+                        outcome.continuation_messages.clone(),
+                        &window_messages,
+                    )
+                    .await;
+                    let messages = match assessments {
+                        Ok(assessments) => {
+                            let messages = slim_asgard_window_messages(
+                                &window_messages,
+                                &assessments,
+                            );
+                            tracing::info!(
+                                lane = index + 1,
+                                model,
+                                original_bytes = render_asgard_dossier_messages(&window_messages).len(),
+                                slim_bytes = render_asgard_dossier_messages(&messages).len(),
+                                "slimmed Asgard candidate trajectory"
+                            );
+                            messages
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                lane = index + 1,
+                                model,
+                                "keeping full Asgard trajectory after tool-result assessment failed: {error:#}"
+                            );
+                            window_messages.clone()
+                        }
+                    };
+                    (messages, usage)
+                } else {
+                    (
+                        window_messages.clone(),
+                        crate::llm_client::TokenUsage::default(),
+                    )
+                };
+                (
+                    index,
+                    model,
+                    outcome,
+                    patch,
+                    supervisor_window_messages,
+                    grading_usage,
+                )
             });
         }
         let mut candidates = Vec::with_capacity(futures.len());
-        for (index, model, outcome, patch, window_messages) in
+        for (index, model, outcome, patch, supervisor_window_messages, grading_usage) in
             futures::future::join_all(futures).await
         {
             aggregate_usage.add(outcome.usage);
+            aggregate_usage.add(grading_usage);
             usage_by_model
                 .entry(model.clone())
                 .or_default()
                 .add(outcome.usage);
+            usage_by_model
+                .entry(model.clone())
+                .or_default()
+                .add(grading_usage);
             match patch {
                 Ok(patch) => candidates.push(AsgardCandidate {
                     index,
                     model,
                     outcome,
                     patch,
-                    window_messages,
+                    supervisor_window_messages,
                 }),
                 Err(error) => {
                     cleanup_asgard_repositories(&repositories);
@@ -5175,7 +5253,11 @@ async fn run_asgard_trajectory_loop(
             &repositories[winner.index].session_cwd,
             parent_registry.cwd(),
         );
-        let mut selected_window = winner.window_messages.clone();
+        // Candidate model history remains exact in `common_messages`, but the
+        // supervisor should keep seeing the assessed representation after this
+        // window becomes selected. Otherwise an omitted noisy result disappears
+        // for one decision and is reintroduced in full at the next window.
+        let mut selected_window = winner.supervisor_window_messages.clone();
         rewrite_asgard_cwd(
             &mut selected_window,
             &repositories[winner.index].session_cwd,
@@ -5322,7 +5404,7 @@ async fn run_asgard_supervisor(
 ) {
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
-        let trajectory = render_asgard_dossier_messages(&candidate.window_messages);
+        let trajectory = render_asgard_dossier_messages(&candidate.supervisor_window_messages);
         let terminal_patch =
             asgard_terminal_non_test_patch(&candidate.outcome.stop, &candidate.patch)
                 .map(|patch| {
@@ -5898,6 +5980,357 @@ fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String {
         rendered.push_str("</message>\n");
     }
     rendered
+}
+
+fn asgard_slim_trajectories_enabled() -> bool {
+    std::env::var(ASGARD_SLIM_TRAJECTORIES_ENV)
+        .ok()
+        .is_some_and(|value| asgard_slim_trajectories_value_enabled(&value))
+}
+
+fn asgard_slim_trajectories_value_enabled(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn asgard_window_tool_inventory(messages: &[ChatMessage]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .map(|call| (call.id.clone(), call.function.name.clone()))
+        .collect()
+}
+
+fn asgard_tool_result_assessment_prompt(inventory: &[(String, String)]) -> ChatMessage {
+    let calls = inventory
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name))| format!("{}. id={id:?}, tool={name:?}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ChatMessage::user(format!(
+        r#"<asgard_tool_result_assessment>
+This Asgard window has ended. Your progress will now be assessed by a supervisor. Review the
+actual result of every tool call listed below against the original user goal, the current plan,
+and the information already established in your trajectory. Classify how its result should be
+shown to the supervisor. Judge the evidence produced, not merely whether the call succeeded or
+whether its intended action sounded reasonable. A failed verifier can be highly useful when its
+failure precisely diagnoses the implementation; a successful but redundant call can be omitted.
+
+Rubric:
+- omit: The result is irrelevant, tangential, duplicative, superseded, or provides no material
+  evidence for choosing or continuing this trajectory. Supply a concise explanation; the original
+  result will be removed.
+- full: The result is materially useful and either already concise or its exact wording/details are
+  important. Do not supply a summary.
+- summary: The result is materially useful but long or noisy. Supply a loss-aware extract at least
+  about 4x shorter than the original. Preserve every task-relevant command outcome, error message,
+  failing test or check name, path, symbol, line number, count, and concrete observation needed to
+  evaluate correctness. Do not turn adverse evidence into a vague or favorable paraphrase.
+
+For each entry, call assess_tool_results exactly once with its tool_call_id, disposition, and a
+brief explanation. Include summary only for disposition=summary. Do not continue the original task,
+make new tool calls, or assess calls outside this list.
+
+Tool calls from this window:
+{calls}
+</asgard_tool_result_assessment>"#
+    ))
+}
+
+fn asgard_assess_tool_results_tool(inventory: &[(String, String)]) -> ToolDefinition {
+    let ids = inventory
+        .iter()
+        .map(|(id, _)| serde_json::Value::String(id.clone()))
+        .collect::<Vec<_>>();
+    ToolDefinition {
+        r#type: "function".to_string(),
+        function: FunctionDef {
+            name: ASGARD_ASSESS_TOOL_RESULTS_TOOL_NAME.to_string(),
+            description: "Classify how every tool result from the completed Asgard window should be presented to the supervisor. This terminal assessment must be called exactly once.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["assessments"],
+                "properties": {
+                    "assessments": {
+                        "type": "array",
+                        "minItems": inventory.len(),
+                        "maxItems": inventory.len(),
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["tool_call_id", "disposition", "explanation"],
+                            "properties": {
+                                "tool_call_id": { "type": "string", "enum": ids },
+                                "disposition": {
+                                    "type": "string",
+                                    "enum": ["omit", "full", "summary"],
+                                },
+                                "explanation": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 240,
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 1600,
+                                    "description": "Required only for disposition=summary; omit for full or omit.",
+                                },
+                            },
+                        },
+                    },
+                },
+            }),
+        },
+    }
+}
+
+fn parse_asgard_tool_result_assessments(
+    arguments: &serde_json::Value,
+    inventory: &[(String, String)],
+) -> anyhow::Result<HashMap<String, AsgardToolResultAssessment>> {
+    let raw = arguments
+        .get("assessments")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("assess_tool_results requires an assessments array"))?;
+    if raw.len() != inventory.len() {
+        anyhow::bail!(
+            "assess_tool_results returned {} assessments for {} tool calls",
+            raw.len(),
+            inventory.len()
+        );
+    }
+    let expected: HashSet<&str> = inventory.iter().map(|(id, _)| id.as_str()).collect();
+    if expected.len() != inventory.len() {
+        anyhow::bail!("window contains duplicate tool call IDs");
+    }
+    let mut parsed = HashMap::with_capacity(raw.len());
+    for value in raw {
+        let mut assessment: AsgardToolResultAssessment = serde_json::from_value(value.clone())?;
+        assessment.explanation = assessment.explanation.trim().to_string();
+        if assessment.explanation.is_empty() {
+            anyhow::bail!(
+                "assessment for {:?} has an empty explanation",
+                assessment.tool_call_id
+            );
+        }
+        if !expected.contains(assessment.tool_call_id.as_str()) {
+            anyhow::bail!(
+                "assessment names unknown tool call {:?}",
+                assessment.tool_call_id
+            );
+        }
+        match assessment.disposition {
+            AsgardToolResultDisposition::Summary => {
+                let summary = assessment.summary.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "summary assessment for {:?} omitted its summary",
+                        assessment.tool_call_id
+                    )
+                })?;
+                *summary = summary.trim().to_string();
+                if summary.is_empty() {
+                    anyhow::bail!(
+                        "summary assessment for {:?} has an empty summary",
+                        assessment.tool_call_id
+                    );
+                }
+            }
+            AsgardToolResultDisposition::Omit | AsgardToolResultDisposition::Full => {
+                if assessment
+                    .summary
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    anyhow::bail!(
+                        "non-summary assessment for {:?} included a summary",
+                        assessment.tool_call_id
+                    );
+                }
+                assessment.summary = None;
+            }
+        }
+        let id = assessment.tool_call_id.clone();
+        if parsed.insert(id.clone(), assessment).is_some() {
+            anyhow::bail!("tool call {id:?} was assessed more than once");
+        }
+    }
+    if parsed.len() != expected.len() {
+        anyhow::bail!("not every tool call was assessed exactly once");
+    }
+    Ok(parsed)
+}
+
+async fn run_asgard_candidate_result_assessment(
+    llm: &dyn crate::llm_client::LlmBackend,
+    context: AsgardCandidateAssessmentContext<'_>,
+    cancel: tokio_util::sync::CancellationToken,
+    mut messages: Vec<ChatMessage>,
+    window_messages: &[ChatMessage],
+) -> (
+    anyhow::Result<HashMap<String, AsgardToolResultAssessment>>,
+    crate::llm_client::TokenUsage,
+) {
+    const MAX_STEPS: usize = 2;
+    let inventory = asgard_window_tool_inventory(window_messages);
+    if inventory.is_empty() {
+        return (Ok(HashMap::new()), Default::default());
+    }
+    messages.push(asgard_tool_result_assessment_prompt(&inventory));
+    let tools = vec![asgard_assess_tool_results_tool(&inventory)];
+    let mut usage = crate::llm_client::TokenUsage::default();
+    let mut last_invalid_response = None;
+
+    for step in 1..=MAX_STEPS {
+        let response = stream_chat_no_visible_output_with_retry(
+            llm,
+            "assessing Asgard candidate tool results",
+            &cancel,
+            || StreamChatRequest {
+                model: context.model.to_string(),
+                messages: messages.clone(),
+                tools: Some(tools.clone()),
+                reasoning_effort: context.reasoning_effort.map(str::to_string),
+                service_tier: context.service_tier.map(str::to_string),
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeouts: context.idle_timeout,
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return (Err(error), usage),
+        };
+        usage.add(response.usage());
+
+        match response {
+            LlmResponse::Text {
+                text,
+                reasoning_content,
+                ..
+            } => messages.push(ChatMessage::assistant_with_reasoning(
+                text,
+                reasoning_content,
+            )),
+            LlmResponse::ToolCalls {
+                text,
+                reasoning_content,
+                calls,
+                ..
+            } => {
+                if calls.len() == 1
+                    && calls[0].function.name == ASGARD_ASSESS_TOOL_RESULTS_TOOL_NAME
+                {
+                    match crate::tool_arguments::normalize_tool_arguments(
+                        &calls[0].function.arguments,
+                    ) {
+                        Ok(arguments) => {
+                            match parse_asgard_tool_result_assessments(&arguments.value, &inventory)
+                            {
+                                Ok(assessments) => return (Ok(assessments), usage),
+                                Err(error) => last_invalid_response = Some(error),
+                            }
+                        }
+                        Err(error) => {
+                            last_invalid_response = Some(anyhow::anyhow!(
+                                "candidate emitted invalid assess_tool_results arguments: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    last_invalid_response = Some(anyhow::anyhow!(
+                        "candidate must call assess_tool_results exactly once and no other tool"
+                    ));
+                }
+                if !text.is_empty() || reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
+                    messages.push(ChatMessage::assistant_with_reasoning(
+                        text,
+                        reasoning_content,
+                    ));
+                }
+            }
+        }
+
+        if step < MAX_STEPS {
+            let detail = last_invalid_response
+                .as_ref()
+                .map(|error| format!(" Your previous response was invalid: {error}."))
+                .unwrap_or_default();
+            messages.push(ChatMessage::user(format!(
+                "You have not assessed the window's tool results.{detail} Only \
+                 assess_tool_results is available. Call it exactly once now; do not answer in prose."
+            )));
+        }
+    }
+
+    (
+        Err(last_invalid_response.unwrap_or_else(|| {
+            anyhow::anyhow!("candidate did not call assess_tool_results after {MAX_STEPS} steps")
+        })),
+        usage,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AsgardCandidateAssessmentContext<'a> {
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+    service_tier: Option<&'a str>,
+    idle_timeout: IdleTimeouts,
+}
+
+fn slim_asgard_window_messages(
+    messages: &[ChatMessage],
+    assessments: &HashMap<String, AsgardToolResultAssessment>,
+) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if message.role != "tool" {
+                return message;
+            }
+            let Some(id) = message.tool_call_id.as_deref() else {
+                return message;
+            };
+            let Some(assessment) = assessments.get(id) else {
+                return message;
+            };
+            let replacement = match assessment.disposition {
+                AsgardToolResultDisposition::Full => return message,
+                AsgardToolResultDisposition::Omit => format!(
+                    "[Asgard candidate assessment: original tool result omitted. Reason: {}]",
+                    assessment.explanation
+                ),
+                AsgardToolResultDisposition::Summary => format!(
+                    "[Asgard candidate assessment: original tool result summarized. Reason: {}]\n{}",
+                    assessment.explanation,
+                    assessment.summary.as_deref().unwrap_or_default()
+                ),
+            };
+            let original_bytes = message
+                .content
+                .iter()
+                .map(|part| match part {
+                    ChatContentPart::Text { text } => text.len(),
+                    ChatContentPart::Image { image_url } => image_url.len(),
+                })
+                .sum::<usize>();
+            if replacement.len() >= original_bytes {
+                return message;
+            }
+            message.content = vec![ChatContentPart::text(replacement)];
+            message
+        })
+        .collect()
 }
 
 fn asgard_advise_trajectories_tool(candidate_count: usize) -> ToolDefinition {
@@ -17123,6 +17556,263 @@ mod tests {
         assert!(dossier.contains("END"));
         assert_eq!(dossier.matches(&"x".repeat(9_000)).count(), 1);
         assert!(dossier.contains("small exact result"));
+    }
+
+    #[test]
+    fn asgard_slim_trajectory_flag_accepts_only_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "On"] {
+            assert!(asgard_slim_trajectories_value_enabled(value));
+        }
+        for value in ["", "0", "false", "no", "enabled"] {
+            assert!(!asgard_slim_trajectories_value_enabled(value));
+        }
+    }
+
+    #[test]
+    fn asgard_result_assessment_requires_every_call_and_summary_content() {
+        let inventory = vec![
+            ("call-read".to_string(), "read_file".to_string()),
+            ("call-test".to_string(), "runShellCommand".to_string()),
+        ];
+        let parsed = parse_asgard_tool_result_assessments(
+            &serde_json::json!({
+                "assessments": [
+                    {
+                        "tool_call_id": "call-read",
+                        "disposition": "omit",
+                        "explanation": "Superseded by the later targeted read."
+                    },
+                    {
+                        "tool_call_id": "call-test",
+                        "disposition": "summary",
+                        "explanation": "The test evidence is decisive but the log is noisy.",
+                        "summary": "Exit 1: parser_boundary failed at tests/parser.rs:42."
+                    }
+                ]
+            }),
+            &inventory,
+        )
+        .expect("valid complete assessment");
+        assert_eq!(
+            parsed["call-read"].disposition,
+            AsgardToolResultDisposition::Omit
+        );
+        assert_eq!(
+            parsed["call-test"].summary.as_deref(),
+            Some("Exit 1: parser_boundary failed at tests/parser.rs:42.")
+        );
+
+        assert!(
+            parse_asgard_tool_result_assessments(
+                &serde_json::json!({
+                    "assessments": [{
+                        "tool_call_id": "call-read",
+                        "disposition": "full",
+                        "explanation": "Exact output matters."
+                    }]
+                }),
+                &inventory,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_asgard_tool_result_assessments(
+                &serde_json::json!({
+                    "assessments": [
+                        {
+                            "tool_call_id": "call-read",
+                            "disposition": "omit",
+                            "explanation": "Not useful."
+                        },
+                        {
+                            "tool_call_id": "call-test",
+                            "disposition": "summary",
+                            "explanation": "No summary supplied."
+                        }
+                    ]
+                }),
+                &inventory,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn asgard_slimming_changes_only_worthwhile_tool_result_payloads() {
+        let mut assistant = ChatMessage::assistant("I inspected and verified the change.");
+        assistant.tool_calls = Some(vec![
+            supervisor_tool_call(
+                "call-omit",
+                "read_file",
+                serde_json::json!({"path":"README"}),
+            ),
+            supervisor_tool_call(
+                "call-full",
+                "read_file",
+                serde_json::json!({"path":"src/lib.rs"}),
+            ),
+            supervisor_tool_call(
+                "call-summary",
+                "runShellCommand",
+                serde_json::json!({"command":"cargo test"}),
+            ),
+            supervisor_tool_call("call-tiny", "pwd", serde_json::json!({})),
+        ]);
+        let messages = vec![
+            assistant,
+            ChatMessage::tool_result("call-omit", "read_file", "noise ".repeat(200)),
+            ChatMessage::tool_result("call-full", "read_file", "exact useful result"),
+            ChatMessage::tool_result("call-summary", "runShellCommand", "log line\n".repeat(500)),
+            ChatMessage::tool_result("call-tiny", "pwd", "x"),
+        ];
+        let assessments = HashMap::from([
+            (
+                "call-omit".to_string(),
+                AsgardToolResultAssessment {
+                    tool_call_id: "call-omit".to_string(),
+                    disposition: AsgardToolResultDisposition::Omit,
+                    explanation: "Unrelated documentation output.".to_string(),
+                    summary: None,
+                },
+            ),
+            (
+                "call-full".to_string(),
+                AsgardToolResultAssessment {
+                    tool_call_id: "call-full".to_string(),
+                    disposition: AsgardToolResultDisposition::Full,
+                    explanation: "The exact source is concise and required.".to_string(),
+                    summary: None,
+                },
+            ),
+            (
+                "call-summary".to_string(),
+                AsgardToolResultAssessment {
+                    tool_call_id: "call-summary".to_string(),
+                    disposition: AsgardToolResultDisposition::Summary,
+                    explanation: "The test log is useful but repetitive.".to_string(),
+                    summary: Some(
+                        "Exit 1; parser_boundary failed at tests/parser.rs:42.".to_string(),
+                    ),
+                },
+            ),
+            (
+                "call-tiny".to_string(),
+                AsgardToolResultAssessment {
+                    tool_call_id: "call-tiny".to_string(),
+                    disposition: AsgardToolResultDisposition::Omit,
+                    explanation: "No decision value.".to_string(),
+                    summary: None,
+                },
+            ),
+        ]);
+
+        let slim = slim_asgard_window_messages(&messages, &assessments);
+
+        assert_eq!(
+            messages[1].text_content(),
+            Some("noise ".repeat(200).as_str())
+        );
+        assert!(
+            slim[1]
+                .text_content()
+                .is_some_and(|text| text.contains("original tool result omitted"))
+        );
+        assert_eq!(slim[2], messages[2]);
+        assert!(
+            slim[3]
+                .text_content()
+                .is_some_and(|text| text.contains("parser_boundary failed"))
+        );
+        assert_eq!(
+            slim[4], messages[4],
+            "a replacement must not enlarge a result"
+        );
+        assert_eq!(slim[0], messages[0], "tool calls and arguments stay exact");
+    }
+
+    #[tokio::test]
+    async fn asgard_candidate_assessment_uses_one_terminal_tool_call() {
+        let backend = ScriptedSupervisorBackend::new(vec![
+            LlmResponse::Text {
+                text: "I have finished the original task.".to_string(),
+                reasoning_content: None,
+                usage: crate::llm_client::TokenUsage {
+                    input_tokens: 100,
+                    ..Default::default()
+                },
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("The build log is useful but noisy.".to_string()),
+                calls: vec![supervisor_tool_call(
+                    "assessment-call",
+                    "assess_tool_results",
+                    serde_json::json!({
+                        "assessments": [{
+                            "tool_call_id": "call-test",
+                            "disposition": "summary",
+                            "explanation": "The failure is decisive but the log repeats it.",
+                            "summary": "Exit 1: parser_boundary failed at tests/parser.rs:42."
+                        }]
+                    }),
+                )],
+                usage: crate::llm_client::TokenUsage {
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+            },
+        ]);
+        let mut assistant = ChatMessage::assistant("I ran the focused test.");
+        assistant.tool_calls = Some(vec![supervisor_tool_call(
+            "call-test",
+            "runShellCommand",
+            serde_json::json!({"command":"cargo test parser_boundary"}),
+        )]);
+        let window = vec![
+            assistant,
+            ChatMessage::tool_result("call-test", "runShellCommand", "long test output"),
+        ];
+        let mut history = vec![
+            ChatMessage::system("normal Anvil system prompt"),
+            ChatMessage::user("Fix the parser boundary."),
+        ];
+        history.extend(window.clone());
+
+        let (assessments, usage) = run_asgard_candidate_result_assessment(
+            &backend,
+            AsgardCandidateAssessmentContext {
+                model: "deepseek::deepseek-v4-flash",
+                reasoning_effort: None,
+                service_tier: None,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+            },
+            tokio_util::sync::CancellationToken::new(),
+            history.clone(),
+            &window,
+        )
+        .await;
+
+        assert_eq!(
+            assessments.expect("valid assessment")["call-test"].disposition,
+            AsgardToolResultDisposition::Summary
+        );
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tool_names, vec!["assess_tool_results"]);
+        assert_eq!(&requests[0].messages[..history.len()], history.as_slice());
+        let prompt = asgard_message_text(requests[0].messages.last().expect("assessment prompt"));
+        assert!(prompt.contains("Rubric:"));
+        assert!(prompt.contains("omit:"));
+        assert!(prompt.contains("full:"));
+        assert!(prompt.contains("summary:"));
+        assert!(prompt.contains("failed verifier can be highly useful"));
+        assert_eq!(requests[1].tool_names, vec!["assess_tool_results"]);
+        assert!(
+            asgard_message_text(requests[1].messages.last().expect("assessment reminder"))
+                .contains("Call it exactly once now")
+        );
     }
 
     #[test]
