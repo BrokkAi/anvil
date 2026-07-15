@@ -562,6 +562,47 @@ fn is_openrouter_model(model_wire_id: &str) -> bool {
     )
 }
 
+fn insert_deepseek_balance_meta(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    model_wire_id: &str,
+    status: crate::deepseek_balance::Status,
+) {
+    if !is_deepseek_model(model_wire_id) {
+        return;
+    }
+    let mut namespace = meta
+        .remove(crate::structured_output::ACP_META_NAMESPACE)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    namespace.insert(
+        "deepseekBalance".to_string(),
+        serde_json::to_value(status).expect("DeepSeek balance status is serializable"),
+    );
+    meta.insert(
+        crate::structured_output::ACP_META_NAMESPACE.to_string(),
+        serde_json::Value::Object(namespace),
+    );
+}
+
+fn attach_deepseek_balance_meta<F>(
+    meta: &mut serde_json::Map<String, serde_json::Value>,
+    model_wire_id: &str,
+    status: F,
+) where
+    F: FnOnce() -> crate::deepseek_balance::Status,
+{
+    if is_deepseek_model(model_wire_id) {
+        insert_deepseek_balance_meta(meta, model_wire_id, status());
+    }
+}
+
+fn is_deepseek_model(model_wire_id: &str) -> bool {
+    matches!(
+        split_wire_id(model_wire_id),
+        Some((ModelSource::DeepSeek, model_id)) if !model_id.is_empty()
+    )
+}
+
 /// Build the terminal `PromptResponse` for a finished turn, choosing the
 /// stop reason from whether the prompt's cancellation token fired.
 ///
@@ -1490,6 +1531,7 @@ async fn send_session_usage_update_with_breakdown(
     }
     attach_bedrock_credits_meta(&mut meta, &snap.model, crate::bedrock_credits::status);
     attach_openrouter_balance_meta(&mut meta, &snap.model, crate::openrouter_credits::status);
+    attach_deepseek_balance_meta(&mut meta, &snap.model, crate::deepseek_balance::status);
     if !meta.is_empty() {
         update = update.meta(Some(meta));
     }
@@ -18500,5 +18542,56 @@ mod tests {
         assert!(!looked_up);
         assert!(meta.is_empty());
         assert!(!is_openrouter_model("openrouter::"));
+    }
+
+    #[test]
+    fn deepseek_balance_metadata_attaches_and_preserves_existing_anvil_metadata() {
+        let mut meta = usage_by_model_meta(&BTreeMap::from([(
+            "deepseek::deepseek-chat".to_string(),
+            crate::llm_client::TokenUsage::default(),
+        )]));
+        insert_turn_failure_meta(
+            &mut meta,
+            &crate::tool_loop::TurnFailure {
+                retryable: true,
+                message: "retry".into(),
+            },
+        );
+        insert_deepseek_balance_meta(
+            &mut meta,
+            "deepseek::deepseek-chat",
+            crate::deepseek_balance::Status::Available {
+                balances: vec![crate::deepseek_balance::Balance {
+                    currency: "CNY".into(),
+                    total_balance: "12.3400".into(),
+                    granted_balance: "2.0000".into(),
+                    topped_up_balance: "10.3400".into(),
+                }],
+                as_of: "2026-07-15T18:42:00Z".into(),
+            },
+        );
+        assert!(meta["anvil"]["usageByModel"].is_object());
+        assert_eq!(meta["anvil"]["turnFailure"]["message"], "retry");
+        assert_eq!(meta["anvil"]["deepseekBalance"]["status"], "available");
+        assert_eq!(
+            meta["anvil"]["deepseekBalance"]["balances"][0]["totalBalance"],
+            "12.3400"
+        );
+    }
+
+    #[test]
+    fn deepseek_balance_metadata_is_lazy_for_other_providers() {
+        let mut meta = serde_json::Map::new();
+        let mut looked_up = false;
+        attach_deepseek_balance_meta(&mut meta, "openrouter::model", || {
+            looked_up = true;
+            crate::deepseek_balance::Status::Unavailable {
+                reason: "refresh pending".into(),
+                as_of: "2026-07-15T18:42:00Z".into(),
+            }
+        });
+        assert!(!looked_up);
+        assert!(meta.is_empty());
+        assert!(!is_deepseek_model("deepseek::"));
     }
 }

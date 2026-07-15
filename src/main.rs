@@ -18,6 +18,7 @@ mod codex_client;
 mod codex_credits;
 mod context_manager;
 mod deepseek_auth;
+mod deepseek_balance;
 mod discovery;
 mod host_notice;
 mod http_retry;
