@@ -4894,7 +4894,8 @@ const ASGARD_AUDIT_BIFROST_TOOLS: &[&str] = &[
     "get_symbol_locations",
     "get_summaries",
 ];
-const ASGARD_AUDIT_MAX_STEPS: usize = 8;
+const ASGARD_AUDIT_MAX_ROUNDS: usize = 3;
+const ASGARD_SELECTION_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardCandidatePatchManifest {
@@ -4940,7 +4941,7 @@ struct AsgardSupervisorDecision {
     state_summary: String,
 }
 
-const ASGARD_SUPERVISOR_MAX_ATTEMPTS: usize = 2;
+const ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS: usize = 2;
 const ASGARD_MIN_WINDOW_STEPS: usize = 3;
 const ASGARD_MAX_WINDOW_STEPS: usize = 12;
 
@@ -5020,7 +5021,7 @@ async fn run_asgard_trajectory_loop(
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
     let mut initial_advice = None;
     let mut initial_advice_error = None;
-    for attempt in 1..=ASGARD_SUPERVISOR_MAX_ATTEMPTS {
+    for attempt in 1..=ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS {
         let supervisor = run_asgard_initial_advice(
             llm,
             supervisor_model,
@@ -5041,10 +5042,12 @@ async fn run_asgard_trajectory_loop(
                 initial_advice = Some(value);
                 break;
             }
-            Err(error) if attempt < ASGARD_SUPERVISOR_MAX_ATTEMPTS && !cancel.is_cancelled() => {
+            Err(error)
+                if attempt < ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS && !cancel.is_cancelled() =>
+            {
                 tracing::warn!(
                     attempt,
-                    max_attempts = ASGARD_SUPERVISOR_MAX_ATTEMPTS,
+                    max_attempts = ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS,
                     "retrying failed initial Asgard supervisor advice: {error:#}"
                 );
             }
@@ -5254,57 +5257,35 @@ async fn run_asgard_trajectory_loop(
                 }
             }
         }
-        let mut supervisor_usage = crate::llm_client::TokenUsage::default();
-        let mut decision = None;
-        let mut supervisor_error = None;
-        for attempt in 1..=ASGARD_SUPERVISOR_MAX_ATTEMPTS {
-            let supervisor = run_asgard_supervisor(
-                llm,
-                supervisor_model,
-                idle_timeout,
-                cancel.clone(),
-                window,
-                &candidates,
-                &registries,
-                &original_task,
-                &selected_trajectory_initial,
-                &selected_trajectory_windows,
-                &supervisor_history,
-                &live_output,
-            )
-            .await;
-            supervisor_usage.add(supervisor.1);
-            match supervisor.0 {
-                Ok(value) => {
-                    decision = Some(value);
-                    break;
-                }
-                Err(error)
-                    if attempt < ASGARD_SUPERVISOR_MAX_ATTEMPTS && !cancel.is_cancelled() =>
-                {
-                    tracing::warn!(
-                        window,
-                        attempt,
-                        max_attempts = ASGARD_SUPERVISOR_MAX_ATTEMPTS,
-                        "retrying failed Asgard supervisor decision: {error:#}"
-                    );
-                }
-                Err(error) => {
-                    supervisor_error = Some(error);
-                    break;
-                }
-            }
-        }
+        let supervisor = run_asgard_supervisor(
+            llm,
+            supervisor_model,
+            idle_timeout,
+            cancel.clone(),
+            window,
+            &candidates,
+            &registries,
+            &original_task,
+            &selected_trajectory_initial,
+            &selected_trajectory_windows,
+            &supervisor_history,
+            &live_output,
+        )
+        .await;
+        let supervisor_usage = supervisor.1;
         aggregate_usage.add(supervisor_usage);
         usage_by_model
             .entry(supervisor_model.to_string())
             .or_default()
             .add(supervisor_usage);
-        let decision = match decision {
-            Some(decision) => decision,
-            None => {
-                let error = supervisor_error
-                    .unwrap_or_else(|| anyhow::anyhow!("supervisor produced no decision"));
+        let decision = match supervisor.0 {
+            Ok(decision) => decision,
+            Err(error) => {
+                tracing::warn!(
+                    window,
+                    model = supervisor_model,
+                    "Asgard supervisor produced no valid decision: {error:#}"
+                );
                 let apply_result =
                     crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
                 cleanup_asgard_repositories(&repositories);
@@ -5901,10 +5882,10 @@ async fn run_asgard_supervisor_tool_steps(
     anyhow::Result<AsgardSupervisorDecision>,
     crate::llm_client::TokenUsage,
 ) {
-    let max_steps = if context.audit.is_some() {
-        ASGARD_AUDIT_MAX_STEPS
+    let audit_round_limit = if context.audit.is_some() {
+        ASGARD_AUDIT_MAX_ROUNDS
     } else {
-        2
+        0
     };
     let mut tools = vec![asgard_select_trajectory_tool(context.candidate_count)];
     if let Some(audit) = &context.audit {
@@ -5912,8 +5893,16 @@ async fn run_asgard_supervisor_tool_steps(
     }
     let mut usage = crate::llm_client::TokenUsage::default();
     let mut last_invalid_response = None;
+    let mut audit_rounds_used = 0usize;
+    let mut selection_attempts = 0usize;
 
-    for step in 1..=max_steps {
+    loop {
+        let audit_phase = audit_rounds_used < audit_round_limit;
+        if audit_phase {
+            audit_rounds_used += 1;
+        } else {
+            selection_attempts += 1;
+        }
         let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
         let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
         let response = stream_chat_no_visible_output_with_retry(
@@ -5981,130 +5970,196 @@ async fn run_asgard_supervisor_tool_steps(
                 calls,
                 ..
             } => {
-                let selection_only =
-                    calls.len() == 1 && calls[0].function.name.as_str() == "select_trajectory";
-                if selection_only {
-                    let normalized = match crate::tool_arguments::normalize_tool_arguments(
-                        &calls[0].function.arguments,
-                    ) {
-                        Ok(arguments) => arguments.value,
-                        Err(error) => {
-                            last_invalid_response = Some(anyhow::anyhow!(
-                                "Asgard supervisor emitted invalid `select_trajectory` arguments: {error}"
-                            ));
-                            serde_json::Value::Null
-                        }
-                    };
-                    if !normalized.is_null() {
-                        let serialized = serde_json::to_string(&normalized)
-                            .expect("normalized tool arguments serialize");
-                        match parse_asgard_supervisor_decision(&serialized, context.candidate_count)
-                        {
-                            Ok(decision) => return (Ok(decision), usage),
-                            Err(error) => last_invalid_response = Some(error),
-                        }
-                    }
-                    if !text.is_empty()
-                        || reasoning_content.as_deref().is_some_and(|s| !s.is_empty())
-                    {
-                        messages.push(ChatMessage::assistant_with_reasoning(
-                            text,
-                            reasoning_content,
-                        ));
-                    }
-                } else if let Some(audit) = &context.audit
-                    && calls
-                        .iter()
-                        .any(|call| asgard_is_audit_tool(&call.function.name))
-                {
-                    messages.push(
-                        ChatMessage::assistant_tool_calls_with_content_and_reasoning(
-                            text,
-                            calls.clone(),
-                            reasoning_content,
-                        ),
-                    );
-                    for call in &calls {
-                        let output = if call.function.name == "select_trajectory" {
-                            "Selection deferred because inspection tools were called in the same step. Review their results, then call select_trajectory by itself."
-                                .to_string()
-                        } else if !asgard_is_audit_tool(&call.function.name) {
-                            format!(
-                                "Error: tool `{}` is not available for Asgard audit",
-                                call.function.name
-                            )
-                        } else {
-                            match crate::tool_arguments::normalize_tool_arguments(
-                                &call.function.arguments,
-                            ) {
-                                Ok(arguments) => {
-                                    execute_asgard_audit_tool(
-                                        audit,
-                                        &call.function.name,
-                                        arguments.value,
-                                        &cancel,
-                                    )
-                                    .await
-                                }
-                                Err(error) => format!(
-                                    "Error: invalid `{}` arguments: {error}",
-                                    call.function.name
-                                ),
-                            }
-                        };
-                        messages.push(ChatMessage::tool_result(
-                            &call.id,
-                            &call.function.name,
-                            output,
-                        ));
-                    }
-                    last_invalid_response = None;
-                } else {
-                    let names = calls
-                        .iter()
-                        .map(|call| call.function.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    last_invalid_response = Some(if calls.len() == 1 {
-                        anyhow::anyhow!("Asgard supervisor called unexpected tool `{names}`")
+                let call_names = calls
+                    .iter()
+                    .map(|call| call.function.name.as_str())
+                    .collect::<Vec<_>>();
+                let selector_calls = calls
+                    .iter()
+                    .filter(|call| call.function.name == "select_trajectory")
+                    .collect::<Vec<_>>();
+                tracing::info!(
+                    model = context.model,
+                    phase = if audit_phase { "audit" } else { "selection" },
+                    audit_round = if audit_phase {
+                        Some(audit_rounds_used)
                     } else {
-                        anyhow::anyhow!(
-                            "Asgard supervisor called unexpected or non-terminal tool batch `{names}`"
-                        )
-                    });
-                    if !text.is_empty()
-                        || reasoning_content.as_deref().is_some_and(|s| !s.is_empty())
-                    {
-                        messages.push(ChatMessage::assistant_with_reasoning(
-                            text,
-                            reasoning_content,
-                        ));
+                        None
+                    },
+                    selection_attempt = if audit_phase {
+                        None
+                    } else {
+                        Some(selection_attempts)
+                    },
+                    calls = ?call_names,
+                    selector_count = selector_calls.len(),
+                    "received Asgard supervisor tool-call batch"
+                );
+
+                let may_accept_selector =
+                    selector_calls.len() == 1 && (calls.len() == 1 || !audit_phase);
+                let mut selector_error = None;
+                if may_accept_selector {
+                    let selection_call = selector_calls[0];
+                    match crate::tool_arguments::normalize_tool_arguments(
+                        &selection_call.function.arguments,
+                    ) {
+                        Ok(arguments) => {
+                            let serialized = serde_json::to_string(&arguments.value)
+                                .expect("normalized tool arguments serialize");
+                            match parse_asgard_supervisor_decision(
+                                &serialized,
+                                context.candidate_count,
+                            ) {
+                                Ok(decision) => {
+                                    if calls.len() > 1 {
+                                        tracing::warn!(
+                                            model = context.model,
+                                            ignored_calls = ?call_names
+                                                .iter()
+                                                .copied()
+                                                .filter(|name| *name != "select_trajectory")
+                                                .collect::<Vec<_>>(),
+                                            "accepted final Asgard selection and ignored other tool calls"
+                                        );
+                                    }
+                                    return (Ok(decision), usage);
+                                }
+                                Err(error) => selector_error = Some(error.to_string()),
+                            }
+                        }
+                        Err(error) => {
+                            selector_error =
+                                Some(format!("invalid `select_trajectory` arguments: {error}"));
+                        }
                     }
+                } else if selector_calls.len() > 1 {
+                    selector_error = Some(
+                        "the supervisor called select_trajectory more than once in one batch"
+                            .to_string(),
+                    );
                 }
+
+                messages.push(
+                    ChatMessage::assistant_tool_calls_with_content_and_reasoning(
+                        text,
+                        calls.clone(),
+                        reasoning_content,
+                    ),
+                );
+                let has_audit_calls = calls
+                    .iter()
+                    .any(|call| asgard_is_audit_tool(&call.function.name));
+                let unexpected_calls = calls
+                    .iter()
+                    .filter(|call| {
+                        call.function.name != "select_trajectory"
+                            && !asgard_is_audit_tool(&call.function.name)
+                    })
+                    .map(|call| call.function.name.as_str())
+                    .collect::<Vec<_>>();
+                for call in &calls {
+                    let output = if call.function.name == "select_trajectory" {
+                        if let Some(error) = &selector_error {
+                            format!("Error: {error}")
+                        } else if audit_phase && calls.len() > 1 {
+                            "Selection deferred because inspection tools were called in the same audit round. Review their results, then call select_trajectory by itself."
+                                .to_string()
+                        } else {
+                            "Error: select_trajectory was not accepted; call it once with valid arguments."
+                                .to_string()
+                        }
+                    } else if !asgard_is_audit_tool(&call.function.name) {
+                        format!(
+                            "Error: tool `{}` is not available for Asgard audit",
+                            call.function.name
+                        )
+                    } else if !audit_phase {
+                        format!(
+                            "Audit budget exhausted; `{}` was not executed. Call select_trajectory now using the evidence already gathered.",
+                            call.function.name
+                        )
+                    } else if let Some(audit) = &context.audit {
+                        match crate::tool_arguments::normalize_tool_arguments(
+                            &call.function.arguments,
+                        ) {
+                            Ok(arguments) => {
+                                execute_asgard_audit_tool(
+                                    audit,
+                                    &call.function.name,
+                                    arguments.value,
+                                    &cancel,
+                                )
+                                .await
+                            }
+                            Err(error) => format!(
+                                "Error: invalid `{}` arguments: {error}",
+                                call.function.name
+                            ),
+                        }
+                    } else {
+                        format!(
+                            "Error: tool `{}` is not available for this decision",
+                            call.function.name
+                        )
+                    };
+                    messages.push(ChatMessage::tool_result(
+                        &call.id,
+                        &call.function.name,
+                        output,
+                    ));
+                }
+
+                last_invalid_response = if let Some(error) = selector_error {
+                    Some(anyhow::anyhow!(error))
+                } else if !unexpected_calls.is_empty() {
+                    Some(anyhow::anyhow!(
+                        "Asgard supervisor called unexpected tool(s) `{}`",
+                        unexpected_calls.join(", ")
+                    ))
+                } else if audit_phase && has_audit_calls {
+                    None
+                } else {
+                    Some(anyhow::anyhow!(
+                        "Asgard supervisor did not call select_trajectory by itself"
+                    ))
+                };
             }
         }
 
-        if step < max_steps {
-            let detail = last_invalid_response
-                .as_ref()
-                .map(|error| format!(" Your previous response was invalid: {error}."))
-                .unwrap_or_default();
-            if context.audit.is_some() {
+        let detail = last_invalid_response
+            .as_ref()
+            .map(|error| format!(" Your previous response was invalid: {error}."))
+            .unwrap_or_default();
+        if audit_phase {
+            let remaining = audit_round_limit.saturating_sub(audit_rounds_used);
+            if remaining == 0 {
                 messages.push(ChatMessage::user(format!(
-                    "You have not made the trajectory decision.{detail} You may inspect a candidate lane with the advertised audit tools, or call select_trajectory by itself when ready. Do not answer in prose."
+                    "The information-gathering budget is exhausted.{detail} You must now call select_trajectory with your best engineering judgment. Do not call audit tools. If verification is still needed, select the best incomplete lane and direct candidates to perform it in the next window. Do not answer in prose."
+                )));
+            } else if remaining == 1 {
+                messages.push(ChatMessage::user(format!(
+                    "This is your final information-gathering turn.{detail} Inspect only evidence necessary to distinguish the lanes or decide completion. After these results you must select the best lane under any remaining uncertainty. You may instead call select_trajectory now."
                 )));
             } else {
                 messages.push(ChatMessage::user(format!(
-                    "You have not selected a trajectory.{detail} Only select_trajectory is available. Call select_trajectory now. Do not answer in prose."
+                    "You have {remaining} information-gathering turns remaining.{detail} Use audit tools only for a consequential unresolved question, or call select_trajectory now."
                 )));
             }
+        } else if selection_attempts < ASGARD_SELECTION_MAX_ATTEMPTS {
+            let remaining = ASGARD_SELECTION_MAX_ATTEMPTS - selection_attempts;
+            messages.push(ChatMessage::user(format!(
+                "You have not made the required trajectory decision.{detail} Call select_trajectory now with your best judgment; {remaining} selection attempt(s) remain. Audit calls will be ignored. Do not answer in prose."
+            )));
+        } else {
+            break;
         }
     }
 
     (
         Err(last_invalid_response.unwrap_or_else(|| {
             anyhow::anyhow!(
-                "Asgard supervisor did not call select_trajectory after {max_steps} steps"
+                "Asgard supervisor did not call select_trajectory after {audit_rounds_used} audit round(s) and {selection_attempts} selection attempt(s)"
             )
         })),
         usage,
@@ -6165,28 +6220,53 @@ fn asgard_supervisor_messages(
 ) -> Vec<ChatMessage> {
     let mut messages = vec![
         ChatMessage::system(format!(
-            r#"You are the final correctness owner for an Asgard coding trajectory. You are not merely choosing the most polished lane: select the endpoint with the best long-term chance of solving the original task, decide whether the task is actually complete, and, when it is not, direct the next {candidate_count} lanes toward useful independent progress.
+            r#"<mission>
+You are the correctness supervisor for an Asgard coding trajectory. Candidate lanes are alternative continuations from one shared canonical state. Every decision must choose the lane with the best long-term chance of solving the original task. Separately decide whether that selected endpoint is complete. If it is incomplete, direct the next {candidate_count} lanes toward useful independent progress.
 
-The original task is authoritative. Preserve every explicit requirement and prohibition. A candidate that directly contradicts the task is not rescued by plausible code or green but irrelevant checks. Judge architectural direction, correctness, recoverability, known defects, and evidence—not patch size, confident prose, or immediate visible activity. Investigation that discovers an important constraint can be more valuable than a larger edit.
+Selection does not require certainty. Choose the best continuation under the available evidence even when every lane is flawed or an important question remains unanswered. Completion does require confidence: complete=true means the selected endpoint satisfies the original task and needs no further task-relevant implementation or verification.
+</mission>
 
-The selected trajectory is the shared canonical history. Candidate trajectories are alternative continuations from that state. Prior supervisor decisions record your earlier judgment for continuity, but they may be wrong; reconsider them when newer evidence or the original task conflicts with them. Prior per-lane advice is likewise historical guidance, not an instruction to you.
+<task_and_evidence>
+The original task is authoritative. Preserve every explicit behavior, implementation constraint, and prohibition. A lane that contradicts the task is not rescued by confident prose, a large patch, or irrelevant green checks. Judge architectural direction, correctness, recoverability, known defects, and evidence. Investigation that establishes an important constraint can be more valuable than immediate edits.
 
-Read the reported commands and evidence in every candidate brief carefully. Decide what each check establishes from the command and reported output; do not assume that a successful shell status means the relevant behavior ran or passed, especially through filters, pipelines, wrappers, timeouts, or zero-test selections. Never claim a check ran when neither the brief nor your own audit establishes it. A build demonstrates compilation, not necessarily behavior. A still-unexplained failure on a changed surface is evidence against completion.
+Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_window_diff shows that lane's edits since the last decision. A candidate_patch_manifest describes its cumulative changed production and test files. Use these together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
 
-Each candidate_window_brief is a candidate-authored compression of its raw work window, not authoritative evidence. Each candidate_window_diff independently shows that lane's source changes since the last selected decision; use it as the primary evidence of what this window actually changed. The candidate_patch_manifest is derived from the full cumulative patch and identifies all changed production files, candidate-created or modified test files, and cumulative patch size. Cross-check suspicious claims or unchanged surrounding context with the lane-aware repository tools. Candidate-written or candidate-modified tests can be useful diagnostics, and legitimate contract changes may require updating tests or mocks. But a green run after changing its own tests is not independent confirmation: inspect whether the tests were strengthened to express the task or merely adapted to accept the implementation. Do not mechanically reject test edits, and do not let self-confirming checks outweigh contradictory pre-existing or boundary-level evidence.
+Interpret verification precisely. A successful command establishes only what it actually exercised; filters, wrappers, timeouts, and zero-test selections can mislead. A build establishes compilation, not behavior. Candidate-written tests can be valuable, but green tests that were changed alongside the implementation are not independent proof unless they genuinely express the task. Do not mechanically reject legitimate test or mock updates.
 
-Lane-aware read_file, grep_search, list_directory, and Bifrost symbol tools are available at every decision. Candidate worktree locations and stop states are shown in the lane headers. Use these tools selectively whenever the brief and window diff omit unchanged context needed to distinguish lanes or judge a potentially complete endpoint. Repository tools are for evidence gathering, not another implementation rollout. When ready, call select_trajectory by itself.
+Prior supervisor decisions and lane advice provide continuity, not authority. Reconsider them when the original task or newer evidence disagrees.
+</task_and_evidence>
 
-Stay within scope. Do not repair dependencies, lockfiles, build configuration, toolchains, wrappers, generated build machinery, warning policy, test selection, or expected outputs merely to hide a failure, unless the original task requires that surface or the candidate changed it and must correct the resulting defect. Treat a failure as environmental, pre-existing, flaky, or unrelated only when the trajectories provide concrete evidence. Do not weaken task-mandated behavior to preserve obsolete mocks or callers; updating genuinely affected tests and mocks is in scope.
+<decision_depth>
+First decide whether the leading lane plausibly appears terminal.
 
-Completion is a property of the endpoint's behavior, not of who introduced a defect. Set complete=true only when the selected endpoint satisfies the original task, violates no explicit constraint, and has no known defect or necessary work remaining on task-required behavior. A pre-existing limitation remains unfinished when the task explicitly asks to repair that behavior. Use engineering judgment rather than a hardcoded testing ritual: require evidence proportionate to the change, account for unavailable or inconclusive checks honestly, and do not invent endless optional work after the task is genuinely complete.
+If a lane appears terminal, actively audit completeness before setting complete=true. Account for every explicit requirement and prohibition, inspect suspicious unchanged context, investigate known or candidate-caused failures, and seek verification proportionate to the risk. Do not accept polished but unverified work as complete.
 
-When incomplete, choose next_window_steps and return exactly {candidate_count} concise, actionable, mutually distinct advice objects ordered by zero-based lane index. Every strategy must independently remain compliant with the original task. At least one strategy must challenge the selected direction's most consequential unverified assumption instead of treating the current architecture as settled. Advice should identify the objective, risk, or evidence to obtain. Do not prescribe exact syntax, APIs, grammar shapes, or implementation facts unless the supplied trajectory evidence establishes them; when uncertain, direct the candidate to inspect the relevant source or behavior and resolve the uncertainty. If useful, advise a candidate to update_plan. The candidates continue normal rollouts and must not stop at Asgard window boundaries.
+If the best lanes are plainly incomplete, do not perform a terminal-grade exhaustive audit. Inspect only enough consequential evidence to rank their directions and formulate the next work. Unknowns can remain: select the best foundation, set complete=false, record the uncertainty, and delegate the needed implementation or verification to candidates in the next window.
+</decision_depth>
+
+<audit_protocol>
+Lane-aware read_file, grep_search, list_directory, and Bifrost symbol tools are available for read-only evidence gathering. They cannot run builds or tests. You have at most {audit_rounds} information-gathering responses, including this one; the last opportunity will be announced. Batch related questions and stop once the answer cannot change the winner or completion judgment. After the budget is exhausted, audit calls are ignored and you must select.
+
+Unavailable executable verification is not a reason to withhold a decision. If it is necessary to establish completeness, set complete=false and tell one or more next-window candidates exactly what behavior or command to verify. Repository auditing is evidence gathering, not another implementation rollout.
+</audit_protocol>
+
+<scope_and_completion>
+Stay within the original scope. Do not repair dependencies, lockfiles, toolchains, generated machinery, warning policy, test selection, or expected outputs merely to hide a failure unless the task requires that surface or the candidate broke it. Treat a failure as environmental, pre-existing, flaky, or unrelated only with concrete evidence. Do not weaken required behavior to preserve obsolete callers or mocks.
+
+Completion is a property of the endpoint, not of who introduced a defect. Set complete=true only when the selected endpoint satisfies the task, violates no constraint, has no known task-relevant defect, and has proportionate verification. Set complete=false when required work or verification remains. Do not invent optional work after the task is genuinely complete.
+</scope_and_completion>
+
+<continuation>
+When incomplete, choose next_window_steps and return exactly {candidate_count} concise, actionable, mutually distinct advice objects in zero-based lane order. Each strategy must independently comply with the task. Include one strategy that tests the selected direction's most consequential unverified assumption. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
 
 {}
+</continuation>
 
-Call select_trajectory exactly once and by itself. Return advices=[] when complete. state_summary must concisely record why the endpoint was selected, the decisive evidence, and any unresolved risk. Do not answer in prose. If you omit select_trajectory, you will receive a reminder."#,
+<output_contract>
+Call select_trajectory exactly once and by itself as soon as your judgment is ready. Return advices=[] when complete. state_summary must concisely record why the endpoint won, the decisive evidence, and any unresolved risk. Do not answer in prose.
+</output_contract>"#,
             asgard_window_horizon_policy(),
+            audit_rounds = ASGARD_AUDIT_MAX_ROUNDS,
         )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
     ];
@@ -6224,14 +6304,12 @@ Call select_trajectory exactly once and by itself. Return advices=[] when comple
         r#"{candidate_trajectories}
 
 <decision_procedure>
-Before calling select_trajectory:
-1. Re-read the original task. Identify its required behaviors, explicit implementation constraints, and prohibitions.
-2. For each lane, identify its actual direction, known defects, contradictions with the task, and most consequential uncertainty. Treat prior supervisor advice as fallible.
-3. Treat each candidate brief as a fallible claim. Compare it with that lane's diff since the last decision and the cumulative patch manifest. Identify contradictions and the most consequential missing evidence.
-4. Choose a provisional winner. Use lane-aware read, search, or symbol inspection when the briefs, window diffs, and manifests do not establish necessary unchanged context—especially before declaring completion. Note whether the tools actually answered the question; a failed or irrelevant lookup is not evidence.
-5. Decide completion independently: complete only if the selected endpoint satisfies the task and no required work or known candidate-caused defect remains.
-6. If incomplete, choose next_window_steps using the shared horizon policy, then produce exactly {candidate_count} task-compliant strategies. Make them genuinely different, include one that tries to falsify the leading unverified assumption, and avoid asserting implementation details not established by the evidence.
-Then call select_trajectory exactly once.
+1. Re-read the original task and identify its explicit requirements, constraints, and prohibitions.
+2. Compare each lane's actual direction, defects, evidence, and recoverability. Choose a provisional winner even if all are incomplete.
+3. Decide whether that winner plausibly appears terminal. If so, audit completeness proportionately; if not, investigate only questions that could change the ranking or next-window direction.
+4. Make the independent completion judgment. Missing necessary executable verification means complete=false and should become concrete next-window advice, not an endless audit.
+5. If incomplete, choose the shared horizon and exactly {candidate_count} distinct compliant strategies, including one that challenges the leading unverified assumption.
+6. Call select_trajectory. Do not continue investigating once you can make the best available judgment.
 </decision_procedure>"#,
     )));
     messages
@@ -17688,20 +17766,21 @@ mod tests {
         assert_ne!(first.last(), second.last());
         assert!(asgard_message_text(&first[1]).contains("fix the parser"));
         assert!(!asgard_message_text(&first[0]).contains("window one"));
-        assert!(asgard_message_text(&first[0]).contains("final correctness owner"));
+        assert!(asgard_message_text(&first[0]).contains("correctness supervisor"));
         assert!(asgard_message_text(&first[0]).contains("exactly 3"));
-        assert!(asgard_message_text(&first[0]).contains("candidate brief carefully"));
-        assert!(asgard_message_text(&first[0]).contains("green run after changing its own tests"));
+        assert!(asgard_message_text(&first[0]).contains("Candidate briefs are loss-aware"));
+        assert!(asgard_message_text(&first[0]).contains("green tests that were changed"));
         assert!(
             asgard_message_text(&first[0]).contains("most consequential unverified assumption")
         );
-        assert!(asgard_message_text(&first[0]).contains("Do not prescribe exact syntax"));
+        assert!(asgard_message_text(&first[0]).contains("Do not assert exact APIs"));
         assert!(!asgard_message_text(&first[0]).contains("Tool choice is not forced"));
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
-        assert!(asgard_message_text(&first[0]).contains("available at every decision"));
-        assert!(
-            asgard_message_text(&first[0]).contains("changes since the last selected decision")
-        );
+        assert!(asgard_message_text(&first[0]).contains("available for read-only"));
+        assert!(asgard_message_text(&first[0]).contains("edits since the last decision"));
+        assert!(asgard_message_text(&first[0]).contains("actively audit completeness"));
+        assert!(asgard_message_text(&first[0]).contains("at most 3 information-gathering"));
+        assert!(asgard_message_text(&first[0]).contains("tell one or more next-window candidates"));
         assert_eq!(first[0], terminal[0]);
         assert!(asgard_message_text(&first[2]).contains("stable selected system"));
         assert_eq!(first[2].role, "assistant");
@@ -17714,8 +17793,8 @@ mod tests {
         assert_eq!(second[5].role, "user");
         assert!(asgard_message_text(&second[5]).contains("candidate window two"));
         assert!(asgard_message_text(&second[5]).contains("<decision_procedure>"));
-        assert!(asgard_message_text(&second[5]).contains("fallible claim"));
-        assert!(asgard_message_text(&second[5]).contains("lane-aware read"));
+        assert!(asgard_message_text(&second[5]).contains("Compare each lane's actual direction"));
+        assert!(asgard_message_text(&second[5]).contains("audit completeness proportionately"));
     }
 
     #[test]
@@ -18285,6 +18364,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asgard_supervisor_exhausts_audit_then_retries_selection_in_same_conversation() {
+        let cwd = tempfile::tempdir().expect("candidate cwd");
+        init_git_repo(cwd.path());
+        std::fs::write(cwd.path().join("evidence.txt"), "repository evidence\n")
+            .expect("write evidence fixture");
+        run_git(cwd.path(), &["add", "evidence.txt"]);
+        run_git(cwd.path(), &["commit", "-m", "seed"]);
+        let registry = Arc::new(
+            crate::tools::ToolRegistry::new(
+                cwd.path().to_path_buf(),
+                Vec::new(),
+                Vec::new(),
+                Arc::new(crate::skills::SkillRegistry::default()),
+                Arc::new(crate::agents::AgentRegistry::default()),
+                Vec::new(),
+            )
+            .await,
+        );
+        let definitions = asgard_audit_tool_definitions(registry.tool_definitions().await, 1);
+        let registries = vec![registry];
+        let candidates = vec![AsgardCandidate {
+            index: 0,
+            model: "deepseek::deepseek-v4-flash".to_string(),
+            outcome: asgard_failure(anyhow::anyhow!("unused test outcome")),
+            patch: Vec::new(),
+            delta_patch: Vec::new(),
+            supervisor_window_messages: Vec::new(),
+        }];
+        let audit_call = |id: &str| {
+            supervisor_tool_call(
+                id,
+                "read_file",
+                serde_json::json!({"lane": 0, "file_path": "evidence.txt"}),
+            )
+        };
+        let selection_call = supervisor_tool_call(
+            "selection-call",
+            "select_trajectory",
+            serde_json::json!({
+                "winner": 0,
+                "complete": false,
+                "next_window_steps": 3,
+                "state_summary": "Lane 1 is the best incomplete foundation; focused verification remains.",
+                "advices": [{
+                    "strategy": "Run the focused verification and repair any resulting defect.",
+                    "scope_basis": "Establish the remaining task-required behavior."
+                }]
+            }),
+        );
+        let backend = ScriptedSupervisorBackend::new(vec![
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("First consequential question.".to_string()),
+                calls: vec![audit_call("audit-1")],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("Second consequential question.".to_string()),
+                calls: vec![audit_call("audit-2")],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("Final audit question.".to_string()),
+                calls: vec![audit_call("audit-3")],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::Text {
+                text: "Lane 1 is best, but I forgot the tool call.".to_string(),
+                reasoning_content: None,
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("I should inspect once more.".to_string()),
+                calls: vec![audit_call("ignored-audit")],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: Some("Selecting under the remaining uncertainty.".to_string()),
+                calls: vec![selection_call, audit_call("mixed-ignored-audit")],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+        ]);
+
+        let (decision, _) = run_asgard_supervisor_tool_steps(
+            &backend,
+            vec![ChatMessage::user("terminal dossier")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 1,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: Some(AsgardAuditContext {
+                    registries: &registries,
+                    candidates: &candidates,
+                    definitions,
+                }),
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        let decision = decision.expect("selection after retained audit conversation");
+        assert_eq!(decision.winner, 0);
+        assert!(!decision.complete);
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 6);
+        let tool_names = &requests[0].tool_names;
+        assert!(
+            requests
+                .iter()
+                .all(|request| &request.tool_names == tool_names)
+        );
+        assert!(
+            asgard_message_text(requests[1].messages.last().expect("audit reminder"))
+                .contains("2 information-gathering turns remaining")
+        );
+        assert!(
+            asgard_message_text(requests[2].messages.last().expect("last audit reminder"))
+                .contains("final information-gathering turn")
+        );
+        assert!(
+            asgard_message_text(requests[3].messages.last().expect("selection instruction"))
+                .contains("information-gathering budget is exhausted")
+        );
+        assert!(requests[5].messages.iter().any(|message| {
+            message.role == "tool"
+                && asgard_message_text(message).contains("Audit budget exhausted")
+        }));
+        assert!(requests[5].messages.iter().any(|message| {
+            message.role == "tool" && asgard_message_text(message).contains("repository evidence")
+        }));
+    }
+
+    #[tokio::test]
     async fn asgard_supervisor_rejects_unadvertised_plan_call() {
         let wrong_response = || LlmResponse::ToolCalls {
             text: String::new(),
@@ -18298,7 +18515,11 @@ mod tests {
             )],
             usage: crate::llm_client::TokenUsage::default(),
         };
-        let backend = ScriptedSupervisorBackend::new(vec![wrong_response(), wrong_response()]);
+        let backend = ScriptedSupervisorBackend::new(vec![
+            wrong_response(),
+            wrong_response(),
+            wrong_response(),
+        ]);
 
         let (decision, _) = run_asgard_supervisor_tool_steps(
             &backend,
@@ -18318,14 +18539,14 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("called unexpected tool `update_plan`")
+                .contains("called unexpected tool(s) `update_plan`")
         );
         let requests = backend.requests.lock().expect("request lock");
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
         assert!(
             asgard_message_text(requests[1].messages.last().expect("reminder"))
-                .contains("Only select_trajectory is available")
+                .contains("Call select_trajectory now")
         );
     }
     #[test]

@@ -584,7 +584,7 @@ Tags follow `vX.Y.Z`; release workflows validate that the tag matches
 
 Asset names:
 
-- `brokk-anvil-vX.Y.Z-x86_64-unknown-linux-gnu.zip`
+- `brokk-anvil-vX.Y.Z-x86_64-unknown-linux-musl.zip`
 - `brokk-anvil-vX.Y.Z-aarch64-unknown-linux-gnu.zip`
 - `brokk-anvil-vX.Y.Z-aarch64-linux-android.zip`
 - `brokk-anvil-vX.Y.Z-x86_64-pc-windows-msvc.zip`
