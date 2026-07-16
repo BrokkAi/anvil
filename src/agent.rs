@@ -4911,7 +4911,7 @@ struct AsgardExecutionLedger {
 }
 
 const ASGARD_SUMMARIZE_WINDOW_TOOL_NAME: &str = "summarize_candidate_window";
-const ASGARD_CONTRACT_EXTRACTION_PROMPT: &str = "You are extracting the explicit contract checklist from a software task description, before any implementation exists. List every externally checkable requirement the task states: function and method signatures including argument order and curried versus non-curried forms, exact strings, separators, suffixes, and output formats, boundary values and their required handling, lifecycle and cancellation obligations (what must unblock, interrupt, close, or clean up what, including operations already in flight), concurrency and atomicity requirements, error types and exact error text, compatibility constraints, and explicit prohibitions. Quote the task's own words wherever possible. One requirement per entry; split compound sentences into separate entries. Do not invent requirements the task does not state and do not add generic quality goals. Tag each entry's kind: \"inspection\" when a reviewer can verify it by reading the final code (signatures, argument order, exact strings present in source, type shapes); \"execution\" when verification requires running a scenario (blocking and unblocking, timing, cancellation of in-flight operations, end-to-end produced output, formatting of emitted streams); \"delivery\" for repository-delivery obligations that do not affect runtime behavior (working on a named branch, committing the work, repository cleanliness). For each entry, if the requirement only holds meaning under a specific adverse condition — an operation already blocked or in flight when the triggering event fires, an exhausted window or resource, an externally stalled dependency, a boundary or zero value — record that condition verbatim in adverse_condition; otherwise set adverse_condition to null. When the task names classification values, categories, or enumerated labels (for example conflict types, error kinds, source values, status codes), add a separate contract that each reported classification carries the correct value for its specific scenario — distinct from, and in addition to, the contract that the item is detected or reported at all; verifying a count or presence does not verify a label. When a requirement combines, maps, constructs from, or dispatches over multiple positional inputs (combining N containers, building a record from several fields, constructor argument lists), add a separate contract that each input's value reaches its correct output position, with adverse_condition stating that the inputs must be pairwise distinguishable and the operation non-commutative — evidence from same-valued or commutative examples cannot detect positional swaps. Success paths get adverse conditions too: when a requirement's happy path can be partially wrong (right for the first element, the common case, or homogeneous inputs), record the discriminating input shape as its adverse_condition rather than leaving it null. When the task requires emitting a well-known textual format or stream whose name implies standard structural conventions (for example a manifest stream with document separators and source annotations, a unified diff, a standard header block), also add one contract per structural convention the named format prescribes — including how the stream begins, how documents or sections are delimited, and how identifying annotations are formed and normalized — marked kind \"execution\" and quoting the format name from the task. Only do this for formats whose conventions you are certain of; do not invent conventions. Call extract_task_contracts exactly once. Do not answer in prose.";
+const ASGARD_CONTRACT_EXTRACTION_PROMPT: &str = "You are extracting the explicit contract checklist from a software task description, before any implementation exists. List every externally checkable requirement the task states: function and method signatures including argument order and curried versus non-curried forms, exact strings, separators, suffixes, and output formats, boundary values and their required handling, lifecycle and cancellation obligations (what must unblock, interrupt, close, or clean up what, including operations already in flight), concurrency and atomicity requirements, error types and exact error text, compatibility constraints, and explicit prohibitions. Quote the task's own words wherever possible. One requirement per entry; split compound sentences into separate entries. Do not invent requirements the task does not state and do not add generic quality goals. Tag each entry's kind: \"inspection\" when a reviewer can verify it by reading the final code (signatures, argument order, exact strings present in source, type shapes); \"execution\" when verification requires running a scenario (blocking and unblocking, timing, cancellation of in-flight operations, end-to-end produced output, formatting of emitted streams); \"delivery\" for repository-delivery obligations that do not affect runtime behavior (working on a named branch, committing the work, repository cleanliness). For each entry, if the requirement only holds meaning under a specific adverse condition — an operation already blocked or in flight when the triggering event fires, an exhausted window or resource, an externally stalled dependency, a boundary or zero value — record that condition verbatim in adverse_condition; otherwise set adverse_condition to null. When the task names classification values, categories, or enumerated labels (for example conflict types, error kinds, source values, status codes), add a separate contract that each reported classification carries the correct value for its specific scenario — distinct from, and in addition to, the contract that the item is detected or reported at all; verifying a count or presence does not verify a label. When a requirement combines, maps, constructs from, or dispatches over multiple positional inputs (combining N containers, building a record from several fields, constructor argument lists), add a separate contract that each input's value reaches its correct output position, with adverse_condition stating that the inputs must be pairwise distinguishable and the operation non-commutative — evidence from same-valued or commutative examples cannot detect positional swaps. Success paths get adverse conditions too: when a requirement's happy path can be partially wrong (right for the first element, the common case, or homogeneous inputs), record the discriminating input shape as its adverse_condition rather than leaving it null. When the task requires emitting a well-known textual format or stream whose name implies standard structural conventions (for example a manifest stream with document separators and source annotations, a unified diff, a standard header block), also add one contract per structural convention the named format prescribes — including how the stream begins, how documents or sections are delimited, and how identifying annotations are formed and normalized — marked kind \"execution\" and quoting the format name from the task. Only do this for formats whose conventions you are certain of; do not invent conventions. When the task defines a typed public API, add one contract per public signature stating its exact parameter and return types in the task's words, kind \"execution\", with adverse_condition: verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests. If a requirement admits two materially different readings, record the contract once per reading and set each adverse_condition to the ambiguity it resolves; do not silently pick one reading. Call extract_task_contracts exactly once. Do not answer in prose.";
 const ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS: usize = 3;
 const ASGARD_AUDIT_BUILTIN_TOOLS: &[&str] = &["read_file", "grep_search", "list_directory"];
 const ASGARD_AUDIT_BIFROST_TOOLS: &[&str] = &[
@@ -5157,6 +5157,9 @@ async fn run_asgard_trajectory_loop(
     );
     let mut canonical_plan = initial_plan;
     for window in 1usize.. {
+        let verified_at_window_start = canonical_ledger
+            .last()
+            .and_then(|(_, ledger)| render_asgard_verified_at_window_start(ledger));
         send_thought(
             cx,
             session_id,
@@ -5187,7 +5190,11 @@ async fn run_asgard_trajectory_loop(
                 .flatten();
             let trajectory_message_start = messages.len();
             if let Some(advice) = &assigned_advice {
-                messages.push(asgard_advice_message(index, advice));
+                messages.push(asgard_advice_message(
+                    index,
+                    advice,
+                    verified_at_window_start.as_deref(),
+                ));
             }
             let model = model.clone();
             let registry = registry.clone();
@@ -6691,7 +6698,7 @@ Completion is a property of the endpoint, not of who introduced a defect. Set co
 </scope_and_completion>
 
 <continuation>
-When incomplete, choose next_window_steps and return exactly {candidate_count} concise, actionable, mutually distinct advice objects in zero-based lane order. Each strategy must independently comply with the task. Include one strategy that tests the selected direction's most consequential unverified assumption. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
+When incomplete, choose next_window_steps and return exactly {candidate_count} concise, actionable, mutually distinct advice objects in zero-based lane order. Each strategy must independently comply with the task. Include one strategy that tests the selected direction's most consequential unverified assumption. When the checklist records a contract once per ambiguous reading, assign different lanes different readings in their advices and treat the lanes' divergence as the deciding experiment for the next selection. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
 
 {}
 </continuation>
@@ -6799,7 +6806,7 @@ fn asgard_completion_review_messages(
 <terminal_completion_review selected_lane="{selected_lane}">
 This is an independent completion review of the single would-be-final endpoint shown above. The comparative selection decision and all discarded candidate lanes are intentionally absent. Do not reconstruct, compare, or speculate about them. Keep selected_lane={selected_lane}; your only decision is whether this endpoint actually completes the original task.
 
-The task_contract_checklist was derived from the task text alone before any candidate work existed. Your select_trajectory call must return one contracts row per checklist id. Evidence rules, in strength order: (1) Execution evidence — an execution_ledger entry (cite its id) whose command demonstrably exercised the contract and exited 0 at or after the last edit of the implementing files; a green command counts only for behaviors its selected tests actually assert — confirm in the terminal_test_patch that some assertion would fail if the contract were violated; a broad suite pass does not verify a contract no test asserts; a build proves compilation; a race detector proves absence of data races, not liveness. Golden, snapshot, or fixture expectation files created or regenerated by the candidate are candidate-authored assertions: a passing comparison against them proves only that the output matches itself; for exact-output contracts, quote the actual emitted output — from a ledger entry or from the expectation-file content in the patches — and show it satisfies the contract's required shape at its boundaries, including the very first and very last elements of the stream. Evidence must be discriminating: state the most plausible wrong implementation of this contract — the wrong label or classification, the missing boundary element, the partially-correct result — and confirm the cited assertion would catch it; an assertion that only counts results, checks non-emptiness, or matches a substring usually passes under mislabeled or partially-wrong behavior. For a contract naming enumerated values, classifications, or exact labels, quote — for each scenario the contract names — the assertion line or observed ledger output showing that exact value in that exact scenario; an assertion checking a different scenario's value does not transfer. For a contract that combines, maps, or constructs from multiple positional inputs, the cited test's values must be pairwise distinguishable and the checked operation non-commutative: a test combining equal values, or reducing with an order-insensitive operation like numeric addition, passes under any positional swap and verifies nothing about position — quote the test's actual input values and state why a positional swap would fail the assertion. (2) Inspection evidence — exact quoted lines from the terminal patches showing the contract satisfied; a file name alone is not evidence; use only for contracts fully verifiable by reading. (3) Candidate claims are never evidence.
+The task_contract_checklist was derived from the task text alone before any candidate work existed. Your select_trajectory call must return one contracts row per checklist id. Evidence rules, in strength order: (1) Execution evidence — an execution_ledger entry (cite its id) whose command demonstrably exercised the contract and exited 0 at or after the last edit of the implementing files; a green command counts only for behaviors its selected tests actually assert — confirm in the terminal_test_patch that some assertion would fail if the contract were violated; a broad suite pass does not verify a contract no test asserts; a build proves compilation; a race detector proves absence of data races, not liveness. Golden, snapshot, or fixture expectation files created or regenerated by the candidate are candidate-authored assertions: a passing comparison against them proves only that the output matches itself; for exact-output contracts, quote the actual emitted output — from a ledger entry or from the expectation-file content in the patches — and show it satisfies the contract's required shape at its boundaries, including the very first and very last elements of the stream. Evidence must be discriminating: state the most plausible wrong implementation of this contract — the wrong label or classification, the missing boundary element, the partially-correct result — and confirm the cited assertion would catch it; an assertion that only counts results, checks non-emptiness, or matches a substring usually passes under mislabeled or partially-wrong behavior. For a contract naming enumerated values, classifications, or exact labels, quote — for each scenario the contract names — the assertion line or observed ledger output showing that exact value in that exact scenario; an assertion checking a different scenario's value does not transfer. For a contract that combines, maps, or constructs from multiple positional inputs, the cited test's values must be pairwise distinguishable and the checked operation non-commutative: a test combining equal values, or reducing with an order-insensitive operation like numeric addition, passes under any positional swap and verifies nothing about position — quote the test's actual input values and state why a positional swap would fail the assertion. For a contract specifying a typed public signature, evidence counts only when a ledger entry type-checks standalone usage authored from the contract's text; the implementation's own tests compiling proves self-consistency, not the contract. (2) Inspection evidence — exact quoted lines from the terminal patches showing the contract satisfied; a file name alone is not evidence; use only for contracts fully verifiable by reading. (3) Candidate claims are never evidence.
 
 Unblocking contracts get the strictest treatment. For any contract that an event X (close, shutdown, abort, cancellation, deadline) must unblock, interrupt, or fail a pending operation P, execution evidence counts only if the verifying test performs no action after X that could itself wake P — releasing, closing, erroring, or enqueuing on the awaited stream or channel, sending or receiving data, advancing timers, or completing the awaited resource. A test that wakes P by such means verifies only that P notices a flag after being woken; the row is unverified. Inspection evidence must quote the affirmative wake path X triggers on the already-blocked waiter and show X can reach it while P is blocked: a flag tested inside a read or write loop wakes nothing, and a mutex held across a blocking wait prevents any unblocking path needing that mutex from running. For exact-output contracts, reconstruct the emitted stream from the writer code for the first and last element, not only the middle.
 
@@ -6807,7 +6814,7 @@ Contracts that carry an adverse_condition are verified only under that condition
 
 Delivery-mechanics contracts (kind "delivery": branch, commit, repository cleanliness) rank below functional contracts: mark such a row unverified rather than violated when evidence is merely absent, record the residual risk in state_summary, and do not block completion on absence alone — but a delivery contract affirmatively contradicted by evidence is violated and blocks completion like any other.
 
-complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps (3 suffices for pure verification), and provide exactly {candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce — for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
+complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps (3 suffices for pure verification), and provide exactly {candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce — for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and its output. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
 </terminal_completion_review>"#,
     ));
     if let Some(last) = messages.last_mut() {
@@ -7436,8 +7443,40 @@ fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
     }
 }
 
-fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
-    ChatMessage::user(format!(
+fn render_asgard_verified_at_window_start(ledger: &AsgardExecutionLedger) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut commands = ledger
+        .entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.exit_code == Some(0))
+        .filter_map(|entry| {
+            if seen.insert(entry.command.as_str()) {
+                Some(entry.command.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    commands.reverse();
+    if commands.is_empty() {
+        return None;
+    }
+    let start = commands.len().saturating_sub(15);
+    let mut rendered = String::from(
+        "<verified_at_window_start>\n\
+         The following commands ran with exit code 0 on exactly this starting tree at the end of the previous window. Do not re-run them unless your edits invalidate what they exercised; run the narrowest check that covers your actual change instead.",
+    );
+    for command in &commands[start..] {
+        rendered.push_str("\n- ");
+        rendered.push_str(command);
+    }
+    rendered.push_str("\n</verified_at_window_start>");
+    Some(rendered)
+}
+
+fn asgard_advice_message(lane: usize, advice: &str, verified_block: Option<&str>) -> ChatMessage {
+    let advice = format!(
         "<asgard_next_window_advice lane=\"{lane}\">\n{advice}\n\
          </asgard_next_window_advice>\n\
          Treat this as advisory strategy for continuing the original task normally. \
@@ -7457,7 +7496,12 @@ fn asgard_advice_message(lane: usize, advice: &str) -> ChatMessage {
          boundary-level verification. Do not dismiss a failing existing \
          test as pre-existing, flaky, or unrelated without concrete baseline or subsequent passing \
          evidence, especially when it exercises code changed by this trajectory."
-    ))
+    );
+    let text = match verified_block {
+        Some(block) => format!("{block}\n{advice}"),
+        None => advice,
+    };
+    ChatMessage::user(text)
 }
 
 fn render_asgard_lane_advices(advices: &[Option<String>]) -> String {
@@ -14036,6 +14080,16 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    fn asgard_ledger_entry_for_test(command: &str, exit_code: Option<i32>) -> AsgardLedgerEntry {
+        AsgardLedgerEntry {
+            id: format!("id-{command}"),
+            step: 0,
+            command: command.to_string(),
+            exit_code,
+            output_tail: String::new(),
+        }
+    }
+
     #[test]
     fn mcp_instructions_extend_only_the_system_prompt() {
         let original_user = "user bytes stay exactly the same";
@@ -18650,7 +18704,7 @@ mod tests {
 
     #[test]
     fn asgard_advice_continues_the_normal_rollout() {
-        let message = asgard_advice_message(2, "Focus on the concurrency invariant.");
+        let message = asgard_advice_message(2, "Focus on the concurrency invariant.", None);
         let text = asgard_message_text(&message);
         assert!(text.contains("lane=\"2\""));
         assert!(text.contains("Focus on the concurrency invariant."));
@@ -18660,11 +18714,84 @@ mod tests {
     }
 
     #[test]
+    fn asgard_verified_at_window_start_renders_green_last_unique_commands() {
+        let ledger = AsgardExecutionLedger {
+            entries: vec![
+                asgard_ledger_entry_for_test("cargo test old", Some(0)),
+                asgard_ledger_entry_for_test("cargo test failing", Some(1)),
+                asgard_ledger_entry_for_test("cargo check", None),
+                asgard_ledger_entry_for_test("cargo test kept", Some(0)),
+                asgard_ledger_entry_for_test("cargo test old", Some(0)),
+            ],
+            ..Default::default()
+        };
+
+        let rendered = render_asgard_verified_at_window_start(&ledger).expect("verified block");
+
+        assert!(rendered.starts_with("<verified_at_window_start>\nThe following commands ran"));
+        assert!(rendered.contains("- cargo test kept\n- cargo test old"));
+        assert!(!rendered.contains("cargo test failing"));
+        assert!(!rendered.contains("cargo check"));
+        assert!(rendered.ends_with("</verified_at_window_start>"));
+    }
+
+    #[test]
+    fn asgard_verified_at_window_start_caps_at_last_fifteen() {
+        let ledger = AsgardExecutionLedger {
+            entries: (0..18)
+                .map(|index| asgard_ledger_entry_for_test(&format!("cmd {index}"), Some(0)))
+                .collect(),
+            ..Default::default()
+        };
+
+        let rendered = render_asgard_verified_at_window_start(&ledger).expect("verified block");
+        let commands = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(commands.len(), 15);
+        assert_eq!(commands[0], "cmd 3");
+        assert_eq!(commands[14], "cmd 17");
+        assert!(!rendered.contains("- cmd 2\n"));
+    }
+
+    #[test]
+    fn asgard_verified_at_window_start_is_omitted_when_empty() {
+        let ledger = AsgardExecutionLedger {
+            entries: vec![
+                asgard_ledger_entry_for_test("cargo test failing", Some(1)),
+                asgard_ledger_entry_for_test("cargo check", None),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(render_asgard_verified_at_window_start(&ledger), None);
+        let message = asgard_advice_message(0, "Try the parser path.", None);
+        assert!(!asgard_message_text(&message).contains("verified_at_window_start"));
+    }
+
+    #[test]
+    fn asgard_advice_prepends_verified_at_window_start_block() {
+        let message = asgard_advice_message(
+            0,
+            "Try the parser path.",
+            Some("<verified_at_window_start>\n- cargo test parser\n</verified_at_window_start>"),
+        );
+        let text = asgard_message_text(&message);
+
+        assert!(text.starts_with("<verified_at_window_start>"));
+        assert!(
+            text.contains("</verified_at_window_start>\n<asgard_next_window_advice lane=\"0\">")
+        );
+    }
+
+    #[test]
     fn asgard_advice_remains_in_canonical_history_after_window() {
         let messages = vec![
             ChatMessage::system("stable prefix"),
             ChatMessage::user("original task"),
-            asgard_advice_message(0, "Try the parser path."),
+            asgard_advice_message(0, "Try the parser path.", None),
             ChatMessage::assistant("I will inspect the parser."),
         ];
 
@@ -18673,7 +18800,7 @@ mod tests {
         assert_eq!(
             window,
             vec![
-                asgard_advice_message(0, "Try the parser path."),
+                asgard_advice_message(0, "Try the parser path.", None),
                 ChatMessage::assistant("I will inspect the parser."),
             ]
         );
@@ -18705,7 +18832,7 @@ mod tests {
                 .contains("unresolved wildcard assumption")
         );
 
-        let candidate_advice = asgard_advice_message(0, "independent strategy");
+        let candidate_advice = asgard_advice_message(0, "independent strategy", None);
         assert!(!asgard_message_text(&candidate_advice).contains("wildcard assumption"));
 
         history.checkpoint_selected_windows();
@@ -18771,7 +18898,7 @@ mod tests {
             ChatMessage::user("selected step one"),
         ];
         let selected_windows = vec![vec![
-            asgard_advice_message(1, "Verify the selected implementation."),
+            asgard_advice_message(1, "Verify the selected implementation.", None),
             ChatMessage::assistant("selected step two"),
         ]];
         let first_history = AsgardSupervisorHistory::default();
@@ -18857,6 +18984,10 @@ mod tests {
         assert!(
             asgard_message_text(&first[0]).contains("most consequential unverified assumption")
         );
+        assert!(
+            asgard_message_text(&first[0])
+                .contains("assign different lanes different readings in their advices")
+        );
         assert!(asgard_message_text(&first[0]).contains("Do not assert exact APIs"));
         assert!(!asgard_message_text(&first[0]).contains("Tool choice is not forced"));
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
@@ -18897,10 +19028,25 @@ mod tests {
         assert!(isolated_suffix.contains("<terminal_non_test_patch"));
         assert!(isolated_suffix.contains("<terminal_test_patch"));
         assert!(isolated_suffix.contains("Evidence rules, in strength order"));
+        assert!(
+            isolated_suffix
+                .contains("type-checks standalone usage authored from the contract's text")
+        );
         assert!(isolated_suffix.contains(
             "complete=true requires every functional (inspection or execution) row verified"
         ));
+        assert!(
+            isolated_suffix
+                .contains("write a standalone usage file authored from the contract text verbatim")
+        );
         assert!(!isolated_suffix.contains("candidate window two"));
+        assert!(ASGARD_CONTRACT_EXTRACTION_PROMPT.contains(
+            "add one contract per public signature stating its exact parameter and return types"
+        ));
+        assert!(
+            ASGARD_CONTRACT_EXTRACTION_PROMPT
+                .contains("record the contract once per reading and set each adverse_condition")
+        );
     }
 
     #[test]

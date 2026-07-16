@@ -3,7 +3,7 @@ pub(crate) mod announce;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     Diff, PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
@@ -5100,6 +5100,11 @@ async fn run_post_tool_use_hooks(
 }
 
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
+    // Extract the (truncated) shell command before `args` is moved into
+    // execution; cloning the whole args value would deep-copy large
+    // payloads (e.g. write_file content) on every tool call.
+    let shell_command = shell_command_snippet(request.tool_name, &request.args);
+    let start = Instant::now();
     let result = registry
         .execute_with_sandbox_mode_cancellable(
             request.tool_name,
@@ -5110,12 +5115,51 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
             Some(request.cancel),
         )
         .await;
+    let duration = start.elapsed();
+    let success = matches!(&result.status, ToolStatus::Success);
+    append_trace_record(tool_timing_record(
+        request.tool_name,
+        shell_command.as_deref(),
+        duration,
+        success,
+    ));
     tool_result_to_execution(
         request.tool_name,
         request.shell_sandboxed,
         request.outside_sandbox_once,
         result,
     )
+}
+
+/// First 120 chars of the `command` argument for `run_shell_command`
+/// calls; `None` for every other tool (the timing record omits the key).
+fn shell_command_snippet(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    if tool_name != "run_shell_command" {
+        return None;
+    }
+    args.get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(|command| command.chars().take(120).collect())
+}
+
+fn tool_timing_record(
+    tool_name: &str,
+    shell_command: Option<&str>,
+    duration: Duration,
+    success: bool,
+) -> serde_json::Value {
+    let mut record = serde_json::Map::new();
+    record.insert("type".to_string(), serde_json::json!("tool_timing"));
+    record.insert("tool".to_string(), serde_json::json!(tool_name));
+    if let Some(command) = shell_command {
+        record.insert("command".to_string(), serde_json::json!(command));
+    }
+    record.insert(
+        "duration_ms".to_string(),
+        serde_json::json!(duration.as_millis()),
+    );
+    record.insert("success".to_string(), serde_json::json!(success));
+    serde_json::Value::Object(record)
 }
 
 fn tool_result_to_execution(
@@ -5609,6 +5653,41 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn tool_timing_record_includes_shell_command_and_omits_other_commands() {
+        let command = format!("{}{}", "é".repeat(121), "tail");
+        let shell_snippet = shell_command_snippet(
+            "run_shell_command",
+            &serde_json::json!({ "command": command }),
+        );
+        let shell = tool_timing_record(
+            "run_shell_command",
+            shell_snippet.as_deref(),
+            Duration::from_millis(42),
+            true,
+        );
+
+        assert_eq!(shell["type"], "tool_timing");
+        assert_eq!(shell["tool"], "run_shell_command");
+        assert_eq!(shell["duration_ms"], 42);
+        assert_eq!(shell["success"], true);
+        assert_eq!(shell["command"].as_str().expect("command"), "é".repeat(120));
+
+        let other_snippet =
+            shell_command_snippet("read_file", &serde_json::json!({ "command": "ignored" }));
+        assert_eq!(other_snippet, None);
+        let other = tool_timing_record(
+            "read_file",
+            other_snippet.as_deref(),
+            Duration::from_millis(7),
+            false,
+        );
+        assert_eq!(other["tool"], "read_file");
+        assert_eq!(other["duration_ms"], 7);
+        assert_eq!(other["success"], false);
+        assert!(other.get("command").is_none());
     }
 
     fn task_call_for_test(id: &str, permission_mode: Option<&str>) -> ToolCall {
