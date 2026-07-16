@@ -265,7 +265,7 @@ Built-in commands:
   completion, not a turn count. Pass `--max-turns N` to set an optional ceiling
   (a wrap-up turn runs when it is reached). Inspired by Codex's `/goal`, whose
   token budget is likewise optional.
-- `/compress`: summarize uncompressed history turns to free context window.
+- `/compact`: summarize uncompressed history turns to free context window.
 - `/mcp`: list and configure stdio MCP servers.
 - `/plugin`: list, install, update, enable, disable, or remove Claude
   Code-format plugins.
@@ -464,7 +464,7 @@ behavior mode, and per-turn summaries.
 Context management is built in:
 
 - `/context` reports the current prompt shape and token estimate.
-- `/compress` summarizes uncompressed turns and stores summaries beside the
+- `/compact` summarizes uncompressed turns and stores summaries beside the
   original verbatim log.
 - Automatic compression runs when a prompt would overflow the configured model
   context budget.

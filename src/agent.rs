@@ -14507,6 +14507,14 @@ mod tests {
             builtin_command_names().contains("compact"),
             "builtin_command_names() missing compact"
         );
+        assert!(
+            !cmds.iter().any(|c| c.name == "compress"),
+            "legacy compress command must not be advertised"
+        );
+        assert!(
+            !builtin_command_names().contains("compress"),
+            "legacy compress command must not reserve a built-in name"
+        );
     }
 
     #[test]
@@ -14590,6 +14598,7 @@ mod tests {
         assert!(is_slash_command("/COMPACT", "compact"));
         // The dispatcher must not confuse `/compact` with `/context`.
         assert!(!is_slash_command("/context", "compact"));
+        assert!(!is_slash_command("/compress", "compact"));
     }
 
     #[test]
