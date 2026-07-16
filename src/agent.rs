@@ -4958,7 +4958,7 @@ impl AsgardSupervisorHistory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardSupervisorDecision {
     winner: usize,
     complete: bool,
@@ -5079,6 +5079,12 @@ async fn run_asgard_trajectory_loop(
         &original_task,
     )
     .await;
+    if !task_contract_checklist.contracts.is_empty() {
+        crate::trace_logging::append_trace_record(serde_json::json!({
+            "type": "asgard_checklist",
+            "contracts": &task_contract_checklist.contracts,
+        }));
+    }
     aggregate_usage.add(checklist_usage);
     usage_by_model
         .entry(supervisor_model.to_string())
@@ -6364,6 +6370,19 @@ async fn run_asgard_supervisor_tool_steps(
                                                         "accepted final Asgard selection and ignored other tool calls"
                                                     );
                                                 }
+                                                let decision_call =
+                                                    if context.required_winner.is_some() {
+                                                        "completion_review"
+                                                    } else {
+                                                        "supervisor"
+                                                    };
+                                                crate::trace_logging::append_trace_record(
+                                                    serde_json::json!({
+                                                        "type": "asgard_decision",
+                                                        "call": decision_call,
+                                                        "decision": &decision,
+                                                    }),
+                                                );
                                                 return (Ok(decision), usage);
                                             }
                                             // One self-adjudication challenge per review:
@@ -6391,6 +6410,18 @@ async fn run_asgard_supervisor_tool_steps(
                                                 "accepted final Asgard selection and ignored other tool calls"
                                             );
                                         }
+                                        let decision_call = if context.required_winner.is_some() {
+                                            "completion_review"
+                                        } else {
+                                            "supervisor"
+                                        };
+                                        crate::trace_logging::append_trace_record(
+                                            serde_json::json!({
+                                                "type": "asgard_decision",
+                                                "call": decision_call,
+                                                "decision": &decision,
+                                            }),
+                                        );
                                         return (Ok(decision), usage);
                                     }
                                 }
