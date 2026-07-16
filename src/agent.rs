@@ -4922,6 +4922,7 @@ const ASGARD_AUDIT_BIFROST_TOOLS: &[&str] = &[
 ];
 const ASGARD_AUDIT_MAX_ROUNDS: usize = 3;
 const ASGARD_SELECTION_MAX_ATTEMPTS: usize = 3;
+const ASGARD_REVIEW_SELECTION_MAX_ATTEMPTS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardCandidatePatchManifest {
@@ -5430,26 +5431,35 @@ async fn run_asgard_trajectory_loop(
             decision = match completion_review.0 {
                 Ok(review) => review,
                 Err(error) => {
+                    // Failing closed used to abort the whole Asgard run, which
+                    // wastes the remaining task budget and grades the very
+                    // endpoint the reviewer refused to endorse. Degrade to an
+                    // incomplete decision instead: keep the provisional winner
+                    // and spend a short verification window producing the
+                    // evidence the review could not obtain.
                     tracing::warn!(
                         window,
                         model = supervisor_model,
-                        "Asgard isolated completion review produced no valid decision: {error:#}"
+                        "Asgard isolated completion review produced no valid decision; continuing incomplete: {error:#}"
                     );
-                    let apply_result =
-                        crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
-                    cleanup_asgard_repositories(&repositories);
-                    if let Err(apply_error) = apply_result {
-                        let mut outcome = asgard_failure(anyhow::anyhow!(
-                            "completion review failed in window {window} ({error:#}) and applying the last accepted incumbent also failed: {apply_error:#}"
-                        ));
-                        outcome.usage = aggregate_usage;
-                        return (outcome, usage_by_model);
+                    let advice = format!(
+                        "The completion review could not validate the proposed endpoint \
+                         ({error:#}). Produce concrete execution evidence for every task \
+                         contract that lacks it: run the narrowest checks that exercise \
+                         each contract's stated scenario, report each command and its \
+                         output verbatim, and fix any contract the evidence contradicts."
+                    );
+                    AsgardSupervisorDecision {
+                        winner: decision.winner,
+                        complete: false,
+                        advices: vec![Some(advice); candidates.len()],
+                        next_window_steps: Some(ASGARD_MIN_WINDOW_STEPS),
+                        state_summary: format!(
+                            "Completion review failed to produce a valid decision in \
+                             window {window}; continuing with a verification window."
+                        ),
+                        contracts: None,
                     }
-                    let mut outcome = asgard_failure(anyhow::anyhow!(
-                        "completion review produced no valid decision for window {window}; preserved the last accepted incumbent: {error:#}"
-                    ));
-                    outcome.usage = aggregate_usage;
-                    return (outcome, usage_by_model);
                 }
             };
         }
@@ -6221,6 +6231,14 @@ async fn run_asgard_supervisor_tool_steps(
         0
     };
     let tools = asgard_supervisor_tool_definitions(&context);
+    // The completion review's structural loop (violation retry, challenge,
+    // re-verdict) legitimately needs more selector rounds than a comparative
+    // decision does.
+    let selection_attempt_limit = if context.required_winner.is_some() {
+        ASGARD_REVIEW_SELECTION_MAX_ATTEMPTS
+    } else {
+        ASGARD_SELECTION_MAX_ATTEMPTS
+    };
     let mut usage = crate::llm_client::TokenUsage::default();
     let mut last_invalid_response = None;
     let mut audit_rounds_used = 0usize;
@@ -6546,8 +6564,8 @@ async fn run_asgard_supervisor_tool_steps(
                     "You have {remaining} information-gathering turns remaining.{detail} Use audit tools only for a consequential unresolved question, or call select_trajectory now."
                 )));
             }
-        } else if selection_attempts < ASGARD_SELECTION_MAX_ATTEMPTS {
-            let remaining = ASGARD_SELECTION_MAX_ATTEMPTS - selection_attempts;
+        } else if selection_attempts < selection_attempt_limit {
+            let remaining = selection_attempt_limit - selection_attempts;
             messages.push(ChatMessage::user(format!(
                 "You have not made the required trajectory decision.{detail} Call select_trajectory now with your best judgment; {remaining} selection attempt(s) remain. Audit calls will be ignored. Do not answer in prose."
             )));
