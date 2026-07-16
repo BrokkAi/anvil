@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "id": "drizzle-r1-false-complete",
+      "archive": "/home/jonathan/brokkbench-archive/drizzle-orm-window-function-builders/asgard3-flash-pro-drizzle-orm-window-function-builders-r1-1784067332-564594.zip",
+      "expected_complete": false,
+      "review_note": "Selected patch failed 11 F2P tests: zero preceding/following was rejected and primitive lag/lead defaults rendered incorrectly."
+    },
+    {
+      "id": "happy-dom-r2-false-complete",
+      "archive": "/home/jonathan/brokkbench-archive/happy-dom-abort-pending-body-reads/asgard3-flash-pro-happy-dom-abort-pending-body-reads-r2-1784069245-564594.zip",
+      "expected_complete": false,
+      "review_note": "Selected patch left actual shutdown cancellation unwired; 13 integration cases timed out."
+    },
+    {
+      "id": "ofetch-r2-false-complete",
+      "archive": "/home/jonathan/brokkbench-archive/ofetch-per-origin-circuit-breaker/asgard3-flash-pro-ofetch-per-origin-circuit-breaker-r2-1784069953-564594.zip",
+      "expected_complete": false,
+      "review_note": "Selected patch failed origin independence and final-retry cooldown timing contracts."
+    },
+    {
+      "id": "wazero-r2-false-complete",
+      "archive": "/home/jonathan/brokkbench-archive/wazero-multi-module-snapshots/asgard3-flash-pro-wazero-multi-module-snapshots-r2-1784070903-564594.zip",
+      "expected_complete": false,
+      "review_note": "Selected patch returned errors that did not contain the exact required phrase 'module closed'."
+    },
+    {
+      "id": "happy-dom-r1-correct-complete",
+      "archive": "/home/jonathan/brokkbench-archive/happy-dom-abort-pending-body-reads/asgard3-flash-pro-happy-dom-abort-pending-body-reads-r1-1784067332-564594.zip",
+      "expected_complete": true,
+      "review_note": "Selected patch passed all 14 F2P and 165 P2P tests."
+    },
+    {
+      "id": "returns-r1-correct-complete",
+      "archive": "/home/jonathan/brokkbench-archive/returns-validated-error-accumulation/asgard3-flash-pro-returns-validated-error-accumulation-r1-1784067332-564594.zip",
+      "expected_complete": true,
+      "review_note": "Selected patch passed all 110 F2P and 172 P2P tests."
+    }
+  ]
+}

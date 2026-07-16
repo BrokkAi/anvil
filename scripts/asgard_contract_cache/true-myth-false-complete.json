@@ -1,0 +1,365 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "inspection",
+      "text": "`Maybe` implements `[Symbol.iterator]`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "inspection",
+      "text": "`Result` implements `[Symbol.iterator]`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "`Task` implements `[Symbol.asyncIterator]`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "execution",
+      "text": "Task's async iterator yields exactly one `Result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "execution",
+      "text": "Task's async iterator yields `Ok` when the task resolves.",
+      "adverse_condition": "When the task resolves."
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "Task's async iterator yields `Err` when the task rejects.",
+      "adverse_condition": "When the task rejects."
+    },
+    {
+      "id": "C7",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `sequence` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C8",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `traverse` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C9",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `zip` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `zipWith` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "`result` module exports a `sequence` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "`result` module exports a `traverse` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "inspection",
+      "text": "`result` module exports a `zip` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "inspection",
+      "text": "`result` module exports a `zipWith` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "inspection",
+      "text": "`task` module exports a `sequence` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "inspection",
+      "text": "`task` module exports a `traverse` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "inspection",
+      "text": "`task` module exports a `zip` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "inspection",
+      "text": "`task` module exports a `zipWith` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "inspection",
+      "text": "On `maybe` and `result`, `sequence` accepts any `Iterable`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C20",
+      "kind": "inspection",
+      "text": "On `maybe` and `result`, `traverse` accepts any `Iterable`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C21",
+      "kind": "execution",
+      "text": "On `maybe` and `result`, `sequence` stops advancing the iterator immediately after the first failure (first `Nothing` or first `Err`).",
+      "adverse_condition": "When the iterable yields a failure before exhaustion."
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "On `maybe` and `result`, `traverse` stops advancing the iterator immediately after the first failure returned by `fn`.",
+      "adverse_condition": "When `fn` returns a failure before the iterable is exhausted."
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "`traverse` has the non-curried signature `traverse(items, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "inspection",
+      "text": "`traverse` has a single-argument curried form `traverse(fn)` that returns `(items) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C25",
+      "kind": "inspection",
+      "text": "`zipWith` takes `(a, b, fn)` — data arguments first, combiner function last.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C26",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `compact` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C27",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `filterMap` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "`compact` drops failures (`Nothing`) silently, keeping only `Just` values.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C29",
+      "kind": "inspection",
+      "text": "`filterMap` has the non-curried signature `filterMap(items, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C30",
+      "kind": "inspection",
+      "text": "`filterMap` has a curried form `filterMap(fn)` that returns `(items) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C31",
+      "kind": "inspection",
+      "text": "`result` module exports a `partition` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "`partition` splits an iterable of Results into `[oks, errs]` — an array of two arrays.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C33",
+      "kind": "inspection",
+      "text": "`task` module exports a `traverseSerial` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C34",
+      "kind": "execution",
+      "text": "`traverseSerial` processes items sequentially (one at a time, not concurrent).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C35",
+      "kind": "execution",
+      "text": "`traverseSerial` stops on the first rejection and does not process remaining items.",
+      "adverse_condition": "When `fn` returns a rejected task before all items are processed."
+    },
+    {
+      "id": "C36",
+      "kind": "inspection",
+      "text": "`traverseSerial` has the non-curried signature `traverseSerial(items, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C37",
+      "kind": "inspection",
+      "text": "`traverseSerial` has a curried form `traverseSerial(fn)` that returns `(items) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C38",
+      "kind": "inspection",
+      "text": "`task` module exports a `tap(task, fn)` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C39",
+      "kind": "inspection",
+      "text": "`task` module exports a `tapRejected(task, fn)` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C40",
+      "kind": "execution",
+      "text": "`tap(task, fn)` calls `fn` for its side effect and passes the resolved value through unchanged.",
+      "adverse_condition": "When the task resolves."
+    },
+    {
+      "id": "C41",
+      "kind": "execution",
+      "text": "`tapRejected(task, fn)` calls `fn` for its side effect and passes the rejection value through unchanged.",
+      "adverse_condition": "When the task rejects."
+    },
+    {
+      "id": "C42",
+      "kind": "inspection",
+      "text": "`tap` has a curried form `tap(fn)` that returns `(task) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C43",
+      "kind": "inspection",
+      "text": "`tapRejected` has a curried form `tapRejected(fn)` that returns `(task) => result`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C44",
+      "kind": "inspection",
+      "text": "`task` module exports a `retryN(n, fn)` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C45",
+      "kind": "execution",
+      "text": "`retryN(n, fn)` retries the task-producing function `fn` up to `n` additional times (beyond the initial call) when the produced task rejects.",
+      "adverse_condition": "When the task produced by `fn` rejects."
+    },
+    {
+      "id": "C46",
+      "kind": "inspection",
+      "text": "`maybe` module exports a `firstJust(maybes)` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C47",
+      "kind": "execution",
+      "text": "`firstJust` returns the first `Just` value in the array.",
+      "adverse_condition": "When the array contains at least one `Just`."
+    },
+    {
+      "id": "C48",
+      "kind": "execution",
+      "text": "`firstJust` returns `Nothing` when no `Just` exists in the array.",
+      "adverse_condition": "When the array contains no `Just` values."
+    },
+    {
+      "id": "C49",
+      "kind": "inspection",
+      "text": "`toolbelt` module exports a `sequenceMaybeAsResult` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C50",
+      "kind": "inspection",
+      "text": "`toolbelt` module exports a `traverseMaybeAsResult` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C51",
+      "kind": "inspection",
+      "text": "`toolbelt` module exports a `zipMaybeAsResult` function.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C52",
+      "kind": "execution",
+      "text": "`sequenceMaybeAsResult` converts each `Nothing` into `Err(errValue)` using the caller-supplied `errValue`.",
+      "adverse_condition": "When a `Nothing` is encountered."
+    },
+    {
+      "id": "C53",
+      "kind": "execution",
+      "text": "`traverseMaybeAsResult` converts each `Nothing` into `Err(errValue)` using the caller-supplied `errValue`.",
+      "adverse_condition": "When `fn` returns `Nothing`."
+    },
+    {
+      "id": "C54",
+      "kind": "execution",
+      "text": "`zipMaybeAsResult` converts each `Nothing` into `Err(errValue)` using the caller-supplied `errValue`.",
+      "adverse_condition": "When either input is `Nothing`."
+    },
+    {
+      "id": "C55",
+      "kind": "inspection",
+      "text": "Each toolbelt function (`sequenceMaybeAsResult`, `traverseMaybeAsResult`, `zipMaybeAsResult`) has a curried form `fn(errValue)` that returns a function taking the remaining arguments.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C56",
+      "kind": "inspection",
+      "text": "`traverseMaybeAsResult` has the non-curried signature `traverseMaybeAsResult(errValue, items, fn)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C57",
+      "kind": "delivery",
+      "text": "All work is done on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C58",
+      "kind": "delivery",
+      "text": "All changes are committed when the work is complete.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1511,
+    "completion_tokens": 6392,
+    "total_tokens": 7903,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 3678
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 1511
+  }
+}

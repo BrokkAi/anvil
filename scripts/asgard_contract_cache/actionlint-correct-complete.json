@@ -1,0 +1,191 @@
+{
+  "contracts": [
+    {
+      "id": "C01",
+      "kind": "inspection",
+      "text": "The rule must define an error kind with the exact string \"action-pinning\".",
+      "adverse_condition": null
+    },
+    {
+      "id": "C02",
+      "kind": "inspection",
+      "text": "The rule must check step-level action `uses:` references for version pinning.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C03",
+      "kind": "inspection",
+      "text": "The rule must check job-level reusable workflow `uses:` references for version pinning.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C04",
+      "kind": "inspection",
+      "text": "The rule must be configurable via an `action-pinning` configuration section.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C05",
+      "kind": "inspection",
+      "text": "The `action-pinning` config section must accept a `level` field whose valid values are \"major-minor\", \"semver\", and \"commit-sha\".",
+      "adverse_condition": null
+    },
+    {
+      "id": "C06",
+      "kind": "inspection",
+      "text": "The default `level` must be \"semver\" when no explicit level is provided.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C07",
+      "kind": "execution",
+      "text": "Levels must be ordered by increasing strictness: \"major-minor\" < \"semver\" < \"commit-sha\". A ref satisfying a stricter level must also satisfy any less strict requirement (e.g., a commit-sha ref must pass both semver and major-minor checks).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C08",
+      "kind": "inspection",
+      "text": "Setting `action-pinning: null` must keep the rule disabled.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C09",
+      "kind": "inspection",
+      "text": "An empty object `action-pinning: {}` must enable the rule with default settings.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "inspection",
+      "text": "Local refs (references starting with `./`) must be skipped and not flagged.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "Docker refs (references starting with `docker://`) must be skipped and not flagged.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "When the action name itself is an expression, the entire `uses:` reference must be skipped entirely with no error reported.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "When only the version ref portion is a dynamic expression, the rule must flag it with an error message indicating the ref is a dynamic expression that cannot be verified for pinning.",
+      "adverse_condition": "Only the version ref is a dynamic expression, not the entire action name."
+    },
+    {
+      "id": "C14",
+      "kind": "inspection",
+      "text": "The config must support an `allowed-owners` list that is case-insensitive.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "inspection",
+      "text": "The config must support an `allowed-actions` list whose entries use the `owner/repo` format.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "inspection",
+      "text": "The config must support a `denied-owners` list.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "inspection",
+      "text": "The config must support a `denied-actions` list whose entries use the `owner/repo` format.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "Global and per-path allowed and denied lists must merge by union across all matching configurations.",
+      "adverse_condition": "Multiple configuration sources (global and per-path) both define allowed/denied entries."
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "Denied entries must take precedence over allowed entries when an entry appears in both lists, but denied entries must still be subject to pinning checks rather than being unconditionally blocked.",
+      "adverse_condition": "An entry appears in both the denied list and the allowed list."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "For popular actions present in the known-actions data, error suggestions must reference the specific known version (e.g., the pinned version from the known-actions dataset).",
+      "adverse_condition": "The action is present in the known-actions data."
+    },
+    {
+      "id": "C21",
+      "kind": "inspection",
+      "text": "Per-path overrides must use an `action-pinning` key to override the pinning level for matching paths.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "A per-path `action-pinning` entry must enable the rule for that path even when no global `action-pinning` section exists.",
+      "adverse_condition": "No global `action-pinning` config section is present."
+    },
+    {
+      "id": "C23",
+      "kind": "inspection",
+      "text": "An `-action-pinning-level` CLI flag must be accepted, overriding only the pinning level (not allow/deny lists).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C24",
+      "kind": "execution",
+      "text": "The `-action-pinning-level` CLI flag must enable the rule even when it would otherwise be disabled (e.g., via `action-pinning: null` or absence of config).",
+      "adverse_condition": "The rule is disabled via config (null or absent)."
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "Config validation must reject invalid `level` values (anything other than \"major-minor\", \"semver\", or \"commit-sha\").",
+      "adverse_condition": "A config or override specifies a level not in the allowed set."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "Config validation must reject owner entries in `allowed-owners` or `denied-owners` that contain a slash (`/`).",
+      "adverse_condition": "An owner entry contains a slash character."
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "Config validation must reject malformed entries in `allowed-actions` or `denied-actions` that do not match the `owner/repo` format.",
+      "adverse_condition": "An action entry does not follow the `owner/repo` format."
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "Error messages for reusable workflow `uses:` violations must be distinguishable from error messages for step action `uses:` violations.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C29",
+      "kind": "delivery",
+      "text": "All work must be done on a new branch created from main and committed when complete.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1424,
+    "completion_tokens": 2077,
+    "total_tokens": 3501,
+    "prompt_tokens_details": {
+      "cached_tokens": 896
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 441
+    },
+    "prompt_cache_hit_tokens": 896,
+    "prompt_cache_miss_tokens": 528
+  }
+}

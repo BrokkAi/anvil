@@ -34,3 +34,4 @@ brokk-acp-sandbox/target/
 .bifrost/
 # Mjolnir linked worktrees
 .mjolnir/worktrees/
+scripts/__pycache__/
