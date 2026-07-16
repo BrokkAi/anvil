@@ -721,6 +721,24 @@ pub struct ToolRegistry {
     plugin_hooks: Vec<crate::plugins::HookCommand>,
 }
 
+fn render_mcp_instructions(mut entries: Vec<(String, String)>) -> Option<String> {
+    entries.retain(|(_, instructions)| !instructions.trim().is_empty());
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut block = String::from("<mcp_instructions>\n");
+    for (name, instructions) in entries {
+        block.push_str(&format!(
+            "  <server name=\"{name}\">\n{}\n  </server>\n",
+            instructions.trim()
+        ));
+    }
+    block.push_str("</mcp_instructions>");
+    Some(block)
+}
+
 impl ToolRegistry {
     /// Working directory this registry is rooted in.
     pub(crate) fn cwd(&self) -> &Path {
@@ -766,6 +784,19 @@ impl ToolRegistry {
     /// nested LLM call.
     pub(crate) async fn agents_snapshot(&self) -> Arc<AgentRegistry> {
         self.agents.read().await.clone()
+    }
+
+    /// Render instructions from currently connected MCP servers for inclusion
+    /// in the model's system prompt. Clients are sorted by server name so the
+    /// prefix remains deterministic even when configuration order changes.
+    pub(crate) async fn mcp_instructions(&self) -> Option<String> {
+        let mut entries = Vec::new();
+        for client in &self.mcp_clients {
+            if let Some(instructions) = client.instructions().await {
+                entries.push((client.name().to_string(), instructions));
+            }
+        }
+        render_mcp_instructions(entries)
     }
 
     pub async fn new(
@@ -1854,6 +1885,22 @@ fn canonical_workspace_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_instruction_block_is_deterministic_and_omits_empty_entries() {
+        let rendered = render_mcp_instructions(vec![
+            ("zeta".to_string(), "Last policy".to_string()),
+            ("empty".to_string(), " \n".to_string()),
+            ("alpha".to_string(), "First policy".to_string()),
+        ]);
+        assert_eq!(
+            rendered.as_deref(),
+            Some(
+                "<mcp_instructions>\n  <server name=\"alpha\">\nFirst policy\n  </server>\n  <server name=\"zeta\">\nLast policy\n  </server>\n</mcp_instructions>"
+            )
+        );
+        assert_eq!(render_mcp_instructions(Vec::new()), None);
+    }
 
     /// Allocate a fresh empty directory under the system temp dir for one test
     /// to scribble in. Caller is responsible for cleaning it up.

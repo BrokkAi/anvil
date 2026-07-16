@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -466,6 +466,7 @@ pub struct McpClient {
     state: Mutex<McpClientState>,
     next_id: AtomicI64,
     tools: Vec<McpToolDef>,
+    instructions: RwLock<Option<String>>,
 }
 
 enum McpClientState {
@@ -498,7 +499,7 @@ struct McpIo {
 impl McpClient {
     pub async fn spawn(config: &McpServerConfig, cwd: &Path) -> Result<Self, McpError> {
         let next_id = AtomicI64::new(1);
-        let (state, tools) = Self::spawn_connected(config, cwd, &next_id).await?;
+        let (state, tools, instructions) = Self::spawn_connected(config, cwd, &next_id).await?;
 
         Ok(Self {
             name: config.name.clone(),
@@ -507,6 +508,7 @@ impl McpClient {
             state: Mutex::new(state),
             next_id,
             tools,
+            instructions: RwLock::new(instructions),
         })
     }
 
@@ -514,7 +516,7 @@ impl McpClient {
         config: &McpServerConfig,
         cwd: &Path,
         next_id: &AtomicI64,
-    ) -> Result<(McpClientState, Vec<McpToolDef>), McpError> {
+    ) -> Result<(McpClientState, Vec<McpToolDef>, Option<String>), McpError> {
         match config.transport {
             McpTransport::Http => return Self::connect_http(config, next_id).await,
             McpTransport::Sse => return Self::connect_sse(config, next_id).await,
@@ -564,7 +566,8 @@ impl McpClient {
             }),
         )
         .await?;
-        let _init = read_response(&mut io, init_id).await?;
+        let init = read_response(&mut io, init_id).await?;
+        let instructions = parse_server_instructions(&init);
 
         write_notification(&mut io, "notifications/initialized", json!({})).await?;
 
@@ -595,13 +598,14 @@ impl McpClient {
                 healthy: true,
             },
             tools,
+            instructions,
         ))
     }
 
     async fn connect_http(
         config: &McpServerConfig,
         next_id: &AtomicI64,
-    ) -> Result<(McpClientState, Vec<McpToolDef>), McpError> {
+    ) -> Result<(McpClientState, Vec<McpToolDef>, Option<String>), McpError> {
         let url = config
             .url
             .as_deref()
@@ -617,7 +621,7 @@ impl McpClient {
         }
         let client = build_mcp_http_client(&url)?;
         let init_id = next_id.fetch_add(1, Ordering::SeqCst);
-        let (_, session_id) = http_request_with_session(
+        let (init, session_id) = http_request_with_session(
             &client,
             &url,
             &headers,
@@ -631,6 +635,7 @@ impl McpClient {
             }),
         )
         .await?;
+        let instructions = parse_server_instructions(&init);
         http_notification(
             &client,
             &url,
@@ -661,13 +666,14 @@ impl McpClient {
                 session_id,
             },
             tools,
+            instructions,
         ))
     }
 
     async fn connect_sse(
         config: &McpServerConfig,
         next_id: &AtomicI64,
-    ) -> Result<(McpClientState, Vec<McpToolDef>), McpError> {
+    ) -> Result<(McpClientState, Vec<McpToolDef>, Option<String>), McpError> {
         let url = config
             .url
             .as_deref()
@@ -712,7 +718,7 @@ impl McpClient {
             _reader: reader,
         };
         let init_id = next_id.fetch_add(1, Ordering::SeqCst);
-        let _ = sse_request(
+        let init = sse_request(
             &mut state,
             init_id,
             "initialize",
@@ -723,12 +729,13 @@ impl McpClient {
             }),
         )
         .await?;
+        let instructions = parse_server_instructions(&init);
         sse_notification(&state, "notifications/initialized", json!({})).await?;
         let list_id = next_id.fetch_add(1, Ordering::SeqCst);
         let list = sse_request(&mut state, list_id, "tools/list", json!({})).await?;
         let tools = parse_tool_list(list, Some(config.name.as_str()))?;
         tracing::info!(server = %config.name, url, tool_count = tools.len(), "SSE MCP server ready");
-        Ok((state, tools))
+        Ok((state, tools, instructions))
     }
 
     pub fn name(&self) -> &str {
@@ -737,6 +744,17 @@ impl McpClient {
 
     pub fn tools(&self) -> &[McpToolDef] {
         &self.tools
+    }
+
+    /// Instructions advertised by this server's most recent successful
+    /// initialize handshake. An unhealthy stdio client is omitted until its
+    /// next tool call reconnects it successfully.
+    pub async fn instructions(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        if matches!(&*state, McpClientState::Stdio { healthy: false, .. }) {
+            return None;
+        }
+        self.instructions.read().await.clone()
     }
 
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
@@ -775,9 +793,10 @@ impl McpClient {
         };
 
         if matches!(&*state, McpClientState::Stdio { healthy: false, .. }) {
-            let (new_state, _) =
+            let (new_state, _, new_instructions) =
                 Self::spawn_connected(&self.config, &self.cwd, &self.next_id).await?;
             *state = new_state;
+            *self.instructions.write().await = new_instructions;
         }
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -928,6 +947,15 @@ impl McpError {
             McpError::Io(_) | McpError::Timeout { .. } | McpError::Cancelled { .. }
         )
     }
+}
+
+fn parse_server_instructions(initialize_result: &Value) -> Option<String> {
+    initialize_result
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|instructions| !instructions.is_empty())
+        .map(str::to_string)
 }
 
 async fn mark_unhealthy(state: &mut McpClientState, err: &McpError) {
@@ -1285,7 +1313,11 @@ mod http_tests {
                 let value: Value = serde_json::from_str(&body).expect("json");
                 seen.lock().unwrap().push(value.clone());
                 let response = match value.get("method").and_then(Value::as_str) {
-                    Some("initialize") => json!({"jsonrpc":"2.0","id":value["id"],"result":{}}),
+                    Some("initialize") => json!({
+                        "jsonrpc":"2.0",
+                        "id":value["id"],
+                        "result":{"instructions":"Follow remote coordination policy."}
+                    }),
                     Some("tools/list") => {
                         json!({"jsonrpc":"2.0","id":value["id"],"result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}})
                     }
@@ -1326,6 +1358,10 @@ mod http_tests {
         let client = McpClient::spawn(&config, Path::new("."))
             .await
             .expect("connect");
+        assert_eq!(
+            client.instructions().await.as_deref(),
+            Some("Follow remote coordination policy.")
+        );
         assert_eq!(client.tools()[0].name, "echo");
         assert_eq!(
             client.call_tool("echo", json!({})).await.unwrap(),
@@ -1608,6 +1644,23 @@ fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn server_instructions_omit_absent_empty_and_whitespace_values() {
+        assert_eq!(parse_server_instructions(&json!({})), None);
+        assert_eq!(
+            parse_server_instructions(&json!({"instructions": null})),
+            None
+        );
+        assert_eq!(
+            parse_server_instructions(&json!({"instructions": "  \n"})),
+            None
+        );
+        assert_eq!(
+            parse_server_instructions(&json!({"instructions": "  coordinate carefully  "})),
+            Some("coordinate carefully".to_string())
+        );
+    }
 
     /// A persisted bifrost entry carrying the prior managed default
     /// (`--server core`) is upgraded to the current default surface on load, so

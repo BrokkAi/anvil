@@ -8002,7 +8002,7 @@ async fn run_model_turn_in_spawn(
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     structured_output_request: Option<&StructuredOutputRequest>,
-    messages: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
     initial_usage: crate::llm_client::TokenUsage,
     context_length: Option<u32>,
     context_prefix_len: usize,
@@ -8015,6 +8015,10 @@ async fn run_model_turn_in_spawn(
 ) -> ModelTurnResult {
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
+
+    if let Some(instructions) = registry.mcp_instructions().await {
+        append_mcp_instructions_to_system_prompt(&mut messages, &instructions);
+    }
 
     let cx_text = cx.clone();
     let sid_text = session_id.to_string();
@@ -8232,6 +8236,17 @@ async fn run_model_turn_in_spawn(
         tool_stats,
         persisted_fragment_id,
     }
+}
+
+fn append_mcp_instructions_to_system_prompt(messages: &mut [ChatMessage], instructions: &str) {
+    let Some(system) = messages.iter_mut().find(|message| message.role == "system") else {
+        return;
+    };
+    let Some(crate::llm_client::ChatContentPart::Text { text }) = system.content.first_mut() else {
+        return;
+    };
+    text.push_str("\n\n");
+    text.push_str(instructions);
 }
 
 /// Shared "run one model turn" pipeline behind both `/loop` and `/goal`:
@@ -13971,6 +13986,31 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    #[test]
+    fn mcp_instructions_extend_only_the_system_prompt() {
+        let original_user = "user bytes stay exactly the same";
+        let mut messages = vec![
+            ChatMessage::system("base system prompt"),
+            ChatMessage::user(original_user),
+        ];
+
+        append_mcp_instructions_to_system_prompt(
+            &mut messages,
+            "<mcp_instructions>\n  <server name=\"council\">\nCoordinate persistently.\n  </server>\n</mcp_instructions>",
+        );
+
+        let crate::llm_client::ChatContentPart::Text { text: system } = &messages[0].content[0]
+        else {
+            panic!("system prompt should be text")
+        };
+        assert!(system.starts_with("base system prompt\n\n<mcp_instructions>"));
+        let crate::llm_client::ChatContentPart::Text { text: user } = &messages[1].content[0]
+        else {
+            panic!("user prompt should be text")
+        };
+        assert_eq!(user.as_bytes(), original_user.as_bytes());
+    }
 
     #[derive(Debug)]
     struct SupervisorRequestRecord {
