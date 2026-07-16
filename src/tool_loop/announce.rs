@@ -462,13 +462,7 @@ pub(super) fn tool_locations(tool_name: &str, raw_input: &Value) -> Vec<ToolCall
 }
 
 fn truncate(s: &str) -> String {
-    if s.len() <= MAX_INLINE_OUTPUT_BYTES {
-        s.to_string()
-    } else {
-        let mut out = crate::text::truncate_utf8(s, MAX_INLINE_OUTPUT_BYTES).to_string();
-        out.push_str("\n... output truncated");
-        out
-    }
+    crate::text::truncate_utf8_with_suffix(s, MAX_INLINE_OUTPUT_BYTES, "\n... output truncated")
 }
 
 fn first_line(s: &str) -> &str {
@@ -535,11 +529,7 @@ fn brief_input_summary(raw_input: &Value) -> String {
         if let Some(s) = v.as_str() {
             let s = s.trim();
             if !s.is_empty() {
-                let mut out = crate::text::truncate_utf8(s, 80).to_string();
-                if s.len() > 80 {
-                    out.push_str("...");
-                }
-                return out;
+                return crate::text::truncate_utf8_with_suffix(s, 80, "...");
             }
         }
         if let Some(arr) = v.as_array()
@@ -547,11 +537,7 @@ fn brief_input_summary(raw_input: &Value) -> String {
         {
             let s = first.trim();
             if !s.is_empty() {
-                let mut out = crate::text::truncate_utf8(s, 80).to_string();
-                if s.len() > 80 {
-                    out.push_str("...");
-                }
-                return out;
+                return crate::text::truncate_utf8_with_suffix(s, 80, "...");
             }
         }
     }

@@ -11,6 +11,22 @@ pub(crate) fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+/// Returns `value` unchanged when it fits, or a UTF-8-safe prefix followed by
+/// `suffix` when it exceeds `max_bytes`. The byte cap applies to the source
+/// text; callers may use a visible truncation marker without risking a direct
+/// `String::truncate` at a non-character boundary.
+pub(crate) fn truncate_utf8_with_suffix(value: &str, max_bytes: usize, suffix: &str) -> String {
+    let prefix = truncate_utf8(value, max_bytes);
+    if prefix.len() == value.len() {
+        return value.to_string();
+    }
+
+    let mut output = String::with_capacity(prefix.len() + suffix.len());
+    output.push_str(prefix);
+    output.push_str(suffix);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -27,5 +43,18 @@ mod tests {
         let value = "\u{25cf}";
 
         assert_eq!(truncate_utf8(value, 10), "\u{25cf}");
+    }
+
+    #[test]
+    fn suffix_helper_handles_reported_unicode_boundaries() {
+        assert_eq!(
+            truncate_utf8_with_suffix("abc\u{2715}tail", 4, "..."),
+            "abc..."
+        );
+        assert_eq!(
+            truncate_utf8_with_suffix("abc\u{25cf}tail", 6, "..."),
+            "abc\u{25cf}..."
+        );
+        assert_eq!(truncate_utf8_with_suffix("\u{25cf}", 0, "..."), "...");
     }
 }

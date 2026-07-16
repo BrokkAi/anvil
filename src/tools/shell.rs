@@ -371,9 +371,11 @@ fn format_shell_tool_result(
     }
 
     if combined.len() > MAX_OUTPUT_BYTES {
-        let end = crate::text::truncate_utf8(&combined, MAX_OUTPUT_BYTES).len();
-        combined.truncate(end);
-        combined.push_str("\n... output truncated");
+        combined = crate::text::truncate_utf8_with_suffix(
+            &combined,
+            MAX_OUTPUT_BYTES,
+            "\n... output truncated",
+        );
     }
 
     if bypass_warning {
