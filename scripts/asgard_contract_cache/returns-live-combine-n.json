@@ -1,0 +1,293 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "inspection",
+      "text": "A container type named Validated must exist.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "inspection",
+      "text": "A concrete subtype named Valid must exist, representing success.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "A concrete subtype named Invalid must exist, representing accumulated failures.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "inspection",
+      "text": "Invalid must store its errors in an immutable tuple (the type annotation must indicate a tuple).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "execution",
+      "text": "Invalid.from_failure(error) must wrap the single error into a 1-tuple so that Invalid((error,)) is produced.",
+      "adverse_condition": "error is itself a tuple — wrapping must still produce a 1-tuple containing that tuple, not flatten it."
+    },
+    {
+      "id": "C6",
+      "kind": "execution",
+      "text": "When apply combines two Invalid containers, the resulting error tuple must be self's errors concatenated with the other's errors, preserving stable left-to-right order.",
+      "adverse_condition": "Both Invalid containers hold errors that are pairwise distinguishable — identical or commutative error sets cannot reveal order violations."
+    },
+    {
+      "id": "C7",
+      "kind": "execution",
+      "text": "swap on Valid(x) must return Invalid((x,)).",
+      "adverse_condition": "x is itself a tuple; swap must wrap the whole tuple in another 1-tuple, e.g. Valid((1,2)) → Invalid(((1,2),))."
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "swap on Invalid(errs) must return Valid(errs), where the error tuple becomes the valid value.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C9",
+      "kind": "execution",
+      "text": "from_validated classmethod must return the same instance it receives (identity, not just equality).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "alt on Invalid must apply the provided function to each individual error element in the tuple and return a new Invalid with the mapped results.",
+      "adverse_condition": "The error tuple contains multiple elements; each must be independently mapped. If elements are identical after mapping, correctness of per-element application may be hidden."
+    },
+    {
+      "id": "C11",
+      "kind": "inspection",
+      "text": "Valid must define __match_args__ to support structural pattern matching.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C12",
+      "kind": "inspection",
+      "text": "Invalid must define __match_args__ to support structural pattern matching.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "Validated must support equality comparison.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C14",
+      "kind": "execution",
+      "text": "Validated must support repr.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "Validated must support do-notation.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "Validated must have an unwrap method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "Validated must have a failure method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C18",
+      "kind": "execution",
+      "text": "Validated must have a value_or method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "Validated must have a from_value classmethod or constructor.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "Validated must have a bind_validated method.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C21",
+      "kind": "execution",
+      "text": "bind on Invalid must short-circuit: it must not apply the bound function and must return the Invalid (or an equivalent Invalid with the same errors).",
+      "adverse_condition": "The Validated is Invalid. The bound function, if erroneously called, might produce a side-effect or return a different Validated — the contract requires it is never invoked."
+    },
+    {
+      "id": "C22",
+      "kind": "execution",
+      "text": "from_result classmethod: given a Success(value), it must produce Valid(value).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C23",
+      "kind": "execution",
+      "text": "from_result classmethod: given a Failure(error), it must produce Invalid((error,)) with the error wrapped in a 1-tuple.",
+      "adverse_condition": "error is itself a tuple; it must be wrapped in another tuple, not flattened."
+    },
+    {
+      "id": "C24",
+      "kind": "inspection",
+      "text": "A pointfree bind_validated function must be exported from the returns.pointfree package (in __init__.py).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "combine classmethod: given two Valid containers and a binary function, it must produce Valid(f(x, y)) using applicative combination.",
+      "adverse_condition": "Both inputs are Valid but their values are identical or the function is commutative — this can hide argument-order errors."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "combine classmethod: given at least one Invalid, it must accumulate errors from all Invalid inputs into a single Invalid whose error tuple is the concatenation of all individual error tuples.",
+      "adverse_condition": "Multiple Invalid inputs carry errors; the concatenation order (self's errors before other's errors) must be preserved."
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "combine_n classmethod: given a tuple of N Validated containers all being Valid and an N-ary function, it must produce Valid(f(v1, ..., vN)).",
+      "adverse_condition": "All inputs are Valid but some values are identical or the function is commutative over swapped arguments — this can hide positional argument errors."
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "combine_n classmethod: if any of the N Validated containers is Invalid, it must accumulate all errors from every Invalid container into a single Invalid.",
+      "adverse_condition": "Multiple containers are Invalid; errors from a later Invalid could be mistakenly omitted while only the first Invalid's errors are kept."
+    },
+    {
+      "id": "C29",
+      "kind": "execution",
+      "text": "The result_to_validated converter function must exist in the converters module and convert a Result into a Validated.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C30",
+      "kind": "execution",
+      "text": "The validated_to_result converter function must exist in the converters module and convert a Validated into a Result.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C31",
+      "kind": "execution",
+      "text": "The validated decorator must catch exceptions raised by the wrapped function and return Invalid containing the caught exception.",
+      "adverse_condition": "The wrapped function raises an exception. If no exception is raised, the decorator must not alter the return value into an Invalid."
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "The validated decorator must support an exceptions parameter that restricts which exception types are caught (others propagate normally).",
+      "adverse_condition": "The wrapped function raises an exception type not listed in exceptions — it must propagate, not be caught."
+    },
+    {
+      "id": "C33",
+      "kind": "execution",
+      "text": "The validated decorator must preserve the wrapped function's __name__.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C34",
+      "kind": "inspection",
+      "text": "The ValidatedLikeN interface must extend FailableN directly (not DiverseFailableN).",
+      "adverse_condition": null
+    },
+    {
+      "id": "C35",
+      "kind": "inspection",
+      "text": "ValidatedLikeN must define its own from_failure classmethod.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C36",
+      "kind": "inspection",
+      "text": "ValidatedLikeN must define custom short-circuit law specifications for map on failure values.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C37",
+      "kind": "inspection",
+      "text": "ValidatedLikeN must define custom short-circuit law specifications for bind on failure values.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C38",
+      "kind": "inspection",
+      "text": "ValidatedLikeN must define custom short-circuit law specifications for apply on failure values.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C39",
+      "kind": "inspection",
+      "text": "returns/methods/cond.py must include a dispatch branch for ValidatedLikeN, placed before the container_type.empty fallback.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C40",
+      "kind": "inspection",
+      "text": "returns/contrib/hypothesis/containers.py must register ValidatedLikeN with from_failure strategy generation.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C41",
+      "kind": "inspection",
+      "text": "returns/pointfree/__init__.py must export bind_validated.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C42",
+      "kind": "delivery",
+      "text": "All work must be done on a new branch created from main.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C43",
+      "kind": "delivery",
+      "text": "All changes must be committed when done.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C44",
+      "kind": "inspection",
+      "text": "No changes to returns/iterables.py are permitted; Fold.collect must work automatically through apply with no modifications.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C45",
+      "kind": "execution",
+      "text": "The combine classmethod must correctly map each positional input to its corresponding function-argument position: the first Validated maps to the first parameter, the second to the second parameter.",
+      "adverse_condition": "Both Validated values are Valid and pairwise distinguishable, and the binary function is non-commutative."
+    },
+    {
+      "id": "C46",
+      "kind": "execution",
+      "text": "The combine_n classmethod must correctly map each positional Validated in the tuple to its corresponding N-ary function-argument position.",
+      "adverse_condition": "At least two Validated values in the tuple are Valid and pairwise distinguishable, and the N-ary function is non-commutative with respect to those positions."
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1742,
+    "completion_tokens": 6191,
+    "total_tokens": 7933,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 3722
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 1742
+  }
+}

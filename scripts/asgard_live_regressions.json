@@ -1,0 +1,5 @@
+{"cases":[
+{"id":"returns-live-combine-n","archive":"/home/jonathan/brokkbench-archive/returns-validated-error-accumulation/asgard4b-evidence-returns-validated-error-accumulation-r2-1784230976-861149.zip","expected_complete":false,"review_note":"combine_n success path misassigns positional values; candidate test reduces with commutative numeric addition and cannot detect swaps."},
+{"id":"httpx-live-combined-header","archive":"/home/jonathan/brokkbench-archive/httpx-deterministic-cookie-store/asgard4-evidence-httpx-deterministic-cookie-store-r1-1784225803-2653259.zip","expected_complete":false,"review_note":"Combined Set-Cookie splitting keeps only the first cookie when Expires contains a comma; candidate's multi-cookie test does not exercise the failing shape."},
+{"id":"psd-live-from-values","archive":"/home/jonathan/brokkbench-archive/psd-tools-blend-range-api/asgard4b-evidence-psd-tools-blend-range-api-r1-1784230976-861149.zip","expected_complete":false,"review_note":"from_values/from_channels constructor tests fail; positional/default handling wrong despite 42-row verified review."}
+]}
