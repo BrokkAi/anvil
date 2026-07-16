@@ -6227,11 +6227,11 @@ Selection does not require certainty. Choose the best continuation under the ava
 </mission>
 
 <task_and_evidence>
-The original task is authoritative. Preserve every explicit behavior, implementation constraint, and prohibition. A lane that contradicts the task is not rescued by confident prose, a large patch, or irrelevant green checks. Judge architectural direction, correctness, recoverability, known defects, and evidence. Investigation that establishes an important constraint can be more valuable than immediate edits.
+The original task is authoritative. Preserve its exact externally observable contracts, including argument order, return values, error behavior, atomicity, compatibility requirements, implementation constraints, and prohibitions. Merely defining the requested symbol or compiling the code does not establish that contract. A lane that contradicts the task is not rescued by confident prose, a large patch, or aggregate green checks. Judge architectural direction, correctness, recoverability, known defects, and evidence. Investigation that establishes an important constraint can be more valuable than immediate edits.
 
 Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_window_diff shows that lane's edits since the last decision. A candidate_patch_manifest describes its cumulative changed production and test files. Use these together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
 
-Interpret verification precisely. A successful command establishes only what it actually exercised; filters, wrappers, timeouts, and zero-test selections can mislead. A build establishes compilation, not behavior. Candidate-written tests can be valuable, but green tests that were changed alongside the implementation are not independent proof unless they genuinely express the task. Do not mechanically reject legitimate test or mock updates.
+Interpret verification precisely. A successful command establishes only the behaviors its selected tests and assertions actually exercised; filters, wrappers, timeouts, zero-test selections, and missing combinations can mislead. Candidate-written tests can be valuable, but green tests changed alongside the implementation are not independent proof merely because they pass. Check whether they genuinely express the task, especially the highest-risk requirement and combinations of behaviors changed by the patch. Do not mechanically reject legitimate test or mock updates.
 
 Prior supervisor decisions and lane advice provide continuity, not authority. Reconsider them when the original task or newer evidence disagrees.
 </task_and_evidence>
@@ -6239,7 +6239,12 @@ Prior supervisor decisions and lane advice provide continuity, not authority. Re
 <decision_depth>
 First decide whether the leading lane plausibly appears terminal.
 
-If a lane appears terminal, actively audit completeness before setting complete=true. Account for every explicit requirement and prohibition, inspect suspicious unchanged context, investigate known or candidate-caused failures, and seek verification proportionate to the risk. Do not accept polished but unverified work as complete.
+If a lane appears terminal, audit in this priority order:
+1. Compare the implementation against every exact task contract, not just requested symbol names or candidate claims.
+2. Identify the highest-risk requirement and ask what boundary case or combination of changed behaviors the reported verification did not exercise.
+3. Resolve concrete task-relevant counterexamples, failure mechanisms, and contradictions before investigating speculative quality concerns.
+
+A concrete plausible defect or counterexample that remains unresolved requires complete=false. Do not let numerous weaker signals, candidate confidence, or unrelated passing tests outvote it. Evidence resolves a concern only when it specifically addresses the behavior or mechanism in question. General uncertainty alone is not a defect: when the contracts are satisfied and verification is proportionate, do not invent optional work.
 
 If the best lanes are plainly incomplete, do not perform a terminal-grade exhaustive audit. Inspect only enough consequential evidence to rank their directions and formulate the next work. Unknowns can remain: select the best foundation, set complete=false, record the uncertainty, and delegate the needed implementation or verification to candidates in the next window.
 </decision_depth>
@@ -6253,7 +6258,7 @@ Unavailable executable verification is not a reason to withhold a decision. If i
 <scope_and_completion>
 Stay within the original scope. Do not repair dependencies, lockfiles, toolchains, generated machinery, warning policy, test selection, or expected outputs merely to hide a failure unless the task requires that surface or the candidate broke it. Treat a failure as environmental, pre-existing, flaky, or unrelated only with concrete evidence. Do not weaken required behavior to preserve obsolete callers or mocks.
 
-Completion is a property of the endpoint, not of who introduced a defect. Set complete=true only when the selected endpoint satisfies the task, violates no constraint, has no known task-relevant defect, and has proportionate verification. Set complete=false when required work or verification remains. Do not invent optional work after the task is genuinely complete.
+Completion is a property of the endpoint, not of who introduced a defect. Set complete=true only when the selected endpoint satisfies the exact task contracts, violates no constraint, has no unresolved concrete task-relevant defect, and has verification proportionate to its risk. Set complete=false when required work or necessary verification remains. When executable verification is unavailable to you, select the best lane and delegate the specific check to the next candidate window rather than either assuming success or refusing to decide.
 </scope_and_completion>
 
 <continuation>
@@ -6304,10 +6309,10 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
         r#"{candidate_trajectories}
 
 <decision_procedure>
-1. Re-read the original task and identify its explicit requirements, constraints, and prohibitions.
+1. Re-read the original task and preserve its exact observable contracts: signatures and argument order, returns, errors, atomicity, compatibility, constraints, and prohibitions.
 2. Compare each lane's actual direction, defects, evidence, and recoverability. Choose a provisional winner even if all are incomplete.
-3. Decide whether that winner plausibly appears terminal. If so, audit completeness proportionately; if not, investigate only questions that could change the ranking or next-window direction.
-4. Make the independent completion judgment. Missing necessary executable verification means complete=false and should become concrete next-window advice, not an endless audit.
+3. Decide whether that winner plausibly appears terminal. If so, audit the riskiest explicit contract and look for a boundary case or combination its evidence did not exercise. If not, investigate only questions that could change the ranking or next-window direction.
+4. Make the independent completion judgment. Any unresolved concrete task-relevant defect or counterexample means complete=false; aggregate green checks cannot override it. Missing necessary executable verification also means complete=false and becomes concrete next-window advice, not an endless audit.
 5. If incomplete, choose the shared horizon and exactly {candidate_count} distinct compliant strategies, including one that challenges the leading unverified assumption.
 6. Call select_trajectory. Do not continue investigating once you can make the best available judgment.
 </decision_procedure>"#,
@@ -17769,7 +17774,11 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("correctness supervisor"));
         assert!(asgard_message_text(&first[0]).contains("exactly 3"));
         assert!(asgard_message_text(&first[0]).contains("Candidate briefs are loss-aware"));
-        assert!(asgard_message_text(&first[0]).contains("green tests that were changed"));
+        assert!(asgard_message_text(&first[0]).contains("green tests changed alongside"));
+        assert!(asgard_message_text(&first[0]).contains("argument order"));
+        assert!(asgard_message_text(&first[0]).contains("missing combinations"));
+        assert!(asgard_message_text(&first[0]).contains("concrete plausible defect"));
+        assert!(asgard_message_text(&first[0]).contains("numerous weaker signals"));
         assert!(
             asgard_message_text(&first[0]).contains("most consequential unverified assumption")
         );
@@ -17778,7 +17787,7 @@ mod tests {
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
         assert!(asgard_message_text(&first[0]).contains("available for read-only"));
         assert!(asgard_message_text(&first[0]).contains("edits since the last decision"));
-        assert!(asgard_message_text(&first[0]).contains("actively audit completeness"));
+        assert!(asgard_message_text(&first[0]).contains("audit in this priority order"));
         assert!(asgard_message_text(&first[0]).contains("at most 3 information-gathering"));
         assert!(asgard_message_text(&first[0]).contains("tell one or more next-window candidates"));
         assert_eq!(first[0], terminal[0]);
@@ -17794,7 +17803,8 @@ mod tests {
         assert!(asgard_message_text(&second[5]).contains("candidate window two"));
         assert!(asgard_message_text(&second[5]).contains("<decision_procedure>"));
         assert!(asgard_message_text(&second[5]).contains("Compare each lane's actual direction"));
-        assert!(asgard_message_text(&second[5]).contains("audit completeness proportionately"));
+        assert!(asgard_message_text(&second[5]).contains("audit the riskiest explicit contract"));
+        assert!(asgard_message_text(&second[5]).contains("aggregate green checks cannot override"));
     }
 
     #[test]
