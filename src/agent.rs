@@ -1256,7 +1256,7 @@ fn builtin_commands() -> Vec<AvailableCommand> {
             "List and clear remembered Always allow entries",
         ),
         AvailableCommand::new(
-            "compress",
+            "compact",
             "Summarize uncompressed turns to free up context window",
         ),
         AvailableCommand::new("rewind", "Remove the latest completed conversation turn"),
@@ -1287,7 +1287,7 @@ fn builtin_command_names() -> std::collections::HashSet<&'static str> {
         "goal",
         "setup",
         "permissions",
-        "compress",
+        "compact",
         "rewind",
         "mcp",
         "plugin",
@@ -2909,18 +2909,18 @@ pub async fn run_agent(
                     default_stall_timeout_secs,
                 );
 
-                // `/compress` runs synchronously here (not via the
+                // `/compact` runs synchronously here (not via the
                 // spawn task below) because it's a slash command that
                 // produces a final report rather than a streamed LLM
                 // turn. Dispatch *after* `start_prompt` so the user
-                // can `session/cancel` mid-compress -- the cancel
+                // can `session/cancel` mid-compaction -- the cancel
                 // token threads into `run_summarization`, aborting
                 // any in-flight summarization stream, and the loop in
                 // `handle_compress` checks the token between turns.
                 // `finish_prompt` releases the session reservation
                 // before we respond so a subsequent prompt isn't
                 // rejected as AlreadyInFlight.
-                if is_slash_command(&prompt_text, "compress") {
+                if is_slash_command(&prompt_text, "compact") {
                     let report = handle_compress(
                         &snap,
                         llm_prompt.as_ref(),
@@ -2935,8 +2935,8 @@ pub async fn run_agent(
                     send_message(&cx, &session_id, &report);
                     send_session_usage_update(&cx, &sessions_prompt, &session_id, &snap.cwd).await;
                     sessions_prompt.finish_prompt(&session_id).await;
-                    // `/compress` threads the cancel token into summarization;
-                    // a mid-compress `session/cancel` resolves as cancelled.
+                    // `/compact` threads the cancel token into summarization;
+                    // a mid-compaction `session/cancel` resolves as cancelled.
                     return responder.respond(prompt_stop_response(cancel.is_cancelled()));
                 }
 
@@ -4127,7 +4127,7 @@ async fn run_loop_iteration(
         return Ok(LoopIterationOutcome::without_usage());
     }
 
-    if is_slash_command(target, "compress") {
+    if is_slash_command(target, "compact") {
         let context_length = sessions
             .available_model_metadata()
             .await
@@ -4884,9 +4884,35 @@ struct AsgardCandidate {
     patch: Vec<u8>,
     delta_patch: Vec<u8>,
     supervisor_window_messages: Vec<ChatMessage>,
+    window_ledger: AsgardExecutionLedger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AsgardLedgerEntry {
+    id: String,
+    step: usize,
+    command: String,
+    exit_code: Option<i32>,
+    output_tail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AsgardLedgerEdit {
+    step: usize,
+    file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+struct AsgardExecutionLedger {
+    entries: Vec<AsgardLedgerEntry>,
+    edit_steps: Vec<AsgardLedgerEdit>,
+    total_shell_commands: usize,
+    entries_truncated: bool,
 }
 
 const ASGARD_SUMMARIZE_WINDOW_TOOL_NAME: &str = "summarize_candidate_window";
+const ASGARD_CONTRACT_EXTRACTION_PROMPT: &str = "You are extracting the explicit contract checklist from a software task description, before any implementation exists. List every externally checkable requirement the task states: function and method signatures including argument order and curried versus non-curried forms, exact strings, separators, suffixes, and output formats, boundary values and their required handling, lifecycle and cancellation obligations (what must unblock, interrupt, close, or clean up what, including operations already in flight), concurrency and atomicity requirements, error types and exact error text, compatibility constraints, and explicit prohibitions. Quote the task's own words wherever possible. One requirement per entry; split compound sentences into separate entries. Do not invent requirements the task does not state and do not add generic quality goals. Tag each entry's kind: \"inspection\" when a reviewer can verify it by reading the final code (signatures, argument order, exact strings present in source, type shapes); \"execution\" when verification requires running a scenario (blocking and unblocking, timing, cancellation of in-flight operations, end-to-end produced output, formatting of emitted streams); \"delivery\" for repository-delivery obligations that do not affect runtime behavior (working on a named branch, committing the work, repository cleanliness). For each entry, if the requirement only holds meaning under a specific adverse condition — an operation already blocked or in flight when the triggering event fires, an exhausted window or resource, an externally stalled dependency, a boundary or zero value — record that condition verbatim in adverse_condition; otherwise set adverse_condition to null. When the task names classification values, categories, or enumerated labels (for example conflict types, error kinds, source values, status codes), add a separate contract that each reported classification carries the correct value for its specific scenario — distinct from, and in addition to, the contract that the item is detected or reported at all; verifying a count or presence does not verify a label. When the task requires emitting a well-known textual format or stream whose name implies standard structural conventions (for example a manifest stream with document separators and source annotations, a unified diff, a standard header block), also add one contract per structural convention the named format prescribes — including how the stream begins, how documents or sections are delimited, and how identifying annotations are formed and normalized — marked kind \"execution\" and quoting the format name from the task. Only do this for formats whose conventions you are certain of; do not invent conventions. Call extract_task_contracts exactly once. Do not answer in prose.";
+const ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS: usize = 3;
 const ASGARD_AUDIT_BUILTIN_TOOLS: &[&str] = &["read_file", "grep_search", "list_directory"];
 const ASGARD_AUDIT_BIFROST_TOOLS: &[&str] = &[
     "search_symbols",
@@ -4939,6 +4965,31 @@ struct AsgardSupervisorDecision {
     advices: Vec<Option<String>>,
     next_window_steps: Option<usize>,
     state_summary: String,
+    contracts: Option<Vec<AsgardContractRow>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AsgardTaskContract {
+    id: String,
+    kind: String,
+    text: String,
+    adverse_condition: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AsgardTaskContractChecklist {
+    contracts: Vec<AsgardTaskContract>,
+    /// Fully rendered `<task_contract_checklist ...>...</task_contract_checklist>`
+    /// block, computed once, ready to insert verbatim as one assistant message.
+    block: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AsgardContractRow {
+    id: String,
+    status: String,
+    evidence: String,
+    adverse_condition_evidence: Option<String>,
 }
 
 const ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS: usize = 2;
@@ -5013,12 +5064,26 @@ async fn run_asgard_trajectory_loop(
     let original_task = asgard_original_task(&common_messages);
     let mut selected_trajectory_initial = common_messages.clone();
     let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
+    let mut canonical_ledger: Vec<(usize, AsgardExecutionLedger)> = Vec::new();
     let mut supervisor_history = AsgardSupervisorHistory::default();
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
+    let (task_contract_checklist, checklist_usage) = run_asgard_task_contract_extraction(
+        llm,
+        supervisor_model,
+        idle_timeout,
+        cancel.clone(),
+        &original_task,
+    )
+    .await;
+    aggregate_usage.add(checklist_usage);
+    usage_by_model
+        .entry(supervisor_model.to_string())
+        .or_default()
+        .add(checklist_usage);
     let mut initial_advice = None;
     let mut initial_advice_error = None;
     for attempt in 1..=ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS {
@@ -5172,6 +5237,7 @@ async fn run_asgard_trajectory_loop(
                     &outcome.continuation_messages,
                     trajectory_message_start,
                 );
+                let window_ledger = asgard_extract_execution_ledger(&window_messages);
                 let (brief, grading_usage) = run_asgard_candidate_window_summary(
                     llm.as_ref(),
                     AsgardCandidateAssessmentContext {
@@ -5224,13 +5290,21 @@ async fn run_asgard_trajectory_loop(
                     outcome,
                     patches,
                     supervisor_window_messages,
+                    window_ledger,
                     grading_usage,
                 )
             });
         }
         let mut candidates = Vec::with_capacity(futures.len());
-        for (index, model, outcome, patches, supervisor_window_messages, grading_usage) in
-            futures::future::join_all(futures).await
+        for (
+            index,
+            model,
+            outcome,
+            patches,
+            supervisor_window_messages,
+            window_ledger,
+            grading_usage,
+        ) in futures::future::join_all(futures).await
         {
             aggregate_usage.add(outcome.usage);
             aggregate_usage.add(grading_usage);
@@ -5250,6 +5324,7 @@ async fn run_asgard_trajectory_loop(
                     patch,
                     delta_patch,
                     supervisor_window_messages,
+                    window_ledger,
                 }),
                 Err(error) => {
                     cleanup_asgard_repositories(&repositories);
@@ -5257,6 +5332,12 @@ async fn run_asgard_trajectory_loop(
                 }
             }
         }
+        let supervisor_audit_definitions = match registries.first() {
+            Some(registry) => {
+                asgard_audit_tool_definitions(registry.tool_definitions().await, candidates.len())
+            }
+            None => Vec::new(),
+        };
         let supervisor = run_asgard_supervisor(
             llm,
             supervisor_model,
@@ -5265,6 +5346,8 @@ async fn run_asgard_trajectory_loop(
             window,
             &candidates,
             &registries,
+            &supervisor_audit_definitions,
+            &task_contract_checklist,
             &original_task,
             &selected_trajectory_initial,
             &selected_trajectory_windows,
@@ -5278,7 +5361,7 @@ async fn run_asgard_trajectory_loop(
             .entry(supervisor_model.to_string())
             .or_default()
             .add(supervisor_usage);
-        let decision = match supervisor.0 {
+        let mut decision = match supervisor.0 {
             Ok(decision) => decision,
             Err(error) => {
                 tracing::warn!(
@@ -5303,6 +5386,67 @@ async fn run_asgard_trajectory_loop(
                 return (outcome, usage_by_model);
             }
         };
+        if decision.complete {
+            send_thought(
+                cx,
+                session_id,
+                &format!(
+                    "[Asgard reviewing proposed completion of lane {} in isolation]\n",
+                    decision.winner + 1
+                ),
+            );
+            let completion_review = run_asgard_completion_review(
+                llm,
+                cancel.clone(),
+                AsgardCompletionReviewContext {
+                    model: supervisor_model,
+                    idle_timeout,
+                    window,
+                    selected_lane: decision.winner,
+                    candidates: &candidates,
+                    registries: &registries,
+                    audit_definitions: &supervisor_audit_definitions,
+                    task_contract_checklist: &task_contract_checklist,
+                    canonical_ledger: &canonical_ledger,
+                    original_task: &original_task,
+                    selected_trajectory_initial: &selected_trajectory_initial,
+                    selected_trajectory_windows: &selected_trajectory_windows,
+                    supervisor_history: &supervisor_history,
+                    live_output: &live_output,
+                },
+            )
+            .await;
+            aggregate_usage.add(completion_review.1);
+            usage_by_model
+                .entry(supervisor_model.to_string())
+                .or_default()
+                .add(completion_review.1);
+            decision = match completion_review.0 {
+                Ok(review) => review,
+                Err(error) => {
+                    tracing::warn!(
+                        window,
+                        model = supervisor_model,
+                        "Asgard isolated completion review produced no valid decision: {error:#}"
+                    );
+                    let apply_result =
+                        crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
+                    cleanup_asgard_repositories(&repositories);
+                    if let Err(apply_error) = apply_result {
+                        let mut outcome = asgard_failure(anyhow::anyhow!(
+                            "completion review failed in window {window} ({error:#}) and applying the last accepted incumbent also failed: {apply_error:#}"
+                        ));
+                        outcome.usage = aggregate_usage;
+                        return (outcome, usage_by_model);
+                    }
+                    let mut outcome = asgard_failure(anyhow::anyhow!(
+                        "completion review produced no valid decision for window {window}; preserved the last accepted incumbent: {error:#}"
+                    ));
+                    outcome.usage = aggregate_usage;
+                    return (outcome, usage_by_model);
+                }
+            };
+        }
         let winner_index = decision.winner;
         let supervisor_complete = decision.complete;
         let supervisor_completion_summary = decision.state_summary.clone();
@@ -5376,6 +5520,7 @@ async fn run_asgard_trajectory_loop(
             parent_registry.cwd(),
         );
         selected_trajectory_windows.push(selected_window);
+        canonical_ledger.push((window, winner.window_ledger.clone()));
         supervisor_history.push(window, &decision);
         if crate::tokens::approximate_tokens_messages(&common_messages)
             > crate::context_manager::context_budget(context_length)
@@ -5491,6 +5636,8 @@ async fn run_asgard_initial_advice(
             candidate_count,
             idle_timeout,
             audit: None,
+            required_winner: None,
+            checklist_ids: &[],
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Supervisor")),
@@ -5507,6 +5654,8 @@ async fn run_asgard_supervisor(
     window: usize,
     candidates: &[AsgardCandidate],
     registries: &[Arc<crate::tools::ToolRegistry>],
+    audit_definitions: &[ToolDefinition],
+    task_contract_checklist: &AsgardTaskContractChecklist,
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
@@ -5517,58 +5666,29 @@ async fn run_asgard_supervisor(
     crate::llm_client::TokenUsage,
 ) {
     debug_assert_eq!(candidates.len(), registries.len());
-    let definitions = match registries.first() {
-        Some(registry) => {
-            asgard_audit_tool_definitions(registry.tool_definitions().await, candidates.len())
-        }
-        None => Vec::new(),
-    };
     let audit = AsgardAuditContext {
         registries,
         candidates,
-        definitions,
+        definitions: audit_definitions.to_vec(),
+        allowed_lane: None,
     };
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
     for candidate in candidates {
-        let trajectory = render_asgard_dossier_messages(&candidate.supervisor_window_messages);
-        let candidate_changed_production_files =
-            asgard_patch_production_inventory(&candidate.patch);
-        let (candidate_created_test_files, candidate_modified_test_files) =
-            asgard_patch_test_inventory(&candidate.patch);
-        let candidate_patch_manifest =
-            match serde_json::to_string_pretty(&AsgardCandidatePatchManifest {
-                candidate_changed_production_files,
-                candidate_created_test_files,
-                candidate_modified_test_files,
-                patch_bytes: candidate.patch.len(),
-            }) {
-                Ok(evidence) => evidence,
-                Err(error) => {
-                    return (
-                        Err(anyhow::anyhow!(
-                            "failed to serialize Asgard lane {} patch manifest: {error}",
-                            candidate.index
-                        )),
-                        crate::llm_client::TokenUsage::default(),
-                    );
-                }
-            };
-        candidate_trajectories.push_str(&format!(
-            "\n<lane_trajectory index=\"{}\" model=\"{}\" worktree=\"{}\" stop=\"{:?}\">\n\
-             <candidate_patch_manifest derived_from_full_patch=\"true\">\n{}\n\
-             </candidate_patch_manifest>\n\
-             <candidate_window_diff base=\"last_selected_decision\" bytes=\"{}\">\n{}\n\
-             </candidate_window_diff>\n\
-             <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
-            candidate.index,
-            candidate.model,
-            registries[candidate.index].cwd().display(),
-            candidate.outcome.stop,
-            candidate_patch_manifest,
-            candidate.delta_patch.len(),
-            String::from_utf8_lossy(&candidate.delta_patch),
-            trajectory,
-        ));
+        let Some(registry) = registries.get(candidate.index) else {
+            return (
+                Err(anyhow::anyhow!(
+                    "Asgard lane {} has no checkout registry",
+                    candidate.index
+                )),
+                crate::llm_client::TokenUsage::default(),
+            );
+        };
+        match render_asgard_candidate_trajectory(candidate, registry) {
+            Ok(trajectory) => candidate_trajectories.push_str(&trajectory),
+            Err(error) => {
+                return (Err(error), crate::llm_client::TokenUsage::default());
+            }
+        }
     }
     candidate_trajectories.push_str("</candidate_trajectories>");
     let messages = asgard_supervisor_messages(
@@ -5577,6 +5697,7 @@ async fn run_asgard_supervisor(
         selected_trajectory_windows,
         supervisor_history,
         candidates.len(),
+        task_contract_checklist,
         candidate_trajectories,
     );
     tracing::info!(
@@ -5600,6 +5721,8 @@ async fn run_asgard_supervisor(
             candidate_count: candidates.len(),
             idle_timeout,
             audit: Some(audit),
+            required_winner: None,
+            checklist_ids: &[],
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Supervisor")),
@@ -5607,17 +5730,214 @@ async fn run_asgard_supervisor(
     .await
 }
 
+struct AsgardCompletionReviewContext<'a> {
+    model: &'a str,
+    idle_timeout: IdleTimeouts,
+    window: usize,
+    selected_lane: usize,
+    candidates: &'a [AsgardCandidate],
+    registries: &'a [Arc<crate::tools::ToolRegistry>],
+    audit_definitions: &'a [ToolDefinition],
+    task_contract_checklist: &'a AsgardTaskContractChecklist,
+    canonical_ledger: &'a [(usize, AsgardExecutionLedger)],
+    original_task: &'a str,
+    selected_trajectory_initial: &'a [ChatMessage],
+    selected_trajectory_windows: &'a [Vec<ChatMessage>],
+    supervisor_history: &'a AsgardSupervisorHistory,
+    live_output: &'a AsgardLiveOutput,
+}
+
+async fn run_asgard_completion_review(
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    cancel: tokio_util::sync::CancellationToken,
+    context: AsgardCompletionReviewContext<'_>,
+) -> (
+    anyhow::Result<AsgardSupervisorDecision>,
+    crate::llm_client::TokenUsage,
+) {
+    let AsgardCompletionReviewContext {
+        model,
+        idle_timeout,
+        window,
+        selected_lane,
+        candidates,
+        registries,
+        audit_definitions,
+        task_contract_checklist,
+        canonical_ledger,
+        original_task,
+        selected_trajectory_initial,
+        selected_trajectory_windows,
+        supervisor_history,
+        live_output,
+    } = context;
+    debug_assert_eq!(candidates.len(), registries.len());
+    let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.index == selected_lane)
+    else {
+        return (
+            Err(anyhow::anyhow!(
+                "terminal completion review selected unknown lane {selected_lane}"
+            )),
+            crate::llm_client::TokenUsage::default(),
+        );
+    };
+    let Some(registry) = registries.get(selected_lane) else {
+        return (
+            Err(anyhow::anyhow!(
+                "terminal completion review lane {selected_lane} has no checkout registry"
+            )),
+            crate::llm_client::TokenUsage::default(),
+        );
+    };
+    let audit = AsgardAuditContext {
+        registries,
+        candidates,
+        definitions: audit_definitions.to_vec(),
+        allowed_lane: Some(selected_lane),
+    };
+    let (terminal_non_test_patch, terminal_test_patch) = asgard_patch_surfaces(&candidate.patch);
+    let terminal_test_patch = if terminal_test_patch.len() > 200_000 {
+        format!(
+            "{}\n... test patch truncated (mechanical cap)",
+            crate::text::truncate_utf8(&terminal_test_patch, 200_000)
+        )
+    } else {
+        terminal_test_patch
+    };
+    let candidate_trajectory = match render_asgard_candidate_trajectory(candidate, registry) {
+        Ok(trajectory) => format!(
+            "<candidate_trajectories window=\"{window}\">\n{trajectory}</candidate_trajectories>"
+        ),
+        Err(error) => {
+            return (Err(error), crate::llm_client::TokenUsage::default());
+        }
+    };
+    let messages = asgard_completion_review_messages(
+        original_task,
+        selected_trajectory_initial,
+        selected_trajectory_windows,
+        supervisor_history,
+        candidates.len(),
+        task_contract_checklist,
+        canonical_ledger,
+        terminal_non_test_patch,
+        terminal_test_patch,
+        selected_lane,
+        candidate_trajectory,
+    );
+    tracing::info!(
+        window,
+        selected_lane = selected_lane + 1,
+        selected_candidate_bytes = messages
+            .last()
+            .map(asgard_message_text)
+            .map_or(0, |text| text.len()),
+        "assembled isolated Asgard completion-review dossier"
+    );
+    run_asgard_supervisor_tool_steps(
+        llm.as_ref(),
+        messages,
+        AsgardSupervisorToolContext {
+            model,
+            candidate_count: candidates.len(),
+            idle_timeout,
+            audit: Some(audit),
+            required_winner: Some(selected_lane),
+            checklist_ids: &task_contract_checklist.contracts,
+        },
+        cancel,
+        Some(AsgardStreamSinks::new(live_output, "Completion reviewer")),
+    )
+    .await
+}
+
+fn render_asgard_candidate_trajectory(
+    candidate: &AsgardCandidate,
+    registry: &crate::tools::ToolRegistry,
+) -> anyhow::Result<String> {
+    let trajectory = render_asgard_dossier_messages(&candidate.supervisor_window_messages);
+    let candidate_changed_production_files = asgard_patch_production_inventory(&candidate.patch);
+    let (candidate_created_test_files, candidate_modified_test_files) =
+        asgard_patch_test_inventory(&candidate.patch);
+    let candidate_patch_manifest = serde_json::to_string_pretty(&AsgardCandidatePatchManifest {
+        candidate_changed_production_files,
+        candidate_created_test_files,
+        candidate_modified_test_files,
+        patch_bytes: candidate.patch.len(),
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to serialize Asgard lane {} patch manifest: {error}",
+            candidate.index
+        )
+    })?;
+    let execution_ledger =
+        serde_json::to_string_pretty(&candidate.window_ledger).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to serialize Asgard lane {} execution ledger: {error}",
+                candidate.index
+            )
+        })?;
+    let last_shell_step = candidate
+        .window_ledger
+        .entries
+        .last()
+        .map(|entry| entry.step);
+    let mut seen_files = HashSet::new();
+    let files_edited_after_last_command = candidate
+        .window_ledger
+        .edit_steps
+        .iter()
+        .filter(|edit| last_shell_step.is_none_or(|step| edit.step > step))
+        .filter_map(|edit| {
+            if seen_files.insert(edit.file.clone()) {
+                Some(edit.file.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let files_edited_after_last_command = serde_json::to_string(&files_edited_after_last_command)
+        .expect("files edited after last command serialize");
+    Ok(format!(
+        "\n<lane_trajectory index=\"{}\" model=\"{}\" worktree=\"{}\" stop=\"{:?}\">\n\
+         <candidate_patch_manifest derived_from_full_patch=\"true\">\n{}\n\
+         </candidate_patch_manifest>\n\
+         <candidate_window_diff base=\"last_selected_decision\" bytes=\"{}\">\n{}\n\
+         </candidate_window_diff>\n\
+         <execution_ledger mechanically_derived=\"true\" source=\"lane tool calls, not candidate claims\">\n{}\n\
+         </execution_ledger>\n\
+         files_edited_after_last_command: {}\n\
+         <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
+        candidate.index,
+        candidate.model,
+        registry.cwd().display(),
+        candidate.outcome.stop,
+        candidate_patch_manifest,
+        candidate.delta_patch.len(),
+        String::from_utf8_lossy(&candidate.delta_patch),
+        execution_ledger,
+        files_edited_after_last_command,
+        trajectory,
+    ))
+}
+
 struct AsgardSupervisorToolContext<'a> {
     model: &'a str,
     candidate_count: usize,
     idle_timeout: IdleTimeouts,
     audit: Option<AsgardAuditContext<'a>>,
+    required_winner: Option<usize>,
+    checklist_ids: &'a [AsgardTaskContract],
 }
 
 struct AsgardAuditContext<'a> {
     registries: &'a [Arc<crate::tools::ToolRegistry>],
     candidates: &'a [AsgardCandidate],
     definitions: Vec<ToolDefinition>,
+    allowed_lane: Option<usize>,
 }
 
 fn asgard_is_audit_tool(name: &str) -> bool {
@@ -5688,6 +6008,13 @@ async fn execute_asgard_audit_tool(
         Ok(parsed) => parsed,
         Err(error) => return format!("Error: {error}"),
     };
+    if let Some(allowed_lane) = audit.allowed_lane
+        && lane != allowed_lane
+    {
+        return format!(
+            "Error: only selected candidate lane {allowed_lane} is available during terminal completion review"
+        );
+    }
     let Some(registry) = audit.registries.get(lane) else {
         return format!("Error: candidate lane {lane} has no checkout registry");
     };
@@ -5887,14 +6214,12 @@ async fn run_asgard_supervisor_tool_steps(
     } else {
         0
     };
-    let mut tools = vec![asgard_select_trajectory_tool(context.candidate_count)];
-    if let Some(audit) = &context.audit {
-        tools.extend(audit.definitions.clone());
-    }
+    let tools = asgard_supervisor_tool_definitions(&context);
     let mut usage = crate::llm_client::TokenUsage::default();
     let mut last_invalid_response = None;
     let mut audit_rounds_used = 0usize;
     let mut selection_attempts = 0usize;
+    let mut challenge_issued = false;
 
     loop {
         let audit_phase = audit_rounds_used < audit_round_limit;
@@ -6012,18 +6337,62 @@ async fn run_asgard_supervisor_tool_steps(
                                 context.candidate_count,
                             ) {
                                 Ok(decision) => {
-                                    if calls.len() > 1 {
-                                        tracing::warn!(
-                                            model = context.model,
-                                            ignored_calls = ?call_names
-                                                .iter()
-                                                .copied()
-                                                .filter(|name| *name != "select_trajectory")
-                                                .collect::<Vec<_>>(),
-                                            "accepted final Asgard selection and ignored other tool calls"
+                                    if let Some(required_winner) = context.required_winner
+                                        && decision.winner != required_winner
+                                    {
+                                        selector_error = Some(format!(
+                                            "terminal completion review must keep selected lane {required_winner}, not lane {}",
+                                            decision.winner
+                                        ));
+                                    } else if context.required_winner.is_some() && decision.complete
+                                    {
+                                        let violations = asgard_validate_contract_rows(
+                                            &decision,
+                                            context.checklist_ids,
                                         );
+                                        if violations.is_empty() {
+                                            if challenge_issued || context.checklist_ids.is_empty()
+                                            {
+                                                if calls.len() > 1 {
+                                                    tracing::warn!(
+                                                        model = context.model,
+                                                        ignored_calls = ?call_names
+                                                            .iter()
+                                                            .copied()
+                                                            .filter(|name| *name != "select_trajectory")
+                                                            .collect::<Vec<_>>(),
+                                                        "accepted final Asgard selection and ignored other tool calls"
+                                                    );
+                                                }
+                                                return (Ok(decision), usage);
+                                            }
+                                            // One self-adjudication challenge per review:
+                                            // complete=true is provisional until the
+                                            // reviewer re-judges its own rows.
+                                            challenge_issued = true;
+                                            selection_attempts =
+                                                selection_attempts.saturating_sub(1);
+                                            selector_error =
+                                                Some(ASGARD_CHALLENGE_MESSAGE.to_string());
+                                        } else {
+                                            selector_error = Some(
+                                                asgard_contract_violation_message(&violations),
+                                            );
+                                        }
+                                    } else {
+                                        if calls.len() > 1 {
+                                            tracing::warn!(
+                                                model = context.model,
+                                                ignored_calls = ?call_names
+                                                    .iter()
+                                                    .copied()
+                                                    .filter(|name| *name != "select_trajectory")
+                                                    .collect::<Vec<_>>(),
+                                                "accepted final Asgard selection and ignored other tool calls"
+                                            );
+                                        }
+                                        return (Ok(decision), usage);
                                     }
-                                    return (Ok(decision), usage);
                                 }
                                 Err(error) => selector_error = Some(error.to_string()),
                             }
@@ -6166,6 +6535,16 @@ async fn run_asgard_supervisor_tool_steps(
     )
 }
 
+fn asgard_supervisor_tool_definitions(
+    context: &AsgardSupervisorToolContext<'_>,
+) -> Vec<ToolDefinition> {
+    let mut tools = vec![asgard_select_trajectory_tool(context.candidate_count)];
+    if let Some(audit) = &context.audit {
+        tools.extend(audit.definitions.clone());
+    }
+    tools
+}
+
 fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
     // Session bootstrap can contribute user-role instruction messages (for
     // example AGENTS.md) before the actual prompt. The last user message is
@@ -6216,6 +6595,7 @@ fn asgard_supervisor_messages(
     selected_trajectory_windows: &[Vec<ChatMessage>],
     supervisor_history: &AsgardSupervisorHistory,
     candidate_count: usize,
+    task_contract_checklist: &AsgardTaskContractChecklist,
     candidate_trajectories: String,
 ) -> Vec<ChatMessage> {
     let mut messages = vec![
@@ -6275,6 +6655,9 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
         )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
     ];
+    messages.push(ChatMessage::assistant(
+        task_contract_checklist.block.clone(),
+    ));
     messages.push(ChatMessage::assistant(format!(
         "<selected_trajectory_initial>\n{}\n</selected_trajectory_initial>",
         render_asgard_dossier_messages(selected_trajectory_initial),
@@ -6318,6 +6701,85 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
 </decision_procedure>"#,
     )));
     messages
+}
+
+#[allow(clippy::too_many_arguments)]
+fn asgard_completion_review_messages(
+    original_task: &str,
+    selected_trajectory_initial: &[ChatMessage],
+    selected_trajectory_windows: &[Vec<ChatMessage>],
+    supervisor_history: &AsgardSupervisorHistory,
+    candidate_count: usize,
+    task_contract_checklist: &AsgardTaskContractChecklist,
+    canonical_ledger: &[(usize, AsgardExecutionLedger)],
+    terminal_non_test_patch: String,
+    terminal_test_patch: String,
+    selected_lane: usize,
+    selected_candidate_trajectory: String,
+) -> Vec<ChatMessage> {
+    let mut messages = asgard_supervisor_messages(
+        original_task,
+        selected_trajectory_initial,
+        selected_trajectory_windows,
+        supervisor_history,
+        candidate_count,
+        task_contract_checklist,
+        selected_candidate_trajectory.clone(),
+    );
+    let canonical_ledger = render_asgard_canonical_ledger(canonical_ledger);
+    let terminal_non_test_patch = if terminal_non_test_patch.is_empty() {
+        "(no non-test changes)".to_string()
+    } else {
+        terminal_non_test_patch
+    };
+    let terminal_test_patch = if terminal_test_patch.is_empty() {
+        "(no test changes)".to_string()
+    } else {
+        terminal_test_patch
+    };
+    let terminal_review = ChatMessage::user(format!(
+        r#"{canonical_ledger}
+<terminal_non_test_patch cumulative_from_task_baseline="true">
+{terminal_non_test_patch}
+</terminal_non_test_patch>
+<terminal_test_patch cumulative_from_task_baseline="true">
+{terminal_test_patch}
+</terminal_test_patch>
+{selected_candidate_trajectory}
+
+<terminal_completion_review selected_lane="{selected_lane}">
+This is an independent completion review of the single would-be-final endpoint shown above. The comparative selection decision and all discarded candidate lanes are intentionally absent. Do not reconstruct, compare, or speculate about them. Keep selected_lane={selected_lane}; your only decision is whether this endpoint actually completes the original task.
+
+The task_contract_checklist was derived from the task text alone before any candidate work existed. Your select_trajectory call must return one contracts row per checklist id. Evidence rules, in strength order: (1) Execution evidence — an execution_ledger entry (cite its id) whose command demonstrably exercised the contract and exited 0 at or after the last edit of the implementing files; a green command counts only for behaviors its selected tests actually assert — confirm in the terminal_test_patch that some assertion would fail if the contract were violated; a broad suite pass does not verify a contract no test asserts; a build proves compilation; a race detector proves absence of data races, not liveness. Golden, snapshot, or fixture expectation files created or regenerated by the candidate are candidate-authored assertions: a passing comparison against them proves only that the output matches itself; for exact-output contracts, quote the actual emitted output — from a ledger entry or from the expectation-file content in the patches — and show it satisfies the contract's required shape at its boundaries, including the very first and very last elements of the stream. Evidence must be discriminating: state the most plausible wrong implementation of this contract — the wrong label or classification, the missing boundary element, the partially-correct result — and confirm the cited assertion would catch it; an assertion that only counts results, checks non-emptiness, or matches a substring usually passes under mislabeled or partially-wrong behavior. For a contract naming enumerated values, classifications, or exact labels, quote — for each scenario the contract names — the assertion line or observed ledger output showing that exact value in that exact scenario; an assertion checking a different scenario's value does not transfer. (2) Inspection evidence — exact quoted lines from the terminal patches showing the contract satisfied; a file name alone is not evidence; use only for contracts fully verifiable by reading. (3) Candidate claims are never evidence.
+
+Unblocking contracts get the strictest treatment. For any contract that an event X (close, shutdown, abort, cancellation, deadline) must unblock, interrupt, or fail a pending operation P, execution evidence counts only if the verifying test performs no action after X that could itself wake P — releasing, closing, erroring, or enqueuing on the awaited stream or channel, sending or receiving data, advancing timers, or completing the awaited resource. A test that wakes P by such means verifies only that P notices a flag after being woken; the row is unverified. Inspection evidence must quote the affirmative wake path X triggers on the already-blocked waiter and show X can reach it while P is blocked: a flag tested inside a read or write loop wakes nothing, and a mutex held across a blocking wait prevents any unblocking path needing that mutex from running. For exact-output contracts, reconstruct the emitted stream from the writer code for the first and last element, not only the middle.
+
+Contracts that carry an adverse_condition are verified only under that condition. Their rows must also fill adverse_condition_evidence: quote the test or code lines showing the stated condition is actually constructed — the operation genuinely pending or blocked when the event fires, the resource genuinely exhausted, the dependency genuinely stalled, the boundary value genuinely used — and list every action the verifying test performs after the triggering event. If the cited test never constructs the stated condition, or performs any post-event action that could itself wake or complete the pending operation, the contract is unverified regardless of the test's name or its green result.
+
+Delivery-mechanics contracts (kind "delivery": branch, commit, repository cleanliness) rank below functional contracts: mark such a row unverified rather than violated when evidence is merely absent, record the residual risk in state_summary, and do not block completion on absence alone — but a delivery contract affirmatively contradicted by evidence is violated and blocks completion like any other.
+
+complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps (3 suffices for pure verification), and provide exactly {candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce — for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
+</terminal_completion_review>"#,
+    ));
+    if let Some(last) = messages.last_mut() {
+        *last = terminal_review;
+    } else {
+        messages.push(terminal_review);
+    }
+    messages
+}
+
+fn render_asgard_canonical_ledger(canonical_ledger: &[(usize, AsgardExecutionLedger)]) -> String {
+    canonical_ledger
+        .iter()
+        .map(|(window, ledger)| {
+            format!(
+                "<canonical_execution_ledger window=\"{window}\">\n{}\n</canonical_execution_ledger>",
+                serde_json::to_string_pretty(ledger).unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_asgard_supervisor_history(entries: &[AsgardSupervisorHistoryEntry]) -> String {
@@ -6373,6 +6835,214 @@ fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String {
         rendered.push_str("</message>\n");
     }
     rendered
+}
+
+fn asgard_extract_task_contracts_tool() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".to_string(),
+        function: FunctionDef {
+            name: "extract_task_contracts".to_string(),
+            description: "Extract the explicit, externally checkable contract checklist from a software task description, before any implementation exists.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["contracts"],
+                "properties": {
+                    "contracts": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 75,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["id", "kind", "text", "adverse_condition"],
+                            "properties": {
+                                "id": { "type": "string", "pattern": "^C[0-9]+$" },
+                                "kind": { "type": "string", "enum": ["inspection", "execution", "delivery"] },
+                                "text": { "type": "string", "minLength": 1, "maxLength": 600 },
+                                "adverse_condition": { "type": ["string", "null"], "maxLength": 400 }
+                            }
+                        }
+                    }
+                }
+            }),
+        },
+    }
+}
+
+fn parse_asgard_task_contracts(
+    value: &serde_json::Value,
+) -> anyhow::Result<Vec<AsgardTaskContract>> {
+    let contracts = value
+        .get("contracts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("contract extraction is missing `contracts` array"))?;
+    let mut parsed = Vec::with_capacity(contracts.len());
+    for (index, contract) in contracts.iter().enumerate() {
+        let id = contract
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("contract {index} is missing string `id`"))?;
+        let kind = contract
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("contract {index} is missing string `kind`"))?;
+        let text = contract
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("contract {index} is missing string `text`"))?;
+        let adverse_condition = contract
+            .get("adverse_condition")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|condition| !condition.is_empty())
+            .map(str::to_string);
+        parsed.push(AsgardTaskContract {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            adverse_condition,
+        });
+    }
+    anyhow::ensure!(!parsed.is_empty(), "contract checklist is empty");
+    Ok(parsed)
+}
+
+fn asgard_render_task_contract_checklist(
+    contracts: Vec<AsgardTaskContract>,
+) -> AsgardTaskContractChecklist {
+    let block = format!(
+        "<task_contract_checklist derived_from_task_text_only=\"true\" independent_of_candidates=\"true\">\n{}\n</task_contract_checklist>",
+        serde_json::to_string_pretty(&serde_json::json!({ "contracts": contracts }))
+            .expect("contracts serialize")
+    );
+    AsgardTaskContractChecklist { contracts, block }
+}
+
+fn asgard_empty_task_contract_checklist() -> AsgardTaskContractChecklist {
+    asgard_render_task_contract_checklist(Vec::new())
+}
+
+async fn run_asgard_task_contract_extraction(
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    model: &str,
+    idle_timeout: IdleTimeouts,
+    cancel: tokio_util::sync::CancellationToken,
+    original_task: &str,
+) -> (AsgardTaskContractChecklist, crate::llm_client::TokenUsage) {
+    let mut messages = vec![
+        ChatMessage::system(ASGARD_CONTRACT_EXTRACTION_PROMPT),
+        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
+        ChatMessage::user("Call extract_task_contracts exactly once now. Do not answer in prose."),
+    ];
+    let tools = vec![asgard_extract_task_contracts_tool()];
+    let mut usage = crate::llm_client::TokenUsage::default();
+    let mut last_invalid_response = None;
+
+    for step in 1..=ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS {
+        let response = stream_chat_no_visible_output_with_retry(
+            llm.as_ref(),
+            "extracting Asgard task contracts",
+            &cancel,
+            || StreamChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: Some(tools.clone()),
+                reasoning_effort: None,
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: cancel.clone(),
+                idle_timeouts: idle_timeout,
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                last_invalid_response = Some(error);
+                if step < ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS {
+                    let detail = last_invalid_response
+                        .as_ref()
+                        .map(|error| format!(" Your previous response was invalid: {error}."))
+                        .unwrap_or_default();
+                    messages.push(ChatMessage::user(format!(
+                        "You must call extract_task_contracts now.{detail} Do not answer in prose."
+                    )));
+                }
+                continue;
+            }
+        };
+        usage.add(response.usage());
+
+        match response {
+            LlmResponse::Text {
+                text,
+                reasoning_content,
+                ..
+            } => messages.push(ChatMessage::assistant_with_reasoning(
+                text,
+                reasoning_content,
+            )),
+            LlmResponse::ToolCalls {
+                text,
+                reasoning_content,
+                calls,
+                ..
+            } => {
+                if calls.len() == 1 && calls[0].function.name == "extract_task_contracts" {
+                    match crate::tool_arguments::normalize_tool_arguments(
+                        &calls[0].function.arguments,
+                    ) {
+                        Ok(arguments) => match parse_asgard_task_contracts(&arguments.value) {
+                            Ok(contracts) => {
+                                return (asgard_render_task_contract_checklist(contracts), usage);
+                            }
+                            Err(error) => last_invalid_response = Some(error),
+                        },
+                        Err(error) => {
+                            last_invalid_response = Some(anyhow::anyhow!(
+                                "contract extractor emitted invalid extract_task_contracts arguments: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    last_invalid_response = Some(anyhow::anyhow!(
+                        "contract extractor must call extract_task_contracts exactly once and no other tool"
+                    ));
+                }
+                if !text.is_empty() || reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
+                    messages.push(ChatMessage::assistant_with_reasoning(
+                        text,
+                        reasoning_content,
+                    ));
+                }
+            }
+        }
+
+        if step < ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS {
+            let detail = last_invalid_response
+                .as_ref()
+                .map(|error| format!(" Your previous response was invalid: {error}."))
+                .unwrap_or_default();
+            messages.push(ChatMessage::user(format!(
+                "You must call extract_task_contracts now.{detail} Do not answer in prose."
+            )));
+        }
+    }
+
+    tracing::warn!(
+        model,
+        "Asgard task contract extraction failed; continuing with empty checklist: {:#}",
+        last_invalid_response.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "contract extractor did not call extract_task_contracts after {ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS} steps"
+            )
+        })
+    );
+    (asgard_empty_task_contract_checklist(), usage)
 }
 
 fn asgard_candidate_window_summary_messages(
@@ -6692,6 +7362,25 @@ fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
                         },
                     },
                 },
+                "contracts": {
+                    "type": "array",
+                    "maxItems": 90,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["id", "status", "evidence"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "status": { "type": "string", "enum": ["verified", "violated", "unverified"] },
+                            "evidence": { "type": "string", "minLength": 1, "maxLength": 1500 },
+                            "adverse_condition_evidence": {
+                                "type": "string",
+                                "maxLength": 1200,
+                                "description": "Required when the checklist entry carries an adverse_condition: quote the test or code lines showing that exact condition is constructed, and list every action the verifying test performs after the triggering event."
+                            }
+                        }
+                    }
+                },
             },
             }),
         },
@@ -6745,6 +7434,118 @@ fn asgard_take_window_messages(
         .get(trajectory_message_start..)
         .unwrap_or_default()
         .to_vec()
+}
+
+fn asgard_extract_execution_ledger(window_messages: &[ChatMessage]) -> AsgardExecutionLedger {
+    let exit_code_regex =
+        regex::Regex::new(r"Exit code: (-?\d+)|Command completed with exit code (-?\d+)")
+            .expect("valid exit-code regex");
+    let mut entries = Vec::new();
+    let mut edit_steps = Vec::new();
+    let mut total_shell_commands = 0usize;
+
+    for (step, message) in window_messages.iter().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in tool_calls {
+            let name = call.function.name.as_str();
+            if !matches!(name, "run_shell_command" | "edit" | "write_file") {
+                continue;
+            }
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            else {
+                continue;
+            };
+            let Some(arguments) = arguments.as_object() else {
+                continue;
+            };
+            if name == "run_shell_command" {
+                total_shell_commands += 1;
+                let mut command = arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if command.chars().count() > 500 {
+                    command = format!("{}…", command.chars().take(500).collect::<String>());
+                }
+                let matching_result = window_messages
+                    .get(step + 1..)
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|later| {
+                        later.role == "tool" && later.tool_call_id.as_deref() == Some(&call.id)
+                    });
+                let (exit_code, output_tail) = match matching_result {
+                    Some(result) => {
+                        let result_text = asgard_message_text(result);
+                        let exit_code = exit_code_regex
+                            .captures_iter(&result_text)
+                            .last()
+                            .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
+                            .and_then(|capture| capture.as_str().parse::<i32>().ok())
+                            .or(Some(0));
+                        let filtered = result_text
+                            .lines()
+                            .filter(|line| !line.contains("[WARNING] OS sandbox unavailable"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (exit_code, asgard_utf8_suffix(&filtered, 400).to_string())
+                    }
+                    None => (None, String::new()),
+                };
+                entries.push(AsgardLedgerEntry {
+                    id: format!("L{total_shell_commands}"),
+                    step,
+                    command,
+                    exit_code,
+                    output_tail,
+                });
+            } else {
+                edit_steps.push(AsgardLedgerEdit {
+                    step,
+                    file: arguments
+                        .get("file_path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    let entries_truncated = entries.len() > 120;
+    if entries_truncated {
+        let mut capped = Vec::with_capacity(120);
+        capped.extend_from_slice(&entries[..20]);
+        capped.extend_from_slice(&entries[entries.len() - 100..]);
+        entries = capped;
+    }
+    if edit_steps.len() > 150 {
+        edit_steps = edit_steps[edit_steps.len() - 150..].to_vec();
+    }
+
+    AsgardExecutionLedger {
+        entries,
+        edit_steps,
+        total_shell_commands,
+        entries_truncated,
+    }
+}
+
+fn asgard_utf8_suffix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn asgard_message_text(message: &ChatMessage) -> String {
@@ -6804,6 +7605,37 @@ fn asgard_patch_production_inventory(patch: &[u8]) -> Vec<String> {
         }
     }
     paths.into_iter().collect()
+}
+
+fn asgard_patch_surfaces(patch: &[u8]) -> (String, String) {
+    let patch = String::from_utf8_lossy(patch);
+    let patch = patch.as_ref();
+    let section_regex = regex::Regex::new(r"(?m)^diff --git a/").expect("valid diff regex");
+    let starts = section_regex
+        .find_iter(patch)
+        .map(|found| found.start())
+        .collect::<Vec<_>>();
+    let mut production = String::new();
+    let mut test = String::new();
+
+    for (index, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(patch.len());
+        let section = &patch[start..end];
+        let Some(rest) = section.strip_prefix("diff --git a/") else {
+            continue;
+        };
+        let Some((old_path, new_path)) = rest.split_once(" b/") else {
+            continue;
+        };
+        let new_path = new_path.lines().next().unwrap_or_default();
+        if asgard_is_test_path(old_path) || asgard_is_test_path(new_path) {
+            test.push_str(section);
+        } else {
+            production.push_str(section);
+        }
+    }
+
+    (production, test)
 }
 
 fn asgard_flush_patch_test_path(
@@ -6872,12 +7704,14 @@ fn parse_asgard_supervisor_decision(
             if !raw_advices.is_empty() {
                 continue;
             }
+            let contracts = parse_asgard_contract_rows(&value);
             return Ok(AsgardSupervisorDecision {
                 winner,
                 complete,
                 advices: vec![None; count],
                 next_window_steps: None,
                 state_summary: state_summary.to_string(),
+                contracts,
             });
         }
         let Some(next_window_steps) = parse_asgard_next_window_steps(&value) else {
@@ -6886,12 +7720,14 @@ fn parse_asgard_supervisor_decision(
         let Some(advices) = parse_asgard_incomplete_advices(raw_advices, count) else {
             continue;
         };
+        let contracts = parse_asgard_contract_rows(&value);
         return Ok(AsgardSupervisorDecision {
             winner,
             complete,
             advices,
             next_window_steps: Some(next_window_steps),
             state_summary: state_summary.to_string(),
+            contracts,
         });
     }
     anyhow::bail!(
@@ -6935,6 +7771,114 @@ fn parse_asgard_initial_advice(
     }
     anyhow::bail!(
         "Asgard supervisor returned no valid initial advice with {count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
+    )
+}
+
+fn parse_asgard_contract_rows(value: &serde_json::Value) -> Option<Vec<AsgardContractRow>> {
+    value.get("contracts").map(|contracts| {
+        contracts
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(AsgardContractRow {
+                            id: row.get("id")?.as_str()?.to_string(),
+                            status: row.get("status")?.as_str()?.to_string(),
+                            evidence: row.get("evidence")?.as_str()?.to_string(),
+                            adverse_condition_evidence: row
+                                .get("adverse_condition_evidence")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn asgard_validate_contract_rows(
+    decision: &AsgardSupervisorDecision,
+    checklist: &[AsgardTaskContract],
+) -> Vec<String> {
+    let mut rows_by_id: HashMap<&str, Vec<&AsgardContractRow>> = HashMap::new();
+    for row in decision.contracts.as_deref().unwrap_or_default() {
+        rows_by_id.entry(row.id.as_str()).or_default().push(row);
+    }
+
+    let mut violations = Vec::new();
+    for entry in checklist {
+        let id = &entry.id;
+        match rows_by_id.get(id.as_str()).map(Vec::as_slice) {
+            None | Some([]) => violations.push(format!("contract {id} is missing")),
+            Some([row]) => {
+                if entry.kind == "delivery" {
+                    // Delivery-mechanics obligations rank below functional
+                    // contracts: a filled, non-violated row is sufficient.
+                    if row.status == "violated" {
+                        violations.push(format!("contract {id} is violated"));
+                    }
+                    continue;
+                }
+                if row.status != "verified" {
+                    violations.push(format!("contract {id} is {}", row.status));
+                } else if row.evidence.trim().is_empty() {
+                    violations.push(format!("contract {id} has empty evidence"));
+                } else if entry.kind == "execution" && !asgard_cites_ledger_entry(row) {
+                    violations.push(format!(
+                        "contract {id} is kind=execution but its row cites no \
+                         execution_ledger entry (L<n>); execution contracts cannot be \
+                         verified by inspection alone — cite the ledger entry that \
+                         exercised this behavior, or mark the row unverified"
+                    ));
+                } else if entry.adverse_condition.is_some()
+                    && row
+                        .adverse_condition_evidence
+                        .as_deref()
+                        .is_none_or(|evidence| evidence.trim().is_empty())
+                {
+                    let condition: String = entry
+                        .adverse_condition
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(120)
+                        .collect();
+                    violations.push(format!(
+                        "contract {id} carries adverse_condition ({condition:?}) but its \
+                         row has no adverse_condition_evidence showing that condition \
+                         constructed"
+                    ));
+                }
+            }
+            Some(_) => violations.push(format!("contract {id} appears more than once")),
+        }
+    }
+    violations
+}
+
+fn asgard_cites_ledger_entry(row: &AsgardContractRow) -> bool {
+    let cited = |text: &str| {
+        text.match_indices('L').any(|(index, _)| {
+            text[index + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_digit())
+                && text[..index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|previous| !previous.is_alphanumeric())
+        })
+    };
+    cited(&row.evidence) || row.adverse_condition_evidence.as_deref().is_some_and(cited)
+}
+
+const ASGARD_CHALLENGE_MESSAGE: &str = "Before your verdict is accepted, re-adjudicate only the rows that carry adverse_condition_evidence, using your own stated facts. For each: (1) The contract's triggering event is X and the pending operation is P. List what your evidence says the test does after X. If any of those actions — releasing, closing, erroring, enqueuing, sending, receiving, advancing timers, or completing the awaited resource — could cause P to resume regardless of X, then the test does not demonstrate that X unblocks P: mark the row unverified. The order in which flags were set does not matter; what matters is what made the blocked call return. (2) If your evidence says P notices a flag after a read or wait returns, or on the next loop iteration, identify what makes the blocked call return in the cited test. If the answer is a test action rather than X itself, mark the row unverified. (3) If the row's evidence is inspection-based, confirm the quoted code shows X proactively completing, erroring, or waking the specific pending P — a state check on a later code path does not qualify. (4) For every row that cites a passing test (not only adverse-condition rows), state the weakest implementation that would still pass the cited assertions. If that implementation would violate the contract — a wrong classification that still produces a nonzero count, a stream missing its first separator that still contains the substring, a result that is right in the common case only — the evidence is not discriminating: mark the row unverified. (5) For every row whose contract names enumerated values, classifications, or exact labels, quote from the cited test or from ledger output the line showing the exact required value in each scenario the contract names. An assertion on a different scenario's value does not transfer. If you cannot produce the quote, mark the row unverified. Then call select_trajectory again: either the same verdict with rows you re-confirmed, or complete=false with corrected rows and advices targeting the evidence gaps. Do not soften a rule violation because other checks pass.";
+
+fn asgard_contract_violation_message(violations: &[String]) -> String {
+    format!(
+        "complete=true was not accepted: {}. Every checklist contract must have a verified row citing concrete evidence (execution_ledger entry ids, or quoted code). If you cannot cite such evidence, return complete=false with advices that direct the next candidate windows to produce exactly that evidence.",
+        violations.join("; ")
     )
 }
 
@@ -13548,20 +14492,20 @@ mod tests {
         assert!(!builtin_command_names().contains("configure"));
     }
 
-    /// `/compress` must appear in autocomplete (`builtin_commands`)
+    /// `/compact` must appear in autocomplete (`builtin_commands`)
     /// and in the collision set (`builtin_command_names`) so a skill
-    /// named "compress" can't shadow the built-in.
+    /// named "compact" can't shadow the built-in.
     #[test]
-    fn builtin_commands_include_compress() {
+    fn builtin_commands_include_compact() {
         let cmds = builtin_commands();
         assert!(
-            cmds.iter().any(|c| c.name == "compress"),
-            "builtin_commands() missing compress; got: {:?}",
+            cmds.iter().any(|c| c.name == "compact"),
+            "builtin_commands() missing compact; got: {:?}",
             cmds.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
         assert!(
-            builtin_command_names().contains("compress"),
-            "builtin_command_names() missing compress"
+            builtin_command_names().contains("compact"),
+            "builtin_command_names() missing compact"
         );
     }
 
@@ -13635,17 +14579,17 @@ mod tests {
         );
     }
 
-    /// `/compress` parses via the same slash-command dispatcher used
+    /// `/compact` parses via the same slash-command dispatcher used
     /// by `/context` and `/setup`, including case-insensitive and
     /// args-tolerant forms.
     #[test]
-    fn is_slash_command_matches_compress_variants() {
-        assert!(is_slash_command("/compress", "compress"));
-        assert!(is_slash_command("  /compress  ", "compress"));
-        assert!(is_slash_command("/compress now", "compress"));
-        assert!(is_slash_command("/COMPRESS", "compress"));
-        // The dispatcher must not confuse `/compress` with `/context`.
-        assert!(!is_slash_command("/context", "compress"));
+    fn is_slash_command_matches_compact_variants() {
+        assert!(is_slash_command("/compact", "compact"));
+        assert!(is_slash_command("  /compact  ", "compact"));
+        assert!(is_slash_command("/compact now", "compact"));
+        assert!(is_slash_command("/COMPACT", "compact"));
+        // The dispatcher must not confuse `/compact` with `/context`.
+        assert!(!is_slash_command("/context", "compact"));
     }
 
     #[test]
@@ -15663,7 +16607,7 @@ mod tests {
                 "setup",
                 "fast",
                 "permissions",
-                "compress",
+                "compact",
                 "rewind",
                 "mcp",
                 "plugin",
@@ -17652,6 +18596,7 @@ mod tests {
             next_window_steps: Some(4),
             state_summary: "The selected parser still has an unresolved wildcard assumption."
                 .to_string(),
+            contracts: None,
         };
         let mut history = AsgardSupervisorHistory::default();
         history.push(4, &decision);
@@ -17742,12 +18687,29 @@ mod tests {
                         .to_string(),
             }],
         };
+        let task_contract_checklist =
+            asgard_render_task_contract_checklist(vec![AsgardTaskContract {
+                id: "C1".to_string(),
+                kind: "inspection".to_string(),
+                text: "The parser preserves the requested output format.".to_string(),
+                adverse_condition: None,
+            }]);
         let first = asgard_supervisor_messages(
             "fix the parser",
             &selected_first,
             &[],
             &first_history,
             3,
+            &task_contract_checklist,
+            "candidate window one".to_string(),
+        );
+        let repeated_first = asgard_supervisor_messages(
+            "fix the parser",
+            &selected_first,
+            &[],
+            &first_history,
+            3,
+            &task_contract_checklist,
             "candidate window one".to_string(),
         );
         let second = asgard_supervisor_messages(
@@ -17756,6 +18718,7 @@ mod tests {
             &selected_windows,
             &second_history,
             3,
+            &task_contract_checklist,
             "candidate window two".to_string(),
         );
         let terminal = asgard_supervisor_messages(
@@ -17764,7 +18727,21 @@ mod tests {
             &selected_windows,
             &second_history,
             3,
+            &task_contract_checklist,
             "terminal candidate window".to_string(),
+        );
+        let isolated_review = asgard_completion_review_messages(
+            "fix the parser",
+            &selected_first,
+            &selected_windows,
+            &second_history,
+            3,
+            &task_contract_checklist,
+            &[(1, AsgardExecutionLedger::default())],
+            "diff --git a/src/parser.rs b/src/parser.rs\n+impl\n".to_string(),
+            "diff --git a/tests/parser_test.rs b/tests/parser_test.rs\n+assert\n".to_string(),
+            1,
+            "selected lane two only".to_string(),
         );
 
         assert_eq!(&first[..first.len() - 1], &second[..first.len() - 1]);
@@ -17791,20 +18768,375 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("at most 3 information-gathering"));
         assert!(asgard_message_text(&first[0]).contains("tell one or more next-window candidates"));
         assert_eq!(first[0], terminal[0]);
-        assert!(asgard_message_text(&first[2]).contains("stable selected system"));
         assert_eq!(first[2].role, "assistant");
-        assert_eq!(second[3].role, "user");
-        assert!(asgard_message_text(&second[3]).contains("window_boundary"));
-        assert_eq!(second[4].role, "assistant");
-        assert!(asgard_message_text(&second[4]).contains("Verify the selected implementation."));
-        assert!(asgard_message_text(&second[4]).contains("selected step two"));
-        assert!(asgard_message_text(&second[4]).contains("boundary behavior remains uncertain"));
-        assert_eq!(second[5].role, "user");
-        assert!(asgard_message_text(&second[5]).contains("candidate window two"));
-        assert!(asgard_message_text(&second[5]).contains("<decision_procedure>"));
-        assert!(asgard_message_text(&second[5]).contains("Compare each lane's actual direction"));
-        assert!(asgard_message_text(&second[5]).contains("audit the riskiest explicit contract"));
-        assert!(asgard_message_text(&second[5]).contains("aggregate green checks cannot override"));
+        assert!(asgard_message_text(&first[2]).contains("task_contract_checklist"));
+        assert!(asgard_message_text(&first[2]).contains("C1"));
+        assert_eq!(first[2], repeated_first[2]);
+        assert!(asgard_message_text(&first[3]).contains("stable selected system"));
+        assert_eq!(first[3].role, "assistant");
+        assert_eq!(second[4].role, "user");
+        assert!(asgard_message_text(&second[4]).contains("window_boundary"));
+        assert_eq!(second[5].role, "assistant");
+        assert!(asgard_message_text(&second[5]).contains("Verify the selected implementation."));
+        assert!(asgard_message_text(&second[5]).contains("selected step two"));
+        assert!(asgard_message_text(&second[5]).contains("boundary behavior remains uncertain"));
+        assert_eq!(second[6].role, "user");
+        assert!(asgard_message_text(&second[6]).contains("candidate window two"));
+        assert!(asgard_message_text(&second[6]).contains("<decision_procedure>"));
+        assert!(asgard_message_text(&second[6]).contains("Compare each lane's actual direction"));
+        assert!(asgard_message_text(&second[6]).contains("audit the riskiest explicit contract"));
+        assert!(asgard_message_text(&second[6]).contains("aggregate green checks cannot override"));
+        assert_eq!(
+            &second[..second.len() - 1],
+            &isolated_review[..isolated_review.len() - 1]
+        );
+        let isolated_suffix = asgard_message_text(isolated_review.last().unwrap());
+        assert!(isolated_suffix.contains("selected lane two only"));
+        assert!(isolated_suffix.contains("single would-be-final endpoint"));
+        assert!(isolated_suffix.contains("discarded candidate lanes are intentionally absent"));
+        assert!(isolated_suffix.contains("Keep selected_lane=1"));
+        assert!(isolated_suffix.contains("<canonical_execution_ledger"));
+        assert!(isolated_suffix.contains("<terminal_non_test_patch"));
+        assert!(isolated_suffix.contains("<terminal_test_patch"));
+        assert!(isolated_suffix.contains("Evidence rules, in strength order"));
+        assert!(isolated_suffix.contains(
+            "complete=true requires every functional (inspection or execution) row verified"
+        ));
+        assert!(!isolated_suffix.contains("candidate window two"));
+    }
+
+    #[test]
+    fn asgard_execution_ledger_recovers_shell_results_and_edit_steps() {
+        let messages = vec![
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "shell-fail",
+                "run_shell_command",
+                serde_json::json!({"command":"cargo test failing_case"}),
+            )]),
+            ChatMessage::tool_result(
+                "shell-fail",
+                "run_shell_command",
+                "stdout\n[WARNING] OS sandbox unavailable\n\nExit code: 2",
+            ),
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "shell-empty-success",
+                "run_shell_command",
+                serde_json::json!({"command":"true"}),
+            )]),
+            ChatMessage::tool_result(
+                "shell-empty-success",
+                "run_shell_command",
+                "Command completed with exit code 0",
+            ),
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "shell-output-success",
+                "run_shell_command",
+                serde_json::json!({"command":"printf ok"}),
+            )]),
+            ChatMessage::tool_result("shell-output-success", "run_shell_command", "ok\nall good"),
+            ChatMessage::assistant_tool_calls(vec![
+                supervisor_tool_call(
+                    "edit-call",
+                    "edit",
+                    serde_json::json!({"file_path":"src/lib.rs"}),
+                ),
+                supervisor_tool_call(
+                    "write-call",
+                    "write_file",
+                    serde_json::json!({"file_path":"tests/lib_test.rs"}),
+                ),
+            ]),
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "shell-missing",
+                "run_shell_command",
+                serde_json::json!({"command":"cargo test missing"}),
+            )]),
+        ];
+
+        let ledger = asgard_extract_execution_ledger(&messages);
+
+        assert_eq!(ledger.total_shell_commands, 4);
+        assert_eq!(ledger.entries.len(), 4);
+        assert_eq!(ledger.entries[0].exit_code, Some(2));
+        assert_eq!(ledger.entries[1].exit_code, Some(0));
+        assert_eq!(ledger.entries[2].exit_code, Some(0));
+        assert_eq!(ledger.entries[3].exit_code, None);
+        assert!(
+            !ledger.entries[0]
+                .output_tail
+                .contains("[WARNING] OS sandbox unavailable")
+        );
+        assert!(ledger.entries[0].output_tail.contains("stdout"));
+        assert_eq!(
+            ledger.edit_steps,
+            vec![
+                AsgardLedgerEdit {
+                    step: 6,
+                    file: "src/lib.rs".to_string(),
+                },
+                AsgardLedgerEdit {
+                    step: 6,
+                    file: "tests/lib_test.rs".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn asgard_execution_ledger_matches_shell_result_documented_formats() {
+        let shell = |id: &str, command: &str, result: &str| {
+            vec![
+                ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                    id,
+                    "run_shell_command",
+                    serde_json::json!({"command": command}),
+                )]),
+                ChatMessage::tool_result(id, "run_shell_command", result),
+            ]
+        };
+        // These strings mirror src/tools/shell.rs format_shell_tool_result:
+        // successful output has no marker, empty success has a completion marker,
+        // and failure appends "\n\nExit code: {code}".
+        let mut messages = Vec::new();
+        messages.extend(shell("success-output", "printf ok", "ok\n"));
+        messages.extend(shell(
+            "success-empty",
+            "true",
+            "Command completed with exit code 0",
+        ));
+        messages.extend(shell("failure-output", "false", "failed\n\nExit code: 17"));
+
+        let ledger = asgard_extract_execution_ledger(&messages);
+
+        assert_eq!(
+            ledger
+                .entries
+                .iter()
+                .map(|entry| entry.exit_code)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(17)]
+        );
+    }
+
+    #[tokio::test]
+    async fn asgard_completion_review_enforces_contract_rows_only_for_terminal_complete() {
+        let checklist_ids = vec![AsgardTaskContract {
+            id: "C1".to_string(),
+            kind: "inspection".to_string(),
+            text: "The parser preserves the requested output format.".to_string(),
+            adverse_condition: None,
+        }];
+        let missing_contracts = supervisor_tool_call(
+            "missing-contracts",
+            "select_trajectory",
+            serde_json::json!({
+                "winner": 0,
+                "complete": true,
+                "state_summary": "The endpoint is complete but lacks evidence rows.",
+                "advices": []
+            }),
+        );
+        let valid_contracts_json = serde_json::json!({
+            "winner": 0,
+            "complete": true,
+            "state_summary": "The endpoint is complete with contract evidence.",
+            "advices": [],
+            "contracts": [{
+                "id": "C1",
+                "status": "verified",
+                "evidence": "execution_ledger L1 exited 0 and terminal_test_patch asserts it"
+            }]
+        });
+        let valid_contracts = supervisor_tool_call(
+            "valid-contracts",
+            "select_trajectory",
+            valid_contracts_json.clone(),
+        );
+        let reconfirmed_contracts = supervisor_tool_call(
+            "reconfirmed-contracts",
+            "select_trajectory",
+            valid_contracts_json,
+        );
+        let backend = ScriptedSupervisorBackend::new(vec![
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![missing_contracts],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![valid_contracts],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![reconfirmed_contracts],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+        ]);
+
+        let (decision, _) = run_asgard_supervisor_tool_steps(
+            &backend,
+            vec![ChatMessage::user("completion review")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 1,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: None,
+                required_winner: Some(0),
+                checklist_ids: &checklist_ids,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        assert!(decision.expect("corrected contract rows").complete);
+        {
+            let requests = backend.requests.lock().expect("request lock");
+            // Round 1: missing rows rejected; round 2: valid rows accepted
+            // provisionally and challenged; round 3: re-confirmed and accepted.
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1].messages.iter().any(|message| {
+                message.role == "tool"
+                    && asgard_message_text(message).contains("contract C1 is missing")
+            }));
+            assert!(requests[2].messages.iter().any(|message| {
+                message.role == "tool"
+                    && asgard_message_text(message)
+                        .contains("re-adjudicate only the rows that carry")
+            }));
+        }
+
+        let incomplete_backend = ScriptedSupervisorBackend::new(vec![LlmResponse::ToolCalls {
+            text: String::new(),
+            reasoning_content: None,
+            calls: vec![supervisor_tool_call(
+                "incomplete",
+                "select_trajectory",
+                serde_json::json!({
+                    "winner": 0,
+                    "complete": false,
+                    "next_window_steps": 3,
+                    "state_summary": "More evidence is needed.",
+                    "advices": [{
+                        "strategy": "Produce the missing evidence.",
+                        "scope_basis": "The task contract remains unverified."
+                    }]
+                }),
+            )],
+            usage: crate::llm_client::TokenUsage::default(),
+        }]);
+        let (incomplete, _) = run_asgard_supervisor_tool_steps(
+            &incomplete_backend,
+            vec![ChatMessage::user("completion review")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 1,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: None,
+                required_winner: Some(0),
+                checklist_ids: &checklist_ids,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+        assert!(!incomplete.expect("incomplete accepted").complete);
+        assert_eq!(
+            incomplete_backend
+                .requests
+                .lock()
+                .expect("request lock")
+                .len(),
+            1
+        );
+
+        let empty_checklist_backend =
+            ScriptedSupervisorBackend::new(vec![LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![supervisor_tool_call(
+                    "complete-empty-checklist",
+                    "select_trajectory",
+                    serde_json::json!({
+                        "winner": 0,
+                        "complete": true,
+                        "state_summary": "No checklist ids means no contract-row enforcement.",
+                        "advices": []
+                    }),
+                )],
+                usage: crate::llm_client::TokenUsage::default(),
+            }]);
+        let (empty_checklist, _) = run_asgard_supervisor_tool_steps(
+            &empty_checklist_backend,
+            vec![ChatMessage::user("completion review")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 1,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: None,
+                required_winner: Some(0),
+                checklist_ids: &[],
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+        assert!(empty_checklist.expect("empty checklist accepted").complete);
+        assert_eq!(
+            empty_checklist_backend
+                .requests
+                .lock()
+                .expect("request lock")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn asgard_completion_review_dossier_includes_terminal_evidence_bundle() {
+        let checklist = asgard_render_task_contract_checklist(vec![AsgardTaskContract {
+            id: "C1".to_string(),
+            kind: "execution".to_string(),
+            text: "The command must produce the requested output.".to_string(),
+            adverse_condition: None,
+        }]);
+        let ledger = AsgardExecutionLedger {
+            entries: vec![AsgardLedgerEntry {
+                id: "L1".to_string(),
+                step: 2,
+                command: "cargo test output_contract".to_string(),
+                exit_code: Some(0),
+                output_tail: "ok".to_string(),
+            }],
+            ..Default::default()
+        };
+        let messages = asgard_completion_review_messages(
+            "fix output",
+            &[],
+            &[],
+            &AsgardSupervisorHistory::default(),
+            1,
+            &checklist,
+            &[(1, ledger)],
+            "diff --git a/src/lib.rs b/src/lib.rs\n+pub fn output() {}\n".to_string(),
+            "diff --git a/tests/output_test.rs b/tests/output_test.rs\n+assert_eq!()\n".to_string(),
+            0,
+            "<candidate_trajectories>selected lane</candidate_trajectories>".to_string(),
+        );
+
+        let suffix = asgard_message_text(messages.last().expect("terminal message"));
+        assert!(suffix.contains("<canonical_execution_ledger"));
+        assert!(
+            suffix.contains("<terminal_non_test_patch cumulative_from_task_baseline=\"true\">")
+        );
+        assert!(suffix.contains("<terminal_test_patch cumulative_from_task_baseline=\"true\">"));
+        assert!(suffix.contains("<candidate_trajectories>selected lane</candidate_trajectories>"));
+        assert!(suffix.contains("Your select_trajectory call must return one contracts row"));
     }
 
     #[test]
@@ -17982,6 +19314,11 @@ mod tests {
             schema["properties"]["advices"]["items"]["required"],
             serde_json::json!(["strategy", "scope_basis"])
         );
+        assert_eq!(schema["properties"]["contracts"]["maxItems"], 90);
+        assert_eq!(
+            schema["properties"]["contracts"]["items"]["properties"]["status"]["enum"],
+            serde_json::json!(["verified", "violated", "unverified"])
+        );
     }
 
     #[test]
@@ -18074,6 +19411,8 @@ mod tests {
                 candidate_count: 3,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
+                required_winner: None,
+                checklist_ids: &[],
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -18146,6 +19485,8 @@ mod tests {
                 candidate_count: 2,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
+                required_winner: None,
+                checklist_ids: &[],
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -18206,6 +19547,8 @@ mod tests {
                 candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
+                required_winner: None,
+                checklist_ids: &[],
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -18218,6 +19561,84 @@ mod tests {
         let requests = backend.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].tool_names, vec!["select_trajectory"]);
+    }
+
+    #[tokio::test]
+    async fn asgard_completion_review_keeps_the_provisionally_selected_lane() {
+        let wrong_lane = supervisor_tool_call(
+            "wrong-lane",
+            "select_trajectory",
+            serde_json::json!({
+                "winner": 0,
+                "complete": true,
+                "state_summary": "A discarded lane looked preferable.",
+                "advices": []
+            }),
+        );
+        let reviewed_lane = supervisor_tool_call(
+            "reviewed-lane",
+            "select_trajectory",
+            serde_json::json!({
+                "winner": 1,
+                "complete": false,
+                "next_window_steps": 3,
+                "state_summary": "The isolated endpoint still needs focused verification.",
+                "advices": [
+                    {
+                        "strategy": "Trace the boundary contract and repair it.",
+                        "scope_basis": "The task explicitly requires the boundary behavior."
+                    },
+                    {
+                        "strategy": "Add and run a focused regression for the boundary.",
+                        "scope_basis": "The current verification omits that behavior."
+                    },
+                    {
+                        "strategy": "Independently audit the implementation path.",
+                        "scope_basis": "Confirm the selected endpoint before completion."
+                    }
+                ]
+            }),
+        );
+        let backend = ScriptedSupervisorBackend::new(vec![
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![wrong_lane],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![reviewed_lane],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+        ]);
+
+        let (decision, _) = run_asgard_supervisor_tool_steps(
+            &backend,
+            vec![ChatMessage::user("isolated endpoint")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 3,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: None,
+                required_winner: Some(1),
+                checklist_ids: &[],
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        let decision = decision.expect("completion review decision");
+        assert_eq!(decision.winner, 1);
+        assert!(!decision.complete);
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == "tool"
+                && asgard_message_text(message).contains("must keep selected lane 1")
+        }));
     }
 
     #[test]
@@ -18268,6 +19689,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn asgard_completion_review_preserves_the_exact_supervisor_tool_catalog() {
+        let audit_definition = ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: "read_file".to_string(),
+                description: "Read-only audit".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "lane": {"type": "integer", "minimum": 0, "maximum": 2}
+                    },
+                    "required": ["file_path", "lane"]
+                }),
+            },
+        };
+        let registries = Vec::new();
+        let candidates = Vec::new();
+        let selection_context = AsgardSupervisorToolContext {
+            model: "deepseek::deepseek-v4-pro",
+            candidate_count: 3,
+            idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+            audit: Some(AsgardAuditContext {
+                registries: &registries,
+                candidates: &candidates,
+                definitions: vec![audit_definition.clone()],
+                allowed_lane: None,
+            }),
+            required_winner: None,
+            checklist_ids: &[],
+        };
+        let completion_context = AsgardSupervisorToolContext {
+            model: "deepseek::deepseek-v4-pro",
+            candidate_count: 3,
+            idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+            audit: Some(AsgardAuditContext {
+                registries: &registries,
+                candidates: &candidates,
+                definitions: vec![audit_definition],
+                allowed_lane: Some(1),
+            }),
+            required_winner: Some(1),
+            checklist_ids: &[],
+        };
+
+        assert_eq!(
+            serde_json::to_value(asgard_supervisor_tool_definitions(&selection_context)).unwrap(),
+            serde_json::to_value(asgard_supervisor_tool_definitions(&completion_context)).unwrap(),
+        );
+    }
+
     #[tokio::test]
     async fn asgard_supervisor_can_read_before_selecting() {
         let cwd = tempfile::tempdir().expect("candidate cwd");
@@ -18304,6 +19777,7 @@ mod tests {
             patch: Vec::new(),
             delta_patch: Vec::new(),
             supervisor_window_messages: Vec::new(),
+            window_ledger: AsgardExecutionLedger::default(),
         }];
         let backend = ScriptedSupervisorBackend::new(vec![
             LlmResponse::ToolCalls {
@@ -18344,7 +19818,10 @@ mod tests {
                     registries: &registries,
                     candidates: &candidates,
                     definitions,
+                    allowed_lane: None,
                 }),
+                required_winner: None,
+                checklist_ids: &[],
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -18401,6 +19878,7 @@ mod tests {
             patch: Vec::new(),
             delta_patch: Vec::new(),
             supervisor_window_messages: Vec::new(),
+            window_ledger: AsgardExecutionLedger::default(),
         }];
         let audit_call = |id: &str| {
             supervisor_tool_call(
@@ -18472,7 +19950,10 @@ mod tests {
                     registries: &registries,
                     candidates: &candidates,
                     definitions,
+                    allowed_lane: None,
                 }),
+                required_winner: None,
+                checklist_ids: &[],
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -18539,6 +20020,8 @@ mod tests {
                 candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
+                required_winner: None,
+                checklist_ids: &[],
             },
             tokio_util::sync::CancellationToken::new(),
             None,
