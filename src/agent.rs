@@ -6351,7 +6351,6 @@ async fn run_asgard_supervisor_tool_steps(
     let mut last_invalid_response = None;
     let mut audit_rounds_used = 0usize;
     let mut selection_attempts = 0usize;
-    let mut challenge_issued = false;
     let mut validation_rounds = 0usize;
 
     loop {
@@ -6485,7 +6484,6 @@ async fn run_asgard_supervisor_tool_steps(
                                             context.carry_forward_allowed,
                                         );
                                         if violations.is_empty() {
-                                            if challenge_issued || context.checklist_ids.is_empty()
                                             {
                                                 if calls.len() > 1 {
                                                     tracing::warn!(
@@ -6505,7 +6503,7 @@ async fn run_asgard_supervisor_tool_steps(
                                                         "supervisor"
                                                     };
                                                 let stats = AsgardChallengeStats {
-                                                    issued: challenge_issued,
+                                                    issued: false,
                                                     flipped: false,
                                                     validation_rounds,
                                                 };
@@ -6518,14 +6516,6 @@ async fn run_asgard_supervisor_tool_steps(
                                                 );
                                                 return (Ok((decision, stats)), usage);
                                             }
-                                            // One self-adjudication challenge per review:
-                                            // complete=true is provisional until the
-                                            // reviewer re-judges its own rows.
-                                            challenge_issued = true;
-                                            selection_attempts =
-                                                selection_attempts.saturating_sub(1);
-                                            selector_error =
-                                                Some(ASGARD_CHALLENGE_MESSAGE.to_string());
                                         } else {
                                             validation_rounds += 1;
                                             selector_error = Some(
@@ -6550,8 +6540,8 @@ async fn run_asgard_supervisor_tool_steps(
                                             "supervisor"
                                         };
                                         let stats = AsgardChallengeStats {
-                                            issued: challenge_issued,
-                                            flipped: challenge_issued && !decision.complete,
+                                            issued: false,
+                                            flipped: false,
                                             validation_rounds,
                                         };
                                         crate::trace_logging::append_trace_record(
@@ -6968,7 +6958,7 @@ Contracts that carry an adverse_condition are verified only under that condition
 
 Delivery-mechanics contracts (kind "delivery": branch, commit, repository cleanliness) rank below functional contracts: mark such a row unverified rather than violated when evidence is merely absent, record the residual risk in state_summary, and do not block completion on absence alone — but a delivery contract affirmatively contradicted by evidence is violated and blocks completion like any other — except when the contradiction is an environmental failure of the delivery action itself (missing git identity, authentication, network): that is unverified with the residual risk noted, not violated, because no amount of task work can resolve it.
 
-complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps (3 suffices for pure verification), and provide exactly {candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce — for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and its output. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
+complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps (3 suffices for pure verification), and provide exactly {candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce. Structure each advice as an ordered work list over the violated and unverified contracts: for each, name the contract id, state what is broken or unproven, give the fix obligation first and the proving command second, and require the candidate to run that command and report its output verbatim after the fix — evidence produced before the fix proves nothing. Additionally, for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and its output. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
 </terminal_completion_review>"#,
     ));
     if let Some(last) = messages.last_mut() {
@@ -8124,8 +8114,6 @@ fn asgard_cites_ledger_entry(row: &AsgardContractRow) -> bool {
     };
     cited(&row.evidence) || row.adverse_condition_evidence.as_deref().is_some_and(cited)
 }
-
-const ASGARD_CHALLENGE_MESSAGE: &str = "Before your verdict is accepted, re-adjudicate only the rows that carry adverse_condition_evidence, using your own stated facts. For each: (1) The contract's triggering event is X and the pending operation is P. List what your evidence says the test does after X. If any of those actions — releasing, closing, erroring, enqueuing, sending, receiving, advancing timers, or completing the awaited resource — could cause P to resume regardless of X, then the test does not demonstrate that X unblocks P: mark the row unverified. The order in which flags were set does not matter; what matters is what made the blocked call return. (2) If your evidence says P notices a flag after a read or wait returns, or on the next loop iteration, identify what makes the blocked call return in the cited test. If the answer is a test action rather than X itself, mark the row unverified. (3) If the row's evidence is inspection-based, confirm the quoted code shows X proactively completing, erroring, or waking the specific pending P — a state check on a later code path does not qualify. (4) For every row that cites a passing test (not only adverse-condition rows), state the weakest implementation that would still pass the cited assertions. If that implementation would violate the contract — a wrong classification that still produces a nonzero count, a stream missing its first separator that still contains the substring, a result that is right in the common case only — the evidence is not discriminating: mark the row unverified. (5) For every row whose contract names enumerated values, classifications, or exact labels, quote from the cited test or from ledger output the line showing the exact required value in each scenario the contract names. An assertion on a different scenario's value does not transfer. If you cannot produce the quote, mark the row unverified. Then call select_trajectory again: either the same verdict with rows you re-confirmed, or complete=false with corrected rows and advices targeting the evidence gaps. Do not soften a rule violation because other checks pass.";
 
 fn asgard_contract_violation_message(violations: &[String]) -> String {
     format!(
@@ -19427,7 +19415,7 @@ mod tests {
         assert_eq!(
             stats,
             AsgardChallengeStats {
-                issued: true,
+                issued: false,
                 flipped: false,
                 validation_rounds: 1,
             }
@@ -19435,16 +19423,12 @@ mod tests {
         {
             let requests = backend.requests.lock().expect("request lock");
             // Round 1: missing rows rejected; round 2: valid rows accepted
-            // provisionally and challenged; round 3: re-confirmed and accepted.
-            assert_eq!(requests.len(), 3);
+            // immediately (the self-adjudication challenge round is retired:
+            // measured live, its flips never changed a final outcome).
+            assert_eq!(requests.len(), 2);
             assert!(requests[1].messages.iter().any(|message| {
                 message.role == "tool"
                     && asgard_message_text(message).contains("contract C1 is missing")
-            }));
-            assert!(requests[2].messages.iter().any(|message| {
-                message.role == "tool"
-                    && asgard_message_text(message)
-                        .contains("re-adjudicate only the rows that carry")
             }));
         }
 
@@ -19551,87 +19535,6 @@ mod tests {
                 .expect("request lock")
                 .len(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn asgard_completion_review_records_challenge_flip_to_incomplete() {
-        let checklist_ids = vec![AsgardTaskContract {
-            id: "C1".to_string(),
-            kind: "inspection".to_string(),
-            text: "The parser preserves the requested output format.".to_string(),
-            adverse_condition: None,
-        }];
-        let valid_complete = supervisor_tool_call(
-            "valid-complete",
-            "select_trajectory",
-            serde_json::json!({
-                "winner": 0,
-                "complete": true,
-                "state_summary": "The endpoint appears complete.",
-                "advices": [],
-                "contracts": [{
-                    "id": "C1",
-                    "status": "verified",
-                    "evidence": "terminal patch quotes the requested output format"
-                }]
-            }),
-        );
-        let challenged_incomplete = supervisor_tool_call(
-            "challenged-incomplete",
-            "select_trajectory",
-            serde_json::json!({
-                "winner": 0,
-                "complete": false,
-                "next_window_steps": 3,
-                "state_summary": "The challenge exposed an evidence gap.",
-                "advices": [{
-                    "strategy": "Produce discriminating evidence for the output format.",
-                    "scope_basis": "The task contract remains unverified."
-                }]
-            }),
-        );
-        let backend = ScriptedSupervisorBackend::new(vec![
-            LlmResponse::ToolCalls {
-                text: String::new(),
-                reasoning_content: None,
-                calls: vec![valid_complete],
-                usage: crate::llm_client::TokenUsage::default(),
-            },
-            LlmResponse::ToolCalls {
-                text: String::new(),
-                reasoning_content: None,
-                calls: vec![challenged_incomplete],
-                usage: crate::llm_client::TokenUsage::default(),
-            },
-        ]);
-
-        let (decision, _) = run_asgard_supervisor_tool_steps(
-            &backend,
-            vec![ChatMessage::user("completion review")],
-            AsgardSupervisorToolContext {
-                model: "deepseek::deepseek-v4-pro",
-                candidate_count: 1,
-                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
-                audit: None,
-                required_winner: Some(0),
-                checklist_ids: &checklist_ids,
-                carry_forward_allowed: false,
-            },
-            tokio_util::sync::CancellationToken::new(),
-            None,
-        )
-        .await;
-
-        let (decision, stats) = decision.expect("challenge flip accepted");
-        assert!(!decision.complete);
-        assert_eq!(
-            stats,
-            AsgardChallengeStats {
-                issued: true,
-                flipped: true,
-                validation_rounds: 0,
-            }
         );
     }
 
