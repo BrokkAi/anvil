@@ -629,3 +629,27 @@ Asset names:
 - `brokk-anvil-vX.Y.Z-aarch64-linux-android.zip`
 - `brokk-anvil-vX.Y.Z-x86_64-pc-windows-msvc.zip`
 - `brokk-anvil-vX.Y.Z-universal-apple-darwin.zip`
+
+## License And Third-Party Notices
+
+Anvil is licensed under `LGPL-3.0-only`. [`LICENSE`](LICENSE) contains the GNU
+LGPLv3 text, and [`licenses/GPL-3.0.md`](licenses/GPL-3.0.md) contains the GNU
+GPLv3 text incorporated by LGPLv3. Official release archives also include
+[`licenses/SOURCE.md`](licenses/SOURCE.md), a generated Rust dependency report,
+and supplemental notices for standalone attributions and vendored native code.
+
+The generated report covers the locked dependency graph across every native
+release target and the `wasm32-wasip2` parser guest embedded by the default
+`wasm-sandbox` feature. It keeps the MPL-covered `colored` and `option-ext`
+dependencies as narrow, reviewed exceptions with exact source-package links.
+The supplemental generator fails when a new native-linking crate or standalone
+`NOTICE` file appears without review.
+
+To validate or regenerate the reports after changing `Cargo.lock`:
+
+```bash
+cargo deny --config licenses/deny.toml --locked check licenses
+cargo about generate --offline --config licenses/about.toml --locked --fail \
+  licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
+node scripts/generate-supplemental-third-party-notices.mjs
+```

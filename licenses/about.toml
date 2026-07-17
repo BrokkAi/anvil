@@ -1,0 +1,41 @@
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "ISC",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "LGPL-3.0-only",
+    "MPL-2.0",
+    "Unlicense",
+    "bzip2-1.0.6",
+]
+
+# Union of the native targets used by the GitHub release workflow plus the
+# wasm32-wasip2 guest embedded in every default-feature binary.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-linux-android",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "wasm32-wasip2",
+]
+
+# ureq is dual-licensed and cargo-about can otherwise choose a different
+# accepted license file on different platforms.
+[ureq.clarify]
+license = "Apache-2.0"
+
+[[ureq.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"

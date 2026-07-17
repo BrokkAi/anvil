@@ -15,6 +15,35 @@ env:
   CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
+  licenses:
+    name: dependency licenses
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Set up Node
+      uses: actions/setup-node@v6
+      with:
+        node-version: 24
+
+    - name: Install pinned license tools
+      run: |
+        cargo install --locked cargo-about --version 0.9.1 --features cli
+        cargo install --locked cargo-deny --version 0.20.2
+
+    - name: Check dependency license policy
+      run: cargo deny --config licenses/deny.toml --locked check licenses
+
+    - name: Check shipped notice reports
+      run: |
+        cargo about generate --offline --config licenses/about.toml --locked --fail licenses/about.hbs -o /tmp/THIRD_PARTY_LICENSES.html
+        diff -u licenses/THIRD_PARTY_LICENSES.html /tmp/THIRD_PARTY_LICENSES.html
+        node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
+        diff -u licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
+
   build:
     strategy:
       fail-fast: false
