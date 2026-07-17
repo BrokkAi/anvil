@@ -4969,6 +4969,19 @@ struct AsgardSupervisorDecision {
     contracts: Option<Vec<AsgardContractRow>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AsgardChallengeStats {
+    issued: bool,
+    flipped: bool,
+    validation_rounds: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AsgardPriorCompletionReview {
+    window: usize,
+    rows: Vec<AsgardContractRow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardTaskContract {
     id: String,
@@ -5067,6 +5080,8 @@ async fn run_asgard_trajectory_loop(
     let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
     let mut canonical_ledger: Vec<(usize, AsgardExecutionLedger)> = Vec::new();
     let mut supervisor_history = AsgardSupervisorHistory::default();
+    let mut prior_completion_review: Option<AsgardPriorCompletionReview> = None;
+    let mut window_deltas_since_prior_review: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
@@ -5400,6 +5415,7 @@ async fn run_asgard_trajectory_loop(
                 return (outcome, usage_by_model);
             }
         };
+        let mut accepted_completion_review_rows: Option<Vec<AsgardContractRow>> = None;
         if decision.complete {
             send_thought(
                 cx,
@@ -5426,6 +5442,8 @@ async fn run_asgard_trajectory_loop(
                     selected_trajectory_initial: &selected_trajectory_initial,
                     selected_trajectory_windows: &selected_trajectory_windows,
                     supervisor_history: &supervisor_history,
+                    prior_review: prior_completion_review.as_ref(),
+                    window_deltas_since_prior_review: &window_deltas_since_prior_review,
                     live_output: &live_output,
                 },
             )
@@ -5436,7 +5454,14 @@ async fn run_asgard_trajectory_loop(
                 .or_default()
                 .add(completion_review.1);
             decision = match completion_review.0 {
-                Ok(review) => review,
+                Ok(review) => {
+                    accepted_completion_review_rows = review
+                        .contracts
+                        .as_ref()
+                        .filter(|rows| !rows.is_empty())
+                        .cloned();
+                    review
+                }
                 Err(error) => {
                     // Failing closed used to abort the whole Asgard run, which
                     // wastes the remaining task budget and grades the very
@@ -5567,6 +5592,12 @@ async fn run_asgard_trajectory_loop(
         selected_trajectory_windows.push(selected_window);
         canonical_ledger.push((window, winner.window_ledger.clone()));
         supervisor_history.push(window, &decision);
+        if let Some(rows) = accepted_completion_review_rows {
+            prior_completion_review = Some(AsgardPriorCompletionReview { window, rows });
+            window_deltas_since_prior_review.clear();
+        } else if prior_completion_review.is_some() {
+            window_deltas_since_prior_review.push((window, winner.delta_patch.clone()));
+        }
         if crate::tokens::approximate_tokens_messages(&common_messages)
             > crate::context_manager::context_budget(context_length)
         {
@@ -5683,6 +5714,7 @@ async fn run_asgard_initial_advice(
             audit: None,
             required_winner: None,
             checklist_ids: &[],
+            carry_forward_allowed: false,
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Supervisor")),
@@ -5758,7 +5790,7 @@ async fn run_asgard_supervisor(
             .map_or(0, |text| text.len()),
         "assembled Asgard supervisor dossier"
     );
-    run_asgard_supervisor_tool_steps(
+    let (decision, usage) = run_asgard_supervisor_tool_steps(
         llm.as_ref(),
         messages,
         AsgardSupervisorToolContext {
@@ -5768,11 +5800,13 @@ async fn run_asgard_supervisor(
             audit: Some(audit),
             required_winner: None,
             checklist_ids: &[],
+            carry_forward_allowed: false,
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Supervisor")),
     )
-    .await
+    .await;
+    (decision.map(|(decision, _stats)| decision), usage)
 }
 
 struct AsgardCompletionReviewContext<'a> {
@@ -5789,6 +5823,8 @@ struct AsgardCompletionReviewContext<'a> {
     selected_trajectory_initial: &'a [ChatMessage],
     selected_trajectory_windows: &'a [Vec<ChatMessage>],
     supervisor_history: &'a AsgardSupervisorHistory,
+    prior_review: Option<&'a AsgardPriorCompletionReview>,
+    window_deltas_since_prior_review: &'a [(usize, Vec<u8>)],
     live_output: &'a AsgardLiveOutput,
 }
 
@@ -5814,6 +5850,8 @@ async fn run_asgard_completion_review(
         selected_trajectory_initial,
         selected_trajectory_windows,
         supervisor_history,
+        prior_review,
+        window_deltas_since_prior_review,
         live_output,
     } = context;
     debug_assert_eq!(candidates.len(), registries.len());
@@ -5859,6 +5897,24 @@ async fn run_asgard_completion_review(
             return (Err(error), crate::llm_client::TokenUsage::default());
         }
     };
+    let prior_review_delta = prior_review
+        .map(|_| {
+            window_deltas_since_prior_review
+                .iter()
+                .map(|(window, patch)| {
+                    format!(
+                        "<window_delta window=\"{window}\">\n{}\n</window_delta>",
+                        String::from_utf8_lossy(patch)
+                    )
+                })
+                .chain(std::iter::once(format!(
+                    "<window_delta window=\"{window}\">\n{}\n</window_delta>",
+                    String::from_utf8_lossy(&candidate.delta_patch)
+                )))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     let messages = asgard_completion_review_messages(
         original_task,
         selected_trajectory_initial,
@@ -5871,6 +5927,8 @@ async fn run_asgard_completion_review(
         terminal_test_patch,
         selected_lane,
         candidate_trajectory,
+        prior_review,
+        prior_review_delta,
     );
     tracing::info!(
         window,
@@ -5881,7 +5939,7 @@ async fn run_asgard_completion_review(
             .map_or(0, |text| text.len()),
         "assembled isolated Asgard completion-review dossier"
     );
-    run_asgard_supervisor_tool_steps(
+    let (decision, usage) = run_asgard_supervisor_tool_steps(
         llm.as_ref(),
         messages,
         AsgardSupervisorToolContext {
@@ -5891,11 +5949,13 @@ async fn run_asgard_completion_review(
             audit: Some(audit),
             required_winner: Some(selected_lane),
             checklist_ids: &task_contract_checklist.contracts,
+            carry_forward_allowed: prior_review.is_some(),
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Completion reviewer")),
     )
-    .await
+    .await;
+    (decision.map(|(decision, _stats)| decision), usage)
 }
 
 fn render_asgard_candidate_trajectory(
@@ -5976,6 +6036,7 @@ struct AsgardSupervisorToolContext<'a> {
     audit: Option<AsgardAuditContext<'a>>,
     required_winner: Option<usize>,
     checklist_ids: &'a [AsgardTaskContract],
+    carry_forward_allowed: bool,
 }
 
 struct AsgardAuditContext<'a> {
@@ -6251,7 +6312,7 @@ async fn run_asgard_supervisor_tool_steps(
     cancel: tokio_util::sync::CancellationToken,
     stream_sinks: Option<AsgardStreamSinks>,
 ) -> (
-    anyhow::Result<AsgardSupervisorDecision>,
+    anyhow::Result<(AsgardSupervisorDecision, AsgardChallengeStats)>,
     crate::llm_client::TokenUsage,
 ) {
     let audit_round_limit = if context.audit.is_some() {
@@ -6273,6 +6334,7 @@ async fn run_asgard_supervisor_tool_steps(
     let mut audit_rounds_used = 0usize;
     let mut selection_attempts = 0usize;
     let mut challenge_issued = false;
+    let mut validation_rounds = 0usize;
 
     loop {
         let audit_phase = audit_rounds_used < audit_round_limit;
@@ -6402,6 +6464,7 @@ async fn run_asgard_supervisor_tool_steps(
                                         let violations = asgard_validate_contract_rows(
                                             &decision,
                                             context.checklist_ids,
+                                            context.carry_forward_allowed,
                                         );
                                         if violations.is_empty() {
                                             if challenge_issued || context.checklist_ids.is_empty()
@@ -6423,14 +6486,19 @@ async fn run_asgard_supervisor_tool_steps(
                                                     } else {
                                                         "supervisor"
                                                     };
+                                                let stats = AsgardChallengeStats {
+                                                    issued: challenge_issued,
+                                                    flipped: false,
+                                                    validation_rounds,
+                                                };
                                                 crate::trace_logging::append_trace_record(
-                                                    serde_json::json!({
-                                                        "type": "asgard_decision",
-                                                        "call": decision_call,
-                                                        "decision": &decision,
-                                                    }),
+                                                    asgard_decision_trace_record(
+                                                        decision_call,
+                                                        &decision,
+                                                        stats,
+                                                    ),
                                                 );
-                                                return (Ok(decision), usage);
+                                                return (Ok((decision, stats)), usage);
                                             }
                                             // One self-adjudication challenge per review:
                                             // complete=true is provisional until the
@@ -6441,6 +6509,7 @@ async fn run_asgard_supervisor_tool_steps(
                                             selector_error =
                                                 Some(ASGARD_CHALLENGE_MESSAGE.to_string());
                                         } else {
+                                            validation_rounds += 1;
                                             selector_error = Some(
                                                 asgard_contract_violation_message(&violations),
                                             );
@@ -6462,14 +6531,19 @@ async fn run_asgard_supervisor_tool_steps(
                                         } else {
                                             "supervisor"
                                         };
+                                        let stats = AsgardChallengeStats {
+                                            issued: challenge_issued,
+                                            flipped: challenge_issued && !decision.complete,
+                                            validation_rounds,
+                                        };
                                         crate::trace_logging::append_trace_record(
-                                            serde_json::json!({
-                                                "type": "asgard_decision",
-                                                "call": decision_call,
-                                                "decision": &decision,
-                                            }),
+                                            asgard_decision_trace_record(
+                                                decision_call,
+                                                &decision,
+                                                stats,
+                                            ),
                                         );
-                                        return (Ok(decision), usage);
+                                        return (Ok((decision, stats)), usage);
                                     }
                                 }
                                 Err(error) => selector_error = Some(error.to_string()),
@@ -6623,6 +6697,23 @@ fn asgard_supervisor_tool_definitions(
     tools
 }
 
+fn asgard_decision_trace_record(
+    decision_call: &str,
+    decision: &AsgardSupervisorDecision,
+    challenge: AsgardChallengeStats,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "asgard_decision",
+        "call": decision_call,
+        "decision": decision,
+        "challenge": {
+            "issued": challenge.issued,
+            "flipped": challenge.flipped,
+            "validation_rounds": challenge.validation_rounds,
+        },
+    })
+}
+
 fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
     // Session bootstrap can contribute user-role instruction messages (for
     // example AGENTS.md) before the actual prompt. The last user message is
@@ -6681,7 +6772,7 @@ fn asgard_supervisor_messages(
             r#"<mission>
 You are the correctness supervisor for an Asgard coding trajectory. Candidate lanes are alternative continuations from one shared canonical state. Every decision must choose the lane with the best long-term chance of solving the original task. Separately decide whether that selected endpoint is complete. If it is incomplete, direct the next {candidate_count} lanes toward useful independent progress.
 
-Selection does not require certainty. Choose the best continuation under the available evidence even when every lane is flawed or an important question remains unanswered. Completion does require confidence: complete=true means the selected endpoint satisfies the original task and needs no further task-relevant implementation or verification.
+Selection does not require certainty. Choose the best continuation under the available evidence even when every lane is flawed or an important question remains unanswered. complete=true is a nomination that the selected endpoint plausibly satisfies the original task; a separate isolated completion review owns the terminal adjudication.
 </mission>
 
 <task_and_evidence>
@@ -6697,12 +6788,7 @@ Prior supervisor decisions and lane advice provide continuity, not authority. Re
 <decision_depth>
 First decide whether the leading lane plausibly appears terminal.
 
-If a lane appears terminal, audit in this priority order:
-1. Compare the implementation against every exact task contract, not just requested symbol names or candidate claims.
-2. Identify the highest-risk requirement and ask what boundary case or combination of changed behaviors the reported verification did not exercise.
-3. Resolve concrete task-relevant counterexamples, failure mechanisms, and contradictions before investigating speculative quality concerns.
-
-A concrete plausible defect or counterexample that remains unresolved requires complete=false. Do not let numerous weaker signals, candidate confidence, or unrelated passing tests outvote it. Evidence resolves a concern only when it specifically addresses the behavior or mechanism in question. General uncertainty alone is not a defect: when the contracts are satisfied and verification is proportionate, do not invent optional work.
+complete=true is a nomination, not a terminal verdict. A separate isolated completion review owns all terminal adjudication and re-judges the nominated endpoint against every task contract with the full evidence bundle. Nominate complete=true when the selected endpoint plausibly satisfies the task contracts; the candidate briefs and diffs are sufficient basis. Do not perform a terminal-grade audit, search for boundary counterexamples, or re-verify evidence before nominating — that depth is the review's job and paying it here duplicates the review. Do not nominate past a defect you can already see: a concrete task-relevant defect, contradiction, or plainly missing required work visible in the dossier means complete=false with advice targeting it.
 
 If the best lanes are plainly incomplete, do not perform a terminal-grade exhaustive audit. Inspect only enough consequential evidence to rank their directions and formulate the next work. Unknowns can remain: select the best foundation, set complete=false, record the uncertainty, and delegate the needed implementation or verification to candidates in the next window.
 </decision_depth>
@@ -6716,7 +6802,7 @@ Unavailable executable verification is not a reason to withhold a decision. If i
 <scope_and_completion>
 Stay within the original scope. Do not repair dependencies, lockfiles, toolchains, generated machinery, warning policy, test selection, or expected outputs merely to hide a failure unless the task requires that surface or the candidate broke it. Treat a failure as environmental, pre-existing, flaky, or unrelated only with concrete evidence. Do not weaken required behavior to preserve obsolete callers or mocks.
 
-Completion is a property of the endpoint, not of who introduced a defect. Set complete=true only when the selected endpoint satisfies the exact task contracts, violates no constraint, has no unresolved concrete task-relevant defect, and has verification proportionate to its risk. Set complete=false when required work or necessary verification remains. When executable verification is unavailable to you, select the best lane and delegate the specific check to the next candidate window rather than either assuming success or refusing to decide.
+Completion is a property of the endpoint, not of who introduced a defect. Set complete=true when the selected endpoint plausibly satisfies the exact task contracts on the basis of the candidate briefs and diffs; the isolated completion review — not this decision — adjudicates terminal completeness and will return the work to candidates if evidence falls short. Set complete=false when required work plainly remains or the dossier shows an unresolved concrete task-relevant defect. When executable verification is unavailable to you, select the best lane and delegate the specific check to the next candidate window rather than either assuming success or refusing to decide.
 </scope_and_completion>
 
 <continuation>
@@ -6772,8 +6858,8 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
 <decision_procedure>
 1. Re-read the original task and preserve its exact observable contracts: signatures and argument order, returns, errors, atomicity, compatibility, constraints, and prohibitions.
 2. Compare each lane's actual direction, defects, evidence, and recoverability. Choose a provisional winner even if all are incomplete.
-3. Decide whether that winner plausibly appears terminal. If so, audit the riskiest explicit contract and look for a boundary case or combination its evidence did not exercise. If not, investigate only questions that could change the ranking or next-window direction.
-4. Make the independent completion judgment. Any unresolved concrete task-relevant defect or counterexample means complete=false; aggregate green checks cannot override it. Missing necessary executable verification also means complete=false and becomes concrete next-window advice, not an endless audit.
+3. Decide whether that winner plausibly appears terminal. If so, nominate: complete=true requires only that the endpoint plausibly satisfies the task contracts on the candidate briefs and diffs — the isolated completion review owns terminal adjudication, so do not audit for boundary cases first. If not, investigate only questions that could change the ranking or next-window direction.
+4. Treat the completion judgment as a nomination. A concrete defect, contradiction, or plainly missing required work already visible in the dossier means complete=false and becomes targeted next-window advice; do not search for more before nominating.
 5. If incomplete, choose the shared horizon and exactly {candidate_count} distinct compliant strategies, including one that challenges the leading unverified assumption.
 6. Call select_trajectory. Do not continue investigating once you can make the best available judgment.
 </decision_procedure>"#,
@@ -6794,6 +6880,8 @@ fn asgard_completion_review_messages(
     terminal_test_patch: String,
     selected_lane: usize,
     selected_candidate_trajectory: String,
+    prior_review: Option<&AsgardPriorCompletionReview>,
+    prior_review_delta: String,
 ) -> Vec<ChatMessage> {
     let mut messages = asgard_supervisor_messages(
         original_task,
@@ -6804,6 +6892,32 @@ fn asgard_completion_review_messages(
         task_contract_checklist,
         selected_candidate_trajectory.clone(),
     );
+    if let Some(prior_review) = prior_review {
+        let rows = prior_review
+            .rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "status": row.status,
+                    "evidence": row.evidence,
+                })
+            })
+            .collect::<Vec<_>>();
+        let prior_review_message = ChatMessage::assistant(format!(
+            "<prior_review_rows window=\"{}\">\n{}\n</prior_review_rows>\n<prior_review_delta>\n{}\n</prior_review_delta>",
+            prior_review.window,
+            serde_json::to_string_pretty(&rows).expect("prior review rows serialize"),
+            prior_review_delta,
+        ));
+        let insert_at = messages
+            .iter()
+            .position(|message| {
+                asgard_message_text(message).starts_with("<task_contract_checklist")
+            })
+            .map_or(messages.len(), |position| position + 1);
+        messages.insert(insert_at, prior_review_message);
+    }
     let canonical_ledger = render_asgard_canonical_ledger(canonical_ledger);
     let terminal_non_test_patch = if terminal_non_test_patch.is_empty() {
         "(no non-test changes)".to_string()
@@ -6828,7 +6942,7 @@ fn asgard_completion_review_messages(
 <terminal_completion_review selected_lane="{selected_lane}">
 This is an independent completion review of the single would-be-final endpoint shown above. The comparative selection decision and all discarded candidate lanes are intentionally absent. Do not reconstruct, compare, or speculate about them. Keep selected_lane={selected_lane}; your only decision is whether this endpoint actually completes the original task.
 
-The task_contract_checklist was derived from the task text alone before any candidate work existed. Your select_trajectory call must return one contracts row per checklist id. Evidence rules, in strength order: (1) Execution evidence — an execution_ledger entry (cite its id) whose command demonstrably exercised the contract and exited 0 at or after the last edit of the implementing files; a green command counts only for behaviors its selected tests actually assert — confirm in the terminal_test_patch that some assertion would fail if the contract were violated; a broad suite pass does not verify a contract no test asserts; a build proves compilation; a race detector proves absence of data races, not liveness. Golden, snapshot, or fixture expectation files created or regenerated by the candidate are candidate-authored assertions: a passing comparison against them proves only that the output matches itself; for exact-output contracts, quote the actual emitted output — from a ledger entry or from the expectation-file content in the patches — and show it satisfies the contract's required shape at its boundaries, including the very first and very last elements of the stream. Evidence must be discriminating: state the most plausible wrong implementation of this contract — the wrong label or classification, the missing boundary element, the partially-correct result — and confirm the cited assertion would catch it; an assertion that only counts results, checks non-emptiness, or matches a substring usually passes under mislabeled or partially-wrong behavior. For a contract naming enumerated values, classifications, or exact labels, quote — for each scenario the contract names — the assertion line or observed ledger output showing that exact value in that exact scenario; an assertion checking a different scenario's value does not transfer. For a contract that combines, maps, or constructs from multiple positional inputs, a green test counts only if its values are pairwise distinguishable and the checked operation non-commutative — a test combining equal values or reducing with numeric addition passes under any positional swap and proves nothing about position. Absent such a test, verify positionally by inspection: quote the complete argument flow from construction to application and argue each input reaches its position; mark the row violated if the quoted flow misroutes any input, and unverified only when neither a discriminating test nor a conclusive flow reading exists. For contracts requiring a behavior across a matrix of backends, dialects, or variants, quoted code showing the new path routes through the same shared machinery as an existing verified sibling is acceptable inspection evidence for the uncovered cells; demand per-cell execution only when the path diverges. For a contract specifying a typed public signature whose shape admits divergent readings — callbacks, generics, overloads, container/element relationships — evidence counts only when a ledger entry type-checks standalone usage authored from the contract's text; the implementation's own tests compiling proves self-consistency, not the contract. A simple signature quoted verbatim from the patch that textually matches the contract is ordinary inspection evidence and needs no type-check run. (2) Inspection evidence — exact quoted lines from the terminal patches showing the contract satisfied; a file name alone is not evidence; use only for contracts fully verifiable by reading. (3) Candidate claims are never evidence.
+The task_contract_checklist was derived from the task text alone before any candidate work existed. Your select_trajectory call must return one contracts row per checklist id. Keep verified rows terse — one clause citing the ledger entry or quoted line (aim under 150 characters); reserve detailed prose for violated rows, unverified rows, and adverse_condition_evidence. When prior_review_rows are present, re-adjudicate only contracts plausibly affected by the prior_review_delta, plus every contract that was not verified before. For a previously verified contract untouched by the delta, carry it forward: status verified, evidence 'carried-forward: unchanged since window N review'. A carried-forward row must still be listed. Evidence rules, in strength order: (1) Execution evidence — an execution_ledger entry (cite its id) whose command demonstrably exercised the contract and exited 0 at or after the last edit of the implementing files; a green command counts only for behaviors its selected tests actually assert — confirm in the terminal_test_patch that some assertion would fail if the contract were violated; a broad suite pass does not verify a contract no test asserts; a build proves compilation; a race detector proves absence of data races, not liveness. Golden, snapshot, or fixture expectation files created or regenerated by the candidate are candidate-authored assertions: a passing comparison against them proves only that the output matches itself; for exact-output contracts, quote the actual emitted output — from a ledger entry or from the expectation-file content in the patches — and show it satisfies the contract's required shape at its boundaries, including the very first and very last elements of the stream. Evidence must be discriminating: state the most plausible wrong implementation of this contract — the wrong label or classification, the missing boundary element, the partially-correct result — and confirm the cited assertion would catch it; an assertion that only counts results, checks non-emptiness, or matches a substring usually passes under mislabeled or partially-wrong behavior. For a contract naming enumerated values, classifications, or exact labels, quote — for each scenario the contract names — the assertion line or observed ledger output showing that exact value in that exact scenario; an assertion checking a different scenario's value does not transfer. For a contract that combines, maps, or constructs from multiple positional inputs, a green test counts only if its values are pairwise distinguishable and the checked operation non-commutative — a test combining equal values or reducing with numeric addition passes under any positional swap and proves nothing about position. Absent such a test, verify positionally by inspection: quote the complete argument flow from construction to application and argue each input reaches its position; mark the row violated if the quoted flow misroutes any input, and unverified only when neither a discriminating test nor a conclusive flow reading exists. For contracts requiring a behavior across a matrix of backends, dialects, or variants, quoted code showing the new path routes through the same shared machinery as an existing verified sibling is acceptable inspection evidence for the uncovered cells; demand per-cell execution only when the path diverges. For a contract specifying a typed public signature whose shape admits divergent readings — callbacks, generics, overloads, container/element relationships — evidence counts only when a ledger entry type-checks standalone usage authored from the contract's text; the implementation's own tests compiling proves self-consistency, not the contract. A simple signature quoted verbatim from the patch that textually matches the contract is ordinary inspection evidence and needs no type-check run. (2) Inspection evidence — exact quoted lines from the terminal patches showing the contract satisfied; a file name alone is not evidence; use only for contracts fully verifiable by reading. (3) Candidate claims are never evidence.
 
 Unblocking contracts get the strictest treatment. For any contract that an event X (close, shutdown, abort, cancellation, deadline) must unblock, interrupt, or fail a pending operation P, execution evidence counts only if the verifying test performs no action after X that could itself wake P — releasing, closing, erroring, or enqueuing on the awaited stream or channel, sending or receiving data, advancing timers, or completing the awaited resource. A test that wakes P by such means verifies only that P notices a flag after being woken; the row is unverified. Inspection evidence must quote the affirmative wake path X triggers on the already-blocked waiter and show X can reach it while P is blocked: a flag tested inside a read or write loop wakes nothing, and a mutex held across a blocking wait prevents any unblocking path needing that mutex from running. For exact-output contracts, reconstruct the emitted stream from the writer code for the first and last element, not only the middle.
 
@@ -7915,6 +8029,7 @@ fn parse_asgard_contract_rows(value: &serde_json::Value) -> Option<Vec<AsgardCon
 fn asgard_validate_contract_rows(
     decision: &AsgardSupervisorDecision,
     checklist: &[AsgardTaskContract],
+    carry_forward_allowed: bool,
 ) -> Vec<String> {
     let mut rows_by_id: HashMap<&str, Vec<&AsgardContractRow>> = HashMap::new();
     for row in decision.contracts.as_deref().unwrap_or_default() {
@@ -7939,7 +8054,11 @@ fn asgard_validate_contract_rows(
                     violations.push(format!("contract {id} is {}", row.status));
                 } else if row.evidence.trim().is_empty() {
                     violations.push(format!("contract {id} has empty evidence"));
-                } else if entry.kind == "execution" && !asgard_cites_ledger_entry(row) {
+                } else if entry.kind == "execution"
+                    && !asgard_cites_ledger_entry(row)
+                    && !(carry_forward_allowed
+                        && row.evidence.trim_start().starts_with("carried-forward:"))
+                {
                     violations.push(format!(
                         "contract {id} is kind=execution but its row cites no \
                          execution_ledger entry (L<n>); execution contracts cannot be \
@@ -18989,6 +19108,8 @@ mod tests {
             "diff --git a/tests/parser_test.rs b/tests/parser_test.rs\n+assert\n".to_string(),
             1,
             "selected lane two only".to_string(),
+            None,
+            String::new(),
         );
 
         assert_eq!(&first[..first.len() - 1], &second[..first.len() - 1]);
@@ -19001,8 +19122,15 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("green tests changed alongside"));
         assert!(asgard_message_text(&first[0]).contains("argument order"));
         assert!(asgard_message_text(&first[0]).contains("missing combinations"));
-        assert!(asgard_message_text(&first[0]).contains("concrete plausible defect"));
-        assert!(asgard_message_text(&first[0]).contains("numerous weaker signals"));
+        assert!(asgard_message_text(&first[0]).contains("nomination, not a terminal verdict"));
+        assert!(
+            asgard_message_text(&first[0])
+                .contains("isolated completion review owns all terminal adjudication")
+        );
+        assert!(
+            asgard_message_text(&first[0])
+                .contains("plainly incomplete, do not perform a terminal-grade exhaustive audit")
+        );
         assert!(
             asgard_message_text(&first[0]).contains("most consequential unverified assumption")
         );
@@ -19015,7 +19143,10 @@ mod tests {
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
         assert!(asgard_message_text(&first[0]).contains("available for read-only"));
         assert!(asgard_message_text(&first[0]).contains("edits since the last decision"));
-        assert!(asgard_message_text(&first[0]).contains("audit in this priority order"));
+        assert!(
+            asgard_message_text(&first[0])
+                .contains("complete=true is a nomination that the selected endpoint plausibly")
+        );
         assert!(asgard_message_text(&first[0]).contains("at most 3 information-gathering"));
         assert!(asgard_message_text(&first[0]).contains("tell one or more next-window candidates"));
         assert_eq!(first[0], terminal[0]);
@@ -19035,8 +19166,11 @@ mod tests {
         assert!(asgard_message_text(&second[6]).contains("candidate window two"));
         assert!(asgard_message_text(&second[6]).contains("<decision_procedure>"));
         assert!(asgard_message_text(&second[6]).contains("Compare each lane's actual direction"));
-        assert!(asgard_message_text(&second[6]).contains("audit the riskiest explicit contract"));
-        assert!(asgard_message_text(&second[6]).contains("aggregate green checks cannot override"));
+        assert!(asgard_message_text(&second[6]).contains("If so, nominate: complete=true"));
+        assert!(
+            asgard_message_text(&second[6])
+                .contains("Treat the completion judgment as a nomination")
+        );
         assert_eq!(
             &second[..second.len() - 1],
             &isolated_review[..isolated_review.len() - 1]
@@ -19049,6 +19183,8 @@ mod tests {
         assert!(isolated_suffix.contains("<canonical_execution_ledger"));
         assert!(isolated_suffix.contains("<terminal_non_test_patch"));
         assert!(isolated_suffix.contains("<terminal_test_patch"));
+        assert!(isolated_suffix.contains("Keep verified rows terse"));
+        assert!(isolated_suffix.contains("carried-forward: unchanged since window N review"));
         assert!(isolated_suffix.contains("Evidence rules, in strength order"));
         assert!(
             isolated_suffix
@@ -19254,13 +19390,23 @@ mod tests {
                 audit: None,
                 required_winner: Some(0),
                 checklist_ids: &checklist_ids,
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
 
-        assert!(decision.expect("corrected contract rows").complete);
+        let (decision, stats) = decision.expect("corrected contract rows");
+        assert!(decision.complete);
+        assert_eq!(
+            stats,
+            AsgardChallengeStats {
+                issued: true,
+                flipped: false,
+                validation_rounds: 1,
+            }
+        );
         {
             let requests = backend.requests.lock().expect("request lock");
             // Round 1: missing rows rejected; round 2: valid rows accepted
@@ -19306,12 +19452,22 @@ mod tests {
                 audit: None,
                 required_winner: Some(0),
                 checklist_ids: &checklist_ids,
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
-        assert!(!incomplete.expect("incomplete accepted").complete);
+        let (incomplete, stats) = incomplete.expect("incomplete accepted");
+        assert!(!incomplete.complete);
+        assert_eq!(
+            stats,
+            AsgardChallengeStats {
+                issued: false,
+                flipped: false,
+                validation_rounds: 0,
+            }
+        );
         assert_eq!(
             incomplete_backend
                 .requests
@@ -19347,12 +19503,22 @@ mod tests {
                 audit: None,
                 required_winner: Some(0),
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
-        assert!(empty_checklist.expect("empty checklist accepted").complete);
+        let (empty_checklist, stats) = empty_checklist.expect("empty checklist accepted");
+        assert!(empty_checklist.complete);
+        assert_eq!(
+            stats,
+            AsgardChallengeStats {
+                issued: false,
+                flipped: false,
+                validation_rounds: 0,
+            }
+        );
         assert_eq!(
             empty_checklist_backend
                 .requests
@@ -19361,6 +19527,170 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn asgard_completion_review_records_challenge_flip_to_incomplete() {
+        let checklist_ids = vec![AsgardTaskContract {
+            id: "C1".to_string(),
+            kind: "inspection".to_string(),
+            text: "The parser preserves the requested output format.".to_string(),
+            adverse_condition: None,
+        }];
+        let valid_complete = supervisor_tool_call(
+            "valid-complete",
+            "select_trajectory",
+            serde_json::json!({
+                "winner": 0,
+                "complete": true,
+                "state_summary": "The endpoint appears complete.",
+                "advices": [],
+                "contracts": [{
+                    "id": "C1",
+                    "status": "verified",
+                    "evidence": "terminal patch quotes the requested output format"
+                }]
+            }),
+        );
+        let challenged_incomplete = supervisor_tool_call(
+            "challenged-incomplete",
+            "select_trajectory",
+            serde_json::json!({
+                "winner": 0,
+                "complete": false,
+                "next_window_steps": 3,
+                "state_summary": "The challenge exposed an evidence gap.",
+                "advices": [{
+                    "strategy": "Produce discriminating evidence for the output format.",
+                    "scope_basis": "The task contract remains unverified."
+                }]
+            }),
+        );
+        let backend = ScriptedSupervisorBackend::new(vec![
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![valid_complete],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![challenged_incomplete],
+                usage: crate::llm_client::TokenUsage::default(),
+            },
+        ]);
+
+        let (decision, _) = run_asgard_supervisor_tool_steps(
+            &backend,
+            vec![ChatMessage::user("completion review")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 1,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: None,
+                required_winner: Some(0),
+                checklist_ids: &checklist_ids,
+                carry_forward_allowed: false,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        let (decision, stats) = decision.expect("challenge flip accepted");
+        assert!(!decision.complete);
+        assert_eq!(
+            stats,
+            AsgardChallengeStats {
+                issued: true,
+                flipped: true,
+                validation_rounds: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn asgard_decision_trace_record_includes_challenge_stats() {
+        let decision = AsgardSupervisorDecision {
+            winner: 0,
+            complete: false,
+            advices: vec![Some("Verify the exact behavior.".to_string())],
+            next_window_steps: Some(3),
+            state_summary: "Lane 1 is best but incomplete.".to_string(),
+            contracts: None,
+        };
+
+        let record = asgard_decision_trace_record(
+            "completion_review",
+            &decision,
+            AsgardChallengeStats {
+                issued: true,
+                flipped: true,
+                validation_rounds: 2,
+            },
+        );
+
+        assert_eq!(record["type"], "asgard_decision");
+        assert_eq!(record["challenge"]["issued"], true);
+        assert_eq!(record["challenge"]["flipped"], true);
+        assert_eq!(record["challenge"]["validation_rounds"], 2);
+        assert!(record["decision"]["winner"].is_number());
+    }
+
+    #[test]
+    fn asgard_validate_contract_rows_allows_carried_execution_evidence_only_when_enabled() {
+        let checklist = vec![AsgardTaskContract {
+            id: "C1".to_string(),
+            kind: "execution".to_string(),
+            text: "The command must produce the requested output.".to_string(),
+            adverse_condition: None,
+        }];
+        let decision = AsgardSupervisorDecision {
+            winner: 0,
+            complete: true,
+            advices: Vec::new(),
+            next_window_steps: None,
+            state_summary: "Complete.".to_string(),
+            contracts: Some(vec![AsgardContractRow {
+                id: "C1".to_string(),
+                status: "verified".to_string(),
+                evidence: "carried-forward: unchanged since window 2 review".to_string(),
+                adverse_condition_evidence: None,
+            }]),
+        };
+
+        assert!(asgard_validate_contract_rows(&decision, &checklist, true).is_empty());
+        let violations = asgard_validate_contract_rows(&decision, &checklist, false);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("cites no execution_ledger entry"));
+    }
+
+    #[test]
+    fn asgard_validate_contract_rows_still_requires_adverse_evidence_for_carried_rows() {
+        let checklist = vec![AsgardTaskContract {
+            id: "C1".to_string(),
+            kind: "execution".to_string(),
+            text: "Shutdown must unblock a pending read.".to_string(),
+            adverse_condition: Some("read is pending when shutdown fires".to_string()),
+        }];
+        let decision = AsgardSupervisorDecision {
+            winner: 0,
+            complete: true,
+            advices: Vec::new(),
+            next_window_steps: None,
+            state_summary: "Complete.".to_string(),
+            contracts: Some(vec![AsgardContractRow {
+                id: "C1".to_string(),
+                status: "verified".to_string(),
+                evidence: "carried-forward: unchanged since window 2 review".to_string(),
+                adverse_condition_evidence: None,
+            }]),
+        };
+
+        let violations = asgard_validate_contract_rows(&decision, &checklist, true);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("has no adverse_condition_evidence"));
     }
 
     #[test]
@@ -19393,6 +19723,8 @@ mod tests {
             "diff --git a/tests/output_test.rs b/tests/output_test.rs\n+assert_eq!()\n".to_string(),
             0,
             "<candidate_trajectories>selected lane</candidate_trajectories>".to_string(),
+            None,
+            String::new(),
         );
 
         let suffix = asgard_message_text(messages.last().expect("terminal message"));
@@ -19403,6 +19735,81 @@ mod tests {
         assert!(suffix.contains("<terminal_test_patch cumulative_from_task_baseline=\"true\">"));
         assert!(suffix.contains("<candidate_trajectories>selected lane</candidate_trajectories>"));
         assert!(suffix.contains("Your select_trajectory call must return one contracts row"));
+    }
+
+    #[test]
+    fn asgard_completion_review_dossier_includes_prior_review_rows_after_checklist() {
+        let checklist = asgard_render_task_contract_checklist(vec![AsgardTaskContract {
+            id: "C1".to_string(),
+            kind: "execution".to_string(),
+            text: "The command must produce the requested output.".to_string(),
+            adverse_condition: None,
+        }]);
+        let prior_review = AsgardPriorCompletionReview {
+            window: 2,
+            rows: vec![AsgardContractRow {
+                id: "C1".to_string(),
+                status: "verified".to_string(),
+                evidence: "L1 exercised output contract".to_string(),
+                adverse_condition_evidence: Some("omitted from prior review message".to_string()),
+            }],
+        };
+
+        let messages = asgard_completion_review_messages(
+            "fix output",
+            &[],
+            &[],
+            &AsgardSupervisorHistory::default(),
+            1,
+            &checklist,
+            &[],
+            "diff --git a/src/lib.rs b/src/lib.rs\n+pub fn output() {}\n".to_string(),
+            "diff --git a/tests/output_test.rs b/tests/output_test.rs\n+assert_eq!()\n".to_string(),
+            0,
+            "<candidate_trajectories>selected lane</candidate_trajectories>".to_string(),
+            Some(&prior_review),
+            "<window_delta window=\"3\">\n+delta text\n</window_delta>".to_string(),
+        );
+
+        let checklist_position = messages
+            .iter()
+            .position(|message| asgard_message_text(message).contains("<task_contract_checklist"))
+            .expect("checklist message");
+        let prior_message = asgard_message_text(&messages[checklist_position + 1]);
+        assert!(prior_message.contains("<prior_review_rows window=\"2\">"));
+        assert!(prior_message.contains("\"id\": \"C1\""));
+        assert!(prior_message.contains("\"status\": \"verified\""));
+        assert!(prior_message.contains("\"evidence\": \"L1 exercised output contract\""));
+        assert!(!prior_message.contains("adverse_condition_evidence"));
+        assert!(prior_message.contains("<prior_review_delta>"));
+        assert!(prior_message.contains("+delta text"));
+
+        let suffix = asgard_message_text(messages.last().expect("terminal message"));
+        assert!(suffix.contains("Keep verified rows terse"));
+        assert!(suffix.contains("carried-forward: unchanged since window N review"));
+
+        let without_prior = asgard_completion_review_messages(
+            "fix output",
+            &[],
+            &[],
+            &AsgardSupervisorHistory::default(),
+            1,
+            &checklist,
+            &[],
+            String::new(),
+            String::new(),
+            0,
+            "<candidate_trajectories>selected lane</candidate_trajectories>".to_string(),
+            None,
+            String::new(),
+        );
+        let rendered_without_prior = without_prior
+            .iter()
+            .map(asgard_message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered_without_prior.contains("<prior_review_rows"));
+        assert!(!rendered_without_prior.contains("<prior_review_delta"));
     }
 
     #[test]
@@ -19679,6 +20086,7 @@ mod tests {
                 audit: None,
                 required_winner: None,
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -19753,13 +20161,14 @@ mod tests {
                 audit: None,
                 required_winner: None,
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
 
-        let decision = decision.expect("supervisor decision");
+        let (decision, _stats) = decision.expect("supervisor decision");
         assert_eq!(decision.winner, 1);
         assert!(!decision.complete);
         assert_eq!(decision.next_window_steps, Some(4));
@@ -19815,13 +20224,14 @@ mod tests {
                 audit: None,
                 required_winner: None,
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
 
-        let decision = decision.expect("supervisor decision");
+        let (decision, _stats) = decision.expect("supervisor decision");
         assert_eq!(decision.winner, 0);
         assert!(decision.complete);
         let requests = backend.requests.lock().expect("request lock");
@@ -19890,13 +20300,14 @@ mod tests {
                 audit: None,
                 required_winner: Some(1),
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
 
-        let decision = decision.expect("completion review decision");
+        let (decision, _stats) = decision.expect("completion review decision");
         assert_eq!(decision.winner, 1);
         assert!(!decision.complete);
         let requests = backend.requests.lock().expect("request lock");
@@ -19986,6 +20397,7 @@ mod tests {
             }),
             required_winner: None,
             checklist_ids: &[],
+            carry_forward_allowed: false,
         };
         let completion_context = AsgardSupervisorToolContext {
             model: "deepseek::deepseek-v4-pro",
@@ -19999,6 +20411,7 @@ mod tests {
             }),
             required_winner: Some(1),
             checklist_ids: &[],
+            carry_forward_allowed: false,
         };
 
         assert_eq!(
@@ -20088,13 +20501,14 @@ mod tests {
                 }),
                 required_winner: None,
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
 
-        assert!(decision.expect("terminal decision").complete);
+        assert!(decision.expect("terminal decision").0.complete);
         let requests = backend.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
         assert!(requests[0].tool_names.contains(&"read_file".to_string()));
@@ -20220,13 +20634,14 @@ mod tests {
                 }),
                 required_winner: None,
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await;
 
-        let decision = decision.expect("selection after retained audit conversation");
+        let (decision, _stats) = decision.expect("selection after retained audit conversation");
         assert_eq!(decision.winner, 0);
         assert!(!decision.complete);
         let requests = backend.requests.lock().expect("request lock");
@@ -20288,6 +20703,7 @@ mod tests {
                 audit: None,
                 required_winner: None,
                 checklist_ids: &[],
+                carry_forward_allowed: false,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
