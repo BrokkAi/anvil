@@ -7141,20 +7141,16 @@ fn asgard_empty_task_contract_checklist() -> AsgardTaskContractChecklist {
     asgard_render_task_contract_checklist(Vec::new())
 }
 
-async fn run_asgard_contract_extraction_call(
+async fn run_asgard_task_contract_extraction(
     llm: &Arc<dyn crate::llm_client::LlmBackend>,
     model: &str,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
-    system_prompt: &str,
-    user_payload: String,
-) -> (
-    Option<Vec<AsgardTaskContract>>,
-    crate::llm_client::TokenUsage,
-) {
+    original_task: &str,
+) -> (AsgardTaskContractChecklist, crate::llm_client::TokenUsage) {
     let mut messages = vec![
-        ChatMessage::system(system_prompt.to_string()),
-        ChatMessage::user(user_payload),
+        ChatMessage::system(ASGARD_CONTRACT_EXTRACTION_PROMPT),
+        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
         ChatMessage::user("Call extract_task_contracts exactly once now. Do not answer in prose."),
     ];
     let tools = vec![asgard_extract_task_contracts_tool()];
@@ -7220,7 +7216,7 @@ async fn run_asgard_contract_extraction_call(
                     ) {
                         Ok(arguments) => match parse_asgard_task_contracts(&arguments.value) {
                             Ok(contracts) => {
-                                return (Some(contracts), usage);
+                                return (asgard_render_task_contract_checklist(contracts), usage);
                             }
                             Err(error) => last_invalid_response = Some(error),
                         },
@@ -7257,93 +7253,14 @@ async fn run_asgard_contract_extraction_call(
 
     tracing::warn!(
         model,
-        "Asgard contract extraction call produced no valid checklist: {:#}",
+        "Asgard task contract extraction failed; continuing with empty checklist: {:#}",
         last_invalid_response.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "contract extractor did not call extract_task_contracts after {ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS} steps"
             )
         })
     );
-    (None, usage)
-}
-
-const ASGARD_CONTRACT_MERGE_PROMPT: &str = "You are given two contract checklists independently extracted from the same software task description by different readers. Produce the unified checklist. Include every stated requirement exactly once: merge entries that express the same requirement, keeping the more precise wording, kind, and adverse_condition. Where the two lists read the same task statement differently — different signatures, argument orders, callback parameter shapes, orderings, or semantics for the same requirement — do not pick one reading: emit one contract per reading, and set each adverse_condition to name the divergent readings so verification must distinguish them. Renumber ids C1 upward. Call extract_task_contracts exactly once. Do not answer in prose.";
-
-async fn run_asgard_task_contract_extraction(
-    llm: &Arc<dyn crate::llm_client::LlmBackend>,
-    model: &str,
-    idle_timeout: IdleTimeouts,
-    cancel: tokio_util::sync::CancellationToken,
-    original_task: &str,
-) -> (AsgardTaskContractChecklist, crate::llm_client::TokenUsage) {
-    // Two independent extraction samples: a single sample commits the whole
-    // run to one reading of every ambiguous requirement, and a confidently
-    // wrong reading cannot flag itself. Disagreement between independent
-    // samples is the ambiguity detector (observed live: the same task's
-    // reading flipped between runs and decided the outcome each time).
-    let payload = format!("ORIGINAL TASK (complete):\n{original_task}");
-    let (first, second) = futures::future::join(
-        run_asgard_contract_extraction_call(
-            llm,
-            model,
-            idle_timeout,
-            cancel.clone(),
-            ASGARD_CONTRACT_EXTRACTION_PROMPT,
-            payload.clone(),
-        ),
-        run_asgard_contract_extraction_call(
-            llm,
-            model,
-            idle_timeout,
-            cancel.clone(),
-            ASGARD_CONTRACT_EXTRACTION_PROMPT,
-            payload,
-        ),
-    )
-    .await;
-    let mut usage = first.1;
-    usage.add(second.1);
-    let merged = match (first.0, second.0) {
-        (Some(a), Some(b)) => {
-            let merge_payload = format!(
-                "ORIGINAL TASK (complete):\n{original_task}\n\nCHECKLIST A:\n{}\n\nCHECKLIST B:\n{}",
-                serde_json::to_string_pretty(&serde_json::json!({ "contracts": a }))
-                    .unwrap_or_default(),
-                serde_json::to_string_pretty(&serde_json::json!({ "contracts": b }))
-                    .unwrap_or_default(),
-            );
-            let (merge, merge_usage) = run_asgard_contract_extraction_call(
-                llm,
-                model,
-                idle_timeout,
-                cancel,
-                ASGARD_CONTRACT_MERGE_PROMPT,
-                merge_payload,
-            )
-            .await;
-            usage.add(merge_usage);
-            match merge {
-                Some(contracts) => Some(contracts),
-                None => {
-                    tracing::warn!(model, "contract ensemble merge failed; using first sample");
-                    Some(a)
-                }
-            }
-        }
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    match merged {
-        Some(contracts) => (asgard_render_task_contract_checklist(contracts), usage),
-        None => {
-            tracing::warn!(
-                model,
-                "Asgard task contract extraction failed in both samples; continuing with empty checklist"
-            );
-            (asgard_empty_task_contract_checklist(), usage)
-        }
-    }
+    (asgard_empty_task_contract_checklist(), usage)
 }
 
 fn asgard_candidate_window_summary_messages(
