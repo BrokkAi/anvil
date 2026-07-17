@@ -1,0 +1,395 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "kind": "inspection",
+      "text": "`createTraitRegistry` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C2",
+      "kind": "inspection",
+      "text": "`snapshotEntity` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C3",
+      "kind": "inspection",
+      "text": "`snapshotWorld` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C4",
+      "kind": "inspection",
+      "text": "`rollbackEntity` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C5",
+      "kind": "inspection",
+      "text": "`rollbackWorld` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C6",
+      "kind": "inspection",
+      "text": "`diffEntitySnapshots` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C7",
+      "kind": "inspection",
+      "text": "`diffWorldSnapshots` is exported from the package's public API.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C8",
+      "kind": "execution",
+      "text": "`createTraitRegistry(...entries)` has the type signature accepting variadic `[string, Trait | Relation]` tuples.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests."
+    },
+    {
+      "id": "C9",
+      "kind": "inspection",
+      "text": "`createTraitRegistry(...entries)` — each tuple's first element (the string) is used as the registry key for the trait or relation in the second element.",
+      "adverse_condition": "Verification requires pairwise distinguishable inputs; a green test with only one entry or entries where key equals trait name cannot distinguish correct positional mapping from a swapped implementation."
+    },
+    {
+      "id": "C10",
+      "kind": "execution",
+      "text": "`createTraitRegistry` throws an `Error` when two or more entries share the same string key.",
+      "adverse_condition": "At least two entries have identical string keys but different trait/relation values."
+    },
+    {
+      "id": "C11",
+      "kind": "execution",
+      "text": "`createTraitRegistry` throws an `Error` when the same `Trait` appears in two or more entries (duplicate traits).",
+      "adverse_condition": "The same Trait reference or value is passed under at least two different keys."
+    },
+    {
+      "id": "C12",
+      "kind": "execution",
+      "text": "`createTraitRegistry` throws an `Error` when the same `Relation` appears in two or more entries (duplicate relations).",
+      "adverse_condition": "The same Relation reference or value is passed under at least two different keys."
+    },
+    {
+      "id": "C13",
+      "kind": "execution",
+      "text": "`snapshotEntity(world, entity, registry)` has the type signature `(world: World, entity: Entity, registry: TraitRegistry) => EntitySnapshot`.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone."
+    },
+    {
+      "id": "C14",
+      "kind": "inspection",
+      "text": "The returned `EntitySnapshot` has the shape `{ id: number, traits: Record<string, object | true>, relations?: Record<string, Array<{ targetId: number, data?: object }>> }`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C15",
+      "kind": "execution",
+      "text": "Tag traits (traits with no associated data) are stored as the literal value `true` in the snapshot's `traits` record.",
+      "adverse_condition": "The entity possesses at least one data trait; testing with only tag traits cannot distinguish correct tag-trait handling from a bug that stores everything as `true` or everything as an object."
+    },
+    {
+      "id": "C16",
+      "kind": "execution",
+      "text": "Data traits (traits with associated data) are stored as deep copies in the snapshot's `traits` record.",
+      "adverse_condition": "The original trait data is mutated after the snapshot is captured; without post-snapshot mutation, a shallow copy or even a reference passes a green test."
+    },
+    {
+      "id": "C17",
+      "kind": "execution",
+      "text": "Relations that have a store (carry data) include the `data` field as a deep copy in each element of the relation's array.",
+      "adverse_condition": "The relation's data is mutated after the snapshot is captured; without post-snapshot mutation, a shallow copy passes."
+    },
+    {
+      "id": "C18",
+      "kind": "inspection",
+      "text": "The `relations` property is omitted entirely from the returned `EntitySnapshot` when the entity has no relations — the key must be absent, not present with an empty object or empty array.",
+      "adverse_condition": "The entity has zero relations; an implementation that stores `relations: {}` or `relations: []` passes a truthiness or iteration check but violates the omission contract."
+    },
+    {
+      "id": "C19",
+      "kind": "execution",
+      "text": "`snapshotEntity` throws an `Error` when the given entity has been destroyed.",
+      "adverse_condition": "The entity argument refers to an entity that was destroyed before the call."
+    },
+    {
+      "id": "C20",
+      "kind": "execution",
+      "text": "`snapshotEntity` throws an `Error` when the entity possesses a trait or relation whose key is not present in the given registry.",
+      "adverse_condition": "The entity has a trait or relation that was not registered via `createTraitRegistry` (or an equivalent registry)."
+    },
+    {
+      "id": "C21",
+      "kind": "execution",
+      "text": "`snapshotWorld(world, registry)` has the type signature `(world: World, registry: TraitRegistry) => { entities: EntitySnapshot[] }`.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone."
+    },
+    {
+      "id": "C22",
+      "kind": "inspection",
+      "text": "`snapshotWorld` returns an object with an `entities` array of `EntitySnapshot` objects.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C23",
+      "kind": "execution",
+      "text": "`snapshotWorld` excludes the internal world entity from the returned `entities` array.",
+      "adverse_condition": "The world contains at least one non-internal entity; testing with a world that only has the internal entity cannot prove exclusion vs. inclusion of that entity."
+    },
+    {
+      "id": "C24",
+      "kind": "execution",
+      "text": "`rollbackEntity(world, entity, registry, snapshot)` has the type signature `(world: World, entity: Entity, registry: TraitRegistry, snapshot: EntitySnapshot) => void`.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone."
+    },
+    {
+      "id": "C25",
+      "kind": "execution",
+      "text": "`rollbackEntity` removes traits and relations the entity currently has that are not present in the snapshot — before adding or updating anything from the snapshot.",
+      "adverse_condition": "The entity has at least one trait or relation not in the snapshot, and the snapshot also adds a trait with the same key but different data; adding first then removing would erase the just-added snapshot value."
+    },
+    {
+      "id": "C26",
+      "kind": "execution",
+      "text": "After removal, `rollbackEntity` adds or updates traits and relations so the entity's state exactly matches the snapshot.",
+      "adverse_condition": "The snapshot contains traits/relations that overlap keys with the entity's pre-rollback state; a partial update or add-without-update-semantics would leave stale data."
+    },
+    {
+      "id": "C27",
+      "kind": "execution",
+      "text": "`rollbackEntity` throws an `Error` when a relation in the snapshot targets an entity ID that does not exist in the world.",
+      "adverse_condition": "The snapshot contains a relation whose `targetId` does not correspond to any existing (non-destroyed) entity in the world at the time of rollback."
+    },
+    {
+      "id": "C28",
+      "kind": "execution",
+      "text": "`rollbackEntity` throws an `Error` when the given entity has been destroyed.",
+      "adverse_condition": "The entity argument refers to an entity that was destroyed before the call."
+    },
+    {
+      "id": "C29",
+      "kind": "execution",
+      "text": "`rollbackEntity` throws an `Error` when the snapshot references a trait or relation key not present in the given registry.",
+      "adverse_condition": "The snapshot's `traits` or `relations` contains a key that was never registered."
+    },
+    {
+      "id": "C30",
+      "kind": "execution",
+      "text": "`rollbackWorld(world, registry, checkpoint)` has the type signature `(world: World, registry: TraitRegistry, checkpoint: { entities: EntitySnapshot[] }) => void`.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone."
+    },
+    {
+      "id": "C31",
+      "kind": "execution",
+      "text": "`rollbackWorld` fully replaces the existing world state — all current entities are destroyed or cleared before reapplying the checkpoint.",
+      "adverse_condition": "The world contains entities not present in the checkpoint; if old entities survive the rollback, the replacement is not full."
+    },
+    {
+      "id": "C32",
+      "kind": "execution",
+      "text": "`rollbackWorld` recreates entities using exactly the same numeric IDs as recorded in the checkpoint's entity snapshots.",
+      "adverse_condition": "The checkpoint contains at least two entities with different IDs; testing with a single entity or all-new IDs cannot distinguish ID-preserving recreation from sequential reassignment."
+    },
+    {
+      "id": "C33",
+      "kind": "execution",
+      "text": "`rollbackWorld` throws an `Error` when the checkpoint references a trait or relation key not present in the given registry.",
+      "adverse_condition": "A snapshot in the checkpoint's `entities` array contains a trait or relation key absent from the registry."
+    },
+    {
+      "id": "C34",
+      "kind": "execution",
+      "text": "`rollbackWorld` throws an `Error` for dangling relation targets — a relation in the checkpoint points to a target entity ID that does not exist among the checkpoint's own entities.",
+      "adverse_condition": "A relation's `targetId` in one snapshot does not match the `id` of any snapshot in the same checkpoint's `entities` array."
+    },
+    {
+      "id": "C35",
+      "kind": "execution",
+      "text": "`diffEntitySnapshots(a, b)` has the type signature `(a: EntitySnapshot, b: EntitySnapshot) => { addedTraits: string[], removedTraits: string[], changedTraits: string[] }`.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone."
+    },
+    {
+      "id": "C36",
+      "kind": "inspection",
+      "text": "`diffEntitySnapshots` returns an object with exactly the three array properties `addedTraits`, `removedTraits`, and `changedTraits`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C37",
+      "kind": "execution",
+      "text": "`diffEntitySnapshots` — `addedTraits` contains trait keys present in `b.traits` but absent in `a.traits`.",
+      "adverse_condition": "Verification requires asymmetric inputs where `b` has traits not in `a`; symmetric or identical snapshots produce empty arrays and cannot distinguish added vs. removed."
+    },
+    {
+      "id": "C38",
+      "kind": "execution",
+      "text": "`diffEntitySnapshots` — `removedTraits` contains trait keys present in `a.traits` but absent in `b.traits`.",
+      "adverse_condition": "Verification requires asymmetric inputs where `a` has traits not in `b`."
+    },
+    {
+      "id": "C39",
+      "kind": "execution",
+      "text": "`diffEntitySnapshots` — `changedTraits` contains trait keys present in both `a.traits` and `b.traits` but whose values differ by shallow equality.",
+      "adverse_condition": "Verification requires a trait present in both snapshots with different shallow values; identical values or deep-only differences incorrectly produce an empty `changedTraits` array."
+    },
+    {
+      "id": "C40",
+      "kind": "execution",
+      "text": "All three arrays (`addedTraits`, `removedTraits`, `changedTraits`) are sorted in ascending alphabetical order.",
+      "adverse_condition": "Two or more entries exist in any category; a single-entry array is trivially sorted and cannot prove the sort implementation."
+    },
+    {
+      "id": "C41",
+      "kind": "execution",
+      "text": "Data comparison for trait values uses shallow equality (e.g., `===` or equivalent), not deep equality.",
+      "adverse_condition": "Two trait values are different object instances with identical deep contents; deep equality would report them as unchanged, shallow equality must report them as changed."
+    },
+    {
+      "id": "C42",
+      "kind": "execution",
+      "text": "`diffEntitySnapshots` throws an `Error` when either `a` or `b` is `null`.",
+      "adverse_condition": "Argument `a` is `null` (and `b` is valid), or `b` is `null` (and `a` is valid), or both are `null`."
+    },
+    {
+      "id": "C43",
+      "kind": "execution",
+      "text": "`diffEntitySnapshots` throws an `Error` when either `a` or `b` is `undefined`.",
+      "adverse_condition": "Argument `a` is `undefined` (and `b` is valid), or `b` is `undefined` (and `a` is valid), or both are `undefined`."
+    },
+    {
+      "id": "C44",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots(before, after)` has the type signature `(before: { entities: EntitySnapshot[] }, after: { entities: EntitySnapshot[] }) => { added: number[], removed: number[], changed: number[] }`.",
+      "adverse_condition": "Verification requires type-checking usage authored from this contract's text alone."
+    },
+    {
+      "id": "C45",
+      "kind": "inspection",
+      "text": "`diffWorldSnapshots` returns an object with exactly the three array properties `added`, `removed`, and `changed`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C46",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots` — `added` contains the `id` values of entities present in `after.entities` but absent from `before.entities`.",
+      "adverse_condition": "Verification requires asymmetric inputs where `after` has entity IDs not in `before`."
+    },
+    {
+      "id": "C47",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots` — `removed` contains the `id` values of entities present in `before.entities` but absent from `after.entities`.",
+      "adverse_condition": "Verification requires asymmetric inputs where `before` has entity IDs not in `after`."
+    },
+    {
+      "id": "C48",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots` — `changed` contains the `id` values of entities present in both snapshots whose trait/relation data differs (by the equality rules below).",
+      "adverse_condition": "An entity exists in both snapshots with identical ID but different trait values; identical snapshots produce empty `changed` and cannot prove detection."
+    },
+    {
+      "id": "C49",
+      "kind": "execution",
+      "text": "All three arrays (`added`, `removed`, `changed`) are sorted in ascending numeric order.",
+      "adverse_condition": "Two or more entity IDs exist in any category; a single-entry array is trivially sorted."
+    },
+    {
+      "id": "C50",
+      "kind": "execution",
+      "text": "Trait key ordering within an entity snapshot does not affect equality — `{ traits: { a: true, b: true } }` is equal to `{ traits: { b: true, a: true } }`.",
+      "adverse_condition": "Two snapshots of the same entity have identical traits but with keys inserted in different order; key iteration order must be normalized or ignored during comparison."
+    },
+    {
+      "id": "C51",
+      "kind": "execution",
+      "text": "Relation key ordering within an entity snapshot does not affect equality — different insertion orders of relation keys are treated as equal.",
+      "adverse_condition": "Two snapshots have the same relations but with keys in different insertion order."
+    },
+    {
+      "id": "C52",
+      "kind": "execution",
+      "text": "Relation target ordering within a single relation's array does not affect equality — `[{ targetId: 1 }, { targetId: 2 }]` is equal to `[{ targetId: 2 }, { targetId: 1 }]`.",
+      "adverse_condition": "A relation's target array has the same elements in different order; element order must be normalized or ignored."
+    },
+    {
+      "id": "C53",
+      "kind": "execution",
+      "text": "Trait and relation data within world-level diffing is compared using shallow equality.",
+      "adverse_condition": "Two trait values are different object instances with identical deep contents; deep equality would report them as unchanged, shallow equality must report them as changed."
+    },
+    {
+      "id": "C54",
+      "kind": "execution",
+      "text": "An entity snapshot with `relations: {}` (empty object) is treated as equivalent to an entity snapshot that has no `relations` key at all.",
+      "adverse_condition": "One snapshot omits `relations` while the other has `relations: {}`; a strict key-presence check would incorrectly report them as different."
+    },
+    {
+      "id": "C55",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots` throws an `Error` if either `before` or `after` is `null`.",
+      "adverse_condition": "Argument `before` is `null` (and `after` is valid), or `after` is `null` (and `before` is valid), or both are `null`."
+    },
+    {
+      "id": "C56",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots` throws an `Error` if either `before` or `after` is `undefined`.",
+      "adverse_condition": "Argument `before` is `undefined` (and `after` is valid), or `after` is `undefined` (and `before` is valid), or both are `undefined`."
+    },
+    {
+      "id": "C57",
+      "kind": "execution",
+      "text": "`diffWorldSnapshots` throws an `Error` if either `before` or `after` lacks an `entities` array property.",
+      "adverse_condition": "One argument is a plain object without an `entities` key, or has `entities` set to a non-array value."
+    },
+    {
+      "id": "C58",
+      "kind": "inspection",
+      "text": "`world.snapshot(registry)` convenience method exists on world instances, delegating to the standalone `snapshotWorld(world, registry)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C59",
+      "kind": "inspection",
+      "text": "`world.rollback(registry, checkpoint)` convenience method exists on world instances, delegating to the standalone `rollbackWorld(world, registry, checkpoint)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C60",
+      "kind": "inspection",
+      "text": "`entity.snapshot(registry)` convenience method exists on entity instances, delegating to the standalone `snapshotEntity(world, entity, registry)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C61",
+      "kind": "inspection",
+      "text": "`entity.rollback(registry, snapshot)` convenience method exists on entity instances, delegating to the standalone `rollbackEntity(world, entity, registry, snapshot)`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C62",
+      "kind": "delivery",
+      "text": "All work is done on a new branch created from `main`.",
+      "adverse_condition": null
+    },
+    {
+      "id": "C63",
+      "kind": "delivery",
+      "text": "All changes are committed when the work is complete.",
+      "adverse_condition": null
+    }
+  ],
+  "_usage": {
+    "prompt_tokens": 1829,
+    "completion_tokens": 11509,
+    "total_tokens": 13338,
+    "prompt_tokens_details": {
+      "cached_tokens": 1152
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 6873
+    },
+    "prompt_cache_hit_tokens": 1152,
+    "prompt_cache_miss_tokens": 677
+  }
+}
