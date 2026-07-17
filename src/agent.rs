@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -5795,11 +5795,23 @@ async fn run_asgard_trajectory_loop(
             session_id,
             "[Asgard synchronizing selected repository state]\n",
         );
-        if let Err(error) =
-            crate::asgard::synchronize_candidate_repositories(&repositories, winner_index)
-        {
-            cleanup_asgard_repositories(&repositories);
-            return (asgard_failure(error), usage_by_model);
+        let sync_started = Instant::now();
+        match crate::asgard::synchronize_candidate_repositories(&repositories, winner_index) {
+            Ok(stats) => crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_repository_sync",
+                "window": window,
+                "elapsed_millis": sync_started.elapsed().as_millis(),
+                "destinations": stats.destinations,
+                "files_copied": stats.files_copied,
+                "bytes_copied": stats.bytes_copied,
+                "entries_removed": stats.entries_removed,
+                "files_unchanged": stats.files_unchanged,
+                "metadata_updated": stats.metadata_updated,
+            })),
+            Err(error) => {
+                cleanup_asgard_repositories(&repositories);
+                return (asgard_failure(error), usage_by_model);
+            }
         }
     }
     let apply_result = crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);

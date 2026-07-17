@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::{fs, io::Write};
+use std::time::Instant;
+use std::{fs, io::Write, thread};
 
 use anyhow::{Context, Result, bail};
 
@@ -325,103 +328,221 @@ impl Drop for TemporaryIndex {
 pub(crate) fn synchronize_candidate_repositories(
     repositories: &[CandidateRepository],
     selected_index: usize,
-) -> Result<()> {
+) -> Result<RepositorySyncStats> {
     let selected = repositories
         .get(selected_index)
         .context("selected Asgard repository index is out of range")?;
-    for (index, repository) in repositories.iter().enumerate() {
-        if index != selected_index {
-            replace_repository_contents(&selected.root, &repository.root)?;
+    let started = Instant::now();
+    let stats = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(repositories.len().saturating_sub(1));
+        for (index, repository) in repositories.iter().enumerate() {
+            if index != selected_index {
+                let source = &selected.root;
+                let destination = &repository.root;
+                handles.push(scope.spawn(move || {
+                    synchronize_directory_contents(source, destination).with_context(|| {
+                        format!(
+                            "synchronize selected Asgard repository {} to {}",
+                            source.display(),
+                            destination.display()
+                        )
+                    })
+                }));
+            }
         }
-    }
-    Ok(())
-}
 
-fn replace_repository_contents(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("Asgard candidate repository has no parent directory")?;
-    let staging = parent.join(format!(".asgard-sync-{}", uuid::Uuid::new_v4()));
-    let _staging_guard = TemporaryDirectory::new(staging.clone());
-    copy_repository(source, &staging)?;
-
-    clear_directory(destination)?;
-    for entry in fs::read_dir(&staging)
-        .with_context(|| format!("read staged Asgard snapshot {}", staging.display()))?
-    {
-        let entry = entry?;
-        fs::rename(entry.path(), destination.join(entry.file_name())).with_context(|| {
-            format!(
-                "install staged Asgard snapshot from {} into {}",
-                staging.display(),
-                destination.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn copy_repository(source: &Path, destination: &Path) -> Result<()> {
-    if try_reflink_copy_repository(source, destination)? {
-        return Ok(());
-    }
-    remove_directory(destination, "failed reflink staging directory");
-    fs::create_dir_all(destination).with_context(|| {
-        format!(
-            "create Asgard repository copy destination {}",
-            destination.display()
-        )
+        let mut total = RepositorySyncStats::default();
+        for handle in handles {
+            let candidate = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Asgard repository sync thread panicked"))??;
+            total.add(candidate);
+            total.destinations += 1;
+        }
+        Ok::<_, anyhow::Error>(total)
     })?;
-    copy_directory_contents(source, destination)
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        destinations = stats.destinations,
+        files_copied = stats.files_copied,
+        bytes_copied = stats.bytes_copied,
+        entries_removed = stats.entries_removed,
+        files_unchanged = stats.files_unchanged,
+        metadata_updated = stats.metadata_updated,
+        "synchronized Asgard candidate repositories"
+    );
+    Ok(stats)
 }
 
-#[cfg(unix)]
-fn try_reflink_copy_repository(source: &Path, destination: &Path) -> Result<bool> {
-    let source_contents = source.join(".");
-    let status = Command::new("cp")
-        .args(["-a", "--reflink=auto", "--"])
-        .arg(&source_contents)
-        .arg(destination)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    Ok(status.success())
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RepositorySyncStats {
+    pub destinations: usize,
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub entries_removed: u64,
+    pub files_unchanged: u64,
+    pub metadata_updated: u64,
 }
 
-#[cfg(not(unix))]
-fn try_reflink_copy_repository(_source: &Path, _destination: &Path) -> Result<bool> {
-    Ok(false)
+impl RepositorySyncStats {
+    fn add(&mut self, other: Self) {
+        self.files_copied += other.files_copied;
+        self.bytes_copied += other.bytes_copied;
+        self.entries_removed += other.entries_removed;
+        self.files_unchanged += other.files_unchanged;
+        self.metadata_updated += other.metadata_updated;
+    }
 }
 
-fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+fn synchronize_directory_contents(
+    source: &Path,
+    destination: &Path,
+) -> Result<RepositorySyncStats> {
+    let mut stats = RepositorySyncStats::default();
+    let mut destination_entries: HashMap<OsString, fs::DirEntry> = fs::read_dir(destination)
+        .with_context(|| format!("read Asgard repository {}", destination.display()))?
+        .map(|entry| entry.map(|entry| (entry.file_name(), entry)))
+        .collect::<std::io::Result<_>>()?;
+
     for entry in fs::read_dir(source)
         .with_context(|| format!("read Asgard repository {}", source.display()))?
     {
         let entry = entry?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            fs::create_dir_all(&destination_path).with_context(|| {
-                format!(
-                    "create Asgard repository directory {}",
-                    destination_path.display()
-                )
-            })?;
-            copy_directory_contents(&source_path, &destination_path)?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source_path, &destination_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&source_path, &destination_path).with_context(|| {
-                format!(
-                    "copy Asgard repository file {} to {}",
-                    source_path.display(),
-                    destination_path.display()
-                )
-            })?;
+        let source_metadata = fs::symlink_metadata(&source_path)?;
+        let destination_entry = destination_entries.remove(&entry.file_name());
+        let destination_metadata = destination_entry
+            .as_ref()
+            .map(|entry| fs::symlink_metadata(entry.path()))
+            .transpose()?;
+
+        if destination_metadata
+            .as_ref()
+            .is_some_and(|metadata| !same_entry_type(&source_metadata, metadata))
+        {
+            remove_entry(&destination_path, destination_metadata.as_ref().unwrap())?;
+            stats.entries_removed += 1;
+        }
+
+        if source_metadata.is_dir() {
+            if destination_metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.is_dir())
+            {
+                fs::create_dir(&destination_path).with_context(|| {
+                    format!(
+                        "create Asgard repository directory {}",
+                        destination_path.display()
+                    )
+                })?;
+            }
+            stats.add(synchronize_directory_contents(
+                &source_path,
+                &destination_path,
+            )?);
+            if !same_permissions(&source_metadata, &fs::metadata(&destination_path)?) {
+                fs::set_permissions(&destination_path, source_metadata.permissions())?;
+                stats.metadata_updated += 1;
+            }
+        } else if source_metadata.file_type().is_symlink() {
+            let same_target = destination_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+                && fs::read_link(&source_path)? == fs::read_link(&destination_path)?;
+            if !same_target {
+                if let Some(metadata) = destination_metadata.as_ref()
+                    && same_entry_type(&source_metadata, metadata)
+                {
+                    remove_entry(&destination_path, metadata)?;
+                    stats.entries_removed += 1;
+                }
+                copy_symlink(&source_path, &destination_path)?;
+                stats.files_copied += 1;
+            } else {
+                stats.files_unchanged += 1;
+            }
+        } else if source_metadata.is_file() {
+            let destination_metadata = destination_metadata
+                .as_ref()
+                .filter(|metadata| metadata.is_file());
+            if destination_metadata
+                .is_some_and(|metadata| same_file_contents(&source_metadata, metadata))
+            {
+                stats.files_unchanged += 1;
+                let destination_metadata = destination_metadata.unwrap();
+                if !same_permissions(&source_metadata, destination_metadata) {
+                    fs::set_permissions(&destination_path, source_metadata.permissions())?;
+                    stats.metadata_updated += 1;
+                }
+            } else {
+                if let Some(metadata) = destination_metadata {
+                    remove_entry(&destination_path, metadata)?;
+                    stats.entries_removed += 1;
+                }
+                copy_file(&source_path, &destination_path, &source_metadata)?;
+                stats.files_copied += 1;
+                stats.bytes_copied += source_metadata.len();
+            }
+        } else {
+            bail!(
+                "unsupported special file in Asgard repository: {}",
+                source_path.display()
+            );
         }
     }
+
+    for (_, entry) in destination_entries {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        remove_entry(&entry.path(), &metadata)?;
+        stats.entries_removed += 1;
+    }
+    Ok(stats)
+}
+
+fn same_entry_type(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.is_dir() == right.is_dir()
+        && left.is_file() == right.is_file()
+        && left.file_type().is_symlink() == right.file_type().is_symlink()
+}
+
+fn same_file_contents(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+#[cfg(unix)]
+fn same_permissions(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.mode() == right.mode()
+}
+
+#[cfg(not(unix))]
+fn same_permissions(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.permissions().readonly() == right.permissions().readonly()
+}
+
+fn copy_file(source: &Path, destination: &Path, source_metadata: &fs::Metadata) -> Result<()> {
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "copy Asgard repository file {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    fs::set_permissions(destination, source_metadata.permissions())?;
+    fs::File::open(destination)?
+        .set_times(fs::FileTimes::new().set_modified(source_metadata.modified()?))?;
     Ok(())
+}
+
+fn remove_entry(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .with_context(|| format!("remove stale Asgard repository entry {}", path.display()))
 }
 
 #[cfg(unix)]
@@ -450,38 +571,6 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
             destination.display()
         )
     })
-}
-
-fn clear_directory(path: &Path) -> Result<()> {
-    for entry in
-        fs::read_dir(path).with_context(|| format!("read Asgard repository {}", path.display()))?
-    {
-        let entry = entry?;
-        let entry_path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() && !file_type.is_symlink() {
-            fs::remove_dir_all(&entry_path)?;
-        } else {
-            fs::remove_file(&entry_path)?;
-        }
-    }
-    Ok(())
-}
-
-struct TemporaryDirectory {
-    path: PathBuf,
-}
-
-impl TemporaryDirectory {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for TemporaryDirectory {
-    fn drop(&mut self) {
-        remove_directory(&self.path, "temporary Asgard directory");
-    }
 }
 
 pub(crate) fn remove_candidate_repository(repository: &CandidateRepository) {
@@ -776,5 +865,103 @@ mod tests {
         for repository in &repositories {
             remove_candidate_repository(repository);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_sync_skips_matching_files_and_applies_metadata_deltas() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+
+        let set_mtime = |path: &Path, seconds| {
+            fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        };
+
+        fs::write(source.join("unchanged.txt"), "same\n").unwrap();
+        fs::write(destination.join("unchanged.txt"), "same\n").unwrap();
+        set_mtime(&source.join("unchanged.txt"), 10);
+        set_mtime(&destination.join("unchanged.txt"), 10);
+        let unchanged_inode = fs::metadata(destination.join("unchanged.txt"))
+            .unwrap()
+            .ino();
+
+        fs::write(source.join("changed.txt"), "new!\n").unwrap();
+        fs::write(destination.join("changed.txt"), "old!\n").unwrap();
+        set_mtime(&source.join("changed.txt"), 20);
+        set_mtime(&destination.join("changed.txt"), 10);
+
+        fs::write(source.join("executable.sh"), "echo ok\n").unwrap();
+        fs::write(destination.join("executable.sh"), "echo ok\n").unwrap();
+        set_mtime(&source.join("executable.sh"), 10);
+        set_mtime(&destination.join("executable.sh"), 10);
+        fs::set_permissions(
+            source.join("executable.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::set_permissions(
+            destination.join("executable.sh"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        fs::write(source.join("was-directory"), "now a file\n").unwrap();
+        fs::create_dir(destination.join("was-directory")).unwrap();
+        fs::write(destination.join("was-directory/stale.txt"), "stale\n").unwrap();
+        fs::write(destination.join("nested/remove-me.txt"), "stale\n").unwrap();
+
+        std::os::unix::fs::symlink("new-target", source.join("link")).unwrap();
+        std::os::unix::fs::symlink("old-target", destination.join("link")).unwrap();
+
+        let stats = synchronize_directory_contents(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::metadata(destination.join("unchanged.txt"))
+                .unwrap()
+                .ino(),
+            unchanged_inode,
+            "matching metadata should avoid replacing the destination file"
+        );
+        assert_text_file_eq(&destination.join("changed.txt"), "new!\n");
+        assert_eq!(
+            fs::metadata(destination.join("changed.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            fs::metadata(source.join("changed.txt"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        assert_eq!(
+            fs::metadata(destination.join("executable.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_text_file_eq(&destination.join("was-directory"), "now a file\n");
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            Path::new("new-target")
+        );
+        assert!(!destination.join("nested/remove-me.txt").exists());
+        assert!(stats.files_unchanged >= 2);
+        assert!(stats.files_copied >= 3);
+        assert!(stats.entries_removed >= 3);
+        assert_eq!(stats.metadata_updated, 1);
     }
 }
