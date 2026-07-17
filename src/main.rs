@@ -87,9 +87,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     max_turns: usize,
 
-    /// Candidate model for Asgard trajectory search. Repeat for arbitrary
-    /// candidate counts; all candidates currently require provider-qualified
-    /// model wire ids (for example `deepseek::deepseek-v4-flash`).
+    /// Candidate model for Asgard trajectory search. Repeat to configure an
+    /// ordered pool of up to five lanes; the supervisor chooses how many of
+    /// the pool's leading lanes to launch each window. All candidates require
+    /// provider-qualified model wire ids (for example
+    /// `deepseek::deepseek-v4-flash`).
     #[arg(long = "asgard-model")]
     asgard_models: Vec<String>,
 

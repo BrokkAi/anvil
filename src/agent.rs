@@ -81,6 +81,7 @@ use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, Handled, Responder, on_receive_dispatch,
     on_receive_notification, on_receive_request,
 };
+use anyhow::Context as _;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
@@ -4887,6 +4888,51 @@ struct AsgardCandidate {
     window_ledger: AsgardExecutionLedger,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AsgardCandidateDiffBase {
+    LastSelectedDecision,
+    CurrentWindowLane(usize),
+}
+
+impl AsgardCandidateDiffBase {
+    fn label(&self) -> String {
+        match self {
+            Self::LastSelectedDecision => "last_selected_decision".to_string(),
+            Self::CurrentWindowLane(lane) => format!("current_window_lane_{lane}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsgardCandidateDiffView {
+    candidate_index: usize,
+    base: AsgardCandidateDiffBase,
+    patch: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsgardDiffPresentation {
+    views: Vec<AsgardCandidateDiffView>,
+    anchor_lane: Option<usize>,
+    baseline_sum_bytes: usize,
+    best_candidate_sum_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct AsgardDiffCandidateInput {
+    index: usize,
+    patch: Vec<u8>,
+    delta_patch: Vec<u8>,
+    repository_root: PathBuf,
+    base_commit: String,
+}
+
+struct AsgardCandidateDiffRow {
+    anchor_lane: usize,
+    sum_bytes: usize,
+    patches: Vec<(usize, Vec<u8>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardLedgerEntry {
     id: String,
@@ -4964,6 +5010,7 @@ struct AsgardSupervisorDecision {
     winner: usize,
     complete: bool,
     advices: Vec<Option<String>>,
+    next_candidate_count: Option<usize>,
     next_window_steps: Option<usize>,
     state_summary: String,
     contracts: Option<Vec<AsgardContractRow>>,
@@ -5007,12 +5054,15 @@ struct AsgardContractRow {
 }
 
 const ASGARD_INITIAL_ADVICE_MAX_ATTEMPTS: usize = 2;
-const ASGARD_MIN_WINDOW_STEPS: usize = 3;
-const ASGARD_MAX_WINDOW_STEPS: usize = 12;
+const ASGARD_MIN_CANDIDATES: usize = 1;
+const ASGARD_MAX_CANDIDATES: usize = 5;
+const ASGARD_MIN_WINDOW_STEPS: usize = 1;
+const ASGARD_MAX_WINDOW_STEPS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AsgardSupervisorInitialAdvice {
     advices: Vec<Option<String>>,
+    next_candidate_count: usize,
     next_window_steps: usize,
     state_summary: String,
 }
@@ -5042,6 +5092,16 @@ async fn run_asgard_trajectory_loop(
     let mut usage_by_model = BTreeMap::new();
     if let Err(error) = crate::asgard::ensure_compatible_checkout(parent_registry.cwd()) {
         return (asgard_failure(error), usage_by_model);
+    }
+    if !(ASGARD_MIN_CANDIDATES..=ASGARD_MAX_CANDIDATES).contains(&config.candidate_models.len()) {
+        return (
+            asgard_failure(anyhow::anyhow!(
+                "Asgard requires between {ASGARD_MIN_CANDIDATES} and \
+                 {ASGARD_MAX_CANDIDATES} configured candidate models (got {})",
+                config.candidate_models.len()
+            )),
+            usage_by_model,
+        );
     }
     let mut repositories = Vec::with_capacity(config.candidate_models.len());
     for (index, model) in config.candidate_models.iter().enumerate() {
@@ -5147,16 +5207,34 @@ async fn run_asgard_trajectory_loop(
     let initial_advice = match initial_advice {
         Some(value) => value,
         None => {
-            cleanup_asgard_repositories(&repositories);
             let error = initial_advice_error
                 .unwrap_or_else(|| anyhow::anyhow!("supervisor produced no initial advice"));
-            let mut outcome = asgard_failure(anyhow::anyhow!(
-                "supervisor produced no valid initial Asgard advice: {error:#}"
-            ));
-            outcome.usage = aggregate_usage;
-            return (outcome, usage_by_model);
+            tracing::warn!(
+                "Asgard initial supervisor exhausted validation retries; \
+                 continuing with one short candidate window: {error:#}"
+            );
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_supervisor_fallback",
+                "call": "initial_advice",
+                "error": format!("{error:#}"),
+                "next_candidate_count": ASGARD_MIN_CANDIDATES,
+                "next_window_steps": ASGARD_MIN_WINDOW_STEPS,
+            }));
+            AsgardSupervisorInitialAdvice {
+                advices: vec![Some(
+                    "The supervisor could not produce a valid initial routing decision. \
+                     Inspect the task and repository, identify the most consequential \
+                     next action, and make concrete progress before the next review."
+                        .to_string(),
+                )],
+                next_candidate_count: ASGARD_MIN_CANDIDATES,
+                next_window_steps: ASGARD_MIN_WINDOW_STEPS,
+                state_summary: "Initial supervisor routing failed validation; using a traced one-lane recovery window."
+                    .to_string(),
+            }
         }
     };
+    let mut current_candidate_count = initial_advice.next_candidate_count;
     let mut current_window_steps = initial_advice.next_window_steps;
     let mut consecutive_winner_failures = 0usize;
     let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
@@ -5165,7 +5243,8 @@ async fn run_asgard_trajectory_loop(
         cx,
         session_id,
         &format!(
-            "[Asgard initial strategies: next window = {} steps]\n{}\n{}\n",
+            "[Asgard initial strategies: next window = {} candidates × {} steps]\n{}\n{}\n",
+            current_candidate_count,
             current_window_steps,
             initial_advice.state_summary,
             render_asgard_lane_advices(&initial_advice.advices)
@@ -5181,8 +5260,7 @@ async fn run_asgard_trajectory_loop(
             session_id,
             &format!(
                 "\n[Asgard window {window}: {} candidates × {} steps]\n",
-                config.candidate_models.len(),
-                current_window_steps
+                current_candidate_count, current_window_steps
             ),
         );
         let mut futures = Vec::with_capacity(repositories.len());
@@ -5191,6 +5269,7 @@ async fn run_asgard_trajectory_loop(
             .iter()
             .zip(&repositories)
             .zip(&registries)
+            .take(current_candidate_count)
             .enumerate()
         {
             let mut messages = common_messages.clone();
@@ -5325,7 +5404,7 @@ async fn run_asgard_trajectory_loop(
                 )
             });
         }
-        let mut candidates = Vec::with_capacity(futures.len());
+        let mut candidates = Vec::with_capacity(current_candidate_count);
         for (
             index,
             model,
@@ -5375,8 +5454,10 @@ async fn run_asgard_trajectory_loop(
             cancel.clone(),
             window,
             &candidates,
-            &registries,
+            &repositories[..current_candidate_count],
+            &registries[..current_candidate_count],
             &supervisor_audit_definitions,
+            config.candidate_models.len(),
             &task_contract_checklist,
             &original_task,
             &selected_trajectory_initial,
@@ -5397,27 +5478,45 @@ async fn run_asgard_trajectory_loop(
                 tracing::warn!(
                     window,
                     model = supervisor_model,
-                    "Asgard supervisor produced no valid decision: {error:#}"
+                    "Asgard supervisor exhausted validation retries; continuing with a traced one-lane fallback: {error:#}"
                 );
-                let apply_result =
-                    crate::asgard::apply_selected_patch(parent_registry.cwd(), &common_patch);
-                cleanup_asgard_repositories(&repositories);
-                if let Err(apply_error) = apply_result {
-                    let mut outcome = asgard_failure(anyhow::anyhow!(
-                        "supervisor failed in window {window} ({error:#}) and applying the last accepted incumbent also failed: {apply_error:#}"
-                    ));
-                    outcome.usage = aggregate_usage;
-                    return (outcome, usage_by_model);
+                let winner = candidates
+                    .iter()
+                    .find(|candidate| {
+                        !matches!(
+                            candidate.outcome.stop,
+                            crate::tool_loop::LoopStop::Failed(_)
+                        )
+                    })
+                    .map_or(0, |candidate| candidate.index);
+                crate::trace_logging::append_trace_record(serde_json::json!({
+                    "type": "asgard_supervisor_fallback",
+                    "call": "supervisor",
+                    "window": window,
+                    "error": format!("{error:#}"),
+                    "winner": winner,
+                    "next_candidate_count": ASGARD_MIN_CANDIDATES,
+                    "next_window_steps": ASGARD_MIN_WINDOW_STEPS,
+                }));
+                AsgardSupervisorDecision {
+                    winner,
+                    complete: false,
+                    advices: vec![Some(
+                        "The supervisor could not produce a valid routing decision. \
+                         Reassess the current implementation against the task, fix the \
+                         clearest remaining defect, and report focused verification."
+                            .to_string(),
+                    )],
+                    next_candidate_count: Some(ASGARD_MIN_CANDIDATES),
+                    next_window_steps: Some(ASGARD_MIN_WINDOW_STEPS),
+                    state_summary: format!(
+                        "Window {window} supervisor routing failed validation; selected the first non-failed lane and scheduled a one-lane recovery window."
+                    ),
+                    contracts: None,
                 }
-                let mut outcome = asgard_failure(anyhow::anyhow!(
-                    "supervisor produced no valid decision for window {window}; preserved the last accepted incumbent: {error:#}"
-                ));
-                outcome.usage = aggregate_usage;
-                return (outcome, usage_by_model);
             }
         };
         let mut accepted_completion_review_rows: Option<Vec<AsgardContractRow>> = None;
-        let mut decision_was_review = false;
         if decision.complete {
             send_thought(
                 cx,
@@ -5436,8 +5535,9 @@ async fn run_asgard_trajectory_loop(
                     window,
                     selected_lane: decision.winner,
                     candidates: &candidates,
-                    registries: &registries,
+                    registries: &registries[..current_candidate_count],
                     audit_definitions: &supervisor_audit_definitions,
+                    max_candidate_count: config.candidate_models.len(),
                     task_contract_checklist: &task_contract_checklist,
                     canonical_ledger: &canonical_ledger,
                     original_task: &original_task,
@@ -5455,7 +5555,6 @@ async fn run_asgard_trajectory_loop(
                 .entry(supervisor_model.to_string())
                 .or_default()
                 .add(completion_review.1);
-            decision_was_review = true;
             decision = match completion_review.0 {
                 Ok(review) => {
                     accepted_completion_review_rows = review
@@ -5487,7 +5586,8 @@ async fn run_asgard_trajectory_loop(
                     AsgardSupervisorDecision {
                         winner: decision.winner,
                         complete: false,
-                        advices: vec![Some(advice); candidates.len()],
+                        advices: vec![Some(advice)],
+                        next_candidate_count: Some(ASGARD_MIN_CANDIDATES),
                         next_window_steps: Some(ASGARD_MIN_WINDOW_STEPS),
                         state_summary: format!(
                             "Completion review failed to produce a valid decision in \
@@ -5520,36 +5620,30 @@ async fn run_asgard_trajectory_loop(
                 })
                 .collect::<serde_json::Map<_, _>>(),
         }));
+        crate::trace_logging::append_trace_record(serde_json::json!({
+            "type": "asgard_window",
+            "window": window,
+            "candidate_count": candidates.len(),
+            "window_steps": current_window_steps,
+        }));
         let winner_index = decision.winner;
         let supervisor_complete = decision.complete;
         let supervisor_completion_summary = decision.state_summary.clone();
         current_supervisor_state_summary = decision.state_summary.clone();
         next_advices = Some(decision.advices.clone());
         if !supervisor_complete && let Some(advices) = &next_advices {
+            current_candidate_count = decision
+                .next_candidate_count
+                .expect("incomplete Asgard decision has next_candidate_count");
             current_window_steps = decision
                 .next_window_steps
                 .expect("incomplete Asgard decision has next_window_steps");
-            if decision_was_review {
-                // A rejected completion review enumerates its evidence gaps; a
-                // 3-step verification window closes only two or three of them,
-                // producing multi-cycle claim-reject grinds on correct
-                // endpoints (observed live: nine cycles over 37 minutes).
-                // Size the verification window to the deficit instead.
-                let evidence_gaps = decision
-                    .contracts
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|row| row.status != "verified")
-                    .count();
-                current_window_steps =
-                    current_window_steps.max(evidence_gaps.min(ASGARD_MAX_WINDOW_STEPS));
-            }
             send_thought(
                 cx,
                 session_id,
                 &format!(
-                    "[Asgard next-window strategies: next window = {} steps]\n{}\n",
+                    "[Asgard next-window strategies: next window = {} candidates × {} steps]\n{}\n",
+                    current_candidate_count,
                     current_window_steps,
                     render_asgard_lane_advices(advices)
                 ),
@@ -5746,6 +5840,7 @@ async fn run_asgard_initial_advice(
         AsgardSupervisorToolContext {
             model,
             candidate_count,
+            max_candidate_count: candidate_count,
             idle_timeout,
             audit: None,
             required_winner: None,
@@ -5758,6 +5853,170 @@ async fn run_asgard_initial_advice(
     .await
 }
 
+fn default_asgard_diff_presentation(candidates: &[AsgardCandidate]) -> AsgardDiffPresentation {
+    AsgardDiffPresentation {
+        views: candidates
+            .iter()
+            .map(|candidate| AsgardCandidateDiffView {
+                candidate_index: candidate.index,
+                base: AsgardCandidateDiffBase::LastSelectedDecision,
+                patch: candidate.delta_patch.clone(),
+            })
+            .collect(),
+        anchor_lane: None,
+        baseline_sum_bytes: candidates.iter().fold(0usize, |sum, candidate| {
+            sum.saturating_add(candidate.delta_patch.len())
+        }),
+        best_candidate_sum_bytes: None,
+    }
+}
+
+fn select_asgard_diff_anchor(
+    baseline_sum_bytes: usize,
+    candidate_sums: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    if baseline_sum_bytes == 0 || candidate_sums.len() < 2 {
+        return None;
+    }
+    let &(lane, sum) = candidate_sums
+        .iter()
+        .min_by_key(|(lane, sum)| (*sum, *lane))?;
+    ((sum as u128) * 10 < (baseline_sum_bytes as u128) * 4).then_some((lane, sum))
+}
+
+fn build_asgard_diff_presentation(
+    mut inputs: Vec<AsgardDiffCandidateInput>,
+) -> anyhow::Result<AsgardDiffPresentation> {
+    inputs.sort_by_key(|candidate| candidate.index);
+    let baseline_sum_bytes = inputs.iter().fold(0usize, |sum, candidate| {
+        sum.saturating_add(candidate.delta_patch.len())
+    });
+    if inputs.len() < 2 || baseline_sum_bytes == 0 {
+        return Ok(AsgardDiffPresentation {
+            views: inputs
+                .into_iter()
+                .map(|candidate| AsgardCandidateDiffView {
+                    candidate_index: candidate.index,
+                    base: AsgardCandidateDiffBase::LastSelectedDecision,
+                    patch: candidate.delta_patch,
+                })
+                .collect(),
+            anchor_lane: None,
+            baseline_sum_bytes,
+            best_candidate_sum_bytes: None,
+        });
+    }
+
+    let mut candidate_sums = Vec::with_capacity(inputs.len());
+    let mut best_row: Option<AsgardCandidateDiffRow> = None;
+    for anchor in &inputs {
+        let mut sum = 0usize;
+        let mut row = Vec::with_capacity(inputs.len());
+        for candidate in &inputs {
+            let patch = if candidate.index == anchor.index {
+                Vec::new()
+            } else {
+                crate::asgard::capture_patch_since(
+                    &candidate.repository_root,
+                    &candidate.base_commit,
+                    &anchor.patch,
+                )
+                .with_context(|| {
+                    format!(
+                        "capture Asgard diff from current-window lane {} to lane {}",
+                        anchor.index, candidate.index
+                    )
+                })?
+            };
+            sum = sum.saturating_add(patch.len());
+            row.push((candidate.index, patch));
+        }
+        candidate_sums.push((anchor.index, sum));
+        if best_row
+            .as_ref()
+            .is_none_or(|best| (sum, anchor.index) < (best.sum_bytes, best.anchor_lane))
+        {
+            best_row = Some(AsgardCandidateDiffRow {
+                anchor_lane: anchor.index,
+                sum_bytes: sum,
+                patches: row,
+            });
+        }
+    }
+
+    let Some((anchor_lane, best_candidate_sum_bytes)) =
+        select_asgard_diff_anchor(baseline_sum_bytes, &candidate_sums)
+    else {
+        return Ok(AsgardDiffPresentation {
+            views: inputs
+                .into_iter()
+                .map(|candidate| AsgardCandidateDiffView {
+                    candidate_index: candidate.index,
+                    base: AsgardCandidateDiffBase::LastSelectedDecision,
+                    patch: candidate.delta_patch,
+                })
+                .collect(),
+            anchor_lane: None,
+            baseline_sum_bytes,
+            best_candidate_sum_bytes: candidate_sums
+                .iter()
+                .min_by_key(|(lane, sum)| (*sum, *lane))
+                .map(|(_, sum)| *sum),
+        });
+    };
+    let best_row = best_row.expect("candidate sums have a best diff row");
+    let anchor = inputs
+        .iter()
+        .find(|candidate| candidate.index == anchor_lane)
+        .expect("selected Asgard diff anchor exists");
+    let mut views = Vec::with_capacity(inputs.len());
+    views.push(AsgardCandidateDiffView {
+        candidate_index: anchor_lane,
+        base: AsgardCandidateDiffBase::LastSelectedDecision,
+        patch: anchor.delta_patch.clone(),
+    });
+    views.extend(
+        best_row
+            .patches
+            .into_iter()
+            .filter(|(candidate_index, _)| *candidate_index != anchor_lane)
+            .map(|(candidate_index, patch)| AsgardCandidateDiffView {
+                candidate_index,
+                base: AsgardCandidateDiffBase::CurrentWindowLane(anchor_lane),
+                patch,
+            }),
+    );
+    Ok(AsgardDiffPresentation {
+        views,
+        anchor_lane: Some(anchor_lane),
+        baseline_sum_bytes,
+        best_candidate_sum_bytes: Some(best_candidate_sum_bytes),
+    })
+}
+
+fn asgard_diff_baseline_trace_record(
+    window: usize,
+    presentation: &AsgardDiffPresentation,
+    fallback: Option<(&str, &str)>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "asgard_diff_baseline",
+        "window": window,
+        "mode": if presentation.anchor_lane.is_some() {
+            "current_window_candidate"
+        } else {
+            "last_selected_decision"
+        },
+        "anchor_lane": presentation.anchor_lane,
+        "baseline_sum_bytes": presentation.baseline_sum_bytes,
+        "best_candidate_sum_bytes": presentation.best_candidate_sum_bytes,
+        "threshold_numerator": 2,
+        "threshold_denominator": 5,
+        "fallback_reason": fallback.map(|(reason, _)| reason),
+        "fallback_error": fallback.map(|(_, error)| error),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_asgard_supervisor(
     llm: &Arc<dyn crate::llm_client::LlmBackend>,
@@ -5766,8 +6025,10 @@ async fn run_asgard_supervisor(
     cancel: tokio_util::sync::CancellationToken,
     window: usize,
     candidates: &[AsgardCandidate],
+    repositories: &[crate::asgard::CandidateRepository],
     registries: &[Arc<crate::tools::ToolRegistry>],
     audit_definitions: &[ToolDefinition],
+    max_candidate_count: usize,
     task_contract_checklist: &AsgardTaskContractChecklist,
     original_task: &str,
     selected_trajectory_initial: &[ChatMessage],
@@ -5779,14 +6040,92 @@ async fn run_asgard_supervisor(
     crate::llm_client::TokenUsage,
 ) {
     debug_assert_eq!(candidates.len(), registries.len());
+    debug_assert_eq!(candidates.len(), repositories.len());
     let audit = AsgardAuditContext {
         registries,
         candidates,
         definitions: audit_definitions.to_vec(),
         allowed_lane: None,
     };
+    let diff_inputs = candidates
+        .iter()
+        .map(|candidate| {
+            let repository = repositories.get(candidate.index).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Asgard lane {} has no candidate repository",
+                    candidate.index
+                )
+            })?;
+            Ok(AsgardDiffCandidateInput {
+                index: candidate.index,
+                patch: candidate.patch.clone(),
+                delta_patch: candidate.delta_patch.clone(),
+                repository_root: repository.root.clone(),
+                base_commit: repository.base_commit.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>();
+    let mut diff_fallback: Option<(&'static str, String)> = None;
+    let diff_presentation = match diff_inputs {
+        Ok(inputs) => {
+            match tokio::task::spawn_blocking(move || build_asgard_diff_presentation(inputs)).await
+            {
+                Ok(Ok(presentation)) => presentation,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        window,
+                        "failed to build candidate-relative Asgard diffs; using the last selected decision as every lane's baseline: {error:#}"
+                    );
+                    diff_fallback = Some(("pairwise_diff_error", format!("{error:#}")));
+                    default_asgard_diff_presentation(candidates)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        window,
+                        "candidate-relative Asgard diff task failed; using the last selected decision as every lane's baseline: {error}"
+                    );
+                    diff_fallback = Some(("pairwise_diff_task_error", error.to_string()));
+                    default_asgard_diff_presentation(candidates)
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                window,
+                "candidate-relative Asgard diff inputs were incomplete; using the last selected decision as every lane's baseline: {error:#}"
+            );
+            diff_fallback = Some(("pairwise_diff_input_error", format!("{error:#}")));
+            default_asgard_diff_presentation(candidates)
+        }
+    };
+    crate::trace_logging::append_trace_record(asgard_diff_baseline_trace_record(
+        window,
+        &diff_presentation,
+        diff_fallback
+            .as_ref()
+            .map(|(reason, error)| (*reason, error.as_str())),
+    ));
     let mut candidate_trajectories = format!("<candidate_trajectories window=\"{window}\">\n");
-    for candidate in candidates {
+    if let Some(anchor_lane) = diff_presentation.anchor_lane {
+        candidate_trajectories.push_str(&format!(
+            "<candidate_diff_baseline mode=\"current_window_candidate\" anchor_lane=\"{anchor_lane}\">\n\
+             Lane {anchor_lane} is shown first as a diff-compression anchor only. Its diff is against the last selected decision; every other lane's diff is against lane {anchor_lane}. All lanes still started independently from the last selected decision.\n\
+             </candidate_diff_baseline>\n"
+        ));
+    }
+    for diff_view in &diff_presentation.views {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.index == diff_view.candidate_index)
+        else {
+            return (
+                Err(anyhow::anyhow!(
+                    "Asgard diff presentation references unknown lane {}",
+                    diff_view.candidate_index
+                )),
+                crate::llm_client::TokenUsage::default(),
+            );
+        };
         let Some(registry) = registries.get(candidate.index) else {
             return (
                 Err(anyhow::anyhow!(
@@ -5796,7 +6135,12 @@ async fn run_asgard_supervisor(
                 crate::llm_client::TokenUsage::default(),
             );
         };
-        match render_asgard_candidate_trajectory(candidate, registry) {
+        match render_asgard_candidate_trajectory(
+            candidate,
+            registry.cwd(),
+            &diff_view.base.label(),
+            &diff_view.patch,
+        ) {
             Ok(trajectory) => candidate_trajectories.push_str(&trajectory),
             Err(error) => {
                 return (Err(error), crate::llm_client::TokenUsage::default());
@@ -5809,7 +6153,10 @@ async fn run_asgard_supervisor(
         selected_trajectory_initial,
         selected_trajectory_windows,
         supervisor_history,
-        candidates.len(),
+        AsgardCandidateCounts {
+            current: candidates.len(),
+            max: max_candidate_count,
+        },
         task_contract_checklist,
         candidate_trajectories,
     );
@@ -5832,6 +6179,7 @@ async fn run_asgard_supervisor(
         AsgardSupervisorToolContext {
             model,
             candidate_count: candidates.len(),
+            max_candidate_count,
             idle_timeout,
             audit: Some(audit),
             required_winner: None,
@@ -5853,6 +6201,7 @@ struct AsgardCompletionReviewContext<'a> {
     candidates: &'a [AsgardCandidate],
     registries: &'a [Arc<crate::tools::ToolRegistry>],
     audit_definitions: &'a [ToolDefinition],
+    max_candidate_count: usize,
     task_contract_checklist: &'a AsgardTaskContractChecklist,
     canonical_ledger: &'a [(usize, AsgardExecutionLedger)],
     original_task: &'a str,
@@ -5880,6 +6229,7 @@ async fn run_asgard_completion_review(
         candidates,
         registries,
         audit_definitions,
+        max_candidate_count,
         task_contract_checklist,
         canonical_ledger,
         original_task,
@@ -5925,7 +6275,12 @@ async fn run_asgard_completion_review(
     } else {
         terminal_test_patch
     };
-    let candidate_trajectory = match render_asgard_candidate_trajectory(candidate, registry) {
+    let candidate_trajectory = match render_asgard_candidate_trajectory(
+        candidate,
+        registry.cwd(),
+        "last_selected_decision",
+        &candidate.delta_patch,
+    ) {
         Ok(trajectory) => format!(
             "<candidate_trajectories window=\"{window}\">\n{trajectory}</candidate_trajectories>"
         ),
@@ -5957,6 +6312,7 @@ async fn run_asgard_completion_review(
         selected_trajectory_windows,
         supervisor_history,
         candidates.len(),
+        max_candidate_count,
         task_contract_checklist,
         canonical_ledger,
         terminal_non_test_patch,
@@ -5981,6 +6337,7 @@ async fn run_asgard_completion_review(
         AsgardSupervisorToolContext {
             model,
             candidate_count: candidates.len(),
+            max_candidate_count,
             idle_timeout,
             audit: Some(audit),
             required_winner: Some(selected_lane),
@@ -5996,7 +6353,9 @@ async fn run_asgard_completion_review(
 
 fn render_asgard_candidate_trajectory(
     candidate: &AsgardCandidate,
-    registry: &crate::tools::ToolRegistry,
+    worktree: &Path,
+    diff_base: &str,
+    diff_patch: &[u8],
 ) -> anyhow::Result<String> {
     let trajectory = render_asgard_dossier_messages(&candidate.supervisor_window_messages);
     let candidate_changed_production_files = asgard_patch_production_inventory(&candidate.patch);
@@ -6046,7 +6405,7 @@ fn render_asgard_candidate_trajectory(
         "\n<lane_trajectory index=\"{}\" model=\"{}\" worktree=\"{}\" stop=\"{:?}\">\n\
          <candidate_patch_manifest derived_from_full_patch=\"true\">\n{}\n\
          </candidate_patch_manifest>\n\
-         <candidate_window_diff base=\"last_selected_decision\" bytes=\"{}\">\n{}\n\
+         <candidate_window_diff base=\"{}\" bytes=\"{}\">\n{}\n\
          </candidate_window_diff>\n\
          <execution_ledger mechanically_derived=\"true\" source=\"lane tool calls, not candidate claims\">\n{}\n\
          </execution_ledger>\n\
@@ -6054,11 +6413,12 @@ fn render_asgard_candidate_trajectory(
          <window_trajectory>\n{}\n</window_trajectory>\n</lane_trajectory>\n",
         candidate.index,
         candidate.model,
-        registry.cwd().display(),
+        worktree.display(),
         candidate.outcome.stop,
         candidate_patch_manifest,
-        candidate.delta_patch.len(),
-        String::from_utf8_lossy(&candidate.delta_patch),
+        diff_base,
+        diff_patch.len(),
+        String::from_utf8_lossy(diff_patch),
         execution_ledger,
         files_edited_after_last_command,
         trajectory,
@@ -6068,6 +6428,7 @@ fn render_asgard_candidate_trajectory(
 struct AsgardSupervisorToolContext<'a> {
     model: &'a str,
     candidate_count: usize,
+    max_candidate_count: usize,
     idle_timeout: IdleTimeouts,
     audit: Option<AsgardAuditContext<'a>>,
     required_winner: Option<usize>,
@@ -6200,7 +6561,7 @@ async fn run_asgard_initial_advice_tool_steps(
     crate::llm_client::TokenUsage,
 ) {
     const MAX_STEPS: usize = 2;
-    let tools = vec![asgard_advise_trajectories_tool(context.candidate_count)];
+    let tools = vec![asgard_advise_trajectories_tool(context.max_candidate_count)];
     let mut usage = crate::llm_client::TokenUsage::default();
     let mut last_invalid_response = None;
 
@@ -6294,8 +6655,10 @@ async fn run_asgard_initial_advice_tool_steps(
                             }
                             let serialized = serde_json::to_string(&normalized)
                                 .expect("normalized tool arguments serialize");
-                            match parse_asgard_initial_advice(&serialized, context.candidate_count)
-                            {
+                            match parse_asgard_initial_advice(
+                                &serialized,
+                                context.max_candidate_count,
+                            ) {
                                 Ok(value) => advice = Some(value),
                                 Err(error) => last_invalid_response = Some(error),
                             }
@@ -6482,9 +6845,10 @@ async fn run_asgard_supervisor_tool_steps(
                         Ok(arguments) => {
                             let serialized = serde_json::to_string(&arguments.value)
                                 .expect("normalized tool arguments serialize");
-                            match parse_asgard_supervisor_decision(
+                            match parse_asgard_supervisor_decision_with_max(
                                 &serialized,
                                 context.candidate_count,
+                                context.max_candidate_count,
                             ) {
                                 Ok(decision) => {
                                     if let Some(required_winner) = context.required_winner
@@ -6716,7 +7080,10 @@ async fn run_asgard_supervisor_tool_steps(
 fn asgard_supervisor_tool_definitions(
     context: &AsgardSupervisorToolContext<'_>,
 ) -> Vec<ToolDefinition> {
-    let mut tools = vec![asgard_select_trajectory_tool(context.candidate_count)];
+    let mut tools = vec![asgard_select_trajectory_tool(
+        context.candidate_count,
+        context.max_candidate_count,
+    )];
     if let Some(audit) = &context.audit {
         tools.extend(audit.definitions.clone());
     }
@@ -6753,21 +7120,26 @@ fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
-fn asgard_window_horizon_policy() -> &'static str {
-    "Choose next_window_steps as one shared horizon for all candidate lanes, from 3 to 12 inclusive. The governing question is how long lanes can productively diverge before another comparison becomes valuable. Use 3-5 when direction is uncertain, evidence conflicts, changes are risky, active exploration is needed, or the selected path may be near completion. Use 6-9 for ordinary implementation with a reasonably clear plan. Use 10-12 only for high-confidence mechanically involved execution where interruption would add little value, such as a broad straightforward refactor or an established verification sequence."
+fn asgard_window_policy() -> &'static str {
+    "Choose next_candidate_count from 1 through the configured maximum and next_window_steps from 1 through 10. Candidate count buys independent breadth: use more lanes when the diagnosis, architecture, contract reading, or evidence is uncertain enough that genuinely different approaches can teach you something. Do not spend lanes on cosmetic variations. If a concrete bug must be fixed before any new direction can be useful, choose one candidate to fix and verify that serial dependency first. The shared step horizon controls when comparison resumes, not when candidates should declare the task finished. Use short horizons when feedback is valuable soon and longer horizons only for clear, mechanically involved work where interruption adds little value."
 }
 
-fn asgard_initial_advice_messages(original_task: &str, candidate_count: usize) -> Vec<ChatMessage> {
+fn asgard_initial_advice_messages(
+    original_task: &str,
+    max_candidate_count: usize,
+) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(format!(
-            r#"You are directing the first Asgard coding window. The candidate lanes will all start from the same canonical task history and disk state. Your job is to choose one shared window length and give the next {candidate_count} lanes concise, actionable, mutually distinct strategies for beginning the original task.
+            r#"You are directing the first Asgard coding window. Up to {max_candidate_count} candidate lanes are available. Your job is to choose how many to launch, choose their shared window length, and give each launched lane one concise, actionable strategy for beginning the original task.
+
+Asgard preserves one canonical trajectory. At each window, every launched lane starts independently from the same canonical history and repository state, runs for the shared step horizon, and is then compared by a supervisor. Exactly one winner becomes the next canonical state; all losing lane work is discarded. A candidate count therefore trades cost for useful breadth, while the step horizon controls how long lanes diverge before the next comparison.
 
 The original task is authoritative. Every strategy must independently remain compliant with the task. Do not prescribe exact syntax, APIs, grammar shapes, or implementation facts unless the supplied history establishes them; when uncertain, direct a candidate to inspect the relevant source or behavior and resolve the uncertainty. If useful, advise a candidate to update_plan. The candidates continue normal rollouts and must not stop at Asgard window boundaries.
 
 {}
 
 Call advise_trajectories exactly once. Do not call another tool or answer in prose. If you omit advise_trajectories, you will receive one reminder."#,
-            asgard_window_horizon_policy()
+            asgard_window_policy()
         )),
         ChatMessage::user(format!(
             r#"ORIGINAL TASK (complete):
@@ -6776,12 +7148,19 @@ Call advise_trajectories exactly once. Do not call another tool or answer in pro
 <initial_advice_procedure>
 Before calling advise_trajectories:
 1. Re-read the original task. Identify the main required behaviors, explicit implementation constraints, and prohibitions.
-2. Choose next_window_steps based on when the next comparison should be valuable, not on a fixed rollout habit.
-3. Produce exactly {candidate_count} task-compliant strategies. Make them genuinely different. Include one strategy that quickly falsifies the most consequential assumption if the task direction is uncertain.
+2. Choose next_candidate_count based on how many genuinely useful independent approaches the current uncertainty supports.
+3. Choose next_window_steps based on when the next comparison should be valuable, not on a fixed rollout habit.
+4. Produce exactly next_candidate_count task-compliant strategies. Make them genuinely different. When using multiple lanes, include one strategy that quickly falsifies the most consequential assumption.
 Then call advise_trajectories exactly once.
 </initial_advice_procedure>"#
         )),
     ]
+}
+
+#[derive(Clone, Copy)]
+struct AsgardCandidateCounts {
+    current: usize,
+    max: usize,
 }
 
 fn asgard_supervisor_messages(
@@ -6789,14 +7168,20 @@ fn asgard_supervisor_messages(
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
     supervisor_history: &AsgardSupervisorHistory,
-    candidate_count: usize,
+    candidate_counts: AsgardCandidateCounts,
     task_contract_checklist: &AsgardTaskContractChecklist,
     candidate_trajectories: String,
 ) -> Vec<ChatMessage> {
+    let AsgardCandidateCounts {
+        current: candidate_count,
+        max: max_candidate_count,
+    } = candidate_counts;
     let mut messages = vec![
         ChatMessage::system(format!(
             r#"<mission>
-You are the correctness supervisor for an Asgard coding trajectory. Candidate lanes are alternative continuations from one shared canonical state. Every decision must choose the lane with the best long-term chance of solving the original task. Separately decide whether that selected endpoint is complete. If it is incomplete, direct the next {candidate_count} lanes toward useful independent progress.
+You are the correctness supervisor for an Asgard coding trajectory. You are comparing {candidate_count} candidate lanes, and may launch 1-{max_candidate_count} lanes next. Every decision must choose the lane with the best long-term chance of solving the original task. Separately decide whether that selected endpoint is complete.
+
+Asgard preserves one canonical trajectory. The lanes shown here all started independently from the same prior winner and repository state, ran for one shared step horizon, and now compete to become the sole next canonical state; losing work is discarded. If the endpoint is incomplete, your next_candidate_count controls the cost-versus-breadth tradeoff for fresh continuations from this winner, and next_window_steps controls when those continuations are compared again.
 
 Selection does not require certainty. Choose the best continuation under the available evidence even when every lane is flawed or an important question remains unanswered. complete=true is a nomination that the selected endpoint plausibly satisfies the original task; a separate isolated completion review owns the terminal adjudication.
 </mission>
@@ -6804,7 +7189,7 @@ Selection does not require certainty. Choose the best continuation under the ava
 <task_and_evidence>
 The original task is authoritative. Preserve its exact externally observable contracts, including argument order, return values, error behavior, atomicity, compatibility requirements, implementation constraints, and prohibitions. Merely defining the requested symbol or compiling the code does not establish that contract. A lane that contradicts the task is not rescued by confident prose, a large patch, or aggregate green checks. Judge architectural direction, correctness, recoverability, known defects, and evidence. Investigation that establishes an important constraint can be more valuable than immediate edits.
 
-Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_window_diff shows that lane's edits since the last decision. A candidate_patch_manifest describes its cumulative changed production and test files. Use these together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
+Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_patch_manifest describes its cumulative changed production and test files. Normally each candidate_window_diff shows that lane's edits since the last selected decision. When candidate_diff_baseline names a current-window diff-compression anchor, that anchor is displayed first with its diff against the last selected decision, while every subsequent candidate_window_diff shows the transformation from the anchor lane to that lane. This is only diff compression: every lane still started independently from the same last selected decision, the anchor is not canonical or preferred, and lane indices remain authoritative. Use the briefs, manifests, and correctly based diffs together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
 
 Interpret verification precisely. A successful command establishes only the behaviors its selected tests and assertions actually exercised; filters, wrappers, timeouts, zero-test selections, and missing combinations can mislead. Candidate-written tests can be valuable, but green tests changed alongside the implementation are not independent proof merely because they pass. Check whether they genuinely express the task, especially the highest-risk requirement and combinations of behaviors changed by the patch. Do not mechanically reject legitimate test or mock updates.
 
@@ -6832,7 +7217,7 @@ Completion is a property of the endpoint, not of who introduced a defect. Set co
 </scope_and_completion>
 
 <continuation>
-When incomplete, choose next_window_steps and return exactly {candidate_count} concise, actionable, mutually distinct advice objects in zero-based lane order. Each strategy must independently comply with the task. Include one strategy that tests the selected direction's most consequential unverified assumption. When the checklist records a contract once per ambiguous reading, assign different lanes different readings in their advices and treat the lanes' divergence as the deciding experiment for the next selection. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
+When incomplete, choose next_candidate_count, choose next_window_steps, and return exactly next_candidate_count concise, actionable, mutually distinct advice objects in zero-based lane order. Use more candidates only when uncertainty supports genuinely different investigations or implementations. If an obvious concrete bug must be repaired before new directions become useful, choose one candidate to fix and verify it first. Each strategy must independently comply with the task. With multiple lanes, include one strategy that tests the selected direction's most consequential unverified assumption. When the checklist records materially ambiguous readings, use separate lanes only when implementing or testing those readings will resolve the ambiguity. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
 
 {}
 </continuation>
@@ -6840,7 +7225,7 @@ When incomplete, choose next_window_steps and return exactly {candidate_count} c
 <output_contract>
 Call select_trajectory exactly once and by itself as soon as your judgment is ready. Return advices=[] when complete. state_summary must concisely record why the endpoint won, the decisive evidence, and any unresolved risk. Do not answer in prose.
 </output_contract>"#,
-            asgard_window_horizon_policy(),
+            asgard_window_policy(),
             audit_rounds = ASGARD_AUDIT_MAX_ROUNDS,
         )),
         ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
@@ -6886,7 +7271,7 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
 2. Compare each lane's actual direction, defects, evidence, and recoverability. Choose a provisional winner even if all are incomplete.
 3. Decide whether that winner plausibly appears terminal. If so, nominate: complete=true requires only that the endpoint plausibly satisfies the task contracts on the candidate briefs and diffs — the isolated completion review owns terminal adjudication, so do not audit for boundary cases first. If not, investigate only questions that could change the ranking or next-window direction.
 4. Treat the completion judgment as a nomination. A concrete defect, contradiction, or plainly missing required work already visible in the dossier means complete=false and becomes targeted next-window advice; do not search for more before nominating.
-5. If incomplete, choose the shared horizon and exactly {candidate_count} distinct compliant strategies, including one that challenges the leading unverified assumption.
+5. If incomplete, choose next_candidate_count, the shared horizon, and exactly next_candidate_count distinct compliant strategies. Scale breadth with uncertainty; use one lane for a concrete serial bug fix.
 6. Call select_trajectory. Do not continue investigating once you can make the best available judgment.
 </decision_procedure>"#,
     )));
@@ -6900,6 +7285,7 @@ fn asgard_completion_review_messages(
     selected_trajectory_windows: &[Vec<ChatMessage>],
     supervisor_history: &AsgardSupervisorHistory,
     candidate_count: usize,
+    max_candidate_count: usize,
     task_contract_checklist: &AsgardTaskContractChecklist,
     canonical_ledger: &[(usize, AsgardExecutionLedger)],
     terminal_non_test_patch: String,
@@ -6914,7 +7300,10 @@ fn asgard_completion_review_messages(
         selected_trajectory_initial,
         selected_trajectory_windows,
         supervisor_history,
-        candidate_count,
+        AsgardCandidateCounts {
+            current: candidate_count,
+            max: max_candidate_count,
+        },
         task_contract_checklist,
         selected_candidate_trajectory.clone(),
     );
@@ -6955,7 +7344,7 @@ fn asgard_completion_review_messages(
     } else {
         terminal_test_patch
     };
-    let terminal_review = ChatMessage::user(format!(
+    let terminal_review_text = format!(
         r#"{canonical_ledger}
 <terminal_non_test_patch cumulative_from_task_baseline="true">
 {terminal_non_test_patch}
@@ -6976,9 +7365,10 @@ Contracts that carry an adverse_condition are verified only under that condition
 
 Delivery-mechanics contracts (kind "delivery": branch, commit, repository cleanliness) rank below functional contracts: mark such a row unverified rather than violated when evidence is merely absent, record the residual risk in state_summary, and do not block completion on absence alone — but a delivery contract affirmatively contradicted by evidence is violated and blocks completion like any other — except when the contradiction is an environmental failure of the delivery action itself (missing git identity, authentication, network): that is unverified with the residual risk noted, not violated, because no amount of task work can resolve it.
 
-complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps (3 suffices for pure verification), and provide exactly {candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce. Structure each advice as an ordered work list over the violated and unverified contracts: for each, name the contract id, state what is broken or unproven, give the fix obligation first and the proving command second, and require the candidate to run that command and report its output verbatim after the fix — evidence produced before the fix proves nothing. Additionally, for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and its output. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
+complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_candidate_count from 1 to {max_candidate_count}, choose next_window_steps from 1 to 10, and provide exactly next_candidate_count distinct advices telling the next candidate windows precisely what evidence to produce. Use more candidates when materially different fixes or verification strategies are useful under uncertainty; when one concrete defect is a serial prerequisite, choose one candidate to fix and verify it before exploring new directions. Structure each advice as an ordered work list over the violated and unverified contracts: for each, name the contract id, state what is broken or unproven, give the fix obligation first and the proving command second, and require the candidate to run that command and report its output verbatim after the fix — evidence produced before the fix proves nothing. Additionally, for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and its output. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
 </terminal_completion_review>"#,
-    ));
+    );
+    let terminal_review = ChatMessage::user(terminal_review_text);
     if let Some(last) = messages.last_mut() {
         *last = terminal_review;
     } else {
@@ -7497,7 +7887,7 @@ struct AsgardCandidateAssessmentContext<'a> {
     current_plan: Option<&'a crate::plan::UpdatePlanArgs>,
 }
 
-fn asgard_advise_trajectories_tool(candidate_count: usize) -> ToolDefinition {
+fn asgard_advise_trajectories_tool(max_candidate_count: usize) -> ToolDefinition {
     ToolDefinition {
         r#type: "function".to_string(),
         function: FunctionDef {
@@ -7506,8 +7896,13 @@ fn asgard_advise_trajectories_tool(candidate_count: usize) -> ToolDefinition {
             parameters: serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["next_window_steps", "state_summary", "advices"],
+            "required": ["next_candidate_count", "next_window_steps", "state_summary", "advices"],
             "properties": {
+                "next_candidate_count": {
+                    "type": "integer",
+                    "minimum": ASGARD_MIN_CANDIDATES,
+                    "maximum": max_candidate_count,
+                },
                 "next_window_steps": {
                     "type": "integer",
                     "minimum": ASGARD_MIN_WINDOW_STEPS,
@@ -7519,8 +7914,8 @@ fn asgard_advise_trajectories_tool(candidate_count: usize) -> ToolDefinition {
                 },
                 "advices": {
                     "type": "array",
-                    "minItems": candidate_count,
-                    "maxItems": candidate_count,
+                    "minItems": ASGARD_MIN_CANDIDATES,
+                    "maxItems": max_candidate_count,
                     "uniqueItems": true,
                     "items": {
                         "type": "object",
@@ -7538,7 +7933,10 @@ fn asgard_advise_trajectories_tool(candidate_count: usize) -> ToolDefinition {
     }
 }
 
-fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
+fn asgard_select_trajectory_tool(
+    candidate_count: usize,
+    max_candidate_count: usize,
+) -> ToolDefinition {
     ToolDefinition {
         r#type: "function".to_string(),
         function: FunctionDef {
@@ -7555,6 +7953,12 @@ fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
                     "maximum": candidate_count.saturating_sub(1),
                 },
                 "complete": { "type": "boolean" },
+                "next_candidate_count": {
+                    "type": "integer",
+                    "minimum": ASGARD_MIN_CANDIDATES,
+                    "maximum": max_candidate_count,
+                    "description": "Required when complete=false; omitted or ignored when complete=true.",
+                },
                 "next_window_steps": {
                     "type": "integer",
                     "minimum": ASGARD_MIN_WINDOW_STEPS,
@@ -7568,7 +7972,7 @@ fn asgard_select_trajectory_tool(candidate_count: usize) -> ToolDefinition {
                 "advices": {
                     "type": "array",
                     "minItems": 0,
-                    "maxItems": candidate_count,
+                    "maxItems": max_candidate_count,
                     "uniqueItems": true,
                     "items": {
                         "type": "object",
@@ -7923,9 +8327,10 @@ fn asgard_is_test_path(path: &str) -> bool {
         || file.contains(".spec.")
 }
 
-fn parse_asgard_supervisor_decision(
+fn parse_asgard_supervisor_decision_with_max(
     text: &str,
-    count: usize,
+    candidate_count: usize,
+    max_candidate_count: usize,
 ) -> anyhow::Result<AsgardSupervisorDecision> {
     for (start, _) in text.match_indices('{') {
         let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
@@ -7938,7 +8343,7 @@ fn parse_asgard_supervisor_decision(
             continue;
         };
         let winner = winner as usize;
-        if winner >= count {
+        if winner >= candidate_count {
             continue;
         }
         let Some(complete) = value.get("complete").and_then(serde_json::Value::as_bool) else {
@@ -7963,16 +8368,23 @@ fn parse_asgard_supervisor_decision(
             return Ok(AsgardSupervisorDecision {
                 winner,
                 complete,
-                advices: vec![None; count],
+                advices: vec![None; candidate_count],
+                next_candidate_count: None,
                 next_window_steps: None,
                 state_summary: state_summary.to_string(),
                 contracts,
             });
         }
+        let Some(next_candidate_count) =
+            parse_asgard_next_candidate_count(&value, max_candidate_count)
+        else {
+            continue;
+        };
         let Some(next_window_steps) = parse_asgard_next_window_steps(&value) else {
             continue;
         };
-        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, count) else {
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
+        else {
             continue;
         };
         let contracts = parse_asgard_contract_rows(&value);
@@ -7980,24 +8392,30 @@ fn parse_asgard_supervisor_decision(
             winner,
             complete,
             advices,
+            next_candidate_count: Some(next_candidate_count),
             next_window_steps: Some(next_window_steps),
             state_summary: state_summary.to_string(),
             contracts,
         });
     }
     anyhow::bail!(
-        "Asgard supervisor returned neither a valid completed winner nor a winner plus {count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
+        "Asgard supervisor returned neither a valid completed winner nor a winner plus a valid next_candidate_count, matching distinct advices, and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
     )
 }
 
 fn parse_asgard_initial_advice(
     text: &str,
-    count: usize,
+    max_candidate_count: usize,
 ) -> anyhow::Result<AsgardSupervisorInitialAdvice> {
     for (start, _) in text.match_indices('{') {
         let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
             .into_iter::<serde_json::Value>()
             .next()
+        else {
+            continue;
+        };
+        let Some(next_candidate_count) =
+            parse_asgard_next_candidate_count(&value, max_candidate_count)
         else {
             continue;
         };
@@ -8015,17 +8433,19 @@ fn parse_asgard_initial_advice(
         let Some(raw_advices) = value.get("advices").and_then(serde_json::Value::as_array) else {
             continue;
         };
-        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, count) else {
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
+        else {
             continue;
         };
         return Ok(AsgardSupervisorInitialAdvice {
             advices,
+            next_candidate_count,
             next_window_steps,
             state_summary: state_summary.to_string(),
         });
     }
     anyhow::bail!(
-        "Asgard supervisor returned no valid initial advice with {count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
+        "Asgard supervisor returned no valid initial advice with a 1-{max_candidate_count} next_candidate_count, matching distinct advices, and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
     )
 }
 
@@ -8145,6 +8565,16 @@ fn parse_asgard_next_window_steps(value: &serde_json::Value) -> Option<usize> {
     (ASGARD_MIN_WINDOW_STEPS..=ASGARD_MAX_WINDOW_STEPS)
         .contains(&steps)
         .then_some(steps)
+}
+
+fn parse_asgard_next_candidate_count(
+    value: &serde_json::Value,
+    max_candidate_count: usize,
+) -> Option<usize> {
+    let count = value.get("next_candidate_count")?.as_u64()? as usize;
+    (ASGARD_MIN_CANDIDATES..=max_candidate_count)
+        .contains(&count)
+        .then_some(count)
 }
 
 fn parse_asgard_incomplete_advices(
@@ -18737,134 +19167,42 @@ mod tests {
     }
 
     #[test]
-    fn asgard_supervisor_parser_requires_exactly_n_distinct_advices() {
-        let parsed = parse_asgard_supervisor_decision(
-            r#"{"winner":2,"complete":false,"next_window_steps":5,"state_summary":"parser implemented; API and concurrency remain","advices":[
-                {"strategy":"test the parser","scope_basis":"the task requires parser behavior"},
-                {"strategy":"challenge the API","scope_basis":"the task requires API behavior"},
-                {"strategy":"inspect concurrency","scope_basis":"the candidate changed synchronization"}
+    fn asgard_supervisor_parser_requires_dynamic_count_and_matching_advices() {
+        let parsed = parse_asgard_supervisor_decision_with_max(
+            r#"{"winner":2,"complete":false,"next_candidate_count":2,"next_window_steps":5,"state_summary":"work remains","advices":[
+                {"strategy":"test the parser","scope_basis":"parser behavior"},
+                {"strategy":"challenge the API","scope_basis":"API behavior"}
             ]}"#,
             3,
+            5,
         )
         .unwrap();
         assert_eq!(parsed.winner, 2);
+        assert_eq!(parsed.next_candidate_count, Some(2));
         assert_eq!(parsed.next_window_steps, Some(5));
-        assert_eq!(parsed.advices.len(), 3);
-        assert_eq!(
-            parsed.state_summary,
-            "parser implemented; API and concurrency remain"
-        );
+        assert_eq!(parsed.advices.len(), 2);
 
-        let completed = parse_asgard_supervisor_decision(
-            r#"{"winner":1,"complete":true,"state_summary":"implementation and focused tests are complete","advices":[]}"#,
+        let completed = parse_asgard_supervisor_decision_with_max(
+            r#"{"winner":1,"complete":true,"state_summary":"done","advices":[]}"#,
             3,
+            5,
         )
         .unwrap();
         assert!(completed.complete);
+        assert_eq!(completed.next_candidate_count, None);
         assert_eq!(completed.advices, vec![None, None, None]);
-        // Completion is the supervisor model's judgment. The parser enforces
-        // the wire shape, not a handcrafted policy about which evidence is
-        // sufficient to stop.
-        for summary in [
-            "No compilation or tests were run, but the patch appears syntactically correct.",
-            "Compilation was not run because the wrapper was unavailable; a static compilation audit covered introduced symbols and call contracts.",
-            "All 60 functional tests pass, with a disclosed residual formatting concern.",
-            "Both dotnet build src/Core/Core.csproj and dotnet build src/Api/Api.csproj succeeded with zero errors after all required changes.",
-            "Both Core and Api projects compile with zero errors after implementing all required changes.",
-        ] {
-            let response = serde_json::json!({
-                "winner": 0,
-                "complete": true,
-                "state_summary": summary,
-                "advices": [],
-            });
-            assert!(
-                parse_asgard_supervisor_decision(&response.to_string(), 3)
-                    .unwrap()
-                    .complete
-            );
-        }
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":true,"state_summary":"done","advices":[{"strategy":"more work","scope_basis":"optional"}]}"#,
-                3,
-            )
-            .is_err()
-        );
 
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[
-                    {"strategy":"same","scope_basis":"task"},
-                    {"strategy":"same","scope_basis":"task"},
-                    {"strategy":"different","scope_basis":"task"}
-                ]}"#,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":7,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[
-                    {"strategy":"a","scope_basis":"task"},
-                    {"strategy":"b","scope_basis":"task"},
-                    {"strategy":"c","scope_basis":"task"}
-                ]}"#,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"work remains","advices":[
-                    {"strategy":"a","scope_basis":""},
-                    {"strategy":"b","scope_basis":"task"},
-                    {"strategy":"c","scope_basis":"task"}
-                ]}"#,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"next_window_steps":6,"state_summary":"","advices":[
-                    {"strategy":"a","scope_basis":"task"},
-                    {"strategy":"b","scope_basis":"task"},
-                    {"strategy":"c","scope_basis":"task"}
-                ]}"#,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"state_summary":"work remains","advices":[
-                    {"strategy":"a","scope_basis":"task"},
-                    {"strategy":"b","scope_basis":"task"},
-                    {"strategy":"c","scope_basis":"task"}
-                ]}"#,
-                3
-            )
-            .is_err()
-        );
-        assert!(
-            parse_asgard_supervisor_decision(
-                r#"{"winner":1,"complete":false,"next_window_steps":13,"state_summary":"work remains","advices":[
-                    {"strategy":"a","scope_basis":"task"},
-                    {"strategy":"b","scope_basis":"task"},
-                    {"strategy":"c","scope_basis":"task"}
-                ]}"#,
-                3
-            )
-            .is_err()
-        );
+        for invalid in [
+            r#"{"winner":1,"complete":false,"next_candidate_count":0,"next_window_steps":5,"state_summary":"work","advices":[]}"#,
+            r#"{"winner":1,"complete":false,"next_candidate_count":6,"next_window_steps":5,"state_summary":"work","advices":[]}"#,
+            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":0,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":11,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"same","scope_basis":"task"},{"strategy":"same","scope_basis":"task"}]}"#,
+            r#"{"winner":3,"complete":false,"next_candidate_count":1,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"}]}"#,
+        ] {
+            assert!(parse_asgard_supervisor_decision_with_max(invalid, 3, 5).is_err());
+        }
     }
 
     #[test]
@@ -18983,6 +19321,7 @@ mod tests {
             winner: 2,
             complete: false,
             advices: vec![Some("independent strategy".to_string())],
+            next_candidate_count: Some(1),
             next_window_steps: Some(4),
             state_summary: "The selected parser still has an unresolved wildcard assumption."
                 .to_string(),
@@ -19003,6 +19342,182 @@ mod tests {
         history.checkpoint_selected_windows();
         assert!(history.selected_windows.is_empty());
         assert_eq!(history.checkpointed.len(), 1);
+    }
+
+    #[test]
+    fn asgard_diff_anchor_uses_strict_forty_percent_threshold_and_stable_ties() {
+        assert_eq!(
+            select_asgard_diff_anchor(1_000, &[(2, 399), (1, 500)]),
+            Some((2, 399))
+        );
+        assert_eq!(
+            select_asgard_diff_anchor(1_000, &[(2, 300), (1, 300)]),
+            Some((1, 300))
+        );
+        assert_eq!(
+            select_asgard_diff_anchor(1_000, &[(0, 400), (1, 500)]),
+            None
+        );
+        assert_eq!(select_asgard_diff_anchor(0, &[(0, 0), (1, 0)]), None);
+        assert_eq!(select_asgard_diff_anchor(1_000, &[(0, 1)]), None);
+    }
+
+    #[test]
+    fn asgard_diff_presentation_uses_candidate_medoid_when_diffs_cluster() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        init_git_repo(source.path());
+        std::fs::write(source.path().join("README.md"), "base\n").expect("seed source");
+        run_git(source.path(), &["add", "README.md"]);
+        run_git(source.path(), &["commit", "-m", "seed"]);
+
+        let lane_zero =
+            crate::asgard::create_candidate_repository(source.path(), "diff-medoid-zero")
+                .expect("lane zero repository");
+        let lane_one = crate::asgard::create_candidate_repository(source.path(), "diff-medoid-one")
+            .expect("lane one repository");
+        let shared = (0..1_000)
+            .map(|line| format!("shared-{line:04}\n"))
+            .collect::<String>();
+        std::fs::write(
+            lane_zero.root.join("clustered.txt"),
+            format!("{shared}anchor-only\n"),
+        )
+        .expect("write lane zero");
+        std::fs::write(
+            lane_one.root.join("clustered.txt"),
+            format!("{shared}other-only\n"),
+        )
+        .expect("write lane one");
+
+        let zero_patch = crate::asgard::capture_patch(&lane_zero.root, &lane_zero.base_commit)
+            .expect("capture lane zero patch");
+        let one_patch = crate::asgard::capture_patch(&lane_one.root, &lane_one.base_commit)
+            .expect("capture lane one patch");
+        let zero_delta =
+            crate::asgard::capture_patch_since(&lane_zero.root, &lane_zero.base_commit, &[])
+                .expect("capture lane zero delta");
+        let one_delta =
+            crate::asgard::capture_patch_since(&lane_one.root, &lane_one.base_commit, &[])
+                .expect("capture lane one delta");
+        let presentation = build_asgard_diff_presentation(vec![
+            AsgardDiffCandidateInput {
+                index: 1,
+                patch: one_patch,
+                delta_patch: one_delta,
+                repository_root: lane_one.root.clone(),
+                base_commit: lane_one.base_commit.clone(),
+            },
+            AsgardDiffCandidateInput {
+                index: 0,
+                patch: zero_patch.clone(),
+                delta_patch: zero_delta.clone(),
+                repository_root: lane_zero.root.clone(),
+                base_commit: lane_zero.base_commit.clone(),
+            },
+        ])
+        .expect("build clustered diff presentation");
+
+        assert_eq!(presentation.anchor_lane, Some(0));
+        assert_eq!(
+            presentation.views[0],
+            AsgardCandidateDiffView {
+                candidate_index: 0,
+                base: AsgardCandidateDiffBase::LastSelectedDecision,
+                patch: zero_delta,
+            }
+        );
+        assert_eq!(presentation.views[1].candidate_index, 1);
+        assert_eq!(
+            presentation.views[1].base,
+            AsgardCandidateDiffBase::CurrentWindowLane(0)
+        );
+        let cross_diff = String::from_utf8_lossy(&presentation.views[1].patch);
+        assert!(cross_diff.contains("-anchor-only"));
+        assert!(cross_diff.contains("+other-only"));
+        assert!(
+            presentation.best_candidate_sum_bytes.unwrap() * 10
+                < presentation.baseline_sum_bytes * 4
+        );
+
+        crate::asgard::remove_candidate_repository(&lane_zero);
+        crate::asgard::remove_candidate_repository(&lane_one);
+    }
+
+    #[test]
+    fn asgard_diff_presentation_errors_are_safe_to_fallback_from() {
+        let missing = PathBuf::from("/definitely/missing/asgard-candidate");
+        let input = |index| AsgardDiffCandidateInput {
+            index,
+            patch: b"full patch".to_vec(),
+            delta_patch: b"delta patch".to_vec(),
+            repository_root: missing.clone(),
+            base_commit: "missing-base".to_string(),
+        };
+
+        let error = build_asgard_diff_presentation(vec![input(0), input(1)])
+            .expect_err("pairwise capture should fail");
+        assert!(
+            format!("{error:#}")
+                .contains("capture Asgard diff from current-window lane 0 to lane 1")
+        );
+    }
+
+    #[test]
+    fn asgard_candidate_renderer_labels_the_actual_diff_baseline() {
+        let candidate = AsgardCandidate {
+            index: 3,
+            model: "test-model".to_string(),
+            outcome: asgard_failure(anyhow::anyhow!("test outcome")),
+            patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+full\n".to_vec(),
+            delta_patch: b"unused delta".to_vec(),
+            supervisor_window_messages: vec![ChatMessage::assistant("worked")],
+            window_ledger: AsgardExecutionLedger::default(),
+        };
+        let rendered = render_asgard_candidate_trajectory(
+            &candidate,
+            Path::new("/tmp/lane-three"),
+            "current_window_lane_1",
+            b"cross-candidate diff",
+        )
+        .expect("render candidate");
+
+        assert!(rendered.contains("<lane_trajectory index=\"3\""));
+        assert!(
+            rendered
+                .contains("<candidate_window_diff base=\"current_window_lane_1\" bytes=\"20\">")
+        );
+        assert!(rendered.contains("cross-candidate diff"));
+        assert!(!rendered.contains("unused delta"));
+    }
+
+    #[test]
+    fn asgard_diff_trace_records_anchor_or_fallback() {
+        let anchored = AsgardDiffPresentation {
+            views: Vec::new(),
+            anchor_lane: Some(2),
+            baseline_sum_bytes: 1_000,
+            best_candidate_sum_bytes: Some(250),
+        };
+        let anchored_trace = asgard_diff_baseline_trace_record(4, &anchored, None);
+        assert_eq!(anchored_trace["mode"], "current_window_candidate");
+        assert_eq!(anchored_trace["anchor_lane"], 2);
+        assert_eq!(anchored_trace["threshold_numerator"], 2);
+        assert_eq!(anchored_trace["threshold_denominator"], 5);
+
+        let fallback = AsgardDiffPresentation {
+            views: Vec::new(),
+            anchor_lane: None,
+            baseline_sum_bytes: 1_000,
+            best_candidate_sum_bytes: None,
+        };
+        let fallback_trace = asgard_diff_baseline_trace_record(
+            4,
+            &fallback,
+            Some(("pairwise_diff_error", "git failed")),
+        );
+        assert_eq!(fallback_trace["mode"], "last_selected_decision");
+        assert_eq!(fallback_trace["fallback_reason"], "pairwise_diff_error");
+        assert_eq!(fallback_trace["fallback_error"], "git failed");
     }
 
     #[test]
@@ -19096,7 +19611,7 @@ mod tests {
             &selected_first,
             &[],
             &first_history,
-            3,
+            AsgardCandidateCounts { current: 3, max: 5 },
             &task_contract_checklist,
             "candidate window one".to_string(),
         );
@@ -19105,7 +19620,7 @@ mod tests {
             &selected_first,
             &[],
             &first_history,
-            3,
+            AsgardCandidateCounts { current: 3, max: 5 },
             &task_contract_checklist,
             "candidate window one".to_string(),
         );
@@ -19114,7 +19629,7 @@ mod tests {
             &selected_first,
             &selected_windows,
             &second_history,
-            3,
+            AsgardCandidateCounts { current: 3, max: 5 },
             &task_contract_checklist,
             "candidate window two".to_string(),
         );
@@ -19123,7 +19638,7 @@ mod tests {
             &selected_first,
             &selected_windows,
             &second_history,
-            3,
+            AsgardCandidateCounts { current: 3, max: 5 },
             &task_contract_checklist,
             "terminal candidate window".to_string(),
         );
@@ -19133,6 +19648,7 @@ mod tests {
             &selected_windows,
             &second_history,
             3,
+            5,
             &task_contract_checklist,
             &[(1, AsgardExecutionLedger::default())],
             "diff --git a/src/parser.rs b/src/parser.rs\n+impl\n".to_string(),
@@ -19148,8 +19664,11 @@ mod tests {
         assert!(asgard_message_text(&first[1]).contains("fix the parser"));
         assert!(!asgard_message_text(&first[0]).contains("window one"));
         assert!(asgard_message_text(&first[0]).contains("correctness supervisor"));
-        assert!(asgard_message_text(&first[0]).contains("exactly 3"));
+        assert!(asgard_message_text(&first[0]).contains("1-5 lanes next"));
         assert!(asgard_message_text(&first[0]).contains("Candidate briefs are loss-aware"));
+        assert!(asgard_message_text(&first[0]).contains("diff-compression anchor"));
+        assert!(asgard_message_text(&first[0]).contains("anchor is not canonical or preferred"));
+        assert!(asgard_message_text(&first[0]).contains("lane indices remain authoritative"));
         assert!(asgard_message_text(&first[0]).contains("green tests changed alongside"));
         assert!(asgard_message_text(&first[0]).contains("argument order"));
         assert!(asgard_message_text(&first[0]).contains("missing combinations"));
@@ -19167,13 +19686,13 @@ mod tests {
         );
         assert!(
             asgard_message_text(&first[0])
-                .contains("assign different lanes different readings in their advices")
+                .contains("use separate lanes only when implementing or testing those readings")
         );
         assert!(asgard_message_text(&first[0]).contains("Do not assert exact APIs"));
         assert!(!asgard_message_text(&first[0]).contains("Tool choice is not forced"));
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
         assert!(asgard_message_text(&first[0]).contains("available for read-only"));
-        assert!(asgard_message_text(&first[0]).contains("edits since the last decision"));
+        assert!(asgard_message_text(&first[0]).contains("edits since the last selected decision"));
         assert!(
             asgard_message_text(&first[0])
                 .contains("complete=true is a nomination that the selected endpoint plausibly")
@@ -19417,6 +19936,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: Some(0),
@@ -19459,6 +19979,7 @@ mod tests {
                 serde_json::json!({
                     "winner": 0,
                     "complete": false,
+                    "next_candidate_count": 1,
                     "next_window_steps": 3,
                     "state_summary": "More evidence is needed.",
                     "advices": [{
@@ -19475,6 +19996,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: Some(0),
@@ -19526,6 +20048,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: Some(0),
@@ -19562,6 +20085,7 @@ mod tests {
             winner: 0,
             complete: false,
             advices: vec![Some("Verify the exact behavior.".to_string())],
+            next_candidate_count: Some(1),
             next_window_steps: Some(3),
             state_summary: "Lane 1 is best but incomplete.".to_string(),
             contracts: None,
@@ -19596,6 +20120,7 @@ mod tests {
             winner: 0,
             complete: true,
             advices: Vec::new(),
+            next_candidate_count: None,
             next_window_steps: None,
             state_summary: "Complete.".to_string(),
             contracts: Some(vec![AsgardContractRow {
@@ -19624,6 +20149,7 @@ mod tests {
             winner: 0,
             complete: true,
             advices: Vec::new(),
+            next_candidate_count: None,
             next_window_steps: None,
             state_summary: "Complete.".to_string(),
             contracts: Some(vec![AsgardContractRow {
@@ -19663,6 +20189,7 @@ mod tests {
             &[],
             &AsgardSupervisorHistory::default(),
             1,
+            5,
             &checklist,
             &[(1, ledger)],
             "diff --git a/src/lib.rs b/src/lib.rs\n+pub fn output() {}\n".to_string(),
@@ -19707,6 +20234,7 @@ mod tests {
             &[],
             &AsgardSupervisorHistory::default(),
             1,
+            5,
             &checklist,
             &[],
             "diff --git a/src/lib.rs b/src/lib.rs\n+pub fn output() {}\n".to_string(),
@@ -19740,6 +20268,7 @@ mod tests {
             &[],
             &AsgardSupervisorHistory::default(),
             1,
+            5,
             &checklist,
             &[],
             String::new(),
@@ -19916,7 +20445,7 @@ mod tests {
 
     #[test]
     fn asgard_select_tool_is_fail_closed_and_candidate_bounded() {
-        let tool = asgard_select_trajectory_tool(3);
+        let tool = asgard_select_trajectory_tool(3, 5);
         assert_eq!(tool.function.name, "select_trajectory");
         let schema = tool.function.parameters;
         assert_eq!(schema["properties"]["winner"]["maximum"], 2);
@@ -19924,10 +20453,12 @@ mod tests {
             schema["required"],
             serde_json::json!(["winner", "complete", "state_summary", "advices"])
         );
-        assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 3);
-        assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 12);
+        assert_eq!(schema["properties"]["next_candidate_count"]["minimum"], 1);
+        assert_eq!(schema["properties"]["next_candidate_count"]["maximum"], 5);
+        assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 1);
+        assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 10);
         assert_eq!(schema["properties"]["advices"]["minItems"], 0);
-        assert_eq!(schema["properties"]["advices"]["maxItems"], 3);
+        assert_eq!(schema["properties"]["advices"]["maxItems"], 5);
         assert_eq!(schema["properties"]["advices"]["uniqueItems"], true);
         assert_eq!(
             schema["properties"]["advices"]["items"]["required"],
@@ -19947,26 +20478,34 @@ mod tests {
         let schema = tool.function.parameters;
         assert_eq!(
             schema["required"],
-            serde_json::json!(["next_window_steps", "state_summary", "advices"])
+            serde_json::json!([
+                "next_candidate_count",
+                "next_window_steps",
+                "state_summary",
+                "advices"
+            ])
         );
-        assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 3);
-        assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 12);
-        assert_eq!(schema["properties"]["advices"]["minItems"], 2);
+        assert_eq!(schema["properties"]["next_candidate_count"]["minimum"], 1);
+        assert_eq!(schema["properties"]["next_candidate_count"]["maximum"], 2);
+        assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 1);
+        assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 10);
+        assert_eq!(schema["properties"]["advices"]["minItems"], 1);
         assert_eq!(schema["properties"]["advices"]["maxItems"], 2);
 
         let parsed = parse_asgard_initial_advice(
-            r#"{"next_window_steps":4,"state_summary":"Start with one implementation lane and one falsification lane.","advices":[
+            r#"{"next_candidate_count":2,"next_window_steps":4,"state_summary":"Start with one implementation lane and one falsification lane.","advices":[
                 {"strategy":"Inspect the relevant parser and implement the narrow fix.","scope_basis":"The task asks for parser behavior."},
                 {"strategy":"Write or run the boundary check first, then implement from the observed contract.","scope_basis":"The task asks for parser behavior."}
             ]}"#,
             2,
         )
         .unwrap();
+        assert_eq!(parsed.next_candidate_count, 2);
         assert_eq!(parsed.next_window_steps, 4);
         assert_eq!(parsed.advices.len(), 2);
         assert!(
             parse_asgard_initial_advice(
-                r#"{"next_window_steps":2,"state_summary":"too short","advices":[
+                r#"{"next_candidate_count":2,"next_window_steps":0,"state_summary":"too short","advices":[
                     {"strategy":"a","scope_basis":"task"},
                     {"strategy":"b","scope_basis":"task"}
                 ]}"#,
@@ -19994,6 +20533,7 @@ mod tests {
             "advice-call",
             "advise_trajectories",
             serde_json::json!({
+                "next_candidate_count": 3,
                 "next_window_steps": 4,
                 "state_summary": "Begin with implementation, contract discovery, and falsification lanes.",
                 "advices": [
@@ -20028,6 +20568,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 3,
+                max_candidate_count: 3,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: None,
@@ -20053,6 +20594,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asgard_supervisor_retries_mismatched_advice_count() {
+        let response = |id: &str, next_candidate_count: usize, advices: serde_json::Value| {
+            LlmResponse::ToolCalls {
+                text: String::new(),
+                reasoning_content: None,
+                calls: vec![supervisor_tool_call(
+                    id,
+                    "select_trajectory",
+                    serde_json::json!({
+                        "winner": 0,
+                        "complete": false,
+                        "next_candidate_count": next_candidate_count,
+                        "next_window_steps": 2,
+                        "state_summary": "Work remains.",
+                        "advices": advices,
+                    }),
+                )],
+                usage: crate::llm_client::TokenUsage::default(),
+            }
+        };
+        let backend = ScriptedSupervisorBackend::new(vec![
+            response(
+                "invalid-count",
+                3,
+                serde_json::json!([
+                    {"strategy":"one","scope_basis":"task"},
+                    {"strategy":"two","scope_basis":"task"}
+                ]),
+            ),
+            response(
+                "valid-count",
+                1,
+                serde_json::json!([
+                    {"strategy":"fix the serial bug","scope_basis":"task"}
+                ]),
+            ),
+        ]);
+
+        let (decision, _) = run_asgard_supervisor_tool_steps(
+            &backend,
+            vec![ChatMessage::user("dossier")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 2,
+                max_candidate_count: 5,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: None,
+                required_winner: None,
+                checklist_ids: &[],
+                carry_forward_allowed: false,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        let (decision, _) = decision.expect("corrected decision");
+        assert_eq!(decision.next_candidate_count, Some(1));
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == "tool"
+                && asgard_message_text(message).contains("matching distinct advices")
+        }));
+    }
+
+    #[tokio::test]
     async fn asgard_supervisor_reminds_once_and_only_advertises_selector() {
         let selection_call = supervisor_tool_call(
             "selection-call",
@@ -20060,6 +20668,7 @@ mod tests {
             serde_json::json!({
                 "winner": 1,
                 "complete": false,
+                "next_candidate_count": 2,
                 "next_window_steps": 4,
                 "state_summary": "Lane 2 has the strongest implementation but lacks verification.",
                 "advices": [
@@ -20103,6 +20712,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 2,
+                max_candidate_count: 2,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: None,
@@ -20166,6 +20776,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: None,
@@ -20203,6 +20814,7 @@ mod tests {
             serde_json::json!({
                 "winner": 1,
                 "complete": false,
+                "next_candidate_count": 3,
                 "next_window_steps": 3,
                 "state_summary": "The isolated endpoint still needs focused verification.",
                 "advices": [
@@ -20242,6 +20854,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 3,
+                max_candidate_count: 3,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: Some(1),
@@ -20334,6 +20947,7 @@ mod tests {
         let selection_context = AsgardSupervisorToolContext {
             model: "deepseek::deepseek-v4-pro",
             candidate_count: 3,
+            max_candidate_count: 3,
             idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             audit: Some(AsgardAuditContext {
                 registries: &registries,
@@ -20348,6 +20962,7 @@ mod tests {
         let completion_context = AsgardSupervisorToolContext {
             model: "deepseek::deepseek-v4-pro",
             candidate_count: 3,
+            max_candidate_count: 3,
             idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
             audit: Some(AsgardAuditContext {
                 registries: &registries,
@@ -20438,6 +21053,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: Some(AsgardAuditContext {
                     registries: &registries,
@@ -20519,6 +21135,7 @@ mod tests {
             serde_json::json!({
                 "winner": 0,
                 "complete": false,
+                "next_candidate_count": 1,
                 "next_window_steps": 3,
                 "state_summary": "Lane 1 is the best incomplete foundation; focused verification remains.",
                 "advices": [{
@@ -20571,6 +21188,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: Some(AsgardAuditContext {
                     registries: &registries,
@@ -20645,6 +21263,7 @@ mod tests {
             AsgardSupervisorToolContext {
                 model: "deepseek::deepseek-v4-pro",
                 candidate_count: 1,
+                max_candidate_count: 1,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
                 audit: None,
                 required_winner: None,
