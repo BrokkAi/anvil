@@ -22,9 +22,11 @@ mod deepseek_balance;
 mod discovery;
 mod host_notice;
 mod http_retry;
+mod kimi_auth;
 mod llm_client;
 mod mcp;
 mod multi_backend;
+mod openai_providers;
 mod openrouter_auth;
 mod openrouter_credits;
 mod p2t;
@@ -48,7 +50,7 @@ mod trace_logging;
 mod train_bifrost;
 
 use crate::llm_client::LlmBackend;
-use crate::multi_backend::MultiBackend;
+use crate::multi_backend::{BackendRegistration, MultiBackend};
 
 /// Anvil -- Rust-based Agent Client Protocol (ACP) server with
 /// first-run setup and zero-config auto-discovery: at startup we read
@@ -381,6 +383,31 @@ fn build_deepseek_backend() -> Option<Arc<dyn LlmBackend>> {
     }
 }
 
+fn build_kimi_backend() -> Option<Arc<dyn LlmBackend>> {
+    let auth = match kimi_auth::load_provider() {
+        Ok(auth) => auth,
+        Err(error) => {
+            tracing::warn!("failed to configure Kimi authentication: {error:#}");
+            return None;
+        }
+    }?;
+    let headers = match kimi_auth::default_headers() {
+        Ok(headers) => headers,
+        Err(error) => {
+            tracing::warn!("failed to configure Kimi request headers: {error:#}");
+            return None;
+        }
+    };
+    let base_url = kimi_auth::base_url();
+    tracing::info!(
+        base_url,
+        "Kimi backend wired from KIMI_API_KEY or Kimi Code credentials"
+    );
+    Some(Arc::new(llm_client::OpenAiClient::with_kimi_support(
+        base_url, auth, headers,
+    )))
+}
+
 /// Build an OpenRouter chat backend from a raw API key. OpenRouter speaks
 /// the OpenAI Chat Completions wire format verbatim, so we reuse
 /// `OpenAiClient` with the OpenRouter base URL and attach the optional
@@ -413,7 +440,7 @@ pub fn openrouter_backend_from_key(raw: &str) -> Option<Arc<dyn LlmBackend>> {
     );
 
     // OpenRouter supports the unified reasoning object, so enable it.
-    Some(Arc::new(llm_client::OpenAiClient::with_reasoning_support(
+    Some(Arc::new(llm_client::OpenAiClient::with_openrouter_support(
         discovery::OPENROUTER_BASE_URL.to_string(),
         Some(key.to_string()),
         headers,
@@ -475,6 +502,28 @@ fn build_openrouter_backend() -> Option<Arc<dyn LlmBackend>> {
             None
         }
     }
+}
+
+fn build_openai_compatible_backend() -> Result<Option<Arc<dyn LlmBackend>>> {
+    let config = openai_providers::read()?;
+    if config.is_empty() {
+        tracing::info!(
+            "No generic OpenAI-compatible providers configured at {}; create providers.json to enable them.",
+            openai_providers::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "the Brokk config directory".to_string())
+        );
+        return Ok(None);
+    }
+    for profile in &config.profiles {
+        tracing::info!(
+            profile = %profile.name,
+            base_url = %profile.base_url,
+            auth = profile.api_key_env.as_deref().unwrap_or("none"),
+            "Generic OpenAI-compatible provider profile configured"
+        );
+    }
+    Ok(openai_providers::build_backend(config))
 }
 
 fn build_bedrock_backend(
@@ -617,6 +666,8 @@ async fn main() -> Result<()> {
     let bedrock_backend = build_bedrock_backend(bedrock_catalog_mode);
     let codex_backend = build_codex_backend().await;
     let deepseek_backend = build_deepseek_backend();
+    let kimi_backend = build_kimi_backend();
+    let openai_backend = build_openai_compatible_backend()?;
     let openrouter_backend = build_openrouter_backend();
     let ollama_backend = Some(build_ollama_backend());
 
@@ -641,6 +692,15 @@ async fn main() -> Result<()> {
             discovery::DEEPSEEK_API_KEY_ENV
         );
     }
+    if kimi_backend.is_none() {
+        tracing::info!(
+            "Kimi backend not available; set {} or run `kimi login` to create {}.",
+            kimi_auth::KIMI_API_KEY_ENV,
+            kimi_auth::credentials_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "the Kimi Code credential file".to_string())
+        );
+    }
     if openrouter_backend.is_none() {
         tracing::info!(
             "OpenRouter backend not available; set {} or run `/setup openrouter key <key>` \
@@ -649,13 +709,32 @@ async fn main() -> Result<()> {
         );
     }
 
-    let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(
-        bedrock_backend,
-        codex_backend,
-        deepseek_backend,
-        openrouter_backend,
-        ollama_backend,
-    ));
+    let llm: Arc<MultiBackend> = Arc::new(MultiBackend::new(vec![
+        BackendRegistration::new(discovery::ModelSource::BEDROCK, "Bedrock", bedrock_backend),
+        BackendRegistration::new(discovery::ModelSource::CODEX, "Codex", codex_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OLLAMA,
+            "Local models",
+            ollama_backend,
+        ),
+        BackendRegistration::new(discovery::ModelSource::DS4, "ds4", None),
+        BackendRegistration::new(
+            discovery::ModelSource::DEEPSEEK,
+            "DeepSeek",
+            deepseek_backend,
+        ),
+        BackendRegistration::new(discovery::ModelSource::KIMI, "Kimi", kimi_backend),
+        BackendRegistration::new(
+            discovery::ModelSource::OPENAI,
+            "OpenAI-compatible",
+            openai_backend,
+        ),
+        BackendRegistration::new(
+            discovery::ModelSource::OPENROUTER,
+            "OpenRouter",
+            openrouter_backend,
+        ),
+    ]));
 
     // Kick off model discovery eagerly so any provider errors ("skipped"
     // log lines with HTTP status codes) appear immediately in the startup

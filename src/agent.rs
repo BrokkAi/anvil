@@ -518,7 +518,7 @@ fn attach_bedrock_credits_meta<F>(
 }
 
 fn is_bedrock_model(model_wire_id: &str) -> bool {
-    split_wire_id(model_wire_id).map(|(source, _)| source) == Some(ModelSource::Bedrock)
+    split_wire_id(model_wire_id).map(|(source, _)| source) == Some(ModelSource::BEDROCK)
 }
 
 fn insert_openrouter_balance_meta(
@@ -558,7 +558,7 @@ fn attach_openrouter_balance_meta<F>(
 fn is_openrouter_model(model_wire_id: &str) -> bool {
     matches!(
         split_wire_id(model_wire_id),
-        Some((ModelSource::OpenRouter, model_id)) if !model_id.is_empty()
+        Some((ModelSource::OPENROUTER, model_id)) if !model_id.is_empty()
     )
 }
 
@@ -599,7 +599,7 @@ fn attach_deepseek_balance_meta<F>(
 fn is_deepseek_model(model_wire_id: &str) -> bool {
     matches!(
         split_wire_id(model_wire_id),
-        Some((ModelSource::DeepSeek, model_id)) if !model_id.is_empty()
+        Some((ModelSource::DEEPSEEK, model_id)) if !model_id.is_empty()
     )
 }
 
@@ -1687,7 +1687,7 @@ fn render_session_start_setup_notice(
     "Anvil is ready. Run `/setup` anytime to change or repair model setup.".to_string()
 }
 
-fn source_count(catalog: &[ModelMetadata], source: ModelSource) -> usize {
+fn source_count(catalog: &[ModelMetadata], source: &str) -> usize {
     catalog
         .iter()
         .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
@@ -1698,12 +1698,14 @@ const MODEL_REFRESH_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 fn preferred_model(catalog: &[ModelMetadata]) -> Option<String> {
     [
-        ModelSource::Bedrock,
-        ModelSource::Codex,
-        ModelSource::Ollama,
-        ModelSource::Ds4,
-        ModelSource::DeepSeek,
-        ModelSource::OpenRouter,
+        ModelSource::BEDROCK,
+        ModelSource::CODEX,
+        ModelSource::OLLAMA,
+        ModelSource::DS4,
+        ModelSource::DEEPSEEK,
+        ModelSource::KIMI,
+        ModelSource::OPENAI,
+        ModelSource::OPENROUTER,
     ]
     .into_iter()
     .find_map(|source| {
@@ -1734,12 +1736,12 @@ fn render_setup_home_from_snapshot(snap: &SessionSnapshot, catalog: &[ModelMetad
 }
 
 fn render_setup_home_for_model(model: &str, catalog: &[ModelMetadata]) -> String {
-    let bedrock_count = source_count(catalog, ModelSource::Bedrock);
-    let codex_count = source_count(catalog, ModelSource::Codex);
+    let bedrock_count = source_count(catalog, ModelSource::BEDROCK);
+    let codex_count = source_count(catalog, ModelSource::CODEX);
     let local_count =
-        source_count(catalog, ModelSource::Ollama) + source_count(catalog, ModelSource::Ds4);
-    let deepseek_count = source_count(catalog, ModelSource::DeepSeek);
-    let openrouter_count = source_count(catalog, ModelSource::OpenRouter);
+        source_count(catalog, ModelSource::OLLAMA) + source_count(catalog, ModelSource::DS4);
+    let deepseek_count = source_count(catalog, ModelSource::DEEPSEEK);
+    let openrouter_count = source_count(catalog, ModelSource::OPENROUTER);
     let bedrock_state = crate::bedrock_auth::CredentialState::snapshot();
     let openrouter_state = crate::openrouter_auth::CredentialState::snapshot();
     let deepseek_state = crate::deepseek_auth::CredentialState::snapshot();
@@ -3202,7 +3204,7 @@ pub async fn run_agent(
                         .await
                         {
                             Ok(catalog) => {
-                                let count = source_count(&catalog, ModelSource::OpenRouter);
+                                let count = source_count(&catalog, ModelSource::OPENROUTER);
                                 if count > 0 {
                                     "OpenRouter models are ready. Run `/setup choose`, or use `/setup model` for advanced selection.".to_string()
                                 } else {
@@ -11922,7 +11924,7 @@ async fn handle_setup_local(
     match rest.to_ascii_lowercase().as_str() {
         "use" | "choose" => {
             let catalog = sessions.available_model_metadata().await;
-            if let Some(model) = [ModelSource::Ollama, ModelSource::Ds4]
+            if let Some(model) = [ModelSource::OLLAMA, ModelSource::DS4]
                 .into_iter()
                 .find_map(|source| {
                     catalog
@@ -11940,8 +11942,8 @@ async fn handle_setup_local(
                 .await
             {
                 Ok(catalog) => {
-                    let local_count = source_count(&catalog, ModelSource::Ollama)
-                        + source_count(&catalog, ModelSource::Ds4);
+                    let local_count = source_count(&catalog, ModelSource::OLLAMA)
+                        + source_count(&catalog, ModelSource::DS4);
                     if local_count > 0 {
                         "Local models are ready. Run `/setup local use` to use them, or `/setup choose` to let Anvil pick.".to_string()
                     } else {
@@ -11980,7 +11982,7 @@ async fn handle_provider_setup_refresh(
     session_id: &str,
     llm: &Arc<MultiBackend>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
-    source: ModelSource,
+    source: &str,
     provider: &str,
     render_help: fn() -> String,
 ) -> String {
@@ -12039,7 +12041,7 @@ async fn handle_setup_bedrock(
             session_id,
             llm,
             refresh_lock,
-            ModelSource::Bedrock,
+            ModelSource::BEDROCK,
             "Bedrock",
             render_bedrock_setup_help,
         )
@@ -12385,7 +12387,7 @@ async fn handle_setup_deepseek(
             session_id,
             llm,
             refresh_lock,
-            ModelSource::DeepSeek,
+            ModelSource::DEEPSEEK,
             "DeepSeek",
             render_deepseek_setup_help,
         )
@@ -12533,7 +12535,7 @@ async fn handle_setup_openrouter(
             session_id,
             llm,
             refresh_lock,
-            ModelSource::OpenRouter,
+            ModelSource::OPENROUTER,
             "OpenRouter",
             render_openrouter_setup_help,
         )
@@ -12940,27 +12942,27 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
 
         write_group(
             "Bedrock",
-            source_model_ids(catalog, ModelSource::Bedrock, 12),
+            source_model_ids(catalog, ModelSource::BEDROCK, 12),
             "No Bedrock models found. Run `/setup bedrock` to configure your token and region.",
         );
         write_group(
             "Codex",
-            source_model_ids(catalog, ModelSource::Codex, 12),
+            source_model_ids(catalog, ModelSource::CODEX, 12),
             "No Codex models found. Run `/setup codex`.",
         );
         write_group(
             "Local models",
-            source_model_ids(catalog, ModelSource::Ollama, 12),
+            source_model_ids(catalog, ModelSource::OLLAMA, 12),
             "No local models found. Run `/setup local`.",
         );
         write_group(
             "ds4 (DeepSeek V4)",
-            source_model_ids(catalog, ModelSource::Ds4, 12),
+            source_model_ids(catalog, ModelSource::DS4, 12),
             "No ds4 models found. Start `ds4-server` (antirez/ds4), or set DS4_BASE_URL.",
         );
         write_group(
             "DeepSeek",
-            source_model_ids(catalog, ModelSource::DeepSeek, 12),
+            source_model_ids(catalog, ModelSource::DEEPSEEK, 12),
             "No hosted DeepSeek models found. Export DEEPSEEK_API_KEY and refresh.",
         );
         write_group(
@@ -12970,7 +12972,7 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
         );
     }
 
-    let openrouter_total = source_count(catalog, ModelSource::OpenRouter);
+    let openrouter_total = source_count(catalog, ModelSource::OPENROUTER);
     if openrouter_total > 0 {
         out.push_str(&format!(
             "OpenRouter list is filtered for chat and coding models ({openrouter_total} total in the raw catalog).\n"
@@ -12979,7 +12981,7 @@ fn render_setup_models(catalog: &[ModelMetadata]) -> String {
     out
 }
 
-fn source_model_ids(catalog: &[ModelMetadata], source: ModelSource, limit: usize) -> Vec<String> {
+fn source_model_ids(catalog: &[ModelMetadata], source: &str, limit: usize) -> Vec<String> {
     catalog
         .iter()
         .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == source))
@@ -13011,7 +13013,7 @@ fn filtered_openrouter_models(catalog: &[ModelMetadata]) -> Vec<String> {
     ];
     catalog
         .iter()
-        .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == ModelSource::OpenRouter))
+        .filter(|m| split_wire_id(&m.id).is_some_and(|(s, _)| s == ModelSource::OPENROUTER))
         .filter(|m| {
             let id = m.id.to_ascii_lowercase();
             INCLUDE.iter().any(|needle| id.contains(needle))
@@ -14083,7 +14085,7 @@ const USAGE_CREDITS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// irrelevant network call.
 async fn fetch_openrouter_credits_for_usage(model_wire_id: &str) -> OpenRouterCreditsOutcome {
     let active_source = split_wire_id(model_wire_id).map(|(src, _)| src);
-    if active_source != Some(ModelSource::OpenRouter) {
+    if active_source != Some(ModelSource::OPENROUTER) {
         return OpenRouterCreditsOutcome::Skipped;
     }
     let Some(key) = crate::openrouter_credits::active_api_key() else {
@@ -14117,7 +14119,7 @@ async fn fetch_openrouter_credits_for_usage(model_wire_id: &str) -> OpenRouterCr
 /// `/setup codex` when their setup was already correct.
 async fn fetch_codex_credits_for_usage(model_wire_id: &str) -> CodexCreditsOutcome {
     let active_source = split_wire_id(model_wire_id).map(|(src, _)| src);
-    if active_source != Some(ModelSource::Codex) {
+    if active_source != Some(ModelSource::CODEX) {
         return CodexCreditsOutcome::NotApplicable;
     }
     match crate::codex_credits::auth_status() {
@@ -14193,7 +14195,7 @@ fn render_usage_report(
     codex_credits: CodexCreditsOutcome,
 ) -> String {
     let (model_display, source_display) = match split_wire_id(&snap.model) {
-        Some((source, bare)) => (bare.to_string(), source.as_str().to_string()),
+        Some((source, bare)) => (bare.to_string(), source.to_string()),
         None if snap.model.is_empty() => ("(none)".to_string(), "(unset)".to_string()),
         None => (snap.model.clone(), "(unknown)".to_string()),
     };
@@ -14239,7 +14241,7 @@ fn render_usage_report(
             // Two distinct skip reasons, distinguished by inspecting
             // the active model id. We keep the message short and
             // actionable rather than dumping internal state.
-            if split_wire_id(&snap.model).map(|(src, _)| src) == Some(ModelSource::OpenRouter) {
+            if split_wire_id(&snap.model).map(|(src, _)| src) == Some(ModelSource::OPENROUTER) {
                 out.push_str(
                     "- OpenRouter balance: no credential configured. Set \
                      OPENROUTER_API_KEY or run `/setup openrouter key <key>`.\n",
@@ -17270,9 +17272,43 @@ mod tests {
         let _env = EnvScope::set("OPENROUTER_API_KEY", "sk-or-from-env");
 
         let store = SessionStore::new("m".into());
-        let llm = std::sync::Arc::new(crate::multi_backend::MultiBackend::new(
-            None, None, None, None, None,
-        ));
+        let llm = std::sync::Arc::new(crate::multi_backend::MultiBackend::new(vec![
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::BEDROCK,
+                "Bedrock",
+                None,
+            ),
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::CODEX,
+                "Codex",
+                None,
+            ),
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::OLLAMA,
+                "Local models",
+                None,
+            ),
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::DS4,
+                "ds4",
+                None,
+            ),
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::DEEPSEEK,
+                "DeepSeek",
+                None,
+            ),
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::OPENAI,
+                "OpenAI-compatible",
+                None,
+            ),
+            crate::multi_backend::BackendRegistration::new(
+                crate::discovery::ModelSource::OPENROUTER,
+                "OpenRouter",
+                None,
+            ),
+        ]));
         let refresh = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
         let bare =
