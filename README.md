@@ -20,10 +20,11 @@ one reusable ACP subprocess and put a small client in front of it.
   boundary: initialize, create or resume a session, send prompts, receive
   streamed updates, answer permission requests.
 - **Model routing built in.** Anvil discovers Codex/ChatGPT credentials,
-  Ollama, a local ds4-server (antirez/ds4), and OpenRouter, then exposes
+  Ollama, a local ds4-server (antirez/ds4), Kimi Code, generic
+  OpenAI-compatible profiles from `providers.json`, and OpenRouter, then exposes
   collision-free wire ids such as `codex::gpt-5-codex`,
   `ollama::llama3:latest`, `ds4::deepseek-v4-flash`, and
-  `openrouter::anthropic/claude-sonnet-4.5`.
+  `kimi::k3`.
 - **MCP-native extensibility.** Anvil manages stdio MCP servers per session.
   Bifrost is preinstalled as a pinned, Anvil-managed local MCP server for
   symbol search, cross-references, and structural analysis.
@@ -101,7 +102,7 @@ mode through the session `Permission` selector.
 `/setup` distinguishes three scopes:
 
 - **Global providers:** credentials and discovery for Codex, Bedrock, local
-  models, DeepSeek, and OpenRouter are shared by sessions in this Anvil install.
+  models, DeepSeek, generic OpenAI-compatible providers, and OpenRouter are shared by sessions in this Anvil install.
 - **Current session:** model, behavior, reasoning effort, service tier, timeout,
   and permission mode are client-owned session controls and are not saved as
   Anvil install defaults.
@@ -205,6 +206,44 @@ Anvil is zero-config by default:
   is up; start it and `/setup local refresh` to bring it online.
 - **DeepSeek**: uses `DEEPSEEK_API_KEY` or credentials saved through
   `/setup deepseek`. Hosted models use `deepseek::*` wire ids.
+- **Kimi Code**: uses `KIMI_API_KEY` when set, otherwise reads and refreshes
+  the OAuth credentials created by `kimi login` under `~/.kimi-code`.
+  Authentication is loaded at process startup and refreshed automatically;
+  Anvil does not require an interactive `/setup` flow. Models use `kimi::*`
+  wire ids, including `kimi::k3`. Set `KIMI_CODE_BASE_URL` to override the
+  default `https://api.kimi.com/coding/v1` endpoint.
+- **Generic OpenAI-compatible providers**: read once at startup from
+  `providers.json` in the Brokk config directory (`$BROKK_CONFIG_HOME` when
+  set, otherwise the OS config directory plus `brokk`). These profiles use
+  the baseline OpenAI Chat Completions transport: `GET /v1/models`,
+  `POST /v1/chat/completions`, bearer auth when configured, streaming SSE,
+  tools, usage, and strict JSON Schema structured outputs. They do not expose
+  provider-specific reasoning controls or custom headers.
+
+  Example `providers.json`:
+
+  ```json
+  {
+    "openai": {
+      "deca": {
+        "base_url": "https://api.genlabs.dev/deca",
+        "api_key_env": "DECA_API_KEY"
+      },
+      "local-proxy": {
+        "base_url": "http://127.0.0.1:8000"
+      }
+    }
+  }
+  ```
+
+  Profile names must match `[a-z0-9][a-z0-9_-]{0,31}`. `base_url` must be
+  HTTP(S) without embedded credentials, query string, or fragment; Anvil trims
+  trailing slashes and appends `/v1` unless the path already ends in `/v1`.
+  `api_key_env` is optional, but when present the named environment variable
+  must exist and be non-empty at startup. Inline API keys are not supported.
+  Models use `openai::<profile>/<model-id>` wire ids, for example
+  `openai::deca/deca-model`. Bare model ids route through this provider only
+  when exactly one generic OpenAI profile is configured.
 - **OpenRouter**: uses `OPENROUTER_API_KEY` or credentials saved through
   `/setup openrouter`.
 - **Bedrock**: uses `AWS_BEARER_TOKEN_BEDROCK` or credentials saved through
@@ -236,9 +275,10 @@ Anvil is zero-config by default:
 Provider discovery is non-fatal. If one source is unavailable, Anvil logs it and
 continues with the providers that work.
 
-Provider priority for `/setup choose` is Bedrock first, then Codex, local models
-(Ollama, then ds4), hosted DeepSeek, and OpenRouter. You can also select a
-specific current-session model with `/setup model <wire id>`.
+Provider priority for automatic selection is Bedrock first, then Codex, local
+models (Ollama, then ds4), hosted DeepSeek, Kimi, generic OpenAI-compatible
+profiles, and OpenRouter. You can select a specific current-session model with
+`/setup model <wire id>`.
 
 ## Slash Commands
 
