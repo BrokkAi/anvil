@@ -55,7 +55,7 @@ jobs:
           name="brokk-anvil-${ref}-x86_64-unknown-linux-gnu"
           mkdir "$name"
           cp "target/x86_64-unknown-linux-gnu/release/anvil" "$name/"
-          cp README.md "$name/"
+          cp README.md LICENSE licenses/GPL-3.0.md licenses/SOURCE.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/"
           zip -r "$name.zip" "$name"
           sha256sum "$name.zip" > "$name.zip.sha256"
 
@@ -105,7 +105,7 @@ jobs:
           name="brokk-anvil-${ref}-aarch64-unknown-linux-gnu"
           mkdir "$name"
           cp "target/aarch64-unknown-linux-gnu/release/anvil" "$name/"
-          cp README.md "$name/"
+          cp README.md LICENSE licenses/GPL-3.0.md licenses/SOURCE.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/"
           zip -r "$name.zip" "$name"
           sha256sum "$name.zip" > "$name.zip.sha256"
 
@@ -171,7 +171,7 @@ jobs:
           name="brokk-anvil-${ref}-aarch64-linux-android"
           mkdir "$name"
           cp "target/aarch64-linux-android/release/anvil" "$name/"
-          cp README.md "$name/"
+          cp README.md LICENSE licenses/GPL-3.0.md licenses/SOURCE.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/"
           zip -r "$name.zip" "$name"
           sha256sum "$name.zip" > "$name.zip.sha256"
 
@@ -218,7 +218,7 @@ jobs:
           $name = "brokk-anvil-$ref-x86_64-pc-windows-msvc"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target\x86_64-pc-windows-msvc\release\anvil.exe" -Destination $name
-          Copy-Item "README.md" -Destination $name
+          Copy-Item "README.md", "LICENSE", "licenses\GPL-3.0.md", "licenses\SOURCE.md", "licenses\THIRD_PARTY_LICENSES.html", "licenses\SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt" -Destination $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
           "$hash  $name.zip" | Set-Content -Path "$name.zip.sha256" -NoNewline
@@ -278,7 +278,7 @@ jobs:
           name="brokk-anvil-${ref}-universal-apple-darwin"
           mkdir "$name"
           cp target/universal-apple-darwin/release/anvil "$name/"
-          cp README.md "$name/"
+          cp README.md LICENSE licenses/GPL-3.0.md licenses/SOURCE.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "$name/"
           zip -r "$name.zip" "$name"
           shasum -a 256 "$name.zip" > "$name.zip.sha256"
 

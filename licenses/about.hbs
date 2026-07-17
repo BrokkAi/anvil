@@ -1,0 +1,62 @@
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Anvil third-party licenses</title>
+    <style>
+      @media (prefers-color-scheme: dark) {
+        body { background: #333; color: white; }
+        a { color: skyblue; }
+      }
+      .container { font-family: sans-serif; max-width: 800px; margin: 0 auto; }
+      .intro { text-align: center; }
+      .licenses-list { list-style-type: none; margin: 0; padding: 0; }
+      .license-used-by { margin-top: -10px; }
+      .license-text { max-height: 200px; overflow-y: scroll; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <div class="intro">
+        <h1>Anvil third-party licenses</h1>
+        <p>
+          This report covers the locked production Rust graph incorporated into
+          official Anvil binaries. It includes all native release targets and
+          the <code>wasm32-wasip2</code> parser guest embedded by the default
+          <code>wasm-sandbox</code> feature. The report is conservative: Cargo's
+          metadata can also contribute build or test packages that are not linked
+          into the release binary. The workspace's <code>xtask</code> helper is
+          outside this artifact report.
+        </p>
+        <p>
+          Anvil's own terms are in <code>LICENSE</code>, with the incorporated
+          GPL text in <code>GPL-3.0.md</code>. <code>SOURCE.md</code> identifies
+          the corresponding source revision. Vendored native code and
+          standalone notices not fully represented by Cargo package metadata
+          are covered by <code>SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt</code>.
+        </p>
+      </div>
+      <h2>Overview of licenses:</h2>
+      <ul class="licenses-overview">
+        {{#each overview}}
+          <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+        {{/each}}
+      </ul>
+      <h2>All license text:</h2>
+      <ul class="licenses-list">
+        {{#each licenses}}
+          <li class="license">
+            <h3 id="{{id}}">{{name}}</h3>
+            <h4>Used by:</h4>
+            <ul class="license-used-by">
+              {{#each used_by}}
+                <li><a href="https://crates.io/crates/{{crate.name}}/{{crate.version}}">{{crate.name}} {{crate.version}}</a></li>
+              {{/each}}
+            </ul>
+            <pre class="license-text">{{text}}</pre>
+          </li>
+        {{/each}}
+      </ul>
+    </main>
+  </body>
+</html>
