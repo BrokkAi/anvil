@@ -5158,6 +5158,7 @@ async fn run_asgard_trajectory_loop(
         }
     };
     let mut current_window_steps = initial_advice.next_window_steps;
+    let mut consecutive_winner_failures = 0usize;
     let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
     let mut current_supervisor_state_summary = initial_advice.state_summary.clone();
     send_thought(
@@ -5654,7 +5655,23 @@ async fn run_asgard_trajectory_loop(
             winner.outcome.response = supervisor_completion_summary;
             winner.outcome.stop = crate::tool_loop::LoopStop::Completed { had_text: true };
         }
-        let finished = asgard_should_finish(supervisor_complete, &winner.outcome.stop);
+        if matches!(winner.outcome.stop, crate::tool_loop::LoopStop::Failed(_)) {
+            consecutive_winner_failures += 1;
+            tracing::warn!(
+                window,
+                consecutive_winner_failures,
+                "Asgard winner lane failed; resurrecting from the accepted state next window"
+            );
+            send_thought(
+                cx,
+                session_id,
+                "[Asgard: selected lane failed this window; resurrecting from the accepted state]\n",
+            );
+        } else {
+            consecutive_winner_failures = 0;
+        }
+        let finished = asgard_should_finish(supervisor_complete, &winner.outcome.stop)
+            || consecutive_winner_failures >= 3;
         selected_outcome = Some(winner.outcome);
         if finished {
             break;
@@ -5683,11 +5700,12 @@ async fn run_asgard_trajectory_loop(
 }
 
 fn asgard_should_finish(supervisor_complete: bool, stop: &crate::tool_loop::LoopStop) -> bool {
-    supervisor_complete
-        || matches!(
-            stop,
-            crate::tool_loop::LoopStop::Failed(_) | crate::tool_loop::LoopStop::Cancelled
-        )
+    // A failed winner lane does not end the run: every lane restarts from the
+    // winner snapshot next window, which resurrects it. Only supervisor
+    // completion or an explicit cancellation finishes Asgard; persistent
+    // failures are bounded by the consecutive-failure circuit breaker at the
+    // call site.
+    supervisor_complete || matches!(stop, crate::tool_loop::LoopStop::Cancelled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18989,6 +19007,13 @@ mod tests {
         assert!(asgard_should_finish(
             false,
             &crate::tool_loop::LoopStop::Cancelled
+        ));
+        assert!(!asgard_should_finish(
+            false,
+            &crate::tool_loop::LoopStop::Failed(crate::tool_loop::TurnFailure {
+                retryable: true,
+                message: "lane llm error".to_string(),
+            })
         ));
     }
 
