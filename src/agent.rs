@@ -5417,6 +5417,7 @@ async fn run_asgard_trajectory_loop(
             }
         };
         let mut accepted_completion_review_rows: Option<Vec<AsgardContractRow>> = None;
+        let mut decision_was_review = false;
         if decision.complete {
             send_thought(
                 cx,
@@ -5454,6 +5455,7 @@ async fn run_asgard_trajectory_loop(
                 .entry(supervisor_model.to_string())
                 .or_default()
                 .add(completion_review.1);
+            decision_was_review = true;
             decision = match completion_review.0 {
                 Ok(review) => {
                     accepted_completion_review_rows = review
@@ -5527,6 +5529,22 @@ async fn run_asgard_trajectory_loop(
             current_window_steps = decision
                 .next_window_steps
                 .expect("incomplete Asgard decision has next_window_steps");
+            if decision_was_review {
+                // A rejected completion review enumerates its evidence gaps; a
+                // 3-step verification window closes only two or three of them,
+                // producing multi-cycle claim-reject grinds on correct
+                // endpoints (observed live: nine cycles over 37 minutes).
+                // Size the verification window to the deficit instead.
+                let evidence_gaps = decision
+                    .contracts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|row| row.status != "verified")
+                    .count();
+                current_window_steps =
+                    current_window_steps.max(evidence_gaps.min(ASGARD_MAX_WINDOW_STEPS));
+            }
             send_thought(
                 cx,
                 session_id,
