@@ -1,3 +1,4 @@
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -248,7 +249,7 @@ pub(crate) fn capture_patch_since(
 }
 
 fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
-    let untracked = git_with_index(
+    let listed = git_with_index(
         root,
         index,
         &[
@@ -258,9 +259,25 @@ fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
             "-z",
             "--",
             ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
         ],
     )?
     .stdout;
+    // Candidates run concurrently with this snapshot, so a listed file can
+    // vanish before `git add -N` resolves it (observed: SQLite -shm files),
+    // and git treats an unmatched pathspec as fatal. Re-check existence and
+    // feed git only paths that are still present.
+    let untracked: Vec<u8> = listed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter(|path| {
+            root.join(std::ffi::OsStr::from_bytes(path))
+                .symlink_metadata()
+                .is_ok()
+        })
+        .flat_map(|path| path.iter().copied().chain(std::iter::once(0)))
+        .collect();
     if untracked.is_empty() {
         return Ok(());
     }
