@@ -82,6 +82,7 @@ use agent_client_protocol::{
     on_receive_notification, on_receive_request,
 };
 use anyhow::Context as _;
+use sha2::{Digest, Sha256};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::discovery::{ModelSource, split_wire_id};
@@ -4886,6 +4887,7 @@ struct AsgardCandidate {
     outcome: crate::tool_loop::LoopOutcome,
     patch: Vec<u8>,
     delta_patch: Vec<u8>,
+    window_messages: Vec<ChatMessage>,
     supervisor_window_messages: Vec<ChatMessage>,
     window_ledger: AsgardExecutionLedger,
 }
@@ -4941,6 +4943,8 @@ struct AsgardLedgerEntry {
     step: usize,
     command: String,
     exit_code: Option<i32>,
+    output_bytes: usize,
+    output_sha256: String,
     output_tail: String,
 }
 
@@ -4959,6 +4963,7 @@ struct AsgardExecutionLedger {
 }
 
 const ASGARD_SUMMARIZE_WINDOW_TOOL_NAME: &str = "summarize_candidate_window";
+const ASGARD_DETERMINISTIC_HANDOFF_MAX_BYTES: usize = 16_000;
 const ASGARD_CONTRACT_EXTRACTION_PROMPT: &str = "You are extracting the explicit contract checklist from a software task description, before any implementation exists. List every externally checkable requirement the task states: function and method signatures including argument order and curried versus non-curried forms, exact strings, separators, suffixes, and output formats, boundary values and their required handling, lifecycle and cancellation obligations (what must unblock, interrupt, close, or clean up what, including operations already in flight), concurrency and atomicity requirements, error types and exact error text, compatibility constraints, and explicit prohibitions. Quote the task's own words wherever possible. One requirement per entry; split compound sentences into separate entries. Do not invent requirements the task does not state and do not add generic quality goals. Tag each entry's kind: \"inspection\" when a reviewer can verify it by reading the final code (signatures, argument order, exact strings present in source, type shapes); \"execution\" when verification requires running a scenario (blocking and unblocking, timing, cancellation of in-flight operations, end-to-end produced output, formatting of emitted streams); \"delivery\" for repository-delivery obligations that do not affect runtime behavior (working on a named branch, committing the work, repository cleanliness). For each entry, if the requirement only holds meaning under a specific adverse condition — an operation already blocked or in flight when the triggering event fires, an exhausted window or resource, an externally stalled dependency, a boundary or zero value — record that condition verbatim in adverse_condition; otherwise set adverse_condition to null. When the task names classification values, categories, or enumerated labels (for example conflict types, error kinds, source values, status codes), add a separate contract that each reported classification carries the correct value for its specific scenario — distinct from, and in addition to, the contract that the item is detected or reported at all; verifying a count or presence does not verify a label. When a requirement combines, maps, constructs from, or dispatches over multiple positional inputs (combining N containers, building a record from several fields, constructor argument lists), add a separate contract, kind \"inspection\", that each input's value reaches its correct output position, with adverse_condition stating that verification requires either quoting the complete argument flow from construction to application, or execution with pairwise distinguishable inputs and a non-commutative operation — green tests with same-valued or commutative examples prove nothing about position. Success paths get adverse conditions too: when a requirement's happy path can be partially wrong (right for the first element, the common case, or homogeneous inputs), record the discriminating input shape as its adverse_condition rather than leaving it null. When the task requires emitting a well-known textual format or stream whose name implies standard structural conventions (for example a manifest stream with document separators and source annotations, a unified diff, a standard header block), also add one contract per structural convention the named format prescribes — including how the stream begins, how documents or sections are delimited, and how identifying annotations are formed and normalized — marked kind \"execution\" and quoting the format name from the task. Only do this for formats whose conventions you are certain of; do not invent conventions. When the task defines a typed public API whose signatures involve callbacks, generics, overloads, or container/element relationships — shapes where a misreading changes what external callers must write — add one contract per such signature stating its exact parameter and return types in the task's words, kind \"execution\", with adverse_condition: verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests. Do not create type-shape contracts for simple scalar annotations; those are ordinary inspection contracts. If a requirement admits two materially different readings, record the contract once per reading and set each adverse_condition to the ambiguity it resolves; do not silently pick one reading. Call extract_task_contracts exactly once. Do not answer in prose.";
 const ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS: usize = 3;
 const ASGARD_AUDIT_BUILTIN_TOOLS: &[&str] = &["read_file", "grep_search", "list_directory"];
@@ -5029,6 +5034,9 @@ struct AsgardChallengeStats {
 struct AsgardPriorCompletionReview {
     window: usize,
     rows: Vec<AsgardContractRow>,
+    decision: AsgardSupervisorDecision,
+    reviewed_patch: Vec<u8>,
+    evidence_fingerprints: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -5164,6 +5172,13 @@ async fn run_asgard_trajectory_loop(
         }));
     }
     aggregate_usage.add(checklist_usage);
+    trace_asgard_phase_usage(
+        "task_contract",
+        supervisor_model,
+        None,
+        None,
+        checklist_usage,
+    );
     usage_by_model
         .entry(supervisor_model.to_string())
         .or_default()
@@ -5181,6 +5196,7 @@ async fn run_asgard_trajectory_loop(
             &live_output,
         )
         .await;
+        trace_asgard_phase_usage("initial_advice", supervisor_model, None, None, supervisor.1);
         aggregate_usage.add(supervisor.1);
         usage_by_model
             .entry(supervisor_model.to_string())
@@ -5349,26 +5365,44 @@ async fn run_asgard_trajectory_loop(
                     trajectory_message_start,
                 );
                 let window_ledger = asgard_extract_execution_ledger(&window_messages);
-                let (brief, grading_usage) = run_asgard_candidate_window_summary(
-                    llm.as_ref(),
-                    AsgardCandidateAssessmentContext {
-                        model: &model,
-                        reasoning_effort,
-                        service_tier,
-                        idle_timeout,
-                        original_task: &assessment_original_task,
-                        canonical_state_summary: &assessment_state_summary,
-                        current_plan: outcome.current_plan.as_ref(),
-                    },
-                    cancel,
+                let deterministic_handoff = asgard_deterministic_candidate_handoff(
                     &window_messages,
-                )
-                .await;
+                    outcome.current_plan.as_ref(),
+                );
+                let (brief, grading_usage, deterministic_stats) =
+                    if let Some((messages, raw_bytes, packed_bytes)) = deterministic_handoff {
+                        (
+                            Ok(messages),
+                            crate::llm_client::TokenUsage::default(),
+                            Some((raw_bytes, packed_bytes)),
+                        )
+                    } else {
+                        let (brief, usage) = run_asgard_candidate_window_summary(
+                            llm.as_ref(),
+                            AsgardCandidateAssessmentContext {
+                                model: &model,
+                                window,
+                                lane: index,
+                                reasoning_effort,
+                                service_tier,
+                                idle_timeout,
+                                original_task: &assessment_original_task,
+                                canonical_state_summary: &assessment_state_summary,
+                                current_plan: outcome.current_plan.as_ref(),
+                            },
+                            cancel,
+                            &window_messages,
+                        )
+                        .await;
+                        (brief.map(|brief| {
+                            vec![ChatMessage::assistant(format!(
+                                "<candidate_window_brief>\n{brief}\n</candidate_window_brief>"
+                            ))]
+                        }), usage, None)
+                    };
                 let supervisor_window_messages = match brief {
-                    Ok(brief) => {
-                        let messages = vec![ChatMessage::assistant(format!(
-                            "<candidate_window_brief>\n{brief}\n</candidate_window_brief>"
-                        ))];
+                    Ok(messages) => {
+                        let brief = render_asgard_dossier_messages(&messages);
                         if std::env::var_os("ASGARD_CAPTURE_WINDOW_SUMMARIES").is_some() {
                             tracing::info!(
                                 lane = index + 1,
@@ -5377,13 +5411,44 @@ async fn run_asgard_trajectory_loop(
                                 "captured Asgard candidate window summary for review"
                             );
                         }
-                        tracing::info!(
-                            lane = index + 1,
-                            model,
-                            original_bytes = render_asgard_dossier_messages(&window_messages).len(),
-                            slim_bytes = render_asgard_dossier_messages(&messages).len(),
-                            "summarized Asgard candidate trajectory"
-                        );
+                        let original_bytes = render_asgard_dossier_messages(&window_messages).len();
+                        let slim_bytes = brief.len();
+                        if let Some((raw_bytes, packed_bytes)) = deterministic_stats {
+                            tracing::info!(
+                                lane = index + 1,
+                                model,
+                                original_bytes,
+                                slim_bytes,
+                                raw_bytes,
+                                packed_bytes,
+                                "used deterministic exact Asgard candidate handoff"
+                            );
+                            crate::trace_logging::append_trace_record(serde_json::json!({
+                                "type": "asgard_candidate_handoff",
+                                "window": window,
+                                "lane": index,
+                                "mode": "deterministic_exact",
+                                "raw_bytes": raw_bytes,
+                                "packed_bytes": packed_bytes,
+                                "supervisor_bytes": slim_bytes,
+                            }));
+                        } else {
+                            tracing::info!(
+                                lane = index + 1,
+                                model,
+                                original_bytes,
+                                slim_bytes,
+                                "summarized Asgard candidate trajectory"
+                            );
+                            crate::trace_logging::append_trace_record(serde_json::json!({
+                                "type": "asgard_candidate_handoff",
+                                "window": window,
+                                "lane": index,
+                                "mode": "llm_summary",
+                                "raw_bytes": original_bytes,
+                                "supervisor_bytes": slim_bytes,
+                            }));
+                        }
                         messages
                     }
                     Err(error) => {
@@ -5400,6 +5465,7 @@ async fn run_asgard_trajectory_loop(
                     model,
                     outcome,
                     patches,
+                    window_messages,
                     supervisor_window_messages,
                     window_ledger,
                     grading_usage,
@@ -5412,11 +5478,19 @@ async fn run_asgard_trajectory_loop(
             model,
             outcome,
             patches,
+            window_messages,
             supervisor_window_messages,
             window_ledger,
             grading_usage,
         ) in futures::future::join_all(futures).await
         {
+            trace_asgard_phase_usage(
+                "candidate_window_summary",
+                &model,
+                Some(window),
+                Some(index),
+                grading_usage,
+            );
             aggregate_usage.add(outcome.usage);
             aggregate_usage.add(grading_usage);
             usage_by_model
@@ -5434,6 +5508,7 @@ async fn run_asgard_trajectory_loop(
                     outcome,
                     patch,
                     delta_patch,
+                    window_messages,
                     supervisor_window_messages,
                     window_ledger,
                 }),
@@ -5469,6 +5544,13 @@ async fn run_asgard_trajectory_loop(
         )
         .await;
         let supervisor_usage = supervisor.1;
+        trace_asgard_phase_usage(
+            "routing_supervisor",
+            supervisor_model,
+            Some(window),
+            None,
+            supervisor_usage,
+        );
         aggregate_usage.add(supervisor_usage);
         usage_by_model
             .entry(supervisor_model.to_string())
@@ -5518,7 +5600,65 @@ async fn run_asgard_trajectory_loop(
                 }
             }
         };
-        let mut accepted_completion_review_rows: Option<Vec<AsgardContractRow>> = None;
+        let mut completed_rejection_review: Option<AsgardSupervisorDecision> = None;
+        if decision.complete
+            && let Some(prior_review) = prior_completion_review.as_ref()
+            && let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.index == decision.winner)
+            && let Some(repository) = repositories.get(decision.winner)
+        {
+            match asgard_completion_review_delta(
+                prior_review,
+                candidate,
+                repository,
+                &canonical_ledger,
+            ) {
+                Ok(delta) => {
+                    let material = delta.is_material();
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_completion_review_gate",
+                        "window": window,
+                        "prior_review_window": prior_review.window,
+                        "selected_lane": decision.winner,
+                        "material": material,
+                        "net_patch_bytes": delta.patch.len(),
+                        "production_bytes": delta.production_bytes,
+                        "test_bytes": delta.test_bytes,
+                        "new_evidence_count": delta.new_evidence_count,
+                        "has_read_only_observation": delta.has_read_only_observation,
+                    }));
+                    if !material {
+                        let mut carried = prior_review.decision.clone();
+                        carried.winner = decision.winner;
+                        carried.complete = false;
+                        carried.contracts = Some(prior_review.rows.clone());
+                        carried.state_summary = format!(
+                            "Completion nomination in window {window} was not re-reviewed: no net \
+                             production or test change, new execution evidence, or new read-only \
+                             observation was present since the rejected completion review in window {}. {}",
+                            prior_review.window, prior_review.decision.state_summary,
+                        );
+                        send_thought(
+                            cx,
+                            session_id,
+                            &format!(
+                                "[Asgard deferred repeated completion review: no material delta since window {}]\n",
+                                prior_review.window
+                            ),
+                        );
+                        decision = carried;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        window,
+                        prior_review_window = prior_review.window,
+                        "failed to evaluate Asgard completion-review delta; reviewing conservatively: {error:#}"
+                    );
+                }
+            }
+        }
         if decision.complete {
             send_thought(
                 cx,
@@ -5552,6 +5692,13 @@ async fn run_asgard_trajectory_loop(
                 },
             )
             .await;
+            trace_asgard_phase_usage(
+                "completion_review",
+                supervisor_model,
+                Some(window),
+                Some(decision.winner),
+                completion_review.1,
+            );
             aggregate_usage.add(completion_review.1);
             usage_by_model
                 .entry(supervisor_model.to_string())
@@ -5559,11 +5706,9 @@ async fn run_asgard_trajectory_loop(
                 .add(completion_review.1);
             decision = match completion_review.0 {
                 Ok(review) => {
-                    accepted_completion_review_rows = review
-                        .contracts
-                        .as_ref()
-                        .filter(|rows| !rows.is_empty())
-                        .cloned();
+                    if !review.complete {
+                        completed_rejection_review = Some(review.clone());
+                    }
                     review
                 }
                 Err(error) => {
@@ -5707,8 +5852,17 @@ async fn run_asgard_trajectory_loop(
         selected_trajectory_windows.push(selected_window);
         canonical_ledger.push((window, winner.window_ledger.clone()));
         supervisor_history.push(window, &decision);
-        if let Some(rows) = accepted_completion_review_rows {
-            prior_completion_review = Some(AsgardPriorCompletionReview { window, rows });
+        if let Some(review) = completed_rejection_review {
+            let rows = review.contracts.clone().unwrap_or_default();
+            let evidence_fingerprints =
+                asgard_review_evidence_fingerprints(&canonical_ledger, &winner.window_ledger);
+            prior_completion_review = Some(AsgardPriorCompletionReview {
+                window,
+                rows,
+                decision: review,
+                reviewed_patch: winner.patch.clone(),
+                evidence_fingerprints,
+            });
             window_deltas_since_prior_review.clear();
         } else if prior_completion_review.is_some() {
             window_deltas_since_prior_review.push((window, winner.delta_patch.clone()));
@@ -5729,6 +5883,13 @@ async fn run_asgard_trajectory_loop(
             .await
             {
                 Ok(compaction) => {
+                    trace_asgard_phase_usage(
+                        "selected_compaction",
+                        &winner.model,
+                        Some(window),
+                        Some(winner.index),
+                        compaction.usage,
+                    );
                     aggregate_usage.add(compaction.usage);
                     usage_by_model
                         .entry(winner.model.clone())
@@ -6580,6 +6741,7 @@ async fn run_asgard_initial_advice_tool_steps(
     let mut last_invalid_response = None;
 
     for step in 1..=MAX_STEPS {
+        let request_bytes = render_asgard_dossier_messages(&messages).len();
         let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
         let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
         let response = stream_chat_no_visible_output_with_retry(
@@ -6625,7 +6787,18 @@ async fn run_asgard_initial_advice_tool_steps(
             Ok(response) => response,
             Err(error) => return (Err(error), usage),
         };
-        usage.add(response.usage());
+        let turn_usage = response.usage();
+        trace_asgard_phase_turn_usage(
+            "initial_advice",
+            context.model,
+            None,
+            None,
+            step,
+            "selection",
+            request_bytes,
+            turn_usage,
+        );
+        usage.add(turn_usage);
 
         match response {
             LlmResponse::Text {
@@ -6755,6 +6928,8 @@ async fn run_asgard_supervisor_tool_steps(
         } else {
             selection_attempts += 1;
         }
+        let turn = audit_rounds_used + selection_attempts;
+        let request_bytes = render_asgard_dossier_messages(&messages).len();
         let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
         let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
         let response = stream_chat_no_visible_output_with_retry(
@@ -6803,7 +6978,22 @@ async fn run_asgard_supervisor_tool_steps(
             Ok(response) => response,
             Err(error) => return (Err(error), usage),
         };
-        usage.add(response.usage());
+        let turn_usage = response.usage();
+        trace_asgard_phase_turn_usage(
+            if context.required_winner.is_some() {
+                "completion_review"
+            } else {
+                "routing_supervisor"
+            },
+            context.model,
+            None,
+            context.required_winner,
+            turn,
+            if audit_phase { "audit" } else { "selection" },
+            request_bytes,
+            turn_usage,
+        );
+        usage.add(turn_usage);
 
         match response {
             LlmResponse::Text {
@@ -7203,7 +7393,7 @@ Selection does not require certainty. Choose the best continuation under the ava
 <task_and_evidence>
 The original task is authoritative. Preserve its exact externally observable contracts, including argument order, return values, error behavior, atomicity, compatibility requirements, implementation constraints, and prohibitions. Merely defining the requested symbol or compiling the code does not establish that contract. A lane that contradicts the task is not rescued by confident prose, a large patch, or aggregate green checks. Judge architectural direction, correctness, recoverability, known defects, and evidence. Investigation that establishes an important constraint can be more valuable than immediate edits.
 
-Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_patch_manifest describes its cumulative changed production and test files. Normally each candidate_window_diff shows that lane's edits since the last selected decision. When candidate_diff_baseline names a current-window diff-compression anchor, that anchor is displayed first with its diff against the last selected decision, while every subsequent candidate_window_diff shows the transformation from the anchor lane to that lane. This is only diff compression: every lane still started independently from the same last selected decision, the anchor is not canonical or preferred, and lane indices remain authoritative. Use the briefs, manifests, and correctly based diffs together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
+Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_window_handoff with format="deterministic_exact" is different: it mechanically preserves every unique message from a small window and replaces only byte-identical repeated tool results with explicit back-references. Treat its observations as the original trajectory record, while still judging what each command or inspection actually proves. A candidate_patch_manifest describes its cumulative changed production and test files. Normally each candidate_window_diff shows that lane's edits since the last selected decision. When candidate_diff_baseline names a current-window diff-compression anchor, that anchor is displayed first with its diff against the last selected decision, while every subsequent candidate_window_diff shows the transformation from the anchor lane to that lane. This is only diff compression: every lane still started independently from the same last selected decision, the anchor is not canonical or preferred, and lane indices remain authoritative. Use the handoffs or briefs, manifests, and correctly based diffs together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
 
 Interpret verification precisely. A successful command establishes only the behaviors its selected tests and assertions actually exercised; filters, wrappers, timeouts, zero-test selections, and missing combinations can mislead. Candidate-written tests can be valuable, but green tests changed alongside the implementation are not independent proof merely because they pass. Check whether they genuinely express the task, especially the highest-risk requirement and combinations of behaviors changed by the patch. Do not mechanically reject legitimate test or mock updates.
 
@@ -7459,6 +7649,191 @@ fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String {
     rendered
 }
 
+/// Produces an exact, mechanically structured handoff when the window is
+/// already small enough that paying an LLM to summarize it would cost more
+/// than carrying it forward. Exact duplicate tool results are replaced by an
+/// explicit back-reference; no unique observation or reasoning is discarded.
+fn asgard_deterministic_candidate_handoff(
+    window_messages: &[ChatMessage],
+    current_plan: Option<&crate::plan::UpdatePlanArgs>,
+) -> Option<(Vec<ChatMessage>, usize, usize)> {
+    let raw = render_asgard_dossier_messages(window_messages);
+    let mut packed_messages = window_messages.to_vec();
+    let mut prior_tool_results = HashMap::<String, usize>::new();
+    for (index, message) in packed_messages.iter_mut().enumerate() {
+        if message.role != "tool" {
+            continue;
+        }
+        let text = asgard_message_text(message);
+        if let Some(first_index) = prior_tool_results.get(&text).copied() {
+            message.content = vec![ChatContentPart::text(format!(
+                "<exact_duplicate_of_message index=\"{first_index}\" />"
+            ))];
+        } else {
+            prior_tool_results.insert(text, index);
+        }
+    }
+    let packed = render_asgard_dossier_messages(&packed_messages);
+    if packed.len() > ASGARD_DETERMINISTIC_HANDOFF_MAX_BYTES {
+        return None;
+    }
+    let plan = current_plan
+        .and_then(|plan| serde_json::to_string_pretty(plan).ok())
+        .unwrap_or_else(|| "(no active plan)".to_string());
+    let handoff = ChatMessage::assistant(format!(
+        "<candidate_window_handoff format=\"deterministic_exact\" duplicate_encoding=\"back_reference\">\n\
+         This is a mechanically rendered trajectory, not a candidate-authored summary. Every unique \
+         message is preserved exactly; exact duplicate tool results point to their first message.\n\
+         <current_plan>\n{plan}\n</current_plan>\n\
+         <candidate_window>\n{packed}</candidate_window>\n\
+         </candidate_window_handoff>"
+    ));
+    Some((vec![handoff], raw.len(), packed.len()))
+}
+
+fn asgard_evidence_fingerprint(entry: &AsgardLedgerEntry) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        entry.command,
+        entry
+            .exit_code
+            .map_or_else(|| "none".to_string(), |code| code.to_string()),
+        entry.output_bytes,
+        entry.output_sha256,
+    )
+}
+
+fn asgard_sha256(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn asgard_review_evidence_fingerprints(
+    canonical_ledger: &[(usize, AsgardExecutionLedger)],
+    current_ledger: &AsgardExecutionLedger,
+) -> BTreeSet<String> {
+    canonical_ledger
+        .iter()
+        .flat_map(|(_, ledger)| &ledger.entries)
+        .chain(&current_ledger.entries)
+        .map(asgard_evidence_fingerprint)
+        .collect()
+}
+
+fn asgard_has_new_read_only_observation(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.tool_calls.iter().flatten().any(|call| {
+            asgard_is_audit_tool(&call.function.name)
+                || matches!(
+                    call.function.name.as_str(),
+                    "read_file" | "grep_search" | "list_directory"
+                )
+        })
+    })
+}
+
+#[derive(Debug)]
+struct AsgardReviewDelta {
+    patch: Vec<u8>,
+    production_bytes: usize,
+    test_bytes: usize,
+    new_evidence_count: usize,
+    has_read_only_observation: bool,
+}
+
+impl AsgardReviewDelta {
+    fn is_material(&self) -> bool {
+        self.production_bytes > 0
+            || self.test_bytes > 0
+            || self.new_evidence_count > 0
+            || self.has_read_only_observation
+    }
+}
+
+fn asgard_completion_review_delta(
+    prior: &AsgardPriorCompletionReview,
+    candidate: &AsgardCandidate,
+    repository: &crate::asgard::CandidateRepository,
+    canonical_ledger: &[(usize, AsgardExecutionLedger)],
+) -> anyhow::Result<AsgardReviewDelta> {
+    let patch = crate::asgard::capture_patch_since(
+        &repository.root,
+        &repository.base_commit,
+        &prior.reviewed_patch,
+    )?;
+    let (production, tests) = asgard_patch_surfaces(&patch);
+    let current_evidence =
+        asgard_review_evidence_fingerprints(canonical_ledger, &candidate.window_ledger);
+    Ok(AsgardReviewDelta {
+        patch,
+        production_bytes: production.len(),
+        test_bytes: tests.len(),
+        new_evidence_count: current_evidence
+            .difference(&prior.evidence_fingerprints)
+            .count(),
+        has_read_only_observation: asgard_has_new_read_only_observation(&candidate.window_messages),
+    })
+}
+
+fn trace_asgard_phase_usage(
+    phase: &str,
+    model: &str,
+    window: Option<usize>,
+    lane: Option<usize>,
+    usage: crate::llm_client::TokenUsage,
+) {
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_phase_usage",
+        "phase": phase,
+        "model": model,
+        "window": window,
+        "lane": lane,
+        "usage": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "thought": usage.thought_tokens,
+            "cachedRead": usage.cached_read_tokens,
+            "cachedWrite": usage.cached_write_tokens,
+        },
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_asgard_phase_turn_usage(
+    phase: &str,
+    model: &str,
+    window: Option<usize>,
+    lane: Option<usize>,
+    turn: usize,
+    turn_kind: &str,
+    message_bytes: usize,
+    usage: crate::llm_client::TokenUsage,
+) {
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_phase_turn_usage",
+        "phase": phase,
+        "model": model,
+        "window": window,
+        "lane": lane,
+        "turn": turn,
+        "turn_kind": turn_kind,
+        "message_bytes": message_bytes,
+        "usage": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "thought": usage.thought_tokens,
+            "cachedRead": usage.cached_read_tokens,
+            "cachedWrite": usage.cached_write_tokens,
+        },
+    }));
+}
+
 fn asgard_extract_task_contracts_tool() -> ToolDefinition {
     ToolDefinition {
         r#type: "function".to_string(),
@@ -7562,6 +7937,7 @@ async fn run_asgard_task_contract_extraction(
     let mut last_invalid_response = None;
 
     for step in 1..=ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS {
+        let request_bytes = render_asgard_dossier_messages(&messages).len();
         let response = stream_chat_no_visible_output_with_retry(
             llm.as_ref(),
             "extracting Asgard task contracts",
@@ -7597,7 +7973,18 @@ async fn run_asgard_task_contract_extraction(
                 continue;
             }
         };
-        usage.add(response.usage());
+        let turn_usage = response.usage();
+        trace_asgard_phase_turn_usage(
+            "task_contract",
+            model,
+            None,
+            None,
+            step,
+            "extraction",
+            request_bytes,
+            turn_usage,
+        );
+        usage.add(turn_usage);
 
         match response {
             LlmResponse::Text {
@@ -7798,6 +8185,7 @@ async fn run_asgard_candidate_window_summary(
     let mut last_invalid_response = None;
 
     for step in 1..=MAX_STEPS {
+        let request_bytes = render_asgard_dossier_messages(&messages).len();
         let response = stream_chat_no_visible_output_with_retry(
             llm,
             "summarizing Asgard candidate window",
@@ -7821,7 +8209,18 @@ async fn run_asgard_candidate_window_summary(
             Ok(response) => response,
             Err(error) => return (Err(error), usage),
         };
-        usage.add(response.usage());
+        let turn_usage = response.usage();
+        trace_asgard_phase_turn_usage(
+            "candidate_window_summary",
+            context.model,
+            Some(context.window),
+            Some(context.lane),
+            step,
+            "summary",
+            request_bytes,
+            turn_usage,
+        );
+        usage.add(turn_usage);
 
         match response {
             LlmResponse::Text {
@@ -7893,6 +8292,8 @@ async fn run_asgard_candidate_window_summary(
 #[derive(Clone, Copy)]
 struct AsgardCandidateAssessmentContext<'a> {
     model: &'a str,
+    window: usize,
+    lane: usize,
     reasoning_effort: Option<&'a str>,
     service_tier: Option<&'a str>,
     idle_timeout: IdleTimeouts,
@@ -8153,7 +8554,7 @@ fn asgard_extract_execution_ledger(window_messages: &[ChatMessage]) -> AsgardExe
                     .find(|later| {
                         later.role == "tool" && later.tool_call_id.as_deref() == Some(&call.id)
                     });
-                let (exit_code, output_tail) = match matching_result {
+                let (exit_code, output_bytes, output_sha256, output_tail) = match matching_result {
                     Some(result) => {
                         let result_text = asgard_message_text(result);
                         let exit_code = exit_code_regex
@@ -8167,15 +8568,22 @@ fn asgard_extract_execution_ledger(window_messages: &[ChatMessage]) -> AsgardExe
                             .filter(|line| !line.contains("[WARNING] OS sandbox unavailable"))
                             .collect::<Vec<_>>()
                             .join("\n");
-                        (exit_code, asgard_utf8_suffix(&filtered, 400).to_string())
+                        (
+                            exit_code,
+                            filtered.len(),
+                            asgard_sha256(filtered.as_bytes()),
+                            asgard_utf8_suffix(&filtered, 400).to_string(),
+                        )
                     }
-                    None => (None, String::new()),
+                    None => (None, 0, asgard_sha256(&[]), String::new()),
                 };
                 entries.push(AsgardLedgerEntry {
                     id: format!("L{total_shell_commands}"),
                     step,
                     command,
                     exit_code,
+                    output_bytes,
+                    output_sha256,
                     output_tail,
                 });
             } else {
@@ -10038,7 +10446,14 @@ fn render_mcp_servers() -> String {
 }
 
 fn mcp_usage() -> String {
-    "Commands:\n\
+    let bifrost_args = crate::mcp::McpServerConfig::bifrost()
+        .args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "Commands:\n\
      - `/mcp list`\n\
      - `/mcp add [--framing content-length|line] <name> <command> [args...]`\n\
      - `/mcp enable <name>`\n\
@@ -10047,10 +10462,10 @@ fn mcp_usage() -> String {
      - `/mcp reset`\n\n\
      `content-length` is the standard MCP stdio framing and is the default for new \
      servers. Use `line` only for NDJSON-speaking servers. Use shell-style quoting \
-     for commands or args that contain spaces, and use `{cwd}` in args to pass the \
+     for commands or args that contain spaces, and use `{{cwd}}` in args to pass the \
      current workspace root. Bifrost is preinstalled as Anvil's managed local \
-     binary with the equivalent args `--root '{cwd}' --mcp searchtools --no-line-numbers`."
-        .to_string()
+     binary with the equivalent args `{bifrost_args}`."
+    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -14695,6 +15110,8 @@ mod tests {
             step: 0,
             command: command.to_string(),
             exit_code,
+            output_bytes: 0,
+            output_sha256: asgard_sha256(&[]),
             output_tail: String::new(),
         }
     }
@@ -19518,6 +19935,7 @@ mod tests {
             outcome: asgard_failure(anyhow::anyhow!("test outcome")),
             patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+full\n".to_vec(),
             delta_patch: b"unused delta".to_vec(),
+            window_messages: vec![ChatMessage::assistant("worked")],
             supervisor_window_messages: vec![ChatMessage::assistant("worked")],
             window_ledger: AsgardExecutionLedger::default(),
         };
@@ -19536,6 +19954,161 @@ mod tests {
         );
         assert!(rendered.contains("cross-candidate diff"));
         assert!(!rendered.contains("unused delta"));
+    }
+
+    #[test]
+    fn asgard_deterministic_handoff_preserves_unique_content_and_references_exact_duplicates() {
+        let messages = vec![
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "read-1",
+                "read_file",
+                serde_json::json!({"file_path": "src/lib.rs"}),
+            )]),
+            ChatMessage::tool_result("read-1", "read_file", "important source observation"),
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "read-2",
+                "read_file",
+                serde_json::json!({"file_path": "src/lib.rs"}),
+            )]),
+            ChatMessage::tool_result("read-2", "read_file", "important source observation"),
+            ChatMessage::assistant("The observation determines the next edit."),
+        ];
+
+        let (handoff, raw_bytes, packed_bytes) =
+            asgard_deterministic_candidate_handoff(&messages, None)
+                .expect("small windows use deterministic handoff");
+        let rendered = render_asgard_dossier_messages(&handoff);
+
+        assert!(rendered.contains("format=\"deterministic_exact\""));
+        assert!(rendered.contains("important source observation"));
+        assert_eq!(rendered.matches("important source observation").count(), 1);
+        assert!(rendered.contains("exact_duplicate_of_message index=\"1\""));
+        assert!(rendered.contains("The observation determines the next edit."));
+        assert!(raw_bytes > 0);
+        assert!(packed_bytes > 0);
+    }
+
+    #[test]
+    fn asgard_deterministic_handoff_falls_back_when_unique_evidence_is_large() {
+        let messages = vec![ChatMessage::tool_result(
+            "large",
+            "run_shell_command",
+            "unique evidence".repeat(ASGARD_DETERMINISTIC_HANDOFF_MAX_BYTES),
+        )];
+        assert!(asgard_deterministic_candidate_handoff(&messages, None).is_none());
+    }
+
+    #[test]
+    fn asgard_completion_review_gate_requires_net_change_or_new_evidence() {
+        let temp = tempfile::tempdir().expect("candidate repository");
+        init_git_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join("src")).expect("create src");
+        std::fs::write(temp.path().join("src/lib.rs"), "base\n").expect("seed source");
+        run_git(temp.path(), &["add", "src/lib.rs"]);
+        run_git(temp.path(), &["commit", "-m", "seed"]);
+        let base_commit = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C"])
+                .arg(temp.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("read base commit")
+                .stdout,
+        )
+        .expect("utf8 commit")
+        .trim()
+        .to_string();
+        std::fs::write(temp.path().join("src/lib.rs"), "reviewed\n").expect("write reviewed state");
+        let reviewed_patch = crate::asgard::capture_patch(temp.path(), &base_commit)
+            .expect("capture reviewed patch");
+        let repeated_entry = AsgardLedgerEntry {
+            id: "L1".to_string(),
+            step: 0,
+            command: "cargo test focused".to_string(),
+            exit_code: Some(0),
+            output_bytes: "1 passed".len(),
+            output_sha256: asgard_sha256(b"1 passed"),
+            output_tail: "1 passed".to_string(),
+        };
+        let prior = AsgardPriorCompletionReview {
+            window: 2,
+            rows: Vec::new(),
+            decision: AsgardSupervisorDecision {
+                winner: 0,
+                complete: false,
+                advices: vec![Some("produce new evidence".to_string())],
+                next_candidate_count: Some(1),
+                next_window_steps: Some(1),
+                state_summary: "prior rejection".to_string(),
+                contracts: None,
+            },
+            reviewed_patch: reviewed_patch.clone(),
+            evidence_fingerprints: [asgard_evidence_fingerprint(&repeated_entry)]
+                .into_iter()
+                .collect(),
+        };
+        let repository = crate::asgard::CandidateRepository {
+            root: temp.path().to_path_buf(),
+            session_cwd: temp.path().to_path_buf(),
+            base_commit: base_commit.clone(),
+        };
+        let mut candidate = AsgardCandidate {
+            index: 0,
+            model: "test-model".to_string(),
+            outcome: asgard_failure(anyhow::anyhow!("unused test outcome")),
+            patch: reviewed_patch,
+            delta_patch: Vec::new(),
+            window_messages: Vec::new(),
+            supervisor_window_messages: Vec::new(),
+            window_ledger: AsgardExecutionLedger {
+                entries: vec![repeated_entry],
+                ..AsgardExecutionLedger::default()
+            },
+        };
+
+        // An intermediate edit that is reverted to the reviewed state is not
+        // material, nor is rerunning the same command with identical output.
+        std::fs::write(temp.path().join("src/lib.rs"), "temporary\n").expect("temporary edit");
+        std::fs::write(temp.path().join("src/lib.rs"), "reviewed\n").expect("revert edit");
+        let stale = asgard_completion_review_delta(&prior, &candidate, &repository, &[])
+            .expect("evaluate stale renomination");
+        assert!(!stale.is_material());
+        assert!(stale.patch.is_empty());
+
+        std::fs::write(temp.path().join("src/lib.rs"), "material change\n").expect("material edit");
+        let changed = asgard_completion_review_delta(&prior, &candidate, &repository, &[])
+            .expect("evaluate production change");
+        assert!(changed.is_material());
+        assert!(changed.production_bytes > 0);
+
+        std::fs::write(temp.path().join("src/lib.rs"), "reviewed\n")
+            .expect("restore reviewed state");
+        candidate.window_ledger.entries.push(AsgardLedgerEntry {
+            id: "L2".to_string(),
+            step: 1,
+            command: "cargo test adverse_case".to_string(),
+            exit_code: Some(0),
+            output_bytes: "adverse case passed".len(),
+            output_sha256: asgard_sha256(b"adverse case passed"),
+            output_tail: "adverse case passed".to_string(),
+        });
+        let evidence = asgard_completion_review_delta(&prior, &candidate, &repository, &[])
+            .expect("evaluate new execution evidence");
+        assert!(evidence.is_material());
+        assert_eq!(evidence.new_evidence_count, 1);
+
+        candidate.window_ledger.entries.truncate(1);
+        candidate.window_messages = vec![ChatMessage::assistant_tool_calls(vec![
+            supervisor_tool_call(
+                "read-new",
+                "read_file",
+                serde_json::json!({"file_path": "src/lib.rs"}),
+            ),
+        ])];
+        let observation = asgard_completion_review_delta(&prior, &candidate, &repository, &[])
+            .expect("evaluate new read-only observation");
+        assert!(observation.is_material());
+        assert!(observation.has_read_only_observation);
     }
 
     #[test]
@@ -19867,6 +20440,13 @@ mod tests {
                 .contains("[WARNING] OS sandbox unavailable")
         );
         assert!(ledger.entries[0].output_tail.contains("stdout"));
+        assert_eq!(ledger.entries[2].output_bytes, "ok\nall good".len());
+        assert_eq!(
+            ledger.entries[2].output_sha256,
+            asgard_sha256(b"ok\nall good")
+        );
+        assert_eq!(ledger.entries[3].output_bytes, 0);
+        assert_eq!(ledger.entries[3].output_sha256, asgard_sha256(&[]));
         assert_eq!(
             ledger.edit_steps,
             vec![
@@ -20227,6 +20807,8 @@ mod tests {
                 step: 2,
                 command: "cargo test output_contract".to_string(),
                 exit_code: Some(0),
+                output_bytes: 2,
+                output_sha256: asgard_sha256(b"ok"),
                 output_tail: "ok".to_string(),
             }],
             ..Default::default()
@@ -20274,6 +20856,17 @@ mod tests {
                 evidence: "L1 exercised output contract".to_string(),
                 adverse_condition_evidence: Some("omitted from prior review message".to_string()),
             }],
+            decision: AsgardSupervisorDecision {
+                winner: 0,
+                complete: false,
+                advices: vec![Some("produce missing evidence".to_string())],
+                next_candidate_count: Some(1),
+                next_window_steps: Some(1),
+                state_summary: "prior rejection".to_string(),
+                contracts: None,
+            },
+            reviewed_patch: Vec::new(),
+            evidence_fingerprints: BTreeSet::new(),
         };
 
         let messages = asgard_completion_review_messages(
@@ -20410,6 +21003,8 @@ mod tests {
             &backend,
             AsgardCandidateAssessmentContext {
                 model: "deepseek::deepseek-v4-flash",
+                window: 1,
+                lane: 0,
                 reasoning_effort: None,
                 service_tier: None,
                 idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
@@ -21064,6 +21659,7 @@ mod tests {
             outcome: asgard_failure(anyhow::anyhow!("unused test outcome")),
             patch: Vec::new(),
             delta_patch: Vec::new(),
+            window_messages: Vec::new(),
             supervisor_window_messages: Vec::new(),
             window_ledger: AsgardExecutionLedger::default(),
         }];
@@ -21167,6 +21763,7 @@ mod tests {
             outcome: asgard_failure(anyhow::anyhow!("unused test outcome")),
             patch: Vec::new(),
             delta_patch: Vec::new(),
+            window_messages: Vec::new(),
             supervisor_window_messages: Vec::new(),
             window_ledger: AsgardExecutionLedger::default(),
         }];
