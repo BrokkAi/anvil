@@ -162,8 +162,6 @@ pub(crate) struct AsgardExecutionLedger {
     pub(crate) entries_truncated: bool,
 }
 
-pub(crate) const ASGARD_SUMMARIZE_WINDOW_TOOL_NAME: &str = "summarize_candidate_window";
-pub(crate) const ASGARD_DETERMINISTIC_HANDOFF_MAX_BYTES: usize = 16_000;
 pub(crate) const ASGARD_CONTRACT_EXTRACTION_PROMPT: &str = "You are extracting the explicit contract checklist from a software task description, before any implementation exists. List every externally checkable requirement the task states: function and method signatures including argument order and curried versus non-curried forms, exact strings, separators, suffixes, and output formats, boundary values and their required handling, lifecycle and cancellation obligations (what must unblock, interrupt, close, or clean up what, including operations already in flight), concurrency and atomicity requirements, error types and exact error text, compatibility constraints, and explicit prohibitions. Quote the task's own words wherever possible. One requirement per entry; split compound sentences into separate entries. Do not invent requirements the task does not state and do not add generic quality goals. Tag each entry's kind: \"inspection\" when a reviewer can verify it by reading the final code (signatures, argument order, exact strings present in source, type shapes); \"execution\" when verification requires running a scenario (blocking and unblocking, timing, cancellation of in-flight operations, end-to-end produced output, formatting of emitted streams); \"delivery\" for repository-delivery obligations that do not affect runtime behavior (working on a named branch, committing the work, repository cleanliness). For each entry, if the requirement only holds meaning under a specific adverse condition — an operation already blocked or in flight when the triggering event fires, an exhausted window or resource, an externally stalled dependency, a boundary or zero value — record that condition verbatim in adverse_condition; otherwise set adverse_condition to null. When the task names classification values, categories, or enumerated labels (for example conflict types, error kinds, source values, status codes), add a separate contract that each reported classification carries the correct value for its specific scenario — distinct from, and in addition to, the contract that the item is detected or reported at all; verifying a count or presence does not verify a label. When a requirement combines, maps, constructs from, or dispatches over multiple positional inputs (combining N containers, building a record from several fields, constructor argument lists), add a separate contract, kind \"inspection\", that each input's value reaches its correct output position, with adverse_condition stating that verification requires either quoting the complete argument flow from construction to application, or execution with pairwise distinguishable inputs and a non-commutative operation — green tests with same-valued or commutative examples prove nothing about position. Success paths get adverse conditions too: when a requirement's happy path can be partially wrong (right for the first element, the common case, or homogeneous inputs), record the discriminating input shape as its adverse_condition rather than leaving it null. When the task requires emitting a well-known textual format or stream whose name implies standard structural conventions (for example a manifest stream with document separators and source annotations, a unified diff, a standard header block), also add one contract per structural convention the named format prescribes — including how the stream begins, how documents or sections are delimited, and how identifying annotations are formed and normalized — marked kind \"execution\" and quoting the format name from the task. Only do this for formats whose conventions you are certain of; do not invent conventions. When the task defines a typed public API whose signatures involve callbacks, generics, overloads, or container/element relationships — shapes where a misreading changes what external callers must write — add one contract per such signature stating its exact parameter and return types in the task's words, kind \"execution\", with adverse_condition: verification requires type-checking usage authored from this contract's text alone, not adapted from the implementation's own tests. Do not create type-shape contracts for simple scalar annotations; those are ordinary inspection contracts. If a requirement admits two materially different readings, record the contract once per reading and set each adverse_condition to the ambiguity it resolves; do not silently pick one reading. Call extract_task_contracts exactly once. Do not answer in prose.";
 pub(crate) const ASGARD_CONTRACT_EXTRACTION_MAX_ATTEMPTS: usize = 3;
 pub(crate) const ASGARD_AUDIT_BUILTIN_TOOLS: &[&str] =
@@ -175,6 +173,13 @@ pub(crate) const ASGARD_AUDIT_BIFROST_TOOLS: &[&str] = &[
     "get_summaries",
 ];
 pub(crate) const ASGARD_AUDIT_MAX_ROUNDS: usize = 3;
+pub(crate) const ASGARD_VIEW_TOOL_CALL_NAME: &str = "view_tool_call";
+pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
+/// Retrieval rounds are deliberately not budgeted: expanding a compact line
+/// costs no execution and the supervisor should never have to ration reading
+/// evidence it was shown. This is a runaway guard so an unproductive loop
+/// terminates, not a budget, and should never bind in practice.
+pub(crate) const ASGARD_RETRIEVAL_MAX_ROUNDS: usize = 40;
 pub(crate) const ASGARD_SELECTION_MAX_ATTEMPTS: usize = 3;
 pub(crate) const ASGARD_REVIEW_SELECTION_MAX_ATTEMPTS: usize = 6;
 
@@ -457,7 +462,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut current_window_steps = initial_advice.next_window_steps;
     let mut consecutive_winner_failures = 0usize;
     let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
-    let mut current_supervisor_state_summary = initial_advice.state_summary.clone();
     send_thought(
         cx,
         session_id,
@@ -518,7 +522,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
             let cancel = cancel.clone();
             let inherited_plan = canonical_plan.clone();
             let assessment_original_task = original_task.clone();
-            let assessment_state_summary = current_supervisor_state_summary.clone();
             let window_steps = current_window_steps;
             let candidate_output = live_output.clone();
             futures.push(async move {
@@ -566,101 +569,40 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     trajectory_message_start,
                 );
                 let window_ledger = asgard_extract_execution_ledger(&window_messages);
-                let deterministic_handoff = asgard_deterministic_candidate_handoff(
-                    &window_messages,
-                    outcome.current_plan.as_ref(),
+                let (supervisor_window_messages, raw_bytes, packed_bytes) =
+                    asgard_deterministic_candidate_handoff(
+                        window,
+                        index,
+                        &window_messages,
+                        outcome.current_plan.as_ref(),
+                    );
+                let supervisor_bytes =
+                    render_asgard_dossier_messages(&supervisor_window_messages).len();
+                if std::env::var_os("ASGARD_CAPTURE_WINDOW_SUMMARIES").is_some() {
+                    tracing::info!(
+                        lane = index + 1,
+                        raw_window = %render_asgard_dossier_messages(&window_messages),
+                        candidate_handoff = %render_asgard_dossier_messages(&supervisor_window_messages),
+                        "captured Asgard candidate window handoff for review"
+                    );
+                }
+                tracing::info!(
+                    lane = index + 1,
+                    model,
+                    raw_bytes,
+                    packed_bytes,
+                    supervisor_bytes,
+                    "rendered compact deterministic Asgard candidate handoff"
                 );
-                let (brief, grading_usage, deterministic_stats) =
-                    if let Some((messages, raw_bytes, packed_bytes)) = deterministic_handoff {
-                        (
-                            Ok(messages),
-                            crate::llm_client::TokenUsage::default(),
-                            Some((raw_bytes, packed_bytes)),
-                        )
-                    } else {
-                        let (brief, usage) = run_asgard_candidate_window_summary(
-                            llm.as_ref(),
-                            AsgardCandidateAssessmentContext {
-                                model: &model,
-                                window,
-                                lane: index,
-                                reasoning_effort,
-                                service_tier,
-                                idle_timeout,
-                                original_task: &assessment_original_task,
-                                canonical_state_summary: &assessment_state_summary,
-                                current_plan: outcome.current_plan.as_ref(),
-                            },
-                            cancel,
-                            &window_messages,
-                        )
-                        .await;
-                        (brief.map(|brief| {
-                            vec![ChatMessage::assistant(format!(
-                                "<candidate_window_brief>\n{brief}\n</candidate_window_brief>"
-                            ))]
-                        }), usage, None)
-                    };
-                let supervisor_window_messages = match brief {
-                    Ok(messages) => {
-                        let brief = render_asgard_dossier_messages(&messages);
-                        if std::env::var_os("ASGARD_CAPTURE_WINDOW_SUMMARIES").is_some() {
-                            tracing::info!(
-                                lane = index + 1,
-                                raw_window = %render_asgard_dossier_messages(&window_messages),
-                                candidate_brief = %brief,
-                                "captured Asgard candidate window summary for review"
-                            );
-                        }
-                        let original_bytes = render_asgard_dossier_messages(&window_messages).len();
-                        let slim_bytes = brief.len();
-                        if let Some((raw_bytes, packed_bytes)) = deterministic_stats {
-                            tracing::info!(
-                                lane = index + 1,
-                                model,
-                                original_bytes,
-                                slim_bytes,
-                                raw_bytes,
-                                packed_bytes,
-                                "used deterministic exact Asgard candidate handoff"
-                            );
-                            crate::trace_logging::append_trace_record(serde_json::json!({
-                                "type": "asgard_candidate_handoff",
-                                "window": window,
-                                "lane": index,
-                                "mode": "deterministic_exact",
-                                "raw_bytes": raw_bytes,
-                                "packed_bytes": packed_bytes,
-                                "supervisor_bytes": slim_bytes,
-                            }));
-                        } else {
-                            tracing::info!(
-                                lane = index + 1,
-                                model,
-                                original_bytes,
-                                slim_bytes,
-                                "summarized Asgard candidate trajectory"
-                            );
-                            crate::trace_logging::append_trace_record(serde_json::json!({
-                                "type": "asgard_candidate_handoff",
-                                "window": window,
-                                "lane": index,
-                                "mode": "llm_summary",
-                                "raw_bytes": original_bytes,
-                                "supervisor_bytes": slim_bytes,
-                            }));
-                        }
-                        messages
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            lane = index + 1,
-                            model,
-                            "keeping full Asgard trajectory after window summarization failed: {error:#}"
-                        );
-                        window_messages.clone()
-                    }
-                };
+                crate::trace_logging::append_trace_record(serde_json::json!({
+                    "type": "asgard_candidate_handoff",
+                    "window": window,
+                    "lane": index,
+                    "mode": "compact_deterministic",
+                    "raw_bytes": raw_bytes,
+                    "packed_bytes": packed_bytes,
+                    "supervisor_bytes": supervisor_bytes,
+                }));
                 (
                     index,
                     model,
@@ -669,7 +611,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     window_messages,
                     supervisor_window_messages,
                     window_ledger,
-                    grading_usage,
                 )
             });
         }
@@ -682,26 +623,13 @@ pub(crate) async fn run_asgard_trajectory_loop(
             window_messages,
             supervisor_window_messages,
             window_ledger,
-            grading_usage,
         ) in futures::future::join_all(futures).await
         {
-            trace_asgard_phase_usage(
-                "candidate_window_summary",
-                &model,
-                Some(window),
-                Some(index),
-                grading_usage,
-            );
             aggregate_usage.add(outcome.usage);
-            aggregate_usage.add(grading_usage);
             usage_by_model
                 .entry(model.clone())
                 .or_default()
                 .add(outcome.usage);
-            usage_by_model
-                .entry(model.clone())
-                .or_default()
-                .add(grading_usage);
             match patches {
                 Ok((patch, delta_patch)) => candidates.push(AsgardCandidate {
                     index,
@@ -977,7 +905,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
         let winner_index = decision.winner;
         let supervisor_complete = decision.complete;
         let supervisor_completion_summary = decision.state_summary.clone();
-        current_supervisor_state_summary = decision.state_summary.clone();
         next_advices = Some(decision.advices.clone());
         if !supervisor_complete && let Some(advices) = &next_advices {
             current_candidate_count = decision
@@ -1427,6 +1354,7 @@ pub(crate) async fn run_asgard_supervisor(
         candidates,
         definitions: audit_definitions.to_vec(),
         allowed_lane: None,
+        window,
     };
     let diff_inputs = candidates
         .iter()
@@ -1646,6 +1574,7 @@ pub(crate) async fn run_asgard_completion_review(
         candidates,
         definitions: audit_definitions.to_vec(),
         allowed_lane: Some(selected_lane),
+        window,
     };
     let (terminal_non_test_patch, terminal_test_patch) = asgard_patch_surfaces(&candidate.patch);
     let terminal_test_patch = if terminal_test_patch.len() > 200_000 {
@@ -1822,6 +1751,9 @@ pub(crate) struct AsgardAuditContext<'a> {
     pub(crate) candidates: &'a [AsgardCandidate],
     pub(crate) definitions: Vec<ToolDefinition>,
     pub(crate) allowed_lane: Option<usize>,
+    /// Window the compact trajectories in this dossier were rendered for;
+    /// `view_tool_call` handles are only resolvable within it.
+    pub(crate) window: usize,
 }
 
 pub(crate) fn asgard_is_audit_tool(name: &str) -> bool {
@@ -1861,6 +1793,132 @@ pub(crate) fn asgard_audit_tool_definitions(
             Some(definition)
         })
         .collect()
+}
+
+pub(crate) fn asgard_view_tool_call_handles(
+    arguments: &serde_json::Value,
+) -> anyhow::Result<Vec<String>> {
+    let handles = arguments
+        .get("handles")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("`view_tool_call` requires a `handles` array"))?;
+    anyhow::ensure!(!handles.is_empty(), "`handles` must not be empty");
+    anyhow::ensure!(
+        handles.len() <= ASGARD_VIEW_TOOL_CALL_MAX_HANDLES,
+        "`handles` accepts at most {ASGARD_VIEW_TOOL_CALL_MAX_HANDLES} ids per call"
+    );
+    handles
+        .iter()
+        .map(|handle| {
+            handle
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("every entry in `handles` must be a string"))
+        })
+        .collect()
+}
+
+pub(crate) fn asgard_view_tool_call_tool() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".to_string(),
+        function: FunctionDef {
+            name: ASGARD_VIEW_TOOL_CALL_NAME.to_string(),
+            description:
+                "Retrieve the complete arguments and untruncated result behind one or more compact \
+                 trajectory tool lines. Pass the `id` values shown on <tool> lines. This reads \
+                 recorded window data, executes nothing, and does not consume the \
+                 information-gathering budget."
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["handles"],
+                "properties": {
+                    "handles": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": ASGARD_VIEW_TOOL_CALL_MAX_HANDLES,
+                        "items": { "type": "string" },
+                        "description": "Tool-line ids such as \"w3l1m7\", taken verbatim from the compact trajectories."
+                    }
+                },
+            }),
+        },
+    }
+}
+
+/// Resolves compact-trajectory handles back to the durable tool calls and their
+/// complete results.
+///
+/// The full window is already retained on each candidate, so this is an
+/// in-memory lookup rather than a re-read of the checkout — which is why it is
+/// exempt from the audit-round budget.
+pub(crate) fn resolve_asgard_tool_call_handles(
+    audit: &AsgardAuditContext<'_>,
+    handles: &[String],
+) -> String {
+    let window = audit.window;
+    let mut rendered = String::new();
+    for handle in handles {
+        let Some((handle_window, lane, index)) = crate::asgard::parse_asgard_tool_handle(handle)
+        else {
+            rendered.push_str(&format!(
+                "<tool_call id=\"{handle}\" error=\"unrecognized handle format\" />\n"
+            ));
+            continue;
+        };
+        if handle_window != window {
+            rendered.push_str(&format!(
+                "<tool_call id=\"{handle}\" error=\"handle belongs to window {handle_window}; only \
+                 the current window {window} is retrievable\" />\n"
+            ));
+            continue;
+        }
+        // The terminal completion review sees exactly one lane; a handle naming
+        // another lane must be refused here just as the audit tools refuse it.
+        if let Some(allowed_lane) = audit.allowed_lane
+            && lane != allowed_lane
+        {
+            rendered.push_str(&format!(
+                "<tool_call id=\"{handle}\" error=\"only selected candidate lane {allowed_lane} is \
+                 available during terminal completion review\" />\n"
+            ));
+            continue;
+        }
+        let Some(candidate) = audit
+            .candidates
+            .iter()
+            .find(|candidate| candidate.index == lane)
+        else {
+            rendered.push_str(&format!(
+                "<tool_call id=\"{handle}\" error=\"candidate lane {lane} does not exist\" />\n"
+            ));
+            continue;
+        };
+        let messages = &candidate.window_messages;
+        let Some(result) = messages.get(index).filter(|message| message.role == "tool") else {
+            rendered.push_str(&format!(
+                "<tool_call id=\"{handle}\" error=\"no tool result at this position\" />\n"
+            ));
+            continue;
+        };
+        let call = crate::asgard::originating_tool_call(messages, index);
+        let name = call
+            .map(|call| call.function.name.as_str())
+            .or(result.name.as_deref())
+            .unwrap_or("tool");
+        let arguments = call
+            .map(|call| call.function.arguments.as_str())
+            .unwrap_or("(arguments unavailable)");
+        rendered.push_str(&format!(
+            "<tool_call id=\"{handle}\" lane=\"{lane}\" name=\"{name}\">\n\
+             <arguments>\n{arguments}\n</arguments>\n\
+             <result>\n{}\n</result>\n\
+             </tool_call>\n",
+            asgard_message_text(result),
+        ));
+    }
+    rendered
 }
 
 pub(crate) fn asgard_audit_arguments(
@@ -2126,8 +2184,12 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
     let mut audit_rounds_used = 0usize;
     let mut selection_attempts = 0usize;
     let mut validation_rounds = 0usize;
+    let mut retrieval_rounds_used = 0usize;
 
     loop {
+        // A round that only expands compact trajectory lines is refunded below,
+        // so retrieval never competes with inspection or selection.
+        let mut retrieval_round = false;
         let audit_phase = audit_rounds_used < audit_round_limit;
         if audit_phase {
             audit_rounds_used += 1;
@@ -2371,16 +2433,46 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
                 let has_audit_calls = calls
                     .iter()
                     .any(|call| asgard_is_audit_tool(&call.function.name));
+                let has_view_calls = calls
+                    .iter()
+                    .any(|call| call.function.name == ASGARD_VIEW_TOOL_CALL_NAME);
+                // Only refund when retrieval could actually have returned
+                // something; otherwise a hallucinated call would loop for free
+                // until the runaway guard fires.
+                retrieval_round = has_view_calls
+                    && context.audit.is_some()
+                    && !has_audit_calls
+                    && selector_calls.is_empty();
                 let unexpected_calls = calls
                     .iter()
                     .filter(|call| {
                         call.function.name != "select_trajectory"
+                            && call.function.name != ASGARD_VIEW_TOOL_CALL_NAME
                             && !asgard_is_audit_tool(&call.function.name)
                     })
                     .map(|call| call.function.name.as_str())
                     .collect::<Vec<_>>();
                 for call in &calls {
-                    let output = if call.function.name == "select_trajectory" {
+                    let output = if call.function.name == ASGARD_VIEW_TOOL_CALL_NAME {
+                        // Available in every phase: retrieving evidence the
+                        // supervisor was already shown costs nothing to execute.
+                        match crate::tool_arguments::normalize_tool_arguments(
+                            &call.function.arguments,
+                        ) {
+                            Ok(arguments) => match asgard_view_tool_call_handles(&arguments.value) {
+                                Ok(handles) => match &context.audit {
+                                    Some(audit) => {
+                                        resolve_asgard_tool_call_handles(audit, &handles)
+                                    }
+                                    None => "Error: no candidate trajectories are retrievable for this decision".to_string(),
+                                },
+                                Err(error) => format!("Error: {error}"),
+                            },
+                            Err(error) => {
+                                format!("Error: invalid `view_tool_call` arguments: {error}")
+                            }
+                        }
+                    } else if call.function.name == "select_trajectory" {
                         if let Some(error) = &selector_error {
                             format!("Error: {error}")
                         } else if audit_phase && calls.len() > 1 {
@@ -2438,7 +2530,7 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
                         "Asgard supervisor called unexpected tool(s) `{}`",
                         unexpected_calls.join(", ")
                     ))
-                } else if audit_phase && has_audit_calls {
+                } else if retrieval_round || (audit_phase && has_audit_calls) {
                     None
                 } else {
                     Some(anyhow::anyhow!(
@@ -2446,6 +2538,29 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
                     ))
                 };
             }
+        }
+
+        if retrieval_round {
+            // Refund the round this iteration charged: expanding compact lines
+            // is retrieval, not inspection or selection.
+            if audit_phase {
+                audit_rounds_used -= 1;
+            } else {
+                selection_attempts -= 1;
+            }
+            retrieval_rounds_used += 1;
+            if retrieval_rounds_used >= ASGARD_RETRIEVAL_MAX_ROUNDS {
+                return (
+                    Err(anyhow::anyhow!(
+                        "Asgard supervisor made {retrieval_rounds_used} consecutive view_tool_call rounds without deciding"
+                    )),
+                    usage,
+                );
+            }
+            messages.push(ChatMessage::user(
+                "Those are the full tool calls you requested. Retrieving them did not consume your information-gathering budget. Continue: retrieve more ids, audit a checkout, or call select_trajectory.",
+            ));
+            continue;
         }
 
         let detail = last_invalid_response
@@ -2495,6 +2610,7 @@ pub(crate) fn asgard_supervisor_tool_definitions(
         context.max_candidate_count,
     )];
     if let Some(audit) = &context.audit {
+        tools.push(asgard_view_tool_call_tool());
         tools.extend(audit.definitions.clone());
     }
     tools
@@ -2599,7 +2715,7 @@ Selection does not require certainty. Choose the best continuation under the ava
 <task_and_evidence>
 The original task is authoritative. Preserve its exact externally observable contracts, including argument order, return values, error behavior, atomicity, compatibility requirements, implementation constraints, and prohibitions. Merely defining the requested symbol or compiling the code does not establish that contract. A lane that contradicts the task is not rescued by confident prose, a large patch, or aggregate green checks. Judge architectural direction, correctness, recoverability, known defects, and evidence. Investigation that establishes an important constraint can be more valuable than immediate edits.
 
-Candidate briefs are loss-aware but candidate-authored summaries, not authoritative evidence. A candidate_window_handoff with format="deterministic_exact" is different: it mechanically preserves every unique message from a small window and replaces only byte-identical repeated tool results with explicit back-references. Treat its observations as the original trajectory record, while still judging what each command or inspection actually proves. A candidate_patch_manifest describes its cumulative changed production and test files. Normally each candidate_window_diff shows that lane's edits since the last selected decision. When candidate_diff_baseline names a current-window diff-compression anchor, that anchor is displayed first with its diff against the last selected decision, while every subsequent candidate_window_diff shows the transformation from the anchor lane to that lane. This is only diff compression: every lane still started independently from the same last selected decision, the anchor is not canonical or preferred, and lane indices remain authoritative. Use the handoffs or briefs, manifests, and correctly based diffs together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes.
+Each lane's work window is a candidate_window_handoff with format="compact_deterministic": a mechanically rendered record of what that lane actually did, produced by pure functions over its trajectory. No model summarized, characterized, or judged it, so it never reports work that did not happen — but it is compact, and a compact line states what a call was, not what its output showed. Tool results appear as one-line summaries stamped with an id, and a len attribute gives the full character count of any shortened text. Call view_tool_call with those ids to read the complete arguments and untruncated result. Retrieval is unbudgeted and executes nothing, so expand every line whose actual content bears on the decision instead of inferring from the summary; a claim resting on what a command printed requires reading what it printed. A tool line carrying exact_duplicate_of repeats a byte-identical earlier result and is not independent confirmation of anything. Treat these records as the original trajectory, while still judging what each command or inspection actually proves. A candidate_patch_manifest describes its cumulative changed production and test files. Normally each candidate_window_diff shows that lane's edits since the last selected decision. When candidate_diff_baseline names a current-window diff-compression anchor, that anchor is displayed first with its diff against the last selected decision, while every subsequent candidate_window_diff shows the transformation from the anchor lane to that lane. This is only diff compression: every lane still started independently from the same last selected decision, the anchor is not canonical or preferred, and lane indices remain authoritative. Use the compact trajectories, the tool calls you retrieve from them, the manifests, and the correctly based diffs together: challenge contradictions and consequential unsupported claims, but do not reread the repository merely to reproduce information the dossier already establishes or view_tool_call can return.
 
 Interpret verification precisely. A successful command establishes only the behaviors its selected tests and assertions actually exercised; filters, wrappers, timeouts, zero-test selections, and missing combinations can mislead. Candidate-written tests can be valuable, but green tests changed alongside the implementation are not independent proof merely because they pass. Check whether they genuinely express the task, especially the highest-risk requirement and combinations of behaviors changed by the patch. Do not mechanically reject legitimate test or mock updates.
 
@@ -2609,13 +2725,13 @@ Prior supervisor decisions and lane advice provide continuity, not authority. Re
 <decision_depth>
 First decide whether the leading lane plausibly appears terminal.
 
-complete=true is a nomination, not a terminal verdict. A separate isolated completion review owns all terminal adjudication and re-judges the nominated endpoint against every task contract with the full evidence bundle. Nominate complete=true when the selected endpoint plausibly satisfies the task contracts; the candidate briefs and diffs are sufficient basis. Do not perform a terminal-grade audit, search for boundary counterexamples, or re-verify evidence before nominating — that depth is the review's job and paying it here duplicates the review. Do not nominate past a defect you can already see: a concrete task-relevant defect, contradiction, or plainly missing required work visible in the dossier means complete=false with advice targeting it.
+complete=true is a nomination, not a terminal verdict. A separate isolated completion review owns all terminal adjudication and re-judges the nominated endpoint against every task contract with the full evidence bundle. Nominate complete=true when the selected endpoint plausibly satisfies the task contracts; the compact trajectories and diffs are sufficient basis. Do not perform a terminal-grade audit, search for boundary counterexamples, or re-verify evidence before nominating — that depth is the review's job and paying it here duplicates the review. Do not nominate past a defect you can already see: a concrete task-relevant defect, contradiction, or plainly missing required work visible in the dossier means complete=false with advice targeting it.
 
 If the best lanes are plainly incomplete, do not perform a terminal-grade exhaustive audit. Inspect only enough consequential evidence to rank their directions and formulate the next work. Unknowns can remain: select the best foundation, set complete=false, record the uncertainty, and delegate the needed implementation or verification to candidates in the next window.
 </decision_depth>
 
 <audit_protocol>
-Lane-aware read_file, grep_search, list_directory, and Bifrost symbol tools are available for read-only evidence gathering. They cannot run builds or tests. You have at most {audit_rounds} information-gathering responses, including this one; the last opportunity will be announced. Batch related questions and stop once the answer cannot change the winner or completion judgment. After the budget is exhausted, audit calls are ignored and you must select.
+view_tool_call expands the compact trajectories you were given and is unbudgeted — use it freely and prefer it over auditing the checkout whenever the answer is in a tool result you were already shown. Lane-aware read_file, grep_search, list_directory, and Bifrost symbol tools additionally inspect the candidate checkouts for evidence the trajectories do not contain. They cannot run builds or tests. You have at most {audit_rounds} information-gathering responses using those checkout tools, including this one; the last opportunity will be announced. Batch related questions and stop once the answer cannot change the winner or completion judgment. After the budget is exhausted, audit calls are ignored and you must select.
 
 Unavailable executable verification is not a reason to withhold a decision. If it is necessary to establish completeness, set complete=false and tell one or more next-window candidates exactly what behavior or command to verify. Repository auditing is evidence gathering, not another implementation rollout.
 </audit_protocol>
@@ -2623,7 +2739,7 @@ Unavailable executable verification is not a reason to withhold a decision. If i
 <scope_and_completion>
 Stay within the original scope. Do not repair dependencies, lockfiles, toolchains, generated machinery, warning policy, test selection, or expected outputs merely to hide a failure unless the task requires that surface or the candidate broke it. Treat a failure as environmental, pre-existing, flaky, or unrelated only with concrete evidence. Do not weaken required behavior to preserve obsolete callers or mocks.
 
-Completion is a property of the endpoint, not of who introduced a defect. Set complete=true when the selected endpoint plausibly satisfies the exact task contracts on the basis of the candidate briefs and diffs; the isolated completion review — not this decision — adjudicates terminal completeness and will return the work to candidates if evidence falls short. Set complete=false when required work plainly remains or the dossier shows an unresolved concrete task-relevant defect. When executable verification is unavailable to you, select the best lane and delegate the specific check to the next candidate window rather than either assuming success or refusing to decide.
+Completion is a property of the endpoint, not of who introduced a defect. Set complete=true when the selected endpoint plausibly satisfies the exact task contracts on the basis of the compact trajectories and diffs; the isolated completion review — not this decision — adjudicates terminal completeness and will return the work to candidates if evidence falls short. Set complete=false when required work plainly remains or the dossier shows an unresolved concrete task-relevant defect. When executable verification is unavailable to you, select the best lane and delegate the specific check to the next candidate window rather than either assuming success or refusing to decide.
 </scope_and_completion>
 
 <continuation>
@@ -2679,7 +2795,7 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
 <decision_procedure>
 1. Re-read the original task and preserve its exact observable contracts: signatures and argument order, returns, errors, atomicity, compatibility, constraints, and prohibitions.
 2. Compare each lane's actual direction, defects, evidence, and recoverability. Choose a provisional winner even if all are incomplete.
-3. Decide whether that winner plausibly appears terminal. If so, nominate: complete=true requires only that the endpoint plausibly satisfies the task contracts on the candidate briefs and diffs — the isolated completion review owns terminal adjudication, so do not audit for boundary cases first. If not, investigate only questions that could change the ranking or next-window direction.
+3. Decide whether that winner plausibly appears terminal. If so, nominate: complete=true requires only that the endpoint plausibly satisfies the task contracts on the compact trajectories and diffs — the isolated completion review owns terminal adjudication, so do not audit for boundary cases first. If not, investigate only questions that could change the ranking or next-window direction.
 4. Treat the completion judgment as a nomination. A concrete defect, contradiction, or plainly missing required work already visible in the dossier means complete=false and becomes targeted next-window advice; do not search for more before nominating.
 5. If incomplete, choose next_candidate_count, the shared horizon, and exactly next_candidate_count distinct compliant strategies. Scale breadth with uncertainty; use one lane for a concrete serial bug fix.
 6. Call select_trajectory. Do not continue investigating once you can make the best available judgment.
@@ -2766,6 +2882,8 @@ pub(crate) fn asgard_completion_review_messages(
 
 <terminal_completion_review selected_lane="{selected_lane}">
 This is an independent completion review of the single would-be-final endpoint shown above. The comparative selection decision and all discarded candidate lanes are intentionally absent. Do not reconstruct, compare, or speculate about them. Keep selected_lane={selected_lane}; your only decision is whether this endpoint actually completes the original task.
+
+The lane trajectory is a mechanically rendered compact record: its tool lines state what each call was, stamped with an id, not what the call output showed. Call view_tool_call with those ids to read the complete arguments and untruncated result of any line. Retrieval is unbudgeted, executes nothing, and is restricted to this lane. Because your evidence rules turn on what a command actually printed and what an assertion actually checks, read the full result before citing it — a compact summary reports that a command ran and its exit code, which is not evidence about the behavior it exercised.
 
 The task_contract_checklist was derived from the task text alone before any candidate work existed. Your select_trajectory call must return one contracts row per checklist id. Keep verified rows terse — one clause citing the ledger entry or quoted line (aim under 150 characters); reserve detailed prose for violated rows, unverified rows, and adverse_condition_evidence. When prior_review_rows are present, re-adjudicate only contracts plausibly affected by the prior_review_delta, plus every contract that was not verified before. For a previously verified contract untouched by the delta, carry it forward: status verified, evidence 'carried-forward: unchanged since window N review'. A carried-forward row must still be listed. Evidence rules, in strength order: (1) Execution evidence — an execution_ledger entry (cite its id) whose command demonstrably exercised the contract and exited 0 at or after the last edit of the implementing files; a green command counts only for behaviors its selected tests actually assert — confirm in the terminal_test_patch that some assertion would fail if the contract were violated; a broad suite pass does not verify a contract no test asserts; a build proves compilation; a race detector proves absence of data races, not liveness. Golden, snapshot, or fixture expectation files created or regenerated by the candidate are candidate-authored assertions: a passing comparison against them proves only that the output matches itself; for exact-output contracts, quote the actual emitted output — from a ledger entry or from the expectation-file content in the patches — and show it satisfies the contract's required shape at its boundaries, including the very first and very last elements of the stream. Evidence must be discriminating: state the most plausible wrong implementation of this contract — the wrong label or classification, the missing boundary element, the partially-correct result — and confirm the cited assertion would catch it; an assertion that only counts results, checks non-emptiness, or matches a substring usually passes under mislabeled or partially-wrong behavior. For a contract naming enumerated values, classifications, or exact labels, quote — for each scenario the contract names — the assertion line or observed ledger output showing that exact value in that exact scenario; an assertion checking a different scenario's value does not transfer. For a contract that combines, maps, or constructs from multiple positional inputs, a green test counts only if its values are pairwise distinguishable and the checked operation non-commutative — a test combining equal values or reducing with numeric addition passes under any positional swap and proves nothing about position. Absent such a test, verify positionally by inspection: quote the complete argument flow from construction to application and argue each input reaches its position; mark the row violated if the quoted flow misroutes any input, and unverified only when neither a discriminating test nor a conclusive flow reading exists. For contracts requiring a behavior across a matrix of backends, dialects, or variants, quoted code showing the new path routes through the same shared machinery as an existing verified sibling is acceptable inspection evidence for the uncovered cells; demand per-cell execution only when the path diverges. For a contract specifying a typed public signature whose shape admits divergent readings — callbacks, generics, overloads, container/element relationships — evidence counts only when a ledger entry type-checks standalone usage authored from the contract's text; the implementation's own tests compiling proves self-consistency, not the contract. A simple signature quoted verbatim from the patch that textually matches the contract is ordinary inspection evidence and needs no type-check run. (2) Inspection evidence — exact quoted lines from the terminal patches showing the contract satisfied; a file name alone is not evidence; use only for contracts fully verifiable by reading. (3) Candidate claims are never evidence.
 
@@ -2859,46 +2977,41 @@ pub(crate) fn render_asgard_dossier_messages(messages: &[ChatMessage]) -> String
     rendered
 }
 
-/// Produces an exact, mechanically structured handoff when the window is
-/// already small enough that paying an LLM to summarize it would cost more
-/// than carrying it forward. Exact duplicate tool results are replaced by an
-/// explicit back-reference; no unique observation or reasoning is discarded.
+/// Renders a candidate window into the compact, mechanically derived record the
+/// supervisor reviews.
+///
+/// Every entry becomes a minimal line and every tool result carries a handle
+/// that `view_tool_call` resolves back to the complete arguments and result, so
+/// compression is lossless on demand rather than lossy by inference. This runs
+/// unconditionally at any window size: an LLM asked to summarize a window
+/// reports work that did not happen often enough to be unusable as supervisor
+/// evidence (see research/asgard_summarizer_bench/RESULTS.md).
+///
+/// Returns the handoff messages plus the raw and compacted byte counts.
 pub(crate) fn asgard_deterministic_candidate_handoff(
+    window: usize,
+    lane: usize,
     window_messages: &[ChatMessage],
     current_plan: Option<&crate::plan::UpdatePlanArgs>,
-) -> Option<(Vec<ChatMessage>, usize, usize)> {
+) -> (Vec<ChatMessage>, usize, usize) {
     let raw = render_asgard_dossier_messages(window_messages);
-    let mut packed_messages = window_messages.to_vec();
-    let mut prior_tool_results = HashMap::<String, usize>::new();
-    for (index, message) in packed_messages.iter_mut().enumerate() {
-        if message.role != "tool" {
-            continue;
-        }
-        let text = asgard_message_text(message);
-        if let Some(first_index) = prior_tool_results.get(&text).copied() {
-            message.content = vec![ChatContentPart::text(format!(
-                "<exact_duplicate_of_message index=\"{first_index}\" />"
-            ))];
-        } else {
-            prior_tool_results.insert(text, index);
-        }
-    }
-    let packed = render_asgard_dossier_messages(&packed_messages);
-    if packed.len() > ASGARD_DETERMINISTIC_HANDOFF_MAX_BYTES {
-        return None;
-    }
+    let packed = crate::asgard::render_window_compact(window, lane, window_messages);
     let plan = current_plan
         .and_then(|plan| serde_json::to_string_pretty(plan).ok())
         .unwrap_or_else(|| "(no active plan)".to_string());
     let handoff = ChatMessage::assistant(format!(
-        "<candidate_window_handoff format=\"deterministic_exact\" duplicate_encoding=\"back_reference\">\n\
-         This is a mechanically rendered trajectory, not a candidate-authored summary. Every unique \
-         message is preserved exactly; exact duplicate tool results point to their first message.\n\
+        "<candidate_window_handoff format=\"compact_deterministic\" lane=\"{lane}\" duplicate_encoding=\"back_reference\">\n\
+         This is a mechanically rendered trajectory, not a candidate-authored summary: every line \
+         is a pure function of what this lane actually did. Tool results appear as deterministic \
+         one-line summaries carrying an id; call view_tool_call with those ids to read the complete \
+         arguments and untruncated result. A len attribute gives the full character count of text \
+         that was shortened. A tool line with exact_duplicate_of repeats a byte-identical earlier \
+         result and is not independent confirmation of anything.\n\
          <current_plan>\n{plan}\n</current_plan>\n\
          <candidate_window>\n{packed}</candidate_window>\n\
          </candidate_window_handoff>"
     ));
-    Some((vec![handoff], raw.len(), packed.len()))
+    (vec![handoff], raw.len(), packed.len())
 }
 
 pub(crate) fn asgard_evidence_fingerprint(entry: &AsgardLedgerEntry) -> String {
@@ -3262,256 +3375,6 @@ pub(crate) async fn run_asgard_task_contract_extraction(
         })
     );
     (asgard_empty_task_contract_checklist(), usage)
-}
-
-pub(crate) fn asgard_candidate_window_summary_messages(
-    context: &AsgardCandidateAssessmentContext<'_>,
-    window_messages: &[ChatMessage],
-) -> Vec<ChatMessage> {
-    let plan = context
-        .current_plan
-        .and_then(|plan| serde_json::to_string_pretty(plan).ok())
-        .unwrap_or_else(|| "(no active plan)".to_string());
-    vec![
-        ChatMessage::system(
-            "You are the candidate model writing a compact, loss-aware handoff of your latest \
-             Asgard work window to a trajectory supervisor. Report what the window actually \
-             established, not what you hoped to accomplish. Preserve adverse evidence, failed \
-             checks, incomplete work, and consequential uncertainty. Summarize source edits \
-             semantically by file or symbol; do not reproduce patches or routine narration.",
-        ),
-        ChatMessage::user(format!(
-            "ORIGINAL TASK (complete):\n{}",
-            context.original_task
-        )),
-        ChatMessage::assistant(format!(
-            "<canonical_state_summary>\n{}\n</canonical_state_summary>\n\
-             <current_plan>\n{}\n</current_plan>",
-            context.canonical_state_summary, plan,
-        )),
-        ChatMessage::user(format!(
-            "<candidate_window>\n{}\n</candidate_window>",
-            render_asgard_dossier_messages(window_messages),
-        )),
-    ]
-}
-
-pub(crate) fn asgard_candidate_window_summary_prompt() -> ChatMessage {
-    ChatMessage::user(
-        r#"<candidate_window_handoff>
-This work window has ended. Produce one faithful supervisor brief. Distinguish observed evidence
-from your own claims. A successful command is evidence only for behavior it actually exercised.
-If you edited tests, say so; green candidate-written tests are not independent confirmation.
-Preserve exact failing check names, key error text, counts, paths, and concrete observations when
-they matter. Explicitly record any original-task requirement that remains unimplemented or
-unverified. Keep the brief much shorter than the raw window and do not continue the task.
-
-Call summarize_candidate_window exactly once. Do not call another tool or answer in prose.
-</candidate_window_handoff>"#,
-    )
-}
-
-pub(crate) fn asgard_summarize_candidate_window_tool() -> ToolDefinition {
-    ToolDefinition {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: ASGARD_SUMMARIZE_WINDOW_TOOL_NAME.to_string(),
-            description: "Produce one compact, evidence-focused handoff of the completed candidate work window.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["direction", "progress", "edits", "evidence", "unresolved_risks", "next_step"],
-                "properties": {
-                    "direction": { "type": "string", "minLength": 1, "maxLength": 1200 },
-                    "progress": { "type": "string", "minLength": 1, "maxLength": 1200 },
-                    "edits": {
-                        "type": "array",
-                        "maxItems": 20,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["location", "change"],
-                            "properties": {
-                                "location": { "type": "string", "minLength": 1, "maxLength": 300 },
-                                "change": { "type": "string", "minLength": 1, "maxLength": 700 }
-                            },
-                        },
-                    },
-                    "evidence": {
-                        "type": "array",
-                        "maxItems": 20,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["check", "status", "details"],
-                            "properties": {
-                                "check": { "type": "string", "minLength": 1, "maxLength": 500 },
-                                "status": { "type": "string", "enum": ["passed", "failed", "inconclusive"] },
-                                "details": { "type": "string", "minLength": 1, "maxLength": 1200 }
-                            }
-                        }
-                    },
-                    "unresolved_risks": {
-                        "type": "array",
-                        "maxItems": 16,
-                        "items": { "type": "string", "minLength": 1, "maxLength": 800 }
-                    },
-                    "next_step": { "type": "string", "minLength": 1, "maxLength": 1000 }
-                },
-            }),
-        },
-    }
-}
-
-pub(crate) fn parse_asgard_candidate_window_summary(
-    arguments: &serde_json::Value,
-) -> anyhow::Result<String> {
-    for key in [
-        "direction",
-        "progress",
-        "edits",
-        "evidence",
-        "unresolved_risks",
-        "next_step",
-    ] {
-        anyhow::ensure!(
-            arguments.get(key).is_some(),
-            "candidate brief is missing `{key}`"
-        );
-    }
-    serde_json::to_string_pretty(arguments)
-        .map_err(|error| anyhow::anyhow!("failed to serialize candidate brief: {error}"))
-}
-
-pub(crate) async fn run_asgard_candidate_window_summary(
-    llm: &dyn crate::llm_client::LlmBackend,
-    context: AsgardCandidateAssessmentContext<'_>,
-    cancel: tokio_util::sync::CancellationToken,
-    window_messages: &[ChatMessage],
-) -> (anyhow::Result<String>, crate::llm_client::TokenUsage) {
-    const MAX_STEPS: usize = 2;
-    let mut messages = asgard_candidate_window_summary_messages(&context, window_messages);
-    messages.push(asgard_candidate_window_summary_prompt());
-    let tools = vec![asgard_summarize_candidate_window_tool()];
-    let mut usage = crate::llm_client::TokenUsage::default();
-    let mut last_invalid_response = None;
-
-    for step in 1..=MAX_STEPS {
-        let request_bytes = render_asgard_dossier_messages(&messages).len();
-        let response = stream_chat_no_visible_output_with_retry(
-            llm,
-            "summarizing Asgard candidate window",
-            &cancel,
-            || StreamChatRequest {
-                model: context.model.to_string(),
-                messages: messages.clone(),
-                tools: Some(tools.clone()),
-                reasoning_effort: context.reasoning_effort.map(str::to_string),
-                service_tier: context.service_tier.map(str::to_string),
-                temperature: None,
-                structured_output: None,
-                on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
-                cancel: cancel.clone(),
-                idle_timeouts: context.idle_timeout,
-            },
-        )
-        .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => return (Err(error), usage),
-        };
-        let turn_usage = response.usage();
-        trace_asgard_phase_turn_usage(
-            "candidate_window_summary",
-            context.model,
-            Some(context.window),
-            Some(context.lane),
-            step,
-            "summary",
-            request_bytes,
-            turn_usage,
-        );
-        usage.add(turn_usage);
-
-        match response {
-            LlmResponse::Text {
-                text,
-                reasoning_content,
-                ..
-            } => messages.push(ChatMessage::assistant_with_reasoning(
-                text,
-                reasoning_content,
-            )),
-            LlmResponse::ToolCalls {
-                text,
-                reasoning_content,
-                calls,
-                ..
-            } => {
-                if calls.len() == 1 && calls[0].function.name == ASGARD_SUMMARIZE_WINDOW_TOOL_NAME {
-                    match crate::tool_arguments::normalize_tool_arguments(
-                        &calls[0].function.arguments,
-                    ) {
-                        Ok(arguments) => {
-                            match parse_asgard_candidate_window_summary(&arguments.value) {
-                                Ok(brief) => return (Ok(brief), usage),
-                                Err(error) => last_invalid_response = Some(error),
-                            }
-                        }
-                        Err(error) => {
-                            last_invalid_response = Some(anyhow::anyhow!(
-                                "candidate emitted invalid summarize_candidate_window arguments: {error}"
-                            ));
-                        }
-                    }
-                } else {
-                    last_invalid_response = Some(anyhow::anyhow!(
-                        "candidate must call summarize_candidate_window exactly once and no other tool"
-                    ));
-                }
-                if !text.is_empty() || reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
-                    messages.push(ChatMessage::assistant_with_reasoning(
-                        text,
-                        reasoning_content,
-                    ));
-                }
-            }
-        }
-
-        if step < MAX_STEPS {
-            let detail = last_invalid_response
-                .as_ref()
-                .map(|error| format!(" Your previous response was invalid: {error}."))
-                .unwrap_or_default();
-            messages.push(ChatMessage::user(format!(
-                "You have not summarized the candidate window.{detail} Only \
-                 summarize_candidate_window is available. Call it exactly once now; do not answer in prose."
-            )));
-        }
-    }
-
-    (
-        Err(last_invalid_response.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "candidate did not call summarize_candidate_window after {MAX_STEPS} steps"
-            )
-        })),
-        usage,
-    )
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct AsgardCandidateAssessmentContext<'a> {
-    pub(crate) model: &'a str,
-    pub(crate) window: usize,
-    pub(crate) lane: usize,
-    pub(crate) reasoning_effort: Option<&'a str>,
-    pub(crate) service_tier: Option<&'a str>,
-    pub(crate) idle_timeout: IdleTimeouts,
-    pub(crate) original_task: &'a str,
-    pub(crate) canonical_state_summary: &'a str,
-    pub(crate) current_plan: Option<&'a crate::plan::UpdatePlanArgs>,
 }
 
 pub(crate) fn asgard_advise_trajectories_tool(max_candidate_count: usize) -> ToolDefinition {
@@ -4715,6 +4578,19 @@ mod tests {
         );
     }
 
+    fn asgard_test_candidate(index: usize, window_messages: Vec<ChatMessage>) -> AsgardCandidate {
+        AsgardCandidate {
+            index,
+            model: "test-model".to_string(),
+            outcome: asgard_failure(anyhow::anyhow!("test outcome")),
+            patch: Vec::new(),
+            delta_patch: Vec::new(),
+            supervisor_window_messages: Vec::new(),
+            window_messages,
+            window_ledger: AsgardExecutionLedger::default(),
+        }
+    }
+
     #[test]
     fn asgard_candidate_renderer_labels_the_actual_diff_baseline() {
         let candidate = AsgardCandidate {
@@ -4745,7 +4621,7 @@ mod tests {
     }
 
     #[test]
-    fn asgard_deterministic_handoff_preserves_unique_content_and_references_exact_duplicates() {
+    fn asgard_compact_handoff_summarizes_results_and_references_exact_duplicates() {
         let messages = vec![
             ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
                 "read-1",
@@ -4763,27 +4639,149 @@ mod tests {
         ];
 
         let (handoff, raw_bytes, packed_bytes) =
-            asgard_deterministic_candidate_handoff(&messages, None)
-                .expect("small windows use deterministic handoff");
+            asgard_deterministic_candidate_handoff(4, 2, &messages, None);
         let rendered = render_asgard_dossier_messages(&handoff);
 
-        assert!(rendered.contains("format=\"deterministic_exact\""));
-        assert!(rendered.contains("important source observation"));
-        assert_eq!(rendered.matches("important source observation").count(), 1);
-        assert!(rendered.contains("exact_duplicate_of_message index=\"1\""));
+        assert!(rendered.contains("format=\"compact_deterministic\""));
+        // The result body is summarized, not carried, and the summary names the
+        // call so the supervisor knows what to retrieve.
+        assert!(!rendered.contains("important source observation"));
+        assert!(rendered.contains("read src/lib.rs"));
+        assert!(rendered.contains("id=\"w4l2m1\""));
+        assert!(rendered.contains("exact_duplicate_of=\"w4l2m1\""));
         assert!(rendered.contains("The observation determines the next edit."));
-        assert!(raw_bytes > 0);
-        assert!(packed_bytes > 0);
+        assert!(packed_bytes < raw_bytes);
     }
 
     #[test]
-    fn asgard_deterministic_handoff_falls_back_when_unique_evidence_is_large() {
-        let messages = vec![ChatMessage::tool_result(
-            "large",
-            "run_shell_command",
-            "unique evidence".repeat(ASGARD_DETERMINISTIC_HANDOFF_MAX_BYTES),
-        )];
-        assert!(asgard_deterministic_candidate_handoff(&messages, None).is_none());
+    fn asgard_compact_handoff_has_no_size_gate() {
+        // The old deterministic path bailed above 16 KB and paid an LLM to
+        // summarize instead. Compact rendering has no such ceiling.
+        let messages = vec![
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "large",
+                "run_shell_command",
+                serde_json::json!({"command": "cargo test"}),
+            )]),
+            ChatMessage::tool_result(
+                "large",
+                "run_shell_command",
+                "unique evidence".repeat(40_000),
+            ),
+        ];
+        let (handoff, raw_bytes, packed_bytes) =
+            asgard_deterministic_candidate_handoff(0, 0, &messages, None);
+        assert!(raw_bytes > 500_000);
+        assert!(packed_bytes < 500);
+        let rendered = render_asgard_dossier_messages(&handoff);
+        assert!(rendered.contains("$ \"cargo test\""));
+        assert!(rendered.contains("600000 chars omitted"));
+    }
+
+    #[test]
+    fn asgard_view_tool_call_resolves_handles_within_the_current_window() {
+        let candidates = vec![
+            asgard_test_candidate(
+                0,
+                vec![
+                    ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                        "c0",
+                        "run_shell_command",
+                        serde_json::json!({"command": "cargo test -p lane0"}),
+                    )]),
+                    ChatMessage::tool_result("c0", "run_shell_command", "lane 0 full output"),
+                ],
+            ),
+            asgard_test_candidate(
+                1,
+                vec![
+                    ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                        "c1",
+                        "run_shell_command",
+                        serde_json::json!({"command": "cargo test -p lane1"}),
+                    )]),
+                    ChatMessage::tool_result("c1", "run_shell_command", "lane 1 full output"),
+                ],
+            ),
+        ];
+        let audit = AsgardAuditContext {
+            registries: &[],
+            candidates: &candidates,
+            definitions: Vec::new(),
+            allowed_lane: None,
+            window: 3,
+        };
+
+        // Concurrent lanes at the same message index resolve to their own data.
+        let resolved =
+            resolve_asgard_tool_call_handles(&audit, &["w3l0m1".to_string(), "w3l1m1".to_string()]);
+        assert!(resolved.contains("lane 0 full output"));
+        assert!(resolved.contains("lane 1 full output"));
+        assert!(resolved.contains("cargo test -p lane0"));
+        assert!(resolved.contains("cargo test -p lane1"));
+
+        // Handles from other windows, and malformed handles, are refused rather
+        // than silently resolved against the wrong window's messages.
+        let refused =
+            resolve_asgard_tool_call_handles(&audit, &["w2l0m1".to_string(), "junk".to_string()]);
+        assert!(
+            refused.contains("only \n         the current window 3 is retrievable")
+                || refused.contains("the current window 3 is retrievable")
+        );
+        assert!(refused.contains("unrecognized handle format"));
+        assert!(!refused.contains("lane 0 full output"));
+    }
+
+    #[test]
+    fn asgard_view_tool_call_refuses_other_lanes_during_completion_review() {
+        let candidates = vec![
+            asgard_test_candidate(
+                0,
+                vec![
+                    ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                        "c0",
+                        "read_file",
+                        serde_json::json!({"file_path": "a.rs"}),
+                    )]),
+                    ChatMessage::tool_result("c0", "read_file", "discarded lane content"),
+                ],
+            ),
+            asgard_test_candidate(
+                1,
+                vec![
+                    ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                        "c1",
+                        "read_file",
+                        serde_json::json!({"file_path": "b.rs"}),
+                    )]),
+                    ChatMessage::tool_result("c1", "read_file", "selected lane content"),
+                ],
+            ),
+        ];
+        let audit = AsgardAuditContext {
+            registries: &[],
+            candidates: &candidates,
+            definitions: Vec::new(),
+            allowed_lane: Some(1),
+            window: 0,
+        };
+        let resolved =
+            resolve_asgard_tool_call_handles(&audit, &["w0l0m1".to_string(), "w0l1m1".to_string()]);
+        assert!(resolved.contains("selected lane content"));
+        assert!(!resolved.contains("discarded lane content"));
+        assert!(resolved.contains("only selected candidate lane 1"));
+    }
+
+    #[test]
+    fn asgard_view_tool_call_arguments_are_validated() {
+        assert!(asgard_view_tool_call_handles(&serde_json::json!({})).is_err());
+        assert!(asgard_view_tool_call_handles(&serde_json::json!({"handles": []})).is_err());
+        assert!(asgard_view_tool_call_handles(&serde_json::json!({"handles": [7]})).is_err());
+        assert_eq!(
+            asgard_view_tool_call_handles(&serde_json::json!({"handles": ["w0l0m1"]}))
+                .expect("valid handles"),
+            vec!["w0l0m1".to_string()]
+        );
     }
 
     #[test]
@@ -5034,7 +5032,7 @@ mod tests {
         assert!(!asgard_message_text(&first[0]).contains("window one"));
         assert!(asgard_message_text(&first[0]).contains("correctness supervisor"));
         assert!(asgard_message_text(&first[0]).contains("1-5 lanes next"));
-        assert!(asgard_message_text(&first[0]).contains("Candidate briefs are loss-aware"));
+        assert!(asgard_message_text(&first[0]).contains("format=\"compact_deterministic\""));
         assert!(asgard_message_text(&first[0]).contains("diff-compression anchor"));
         assert!(asgard_message_text(&first[0]).contains("anchor is not canonical or preferred"));
         assert!(asgard_message_text(&first[0]).contains("lane indices remain authoritative"));
@@ -5060,7 +5058,14 @@ mod tests {
         assert!(asgard_message_text(&first[0]).contains("Do not assert exact APIs"));
         assert!(!asgard_message_text(&first[0]).contains("Tool choice is not forced"));
         assert!(!asgard_message_text(&first[0]).contains("reasoning must remain enabled"));
-        assert!(asgard_message_text(&first[0]).contains("available for read-only"));
+        assert!(
+            asgard_message_text(&first[0]).contains("inspect the candidate checkouts for evidence")
+        );
+        // Retrieval must be advertised as free, or the supervisor rations it
+        // against the checkout-audit budget and reasons from summaries instead.
+        assert!(asgard_message_text(&first[0]).contains(
+            "view_tool_call expands the compact trajectories you were given and is unbudgeted"
+        ));
         assert!(asgard_message_text(&first[0]).contains("edits since the last selected decision"));
         assert!(
             asgard_message_text(&first[0])
@@ -5707,85 +5712,6 @@ mod tests {
     }
 
     #[test]
-    fn asgard_candidate_summary_schema_is_stable_and_bounded() {
-        let tool = asgard_summarize_candidate_window_tool();
-        let properties = &tool.function.parameters["properties"];
-        assert_eq!(properties["edits"]["maxItems"], 20);
-        assert_eq!(properties["evidence"]["maxItems"], 20);
-        assert_eq!(properties["unresolved_risks"]["maxItems"], 16);
-        assert!(properties["direction"].get("enum").is_none());
-    }
-
-    #[tokio::test]
-    async fn asgard_candidate_summary_preserves_adverse_evidence() {
-        let backend = ScriptedSupervisorBackend::new(vec![LlmResponse::ToolCalls {
-            text: String::new(),
-            reasoning_content: Some("The failed edge case must remain visible.".to_string()),
-            calls: vec![supervisor_tool_call(
-                "summary-call",
-                ASGARD_SUMMARIZE_WINDOW_TOOL_NAME,
-                serde_json::json!({
-                    "direction": "Repair parser escaping without weakening validation.",
-                    "progress": "Main path implemented; edge case still fails.",
-                    "edits": [{"location":"src/lib.rs::parse", "change":"Handle escaped delimiters."}],
-                    "evidence": [{"check":"cargo test tests::edge_case", "status":"failed", "details":"tests::edge_case failed at src/lib.rs:42"}],
-                    "unresolved_risks": ["Nested escapes remain unverified."],
-                    "next_step": "Fix the failing edge case and rerun parser tests."
-                }),
-            )],
-            usage: crate::llm_client::TokenUsage {
-                input_tokens: 7,
-                ..Default::default()
-            },
-        }]);
-        let window = vec![
-            ChatMessage::assistant("Implemented the parser change."),
-            ChatMessage::tool_result(
-                "test-call",
-                "run_shell_command",
-                "tests::edge_case failed at src/lib.rs:42",
-            ),
-        ];
-
-        let (brief, usage) = run_asgard_candidate_window_summary(
-            &backend,
-            AsgardCandidateAssessmentContext {
-                model: "deepseek::deepseek-v4-flash",
-                window: 1,
-                lane: 0,
-                reasoning_effort: None,
-                service_tier: None,
-                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
-                original_task: "Fix the parser",
-                canonical_state_summary: "The escaping contract is unresolved.",
-                current_plan: None,
-            },
-            tokio_util::sync::CancellationToken::new(),
-            &window,
-        )
-        .await;
-
-        let brief = brief.unwrap();
-        assert!(brief.contains("tests::edge_case failed at src/lib.rs:42"));
-        assert!(brief.contains("Nested escapes remain unverified"));
-        assert_eq!(usage.input_tokens, 7);
-        let requests = backend.requests.lock().expect("request lock");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].tool_names,
-            vec![ASGARD_SUMMARIZE_WINDOW_TOOL_NAME]
-        );
-        let rendered = requests[0]
-            .messages
-            .iter()
-            .map(asgard_message_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("candidate-written tests are not independent confirmation"));
-        assert!(rendered.contains("tests::edge_case failed at src/lib.rs:42"));
-    }
-
-    #[test]
     fn asgard_supervisor_uses_prompt_after_bootstrap_instructions_as_task() {
         let messages = vec![
             ChatMessage::system("agent system prompt"),
@@ -6345,6 +6271,7 @@ mod tests {
                 candidates: &candidates,
                 definitions: vec![audit_definition.clone()],
                 allowed_lane: None,
+                window: 0,
             }),
             required_winner: None,
             checklist_ids: &[],
@@ -6360,6 +6287,7 @@ mod tests {
                 candidates: &candidates,
                 definitions: vec![audit_definition],
                 allowed_lane: Some(1),
+                window: 0,
             }),
             required_winner: Some(1),
             checklist_ids: &[],
@@ -6452,6 +6380,7 @@ mod tests {
                     candidates: &candidates,
                     definitions,
                     allowed_lane: None,
+                    window: 0,
                 }),
                 required_winner: None,
                 checklist_ids: &[],
@@ -6482,6 +6411,136 @@ mod tests {
             message.role == "tool"
                 && asgard_message_text(message).contains("changed repository evidence")
         }));
+    }
+
+    #[tokio::test]
+    async fn asgard_supervisor_retrieval_rounds_do_not_consume_the_audit_budget() {
+        // Three view_tool_call rounds interleaved with three audit rounds must
+        // still leave all three audit rounds spendable: retrieval is refunded.
+        // If it were charged, the fourth response here would be rejected as
+        // out-of-budget and the selection would never be reached.
+        let cwd = tempfile::tempdir().expect("candidate cwd");
+        init_git_repo(cwd.path());
+        std::fs::write(cwd.path().join("evidence.txt"), "repository evidence\n")
+            .expect("write evidence fixture");
+        run_git(cwd.path(), &["add", "evidence.txt"]);
+        run_git(cwd.path(), &["commit", "-m", "seed"]);
+        let registry = Arc::new(
+            crate::tools::ToolRegistry::new(
+                cwd.path().to_path_buf(),
+                Vec::new(),
+                Vec::new(),
+                Arc::new(crate::skills::SkillRegistry::default()),
+                Arc::new(crate::agents::AgentRegistry::default()),
+                Vec::new(),
+            )
+            .await,
+        );
+        let definitions = asgard_audit_tool_definitions(registry.tool_definitions().await, 1);
+        let registries = vec![registry];
+        let candidates = vec![asgard_test_candidate(
+            0,
+            vec![
+                ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                    "shell-1",
+                    "run_shell_command",
+                    serde_json::json!({"command": "cargo test"}),
+                )]),
+                ChatMessage::tool_result("shell-1", "run_shell_command", "the full test output"),
+            ],
+        )];
+        let audit_call = |id: &str| {
+            supervisor_tool_call(
+                id,
+                "read_file",
+                serde_json::json!({"lane": 0, "file_path": "evidence.txt"}),
+            )
+        };
+        let view_call = |id: &str| {
+            supervisor_tool_call(
+                id,
+                ASGARD_VIEW_TOOL_CALL_NAME,
+                serde_json::json!({"handles": ["w0l0m1"]}),
+            )
+        };
+        let scripted = |calls: Vec<crate::llm_client::ToolCall>| LlmResponse::ToolCalls {
+            text: String::new(),
+            reasoning_content: None,
+            calls,
+            usage: crate::llm_client::TokenUsage::default(),
+        };
+        let backend = ScriptedSupervisorBackend::new(vec![
+            scripted(vec![view_call("view-1")]),
+            scripted(vec![audit_call("audit-1")]),
+            scripted(vec![view_call("view-2")]),
+            scripted(vec![audit_call("audit-2")]),
+            scripted(vec![view_call("view-3")]),
+            scripted(vec![audit_call("audit-3")]),
+            scripted(vec![supervisor_tool_call(
+                "selection-call",
+                "select_trajectory",
+                serde_json::json!({
+                    "winner": 0,
+                    "complete": false,
+                    "next_candidate_count": 1,
+                    "next_window_steps": 3,
+                    "state_summary": "Retrieved the full outputs before selecting.",
+                    "advices": [{
+                        "strategy": "Finish the remaining verification.",
+                        "scope_basis": "Establish the remaining task-required behavior."
+                    }]
+                }),
+            )]),
+        ]);
+
+        let (decision, _) = run_asgard_supervisor_tool_steps(
+            &backend,
+            vec![ChatMessage::user("dossier")],
+            AsgardSupervisorToolContext {
+                model: "deepseek::deepseek-v4-pro",
+                candidate_count: 1,
+                max_candidate_count: 1,
+                idle_timeout: IdleTimeouts::uniform(std::time::Duration::from_secs(1)),
+                audit: Some(AsgardAuditContext {
+                    registries: &registries,
+                    candidates: &candidates,
+                    definitions,
+                    allowed_lane: None,
+                    window: 0,
+                }),
+                required_winner: None,
+                checklist_ids: &[],
+                carry_forward_allowed: false,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        let (decision, _stats) = decision.expect("selection after interleaved retrieval");
+        assert_eq!(decision.winner, 0);
+
+        let requests = backend.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 7);
+        // view_tool_call is offered alongside the checkout audit tools.
+        assert!(
+            requests[0]
+                .tool_names
+                .contains(&ASGARD_VIEW_TOOL_CALL_NAME.to_string())
+        );
+        let conversation = requests
+            .last()
+            .expect("final request")
+            .messages
+            .iter()
+            .map(asgard_message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Retrieval returned the untruncated result the compact line omitted.
+        assert!(conversation.contains("the full test output"));
+        assert!(conversation.contains("did not consume your information-gathering budget"));
+        // All three audit rounds survived the interleaved retrieval.
+        assert!(!conversation.contains("Audit budget exhausted"));
     }
 
     #[tokio::test]
@@ -6588,6 +6647,7 @@ mod tests {
                     candidates: &candidates,
                     definitions,
                     allowed_lane: None,
+                    window: 0,
                 }),
                 required_winner: None,
                 checklist_ids: &[],
