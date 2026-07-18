@@ -20,6 +20,7 @@ mod context_manager;
 mod deepseek_auth;
 mod deepseek_balance;
 mod discovery;
+mod goal;
 mod host_notice;
 mod http_retry;
 mod kimi_auth;
