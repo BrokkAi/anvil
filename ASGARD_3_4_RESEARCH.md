@@ -63,6 +63,33 @@ Relevant v9 cohort observations (40 Flash/Flash runs versus v6):
   contract extraction, initial advice, and compaction. Concurrent work on `master` is adding exact
   phase attribution, so use request bytes and local call counters until that can be cherry-picked.
 
+## Primary quality objective: retain the historical success union
+
+The most important quality target is not aggregate 9/40 parity. v6 and v9 solved only three of the same
+runs, while their task/run union solved 15/40. Treat every task that any prior Asgard version solved as a
+protected regression case. A new intervention that loses one protected solution mode and gains a different
+task has not demonstrated monotone progress, even when its aggregate score is unchanged.
+
+Build a machine-readable known-success corpus before recommending either intervention. For each protected
+task include every available successful trace and identify, without hidden-test leakage:
+
+- the architectural or contract reading that distinguished the successful direction;
+- the decisive implementation surface and verification command;
+- evidence or unresolved risk that had to survive a window boundary for the winning continuation;
+- the candidate-count/window-depth sequence that preserved the solution mode;
+- whether the successful lane looked weak after one or two steps.
+
+Use the corpus in two ways:
+
+1. Replay gate: a compressed supervisor dossier must preserve every decisive evidence obligation and should
+   retain the full supervisor's winner on successful trajectories.
+2. Live gate: by default every rerun of every historically solved task must succeed. Report per-task success
+   rates; do not hide a regression behind aggregate replacement wins.
+
+Direct task-specific answer memory is a separate, explicitly labeled experiment because feeding an old patch
+or hidden failure back into the same benchmark changes what the benchmark measures. The default research here
+is about retaining solution modes through better routing and representation, not memorizing answers.
+
 ## Research question 3: stateful/delta supervisor
 
 ### Hypothesis
