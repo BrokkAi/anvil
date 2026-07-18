@@ -39,6 +39,7 @@ mod semantic_rerank;
 mod session;
 mod setup_state;
 mod skills;
+mod slash;
 mod structured_output;
 mod terminal_notifications;
 mod text;

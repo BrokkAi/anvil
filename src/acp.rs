@@ -94,6 +94,7 @@ use crate::session::{
     SessionMode, SessionSnapshot, SessionStore, ToolExchangeDiff, ToolExchangeStatus,
     TurnReplayEvent, UnsupportedMcpTransport, acp_mcp_servers_to_configs, sanitize_replay_events,
 };
+use crate::slash::{is_slash_command, parse_slash_command, slash_command_args};
 use crate::structured_output::{
     StructuredOutputRequest, StructuredOutputResult, build_structured_output_meta,
     parse_structured_output_request, validate_response,
@@ -5152,42 +5153,6 @@ dropping data), state in one line what it does and why.
 - Do not push or otherwise mutate state outside the workspace (remotes, deploys, published \
 packages, external services) unless the user asked. Never expose, log, or commit secrets.";
 
-/// Returns true when `prompt_text` invokes the slash command `name`,
-/// matching `/name` exactly or `/name <args>`. Whitespace and case are
-/// normalized so clients that uppercase auto-complete entries still hit.
-fn is_slash_command(prompt_text: &str, name: &str) -> bool {
-    let stripped = prompt_text.trim();
-    let Some(rest) = stripped.strip_prefix('/') else {
-        return false;
-    };
-    let head = rest
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    head == name
-}
-
-/// Parse `/<name> <args...>` out of a prompt. Returns `None` when the
-/// prompt isn't a slash command. The `name` is lowercased for
-/// case-insensitive lookup; the `args` slice preserves the original
-/// casing/whitespace after the command head.
-fn parse_slash_command(prompt_text: &str) -> Option<(String, String)> {
-    let stripped = prompt_text.trim();
-    let rest = stripped.strip_prefix('/')?;
-    if rest.is_empty() {
-        return None;
-    }
-    let (head, tail) = match rest.find(char::is_whitespace) {
-        Some(i) => (&rest[..i], rest[i..].trim_start()),
-        None => (rest, ""),
-    };
-    if head.is_empty() {
-        return None;
-    }
-    Some((head.to_ascii_lowercase(), tail.to_string()))
-}
-
 /// Only plain prompts should auto-title the session. Any slash command,
 /// including skill activations, is an operational turn rather than a
 /// good title seed and should leave the placeholder title alone.
@@ -9450,18 +9415,6 @@ async fn render_setup_advanced(sessions: &SessionStore, session_id: &str) -> Str
         }
     }
     out
-}
-
-/// Trimmed args for a slash command. Returns the empty string when the
-/// prompt is not a slash command at all, or when the command has no
-/// trailing args. Shared by setup and `/pr-create` -- both want "args
-/// after the command name, trimmed of surrounding whitespace".
-fn slash_command_args(prompt_text: &str) -> String {
-    parse_slash_command(prompt_text)
-        .map(|(_, a)| a)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
