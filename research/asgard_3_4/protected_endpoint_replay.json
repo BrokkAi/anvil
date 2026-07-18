@@ -1,0 +1,78 @@
+{
+  "type": "asgard_protected_endpoint_replay_summary",
+  "task_run_identity": "returns-validated-error-accumulation::r1",
+  "window": 14,
+  "control": {
+    "winner": 0,
+    "complete": true,
+    "next_candidate_count": null,
+    "next_window_steps": null,
+    "full_control_prompt_bytes": 104836,
+    "full_control_raw_input_tokens": 25711
+  },
+  "stop_gate_fired": true,
+  "planned_calls": 40,
+  "executed_calls": 4,
+  "modes": [
+    {
+      "mode": "checkpoint-plus-delta",
+      "winner_agreement": true,
+      "complete_agreement": false,
+      "selection": {
+        "winner": 0,
+        "complete": false,
+        "next_candidate_count": 1,
+        "next_window_steps": 2
+      },
+      "prompt_bytes": 46784,
+      "prompt_byte_reduction_fraction": 0.5537410813079476,
+      "raw_input_tokens": 13664,
+      "usage": {"input": 6368, "cachedRead": 7296, "cachedWrite": 0, "output": 4194, "thought": 0}
+    },
+    {
+      "mode": "latest-state",
+      "winner_agreement": true,
+      "complete_agreement": false,
+      "selection": {
+        "winner": 0,
+        "complete": false,
+        "next_candidate_count": 1,
+        "next_window_steps": 2
+      },
+      "prompt_bytes": 43440,
+      "prompt_byte_reduction_fraction": 0.5856385211186996,
+      "raw_input_tokens": 13125,
+      "usage": {"input": 5829, "cachedRead": 7296, "cachedWrite": 0, "output": 3457, "thought": 0}
+    },
+    {
+      "mode": "decision-log-only",
+      "winner_agreement": true,
+      "complete_agreement": true,
+      "selection": {
+        "winner": 0,
+        "complete": true,
+        "next_candidate_count": null,
+        "next_window_steps": null
+      },
+      "prompt_bytes": 58264,
+      "prompt_byte_reduction_fraction": 0.44423671257964825,
+      "raw_input_tokens": 16523,
+      "usage": {"input": 9227, "cachedRead": 7296, "cachedWrite": 0, "output": 4179, "thought": 0}
+    },
+    {
+      "mode": "recent-exact-tail",
+      "winner_agreement": true,
+      "complete_agreement": false,
+      "selection": {
+        "winner": 0,
+        "complete": false,
+        "next_candidate_count": 1,
+        "next_window_steps": 3
+      },
+      "prompt_bytes": 52079,
+      "prompt_byte_reduction_fraction": 0.5032336220382312,
+      "raw_input_tokens": 14994,
+      "usage": {"input": 7698, "cachedRead": 7296, "cachedWrite": 0, "output": 1988, "thought": 0}
+    }
+  ]
+}
