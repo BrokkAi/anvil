@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokk.ai/schemas/asgard-shadow-survivor-recall-v1.json",
+  "title": "Asgard shadow survivor-recall trace record",
+  "type": "object",
+  "required": ["type", "study_id"],
+  "oneOf": [
+    {
+      "properties": {
+        "type": { "const": "asgard_shadow_tournament_config" },
+        "study_id": { "$ref": "#/$defs/nonempty" },
+        "task": { "$ref": "#/$defs/nonempty" },
+        "window": { "type": "integer", "minimum": 1 },
+        "candidate_count": { "type": "integer", "minimum": 2, "maximum": 5 },
+        "probe_steps": { "enum": [1, 2] },
+        "continuation_steps": { "type": "integer", "minimum": 1 },
+        "top_k": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "base_snapshot_id": { "$ref": "#/$defs/nonempty" }
+      },
+      "required": ["task", "window", "candidate_count", "probe_steps", "continuation_steps", "top_k", "base_snapshot_id"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_shadow_probe_ranking" },
+        "study_id": { "$ref": "#/$defs/nonempty" },
+        "ranking": { "$ref": "#/$defs/laneRanking" },
+        "survivors": { "$ref": "#/$defs/lanes" },
+        "killed": { "$ref": "#/$defs/lanes" },
+        "candidate_usage": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "properties": {
+              "lane": { "type": "integer", "minimum": 0, "maximum": 4 },
+              "usage": { "$ref": "#/$defs/usage" }
+            },
+            "required": ["lane", "usage"],
+            "additionalProperties": false
+          }
+        },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["ranking", "survivors", "killed", "candidate_usage", "usage"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_shadow_continuation" },
+        "study_id": { "$ref": "#/$defs/nonempty" },
+        "lane": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "review_label": { "$ref": "#/$defs/nonempty" },
+        "disposition": { "enum": ["survivor", "killed-shadow"] },
+        "base_snapshot_id": { "$ref": "#/$defs/nonempty" },
+        "endpoint_snapshot_id": { "$ref": "#/$defs/nonempty" },
+        "continuation_steps": { "type": "integer", "minimum": 1 },
+        "isolated": { "const": true },
+        "published_to_canonical": { "const": false },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["lane", "review_label", "disposition", "base_snapshot_id", "endpoint_snapshot_id", "continuation_steps", "isolated", "published_to_canonical", "usage"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_shadow_end_review" },
+        "study_id": { "$ref": "#/$defs/nonempty" },
+        "blinded": { "const": true },
+        "probe_metadata_excluded": { "const": true },
+        "ranking": { "$ref": "#/$defs/reviewRanking" },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["blinded", "probe_metadata_excluded", "ranking", "usage"]
+    }
+  ],
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1 },
+    "lanes": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 4 }, "uniqueItems": true },
+    "laneRanking": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "properties": { "lane": { "type": "integer", "minimum": 0, "maximum": 4 }, "rank": { "type": "integer", "minimum": 1, "maximum": 5 } },
+        "required": ["lane", "rank"],
+        "additionalProperties": false
+      }
+    },
+    "reviewRanking": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "properties": { "review_label": { "$ref": "#/$defs/nonempty" }, "rank": { "type": "integer", "minimum": 1, "maximum": 5 } },
+        "required": ["review_label", "rank"],
+        "additionalProperties": false
+      }
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input": { "type": "integer", "minimum": 0 },
+        "output": { "type": "integer", "minimum": 0 },
+        "thought": { "type": "integer", "minimum": 0 },
+        "cachedRead": { "type": "integer", "minimum": 0 },
+        "cachedWrite": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["input", "output", "thought", "cachedRead", "cachedWrite"],
+      "additionalProperties": false
+    }
+  }
+}

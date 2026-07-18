@@ -1,0 +1,271 @@
+# Asgard 3/4 trajectory-compression research
+
+## Ordinary-routing prompt modes
+
+The production `full` prompt remains the default and is byte-for-byte unchanged.
+Research runs can select one of five ordinary-routing representations with
+`ASGARD_SUPERVISOR_PROMPT_MODE`:
+
+- `full`: append-only selected trajectory control.
+- `latest-state`: latest explicitly cumulative state plus the mechanically derived
+  canonical execution history; no exact older selected-window payloads.
+- `checkpoint-plus-delta`: a frozen state and ledger checkpoint every N global
+  windows plus exact selected-window deltas after it.
+- `decision-log-only`: structured prior decisions and the canonical execution
+  history, without historical candidate briefs.
+- `recent-exact-tail`: a cumulative checkpoint plus the last N exact selected
+  windows; this is the simple truncation baseline.
+
+The checkpoint interval defaults to 3 and the recent tail to 2. Override them with
+`ASGARD_SUPERVISOR_CHECKPOINT_INTERVAL` and
+`ASGARD_SUPERVISOR_RECENT_EXACT_TAIL`. These switches affect ordinary routing
+only; isolated completion review remains unchanged.
+
+Every ordinary decision emits an `asgard_supervisor_prompt_mode` trace record with
+the chosen and counterfactual full-control prompt bytes/token estimates. Set
+`ASGARD_CAPTURE_SUPERVISOR_REPLAYS=1` only for research capture runs. It adds exact
+`asgard_supervisor_replay_state`, `asgard_supervisor_replay_request`, and
+`asgard_supervisor_replay_response` records, including messages, tools, parameters,
+model output, reasoning, and the per-call usage vector. Captures can be very large
+and may contain task or repository content.
+`replay_capture.schema.json` describes the capture and window-policy trace shapes.
+
+Example local build:
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+The controlled DeepSWE pilot uses identical task/model settings and places the
+mode variables in each task's `[environment.env]` table so the containerized Anvil
+process inherits them. The common runner shape is:
+
+```bash
+uv run python bpr_agent.py --engine deepswe \
+  --models q3=deepseek::deepseek-v4-flash \
+  --tasksdir /path/to/mode-specific/tasks \
+  --asgard-candidates 3 \
+  --asgard-supervisor deepseek::deepseek-v4-pro \
+  --anvil-bin /path/to/anvil/target/x86_64-unknown-linux-musl/release/anvil \
+  --no-anvil-rebuild --headless
+```
+
+Aggregate completed pilot archives with:
+
+```bash
+python3 research/asgard_3_4/analyze_live_pilot.py \
+  /path/to/archive/directories --output /tmp/asgard-pilot-report.json
+```
+
+The report separates ordinary-routing and completion-review calls, sums uncached,
+cached, output, and thought tokens, compares each compact prompt with its rendered
+full-control counterfactual, and preserves paired task outcomes.
+`live_pilot_summary.json` preserves the compact result of the completed 20-run
+aggressive-bootstrap pilot; `RESULTS.md` gives the no-go decision and limitations.
+
+Score `asgard_supervisor_replay_result` JSONL entirely offline with:
+
+```bash
+python3 research/asgard_3_4/analyze_supervisor_replays.py replays.jsonl \
+  --pilot-report /tmp/asgard-pilot-report.json \
+  --protected-corpus research/asgard_3_4/known_success_corpus.jsonl \
+  --output /tmp/asgard-replay-analysis.json
+```
+
+The analyzer reports fallback rate; non-fallback and effective (full-fallback)
+winner, completion, and funding agreement; signed candidate/step deltas; the full
+usage vector and cache fractions; and exact disagreement rows/windows. Its Q3
+gates fail closed without supplied prompt/raw-input reduction or protected-record
+identity: at least 25% input reduction, 95% effective winner agreement, and 100%
+effective protected endpoint agreement. Use `--require-automated-gates` for a
+nonzero exit when any automated gate is not met. Even when they pass,
+`recommendation_ready` remains false until a human reviews preservation of the
+known-success evidence obligations; agreement alone cannot automate that review.
+
+Plan the same-state replay batch before making any API calls:
+
+```bash
+python3 research/asgard_3_4/plan_supervisor_replay_batch.py \
+  /path/to/full-control-archives \
+  --protected-corpus research/asgard_3_4/known_success_corpus.jsonl \
+  --sample-size 100 --seed asgard-q3-replay-v1 \
+  --output /tmp/asgard-replay-plan.json
+```
+
+With no `--sample-size`, every completed ordinary decision is selected. Sampling
+is deterministic and balanced across one/multi-lane, long-history (default: ten
+prior windows), post-completion-review, and protected-endpoint strata. Every
+captured protected endpoint is forced into the sample even if that exceeds the
+requested size. Stage 1 runs those protected diagnostics first; Stage 2 contains
+the remaining overall-agreement sample. The plan renders all four compact modes
+locally and reports exact prompt bytes, conservative request-token estimates,
+and a separate UTF-8 byte/token ceiling for checkpoint, latest-state,
+decision-log-only, and recent-tail calls. It does not contain rendered task
+content and performs no network operations.
+
+The protected-stage stop result from the approved replay is preserved in
+`protected_endpoint_replay.json`. Three of four modes disagreed with the full
+terminal decision, so the planned second stage was not run.
+
+## Explicit probe policy (Prototype A)
+
+Set `ASGARD_WINDOW_POLICY_MODE=explicit-probe` to require every initial or
+incomplete route to choose one of two validated window kinds:
+
+- `probe`: 2-5 lanes, 1-2 steps, with a distinct hypothesis, concrete
+  falsification action, and observable continue/stop signal for every lane;
+- `work`: the existing 1-5 lane, 1-10 step behavior and ordinary advice schema.
+
+The default `dynamic` mode retains the existing prompt and tool schemas. After a
+probe, the structured lane contracts are included in the supervisor dossier with
+an instruction to judge information gain rather than patch volume. Each opt-in
+window emits `asgard_window_kind` with its actual kind, candidate count, steps,
+and structured hypotheses. The policy is only a prompt/schema experiment over
+the existing one-winner window mechanism; it does not preserve probe survivors.
+
+## Archive corpus
+
+`extract_archive_corpus.py` turns one or more Anvil result zip archives into a
+machine-readable JSONL window corpus. It joins `anvil-stderr.txt` dossier byte
+telemetry to ordinary `asgard_decision` supervisor records by ordinal and excludes
+`completion_review` records. This is necessarily an ordinal join because current
+decision trace records have no window field.
+
+Run it directly on archives:
+
+```bash
+python3 research/asgard_3_4/extract_archive_corpus.py run-1.zip run-2.zip \
+  --output /tmp/asgard-windows.jsonl
+```
+
+Or use a manifest such as the eight-case live-regression set:
+
+```bash
+python3 research/asgard_3_4/extract_archive_corpus.py \
+  --manifest scripts/asgard_live_regressions.json \
+  --output /tmp/asgard-live-regressions.jsonl
+```
+
+Each `asgard_routing_window` record contains archive, case, task, and window
+identity; the three exact dossier component byte counts; derived history growth
+and removal ceilings; the full ordinary decision and common decision fields;
+candidate count (preferring an explicit field, otherwise `len(advices)`), next
+steps, and one/multi-lane classification; plus `result.json`, `reward.json`, and
+the result-level usage fields. The final `asgard_corpus_summary` record aggregates
+Q3 byte ceilings and Q4 retrospective distributions. Use `--records-only` to omit
+that final row.
+
+Some older archives contain dossier telemetry but predate `asgard_decision` trace
+records. Those windows are retained with `alignment.status="decision_missing"`
+and unknown decision-derived fields; the summary reports this coverage gap. Use
+`--require-decisions` when building a replay corpus that must reject such gaps.
+
+The removal values are deliberately named **ceilings**. In particular,
+`all_history_removal_ceiling` is the impossible perfect ceiling of removing both
+the stable selected-initial component and accumulated selected windows, while
+`older_selected_windows_removal_ceiling` measures the narrower accumulated-history
+opportunity. Neither claims that a compact replacement is safe or free.
+`full_dossier_measured` is only the sum of the three byte components emitted by
+the telemetry; it is not an exact serialized request size and does not include
+separately rendered task, checklist, policy, or supervisor-decision messages.
+
+## Protected known-success corpus
+
+`known_success_corpus.jsonl` is the strict quality corpus requested by the
+research brief. Its first row is a manifest; the remaining 18 rows are every
+successful trace in the exact 40-run `asgard6-claims` and
+`asgard9-flash-flash` cohorts. Those traces cover 15 distinct task/run
+identities, with three successes common to both cohorts. Task and run are one
+identity (`task-id::rN`), so two runs of the same task are separate protected
+regressions.
+
+Regenerate it from the archived public result metadata and Anvil archives:
+
+```bash
+python3 research/asgard_3_4/build_known_success_corpus.py \
+  --agentresults-root /home/jonathan/Projects/brokkbench/agentresults \
+  --archive-root /home/jonathan/brokkbench-archive \
+  --output research/asgard_3_4/known_success_corpus.jsonl
+```
+
+The defaults fail closed unless they find 40 results and nine successes in each
+cohort, a 15-identity union, and three common successes. The corpus records:
+
+- the full agent-side contract checklist and first two supervisor-selected
+  architectural assessments;
+- the final changed-file surface plus mechanically parsed added declarations and
+  patch hunk contexts (not the old patch itself);
+- every ordinary supervisor boundary state, unresolved-risk summary, next
+  advice, selected lane, and funding decision;
+- all test/build/check commands visible in candidate-side traces and stderr,
+  explicitly scoped to all lanes when older telemetry cannot prove lane
+  ownership;
+- actual candidate-count/window-depth sequences where traced, with an explicit
+  source or `null` and a reason where old v6 telemetry cannot recover a depth;
+- completion-review decisions and an explicit `unknown` assessment of whether a
+  winning lane looked weak after one or two steps.
+
+Facts and research inferences are separate top-level fields.
+`known_success_corpus.schema.json` describes both JSONL record types. The builder
+selects successes using public agent-result metadata and reads only
+`anvil-trace.jsonl`, `anvil-stderr.txt`, and `model.patch` from an archive. It
+does **not** read or copy `verifier-output.txt` or `verifier.tar.gz`; hidden-test
+details therefore cannot enter the corpus.
+
+Coverage limitations are deliberately machine visible. All 328 successful
+ordinary-routing windows have candidate counts, but 23 v6 window depths are
+unknown (initial windows and some post-review continuations were not traced).
+All 18 one/two-step weakness fields are `unknown`: these archive versions select
+only after a complete funded window and emit no explicit early weak/strong score.
+The 268 observed verification commands span all candidate lanes; tool completion
+is not treated as proof that test assertions passed. Supervisor state summaries
+are preserved as model assessments, not relabeled as ground truth.
+
+Exact CLI help:
+
+```text
+usage: extract_archive_corpus.py [-h] [-m MANIFEST] [-o OUTPUT]
+                                 [--records-only] [--require-decisions]
+                                 [ARCHIVE ...]
+
+Extract aligned Asgard ordinary-routing windows and Q3/Q4 summary metrics from
+Anvil result zip archives.
+
+positional arguments:
+  ARCHIVE               Anvil result zip archive (repeatable)
+
+options:
+  -h, --help            show this help message and exit
+  -m, --manifest MANIFEST
+                        JSON list, or object with a cases list, whose entries
+                        contain archive paths
+  -o, --output OUTPUT   write JSONL here instead of stdout
+  --records-only        omit the final asgard_corpus_summary JSONL record
+  --require-decisions   fail if any dossier telemetry row lacks an ordinary
+                        supervisor decision
+```
+
+## Shadow survivor-recall study (Prototype B)
+
+Existing winner-only archives cannot measure whether a shallow probe would have
+killed a later-best lane. `PROTOTYPE_B.md` specifies an opt-in three-lane calibration
+that continues the probe top two and the killed lane independently, then ranks all
+endpoints under opaque labels. `survivor_recall.schema.json` defines its trace
+contract, and the scorer is ready for trace captures:
+
+```bash
+python3 research/asgard_3_4/analyze_survivor_recall.py \
+  /path/to/archives-or-jsonl --output /tmp/asgard-survivor-recall.json
+```
+
+The scorer excludes partial, non-isolated, non-blinded, variable-budget, or otherwise
+invalid studies from the 90% top-2 recall gate. Run the executable fixed calibration
+with `ASGARD_WINDOW_POLICY_MODE=explicit-probe`,
+`ASGARD_SHADOW_SURVIVOR_STUDY=1`, and exactly three candidate models. See the bounded
+protocol and required invariants in `PROTOTYPE_B.md`.
+
+Run the focused tests with:
+
+```bash
+python3 -m unittest discover -s research/asgard_3_4 -p 'test_*.py'
+```

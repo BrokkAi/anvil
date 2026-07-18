@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokk.ai/schemas/asgard-supervisor-replay-capture-v1.json",
+  "title": "Asgard ordinary-routing replay capture record",
+  "type": "object",
+  "required": ["type"],
+  "oneOf": [
+    {
+      "properties": {
+        "type": { "const": "asgard_window_kind" },
+        "window": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["probe", "work"] },
+        "candidate_count": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "window_steps": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "hypotheses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["lane", "hypothesis", "falsification_action", "continue_stop_signal"],
+            "properties": {
+              "lane": { "type": "integer", "minimum": 0 },
+              "hypothesis": { "type": "string", "minLength": 1 },
+              "falsification_action": { "type": "string", "minLength": 1 },
+              "continue_stop_signal": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["window", "kind", "candidate_count", "window_steps", "hypotheses"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_prompt_mode" },
+        "window": { "type": "integer", "minimum": 1 },
+        "mode": { "$ref": "#/$defs/mode" },
+        "prompt_bytes": { "type": "integer", "minimum": 0 },
+        "estimated_request_tokens": { "type": "integer", "minimum": 0 },
+        "full_control_prompt_bytes": { "type": "integer", "minimum": 0 },
+        "full_control_estimated_request_tokens": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "window",
+        "mode",
+        "prompt_bytes",
+        "estimated_request_tokens",
+        "full_control_prompt_bytes",
+        "full_control_estimated_request_tokens"
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_replay_state" },
+        "window": { "type": "integer", "minimum": 1 },
+        "mode": { "$ref": "#/$defs/mode" },
+        "selected_trajectory_initial": { "type": "array" },
+        "selected_trajectory_windows": {
+          "type": "array",
+          "items": { "type": "array" }
+        },
+        "supervisor_history": { "type": "object" },
+        "canonical_ledger": { "type": "array" },
+        "candidate_trajectories": { "type": "string" }
+      },
+      "required": [
+        "window",
+        "mode",
+        "selected_trajectory_initial",
+        "selected_trajectory_windows",
+        "supervisor_history",
+        "canonical_ledger",
+        "candidate_trajectories"
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_replay_request" },
+        "decision_call": { "enum": ["supervisor", "completion_review"] },
+        "call_index": { "type": "integer", "minimum": 1 },
+        "phase": { "enum": ["audit", "selection"] },
+        "model": { "type": "string", "minLength": 1 },
+        "messages": { "type": "array" },
+        "tools": { "type": "array" },
+        "parameters": { "type": "object" }
+      },
+      "required": [
+        "decision_call",
+        "call_index",
+        "phase",
+        "model",
+        "messages",
+        "tools",
+        "parameters"
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_replay_response" },
+        "call_index": { "type": "integer", "minimum": 1 },
+        "response": { "type": "object" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "error": { "type": "string" }
+      },
+      "required": ["call_index"],
+      "anyOf": [
+        { "required": ["response", "usage"] },
+        { "required": ["error"] }
+      ]
+    }
+  ],
+  "$defs": {
+    "mode": {
+      "enum": [
+        "full",
+        "latest-state",
+        "checkpoint-plus-delta",
+        "decision-log-only",
+        "recent-exact-tail"
+      ]
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input": { "type": "integer", "minimum": 0 },
+        "output": { "type": "integer", "minimum": 0 },
+        "thought": { "type": "integer", "minimum": 0 },
+        "cachedRead": { "type": "integer", "minimum": 0 },
+        "cachedWrite": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["input", "output", "thought", "cachedRead", "cachedWrite"],
+      "additionalProperties": false
+    }
+  }
+}

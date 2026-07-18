@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anvil.invalid/research/asgard-3-4/known-success-corpus.schema.json",
+  "title": "Asgard v6/v9 known-success corpus JSONL record",
+  "oneOf": [
+    { "$ref": "#/$defs/manifest" },
+    { "$ref": "#/$defs/successTrace" }
+  ],
+  "$defs": {
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "schema_version",
+        "cohorts",
+        "result_counts",
+        "success_trace_counts",
+        "protected_union_count",
+        "protected_identities",
+        "common_success_count",
+        "common_success_identities",
+        "success_trace_count",
+        "hidden_test_leakage_policy"
+      ],
+      "properties": {
+        "type": { "const": "asgard_known_success_manifest" },
+        "schema_version": { "const": 1 },
+        "cohorts": {
+          "const": ["asgard6-claims", "asgard9-flash-flash"]
+        },
+        "result_counts": { "$ref": "#/$defs/cohortCounts" },
+        "success_trace_counts": { "$ref": "#/$defs/cohortCounts" },
+        "protected_union_count": { "type": "integer", "minimum": 0 },
+        "protected_identities": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "::r[1-9][0-9]*$" },
+          "uniqueItems": true
+        },
+        "common_success_count": { "type": "integer", "minimum": 0 },
+        "common_success_identities": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "::r[1-9][0-9]*$" },
+          "uniqueItems": true
+        },
+        "success_trace_count": { "type": "integer", "minimum": 0 },
+        "hidden_test_leakage_policy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "cohortCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asgard6-claims", "asgard9-flash-flash"],
+      "properties": {
+        "asgard6-claims": { "type": "integer", "minimum": 0 },
+        "asgard9-flash-flash": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "successTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "schema_version",
+        "protected_identity",
+        "task_id",
+        "run",
+        "cohort",
+        "common_success",
+        "provenance",
+        "facts",
+        "inferences"
+      ],
+      "properties": {
+        "type": { "const": "asgard_known_success_trace" },
+        "schema_version": { "const": 1 },
+        "protected_identity": { "type": "string", "pattern": "::r[1-9][0-9]*$" },
+        "task_id": { "type": "string", "minLength": 1 },
+        "run": { "type": "integer", "minimum": 1 },
+        "cohort": {
+          "enum": ["asgard6-claims", "asgard9-flash-flash"]
+        },
+        "common_success": { "type": "boolean" },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "facts": { "$ref": "#/$defs/facts" },
+        "inferences": {
+          "type": "object",
+          "required": ["replay_obligations"],
+          "properties": {
+            "replay_obligations": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "agent_result",
+        "agent_result_sha256",
+        "archive",
+        "selection_rule",
+        "excluded_members"
+      ],
+      "properties": {
+        "agent_result": { "type": "string" },
+        "agent_result_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "archive": { "type": "string" },
+        "base_commit": { "type": ["string", "null"] },
+        "anvil_sha256": { "type": ["string", "null"] },
+        "selection_rule": { "type": "string" },
+        "excluded_members": {
+          "type": "array",
+          "items": { "type": "string" },
+          "contains": { "const": "verifier-output.txt" }
+        }
+      }
+    },
+    "facts": {
+      "type": "object",
+      "required": [
+        "public_endpoint",
+        "contract_reading",
+        "architectural_direction",
+        "implementation_surface",
+        "cross_window_evidence_and_risk",
+        "verification",
+        "funding_sequence",
+        "completion_review",
+        "weak_after_one_or_two_steps"
+      ],
+      "properties": {
+        "public_endpoint": { "type": "object" },
+        "contract_reading": { "type": "object" },
+        "architectural_direction": { "type": "object" },
+        "implementation_surface": { "type": "object" },
+        "cross_window_evidence_and_risk": { "type": "object" },
+        "verification": { "type": "object" },
+        "funding_sequence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fundingWindow" }
+        },
+        "completion_review": { "type": "array", "items": { "type": "object" } },
+        "weak_after_one_or_two_steps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": { "enum": ["yes", "no", "unknown"] },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "fundingWindow": {
+      "type": "object",
+      "required": [
+        "window",
+        "candidate_count",
+        "candidate_count_source",
+        "window_steps",
+        "window_steps_source",
+        "selected_winner",
+        "complete_nomination"
+      ],
+      "properties": {
+        "window": { "type": "integer", "minimum": 1 },
+        "candidate_count": { "type": ["integer", "null"], "minimum": 0 },
+        "candidate_count_source": { "type": "string" },
+        "window_steps": { "type": ["integer", "null"], "minimum": 1 },
+        "window_steps_source": { "type": "string" },
+        "selected_winner": { "type": ["integer", "null"], "minimum": 0 },
+        "complete_nomination": { "type": ["boolean", "null"] }
+      }
+    }
+  }
+}
