@@ -1,0 +1,106 @@
+{
+  "gemma4-e4b": {
+    "all": {
+      "completion_like_directions": 2,
+      "compression_ratio": {
+        "median": 0.1322181176487705,
+        "p90": 0.47362924281984337
+      },
+      "edit_location_grounding": {
+        "grounded": 0,
+        "rate": null,
+        "total": 0
+      },
+      "edit_presence": {
+        "rate": 0.0,
+        "summaries_with_edits": 0,
+        "total_items": 0
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 18,
+        "inconclusive": 56,
+        "passed": 179
+      },
+      "finish_reasons": {
+        "stop": 100
+      },
+      "latency_seconds": {
+        "max": 68.75594379700487,
+        "median": 19.26825824000116,
+        "p90": 42.19067692401586
+      },
+      "rows": 100,
+      "schema_invalid": 0,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.2220306009779694,
+        "median": 0.1111111111111111,
+        "n": 57
+      },
+      "summary_items_median": {
+        "edits": 0.0,
+        "evidence": 2.0,
+        "risks": 2.0
+      },
+      "tokens": {
+        "completion_max": 712,
+        "completion_median": 343.0,
+        "completion_p90": 562,
+        "completion_total": 38108,
+        "prompt_total": 915873
+      },
+      "valid": 100
+    },
+    "read-only": {
+      "completion_like_directions": 2,
+      "compression_ratio": {
+        "median": 0.1322181176487705,
+        "p90": 0.47362924281984337
+      },
+      "edit_location_grounding": {
+        "grounded": 0,
+        "rate": null,
+        "total": 0
+      },
+      "edit_presence": {
+        "rate": 0.0,
+        "summaries_with_edits": 0,
+        "total_items": 0
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 18,
+        "inconclusive": 56,
+        "passed": 179
+      },
+      "finish_reasons": {
+        "stop": 100
+      },
+      "latency_seconds": {
+        "max": 68.75594379700487,
+        "median": 19.26825824000116,
+        "p90": 42.19067692401586
+      },
+      "rows": 100,
+      "schema_invalid": 0,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.2220306009779694,
+        "median": 0.1111111111111111,
+        "n": 57
+      },
+      "summary_items_median": {
+        "edits": 0.0,
+        "evidence": 2.0,
+        "risks": 2.0
+      },
+      "tokens": {
+        "completion_max": 712,
+        "completion_median": 343.0,
+        "completion_p90": 562,
+        "completion_total": 38108,
+        "prompt_total": 915873
+      },
+      "valid": 100
+    }
+  }
+}

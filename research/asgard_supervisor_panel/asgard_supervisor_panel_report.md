@@ -76,11 +76,11 @@ rationalize it away in the same response.
 ## Reproduction
 
 ```bash
-python3 scripts/asgard_supervisor_panel.py \
+python3 research/asgard_supervisor_panel/asgard_supervisor_panel.py \
   --api-key-file ~/.secrets/deepseek_bpr_key \
-  --prompt scripts/asgard_supervisor_prompts/grounded_contract.txt \
+  --prompt research/asgard_supervisor_panel/asgard_supervisor_prompts/grounded_contract.txt \
   --output /tmp/asgard-supervisor-panel.jsonl
 ```
 
 The archive paths and expected hidden verdicts are listed in
-`scripts/asgard_supervisor_panel.json`.
+`research/asgard_supervisor_panel/asgard_supervisor_panel.json`.

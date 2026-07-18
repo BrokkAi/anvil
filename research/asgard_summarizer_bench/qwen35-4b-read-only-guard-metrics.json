@@ -1,0 +1,106 @@
+{
+  "qwen35-4b": {
+    "all": {
+      "completion_like_directions": 44,
+      "compression_ratio": {
+        "median": 0.129805886460162,
+        "p90": 0.35205811138014526
+      },
+      "edit_location_grounding": {
+        "grounded": 0,
+        "rate": null,
+        "total": 0
+      },
+      "edit_presence": {
+        "rate": 0.0,
+        "summaries_with_edits": 0,
+        "total_items": 0
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 35,
+        "inconclusive": 10,
+        "passed": 405
+      },
+      "finish_reasons": {
+        "stop": 100
+      },
+      "latency_seconds": {
+        "max": 150.457716023986,
+        "median": 31.18895968349534,
+        "p90": 67.07666508600232
+      },
+      "rows": 100,
+      "schema_invalid": 0,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.23617118748697696,
+        "median": 0.16666666666666666,
+        "n": 57
+      },
+      "summary_items_median": {
+        "edits": 0.0,
+        "evidence": 3.0,
+        "risks": 1.5
+      },
+      "tokens": {
+        "completion_max": 1368,
+        "completion_median": 315.5,
+        "completion_p90": 701,
+        "completion_total": 40315,
+        "prompt_total": 851813
+      },
+      "valid": 100
+    },
+    "read-only": {
+      "completion_like_directions": 44,
+      "compression_ratio": {
+        "median": 0.129805886460162,
+        "p90": 0.35205811138014526
+      },
+      "edit_location_grounding": {
+        "grounded": 0,
+        "rate": null,
+        "total": 0
+      },
+      "edit_presence": {
+        "rate": 0.0,
+        "summaries_with_edits": 0,
+        "total_items": 0
+      },
+      "errors": 0,
+      "evidence_statuses": {
+        "failed": 35,
+        "inconclusive": 10,
+        "passed": 405
+      },
+      "finish_reasons": {
+        "stop": 100
+      },
+      "latency_seconds": {
+        "max": 150.457716023986,
+        "median": 31.18895968349534,
+        "p90": 67.07666508600232
+      },
+      "rows": 100,
+      "schema_invalid": 0,
+      "selected_lane_reference_literal_recall": {
+        "mean": 0.23617118748697696,
+        "median": 0.16666666666666666,
+        "n": 57
+      },
+      "summary_items_median": {
+        "edits": 0.0,
+        "evidence": 3.0,
+        "risks": 1.5
+      },
+      "tokens": {
+        "completion_max": 1368,
+        "completion_median": 315.5,
+        "completion_p90": 701,
+        "completion_total": 40315,
+        "prompt_total": 851813
+      },
+      "valid": 100
+    }
+  }
+}
