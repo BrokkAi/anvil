@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use clap::builder::RangedU64ValueParser;
 
-mod agent;
+mod acp;
 mod agents;
 mod agents_md;
 mod asgard;
@@ -778,7 +778,7 @@ async fn main() -> Result<()> {
     }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.
-    agent::run_agent(
+    acp::run_agent(
         llm,
         sessions,
         max_turns,

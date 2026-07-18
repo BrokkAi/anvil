@@ -1519,7 +1519,7 @@ impl ToolRegistry {
         };
         ToolResult {
             status: ToolStatus::Success,
-            output: crate::agent::build_skill_payload(meta),
+            output: crate::acp::build_skill_payload(meta),
         }
     }
 
