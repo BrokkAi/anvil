@@ -142,7 +142,7 @@ class AnalyzeSurvivorRecallTest(unittest.TestCase):
     def test_gate_requires_minimum_complete_studies(self) -> None:
         study = recall.score_study("memory", "s-1", complete_rows())
         report = recall.summarize([study], min_complete_studies=2)
-        self.assertEqual(report["summary"]["gate_status"], "insufficient-data")
+        self.assertEqual(report["summary"]["gate_status"], "fail-futility")
         report = recall.summarize([study, study], min_complete_studies=2)
         self.assertEqual(report["summary"]["gate_status"], "fail")
         self.assertEqual(report["summary"]["two_step_top2_hits"], 0)
@@ -165,6 +165,27 @@ class AnalyzeSurvivorRecallTest(unittest.TestCase):
             report["summary"]["by_probe_steps"]["2"]["eligible_studies"], 0
         )
         self.assertEqual(report["summary"]["gate_status"], "insufficient-data")
+
+    def test_gate_stops_early_when_remaining_perfect_studies_cannot_pass(self) -> None:
+        miss = recall.score_study("miss", "miss", complete_rows("miss"))
+        hit_rows = complete_rows("hit")
+        review = next(
+            row for row in hit_rows if row["type"] == "asgard_shadow_end_review"
+        )
+        review["ranking"] = [
+            {"review_label": "opaque-c", "rank": 1},
+            {"review_label": "opaque-b", "rank": 2},
+            {"review_label": "opaque-a", "rank": 3},
+        ]
+        hit = recall.score_study("hit", "hit", hit_rows)
+        report = recall.summarize([hit] * 7 + [miss] * 5, min_complete_studies=20)
+        self.assertEqual(report["summary"]["gate_status"], "fail-futility")
+        self.assertTrue(report["summary"]["futility_stop"])
+        self.assertEqual(report["summary"]["remaining_studies_to_minimum"], 8)
+        self.assertEqual(
+            report["summary"]["maximum_attainable_top2_recall_at_minimum"],
+            0.75,
+        )
 
     def test_boolean_probe_step_is_not_accepted_as_one(self) -> None:
         rows = complete_rows()

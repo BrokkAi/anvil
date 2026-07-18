@@ -48,6 +48,10 @@ threshold is the decision rule; the interval is an uncertainty warning, not a se
 hidden gate. A later, production-facing tournament should use a larger cohort before
 changing defaults.
 
+A deterministic futility stop is also reported before 20 studies when treating every
+remaining study needed to reach 20 as a hit would still leave top-2 recall below 90%.
+This can stop spend but cannot turn a failing cohort into a pass.
+
 Studies with sampled rather than exhaustive killed branches remain useful diagnostics,
 but are marked `complete_ground_truth=false` and cannot enter the gate. Likewise, a
 two-lane `K=2` study is structurally incapable of killing a lane and is ineligible.

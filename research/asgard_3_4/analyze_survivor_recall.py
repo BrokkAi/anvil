@@ -506,8 +506,20 @@ def summarize(
     two_step = by_probe_steps["2"]
     two_step_top2 = two_step["recall"]["top2"]
     observed = two_step_top2["rate"]
+    remaining_to_minimum = max(
+        0, min_complete_studies - two_step_top2["opportunities"]
+    )
+    maximum_at_minimum = (
+        (two_step_top2["hits"] + remaining_to_minimum) / min_complete_studies
+    )
+    futility_stop = (
+        two_step_top2["opportunities"] < min_complete_studies
+        and maximum_at_minimum < 0.9
+    )
     gate_status = "insufficient-data"
-    if two_step["eligible_studies"] >= min_complete_studies:
+    if futility_stop:
+        gate_status = "fail-futility"
+    elif two_step["eligible_studies"] >= min_complete_studies:
         gate_status = "pass" if observed is not None and observed >= 0.9 else "fail"
     top1_status = "insufficient-data"
     if two_step["eligible_studies"] >= min_complete_studies:
@@ -530,6 +542,9 @@ def summarize(
             "top2_recall": observed,
             "top2_recall_wilson_95": two_step_top2["wilson_95"],
             "minimum_complete_studies": min_complete_studies,
+            "remaining_studies_to_minimum": remaining_to_minimum,
+            "maximum_attainable_top2_recall_at_minimum": maximum_at_minimum,
+            "futility_stop": futility_stop,
             "gate_threshold": 0.9,
             "gate_status": gate_status,
             "top1_funding_threshold": 0.95,

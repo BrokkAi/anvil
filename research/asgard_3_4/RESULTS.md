@@ -1,9 +1,9 @@
 # Asgard 3/4 results
 
 Status: the 40-call Q3 captured-context replay and the first 20-run live pilot are
-complete. The Q3 promotion decision is **no-go**. Q4's executable
-shadow-survivor prototype is locally validated but has no live calibration
-observations yet.
+complete. The Q3 promotion decision is **no-go**. Q4's shadow-survivor calibration
+also reached an early **no-go** after 12 valid live studies made the 90% gate
+mathematically unattainable.
 
 ## Direct verdicts
 
@@ -13,8 +13,10 @@ observations yet.
 - Explicitly naming a short window a probe is not a new execution mechanism. The
   archived decisions seen so far use three lanes throughout and provide no survivor
   counterfactuals, so they cannot estimate shallow-probe recall.
-- A true survivor tournament is not justified yet. Prototype B must first establish
-  at least 90% top-2 recall after two probe steps in a live calibration.
+- A true survivor tournament is not justified. Prototype B retained the eventual
+  winner after two probe steps in only 7/12 valid live studies (58.3%). Five late
+  bloomers were killed; even eight perfect remaining studies could reach only 75%,
+  so the pre-registered 90% gate failed by mathematical futility.
 - `recent-exact-tail` had the best live score (3/4), but it lost the protected Returns
   solution, failed the replay endpoint gate, and raised uncached input per routing
   window by 18.4%. It is an interesting baseline, not a production candidate.
@@ -139,8 +141,28 @@ and usage vectors, is in `supervisor_replay_40_analysis.json`.
   two-step probe, all three continue autonomously for five equal steps, and an
   opaque-label review chooses the endpoint before the first repository
   synchronization. Probe rankings classify architectural/contract versus cosmetic
-  distinctions. No survivor-recall observations exist yet, and the
-  production/default tournament is unchanged.
+  distinctions. Twelve live studies passed every protocol invariant; seven retained
+  the final winner and five did not. The production/default tournament remains
+  unchanged.
+
+## Q4 shadow-survivor futility result
+
+The first 12 two-step studies completed the decision-relevant shadow protocol before
+their surrounding task runs were stopped. All 12 had exhaustive three-lane ground
+truth, equal five-step continuations, isolated branches, blinded endpoint review,
+complete usage accounting, and no scorer violation. Probe top-2 retained the blinded
+final winner in 7/12 studies (58.3%; 95% Wilson interval 31.95%--80.67%). Among the
+five rank-3 late bloomers, three probe distinctions were architectural/contractual or
+mixed and two were cosmetic; failures were not confined to cosmetic implementation
+progress.
+
+At 12 studies, eight slots remained to the planned minimum of 20. Even if every one
+were a hit, the maximum attainable rate was 15/20 (75%), below the fixed 90% gate.
+Enrollment was therefore stopped for mathematical futility. The surrounding task
+runs were cancelled after their complete shadow records were copied, so this early
+cohort does not provide public grader outcomes; it does provide the exhaustive
+counterfactual ranking needed for the tournament decision. The machine-readable
+record is `shadow_survivor_futility_analysis.json`.
 
 ## Inferences
 
@@ -223,6 +245,6 @@ complete and reinforces the no-go: the next informative Q3 run is a
 corrected-bootstrap live replication of full, checkpoint, and recent-tail on the
 protected Returns case plus the gained PSD/Happy cases, with multiple seeds.
 
-Do not implement a production tournament until the separate Prototype B calibration
-clears its 90% top-2 survivor-recall gate. Prototype A should be treated as a policy
+Do not implement Prototype C or a production tournament: Prototype B failed its 90%
+top-2 survivor-recall gate by mathematical futility. Prototype A remains a policy
 experiment over existing execution capability, not evidence for survivor retention.

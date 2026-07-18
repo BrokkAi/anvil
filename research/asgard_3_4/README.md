@@ -296,7 +296,9 @@ The scorer excludes partial, non-isolated, non-blinded, variable-budget, or othe
 invalid studies from the 90% two-step top-2 recall gate. It separately reports
 one-step and two-step top-1/top-2/top-3 recall, architecture/contract versus cosmetic
 probe distinctions, late-bloomer kills, task outcomes, and attainable continuation
-savings after measured review overhead. Run the executable fixed calibration with
+savings after measured review overhead. It stops for mathematical futility when even
+perfect remaining studies could not reach the fixed threshold. Run the executable
+fixed calibration with
 `ASGARD_WINDOW_POLICY_MODE=explicit-probe`,
 `ASGARD_SHADOW_SURVIVOR_STUDY=1`, `ASGARD_SHADOW_PROBE_STEPS=1` or `2`, and exactly
 three candidate models. See the bounded protocol and required invariants in
