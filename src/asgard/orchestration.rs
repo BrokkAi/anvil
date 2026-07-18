@@ -2190,6 +2190,8 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
         // A round that only expands compact trajectory lines is refunded below,
         // so retrieval never competes with inspection or selection.
         let mut retrieval_round = false;
+        let mut retrieved_handles: Vec<String> = Vec::new();
+        let mut unresolved_handles: Vec<String> = Vec::new();
         let audit_phase = audit_rounds_used < audit_round_limit;
         if audit_phase {
             audit_rounds_used += 1;
@@ -2462,7 +2464,18 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
                             Ok(arguments) => match asgard_view_tool_call_handles(&arguments.value) {
                                 Ok(handles) => match &context.audit {
                                     Some(audit) => {
-                                        resolve_asgard_tool_call_handles(audit, &handles)
+                                        let resolved =
+                                            resolve_asgard_tool_call_handles(audit, &handles);
+                                        for handle in &handles {
+                                            if resolved.contains(&format!(
+                                                "<tool_call id=\"{handle}\" lane="
+                                            )) {
+                                                retrieved_handles.push(handle.clone());
+                                            } else {
+                                                unresolved_handles.push(handle.clone());
+                                            }
+                                        }
+                                        resolved
                                     }
                                     None => "Error: no candidate trajectories are retrievable for this decision".to_string(),
                                 },
@@ -2549,6 +2562,19 @@ pub(crate) async fn run_asgard_supervisor_tool_steps(
                 selection_attempts -= 1;
             }
             retrieval_rounds_used += 1;
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_supervisor_retrieval",
+                "phase": if context.required_winner.is_some() {
+                    "completion_review"
+                } else {
+                    "routing_supervisor"
+                },
+                "model": context.model,
+                "window": context.audit.as_ref().map(|audit| audit.window),
+                "round": retrieval_rounds_used,
+                "handles": retrieved_handles,
+                "unresolved": unresolved_handles,
+            }));
             if retrieval_rounds_used >= ASGARD_RETRIEVAL_MAX_ROUNDS {
                 return (
                     Err(anyhow::anyhow!(
