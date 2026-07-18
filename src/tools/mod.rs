@@ -1147,25 +1147,7 @@ impl ToolRegistry {
             let names: Vec<String> = agents.iter_sorted().map(|m| m.name.clone()).collect();
             let catalog: String = agents
                 .iter_sorted()
-                .map(|m| {
-                    let mut restrictions = Vec::new();
-                    if let Some(max_turns) = m.max_turns {
-                        restrictions.push(format!("max_turns: {max_turns}"));
-                    }
-                    if let Some(tools) = &m.allowed_tools {
-                        restrictions.push(if tools.is_empty() {
-                            "tools: none".to_string()
-                        } else {
-                            format!("tools: {}", tools.join(", "))
-                        });
-                    }
-                    let restrictions = if restrictions.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", restrictions.join("; "))
-                    };
-                    format!("- {}: {}{}", m.name, m.description, restrictions)
-                })
+                .map(|m| format!("- {}: {}", m.name, m.description))
                 .collect::<Vec<_>>()
                 .join("\n");
             defs.push(tool_def(
@@ -2776,20 +2758,25 @@ mod tests {
             .collect();
         assert_eq!(permission_values, vec!["readOnly", "inherit"]);
 
-        // Description should surface the catalog so the model can pick.
-        assert!(
-            task_def.function.description.contains("doc-writer"),
-            "catalog should mention each subagent; got: {}",
-            task_def.function.description
-        );
-        assert!(task_def.function.description.contains("bug-hunter"));
-        assert!(task_def.function.description.contains("max_turns: 7"));
+        // The model-facing catalog contains only selection-relevant metadata.
+        // Execution constraints remain enforced from AgentMeta at dispatch,
+        // but repeating long tool allowlists here wastes tokens every turn.
         assert!(
             task_def
                 .function
                 .description
-                .contains("tools: grep_search, read_file")
+                .contains("- doc-writer: Drafts docs from code"),
+            "catalog should mention each subagent; got: {}",
+            task_def.function.description
         );
+        assert!(
+            task_def
+                .function
+                .description
+                .contains("- bug-hunter: Hunts for regressions")
+        );
+        assert!(!task_def.function.description.contains("max_turns:"));
+        assert!(!task_def.function.description.contains("tools:"));
     }
 
     /// MCP schemas often ask for arrays. The host must wrap scalar strings into
