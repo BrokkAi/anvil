@@ -122,6 +122,30 @@ class AnalyzeLivePilotTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not match pending request"):
                 pilot.extract_run(path)
 
+    def test_discovery_can_skip_incomplete_and_corrupt_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with zipfile.ZipFile(root / "captured.zip", "w") as archive:
+                archive.writestr("anvil-trace.jsonl", "{}\n")
+                archive.writestr("result.json", "{}")
+            with zipfile.ZipFile(root / "cancelled.zip", "w") as archive:
+                archive.writestr("cancellation-error.json", "{}")
+            (root / "corrupt.zip").write_text("not a zip", encoding="utf-8")
+
+            self.assertEqual(
+                [path.name for path in pilot.discover_archives([root])],
+                ["cancelled.zip", "captured.zip", "corrupt.zip"],
+            )
+            self.assertEqual(
+                [
+                    path.name
+                    for path in pilot.discover_archives(
+                        [root], skip_incomplete=True
+                    )
+                ],
+                ["captured.zip"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

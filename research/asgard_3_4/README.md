@@ -74,7 +74,8 @@ Aggregate completed pilot archives with:
 
 ```bash
 python3 research/asgard_3_4/analyze_live_pilot.py \
-  /path/to/archive/directories --output /tmp/asgard-pilot-report.json
+  /path/to/archive/directories --skip-incomplete \
+  --output /tmp/asgard-pilot-report.json
 ```
 
 The report separates ordinary-routing and completion-review calls, sums uncached,
@@ -167,7 +168,8 @@ Analyze paired dynamic and explicit-probe archives with:
 
 ```bash
 python3 research/asgard_3_4/analyze_probe_policy.py \
-  /path/to/dynamic /path/to/explicit --output /tmp/asgard-probe-policy.json
+  /path/to/dynamic /path/to/explicit --skip-incomplete \
+  --output /tmp/asgard-probe-policy.json
 ```
 
 The analyzer uses only structured config, window-kind, candidate-count/depth,

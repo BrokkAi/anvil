@@ -157,6 +157,16 @@ class ProbePolicyAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "excludes shadow survivor"):
             policy.extract_run(path)
 
+    def test_discovery_can_skip_incomplete_archives(self) -> None:
+        captured = self.archive("captured", "dynamic")
+        with zipfile.ZipFile(self.root / "cancelled.zip", "w") as archive:
+            archive.writestr("cancellation-error.json", "{}")
+
+        self.assertEqual(
+            policy.discover_inputs([self.root], skip_incomplete=True),
+            [captured],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

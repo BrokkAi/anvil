@@ -15,7 +15,9 @@ from typing import Any, Iterable
 USAGE_KEYS = ("input", "output", "thought", "cachedRead", "cachedWrite")
 
 
-def discover_archives(paths: Iterable[Path]) -> list[Path]:
+def discover_archives(
+    paths: Iterable[Path], *, skip_incomplete: bool = False
+) -> list[Path]:
     archives: set[Path] = set()
     for path in paths:
         if path.is_dir():
@@ -24,7 +26,19 @@ def discover_archives(paths: Iterable[Path]) -> list[Path]:
             archives.add(path)
         else:
             raise ValueError(f"not an archive or directory: {path}")
-    return sorted(archives)
+    discovered = sorted(archives)
+    if not skip_incomplete:
+        return discovered
+    captured: list[Path] = []
+    for path in discovered:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                members = set(archive.namelist())
+        except zipfile.BadZipFile:
+            continue
+        if {"anvil-trace.jsonl", "result.json"}.issubset(members):
+            captured.append(path)
+    return captured
 
 
 def _json_member(archive: zipfile.ZipFile, name: str) -> dict[str, Any]:
@@ -291,9 +305,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="+", type=Path, help="archive or archive directory")
     parser.add_argument("--output", type=Path, help="write JSON here instead of stdout")
+    parser.add_argument(
+        "--skip-incomplete",
+        action="store_true",
+        help="ignore cancellation/corrupt ZIPs without a captured trace and result",
+    )
     args = parser.parse_args()
     try:
-        archives = discover_archives(args.path)
+        archives = discover_archives(args.path, skip_incomplete=args.skip_incomplete)
         if not archives:
             parser.error("no zip archives found")
         report = summarize([extract_run(path) for path in archives])
