@@ -575,6 +575,20 @@ on — sequential vs. parallel execution, ordering/isolation, cancellation and
 timeout scope, observability, and structured-result collection — see
 [`docs/concurrency.md`](docs/concurrency.md).
 
+## Tool Allowlist
+
+`setup.json` accepts an optional `allowed_tools` array of exact tool names. When
+present, Anvil limits the model-facing catalog to those names after assembling
+built-in, MCP, and dynamic tools such as `activate_skill` and `task`. Unknown
+names are ignored. Omitting the field preserves the full catalog; an empty list
+disables every model-callable tool.
+
+```json
+{
+  "allowed_tools": ["read_file", "grep_search", "semantic_search", "task"]
+}
+```
+
 ## CLI Reference
 
 ```text
@@ -589,7 +603,7 @@ anvil [OPTIONS]
 | `--max-history-turns` | - | `50` | Maximum in-memory history turns per session. `0` disables the cap. |
 | `--llm-idle-timeout-secs` | `ANVIL_LLM_IDLE_TIMEOUT_SECS` | `300` | Seconds to wait for first meaningful LLM stream progress. |
 | `--llm-stall-timeout-secs` | `ANVIL_LLM_STALL_TIMEOUT_SECS` | `60` | Seconds to wait between meaningful chunks after streaming starts. |
-| `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep sandbox, turn-recap, and first-run preferences process-local instead of reading or updating `setup.json`. Provider credentials and `/mcp` use separate stores and remain persistent. |
+| `--transient-setup` | `ANVIL_TRANSIENT_SETUP` | `false` | Keep sandbox, turn-recap, and first-run preferences process-local instead of reading or updating `setup.json`. Provider credentials, `allowed_tools`, and `/mcp` remain persistent. |
 | `--no-wasm-sandbox` | `ANVIL_NO_WASM_SANDBOX` | `false` | Disable the wasmtime-hosted parser sandbox. |
 
 ## Build And Test

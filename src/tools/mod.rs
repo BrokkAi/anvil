@@ -1190,6 +1190,14 @@ impl ToolRegistry {
                 }),
             ));
         }
+
+        // Apply the install-wide allowlist only after every source has
+        // contributed definitions. In particular, `activate_skill` and `task`
+        // are dynamic tools assembled after built-ins and MCP tools.
+        if let Some(allowed_tools) = crate::setup_state::read_allowed_tools() {
+            let allowed_tools: HashSet<String> = allowed_tools.into_iter().collect();
+            defs.retain(|tool| allowed_tools.contains(&tool.function.name));
+        }
         defs
     }
 
@@ -2560,6 +2568,44 @@ mod tests {
         assert!(!advertised.iter().any(|name| name == "grep_search"));
         assert!(!advertised.iter().any(|name| name == "web_search"));
         assert!(!advertised.iter().any(|name| name == "run_shell_command"));
+    }
+
+    #[tokio::test]
+    async fn setup_allowed_tools_filters_builtins_and_dynamic_tools() {
+        use crate::agents::{AgentMeta, AgentScope};
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({ "allowed_tools": ["read_file", "task"] }).to_string(),
+        )
+        .expect("write setup state");
+
+        let registry = registry_with_agents(vec![AgentMeta {
+            name: "reviewer".into(),
+            description: "Reviews code".into(),
+            max_turns: None,
+            allowed_tools: None,
+            location: PathBuf::from("/tmp/reviewer.md"),
+            scope: AgentScope::Project,
+            bundled_body: None,
+        }]);
+        let advertised: Vec<String> = registry
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+
+        assert_eq!(advertised, vec!["read_file", "task"]);
+
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({ "allowed_tools": [] }).to_string(),
+        )
+        .expect("write empty allowed_tools");
+        assert!(registry.tool_definitions().await.is_empty());
     }
 
     #[tokio::test]

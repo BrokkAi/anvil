@@ -9,7 +9,8 @@
 //! reasoning effort, behavior mode, and permission mode are intentionally not
 //! stored here; clients must send them for each session. It also stores
 //! user-configured MCP servers; when that field is absent, Anvil seeds the
-//! config with its preinstalled servers.
+//! config with its preinstalled servers. An optional `allowed_tools` list
+//! constrains the install-wide model-facing tool catalog.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,10 @@ pub struct SetupState {
     pub always_allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<crate::mcp::McpServerConfig>>,
+    /// Optional install-wide allowlist for the model-facing tool catalog.
+    /// Absent means unrestricted; an explicitly empty list hides every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Deserialize an optional enum field leniently: a value this build does not
@@ -204,6 +209,10 @@ pub fn remember_mcp_servers(servers: Vec<crate::mcp::McpServerConfig>) -> Result
     update(|state| state.mcp_servers = Some(servers))
 }
 
+pub fn read_allowed_tools() -> Option<Vec<String>> {
+    read().allowed_tools
+}
+
 fn update(mutator: impl FnOnce(&mut SetupState)) -> Result<()> {
     let _guard = WRITE_LOCK.lock().expect("setup state write mutex poisoned");
     let mut state = read_inner();
@@ -305,6 +314,34 @@ mod tests {
         )
         .expect("setup json");
         assert_eq!(json["bedrock_catalog_mode"], "native-only");
+    }
+
+    #[test]
+    fn allowed_tools_distinguishes_absent_from_empty() {
+        let absent: SetupState = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize setup without allowed_tools");
+        assert_eq!(absent.allowed_tools, None);
+
+        let empty: SetupState = serde_json::from_value(serde_json::json!({
+            "allowed_tools": []
+        }))
+        .expect("deserialize empty allowed_tools");
+        assert_eq!(empty.allowed_tools, Some(Vec::new()));
+
+        let configured: SetupState = serde_json::from_value(serde_json::json!({
+            "allowed_tools": ["read_file", "semantic_search", "task"]
+        }))
+        .expect("deserialize allowed_tools");
+        assert_eq!(
+            configured.allowed_tools.as_deref(),
+            Some(
+                &[
+                    "read_file".to_string(),
+                    "semantic_search".to_string(),
+                    "task".to_string()
+                ][..]
+            )
+        );
     }
 
     #[test]
