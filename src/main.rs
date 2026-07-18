@@ -48,6 +48,7 @@ mod tool_loop;
 mod tools;
 mod trace_logging;
 mod train_bifrost;
+mod usage_report;
 
 use crate::llm_client::LlmBackend;
 use crate::multi_backend::{BackendRegistration, MultiBackend};
