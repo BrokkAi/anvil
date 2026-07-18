@@ -10446,7 +10446,14 @@ fn render_mcp_servers() -> String {
 }
 
 fn mcp_usage() -> String {
-    "Commands:\n\
+    let bifrost_args = crate::mcp::McpServerConfig::bifrost()
+        .args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "Commands:\n\
      - `/mcp list`\n\
      - `/mcp add [--framing content-length|line] <name> <command> [args...]`\n\
      - `/mcp enable <name>`\n\
@@ -10455,10 +10462,10 @@ fn mcp_usage() -> String {
      - `/mcp reset`\n\n\
      `content-length` is the standard MCP stdio framing and is the default for new \
      servers. Use `line` only for NDJSON-speaking servers. Use shell-style quoting \
-     for commands or args that contain spaces, and use `{cwd}` in args to pass the \
+     for commands or args that contain spaces, and use `{{cwd}}` in args to pass the \
      current workspace root. Bifrost is preinstalled as Anvil's managed local \
-     binary with the equivalent args `--root '{cwd}' --mcp searchtools --no-line-numbers`."
-        .to_string()
+     binary with the equivalent args `{bifrost_args}`."
+    )
 }
 
 fn shell_quote(value: &str) -> String {

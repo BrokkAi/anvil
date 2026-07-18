@@ -419,8 +419,7 @@ const TOOLS: &[ToolMeta] = &[
     },
     ToolMeta {
         // bifrost returns the non-mutating rename edit set (it never writes),
-        // so it ships in the read-only `searchtools` surface with
-        // readOnlyHint=true and is classified as a read tool here.
+        // with readOnlyHint=true, so it is classified as a read tool here.
         name: "rename_symbol",
         kind: ToolKind::Read,
         display_name: "Computing symbol rename",
