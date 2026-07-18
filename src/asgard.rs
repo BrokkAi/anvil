@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -274,11 +275,7 @@ fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
     let untracked: Vec<u8> = listed
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .filter(|path| {
-            root.join(std::ffi::OsStr::from_bytes(path))
-                .symlink_metadata()
-                .is_ok()
-        })
+        .filter(|path| path_exists(root, path))
         .flat_map(|path| path.iter().copied().chain(std::iter::once(0)))
         .collect();
     if untracked.is_empty() {
@@ -303,6 +300,20 @@ fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn path_exists(root: &Path, path: &[u8]) -> bool {
+    root.join(std::ffi::OsStr::from_bytes(path))
+        .symlink_metadata()
+        .is_ok()
+}
+
+#[cfg(not(unix))]
+fn path_exists(root: &Path, path: &[u8]) -> bool {
+    std::str::from_utf8(path)
+        .map(|path| root.join(path).symlink_metadata().is_ok())
+        .unwrap_or(false)
 }
 
 struct TemporaryIndex {
