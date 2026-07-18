@@ -83,6 +83,11 @@ cached, output, and thought tokens, compares each compact prompt with its render
 full-control counterfactual, and preserves paired task outcomes.
 `live_pilot_summary.json` preserves the compact result of the completed 20-run
 aggressive-bootstrap pilot; `RESULTS.md` gives the no-go decision and limitations.
+The corrected-bootstrap follow-up is preserved separately as
+`corrected_bootstrap_clean_analysis.json` (the planned nine-run paired cohort) and
+`corrected_bootstrap_all_analysis.json` (45 valid calls including recovered
+exploratory replicates). Both compact modes lost protected Returns and neither
+reduced total raw input in the larger balanced cohort.
 
 Score `asgard_supervisor_replay_result` JSONL entirely offline with:
 
@@ -178,6 +183,11 @@ the fraction of windows already eligible for a shallow tournament, candidate
 cost per lane-step, total cost per run, paired task outcomes, and the
 pre-specified 5% behavioral-sameness tolerance. Shadow-survivor runs are
 rejected so they cannot contaminate this policy comparison.
+
+`probe_policy_clean_analysis.json` preserves the planned four-task pair and
+`probe_policy_all_analysis.json` preserves all 38 valid policy calls. Explicit
+policy was behaviorally different, but only 15/389 all-valid explicit windows were
+probes and total raw input per run increased 1.1%; the rollout is a no-go.
 
 ## Archive corpus
 

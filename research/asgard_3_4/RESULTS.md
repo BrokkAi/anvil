@@ -1,18 +1,19 @@
 # Asgard 3/4 results
 
-Status: the 40-call Q3 captured-context replay and the first 20-run live pilot are
-complete. The Q3 promotion decision is **no-go**. Q4's shadow-survivor calibration
-also reached an early **no-go** after 12 valid live studies made the 90% gate
-mathematically unattainable.
+Status: the 40-call Q3 captured-context replay, 20-run initial pilot, 45-run
+corrected-bootstrap replication, 38-run Q4 policy comparison, and 12-study Q4
+shadow calibration are complete. Q3 compression, Q4 explicit-probe rollout, and
+the true survivor tournament are all **no-go**.
 
 ## Direct verdicts
 
 - Stateful/delta supervision has a large structural opportunity, but none of the four
   compact representations met the combined protected-endpoint, protected-live-result,
   and cache-economics gates. Keep `full` as the default.
-- Explicitly naming a short window a probe is not a new execution mechanism. The
-  archived decisions seen so far use three lanes throughout and provide no survivor
-  counterfactuals, so they cannot estimate shallow-probe recall.
+- Explicit probe policy changed the candidate/depth distribution, but did not save
+  cost. In the authoritative clean pair it increased total raw input 3.0%; across all
+  38 valid runs it increased total raw input 1.1%. Only 15/389 explicit windows
+  (3.9%) were probes. Do not promote Prototype A.
 - A true survivor tournament is not justified. Prototype B retained the eventual
   winner after two probe steps in only 7/12 valid live studies (58.3%). Five late
   bloomers were killed; even eight perfect remaining studies could reach only 75%,
@@ -24,6 +25,10 @@ mathematically unattainable.
   uncached input per window flat (+0.6%), but it also lost protected Returns and failed
   the replay endpoint gate. The frozen-checkpoint hypothesis is not supported strongly
   enough to promote.
+- Correcting the compact bootstrap did not rescue Q3. Across 15 runs per mode, `full`
+  scored 9/15, checkpoint 7/15, and recent-tail 6/15. On protected Returns the rates
+  were 3/5, 1/5, and 1/5 respectively. Checkpoint raised total raw input per run 3.2%;
+  recent-tail was effectively flat (+0.08%) while raising uncached input 21.2%.
 
 ## Facts
 
@@ -116,6 +121,68 @@ the protected Returns identity, versus the required 100%. No mode is
 recommendation-ready, independent of the still-required human obligation review.
 The complete machine-readable analysis, including disagreement and fallback rows
 and usage vectors, is in `supervisor_replay_40_analysis.json`.
+
+### Corrected-bootstrap live replication
+
+The corrected replication closed the aggressive-bootstrap limitation in the first
+pilot. Its authoritative clean cohort contains one run for each of three tasks and
+three modes (nine runs total). All modes scored 2/3, but the identity of the failure
+changed: `full` succeeded on protected Returns and Happy DOM but missed PSD, while
+both compact modes succeeded on PSD and Happy DOM but missed protected Returns.
+Equal aggregate score therefore concealed the exact protected regression the brief
+forbids.
+
+A controller-recovery race also yielded 36 additional valid, independent calls,
+balanced at 12 per mode. They are labeled exploratory rather than silently folded
+into the planned clean cohort. Across all 45 valid calls:
+
+| Mode | Clean success | All success | Protected Returns | Prompt bytes removed | Total raw input/run | Uncached input/run |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| full | 2/3 | 9/15 | 3/5 | 0% | 11.735M | 1.050M |
+| checkpoint + delta | 2/3 | 7/15 | 1/5 | 51.0% | 12.108M (+3.2%) | 1.157M (+10.2%) |
+| recent exact tail | 2/3 | 6/15 | 1/5 | 50.8% | 11.745M (+0.08%) | 1.273M (+21.2%) |
+
+Thus neither compact mode reduced actual aggregate raw cost after cache effects in
+the larger balanced cohort. Both lost two of the three full-control Returns
+successes, and both increased uncached input materially. The clean recent-tail run
+did reduce total raw input 21.5%, but it also lost Returns; the larger cohort shows
+that apparent saving was not stable. `corrected_bootstrap_clean_analysis.json` and
+`corrected_bootstrap_all_analysis.json` preserve the full run-level records.
+
+### Explicit-probe policy live comparison
+
+The authoritative clean Q4 cohort contains one paired run on Returns, PSD, Happy
+DOM, and Drizzle (eight runs total). Dynamic and explicit policy each scored 1/4,
+but dynamic uniquely retained protected Returns while explicit uniquely gained
+Drizzle. Explicit therefore failed the no-protected-regression rule despite equal
+aggregate score.
+
+| Clean mode | Success | Windows | Lane-steps | Probe windows | Total raw input/run | Candidate raw input/lane-step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| dynamic | 1/4 | 94 | 743 | n/a | 16.020M | 74,595 |
+| explicit probe | 1/4 | 104 | 745 | 4 | 16.493M (+3.0%) | 73,763 (-1.1%) |
+
+The clean joint candidate/depth distributions had total-variation distance 0.384,
+so the policy was behaviorally different by the pre-specified 5% tolerance. It was
+not cheaper: mean lane-steps per window fell 9.4%, but more windows erased that
+gain and total raw input rose.
+
+The completed exploratory aggregate is balanced at 19 runs per mode. Dynamic
+scored 6/19 and explicit 8/19; both retained 3/5 Returns, 2/5 PSD, and one Happy
+success, while explicit gained two Drizzle successes versus none for dynamic.
+That gain still did not buy savings:
+
+| All-valid mode | Success | Windows | Lane-steps | Probe windows | Total raw input/run | Candidate raw input/lane-step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| dynamic | 6/19 | 418 | 3,221 | n/a | 14.789M | 75,513 |
+| explicit probe | 8/19 | 389 | 3,245 | 15 | 14.949M (+1.1%) | 76,256 (+1.0%) |
+
+Only 15/389 explicit windows (3.9%) were actual probes; 374 were ordinary work.
+Mean lane-steps per window increased 8.3% and the distribution distance remained
+large at 0.270. Prototype A is therefore a real policy shift, not behaviorally the
+same as dynamic windows, but it neither makes probes common nor reaches the required
+10% candidate raw-token saving. `probe_policy_clean_analysis.json` and
+`probe_policy_all_analysis.json` preserve the structured measurement.
 
 ## Implemented experiment controls
 
@@ -227,24 +294,44 @@ window-normalized comparison is the safer cache-economics read.
 
 ## Experiment limitations
 
-The live pilot used one attempt per task/mode and cannot estimate variance. Each run
-used three DeepSeek V4 Flash candidate lanes and a DeepSeek V4 Pro supervisor. Four
-Drizzle modes timed out without a grader score; only recent-tail finished Drizzle.
+The first live pilot used one attempt per task/mode and cannot estimate variance.
+Each live run used three DeepSeek V4 Flash candidate lanes and a DeepSeek V4 Pro
+supervisor. Four first-pilot Drizzle modes timed out without a grader score; only
+recent-tail finished Drizzle.
 
 The pilot binary used an aggressive compact-mode bootstrap: before the first
 cumulative state existed, compact modes omitted the exact selected-initial message.
-That omission was found during replay validation and is corrected in source. Pilot
-quality results must therefore be labeled an aggressive-bootstrap ablation and
-replicated with the corrected bootstrap before any production recommendation.
+That omission was found during replay validation and is corrected in source. The
+45-run corrected-bootstrap replication above supersedes that limitation and still
+fails the Q3 quality and cache-economics gates.
+
+The clean Q3 and Q4 cohorts are the authoritative paired comparisons. A launcher
+recovery race produced extra independent DeepSeek calls under duplicate run labels;
+they are useful variance evidence but are labeled exploratory. Q4's final 19/19
+aggregate is balanced by mode but differs by one task at the margins (dynamic has
+one more Happy run; explicit has one more Drizzle run), which is another reason not
+to use its aggregate success delta as a causal policy estimate.
+
+Live Q3 tasks did not enable exact supervisor request/response capture, so their
+phase-specific ordinary-routing usage is unavailable. Reported Q3 costs are actual
+result-level totals after cache effects, while prompt reductions are deterministic
+chosen-versus-full counterfactuals. Q4 candidate-window usage has complete structured
+coverage. Analysis excluded 102 cancellation-only ZIPs and five infrastructure
+markers; 83 archives contained both a result and Anvil trace.
 
 ## Current recommendation
 
 Promote no compact Q3 mode. Preserve the full control as default and retain the
-capture/replay switches for research. The exploratory 40-call replay is now
-complete and reinforces the no-go: the next informative Q3 run is a
-corrected-bootstrap live replication of full, checkpoint, and recent-tail on the
-protected Returns case plus the gained PSD/Happy cases, with multiple seeds.
+capture/replay switches for research. The captured replay and corrected-bootstrap
+live replication now independently fail the protected-quality gate, and the larger
+live cohort shows no aggregate raw-cost saving for checkpoint or recent-tail.
 
 Do not implement Prototype C or a production tournament: Prototype B failed its 90%
-top-2 survivor-recall gate by mathematical futility. Prototype A remains a policy
-experiment over existing execution capability, not evidence for survivor retention.
+top-2 survivor-recall gate by mathematical futility. Do not promote Prototype A:
+it changed behavior but made probes rare, cost slightly more in both the clean and
+all-valid comparisons, and replaced a protected clean success with a different task.
+
+The only unmeasured production possibility left on this branch is the conservative
+single-lane serial fast path. It remains opt-in and unpromoted; it cannot overturn
+the no-go for history compression or probe tournaments without its own eligibility,
+fallback, agreement, and cache-economics cohort.

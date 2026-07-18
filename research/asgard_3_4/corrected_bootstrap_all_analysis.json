@@ -1,0 +1,3441 @@
+{
+  "modes": {
+    "checkpoint-plus-delta": {
+      "candidate_counts": {
+        "1": 75,
+        "2": 150,
+        "3": 40
+      },
+      "completion_review_calls": 0,
+      "completion_review_usage": {
+        "cachedRead": 0,
+        "cachedReadFraction": null,
+        "cachedWrite": 0,
+        "input": 0,
+        "output": 0,
+        "rawInput": 0,
+        "thought": 0,
+        "uncachedFraction": null
+      },
+      "estimated_request_tokens": 3481796,
+      "estimated_token_reduction_fraction": 0.4927825812323804,
+      "full_control_estimated_request_tokens": 6864504,
+      "full_control_prompt_bytes": 29838540,
+      "mean_partial": 0.9899191769299136,
+      "ordinary_model_calls": 0,
+      "ordinary_usage": {
+        "cachedRead": 0,
+        "cachedReadFraction": null,
+        "cachedWrite": 0,
+        "input": 0,
+        "output": 0,
+        "rawInput": 0,
+        "thought": 0,
+        "uncachedFraction": null
+      },
+      "ordinary_usage_per_model_call": {
+        "cachedRead": null,
+        "cachedWrite": null,
+        "input": null,
+        "output": null,
+        "rawInput": null,
+        "thought": null
+      },
+      "ordinary_usage_per_window": {
+        "cachedRead": 0.0,
+        "cachedWrite": 0.0,
+        "input": 0.0,
+        "output": 0.0,
+        "rawInput": 0.0,
+        "thought": 0.0
+      },
+      "ordinary_windows": 265,
+      "prompt_byte_reduction_fraction": 0.509621415793132,
+      "prompt_bytes": 14632181,
+      "runs": 15,
+      "step_counts": {
+        "1": 12,
+        "2": 17,
+        "3": 70,
+        "4": 65,
+        "5": 55,
+        "6": 32,
+        "7": 2,
+        "8": 12
+      },
+      "successes": 7,
+      "total_usage": {
+        "cachedRead": 164265728,
+        "cachedReadFraction": 0.9044603592691246,
+        "cachedWrite": 0,
+        "input": 17351660,
+        "output": 2122821,
+        "rawInput": 181617388,
+        "thought": 1620111,
+        "uncachedFraction": 0.0955396407308754
+      },
+      "total_usage_per_run": {
+        "cachedRead": 10951048.533333333,
+        "cachedWrite": 0.0,
+        "input": 1156777.3333333333,
+        "output": 141521.4,
+        "rawInput": 12107825.866666667,
+        "thought": 108007.4
+      }
+    },
+    "full": {
+      "candidate_counts": {
+        "1": 123,
+        "2": 128,
+        "3": 30
+      },
+      "completion_review_calls": 0,
+      "completion_review_usage": {
+        "cachedRead": 0,
+        "cachedReadFraction": null,
+        "cachedWrite": 0,
+        "input": 0,
+        "output": 0,
+        "rawInput": 0,
+        "thought": 0,
+        "uncachedFraction": null
+      },
+      "estimated_request_tokens": 6475695,
+      "estimated_token_reduction_fraction": 0.0,
+      "full_control_estimated_request_tokens": 6475695,
+      "full_control_prompt_bytes": 28568725,
+      "mean_partial": 0.9962310606060606,
+      "ordinary_model_calls": 0,
+      "ordinary_usage": {
+        "cachedRead": 0,
+        "cachedReadFraction": null,
+        "cachedWrite": 0,
+        "input": 0,
+        "output": 0,
+        "rawInput": 0,
+        "thought": 0,
+        "uncachedFraction": null
+      },
+      "ordinary_usage_per_model_call": {
+        "cachedRead": null,
+        "cachedWrite": null,
+        "input": null,
+        "output": null,
+        "rawInput": null,
+        "thought": null
+      },
+      "ordinary_usage_per_window": {
+        "cachedRead": 0.0,
+        "cachedWrite": 0.0,
+        "input": 0.0,
+        "output": 0.0,
+        "rawInput": 0.0,
+        "thought": 0.0
+      },
+      "ordinary_windows": 281,
+      "prompt_byte_reduction_fraction": 0.0,
+      "prompt_bytes": 28568725,
+      "runs": 15,
+      "step_counts": {
+        "1": 34,
+        "10": 5,
+        "2": 35,
+        "3": 58,
+        "4": 52,
+        "5": 51,
+        "6": 32,
+        "7": 4,
+        "8": 10
+      },
+      "successes": 9,
+      "total_usage": {
+        "cachedRead": 160284032,
+        "cachedReadFraction": 0.9105421437647162,
+        "cachedWrite": 0,
+        "input": 15747394,
+        "output": 1987526,
+        "rawInput": 176031426,
+        "thought": 1592520,
+        "uncachedFraction": 0.08945785623528381
+      },
+      "total_usage_per_run": {
+        "cachedRead": 10685602.133333333,
+        "cachedWrite": 0.0,
+        "input": 1049826.2666666666,
+        "output": 132501.73333333334,
+        "rawInput": 11735428.4,
+        "thought": 106168.0
+      }
+    },
+    "recent-exact-tail": {
+      "candidate_counts": {
+        "1": 118,
+        "2": 125,
+        "3": 36
+      },
+      "completion_review_calls": 0,
+      "completion_review_usage": {
+        "cachedRead": 0,
+        "cachedReadFraction": null,
+        "cachedWrite": 0,
+        "input": 0,
+        "output": 0,
+        "rawInput": 0,
+        "thought": 0,
+        "uncachedFraction": null
+      },
+      "estimated_request_tokens": 4505852,
+      "estimated_token_reduction_fraction": 0.4806171383992154,
+      "full_control_estimated_request_tokens": 8675396,
+      "full_control_prompt_bytes": 37054352,
+      "mean_partial": 0.991032626809294,
+      "ordinary_model_calls": 0,
+      "ordinary_usage": {
+        "cachedRead": 0,
+        "cachedReadFraction": null,
+        "cachedWrite": 0,
+        "input": 0,
+        "output": 0,
+        "rawInput": 0,
+        "thought": 0,
+        "uncachedFraction": null
+      },
+      "ordinary_usage_per_model_call": {
+        "cachedRead": null,
+        "cachedWrite": null,
+        "input": null,
+        "output": null,
+        "rawInput": null,
+        "thought": null
+      },
+      "ordinary_usage_per_window": {
+        "cachedRead": 0.0,
+        "cachedWrite": 0.0,
+        "input": 0.0,
+        "output": 0.0,
+        "rawInput": 0.0,
+        "thought": 0.0
+      },
+      "ordinary_windows": 279,
+      "prompt_byte_reduction_fraction": 0.5079071413797764,
+      "prompt_bytes": 18234182,
+      "runs": 15,
+      "step_counts": {
+        "1": 10,
+        "2": 28,
+        "3": 85,
+        "4": 51,
+        "5": 69,
+        "6": 28,
+        "7": 2,
+        "8": 6
+      },
+      "successes": 6,
+      "total_usage": {
+        "cachedRead": 157085568,
+        "cachedReadFraction": 0.8916409023006625,
+        "cachedWrite": 0,
+        "input": 19090253,
+        "output": 2212945,
+        "rawInput": 176175821,
+        "thought": 1668159,
+        "uncachedFraction": 0.10835909769933753
+      },
+      "total_usage_per_run": {
+        "cachedRead": 10472371.2,
+        "cachedWrite": 0.0,
+        "input": 1272683.5333333334,
+        "output": 147529.66666666666,
+        "rawInput": 11745054.733333332,
+        "thought": 111210.6
+      }
+    }
+  },
+  "paired_task_outcomes": {
+    "happy-dom-abort-pending-body-reads": {
+      "checkpoint-plus-delta": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r1-1784355199-2006826.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r1-1784355230-719896.zip",
+          "partial": 0.9273743016759777,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r2-1784355201-2006826.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r2-1784355228-719896.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-2/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg2-happy-dom-abort-pending-body-reads-r1-1784355201-3411406.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        }
+      ],
+      "full": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r1-1784355198-2006830.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r1-1784355228-719879.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r2-1784355199-2006830.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r2-1784355230-719879.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-2/archives/happy-dom-abort-pending-body-reads/q3v2fullg2-happy-dom-abort-pending-body-reads-r1-1784355201-3411355.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        }
+      ],
+      "recent-exact-tail": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r1-1784355198-2006837.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r1-1784355230-719894.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r2-1784355201-2006837.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r2-1784355229-719894.zip",
+          "partial": 0.994413407821229,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-2/archives/happy-dom-abort-pending-body-reads/q3v2recentg2-happy-dom-abort-pending-body-reads-r1-1784355201-3411295.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        }
+      ]
+    },
+    "psd-tools-blend-range-api": {
+      "checkpoint-plus-delta": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r1-1784355200-2006826.zip",
+          "partial": 0.9970703125,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r1-1784355228-719896.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r2-1784355209-2006826.zip",
+          "partial": 0.998046875,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r2-1784355245-719896.zip",
+          "partial": 0.9990234375,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-2/archives/psd-tools-blend-range-api/q3v2checkpointg2-psd-tools-blend-range-api-r1-1784355201-3411406.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        }
+      ],
+      "full": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r1-1784355198-2006830.zip",
+          "partial": 0.9951171875,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r1-1784355230-719879.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r2-1784355206-2006830.zip",
+          "partial": 0.9970703125,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r2-1784355247-719879.zip",
+          "partial": 0.9970703125,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-2/archives/psd-tools-blend-range-api/q3v2fullg2-psd-tools-blend-range-api-r1-1784355201-3411355.zip",
+          "partial": 0.9951171875,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        }
+      ],
+      "recent-exact-tail": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r1-1784355198-2006837.zip",
+          "partial": 0.998046875,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r1-1784355228-719894.zip",
+          "partial": 0.9970703125,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r2-1784355206-2006837.zip",
+          "partial": 0.9970703125,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r2-1784355247-719894.zip",
+          "partial": 0.9970703125,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-2/archives/psd-tools-blend-range-api/q3v2recentg2-psd-tools-blend-range-api-r1-1784355201-3411295.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        }
+      ]
+    },
+    "returns-validated-error-accumulation": {
+      "checkpoint-plus-delta": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r1-1784355198-2006826.zip",
+          "partial": 0.9863636363636363,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r1-1784355229-719896.zip",
+          "partial": 0.9636363636363636,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r2-1784355206-2006826.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r2-1784355247-719896.zip",
+          "partial": 0.9863636363636363,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-2/archives/returns-validated-error-accumulation/q3v2checkpointg2-returns-validated-error-accumulation-r1-1784355201-3411406.zip",
+          "partial": 0.990909090909091,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        }
+      ],
+      "full": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r1-1784355198-2006830.zip",
+          "partial": 0.9954545454545455,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r1-1784355230-719879.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r2-1784355206-2006830.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r2-1784355246-719879.zip",
+          "partial": 0.9636363636363636,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-2/archives/returns-validated-error-accumulation/q3v2fullg2-returns-validated-error-accumulation-r1-1784355201-3411355.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        }
+      ],
+      "recent-exact-tail": [
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r1-1784355198-2006837.zip",
+          "partial": 1.0,
+          "reward": 1,
+          "stop_reason": "SUCCESS"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r1-1784355230-719894.zip",
+          "partial": 0.9636363636363636,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r2-1784355206-2006837.zip",
+          "partial": 0.9818181818181818,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r2-1784355247-719894.zip",
+          "partial": 0.9545454545454546,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        },
+        {
+          "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-2/archives/returns-validated-error-accumulation/q3v2recentg2-returns-validated-error-accumulation-r1-1784355201-3411295.zip",
+          "partial": 0.9818181818181818,
+          "reward": 0,
+          "stop_reason": "HARNESS_TESTS_FAILED"
+        }
+      ]
+    }
+  },
+  "runs": [
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r1-1784355199-2006826.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 36,
+        "estimated_request_tokens": 461811,
+        "estimated_token_reduction_fraction": 0.60839845737428,
+        "full_control_estimated_request_tokens": 1179288,
+        "full_control_prompt_bytes": 5127737,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.6258324091114658,
+        "prompt_bytes": 1918633,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 36
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 25588864,
+        "cachedWrite": 0,
+        "input": 2009816,
+        "output": 239086,
+        "thought": 187797
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 3,
+          "2": 27,
+          "3": 6
+        },
+        "step_counts": {
+          "2": 2,
+          "3": 3,
+          "4": 19,
+          "5": 9,
+          "6": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r1-1784355230-719896.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 19,
+        "estimated_request_tokens": 192296,
+        "estimated_token_reduction_fraction": 0.5753311514219966,
+        "full_control_estimated_request_tokens": 452814,
+        "full_control_prompt_bytes": 1977009,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.5928759049655312,
+        "prompt_bytes": 804888,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 19
+      },
+      "partial": 0.9273743016759777,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 9759360,
+        "cachedWrite": 0,
+        "input": 1074658,
+        "output": 112848,
+        "thought": 93479
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 9,
+          "2": 9,
+          "3": 1
+        },
+        "step_counts": {
+          "1": 3,
+          "2": 2,
+          "3": 3,
+          "5": 8,
+          "6": 2,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r2-1784355201-2006826.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 23,
+        "estimated_request_tokens": 293376,
+        "estimated_token_reduction_fraction": 0.5432720524704091,
+        "full_control_estimated_request_tokens": 642343,
+        "full_control_prompt_bytes": 2804258,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.5670637295141887,
+        "prompt_bytes": 1214065,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 23
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 15469440,
+        "cachedWrite": 0,
+        "input": 1756683,
+        "output": 161871,
+        "thought": 135413
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 2,
+          "2": 17,
+          "3": 4
+        },
+        "step_counts": {
+          "3": 4,
+          "4": 5,
+          "5": 12,
+          "8": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg1-happy-dom-abort-pending-body-reads-r2-1784355228-719896.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 177537,
+        "estimated_token_reduction_fraction": 0.43074673669427366,
+        "full_control_estimated_request_tokens": 311877,
+        "full_control_prompt_bytes": 1437248,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.4591281393329474,
+        "prompt_bytes": 777367,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 14390016,
+        "cachedWrite": 0,
+        "input": 932945,
+        "output": 114103,
+        "thought": 77560
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 3,
+          "2": 11,
+          "3": 2
+        },
+        "step_counts": {
+          "2": 2,
+          "3": 1,
+          "4": 3,
+          "6": 8,
+          "8": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r1-1784355200-2006826.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 8,
+        "estimated_request_tokens": 110461,
+        "estimated_token_reduction_fraction": 0.3173160119650936,
+        "full_control_estimated_request_tokens": 161804,
+        "full_control_prompt_bytes": 692435,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.32500812350617747,
+        "prompt_bytes": 467388,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 8
+      },
+      "partial": 0.9970703125,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 5448704,
+        "cachedWrite": 0,
+        "input": 786734,
+        "output": 98099,
+        "thought": 73521
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 2,
+          "2": 4,
+          "3": 2
+        },
+        "step_counts": {
+          "3": 3,
+          "4": 2,
+          "6": 2,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r1-1784355228-719896.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 12,
+        "estimated_request_tokens": 150622,
+        "estimated_token_reduction_fraction": 0.3843846175853909,
+        "full_control_estimated_request_tokens": 244669,
+        "full_control_prompt_bytes": 1076703,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.40291891078598274,
+        "prompt_bytes": 642879,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 12
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 6876160,
+        "cachedWrite": 0,
+        "input": 906356,
+        "output": 96667,
+        "thought": 76451
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 4,
+          "2": 5,
+          "3": 3
+        },
+        "step_counts": {
+          "1": 2,
+          "3": 3,
+          "4": 4,
+          "6": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r2-1784355209-2006826.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 27,
+        "estimated_request_tokens": 449190,
+        "estimated_token_reduction_fraction": 0.5572834020945732,
+        "full_control_estimated_request_tokens": 1014622,
+        "full_control_prompt_bytes": 4098052,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.5606090405880648,
+        "prompt_bytes": 1800647,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 27
+      },
+      "partial": 0.998046875,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 15847936,
+        "cachedWrite": 0,
+        "input": 1783497,
+        "output": 204865,
+        "thought": 148361
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 4,
+          "2": 20,
+          "3": 3
+        },
+        "step_counts": {
+          "2": 1,
+          "3": 13,
+          "4": 7,
+          "5": 4,
+          "6": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/psd-tools-blend-range-api/q3v2checkpointg1-psd-tools-blend-range-api-r2-1784355245-719896.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 221244,
+        "estimated_token_reduction_fraction": 0.45525590740207267,
+        "full_control_estimated_request_tokens": 406143,
+        "full_control_prompt_bytes": 1733446,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.45860384459625514,
+        "prompt_bytes": 938481,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 0.9990234375,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 12223104,
+        "cachedWrite": 0,
+        "input": 1374371,
+        "output": 158964,
+        "thought": 102220
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 3,
+          "2": 8,
+          "3": 5
+        },
+        "step_counts": {
+          "1": 1,
+          "3": 5,
+          "4": 3,
+          "5": 7
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r1-1784355198-2006826.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 11,
+        "estimated_request_tokens": 142324,
+        "estimated_token_reduction_fraction": 0.3241333459967708,
+        "full_control_estimated_request_tokens": 210580,
+        "full_control_prompt_bytes": 940558,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.34381292807035824,
+        "prompt_bytes": 617182,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 11
+      },
+      "partial": 0.9863636363636363,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 4178048,
+        "cachedWrite": 0,
+        "input": 540284,
+        "output": 104040,
+        "thought": 61648
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 5,
+          "2": 6
+        },
+        "step_counts": {
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 4,
+          "5": 1,
+          "6": 2,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r1-1784355229-719896.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 9,
+        "estimated_request_tokens": 120633,
+        "estimated_token_reduction_fraction": 0.2538734158425028,
+        "full_control_estimated_request_tokens": 161679,
+        "full_control_prompt_bytes": 734086,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.2779374623681694,
+        "prompt_bytes": 530056,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 9
+      },
+      "partial": 0.9636363636363636,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 3904000,
+        "cachedWrite": 0,
+        "input": 614483,
+        "output": 97988,
+        "thought": 69758
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 3,
+          "2": 4,
+          "3": 2
+        },
+        "step_counts": {
+          "3": 4,
+          "4": 2,
+          "5": 1,
+          "6": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r2-1784355206-2006826.zip",
+      "completion_review": {
+        "decisions": 5,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 22,
+        "estimated_request_tokens": 285364,
+        "estimated_token_reduction_fraction": 0.440824564497482,
+        "full_control_estimated_request_tokens": 510330,
+        "full_control_prompt_bytes": 2286772,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.47351987867614265,
+        "prompt_bytes": 1203940,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 22
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 9392896,
+        "cachedWrite": 0,
+        "input": 1099449,
+        "output": 165873,
+        "thought": 157489
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 15,
+          "2": 4,
+          "3": 3
+        },
+        "step_counts": {
+          "2": 5,
+          "3": 12,
+          "4": 1,
+          "6": 2,
+          "7": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-1/archives/returns-validated-error-accumulation/q3v2checkpointg1-returns-validated-error-accumulation-r2-1784355247-719896.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 14,
+        "estimated_request_tokens": 193382,
+        "estimated_token_reduction_fraction": 0.30466393156738447,
+        "full_control_estimated_request_tokens": 278113,
+        "full_control_prompt_bytes": 1270070,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.34531246309258545,
+        "prompt_bytes": 831499,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 14
+      },
+      "partial": 0.9863636363636363,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 6156544,
+        "cachedWrite": 0,
+        "input": 818932,
+        "output": 118925,
+        "thought": 100358
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 7,
+          "2": 7
+        },
+        "step_counts": {
+          "2": 2,
+          "3": 5,
+          "4": 3,
+          "5": 2,
+          "6": 1,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-2/archives/happy-dom-abort-pending-body-reads/q3v2checkpointg2-happy-dom-abort-pending-body-reads-r1-1784355201-3411406.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 18,
+        "estimated_request_tokens": 233232,
+        "estimated_token_reduction_fraction": 0.5377132233141335,
+        "full_control_estimated_request_tokens": 504518,
+        "full_control_prompt_bytes": 2178298,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.5520571565506648,
+        "prompt_bytes": 975753,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 18
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 18980096,
+        "cachedWrite": 0,
+        "input": 1710741,
+        "output": 175721,
+        "thought": 127723
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 1,
+          "2": 13,
+          "3": 4
+        },
+        "step_counts": {
+          "3": 2,
+          "4": 3,
+          "5": 4,
+          "6": 5,
+          "8": 4
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-2/archives/psd-tools-blend-range-api/q3v2checkpointg2-psd-tools-blend-range-api-r1-1784355201-3411406.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 14,
+        "estimated_request_tokens": 193173,
+        "estimated_token_reduction_fraction": 0.3917630945071553,
+        "full_control_estimated_request_tokens": 317595,
+        "full_control_prompt_bytes": 1366731,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.4051214174552271,
+        "prompt_bytes": 813039,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 14
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 8755200,
+        "cachedWrite": 0,
+        "input": 992290,
+        "output": 126274,
+        "thought": 93733
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 4,
+          "2": 5,
+          "3": 5
+        },
+        "step_counts": {
+          "1": 1,
+          "3": 4,
+          "4": 7,
+          "5": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-checkpoint/attempt-2/archives/returns-validated-error-accumulation/q3v2checkpointg2-returns-validated-error-accumulation-r1-1784355201-3411406.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "ordinary_routing": {
+        "decisions": 20,
+        "estimated_request_tokens": 257151,
+        "estimated_token_reduction_fraction": 0.4506834654550348,
+        "full_control_estimated_request_tokens": 468129,
+        "full_control_prompt_bytes": 2115137,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.48165816209541035,
+        "prompt_bytes": 1096364,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 20
+      },
+      "partial": 0.990909090909091,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 7295360,
+        "cachedWrite": 0,
+        "input": 950421,
+        "output": 147497,
+        "thought": 114600
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 10,
+          "2": 10
+        },
+        "step_counts": {
+          "1": 4,
+          "2": 2,
+          "3": 7,
+          "4": 2,
+          "5": 5
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r1-1784355198-2006830.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 15,
+        "estimated_request_tokens": 250818,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 250818,
+        "full_control_prompt_bytes": 1167081,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1167081,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 15
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 12011648,
+        "cachedWrite": 0,
+        "input": 1041986,
+        "output": 99928,
+        "thought": 92736
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 4,
+          "2": 8,
+          "3": 3
+        },
+        "step_counts": {
+          "2": 2,
+          "3": 2,
+          "4": 3,
+          "5": 3,
+          "6": 5
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r1-1784355228-719879.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 30,
+        "estimated_request_tokens": 870423,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 870423,
+        "full_control_prompt_bytes": 3864265,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 3864265,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 30
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 17917824,
+        "cachedWrite": 0,
+        "input": 1682554,
+        "output": 167995,
+        "thought": 173773
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 7,
+          "2": 17,
+          "3": 6
+        },
+        "step_counts": {
+          "1": 4,
+          "2": 3,
+          "3": 9,
+          "4": 9,
+          "5": 5
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r2-1784355199-2006830.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 20,
+        "estimated_request_tokens": 445159,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 445159,
+        "full_control_prompt_bytes": 1982183,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1982183,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 20
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 11143168,
+        "cachedWrite": 0,
+        "input": 968499,
+        "output": 94677,
+        "thought": 89278
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 10,
+          "2": 8,
+          "3": 2
+        },
+        "step_counts": {
+          "1": 2,
+          "2": 3,
+          "3": 3,
+          "4": 5,
+          "5": 1,
+          "6": 5,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2fullg1-happy-dom-abort-pending-body-reads-r2-1784355230-719879.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 21,
+        "estimated_request_tokens": 437318,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 437318,
+        "full_control_prompt_bytes": 1951647,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1951647,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 21
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 15450112,
+        "cachedWrite": 0,
+        "input": 1449013,
+        "output": 200182,
+        "thought": 113950
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 6,
+          "2": 13,
+          "3": 2
+        },
+        "step_counts": {
+          "1": 1,
+          "3": 5,
+          "4": 3,
+          "5": 6,
+          "6": 6
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r1-1784355198-2006830.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 17,
+        "estimated_request_tokens": 358283,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 358283,
+        "full_control_prompt_bytes": 1581612,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1581612,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 17
+      },
+      "partial": 0.9951171875,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 9736064,
+        "cachedWrite": 0,
+        "input": 969098,
+        "output": 108882,
+        "thought": 100657
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 8,
+          "2": 7,
+          "3": 2
+        },
+        "step_counts": {
+          "1": 2,
+          "10": 1,
+          "2": 3,
+          "3": 5,
+          "4": 2,
+          "5": 3,
+          "6": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r1-1784355230-719879.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 400186,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 400186,
+        "full_control_prompt_bytes": 1606424,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1606424,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 9950208,
+        "cachedWrite": 0,
+        "input": 1309386,
+        "output": 162577,
+        "thought": 106280
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 7,
+          "2": 7,
+          "3": 2
+        },
+        "step_counts": {
+          "1": 1,
+          "2": 2,
+          "3": 1,
+          "4": 6,
+          "5": 3,
+          "6": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r2-1784355206-2006830.zip",
+      "completion_review": {
+        "decisions": 5,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 359894,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 359894,
+        "full_control_prompt_bytes": 1559944,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1559944,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 0.9970703125,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 6806144,
+        "cachedWrite": 0,
+        "input": 926219,
+        "output": 159587,
+        "thought": 110327
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 6,
+          "2": 7,
+          "3": 3
+        },
+        "step_counts": {
+          "2": 4,
+          "3": 6,
+          "4": 3,
+          "5": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/psd-tools-blend-range-api/q3v2fullg1-psd-tools-blend-range-api-r2-1784355247-719879.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 18,
+        "estimated_request_tokens": 424837,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 424837,
+        "full_control_prompt_bytes": 1821917,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1821917,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 18
+      },
+      "partial": 0.9970703125,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 13449728,
+        "cachedWrite": 0,
+        "input": 1180797,
+        "output": 136720,
+        "thought": 94212
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 10,
+          "2": 6,
+          "3": 2
+        },
+        "step_counts": {
+          "1": 1,
+          "10": 1,
+          "2": 1,
+          "3": 2,
+          "4": 5,
+          "5": 6,
+          "6": 1,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r1-1784355198-2006830.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 29,
+        "estimated_request_tokens": 716591,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 716591,
+        "full_control_prompt_bytes": 3299449,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 3299449,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 29
+      },
+      "partial": 0.9954545454545455,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 11973760,
+        "cachedWrite": 0,
+        "input": 1047572,
+        "output": 159786,
+        "thought": 146805
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 17,
+          "2": 10,
+          "3": 2
+        },
+        "step_counts": {
+          "1": 10,
+          "10": 1,
+          "2": 3,
+          "3": 7,
+          "4": 5,
+          "5": 2,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r1-1784355230-719879.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 357085,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 357085,
+        "full_control_prompt_bytes": 1615564,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1615564,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 7281152,
+        "cachedWrite": 0,
+        "input": 742435,
+        "output": 127129,
+        "thought": 100397
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 10,
+          "2": 4,
+          "3": 2
+        },
+        "step_counts": {
+          "2": 2,
+          "3": 5,
+          "4": 1,
+          "5": 4,
+          "6": 4
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r2-1784355206-2006830.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 11,
+        "estimated_request_tokens": 177168,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 177168,
+        "full_control_prompt_bytes": 819849,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 819849,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 11
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 4534144,
+        "cachedWrite": 0,
+        "input": 549691,
+        "output": 76370,
+        "thought": 56059
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 6,
+          "2": 5
+        },
+        "step_counts": {
+          "1": 2,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 2,
+          "7": 4
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-1/archives/returns-validated-error-accumulation/q3v2fullg1-returns-validated-error-accumulation-r2-1784355246-719879.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 12,
+        "estimated_request_tokens": 208002,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 208002,
+        "full_control_prompt_bytes": 947001,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 947001,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 12
+      },
+      "partial": 0.9636363636363636,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 6715392,
+        "cachedWrite": 0,
+        "input": 745873,
+        "output": 126393,
+        "thought": 104457
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 5,
+          "2": 7
+        },
+        "step_counts": {
+          "1": 1,
+          "10": 2,
+          "2": 3,
+          "3": 2,
+          "5": 3,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-2/archives/happy-dom-abort-pending-body-reads/q3v2fullg2-happy-dom-abort-pending-body-reads-r1-1784355201-3411355.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 30,
+        "estimated_request_tokens": 869509,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 869509,
+        "full_control_prompt_bytes": 3722435,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 3722435,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 30
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 17953280,
+        "cachedWrite": 0,
+        "input": 1614840,
+        "output": 169187,
+        "thought": 132347
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 10,
+          "2": 16,
+          "3": 4
+        },
+        "step_counts": {
+          "1": 6,
+          "2": 3,
+          "3": 8,
+          "4": 5,
+          "5": 3,
+          "6": 1,
+          "8": 4
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-2/archives/psd-tools-blend-range-api/q3v2fullg2-psd-tools-blend-range-api-r1-1784355201-3411355.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 14,
+        "estimated_request_tokens": 310246,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 310246,
+        "full_control_prompt_bytes": 1292101,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1292101,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 14
+      },
+      "partial": 0.9951171875,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 8919296,
+        "cachedWrite": 0,
+        "input": 904103,
+        "output": 105649,
+        "thought": 80206
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 5,
+          "2": 9
+        },
+        "step_counts": {
+          "1": 3,
+          "2": 1,
+          "3": 2,
+          "4": 1,
+          "5": 1,
+          "6": 5,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-full/attempt-2/archives/returns-validated-error-accumulation/q3v2fullg2-returns-validated-error-accumulation-r1-1784355201-3411355.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "full",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 290176,
+        "estimated_token_reduction_fraction": 0.0,
+        "full_control_estimated_request_tokens": 290176,
+        "full_control_prompt_bytes": 1337253,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.0,
+        "prompt_bytes": 1337253,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 6442112,
+        "cachedWrite": 0,
+        "input": 615328,
+        "output": 92464,
+        "thought": 91036
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 12,
+          "2": 4
+        },
+        "step_counts": {
+          "1": 1,
+          "2": 4,
+          "4": 3,
+          "5": 6,
+          "6": 1,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r1-1784355198-2006837.zip",
+      "completion_review": {
+        "decisions": 5,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 42,
+        "estimated_request_tokens": 966586,
+        "estimated_token_reduction_fraction": 0.500995596865096,
+        "full_control_estimated_request_tokens": 1937029,
+        "full_control_prompt_bytes": 7972364,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.569492185755693,
+        "prompt_bytes": 3432165,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 42
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 25999872,
+        "cachedWrite": 0,
+        "input": 3426631,
+        "output": 244351,
+        "thought": 197825
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 19,
+          "2": 16,
+          "3": 7
+        },
+        "step_counts": {
+          "2": 3,
+          "3": 17,
+          "4": 11,
+          "5": 7,
+          "6": 4
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r1-1784355230-719894.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 32,
+        "estimated_request_tokens": 436989,
+        "estimated_token_reduction_fraction": 0.567067576805334,
+        "full_control_estimated_request_tokens": 1009370,
+        "full_control_prompt_bytes": 4459602,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.6024382893361335,
+        "prompt_bytes": 1772967,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 32
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 19826688,
+        "cachedWrite": 0,
+        "input": 1884624,
+        "output": 197277,
+        "thought": 141658
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 13,
+          "2": 14,
+          "3": 5
+        },
+        "step_counts": {
+          "1": 1,
+          "2": 5,
+          "3": 8,
+          "4": 6,
+          "5": 11,
+          "6": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r2-1784355201-2006837.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 217277,
+        "estimated_token_reduction_fraction": 0.4187626064020459,
+        "full_control_estimated_request_tokens": 373818,
+        "full_control_prompt_bytes": 1649388,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.43952726708330603,
+        "prompt_bytes": 924437,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 15639296,
+        "cachedWrite": 0,
+        "input": 1609345,
+        "output": 144259,
+        "thought": 138715
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 1,
+          "2": 8,
+          "3": 7
+        },
+        "step_counts": {
+          "2": 1,
+          "3": 4,
+          "4": 3,
+          "5": 3,
+          "6": 4,
+          "7": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/happy-dom-abort-pending-body-reads/q3v2recentg1-happy-dom-abort-pending-body-reads-r2-1784355229-719894.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 22,
+        "estimated_request_tokens": 292857,
+        "estimated_token_reduction_fraction": 0.45714243344894,
+        "full_control_estimated_request_tokens": 539473,
+        "full_control_prompt_bytes": 2389707,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.4941894550252395,
+        "prompt_bytes": 1208739,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 22
+      },
+      "partial": 0.994413407821229,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 13260672,
+        "cachedWrite": 0,
+        "input": 1509104,
+        "output": 154706,
+        "thought": 129890
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 6,
+          "2": 15,
+          "3": 1
+        },
+        "step_counts": {
+          "1": 2,
+          "2": 2,
+          "3": 2,
+          "4": 10,
+          "5": 5,
+          "6": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r1-1784355198-2006837.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 15,
+        "estimated_request_tokens": 292963,
+        "estimated_token_reduction_fraction": 0.4949279534930229,
+        "full_control_estimated_request_tokens": 580042,
+        "full_control_prompt_bytes": 2265135,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.48000935926556254,
+        "prompt_bytes": 1177849,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 15
+      },
+      "partial": 0.998046875,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 8313216,
+        "cachedWrite": 0,
+        "input": 1054428,
+        "output": 137232,
+        "thought": 85204
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 7,
+          "2": 8
+        },
+        "step_counts": {
+          "2": 1,
+          "3": 2,
+          "4": 3,
+          "5": 6,
+          "6": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r1-1784355228-719894.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 203912,
+        "estimated_token_reduction_fraction": 0.42239960570258306,
+        "full_control_estimated_request_tokens": 353033,
+        "full_control_prompt_bytes": 1519898,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.4302801898548455,
+        "prompt_bytes": 865916,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 0.9970703125,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 6755456,
+        "cachedWrite": 0,
+        "input": 972631,
+        "output": 122066,
+        "thought": 78982
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 10,
+          "2": 5,
+          "3": 1
+        },
+        "step_counts": {
+          "1": 1,
+          "2": 2,
+          "3": 6,
+          "4": 1,
+          "5": 6
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r2-1784355206-2006837.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 18,
+        "estimated_request_tokens": 352923,
+        "estimated_token_reduction_fraction": 0.5860451532084394,
+        "full_control_estimated_request_tokens": 852564,
+        "full_control_prompt_bytes": 3515711,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.5960495615253927,
+        "prompt_bytes": 1420173,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 18
+      },
+      "partial": 0.9970703125,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 8727680,
+        "cachedWrite": 0,
+        "input": 1212558,
+        "output": 181553,
+        "thought": 139549
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 8,
+          "2": 8,
+          "3": 2
+        },
+        "step_counts": {
+          "2": 3,
+          "3": 6,
+          "4": 2,
+          "5": 7
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/psd-tools-blend-range-api/q3v2recentg1-psd-tools-blend-range-api-r2-1784355247-719894.zip",
+      "completion_review": {
+        "decisions": 3,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 13,
+        "estimated_request_tokens": 181104,
+        "estimated_token_reduction_fraction": 0.33356393744250235,
+        "full_control_estimated_request_tokens": 271750,
+        "full_control_prompt_bytes": 1186618,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.3478212870527836,
+        "prompt_bytes": 773887,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 13
+      },
+      "partial": 0.9970703125,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 6588672,
+        "cachedWrite": 0,
+        "input": 831610,
+        "output": 116242,
+        "thought": 96633
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 7,
+          "2": 5,
+          "3": 1
+        },
+        "step_counts": {
+          "1": 1,
+          "2": 1,
+          "3": 5,
+          "5": 4,
+          "6": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r1-1784355198-2006837.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 235135,
+        "estimated_token_reduction_fraction": 0.3229043683589138,
+        "full_control_estimated_request_tokens": 347270,
+        "full_control_prompt_bytes": 1590550,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.37296909873942974,
+        "prompt_bytes": 997324,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 6593664,
+        "cachedWrite": 0,
+        "input": 819029,
+        "output": 118556,
+        "thought": 65082
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 8,
+          "2": 7,
+          "3": 1
+        },
+        "step_counts": {
+          "2": 3,
+          "3": 4,
+          "4": 1,
+          "5": 5,
+          "6": 2,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r1-1784355230-719894.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 237041,
+        "estimated_token_reduction_fraction": 0.3450151007314115,
+        "full_control_estimated_request_tokens": 361903,
+        "full_control_prompt_bytes": 1625971,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.37650302496169985,
+        "prompt_bytes": 1013788,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 0.9636363636363636,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 7782656,
+        "cachedWrite": 0,
+        "input": 746656,
+        "output": 109401,
+        "thought": 77872
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 5,
+          "2": 10,
+          "3": 1
+        },
+        "step_counts": {
+          "1": 3,
+          "2": 1,
+          "3": 2,
+          "4": 4,
+          "5": 3,
+          "6": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r2-1784355206-2006837.zip",
+      "completion_review": {
+        "decisions": 2,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 12,
+        "estimated_request_tokens": 178648,
+        "estimated_token_reduction_fraction": 0.2688099866980457,
+        "full_control_estimated_request_tokens": 244325,
+        "full_control_prompt_bytes": 1096987,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.2938804197315009,
+        "prompt_bytes": 774604,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 12
+      },
+      "partial": 0.9818181818181818,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 6524928,
+        "cachedWrite": 0,
+        "input": 780728,
+        "output": 118104,
+        "thought": 88401
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 4,
+          "2": 7,
+          "3": 1
+        },
+        "step_counts": {
+          "3": 5,
+          "4": 2,
+          "5": 2,
+          "6": 1,
+          "8": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-1/archives/returns-validated-error-accumulation/q3v2recentg1-returns-validated-error-accumulation-r2-1784355247-719894.zip",
+      "completion_review": {
+        "decisions": 8,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 235283,
+        "estimated_token_reduction_fraction": 0.24901931369513663,
+        "full_control_estimated_request_tokens": 313301,
+        "full_control_prompt_bytes": 1449481,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.31717214644414105,
+        "prompt_bytes": 989746,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 0.9545454545454546,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 5715968,
+        "cachedWrite": 0,
+        "input": 999823,
+        "output": 192491,
+        "thought": 125786
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 9,
+          "2": 6,
+          "3": 1
+        },
+        "step_counts": {
+          "2": 1,
+          "3": 8,
+          "4": 4,
+          "5": 3
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-2/archives/happy-dom-abort-pending-body-reads/q3v2recentg2-happy-dom-abort-pending-body-reads-r1-1784355201-3411295.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 18,
+        "estimated_request_tokens": 196798,
+        "estimated_token_reduction_fraction": 0.506559218510235,
+        "full_control_estimated_request_tokens": 398828,
+        "full_control_prompt_bytes": 1760924,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.5096012093650834,
+        "prompt_bytes": 863555,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 18
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "happy-dom-abort-pending-body-reads",
+      "total_usage": {
+        "cachedRead": 10654336,
+        "cachedWrite": 0,
+        "input": 1186367,
+        "output": 116557,
+        "thought": 107629
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 7,
+          "2": 7,
+          "3": 4
+        },
+        "step_counts": {
+          "2": 1,
+          "3": 6,
+          "4": 2,
+          "5": 7,
+          "6": 2
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-2/archives/psd-tools-blend-range-api/q3v2recentg2-psd-tools-blend-range-api-r1-1784355201-3411295.zip",
+      "completion_review": {
+        "decisions": 4,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 16,
+        "estimated_request_tokens": 328810,
+        "estimated_token_reduction_fraction": 0.6289513002107963,
+        "full_control_estimated_request_tokens": 886164,
+        "full_control_prompt_bytes": 3631863,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.627643168258274,
+        "prompt_bytes": 1352349,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 16
+      },
+      "partial": 1.0,
+      "reward": 1,
+      "stop_reason": "SUCCESS",
+      "task": "psd-tools-blend-range-api",
+      "total_usage": {
+        "cachedRead": 10307200,
+        "cachedWrite": 0,
+        "input": 1498909,
+        "output": 169674,
+        "thought": 120584
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 9,
+          "2": 3,
+          "3": 4
+        },
+        "step_counts": {
+          "1": 2,
+          "2": 1,
+          "3": 7,
+          "6": 4,
+          "7": 1,
+          "8": 1
+        }
+      }
+    },
+    {
+      "archive": "/tmp/asgard-3-4-live-v2/q3-corrected-recent-tail/attempt-2/archives/returns-validated-error-accumulation/q3v2recentg2-returns-validated-error-accumulation-r1-1784355201-3411295.zip",
+      "completion_review": {
+        "decisions": 1,
+        "model_calls": 0,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        }
+      },
+      "mode": "recent-exact-tail",
+      "ordinary_routing": {
+        "decisions": 11,
+        "estimated_request_tokens": 149526,
+        "estimated_token_reduction_fraction": 0.2759943058016908,
+        "full_control_estimated_request_tokens": 206526,
+        "full_control_prompt_bytes": 940153,
+        "model_calls": 0,
+        "prompt_byte_reduction_fraction": 0.2908781868483109,
+        "prompt_bytes": 666683,
+        "usage": {
+          "cachedRead": 0,
+          "cachedReadFraction": null,
+          "cachedWrite": 0,
+          "input": 0,
+          "output": 0,
+          "rawInput": 0,
+          "thought": 0,
+          "uncachedFraction": null
+        },
+        "windows": 11
+      },
+      "partial": 0.9818181818181818,
+      "reward": 0,
+      "stop_reason": "HARNESS_TESTS_FAILED",
+      "task": "returns-validated-error-accumulation",
+      "total_usage": {
+        "cachedRead": 4395264,
+        "cachedWrite": 0,
+        "input": 557810,
+        "output": 90476,
+        "thought": 74349
+      },
+      "window_policy": {
+        "candidate_counts": {
+          "1": 5,
+          "2": 6
+        },
+        "step_counts": {
+          "2": 3,
+          "3": 3,
+          "4": 2,
+          "6": 1,
+          "8": 2
+        }
+      }
+    }
+  ]
+}
