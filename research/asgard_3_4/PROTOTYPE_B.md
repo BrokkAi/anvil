@@ -6,9 +6,10 @@ The fixed three-lane calibration protocol, trace schema, and scorer are executab
 Set both `ASGARD_WINDOW_POLICY_MODE=explicit-probe` and
 `ASGARD_SHADOW_SURVIVOR_STUDY=1` with exactly three configured candidate models. The
 research-only override turns the initial incomplete route into a three-lane,
-two-step probe with mechanically generated distinct probe contracts, so calibration
-does not depend on the supervisor spontaneously proposing a probe. Invalid setup
-fails closed before candidate work.
+one- or two-step probe with mechanically generated distinct probe contracts, so
+calibration does not depend on the supervisor spontaneously proposing a probe.
+Set `ASGARD_SHADOW_PROBE_STEPS=1` or `2`; the default is two. Invalid setup fails
+closed before candidate work.
 
 After the probe, the core ranks all lanes, autonomously continues all three isolated
 lane repositories/transcripts for five steps, runs an opaque-label blinded end
@@ -25,22 +26,27 @@ survived the probe ranking. Continue each lane from its own probe messages and
 repository, with no inter-window supervisor advice, so survivor status is not a
 treatment confound.
 
-The probe reviewer returns a strict permutation of all lane ids. The first two are
-the hypothetical survivors. All three lanes then continue independently for the same
+The probe reviewer returns a strict permutation of all lane ids plus a structured
+classification of whether the ranking distinction is architectural/contractual,
+cosmetic, mixed, or unclear, with concrete evidence. The first two lanes are the
+hypothetical survivors. All three lanes then continue independently for the same
 step budget. A separate end reviewer sees randomized opaque endpoint labels, not lane
 ids, model ids, probe ranks, survivor status, or the probe review's prose. It returns
 a strict permutation of those labels. Only after that review may one endpoint be
 published or the repositories synchronized.
 
-The go/no-go metric is micro-averaged top-2 recall:
+The go/no-go metric asks whether the blinded final-best lane was funded by the
+probe's top two:
 
-`|probe top 2 intersect final top 2| / 2`
+`count(final winner in probe top 2) / complete two-step studies`
 
-The scorer requires at least 20 complete studies and observed recall of at least 90%
-to pass. It also reports the 95% Wilson interval and whether the final best lane
-survived. The observed threshold is the decision rule; the interval is an uncertainty
-warning, not a second hidden gate. A later, production-facing tournament should use a
-larger cohort before changing defaults.
+The scorer requires at least 20 complete two-step studies and observed recall of at
+least 90% to pass. It also reports the 95% Wilson interval, final-winner recall at
+top 1/2/3 separately for one- and two-step probes, whether the final best lane was a
+killed late bloomer, and a stricter 95% top-1 funding diagnostic. The observed top-2
+threshold is the decision rule; the interval is an uncertainty warning, not a second
+hidden gate. A later, production-facing tournament should use a larger cohort before
+changing defaults.
 
 Studies with sampled rather than exhaustive killed branches remain useful diagnostics,
 but are marked `complete_ground_truth=false` and cannot enter the gate. Likewise, a

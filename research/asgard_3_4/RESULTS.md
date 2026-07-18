@@ -1,8 +1,9 @@
 # Asgard 3/4 results
 
-Status: Q3 captured-context replay and the first 20-run live pilot are complete. The
-Q3 promotion decision is **no-go**. Q4's executable shadow-survivor prototype is
-locally validated but has no live calibration observations yet.
+Status: the 40-call Q3 captured-context replay and the first 20-run live pilot are
+complete. The Q3 promotion decision is **no-go**. Q4's executable
+shadow-survivor prototype is locally validated but has no live calibration
+observations yet.
 
 ## Direct verdicts
 
@@ -80,11 +81,39 @@ but only `decision-log-only` reproduced the terminal decision. `latest-state`,
 two, two, and three steps respectively. Those three modes therefore scored 0% on
 the required protected endpoint-agreement gate despite 100% winner agreement.
 
-The pre-registered stop rule fired after four calls, so the remaining 36 planned
-replays were not run. This is evidence that winner agreement alone is too weak for
-routing compression: a false continuation changes cost and can expose a correct
-endpoint to additional edits. Obligation preservation still requires manual review,
-and `decision-log-only` is not promoted from a single agreeing replay.
+The pre-registered stop rule fired after four calls. The confirmatory result
+therefore remains a stop/no-go. After an explicit later approval, the remaining
+36 calls were run as exploratory follow-up rather than silently redefining the
+gate. This is evidence that winner agreement alone is too weak for routing
+compression: a false continuation changes cost and can expose a correct endpoint
+to additional edits. Obligation preservation still requires manual review.
+
+### Complete 40-call captured-context replay
+
+The completed batch covers ten captured ordinary-routing states from PSD Tools
+and Returns, with one call per state for each compact mode. It contains 40 unique
+records: 21 direct selections and 19 fail-closed fallbacks where the compact
+supervisor requested unavailable repository audit tools. All 21 direct selections
+matched the full supervisor's winner, but only 7 matched the entire recorded
+winner/completion/funding tuple. Nine direct selections flipped completion: eight
+continued after the full control stopped and one stopped before the full control.
+
+Treating every fallback as an execution of the captured full-control decision,
+the mode-level results were:
+
+| Mode | Fallback | Winner agreement | Winner + completion | Candidate-count agreement | Step agreement | Raw-input reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| checkpoint + delta | 50% | 100% | 70% | 70% | 60% | 40.7% |
+| decision log | 40% | 100% | 80% | 80% | 60% | 34.3% |
+| latest state | 40% | 100% | 80% | 80% | 70% | 43.6% |
+| recent exact tail | 60% | 100% | 80% | 70% | 70% | 34.6% |
+
+Every mode failed the automated protected-decision gate: each reached only 80%
+effective winner-plus-completion agreement across the five sampled decisions from
+the protected Returns identity, versus the required 100%. No mode is
+recommendation-ready, independent of the still-required human obligation review.
+The complete machine-readable analysis, including disagreement and fallback rows
+and usage vectors, is in `supervisor_replay_40_analysis.json`.
 
 ## Implemented experiment controls
 
@@ -100,12 +129,18 @@ and `decision-log-only` is not promoted from a single agreeing replay.
 - Every routing turn records chosen versus counterfactual full prompt bytes and token
   estimates. Opt-in capture records exact request/response/tool/usage data.
 - Completion-review construction is not routed through the compression switch.
+- A conservative serial fast path now provides the separately required compact,
+  one-response selector with no audit catalog. It is opt-in, mechanically gated,
+  cannot declare completion, traces every eligibility/fallback reason, and charges
+  both calls when it falls back. It has no live eligibility or agreement observations
+  yet and is not part of the Q3 pilot result above.
 - Prototype B now has a strict shadow-study trace schema, executable recall scorer,
-  and a research-only fixed core protocol: three lanes receive a forced two-step
-  probe, all three continue autonomously for five equal steps, and an opaque-label
-  review chooses the endpoint before the first repository synchronization. No
-  survivor-recall observations exist yet, and the production/default tournament is
-  unchanged.
+  and a research-only fixed core protocol: three lanes receive a forced one- or
+  two-step probe, all three continue autonomously for five equal steps, and an
+  opaque-label review chooses the endpoint before the first repository
+  synchronization. Probe rankings classify architectural/contract versus cosmetic
+  distinctions. No survivor-recall observations exist yet, and the
+  production/default tournament is unchanged.
 
 ## Inferences
 
@@ -183,10 +218,10 @@ replicated with the corrected bootstrap before any production recommendation.
 ## Current recommendation
 
 Promote no compact Q3 mode. Preserve the full control as default and retain the
-capture/replay switches for research. If Q3 work continues, the next informative run
-is a corrected-bootstrap replication of full, checkpoint, and recent-tail on the
-protected Returns case plus the gained PSD/Happy cases, with multiple seeds; it is not
-a broader 40-call replay because the protected stop gate already failed.
+capture/replay switches for research. The exploratory 40-call replay is now
+complete and reinforces the no-go: the next informative Q3 run is a
+corrected-bootstrap live replication of full, checkpoint, and recent-tail on the
+protected Returns case plus the gained PSD/Happy cases, with multiple seeds.
 
 Do not implement a production tournament until the separate Prototype B calibration
 clears its 90% top-2 survivor-recall gate. Prototype A should be treated as a policy

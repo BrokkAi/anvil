@@ -103,9 +103,29 @@ and a separate UTF-8 byte/token ceiling for checkpoint, latest-state,
 decision-log-only, and recent-tail calls. It does not contain rendered task
 content and performs no network operations.
 
-The protected-stage stop result from the approved replay is preserved in
-`protected_endpoint_replay.json`. Three of four modes disagreed with the full
-terminal decision, so the planned second stage was not run.
+The protected-stage stop result is preserved in `protected_endpoint_replay.json`.
+Three of four modes disagreed with the full terminal decision, so the
+pre-registered confirmatory replay stopped there. A later explicit approval ran
+the remaining 36 calls as exploratory follow-up. The complete 10-state x 4-mode
+analysis is preserved in `supervisor_replay_40_analysis.json`; the stop-gate
+failure still governs the promotion decision.
+
+## Conservative serial fast path
+
+Set `ASGARD_SUPERVISOR_FAST_PATH=conservative` together with a non-`full` prompt
+mode to test a one-response ordinary selector with no audit tools. It is eligible
+only when the prior supervisor funded exactly one work lane with one non-empty
+serial advice, the lane did not fail or get cancelled, the current window produced
+a non-empty delta, and a successful shell command followed a recorded edit. The
+selector must explicitly confirm both confidence and that the serial prerequisite
+was addressed. It cannot nominate completion; uncertainty, invalid output, or any
+failed criterion falls back to the ordinary full-tool supervisor, with both calls'
+usage retained.
+
+Every enabled window emits `asgard_fast_path` with eligibility reasons, whether the
+path was used, fallback reason, and its full usage vector. Exact fast-path requests
+and responses are also captured when `ASGARD_CAPTURE_SUPERVISOR_REPLAYS=1` is set.
+This is an experiment switch; `disabled` remains the default.
 
 ## Explicit probe policy (Prototype A)
 
@@ -122,6 +142,20 @@ an instruction to judge information gain rather than patch volume. Each opt-in
 window emits `asgard_window_kind` with its actual kind, candidate count, steps,
 and structured hypotheses. The policy is only a prompt/schema experiment over
 the existing one-winner window mechanism; it does not preserve probe survivors.
+
+Analyze paired dynamic and explicit-probe archives with:
+
+```bash
+python3 research/asgard_3_4/analyze_probe_policy.py \
+  /path/to/dynamic /path/to/explicit --output /tmp/asgard-probe-policy.json
+```
+
+The analyzer uses only structured config, window-kind, candidate-count/depth,
+and per-window usage traces. It reports the joint count x depth distribution,
+the fraction of windows already eligible for a shallow tournament, candidate
+cost per lane-step, total cost per run, paired task outcomes, and the
+pre-specified 5% behavioral-sameness tolerance. Shadow-survivor runs are
+rejected so they cannot contaminate this policy comparison.
 
 ## Archive corpus
 
@@ -259,10 +293,14 @@ python3 research/asgard_3_4/analyze_survivor_recall.py \
 ```
 
 The scorer excludes partial, non-isolated, non-blinded, variable-budget, or otherwise
-invalid studies from the 90% top-2 recall gate. Run the executable fixed calibration
-with `ASGARD_WINDOW_POLICY_MODE=explicit-probe`,
-`ASGARD_SHADOW_SURVIVOR_STUDY=1`, and exactly three candidate models. See the bounded
-protocol and required invariants in `PROTOTYPE_B.md`.
+invalid studies from the 90% two-step top-2 recall gate. It separately reports
+one-step and two-step top-1/top-2/top-3 recall, architecture/contract versus cosmetic
+probe distinctions, late-bloomer kills, task outcomes, and attainable continuation
+savings after measured review overhead. Run the executable fixed calibration with
+`ASGARD_WINDOW_POLICY_MODE=explicit-probe`,
+`ASGARD_SHADOW_SURVIVOR_STUDY=1`, `ASGARD_SHADOW_PROBE_STEPS=1` or `2`, and exactly
+three candidate models. See the bounded protocol and required invariants in
+`PROTOTYPE_B.md`.
 
 Run the focused tests with:
 

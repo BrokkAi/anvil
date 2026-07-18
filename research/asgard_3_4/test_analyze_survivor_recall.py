@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import analyze_survivor_recall as recall
+import jsonschema
 
 
 def usage(input_tokens: int = 0) -> dict[str, int]:
@@ -39,6 +40,8 @@ def complete_rows(study_id: str = "s-1") -> list[dict]:
             ],
             "survivors": [0, 1],
             "killed": [2],
+            "distinction_kind": "architecture-contract",
+            "distinction_evidence": ["Lane 2 identified a different contract boundary."],
             "candidate_usage": [
                 {"lane": lane, "usage": usage(5 + lane)} for lane in range(3)
             ],
@@ -83,6 +86,17 @@ def complete_rows(study_id: str = "s-1") -> list[dict]:
 
 
 class AnalyzeSurvivorRecallTest(unittest.TestCase):
+    def test_complete_trace_matches_schema(self) -> None:
+        schema = json.loads(
+            (Path(__file__).resolve().parent / "survivor_recall.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        validator = jsonschema.Draft202012Validator(schema)
+        for row in complete_rows():
+            with self.subTest(record=row["type"]):
+                validator.validate(row)
+
     def test_scores_complete_blinded_top2_study(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"
@@ -94,10 +108,17 @@ class AnalyzeSurvivorRecallTest(unittest.TestCase):
         self.assertTrue(study["complete_ground_truth"])
         self.assertTrue(study["eligible_for_gate"])
         self.assertEqual(study["final_ranking"], [2, 0, 1])
-        self.assertEqual(study["top_k_recalled"], 1)
-        self.assertEqual(study["top_k_recall"], 0.5)
+        self.assertEqual(study["final_winner_probe_rank"], 3)
+        self.assertEqual(
+            study["probe_recall"], {"top1": False, "top2": False, "top3": True}
+        )
         self.assertFalse(study["final_winner_survived"])
+        self.assertTrue(study["late_bloomer_killed"])
         self.assertEqual(study["usage"]["total"]["input"], 121)
+        self.assertAlmostEqual(
+            study["savings"]["top_k_total_savings_after_measured_overhead_fraction"],
+            22 / 121,
+        )
 
     def test_partial_killed_sampling_is_visible_but_gate_ineligible(self) -> None:
         rows = complete_rows()
@@ -124,6 +145,26 @@ class AnalyzeSurvivorRecallTest(unittest.TestCase):
         self.assertEqual(report["summary"]["gate_status"], "insufficient-data")
         report = recall.summarize([study, study], min_complete_studies=2)
         self.assertEqual(report["summary"]["gate_status"], "fail")
+        self.assertEqual(report["summary"]["two_step_top2_hits"], 0)
+        self.assertEqual(report["summary"]["two_step_top2_opportunities"], 2)
+
+    def test_one_step_studies_are_reported_but_do_not_satisfy_two_step_gate(self) -> None:
+        rows = complete_rows()
+        config = next(
+            row
+            for row in rows
+            if row["type"] == "asgard_shadow_tournament_config"
+        )
+        config["probe_steps"] = 1
+        study = recall.score_study("memory", "s-1", rows)
+        report = recall.summarize([study], min_complete_studies=1)
+        self.assertEqual(
+            report["summary"]["by_probe_steps"]["1"]["eligible_studies"], 1
+        )
+        self.assertEqual(
+            report["summary"]["by_probe_steps"]["2"]["eligible_studies"], 0
+        )
+        self.assertEqual(report["summary"]["gate_status"], "insufficient-data")
 
     def test_boolean_probe_step_is_not_accepted_as_one(self) -> None:
         rows = complete_rows()

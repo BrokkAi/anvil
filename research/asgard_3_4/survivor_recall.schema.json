@@ -26,6 +26,13 @@
         "ranking": { "$ref": "#/$defs/laneRanking" },
         "survivors": { "$ref": "#/$defs/lanes" },
         "killed": { "$ref": "#/$defs/lanes" },
+        "distinction_kind": { "enum": ["architecture-contract", "cosmetic", "mixed", "unclear"] },
+        "distinction_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/nonempty" }
+        },
         "candidate_usage": {
           "type": "array",
           "minItems": 2,
@@ -42,7 +49,7 @@
         },
         "usage": { "$ref": "#/$defs/usage" }
       },
-      "required": ["ranking", "survivors", "killed", "candidate_usage", "usage"]
+      "required": ["ranking", "survivors", "killed", "distinction_kind", "distinction_evidence", "candidate_usage", "usage"]
     },
     {
       "properties": {

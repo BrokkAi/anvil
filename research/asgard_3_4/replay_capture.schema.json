@@ -7,6 +7,15 @@
   "oneOf": [
     {
       "properties": {
+        "type": { "const": "asgard_window_policy_config" },
+        "mode": { "enum": ["dynamic", "explicit-probe"] },
+        "shadow_survivor_study": { "type": "boolean" },
+        "shadow_probe_steps": { "enum": [1, 2] }
+      },
+      "required": ["mode", "shadow_survivor_study", "shadow_probe_steps"]
+    },
+    {
+      "properties": {
         "type": { "const": "asgard_window_kind" },
         "window": { "type": "integer", "minimum": 1 },
         "kind": { "enum": ["probe", "work"] },
@@ -28,6 +37,30 @@
         }
       },
       "required": ["window", "kind", "candidate_count", "window_steps", "hypotheses"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_candidate_window_usage" },
+        "window": { "type": "integer", "minimum": 1 },
+        "candidate_count": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "window_steps": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "properties": {
+              "lane": { "type": "integer", "minimum": 0, "maximum": 4 },
+              "model": { "type": ["string", "null"] },
+              "usage": { "$ref": "#/$defs/usage" }
+            },
+            "required": ["lane", "model", "usage"]
+          }
+        },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["window", "candidate_count", "window_steps", "lanes", "usage"]
     },
     {
       "properties": {
@@ -106,6 +139,34 @@
         { "required": ["response", "usage"] },
         { "required": ["error"] }
       ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_fast_path" },
+        "window": { "type": "integer", "minimum": 1 },
+        "eligible": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } },
+        "used": { "type": "boolean" },
+        "fallback_reason": { "type": ["string", "null"] },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["window", "eligible", "reasons", "used", "fallback_reason", "usage"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_fast_path_request" },
+        "model": { "type": "string", "minLength": 1 },
+        "messages": { "type": "array" },
+        "tools": { "type": "array", "minItems": 1, "maxItems": 1 }
+      },
+      "required": ["model", "messages", "tools"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_fast_path_response" },
+        "response": { "type": "object" }
+      },
+      "required": ["response"]
     }
   ],
   "$defs": {
