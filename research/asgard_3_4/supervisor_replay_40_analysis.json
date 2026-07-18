@@ -1,0 +1,1754 @@
+{
+  "all_automated_gates_pass": false,
+  "gate_policy": {
+    "effective_winner_agreement_minimum": 0.95,
+    "fallback_semantics": "effective agreement delegates to full control",
+    "input_reduction_minimum": 0.25,
+    "obligation_preservation": "manual review required",
+    "protected_endpoint_agreement_minimum": 1.0
+  },
+  "modes": {
+    "checkpoint-plus-delta": {
+      "automated_gates_pass": false,
+      "disagreements": {
+        "count": 4,
+        "rows": [
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 1,
+            "record_id": "returns-validated-error-accumulation::r1::w14::checkpoint-plus-delta",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage1-approved.jsonl",
+            "status": "selected",
+            "window": 14
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 13,
+            "record_id": "psd-tools-blend-range-api::r1::w11::checkpoint-plus-delta",
+            "selection": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "selected",
+            "window": 11
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 17,
+            "record_id": "psd-tools-blend-range-api::r1::w12::checkpoint-plus-delta",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "selected",
+            "window": 12
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 1,
+            "record_id": "returns-validated-error-accumulation::r1::w10::checkpoint-plus-delta",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 6,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "selected",
+            "window": 10
+          }
+        ],
+        "windows": [
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 14
+          },
+          {
+            "identity": "psd-tools-blend-range-api::r1",
+            "window": 11
+          },
+          {
+            "identity": "psd-tools-blend-range-api::r1",
+            "window": 12
+          },
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 10
+          }
+        ]
+      },
+      "effective_with_full_fallback": {
+        "assumption": "fallback executes the captured full-control decision",
+        "completion_agreement": {
+          "compared": 10,
+          "matches": 7,
+          "rate": 0.7
+        },
+        "endpoint_agreement": {
+          "compared": 10,
+          "matches": 7,
+          "rate": 0.7
+        },
+        "next_candidate_count_agreement": {
+          "compared": 10,
+          "matches": 7,
+          "rate": 0.7
+        },
+        "next_step_count_agreement": {
+          "compared": 10,
+          "matches": 6,
+          "rate": 0.6
+        },
+        "winner_agreement": {
+          "compared": 10,
+          "matches": 10,
+          "rate": 1.0
+        }
+      },
+      "fallback": {
+        "count": 5,
+        "rate": 0.5,
+        "rows": [
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 3,
+              "next_window_steps": 5,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 1,
+            "record_id": "psd-tools-blend-range-api::r1::w4::checkpoint-plus-delta",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 4
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 5,
+            "record_id": "psd-tools-blend-range-api::r1::w5::checkpoint-plus-delta",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 5
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 9,
+            "record_id": "psd-tools-blend-range-api::r1::w9::checkpoint-plus-delta",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 9
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 5,
+            "record_id": "returns-validated-error-accumulation::r1::w11::checkpoint-plus-delta",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 11
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 2,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 9,
+            "record_id": "returns-validated-error-accumulation::r1::w12::checkpoint-plus-delta",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 12
+          }
+        ],
+        "status_counts": {
+          "audit_or_no_selection:read_file,read_file": 5
+        }
+      },
+      "gates": {
+        "input_reduction": {
+          "metric": "raw_input_tokens",
+          "name": "prompt/raw input reduction",
+          "operator": ">=",
+          "source": "replay result paired fields",
+          "status": "pass",
+          "threshold": 0.25,
+          "value": 0.40661500870395884
+        },
+        "obligation_preservation_review": {
+          "automatically_inferred": false,
+          "reason": "winner/completion agreement cannot establish that every decisive evidence obligation survived compression",
+          "status": "manual_required"
+        },
+        "overall_winner_agreement": {
+          "name": "effective winner agreement",
+          "operator": ">=",
+          "status": "pass",
+          "threshold": 0.95,
+          "value": 1.0
+        },
+        "protected_endpoint_agreement": {
+          "name": "effective protected endpoint agreement",
+          "operator": ">=",
+          "protected_records": 5,
+          "status": "fail",
+          "threshold": 1.0,
+          "value": 0.8
+        }
+      },
+      "mode": "checkpoint-plus-delta",
+      "nonfallback": {
+        "completion_agreement": {
+          "compared": 5,
+          "matches": 2,
+          "rate": 0.4
+        },
+        "endpoint_agreement": {
+          "compared": 5,
+          "matches": 2,
+          "rate": 0.4
+        },
+        "next_candidate_count_agreement": {
+          "compared": 5,
+          "matches": 2,
+          "rate": 0.4
+        },
+        "next_candidate_count_signed_delta": {
+          "count": 1,
+          "histogram": {
+            "0": 1
+          },
+          "max": 0,
+          "mean": 0.0,
+          "min": 0,
+          "negative": 0,
+          "positive": 0,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 0,
+          "zero": 1
+        },
+        "next_step_count_agreement": {
+          "compared": 5,
+          "matches": 1,
+          "rate": 0.2
+        },
+        "next_step_count_signed_delta": {
+          "count": 1,
+          "histogram": {
+            "4": 1
+          },
+          "max": 4,
+          "mean": 4.0,
+          "min": 4,
+          "negative": 0,
+          "positive": 1,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 4,
+          "zero": 0
+        },
+        "records": 5,
+        "winner_agreement": {
+          "compared": 5,
+          "matches": 5,
+          "rate": 1.0
+        }
+      },
+      "prompt_or_raw_input_reduction": {
+        "evidence": [
+          {
+            "chosen": 150324.0,
+            "fraction": 0.40661500870395884,
+            "full_control": 253333.0,
+            "metric": "raw_input_tokens",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "chosen": 524722.0,
+            "fraction": 0.47046452250961235,
+            "full_control": 990910.0,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "fraction": 0.4674982156072865,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "mean replay-result fraction fields"
+          }
+        ],
+        "gate_fraction": 0.40661500870395884,
+        "gate_metric": "raw_input_tokens",
+        "gate_source": "replay result paired fields",
+        "selection_rule": "minimum supplied reduction fraction (fail closed)"
+      },
+      "protected": {
+        "effective_endpoint_agreement": {
+          "compared": 5,
+          "matches": 4,
+          "rate": 0.8
+        },
+        "identities": [
+          "returns-validated-error-accumulation::r1"
+        ],
+        "records": 5
+      },
+      "recommendation_ready": false,
+      "recommendation_status": "automated-gates-not-satisfied",
+      "records": 10,
+      "usage": {
+        "all": {
+          "cacheEligibleInput": 150324,
+          "cachedRead": 78720,
+          "cachedReadFraction": 0.5236688752295042,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 71604,
+          "output": 21386,
+          "perRecord": {
+            "cachedRead": 7872.0,
+            "cachedWrite": 0.0,
+            "input": 7160.4,
+            "output": 2138.6,
+            "thought": 0.0
+          },
+          "rawInput": 150324,
+          "thought": 0,
+          "uncachedFraction": 0.4763311247704957
+        },
+        "fallback": {
+          "cacheEligibleInput": 78461,
+          "cachedRead": 39168,
+          "cachedReadFraction": 0.4992034259058641,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 39293,
+          "output": 6393,
+          "perRecord": {
+            "cachedRead": 7833.6,
+            "cachedWrite": 0.0,
+            "input": 7858.6,
+            "output": 1278.6,
+            "thought": 0.0
+          },
+          "rawInput": 78461,
+          "thought": 0,
+          "uncachedFraction": 0.5007965740941359
+        },
+        "nonfallback": {
+          "cacheEligibleInput": 71863,
+          "cachedRead": 39552,
+          "cachedReadFraction": 0.5503805852803251,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 32311,
+          "output": 14993,
+          "perRecord": {
+            "cachedRead": 7910.4,
+            "cachedWrite": 0.0,
+            "input": 6462.2,
+            "output": 2998.6,
+            "thought": 0.0
+          },
+          "rawInput": 71863,
+          "thought": 0,
+          "uncachedFraction": 0.4496194147196749
+        }
+      }
+    },
+    "decision-log-only": {
+      "automated_gates_pass": false,
+      "disagreements": {
+        "count": 4,
+        "rows": [
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "next_step_count"
+            ],
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 11,
+            "record_id": "psd-tools-blend-range-api::r1::w9::decision-log-only",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "selected",
+            "window": 9
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 19,
+            "record_id": "psd-tools-blend-range-api::r1::w12::decision-log-only",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "selected",
+            "window": 12
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 3,
+            "record_id": "returns-validated-error-accumulation::r1::w10::decision-log-only",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 5,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "selected",
+            "window": 10
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 15,
+            "record_id": "returns-validated-error-accumulation::r1::w13::decision-log-only",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "selected",
+            "window": 13
+          }
+        ],
+        "windows": [
+          {
+            "identity": "psd-tools-blend-range-api::r1",
+            "window": 9
+          },
+          {
+            "identity": "psd-tools-blend-range-api::r1",
+            "window": 12
+          },
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 10
+          },
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 13
+          }
+        ]
+      },
+      "effective_with_full_fallback": {
+        "assumption": "fallback executes the captured full-control decision",
+        "completion_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "endpoint_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "next_candidate_count_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "next_step_count_agreement": {
+          "compared": 10,
+          "matches": 6,
+          "rate": 0.6
+        },
+        "winner_agreement": {
+          "compared": 10,
+          "matches": 10,
+          "rate": 1.0
+        }
+      },
+      "fallback": {
+        "count": 4,
+        "rate": 0.4,
+        "rows": [
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 3,
+              "next_window_steps": 5,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 3,
+            "record_id": "psd-tools-blend-range-api::r1::w4::decision-log-only",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:grep_search,grep_search",
+            "window": 4
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 7,
+            "record_id": "psd-tools-blend-range-api::r1::w5::decision-log-only",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 5
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 15,
+            "record_id": "psd-tools-blend-range-api::r1::w11::decision-log-only",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,grep_search",
+            "window": 11
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 2,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 11,
+            "record_id": "returns-validated-error-accumulation::r1::w12::decision-log-only",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 12
+          }
+        ],
+        "status_counts": {
+          "audit_or_no_selection:grep_search,grep_search": 1,
+          "audit_or_no_selection:read_file,grep_search": 1,
+          "audit_or_no_selection:read_file,read_file": 2
+        }
+      },
+      "gates": {
+        "input_reduction": {
+          "metric": "raw_input_tokens",
+          "name": "prompt/raw input reduction",
+          "operator": ">=",
+          "source": "replay result paired fields",
+          "status": "pass",
+          "threshold": 0.25,
+          "value": 0.34285308270142456
+        },
+        "obligation_preservation_review": {
+          "automatically_inferred": false,
+          "reason": "winner/completion agreement cannot establish that every decisive evidence obligation survived compression",
+          "status": "manual_required"
+        },
+        "overall_winner_agreement": {
+          "name": "effective winner agreement",
+          "operator": ">=",
+          "status": "pass",
+          "threshold": 0.95,
+          "value": 1.0
+        },
+        "protected_endpoint_agreement": {
+          "name": "effective protected endpoint agreement",
+          "operator": ">=",
+          "protected_records": 5,
+          "status": "fail",
+          "threshold": 1.0,
+          "value": 0.8
+        }
+      },
+      "mode": "decision-log-only",
+      "nonfallback": {
+        "completion_agreement": {
+          "compared": 6,
+          "matches": 4,
+          "rate": 0.6666666666666666
+        },
+        "endpoint_agreement": {
+          "compared": 6,
+          "matches": 4,
+          "rate": 0.6666666666666666
+        },
+        "next_candidate_count_agreement": {
+          "compared": 6,
+          "matches": 4,
+          "rate": 0.6666666666666666
+        },
+        "next_candidate_count_signed_delta": {
+          "count": 2,
+          "histogram": {
+            "0": 2
+          },
+          "max": 0,
+          "mean": 0.0,
+          "min": 0,
+          "negative": 0,
+          "positive": 0,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 0,
+          "zero": 2
+        },
+        "next_step_count_agreement": {
+          "compared": 6,
+          "matches": 2,
+          "rate": 0.3333333333333333
+        },
+        "next_step_count_signed_delta": {
+          "count": 2,
+          "histogram": {
+            "-1": 1,
+            "3": 1
+          },
+          "max": 3,
+          "mean": 1.0,
+          "min": -1,
+          "negative": 1,
+          "positive": 1,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 2,
+          "zero": 0
+        },
+        "records": 6,
+        "winner_agreement": {
+          "compared": 6,
+          "matches": 6,
+          "rate": 1.0
+        }
+      },
+      "prompt_or_raw_input_reduction": {
+        "evidence": [
+          {
+            "chosen": 166477.0,
+            "fraction": 0.34285308270142456,
+            "full_control": 253333.0,
+            "metric": "raw_input_tokens",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "chosen": 588596.0,
+            "fraction": 0.4060045816471728,
+            "full_control": 990910.0,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "fraction": 0.4046969785693603,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "mean replay-result fraction fields"
+          }
+        ],
+        "gate_fraction": 0.34285308270142456,
+        "gate_metric": "raw_input_tokens",
+        "gate_source": "replay result paired fields",
+        "selection_rule": "minimum supplied reduction fraction (fail closed)"
+      },
+      "protected": {
+        "effective_endpoint_agreement": {
+          "compared": 5,
+          "matches": 4,
+          "rate": 0.8
+        },
+        "identities": [
+          "returns-validated-error-accumulation::r1"
+        ],
+        "records": 5
+      },
+      "recommendation_ready": false,
+      "recommendation_status": "automated-gates-not-satisfied",
+      "records": 10,
+      "usage": {
+        "all": {
+          "cacheEligibleInput": 166477,
+          "cachedRead": 88832,
+          "cachedReadFraction": 0.5335992359304889,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 77645,
+          "output": 27042,
+          "perRecord": {
+            "cachedRead": 8883.2,
+            "cachedWrite": 0.0,
+            "input": 7764.5,
+            "output": 2704.2,
+            "thought": 0.0
+          },
+          "rawInput": 166477,
+          "thought": 0,
+          "uncachedFraction": 0.4664007640695111
+        },
+        "fallback": {
+          "cacheEligibleInput": 68800,
+          "cachedRead": 36736,
+          "cachedReadFraction": 0.533953488372093,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 32064,
+          "output": 5766,
+          "perRecord": {
+            "cachedRead": 9184.0,
+            "cachedWrite": 0.0,
+            "input": 8016.0,
+            "output": 1441.5,
+            "thought": 0.0
+          },
+          "rawInput": 68800,
+          "thought": 0,
+          "uncachedFraction": 0.466046511627907
+        },
+        "nonfallback": {
+          "cacheEligibleInput": 97677,
+          "cachedRead": 52096,
+          "cachedReadFraction": 0.5333497138528006,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 45581,
+          "output": 21276,
+          "perRecord": {
+            "cachedRead": 8682.666666666666,
+            "cachedWrite": 0.0,
+            "input": 7596.833333333333,
+            "output": 3546.0,
+            "thought": 0.0
+          },
+          "rawInput": 97677,
+          "thought": 0,
+          "uncachedFraction": 0.46665028614719944
+        }
+      }
+    },
+    "latest-state": {
+      "automated_gates_pass": false,
+      "disagreements": {
+        "count": 3,
+        "rows": [
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 2,
+            "record_id": "returns-validated-error-accumulation::r1::w14::latest-state",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage1-approved.jsonl",
+            "status": "selected",
+            "window": 14
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 18,
+            "record_id": "psd-tools-blend-range-api::r1::w12::latest-state",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "selected",
+            "window": 12
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 2,
+            "record_id": "returns-validated-error-accumulation::r1::w10::latest-state",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 5,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "selected",
+            "window": 10
+          }
+        ],
+        "windows": [
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 14
+          },
+          {
+            "identity": "psd-tools-blend-range-api::r1",
+            "window": 12
+          },
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 10
+          }
+        ]
+      },
+      "effective_with_full_fallback": {
+        "assumption": "fallback executes the captured full-control decision",
+        "completion_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "endpoint_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "next_candidate_count_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "next_step_count_agreement": {
+          "compared": 10,
+          "matches": 7,
+          "rate": 0.7
+        },
+        "winner_agreement": {
+          "compared": 10,
+          "matches": 10,
+          "rate": 1.0
+        }
+      },
+      "fallback": {
+        "count": 4,
+        "rate": 0.4,
+        "rows": [
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 3,
+              "next_window_steps": 5,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 2,
+            "record_id": "psd-tools-blend-range-api::r1::w4::latest-state",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file,read_file",
+            "window": 4
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 6,
+            "record_id": "psd-tools-blend-range-api::r1::w5::latest-state",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 5
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 14,
+            "record_id": "psd-tools-blend-range-api::r1::w11::latest-state",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,grep_search",
+            "window": 11
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 2,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 10,
+            "record_id": "returns-validated-error-accumulation::r1::w12::latest-state",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "audit_or_no_selection:get_symbol_sources",
+            "window": 12
+          }
+        ],
+        "status_counts": {
+          "audit_or_no_selection:get_symbol_sources": 1,
+          "audit_or_no_selection:read_file,grep_search": 1,
+          "audit_or_no_selection:read_file,read_file": 1,
+          "audit_or_no_selection:read_file,read_file,read_file": 1
+        }
+      },
+      "gates": {
+        "input_reduction": {
+          "metric": "raw_input_tokens",
+          "name": "prompt/raw input reduction",
+          "operator": ">=",
+          "source": "replay result paired fields",
+          "status": "pass",
+          "threshold": 0.25,
+          "value": 0.4364137321233318
+        },
+        "obligation_preservation_review": {
+          "automatically_inferred": false,
+          "reason": "winner/completion agreement cannot establish that every decisive evidence obligation survived compression",
+          "status": "manual_required"
+        },
+        "overall_winner_agreement": {
+          "name": "effective winner agreement",
+          "operator": ">=",
+          "status": "pass",
+          "threshold": 0.95,
+          "value": 1.0
+        },
+        "protected_endpoint_agreement": {
+          "name": "effective protected endpoint agreement",
+          "operator": ">=",
+          "protected_records": 5,
+          "status": "fail",
+          "threshold": 1.0,
+          "value": 0.8
+        }
+      },
+      "mode": "latest-state",
+      "nonfallback": {
+        "completion_agreement": {
+          "compared": 6,
+          "matches": 4,
+          "rate": 0.6666666666666666
+        },
+        "endpoint_agreement": {
+          "compared": 6,
+          "matches": 4,
+          "rate": 0.6666666666666666
+        },
+        "next_candidate_count_agreement": {
+          "compared": 6,
+          "matches": 4,
+          "rate": 0.6666666666666666
+        },
+        "next_candidate_count_signed_delta": {
+          "count": 2,
+          "histogram": {
+            "0": 2
+          },
+          "max": 0,
+          "mean": 0.0,
+          "min": 0,
+          "negative": 0,
+          "positive": 0,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 0,
+          "zero": 2
+        },
+        "next_step_count_agreement": {
+          "compared": 6,
+          "matches": 3,
+          "rate": 0.5
+        },
+        "next_step_count_signed_delta": {
+          "count": 2,
+          "histogram": {
+            "0": 1,
+            "3": 1
+          },
+          "max": 3,
+          "mean": 1.5,
+          "min": 0,
+          "negative": 0,
+          "positive": 1,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 3,
+          "zero": 1
+        },
+        "records": 6,
+        "winner_agreement": {
+          "compared": 6,
+          "matches": 6,
+          "rate": 1.0
+        }
+      },
+      "prompt_or_raw_input_reduction": {
+        "evidence": [
+          {
+            "chosen": 142775.0,
+            "fraction": 0.4364137321233318,
+            "full_control": 253333.0,
+            "metric": "raw_input_tokens",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "chosen": 488118.0,
+            "fraction": 0.507404305133665,
+            "full_control": 990910.0,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "fraction": 0.503816646350032,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "mean replay-result fraction fields"
+          }
+        ],
+        "gate_fraction": 0.4364137321233318,
+        "gate_metric": "raw_input_tokens",
+        "gate_source": "replay result paired fields",
+        "selection_rule": "minimum supplied reduction fraction (fail closed)"
+      },
+      "protected": {
+        "effective_endpoint_agreement": {
+          "compared": 5,
+          "matches": 4,
+          "rate": 0.8
+        },
+        "identities": [
+          "returns-validated-error-accumulation::r1"
+        ],
+        "records": 5
+      },
+      "recommendation_ready": false,
+      "recommendation_status": "automated-gates-not-satisfied",
+      "records": 10,
+      "usage": {
+        "all": {
+          "cacheEligibleInput": 142775,
+          "cachedRead": 80640,
+          "cachedReadFraction": 0.5648047627385747,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 62135,
+          "output": 18809,
+          "perRecord": {
+            "cachedRead": 8064.0,
+            "cachedWrite": 0.0,
+            "input": 6213.5,
+            "output": 1880.9,
+            "thought": 0.0
+          },
+          "rawInput": 142775,
+          "thought": 0,
+          "uncachedFraction": 0.43519523726142534
+        },
+        "fallback": {
+          "cacheEligibleInput": 61521,
+          "cachedRead": 33792,
+          "cachedReadFraction": 0.5492758570244307,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 27729,
+          "output": 2774,
+          "perRecord": {
+            "cachedRead": 8448.0,
+            "cachedWrite": 0.0,
+            "input": 6932.25,
+            "output": 693.5,
+            "thought": 0.0
+          },
+          "rawInput": 61521,
+          "thought": 0,
+          "uncachedFraction": 0.45072414297556934
+        },
+        "nonfallback": {
+          "cacheEligibleInput": 81254,
+          "cachedRead": 46848,
+          "cachedReadFraction": 0.5765623846210648,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 34406,
+          "output": 16035,
+          "perRecord": {
+            "cachedRead": 7808.0,
+            "cachedWrite": 0.0,
+            "input": 5734.333333333333,
+            "output": 2672.5,
+            "thought": 0.0
+          },
+          "rawInput": 81254,
+          "thought": 0,
+          "uncachedFraction": 0.4234376153789352
+        }
+      }
+    },
+    "recent-exact-tail": {
+      "automated_gates_pass": false,
+      "disagreements": {
+        "count": 3,
+        "rows": [
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 4,
+            "record_id": "returns-validated-error-accumulation::r1::w14::recent-exact-tail",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage1-approved.jsonl",
+            "status": "selected",
+            "window": 14
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "completion",
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 20,
+            "record_id": "psd-tools-blend-range-api::r1::w12::recent-exact-tail",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "selected",
+            "window": 12
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 2,
+              "winner": 0
+            },
+            "disagreement_fields": [
+              "next_candidate_count",
+              "next_step_count"
+            ],
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 4,
+            "record_id": "returns-validated-error-accumulation::r1::w10::recent-exact-tail",
+            "selection": {
+              "complete": false,
+              "next_candidate_count": 2,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "selected",
+            "window": 10
+          }
+        ],
+        "windows": [
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 14
+          },
+          {
+            "identity": "psd-tools-blend-range-api::r1",
+            "window": 12
+          },
+          {
+            "identity": "returns-validated-error-accumulation::r1",
+            "window": 10
+          }
+        ]
+      },
+      "effective_with_full_fallback": {
+        "assumption": "fallback executes the captured full-control decision",
+        "completion_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "endpoint_agreement": {
+          "compared": 10,
+          "matches": 8,
+          "rate": 0.8
+        },
+        "next_candidate_count_agreement": {
+          "compared": 10,
+          "matches": 7,
+          "rate": 0.7
+        },
+        "next_step_count_agreement": {
+          "compared": 10,
+          "matches": 7,
+          "rate": 0.7
+        },
+        "winner_agreement": {
+          "compared": 10,
+          "matches": 10,
+          "rate": 1.0
+        }
+      },
+      "fallback": {
+        "count": 6,
+        "rate": 0.6,
+        "rows": [
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 3,
+              "next_window_steps": 5,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 4,
+            "record_id": "psd-tools-blend-range-api::r1::w4::recent-exact-tail",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file,read_file",
+            "window": 4
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 8,
+            "record_id": "psd-tools-blend-range-api::r1::w5::recent-exact-tail",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 5
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 12,
+            "record_id": "psd-tools-blend-range-api::r1::w9::recent-exact-tail",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file",
+            "window": 9
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 1,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "psd-tools-blend-range-api::r1",
+            "line": 16,
+            "record_id": "psd-tools-blend-range-api::r1::w11::recent-exact-tail",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,grep_search",
+            "window": 11
+          },
+          {
+            "control": {
+              "complete": false,
+              "next_candidate_count": 2,
+              "next_window_steps": 3,
+              "winner": 0
+            },
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 12,
+            "record_id": "returns-validated-error-accumulation::r1::w12::recent-exact-tail",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "audit_or_no_selection:read_file,read_file",
+            "window": 12
+          },
+          {
+            "control": {
+              "complete": true,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": 0
+            },
+            "identity": "returns-validated-error-accumulation::r1",
+            "line": 16,
+            "record_id": "returns-validated-error-accumulation::r1::w13::recent-exact-tail",
+            "selection": {
+              "complete": null,
+              "next_candidate_count": null,
+              "next_window_steps": null,
+              "winner": null
+            },
+            "source": "/tmp/asgard-replay-stage2-returns-approved.jsonl",
+            "status": "audit_or_no_selection:read_file",
+            "window": 13
+          }
+        ],
+        "status_counts": {
+          "audit_or_no_selection:read_file": 2,
+          "audit_or_no_selection:read_file,grep_search": 1,
+          "audit_or_no_selection:read_file,read_file": 2,
+          "audit_or_no_selection:read_file,read_file,read_file": 1
+        }
+      },
+      "gates": {
+        "input_reduction": {
+          "metric": "raw_input_tokens",
+          "name": "prompt/raw input reduction",
+          "operator": ">=",
+          "source": "replay result paired fields",
+          "status": "pass",
+          "threshold": 0.25,
+          "value": 0.34555703362767587
+        },
+        "obligation_preservation_review": {
+          "automatically_inferred": false,
+          "reason": "winner/completion agreement cannot establish that every decisive evidence obligation survived compression",
+          "status": "manual_required"
+        },
+        "overall_winner_agreement": {
+          "name": "effective winner agreement",
+          "operator": ">=",
+          "status": "pass",
+          "threshold": 0.95,
+          "value": 1.0
+        },
+        "protected_endpoint_agreement": {
+          "name": "effective protected endpoint agreement",
+          "operator": ">=",
+          "protected_records": 5,
+          "status": "fail",
+          "threshold": 1.0,
+          "value": 0.8
+        }
+      },
+      "mode": "recent-exact-tail",
+      "nonfallback": {
+        "completion_agreement": {
+          "compared": 4,
+          "matches": 2,
+          "rate": 0.5
+        },
+        "endpoint_agreement": {
+          "compared": 4,
+          "matches": 2,
+          "rate": 0.5
+        },
+        "next_candidate_count_agreement": {
+          "compared": 4,
+          "matches": 1,
+          "rate": 0.25
+        },
+        "next_candidate_count_signed_delta": {
+          "count": 1,
+          "histogram": {
+            "1": 1
+          },
+          "max": 1,
+          "mean": 1.0,
+          "min": 1,
+          "negative": 0,
+          "positive": 1,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 1,
+          "zero": 0
+        },
+        "next_step_count_agreement": {
+          "compared": 4,
+          "matches": 1,
+          "rate": 0.25
+        },
+        "next_step_count_signed_delta": {
+          "count": 1,
+          "histogram": {
+            "1": 1
+          },
+          "max": 1,
+          "mean": 1.0,
+          "min": 1,
+          "negative": 0,
+          "positive": 1,
+          "sign_convention": "replay selection minus full-control decision",
+          "sum": 1,
+          "zero": 0
+        },
+        "records": 4,
+        "winner_agreement": {
+          "compared": 4,
+          "matches": 4,
+          "rate": 1.0
+        }
+      },
+      "prompt_or_raw_input_reduction": {
+        "evidence": [
+          {
+            "chosen": 165792.0,
+            "fraction": 0.34555703362767587,
+            "full_control": 253333.0,
+            "metric": "raw_input_tokens",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "chosen": 585493.0,
+            "fraction": 0.40913604666417736,
+            "full_control": 990910.0,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "replay result paired fields"
+          },
+          {
+            "fraction": 0.4033863468912795,
+            "metric": "prompt_bytes",
+            "records_covered": 10,
+            "source": "mean replay-result fraction fields"
+          }
+        ],
+        "gate_fraction": 0.34555703362767587,
+        "gate_metric": "raw_input_tokens",
+        "gate_source": "replay result paired fields",
+        "selection_rule": "minimum supplied reduction fraction (fail closed)"
+      },
+      "protected": {
+        "effective_endpoint_agreement": {
+          "compared": 5,
+          "matches": 4,
+          "rate": 0.8
+        },
+        "identities": [
+          "returns-validated-error-accumulation::r1"
+        ],
+        "records": 5
+      },
+      "recommendation_ready": false,
+      "recommendation_status": "automated-gates-not-satisfied",
+      "records": 10,
+      "usage": {
+        "all": {
+          "cacheEligibleInput": 165792,
+          "cachedRead": 80640,
+          "cachedReadFraction": 0.4863925883034163,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 85152,
+          "output": 16858,
+          "perRecord": {
+            "cachedRead": 8064.0,
+            "cachedWrite": 0.0,
+            "input": 8515.2,
+            "output": 1685.8,
+            "thought": 0.0
+          },
+          "rawInput": 165792,
+          "thought": 0,
+          "uncachedFraction": 0.5136074116965836
+        },
+        "fallback": {
+          "cacheEligibleInput": 104657,
+          "cachedRead": 49920,
+          "cachedReadFraction": 0.4769867280736119,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 54737,
+          "output": 9871,
+          "perRecord": {
+            "cachedRead": 8320.0,
+            "cachedWrite": 0.0,
+            "input": 9122.833333333334,
+            "output": 1645.1666666666667,
+            "thought": 0.0
+          },
+          "rawInput": 104657,
+          "thought": 0,
+          "uncachedFraction": 0.5230132719263881
+        },
+        "nonfallback": {
+          "cacheEligibleInput": 61135,
+          "cachedRead": 30720,
+          "cachedReadFraction": 0.502494479430768,
+          "cachedWrite": 0,
+          "cachedWriteFractionOfRaw": 0.0,
+          "input": 30415,
+          "output": 6987,
+          "perRecord": {
+            "cachedRead": 7680.0,
+            "cachedWrite": 0.0,
+            "input": 7603.75,
+            "output": 1746.75,
+            "thought": 0.0
+          },
+          "rawInput": 61135,
+          "thought": 0,
+          "uncachedFraction": 0.49750552056923203
+        }
+      }
+    }
+  },
+  "recommendation_ready": false,
+  "records": 40,
+  "type": "asgard_supervisor_replay_analysis"
+}

@@ -419,8 +419,7 @@ const TOOLS: &[ToolMeta] = &[
     },
     ToolMeta {
         // bifrost returns the non-mutating rename edit set (it never writes),
-        // so it ships in the read-only `searchtools` surface with
-        // readOnlyHint=true and is classified as a read tool here.
+        // with readOnlyHint=true, so it is classified as a read tool here.
         name: "rename_symbol",
         kind: ToolKind::Read,
         display_name: "Computing symbol rename",
@@ -1148,25 +1147,7 @@ impl ToolRegistry {
             let names: Vec<String> = agents.iter_sorted().map(|m| m.name.clone()).collect();
             let catalog: String = agents
                 .iter_sorted()
-                .map(|m| {
-                    let mut restrictions = Vec::new();
-                    if let Some(max_turns) = m.max_turns {
-                        restrictions.push(format!("max_turns: {max_turns}"));
-                    }
-                    if let Some(tools) = &m.allowed_tools {
-                        restrictions.push(if tools.is_empty() {
-                            "tools: none".to_string()
-                        } else {
-                            format!("tools: {}", tools.join(", "))
-                        });
-                    }
-                    let restrictions = if restrictions.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", restrictions.join("; "))
-                    };
-                    format!("- {}: {}{}", m.name, m.description, restrictions)
-                })
+                .map(|m| format!("- {}: {}", m.name, m.description))
                 .collect::<Vec<_>>()
                 .join("\n");
             defs.push(tool_def(
@@ -1208,6 +1189,14 @@ impl ToolRegistry {
                     "required": ["description", "prompt", "subagent_type"]
                 }),
             ));
+        }
+
+        // Apply the install-wide allowlist only after every source has
+        // contributed definitions. In particular, `activate_skill` and `task`
+        // are dynamic tools assembled after built-ins and MCP tools.
+        if let Some(allowed_tools) = crate::setup_state::read_allowed_tools() {
+            let allowed_tools: HashSet<String> = allowed_tools.into_iter().collect();
+            defs.retain(|tool| allowed_tools.contains(&tool.function.name));
         }
         defs
     }
@@ -2582,6 +2571,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_allowed_tools_filters_builtins_and_dynamic_tools() {
+        use crate::agents::{AgentMeta, AgentScope};
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let _scope = crate::setup_state::TestConfigHomeScope::set(config_dir.path().to_path_buf());
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({ "allowed_tools": ["read_file", "task"] }).to_string(),
+        )
+        .expect("write setup state");
+
+        let registry = registry_with_agents(vec![AgentMeta {
+            name: "reviewer".into(),
+            description: "Reviews code".into(),
+            max_turns: None,
+            allowed_tools: None,
+            location: PathBuf::from("/tmp/reviewer.md"),
+            scope: AgentScope::Project,
+            bundled_body: None,
+        }]);
+        let advertised: Vec<String> = registry
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+
+        assert_eq!(advertised, vec!["read_file", "task"]);
+
+        std::fs::write(
+            config_dir.path().join("setup.json"),
+            serde_json::json!({ "allowed_tools": [] }).to_string(),
+        )
+        .expect("write empty allowed_tools");
+        assert!(registry.tool_definitions().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn hidden_builtins_still_execute_for_non_llm_callers() {
         let registry = registry_with_skills(vec![]);
         registry.set_builtin_tools(HashSet::new()).await;
@@ -2777,20 +2804,25 @@ mod tests {
             .collect();
         assert_eq!(permission_values, vec!["readOnly", "inherit"]);
 
-        // Description should surface the catalog so the model can pick.
-        assert!(
-            task_def.function.description.contains("doc-writer"),
-            "catalog should mention each subagent; got: {}",
-            task_def.function.description
-        );
-        assert!(task_def.function.description.contains("bug-hunter"));
-        assert!(task_def.function.description.contains("max_turns: 7"));
+        // The model-facing catalog contains only selection-relevant metadata.
+        // Execution constraints remain enforced from AgentMeta at dispatch,
+        // but repeating long tool allowlists here wastes tokens every turn.
         assert!(
             task_def
                 .function
                 .description
-                .contains("tools: grep_search, read_file")
+                .contains("- doc-writer: Drafts docs from code"),
+            "catalog should mention each subagent; got: {}",
+            task_def.function.description
         );
+        assert!(
+            task_def
+                .function
+                .description
+                .contains("- bug-hunter: Hunts for regressions")
+        );
+        assert!(!task_def.function.description.contains("max_turns:"));
+        assert!(!task_def.function.description.contains("tools:"));
     }
 
     /// MCP schemas often ask for arrays. The host must wrap scalar strings into

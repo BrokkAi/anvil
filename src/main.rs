@@ -154,8 +154,8 @@ struct Args {
     /// and first-run choices made during this process are not read from or
     /// written to setup.json. ACP session config options (model, reasoning,
     /// behavior, permission, and service tier) are already live-session-only.
-    /// Provider credential commands and `/mcp` use their own stores and are not
-    /// made transient by this flag.
+    /// Provider credential commands, the `allowed_tools` tool allowlist, and
+    /// `/mcp` are not made transient by this flag.
     #[arg(long, env = "ANVIL_TRANSIENT_SETUP", default_value_t = false)]
     transient_setup: bool,
 

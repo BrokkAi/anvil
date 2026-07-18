@@ -143,7 +143,7 @@ fn session_load_replays_tool_updates_in_order() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
@@ -283,7 +283,7 @@ fn additional_directories_scope_builtin_file_tools() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let allowed_args = format!(
         r#"{{"file_path":{}}}"#,
@@ -415,7 +415,7 @@ fn relative_cwd_lifecycle_requests_return_invalid_params() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -528,7 +528,7 @@ fn lifecycle_mcp_servers_applied_and_unsupported_rejected() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     // A fake stdio MCP server supplied via session/load; spawning it leaves a
     // log line, proving the load-time mcpServers were applied (#145). It lives
@@ -691,7 +691,7 @@ fn session_list_without_cwd_and_cursor_semantics() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // One plain text response: the prompt names the session (auto-rename) and
@@ -858,7 +858,7 @@ fn lifecycle_unknown_cwd_and_additional_dirs_return_invalid_params() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -1159,7 +1159,7 @@ fn session_fork_creates_independent_session() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // One turn to name the source, one to exercise the fork.
@@ -1312,7 +1312,7 @@ fn session_delete_removes_session_and_is_idempotent() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![text_sse_body("Summary.")]);
@@ -1444,7 +1444,7 @@ fn mode_and_config_option_surfaces_stay_in_sync() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -1609,7 +1609,7 @@ fn invalid_prompt_requests_return_invalid_params() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let mut child = spawn_anvil(&home, &config_home, &trace_path, None, 1);
@@ -1713,7 +1713,7 @@ fn llm_request_cancelled_mid_send_is_not_reported_as_error() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_hanging_smoke_server();
@@ -1826,7 +1826,7 @@ fn max_turns_exhaustion_is_reported_in_transcript_and_stop_reason() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // Turn 0 returns a tool call (read_file is auto-allowed, so no permission
@@ -1957,7 +1957,7 @@ fn empty_completion_is_reported_in_transcript_and_survives_reload() {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     // An empty completion is retried on the transient-failure budget
@@ -2060,7 +2060,7 @@ fn run_smoke_case(case: &SmokeCase) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
@@ -2297,7 +2297,7 @@ fn run_p2t_prefix_tail_case(case: SmokeCase, prefix_steps: Vec<Value>) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let p2t_dir = temp.path().join("p2t");
     std::fs::create_dir_all(&p2t_dir).expect("create p2t dir");
@@ -2424,7 +2424,7 @@ fn run_direct_prompt_case(case: &SmokeCase) -> (OpenAiSmokeServer, usize) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider =
@@ -2509,7 +2509,7 @@ fn run_auto_classifier_denial_case(case: &SmokeCase) {
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let trace_path = temp.path().join(format!("{}.trace.jsonl", case.name));
     let provider = start_openai_smoke_server(vec![
@@ -2654,7 +2654,7 @@ fn run_auto_classifier_escalation_case(case: &SmokeCase, escalation_case: AutoEs
     let config_home = temp.path().join("config");
     std::fs::create_dir_all(&config_home).expect("create config home");
     let bifrost_log = temp.path().join("bifrost-spawn.log");
-    write_setup_with_fake_bifrost(&config_home, temp.path(), &bifrost_log);
+    install_fake_managed_bifrost(&config_home, temp.path(), &bifrost_log);
 
     let classifier_body = match escalation_case {
         AutoEscalationCase::ApproveOutside => text_sse_body(
@@ -3179,21 +3179,9 @@ fn text_sse_body(text: &str) -> String {
     )
 }
 
-fn write_setup_with_fake_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
+fn install_fake_managed_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
     let fake_bifrost = make_fake_bifrost_binary(temp, bifrost_log);
     seed_fake_managed_bifrost(config_home, &fake_bifrost);
-    let setup = json!({
-        "mcp_servers": [
-            {
-                "name": "bifrost",
-                "command": fake_bifrost,
-                "args": ["--root", "{cwd}", "--mcp", "searchtools", "--no-line-numbers"],
-                "framing": "line",
-                "enabled": true
-            }
-        ]
-    });
-    std::fs::write(config_home.join("setup.json"), setup.to_string()).expect("write setup");
 }
 
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {

@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokk.ai/schemas/asgard-supervisor-replay-capture-v1.json",
+  "title": "Asgard ordinary-routing replay capture record",
+  "type": "object",
+  "required": ["type"],
+  "oneOf": [
+    {
+      "properties": {
+        "type": { "const": "asgard_window_policy_config" },
+        "mode": { "enum": ["dynamic", "explicit-probe"] },
+        "shadow_survivor_study": { "type": "boolean" },
+        "shadow_probe_steps": { "enum": [1, 2] }
+      },
+      "required": ["mode", "shadow_survivor_study", "shadow_probe_steps"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_window_kind" },
+        "window": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["probe", "work"] },
+        "candidate_count": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "window_steps": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "hypotheses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["lane", "hypothesis", "falsification_action", "continue_stop_signal"],
+            "properties": {
+              "lane": { "type": "integer", "minimum": 0 },
+              "hypothesis": { "type": "string", "minLength": 1 },
+              "falsification_action": { "type": "string", "minLength": 1 },
+              "continue_stop_signal": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["window", "kind", "candidate_count", "window_steps", "hypotheses"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_candidate_window_usage" },
+        "window": { "type": "integer", "minimum": 1 },
+        "candidate_count": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "window_steps": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "lanes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "properties": {
+              "lane": { "type": "integer", "minimum": 0, "maximum": 4 },
+              "model": { "type": ["string", "null"] },
+              "usage": { "$ref": "#/$defs/usage" }
+            },
+            "required": ["lane", "model", "usage"]
+          }
+        },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["window", "candidate_count", "window_steps", "lanes", "usage"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_prompt_mode" },
+        "window": { "type": "integer", "minimum": 1 },
+        "mode": { "$ref": "#/$defs/mode" },
+        "prompt_bytes": { "type": "integer", "minimum": 0 },
+        "estimated_request_tokens": { "type": "integer", "minimum": 0 },
+        "full_control_prompt_bytes": { "type": "integer", "minimum": 0 },
+        "full_control_estimated_request_tokens": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "window",
+        "mode",
+        "prompt_bytes",
+        "estimated_request_tokens",
+        "full_control_prompt_bytes",
+        "full_control_estimated_request_tokens"
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_replay_state" },
+        "window": { "type": "integer", "minimum": 1 },
+        "mode": { "$ref": "#/$defs/mode" },
+        "selected_trajectory_initial": { "type": "array" },
+        "selected_trajectory_windows": {
+          "type": "array",
+          "items": { "type": "array" }
+        },
+        "supervisor_history": { "type": "object" },
+        "canonical_ledger": { "type": "array" },
+        "candidate_trajectories": { "type": "string" }
+      },
+      "required": [
+        "window",
+        "mode",
+        "selected_trajectory_initial",
+        "selected_trajectory_windows",
+        "supervisor_history",
+        "canonical_ledger",
+        "candidate_trajectories"
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_replay_request" },
+        "decision_call": { "enum": ["supervisor", "completion_review"] },
+        "call_index": { "type": "integer", "minimum": 1 },
+        "phase": { "enum": ["audit", "selection"] },
+        "model": { "type": "string", "minLength": 1 },
+        "messages": { "type": "array" },
+        "tools": { "type": "array" },
+        "parameters": { "type": "object" }
+      },
+      "required": [
+        "decision_call",
+        "call_index",
+        "phase",
+        "model",
+        "messages",
+        "tools",
+        "parameters"
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_replay_response" },
+        "call_index": { "type": "integer", "minimum": 1 },
+        "response": { "type": "object" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "error": { "type": "string" }
+      },
+      "required": ["call_index"],
+      "anyOf": [
+        { "required": ["response", "usage"] },
+        { "required": ["error"] }
+      ]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_fast_path" },
+        "window": { "type": "integer", "minimum": 1 },
+        "eligible": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } },
+        "used": { "type": "boolean" },
+        "fallback_reason": { "type": ["string", "null"] },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["window", "eligible", "reasons", "used", "fallback_reason", "usage"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_fast_path_request" },
+        "model": { "type": "string", "minLength": 1 },
+        "messages": { "type": "array" },
+        "tools": { "type": "array", "minItems": 1, "maxItems": 1 }
+      },
+      "required": ["model", "messages", "tools"]
+    },
+    {
+      "properties": {
+        "type": { "const": "asgard_supervisor_fast_path_response" },
+        "response": { "type": "object" }
+      },
+      "required": ["response"]
+    }
+  ],
+  "$defs": {
+    "mode": {
+      "enum": [
+        "full",
+        "latest-state",
+        "checkpoint-plus-delta",
+        "decision-log-only",
+        "recent-exact-tail"
+      ]
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input": { "type": "integer", "minimum": 0 },
+        "output": { "type": "integer", "minimum": 0 },
+        "thought": { "type": "integer", "minimum": 0 },
+        "cachedRead": { "type": "integer", "minimum": 0 },
+        "cachedWrite": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["input", "output", "thought", "cachedRead", "cachedWrite"],
+      "additionalProperties": false
+    }
+  }
+}
