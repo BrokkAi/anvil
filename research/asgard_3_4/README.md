@@ -50,6 +50,26 @@ uv run python bpr_agent.py --engine deepswe \
   --no-anvil-rebuild --headless
 ```
 
+The checked-in `live_experiments.json` stages the corrected-bootstrap Q3 and Q4
+paired studies under `/tmp/asgard-3-4-live-v2`:
+
+```bash
+python3 research/asgard_3_4/prepare_live_experiments.py
+python3 research/asgard_3_4/run_live_detached.py \
+  --batch q3-corrected-full --batch q3-corrected-checkpoint \
+  --batch q3-corrected-recent-tail --attempt 1
+python3 research/asgard_3_4/run_live_detached.py \
+  --batch q3-corrected-full --batch q3-corrected-checkpoint \
+  --batch q3-corrected-recent-tail --attempt 1 --status
+```
+
+The detached launcher gives each controller an explicit log and process session,
+so it can continue across research-agent turns. Status classifies archives with
+both `result.json` and `anvil-trace.jsonl` as captured and reports cancellation or
+corrupt ZIPs separately; infrastructure marker JSON does not count as a completed
+result. A controller PID may be unobservable from a later sandbox PID namespace,
+so artifact counts and the controller log are authoritative.
+
 Aggregate completed pilot archives with:
 
 ```bash
