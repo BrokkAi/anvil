@@ -51,6 +51,7 @@ mod tools;
 mod trace_logging;
 mod train_bifrost;
 mod usage_report;
+mod workspace_delta;
 
 use crate::llm_client::LlmBackend;
 use crate::multi_backend::{BackendRegistration, MultiBackend};
