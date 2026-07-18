@@ -286,18 +286,23 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         }
     tasks = sorted({str(run["task"]) for run in runs})
-    paired = {
-        task: {
-            run["mode"]: {
-                "reward": run["reward"],
-                "partial": run["partial"],
-                "stop_reason": run["stop_reason"],
-            }
-            for run in runs
-            if run["task"] == task
-        }
-        for task in tasks
-    }
+    paired: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for task in tasks:
+        paired[task] = {}
+        for mode in sorted(by_mode):
+            attempts = [
+                run for run in runs if run["task"] == task and run["mode"] == mode
+            ]
+            if attempts:
+                paired[task][mode] = [
+                    {
+                        "archive": run["archive"],
+                        "reward": run["reward"],
+                        "partial": run["partial"],
+                        "stop_reason": run["stop_reason"],
+                    }
+                    for run in attempts
+                ]
     return {"runs": runs, "modes": mode_rows, "paired_task_outcomes": paired}
 
 

@@ -71,7 +71,8 @@ class AnalyzeLivePilotTest(unittest.TestCase):
                     "reward.json", json.dumps({"reward": 1, "partial": 1.0})
                 )
             run = pilot.extract_run(path)
-            summary = pilot.summarize([run])
+            second = {**run, "archive": "second.zip", "reward": 0}
+            summary = pilot.summarize([run, second])
 
         self.assertEqual(run["mode"], "latest-state")
         self.assertEqual(run["ordinary_routing"]["usage"]["input"], 10)
@@ -89,6 +90,15 @@ class AnalyzeLivePilotTest(unittest.TestCase):
                 "rawInput"
             ],
             15,
+        )
+        self.assertEqual(
+            [
+                attempt["reward"]
+                for attempt in summary["paired_task_outcomes"]["task-1"][
+                    "latest-state"
+                ]
+            ],
+            [1, 0],
         )
 
     def test_rejects_mismatched_replay_call_index(self) -> None:
