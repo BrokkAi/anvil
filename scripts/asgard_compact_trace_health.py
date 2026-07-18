@@ -137,10 +137,11 @@ def decision_claims_execution_evidence(decision: dict) -> bool:
 def classify_unresolved(runs: list[RunHealth]) -> tuple[int, int, int]:
     """Splits unresolved handles into prior-window, current-window, malformed.
 
-    Prior-window misses are expected and benign: the dossier shows trajectories
-    from earlier windows whose handles look valid but are not retrievable, and
-    the supervisor gets an explicit error rather than wrong data. A
-    current-window miss is the one that means something is broken.
+    Since v13 the winning lane of every earlier window is retained, so a
+    prior-window handle SHOULD resolve. A miss now means either the handle
+    named a losing lane (benign — that work was discarded with its checkout) or
+    retention is not reaching the supervisor. Both are worth surfacing, but only
+    at volume; a current-window or malformed miss is a defect at any count.
     """
     prior = current = malformed = 0
     for run in runs:
@@ -252,13 +253,16 @@ def report(runs: list[RunHealth], verbose: bool) -> dict:
     summary["unresolved_prior_window"] = prior_miss
     summary["unresolved_current_window"] = current_miss
     summary["unresolved_malformed"] = malformed_miss
+    requested = total_handles + total_unresolved
     if prior_miss:
-        requested = total_handles + total_unresolved
         pct = 100.0 * prior_miss / requested if requested else 0.0
-        print(
-            f"prior-window handles asked : {prior_miss} ({pct:.0f}% of requests) "
-            "- not retrievable by design"
-        )
+        print(f"prior-window misses          : {prior_miss} ({pct:.0f}% of requests)")
+        if pct > 10.0:
+            problems.append(
+                f"RETENTION: {prior_miss} prior-window handles ({pct:.0f}% of requests) failed to "
+                "resolve. Since v13 the winning lane of each earlier window is retained, so this "
+                "should be rare — check that retained_windows reaches the audit context."
+            )
     if current_miss:
         problems.append(
             f"HANDLES: {current_miss} handle(s) naming the CURRENT window failed to resolve. "

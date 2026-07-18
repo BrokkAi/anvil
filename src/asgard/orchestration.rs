@@ -355,6 +355,11 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut selected_trajectory_initial = common_messages.clone();
     let mut selected_trajectory_windows: Vec<Vec<ChatMessage>> = Vec::new();
     let mut canonical_ledger: Vec<(usize, AsgardExecutionLedger)> = Vec::new();
+    // Winning lanes' full windows, kept so `view_tool_call` can expand handles
+    // the dossier still cites from earlier windows. Only the winner is retained
+    // — losing lanes' work is discarded with their checkouts. Measured at
+    // ~0.7 MB for a whole task, so there is no eviction policy.
+    let mut retained_windows: Vec<AsgardRetainedWindow> = Vec::new();
     let mut supervisor_history = AsgardSupervisorHistory::default();
     let mut prior_completion_review: Option<AsgardPriorCompletionReview> = None;
     let mut window_deltas_since_prior_review: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -568,7 +573,8 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     &outcome.continuation_messages,
                     trajectory_message_start,
                 );
-                let window_ledger = asgard_extract_execution_ledger(&window_messages);
+                let window_ledger =
+                    asgard_extract_execution_ledger(window, index, &window_messages);
                 let (supervisor_window_messages, raw_bytes, packed_bytes) =
                     asgard_deterministic_candidate_handoff(
                         window,
@@ -669,6 +675,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             &selected_trajectory_initial,
             &selected_trajectory_windows,
             &supervisor_history,
+            &retained_windows,
             &live_output,
         )
         .await;
@@ -811,6 +818,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     max_candidate_count: config.candidate_models.len(),
                     task_contract_checklist: &task_contract_checklist,
                     canonical_ledger: &canonical_ledger,
+                    retained_windows: &retained_windows,
                     original_task: &original_task,
                     selected_trajectory_initial: &selected_trajectory_initial,
                     selected_trajectory_windows: &selected_trajectory_windows,
@@ -979,6 +987,11 @@ pub(crate) async fn run_asgard_trajectory_loop(
         );
         selected_trajectory_windows.push(selected_window);
         canonical_ledger.push((window, winner.window_ledger.clone()));
+        retained_windows.push(AsgardRetainedWindow {
+            window,
+            lane: winner.index,
+            messages: winner.window_messages.clone(),
+        });
         supervisor_history.push(window, &decision);
         if let Some(review) = completed_rejection_review {
             let rows = review.contracts.clone().unwrap_or_default();
@@ -1342,6 +1355,7 @@ pub(crate) async fn run_asgard_supervisor(
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
     supervisor_history: &AsgardSupervisorHistory,
+    retained_windows: &[AsgardRetainedWindow],
     live_output: &AsgardLiveOutput,
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
@@ -1354,6 +1368,7 @@ pub(crate) async fn run_asgard_supervisor(
         candidates,
         definitions: audit_definitions.to_vec(),
         allowed_lane: None,
+        retained_windows,
         window,
     };
     let diff_inputs = candidates
@@ -1513,6 +1528,7 @@ pub(crate) struct AsgardCompletionReviewContext<'a> {
     pub(crate) max_candidate_count: usize,
     pub(crate) task_contract_checklist: &'a AsgardTaskContractChecklist,
     pub(crate) canonical_ledger: &'a [(usize, AsgardExecutionLedger)],
+    pub(crate) retained_windows: &'a [AsgardRetainedWindow],
     pub(crate) original_task: &'a str,
     pub(crate) selected_trajectory_initial: &'a [ChatMessage],
     pub(crate) selected_trajectory_windows: &'a [Vec<ChatMessage>],
@@ -1541,6 +1557,7 @@ pub(crate) async fn run_asgard_completion_review(
         max_candidate_count,
         task_contract_checklist,
         canonical_ledger,
+        retained_windows,
         original_task,
         selected_trajectory_initial,
         selected_trajectory_windows,
@@ -1574,6 +1591,7 @@ pub(crate) async fn run_asgard_completion_review(
         candidates,
         definitions: audit_definitions.to_vec(),
         allowed_lane: Some(selected_lane),
+        retained_windows,
         window,
     };
     let (terminal_non_test_patch, terminal_test_patch) = asgard_patch_surfaces(&candidate.patch);
@@ -1751,9 +1769,19 @@ pub(crate) struct AsgardAuditContext<'a> {
     pub(crate) candidates: &'a [AsgardCandidate],
     pub(crate) definitions: Vec<ToolDefinition>,
     pub(crate) allowed_lane: Option<usize>,
-    /// Window the compact trajectories in this dossier were rendered for;
-    /// `view_tool_call` handles are only resolvable within it.
+    /// Window the live candidate trajectories were rendered for.
     pub(crate) window: usize,
+    /// Winning lanes from earlier windows, whose handles the dossier still
+    /// cites through the canonical ledger and carried-forward evidence.
+    pub(crate) retained_windows: &'a [AsgardRetainedWindow],
+}
+
+/// One earlier window's winning lane, retained so its handles stay expandable.
+#[derive(Debug, Clone)]
+pub(crate) struct AsgardRetainedWindow {
+    pub(crate) window: usize,
+    pub(crate) lane: usize,
+    pub(crate) messages: Vec<ChatMessage>,
 }
 
 pub(crate) fn asgard_is_audit_tool(name: &str) -> bool {
@@ -1867,16 +1895,12 @@ pub(crate) fn resolve_asgard_tool_call_handles(
             ));
             continue;
         };
-        if handle_window != window {
-            rendered.push_str(&format!(
-                "<tool_call id=\"{handle}\" error=\"handle belongs to window {handle_window}; only \
-                 the current window {window} is retrievable\" />\n"
-            ));
-            continue;
-        }
         // The terminal completion review sees exactly one lane; a handle naming
         // another lane must be refused here just as the audit tools refuse it.
+        // Earlier windows are exempt: only their winner was retained, so their
+        // lane is already the selected one by construction.
         if let Some(allowed_lane) = audit.allowed_lane
+            && handle_window == window
             && lane != allowed_lane
         {
             rendered.push_str(&format!(
@@ -1885,17 +1909,31 @@ pub(crate) fn resolve_asgard_tool_call_handles(
             ));
             continue;
         }
-        let Some(candidate) = audit
-            .candidates
-            .iter()
-            .find(|candidate| candidate.index == lane)
-        else {
-            rendered.push_str(&format!(
-                "<tool_call id=\"{handle}\" error=\"candidate lane {lane} does not exist\" />\n"
-            ));
-            continue;
+        let messages = if handle_window == window {
+            let Some(candidate) = audit
+                .candidates
+                .iter()
+                .find(|candidate| candidate.index == lane)
+            else {
+                rendered.push_str(&format!(
+                    "<tool_call id=\"{handle}\" error=\"candidate lane {lane} does not exist\" />\n"
+                ));
+                continue;
+            };
+            &candidate.window_messages
+        } else {
+            let retained = audit.retained_windows.iter().find(|retained| {
+                retained.window == handle_window && retained.lane == lane
+            });
+            let Some(retained) = retained else {
+                rendered.push_str(&format!(
+                    "<tool_call id=\"{handle}\" error=\"window {handle_window} lane {lane} was not \
+                     retained; only the winning lane of each earlier window is expandable\" />\n"
+                ));
+                continue;
+            };
+            &retained.messages
         };
-        let messages = &candidate.window_messages;
         let Some(result) = messages.get(index).filter(|message| message.role == "tool") else {
             rendered.push_str(&format!(
                 "<tool_call id=\"{handle}\" error=\"no tool result at this position\" />\n"
@@ -2757,7 +2795,7 @@ If the best lanes are plainly incomplete, do not perform a terminal-grade exhaus
 </decision_depth>
 
 <audit_protocol>
-view_tool_call expands the compact trajectories you were given and is unbudgeted — use it freely and prefer it over auditing the checkout whenever the answer is in a tool result you were already shown. Lane-aware read_file, grep_search, list_directory, and Bifrost symbol tools additionally inspect the candidate checkouts for evidence the trajectories do not contain. They cannot run builds or tests. You have at most {audit_rounds} information-gathering responses using those checkout tools, including this one; the last opportunity will be announced. Batch related questions and stop once the answer cannot change the winner or completion judgment. After the budget is exhausted, audit calls are ignored and you must select.
+view_tool_call expands the compact trajectories you were given and is unbudgeted — use it freely and prefer it over auditing the checkout whenever the answer is in a tool result you were already shown. Every id is a handle of the form w<window>l<lane>m<index>, and execution_ledger entries are keyed by the same handles, so a ledger row you are about to cite as evidence can be expanded to the command's full output — the ledger carries only the last 400 bytes. Handles from earlier windows resolve too, for the lane that won that window. Lane-aware read_file, grep_search, list_directory, and Bifrost symbol tools additionally inspect the candidate checkouts for evidence the trajectories do not contain. They cannot run builds or tests. You have at most {audit_rounds} information-gathering responses using those checkout tools, including this one; the last opportunity will be announced. Batch related questions and stop once the answer cannot change the winner or completion judgment. After the budget is exhausted, audit calls are ignored and you must select.
 
 Unavailable executable verification is not a reason to withhold a decision. If it is necessary to establish completeness, set complete=false and tell one or more next-window candidates exactly what behavior or command to verify. Repository auditing is evidence gathering, not another implementation rollout.
 </audit_protocol>
@@ -3030,7 +3068,8 @@ pub(crate) fn asgard_deterministic_candidate_handoff(
          This is a mechanically rendered trajectory, not a candidate-authored summary: every line \
          is a pure function of what this lane actually did. Tool results appear as deterministic \
          one-line summaries carrying an id; call view_tool_call with those ids to read the complete \
-         arguments and untruncated result. A len attribute gives the full character count of text \
+         arguments and untruncated result. The same ids key this lane's execution_ledger entries, \
+         whose output_tail holds only the last 400 bytes of a command's output. A len attribute gives the full character count of text \
          that was shortened. A tool line with exact_duplicate_of repeats a byte-identical earlier \
          result and is not independent confirmation of anything.\n\
          <current_plan>\n{plan}\n</current_plan>\n\
@@ -3617,7 +3656,15 @@ pub(crate) fn asgard_take_window_messages(
         .to_vec()
 }
 
+/// Builds the execution ledger for one lane's window.
+///
+/// Entry ids are `view_tool_call` handles, not a private `L{n}` sequence: the
+/// supervisor cites ledger ids as execution evidence and separately retrieves
+/// full tool results by handle, and two vocabularies for the same shell call
+/// only invited it to pass one where the other belonged.
 pub(crate) fn asgard_extract_execution_ledger(
+    window: usize,
+    lane: usize,
     window_messages: &[ChatMessage],
 ) -> AsgardExecutionLedger {
     let exit_code_regex =
@@ -3656,15 +3703,20 @@ pub(crate) fn asgard_extract_execution_ledger(
                 if command.chars().count() > 500 {
                     command = format!("{}…", command.chars().take(500).collect::<String>());
                 }
+                // The absolute index of the *result* message, not the assistant
+                // message holding the call: that is what a handle addresses.
                 let matching_result = window_messages
                     .get(step + 1..)
                     .unwrap_or_default()
                     .iter()
-                    .find(|later| {
+                    .enumerate()
+                    .find(|(_, later)| {
                         later.role == "tool" && later.tool_call_id.as_deref() == Some(&call.id)
-                    });
+                    })
+                    .map(|(offset, result)| (step + 1 + offset, result));
+                let result_index = matching_result.map(|(index, _)| index);
                 let (exit_code, output_bytes, output_sha256, output_tail) = match matching_result {
-                    Some(result) => {
+                    Some((_, result)) => {
                         let result_text = asgard_message_text(result);
                         let exit_code = exit_code_regex
                             .captures_iter(&result_text)
@@ -3687,7 +3739,14 @@ pub(crate) fn asgard_extract_execution_ledger(
                     None => (None, 0, asgard_sha256(&[]), String::new()),
                 };
                 entries.push(AsgardLedgerEntry {
-                    id: format!("L{total_shell_commands}"),
+                    // A command whose result never arrived has nothing to
+                    // retrieve; the handle points at the call site and
+                    // resolution reports the absence rather than inventing one.
+                    id: crate::asgard::asgard_tool_handle(
+                        window,
+                        lane,
+                        result_index.unwrap_or(step),
+                    ),
                     step,
                     command,
                     exit_code,
@@ -4040,7 +4099,8 @@ pub(crate) fn asgard_validate_contract_rows(
                 {
                     violations.push(format!(
                         "contract {id} is kind=execution but its row cites no \
-                         execution_ledger entry (L<n>); execution contracts cannot be \
+                         execution_ledger entry id (w<window>l<lane>m<index>); \
+                         execution contracts cannot be \
                          verified by inspection alone — cite the ledger entry that \
                          exercised this behavior, or mark the row unverified"
                     ));
@@ -4070,17 +4130,26 @@ pub(crate) fn asgard_validate_contract_rows(
     violations
 }
 
+/// Whether a contract row cites an execution_ledger entry by id.
+///
+/// Ledger ids are `view_tool_call` handles (`w<window>l<lane>m<index>`). This
+/// gates every execution-kind contract, so it must track the id format exactly:
+/// a detector still looking for the old `L<n>` shape would reject every
+/// execution row ever written and fail the completion gate outright.
 pub(crate) fn asgard_cites_ledger_entry(row: &AsgardContractRow) -> bool {
     let cited = |text: &str| {
-        text.match_indices('L').any(|(index, _)| {
-            text[index + 1..]
+        text.match_indices('w').any(|(index, _)| {
+            text[..index]
                 .chars()
-                .next()
-                .is_some_and(|next| next.is_ascii_digit())
-                && text[..index]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|previous| !previous.is_alphanumeric())
+                .next_back()
+                .is_none_or(|previous| !previous.is_alphanumeric())
+                && crate::asgard::parse_asgard_tool_handle(
+                    text[index..]
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .next()
+                        .unwrap_or_default(),
+                )
+                .is_some()
         })
     };
     cited(&row.evidence) || row.adverse_condition_evidence.as_deref().is_some_and(cited)
@@ -4735,6 +4804,7 @@ mod tests {
             candidates: &candidates,
             definitions: Vec::new(),
             allowed_lane: None,
+            retained_windows: &[],
             window: 3,
         };
 
@@ -4746,16 +4816,114 @@ mod tests {
         assert!(resolved.contains("cargo test -p lane0"));
         assert!(resolved.contains("cargo test -p lane1"));
 
-        // Handles from other windows, and malformed handles, are refused rather
-        // than silently resolved against the wrong window's messages.
+        // An unretained earlier window is refused rather than silently resolved
+        // against the current window's messages, as are malformed handles.
         let refused =
             resolve_asgard_tool_call_handles(&audit, &["w2l0m1".to_string(), "junk".to_string()]);
-        assert!(
-            refused.contains("only \n         the current window 3 is retrievable")
-                || refused.contains("the current window 3 is retrievable")
-        );
+        assert!(refused.contains("was not retained"));
         assert!(refused.contains("unrecognized handle format"));
         assert!(!refused.contains("lane 0 full output"));
+    }
+
+    #[test]
+    fn asgard_view_tool_call_expands_retained_earlier_windows() {
+        let candidates = vec![asgard_test_candidate(
+            0,
+            vec![
+                ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                    "c0",
+                    "run_shell_command",
+                    serde_json::json!({"command": "cargo test current"}),
+                )]),
+                ChatMessage::tool_result("c0", "run_shell_command", "current window output"),
+            ],
+        )];
+        // Window 2 was won by lane 1; the dossier still cites its ledger.
+        let retained = vec![AsgardRetainedWindow {
+            window: 2,
+            lane: 1,
+            messages: vec![
+                ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                    "p0",
+                    "run_shell_command",
+                    serde_json::json!({"command": "cargo test --release earlier"}),
+                )]),
+                ChatMessage::tool_result("p0", "run_shell_command", "earlier window full output"),
+            ],
+        }];
+        let audit = AsgardAuditContext {
+            registries: &[],
+            candidates: &candidates,
+            definitions: Vec::new(),
+            allowed_lane: None,
+            retained_windows: &retained,
+            window: 3,
+        };
+
+        let resolved = resolve_asgard_tool_call_handles(&audit, &["w2l1m1".to_string()]);
+        assert!(resolved.contains("earlier window full output"));
+        assert!(resolved.contains("cargo test --release earlier"));
+
+        // Only the lane that actually won that window is expandable.
+        let refused = resolve_asgard_tool_call_handles(&audit, &["w2l0m1".to_string()]);
+        assert!(refused.contains("was not retained"));
+        assert!(!refused.contains("earlier window full output"));
+    }
+
+    #[test]
+    fn asgard_ledger_ids_are_view_tool_call_handles_for_the_same_result() {
+        let messages = vec![
+            ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
+                "s0",
+                "run_shell_command",
+                serde_json::json!({"command": "cargo test -p thing"}),
+            )]),
+            ChatMessage::tool_result("s0", "run_shell_command", "Exit code: 0\nall green"),
+        ];
+        let ledger = asgard_extract_execution_ledger(4, 2, &messages);
+        let entry = &ledger.entries[0];
+
+        // The id addresses the result message, not the assistant message that
+        // issued the call — that is what view_tool_call resolves.
+        assert_eq!(entry.id, "w4l2m1");
+        assert_eq!(entry.step, 0);
+
+        let candidates = vec![AsgardCandidate {
+            index: 2,
+            ..asgard_test_candidate(2, messages.clone())
+        }];
+        let audit = AsgardAuditContext {
+            registries: &[],
+            candidates: &candidates,
+            definitions: Vec::new(),
+            allowed_lane: None,
+            retained_windows: &[],
+            window: 4,
+        };
+        let resolved = resolve_asgard_tool_call_handles(&audit, std::slice::from_ref(&entry.id));
+        assert!(resolved.contains("all green"));
+        assert!(resolved.contains("cargo test -p thing"));
+    }
+
+    #[test]
+    fn asgard_execution_contracts_accept_handle_shaped_ledger_citations() {
+        let row = |evidence: &str| AsgardContractRow {
+            id: "C1".to_string(),
+            status: "verified".to_string(),
+            evidence: evidence.to_string(),
+            adverse_condition_evidence: None,
+        };
+        // The gate must recognize the handle form, or every execution contract
+        // fails validation and completion can never be accepted.
+        assert!(asgard_cites_ledger_entry(&row(
+            "w3l1m12 ran the suite and exited 0"
+        )));
+        assert!(asgard_cites_ledger_entry(&row("see ledger entry w0l0m4.")));
+        assert!(!asgard_cites_ledger_entry(&row(
+            "the tests obviously pass here"
+        )));
+        // The retired L<n> vocabulary is no longer a citation.
+        assert!(!asgard_cites_ledger_entry(&row("L3 exited 0")));
     }
 
     #[test]
@@ -4789,6 +4957,7 @@ mod tests {
             candidates: &candidates,
             definitions: Vec::new(),
             allowed_lane: Some(1),
+            retained_windows: &[],
             window: 0,
         };
         let resolved =
@@ -5205,7 +5374,7 @@ mod tests {
             )]),
         ];
 
-        let ledger = asgard_extract_execution_ledger(&messages);
+        let ledger = asgard_extract_execution_ledger(0, 0, &messages);
 
         assert_eq!(ledger.total_shell_commands, 4);
         assert_eq!(ledger.entries.len(), 4);
@@ -5265,7 +5434,7 @@ mod tests {
         ));
         messages.extend(shell("failure-output", "false", "failed\n\nExit code: 17"));
 
-        let ledger = asgard_extract_execution_ledger(&messages);
+        let ledger = asgard_extract_execution_ledger(0, 0, &messages);
 
         assert_eq!(
             ledger
@@ -5303,7 +5472,7 @@ mod tests {
             "contracts": [{
                 "id": "C1",
                 "status": "verified",
-                "evidence": "execution_ledger L1 exited 0 and terminal_test_patch asserts it"
+                "evidence": "execution_ledger w1l0m3 exited 0 and terminal_test_patch asserts it"
             }]
         });
         let valid_contracts = supervisor_tool_call(
@@ -5632,7 +5801,7 @@ mod tests {
             rows: vec![AsgardContractRow {
                 id: "C1".to_string(),
                 status: "verified".to_string(),
-                evidence: "L1 exercised output contract".to_string(),
+                evidence: "w1l0m3 exercised output contract".to_string(),
                 adverse_condition_evidence: Some("omitted from prior review message".to_string()),
             }],
             decision: AsgardSupervisorDecision {
@@ -5673,7 +5842,7 @@ mod tests {
         assert!(prior_message.contains("<prior_review_rows window=\"2\">"));
         assert!(prior_message.contains("\"id\": \"C1\""));
         assert!(prior_message.contains("\"status\": \"verified\""));
-        assert!(prior_message.contains("\"evidence\": \"L1 exercised output contract\""));
+        assert!(prior_message.contains("\"evidence\": \"w1l0m3 exercised output contract\""));
         assert!(!prior_message.contains("adverse_condition_evidence"));
         assert!(prior_message.contains("<prior_review_delta>"));
         assert!(prior_message.contains("+delta text"));
@@ -6297,6 +6466,7 @@ mod tests {
                 candidates: &candidates,
                 definitions: vec![audit_definition.clone()],
                 allowed_lane: None,
+                retained_windows: &[],
                 window: 0,
             }),
             required_winner: None,
@@ -6313,6 +6483,7 @@ mod tests {
                 candidates: &candidates,
                 definitions: vec![audit_definition],
                 allowed_lane: Some(1),
+                retained_windows: &[],
                 window: 0,
             }),
             required_winner: Some(1),
@@ -6406,6 +6577,7 @@ mod tests {
                     candidates: &candidates,
                     definitions,
                     allowed_lane: None,
+                    retained_windows: &[],
                     window: 0,
                 }),
                 required_winner: None,
@@ -6532,6 +6704,7 @@ mod tests {
                     candidates: &candidates,
                     definitions,
                     allowed_lane: None,
+                    retained_windows: &[],
                     window: 0,
                 }),
                 required_winner: None,
@@ -6673,6 +6846,7 @@ mod tests {
                     candidates: &candidates,
                     definitions,
                     allowed_lane: None,
+                    retained_windows: &[],
                     window: 0,
                 }),
                 required_winner: None,
