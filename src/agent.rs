@@ -4890,64 +4890,6 @@ struct AsgardCandidate {
     window_ledger: AsgardExecutionLedger,
 }
 
-const ASGARD_SHADOW_CANDIDATE_COUNT: usize = 3;
-const ASGARD_SHADOW_DEFAULT_PROBE_STEPS: usize = 2;
-const ASGARD_SHADOW_TOP_K: usize = 2;
-const ASGARD_SHADOW_CONTINUATION_STEPS: usize = 5;
-
-struct AsgardShadowStudyContext<'a> {
-    cx: &'a ConnectionTo<Client>,
-    sessions: &'a SessionStore,
-    session_id: &'a str,
-    llm: &'a Arc<dyn crate::llm_client::LlmBackend>,
-    registries: &'a [Arc<crate::tools::ToolRegistry>],
-    repositories: &'a [crate::asgard::CandidateRepository],
-    supervisor_model: &'a str,
-    reasoning_effort: Option<&'a str>,
-    service_tier: Option<&'a str>,
-    structured_output: Option<&'a StructuredOutputRequest>,
-    idle_timeout: IdleTimeouts,
-    cancel: tokio_util::sync::CancellationToken,
-    original_task: &'a str,
-    task_contract_checklist: &'a AsgardTaskContractChecklist,
-    context_length: Option<u32>,
-    context_prefix_len: usize,
-    window: usize,
-    probe_steps: usize,
-    probe_candidate_usage: &'a [(usize, crate::llm_client::TokenUsage)],
-    live_output: &'a AsgardLiveOutput,
-}
-
-struct AsgardShadowStudyOutcome {
-    candidates: Vec<AsgardCandidate>,
-    decision: AsgardSupervisorDecision,
-    reviewer_usage: crate::llm_client::TokenUsage,
-    continuation_usage_by_model: Vec<(String, crate::llm_client::TokenUsage)>,
-}
-
-struct AsgardShadowEndpoint {
-    lane: usize,
-    review_label: String,
-    endpoint_snapshot_id: String,
-    dossier: String,
-}
-
-struct AsgardShadowRankingRequest<'a> {
-    model: &'a str,
-    idle_timeout: IdleTimeouts,
-    cancel: tokio_util::sync::CancellationToken,
-    tool_name: &'a str,
-    expected_ids: Vec<String>,
-    messages: Vec<ChatMessage>,
-    stream_sinks: Option<AsgardStreamSinks>,
-}
-
-struct AsgardShadowRankingOutcome {
-    ids: Vec<String>,
-    distinction_kind: Option<String>,
-    distinction_evidence: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AsgardCandidateDiffBase {
     LastSelectedDecision,
@@ -5030,258 +4972,6 @@ const ASGARD_AUDIT_MAX_ROUNDS: usize = 3;
 const ASGARD_SELECTION_MAX_ATTEMPTS: usize = 3;
 const ASGARD_REVIEW_SELECTION_MAX_ATTEMPTS: usize = 6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AsgardSupervisorPromptMode {
-    Full,
-    LatestState,
-    CheckpointPlusDelta,
-    DecisionLogOnly,
-    RecentExactTail,
-}
-
-impl AsgardSupervisorPromptMode {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "full" => Some(Self::Full),
-            "latest-state" => Some(Self::LatestState),
-            "checkpoint-plus-delta" => Some(Self::CheckpointPlusDelta),
-            "decision-log-only" => Some(Self::DecisionLogOnly),
-            "recent-exact-tail" => Some(Self::RecentExactTail),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::LatestState => "latest-state",
-            Self::CheckpointPlusDelta => "checkpoint-plus-delta",
-            Self::DecisionLogOnly => "decision-log-only",
-            Self::RecentExactTail => "recent-exact-tail",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AsgardSupervisorPromptConfig {
-    mode: AsgardSupervisorPromptMode,
-    checkpoint_interval: usize,
-    recent_exact_tail: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AsgardSupervisorFastPathMode {
-    Disabled,
-    Conservative,
-}
-
-impl AsgardSupervisorFastPathMode {
-    fn from_environment() -> Self {
-        match std::env::var("ASGARD_SUPERVISOR_FAST_PATH").as_deref() {
-            Ok("conservative") => Self::Conservative,
-            Ok("disabled") | Err(_) => Self::Disabled,
-            Ok(value) => {
-                tracing::warn!(
-                    value,
-                    "unknown ASGARD_SUPERVISOR_FAST_PATH; fast path disabled"
-                );
-                Self::Disabled
-            }
-        }
-    }
-
-    fn is_enabled(self) -> bool {
-        self == Self::Conservative
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AsgardFastPathEligibility {
-    eligible: bool,
-    reasons: Vec<&'static str>,
-}
-
-struct AsgardFastPathRequest<'a> {
-    llm: &'a dyn crate::llm_client::LlmBackend,
-    model: &'a str,
-    idle_timeout: IdleTimeouts,
-    cancel: tokio_util::sync::CancellationToken,
-    messages: Vec<ChatMessage>,
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
-    serial_prerequisite: &'a str,
-    stream_sinks: Option<AsgardStreamSinks>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AsgardWindowPolicyMode {
-    Dynamic,
-    ExplicitProbe,
-}
-
-impl AsgardWindowPolicyMode {
-    fn from_environment() -> Self {
-        match std::env::var("ASGARD_WINDOW_POLICY_MODE").as_deref() {
-            Ok("explicit-probe") => Self::ExplicitProbe,
-            Ok("dynamic") | Err(_) => Self::Dynamic,
-            Ok(value) => {
-                tracing::warn!(
-                    value,
-                    "unknown ASGARD_WINDOW_POLICY_MODE; using dynamic control"
-                );
-                Self::Dynamic
-            }
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Dynamic => "dynamic",
-            Self::ExplicitProbe => "explicit-probe",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-enum AsgardWindowKind {
-    Probe,
-    Work,
-}
-
-impl AsgardWindowKind {
-    fn parse(value: &serde_json::Value) -> Option<Self> {
-        match value.get("window_kind")?.as_str()? {
-            "probe" => Some(Self::Probe),
-            "work" => Some(Self::Work),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Probe => "probe",
-            Self::Work => "work",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-struct AsgardProbeAdvice {
-    lane: usize,
-    hypothesis: String,
-    falsification_action: String,
-    continue_stop_signal: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-struct AsgardWindowPlan {
-    kind: AsgardWindowKind,
-    probe_advices: Vec<AsgardProbeAdvice>,
-}
-
-impl AsgardWindowPlan {
-    fn work() -> Self {
-        Self {
-            kind: AsgardWindowKind::Work,
-            probe_advices: Vec::new(),
-        }
-    }
-}
-
-impl Default for AsgardSupervisorPromptConfig {
-    fn default() -> Self {
-        Self {
-            mode: AsgardSupervisorPromptMode::Full,
-            checkpoint_interval: 3,
-            recent_exact_tail: 2,
-        }
-    }
-}
-
-impl AsgardSupervisorPromptConfig {
-    fn from_environment() -> Self {
-        let mut config = Self::default();
-        if let Ok(value) = std::env::var("ASGARD_SUPERVISOR_PROMPT_MODE") {
-            match AsgardSupervisorPromptMode::parse(&value) {
-                Some(mode) => config.mode = mode,
-                None => tracing::warn!(
-                    value,
-                    "unknown ASGARD_SUPERVISOR_PROMPT_MODE; using full control"
-                ),
-            }
-        }
-        config.checkpoint_interval = asgard_positive_env_usize(
-            "ASGARD_SUPERVISOR_CHECKPOINT_INTERVAL",
-            config.checkpoint_interval,
-        );
-        config.recent_exact_tail = asgard_positive_env_usize(
-            "ASGARD_SUPERVISOR_RECENT_EXACT_TAIL",
-            config.recent_exact_tail,
-        );
-        config
-    }
-}
-
-fn asgard_positive_env_usize(name: &str, default: usize) -> usize {
-    match std::env::var(name) {
-        Ok(value) => match value.parse::<usize>() {
-            Ok(parsed) if parsed > 0 => parsed,
-            _ => {
-                tracing::warn!(
-                    name,
-                    value,
-                    default,
-                    "invalid positive Asgard experiment setting"
-                );
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
-fn asgard_shadow_survivor_study_enabled() -> bool {
-    match std::env::var("ASGARD_SHADOW_SURVIVOR_STUDY").as_deref() {
-        Ok("1" | "true") => true,
-        Err(_) | Ok("0" | "false") => false,
-        Ok(value) => {
-            tracing::warn!(
-                value,
-                "invalid ASGARD_SHADOW_SURVIVOR_STUDY; shadow study disabled"
-            );
-            false
-        }
-    }
-}
-
-fn asgard_shadow_probe_steps() -> usize {
-    match std::env::var("ASGARD_SHADOW_PROBE_STEPS") {
-        Ok(value) => match value.parse::<usize>() {
-            Ok(steps @ 1..=2) => steps,
-            _ => {
-                tracing::warn!(
-                    value,
-                    default = ASGARD_SHADOW_DEFAULT_PROBE_STEPS,
-                    "invalid ASGARD_SHADOW_PROBE_STEPS; using two-step probe"
-                );
-                ASGARD_SHADOW_DEFAULT_PROBE_STEPS
-            }
-        },
-        Err(_) => ASGARD_SHADOW_DEFAULT_PROBE_STEPS,
-    }
-}
-
-fn asgard_usage_trace_value(usage: crate::llm_client::TokenUsage) -> serde_json::Value {
-    serde_json::json!({
-        "input": usage.input_tokens,
-        "output": usage.output_tokens,
-        "thought": usage.thought_tokens,
-        "cachedRead": usage.cached_read_tokens,
-        "cachedWrite": usage.cached_write_tokens,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct AsgardCandidatePatchManifest {
     candidate_changed_production_files: Vec<String>,
@@ -5290,7 +4980,7 @@ struct AsgardCandidatePatchManifest {
     patch_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AsgardSupervisorHistoryEntry {
     window: usize,
     winner: usize,
@@ -5326,8 +5016,6 @@ struct AsgardSupervisorDecision {
     next_window_steps: Option<usize>,
     state_summary: String,
     contracts: Option<Vec<AsgardContractRow>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_window_plan: Option<AsgardWindowPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5379,73 +5067,6 @@ struct AsgardSupervisorInitialAdvice {
     next_candidate_count: usize,
     next_window_steps: usize,
     state_summary: String,
-    next_window_plan: Option<AsgardWindowPlan>,
-}
-
-fn force_asgard_shadow_probe(advice: &mut AsgardSupervisorInitialAdvice, probe_steps: usize) {
-    let contracts = [
-        AsgardProbeAdvice {
-            lane: 0,
-            hypothesis: "The primary implementation path can satisfy the task contract without a structural redesign."
-                .to_string(),
-            falsification_action: "Inspect the named API and execute the narrowest representative behavior before committing to the implementation path."
-                .to_string(),
-            continue_stop_signal: "Continue if the focused evidence supports a local implementation; stop if the contract requires a different architecture."
-                .to_string(),
-        },
-        AsgardProbeAdvice {
-            lane: 1,
-            hypothesis: "Existing repository conventions expose a compatible integration point that avoids duplicating behavior."
-                .to_string(),
-            falsification_action: "Trace the closest existing implementation and test boundary, then check whether the requested behavior composes with it."
-                .to_string(),
-            continue_stop_signal: "Continue if a compatible integration seam is demonstrated; stop if the seam violates an explicit task contract."
-                .to_string(),
-        },
-        AsgardProbeAdvice {
-            lane: 2,
-            hypothesis: "The highest-risk boundary or adverse condition can be reproduced and used to drive a robust solution."
-                .to_string(),
-            falsification_action: "Construct the smallest discriminating boundary scenario and compare the observed behavior with the original task wording."
-                .to_string(),
-            continue_stop_signal: "Continue if the scenario reveals a concrete defect or invariant; stop if it is irrelevant and pursue the next explicit risk."
-                .to_string(),
-        },
-    ];
-    let prior_advices = std::mem::take(&mut advice.advices);
-    advice.advices = contracts
-        .iter()
-        .map(|contract| {
-            let strategy = prior_advices
-                .get(contract.lane)
-                .and_then(|advice| advice.as_deref())
-                .and_then(|advice| advice.split("<probe_contract>").next())
-                .map(str::trim)
-                .filter(|advice| !advice.is_empty())
-                .unwrap_or(
-                    "Investigate this distinct hypothesis and make only evidence-backed progress.",
-                );
-            Some(format!(
-                "{strategy}\n\
-                 <probe_contract>\n\
-                 hypothesis: {}\n\
-                 falsification_action: {}\n\
-                 continue_stop_signal: {}\n\
-                 </probe_contract>",
-                contract.hypothesis, contract.falsification_action, contract.continue_stop_signal,
-            ))
-        })
-        .collect();
-    advice.next_candidate_count = ASGARD_SHADOW_CANDIDATE_COUNT;
-    advice.next_window_steps = probe_steps;
-    advice.next_window_plan = Some(AsgardWindowPlan {
-        kind: AsgardWindowKind::Probe,
-        probe_advices: contracts.to_vec(),
-    });
-    advice.state_summary = format!(
-        "{} Research override: the next window is the fixed three-lane, two-step shadow survivor probe.",
-        advice.state_summary
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5526,38 +5147,8 @@ async fn run_asgard_trajectory_loop(
     let mut common_patch = Vec::new();
     let mut aggregate_usage = crate::llm_client::TokenUsage::default();
     let mut selected_outcome = None;
-    let mut selected_history_has_compaction_checkpoint = false;
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
-    let window_policy = AsgardWindowPolicyMode::from_environment();
-    let shadow_survivor_study = asgard_shadow_survivor_study_enabled();
-    let shadow_probe_steps = asgard_shadow_probe_steps();
-    if shadow_survivor_study
-        && (window_policy != AsgardWindowPolicyMode::ExplicitProbe
-            || config.candidate_models.len() != ASGARD_SHADOW_CANDIDATE_COUNT)
-    {
-        cleanup_asgard_repositories(&repositories);
-        return (
-            asgard_failure(anyhow::anyhow!(
-                "ASGARD_SHADOW_SURVIVOR_STUDY requires \
-                 ASGARD_WINDOW_POLICY_MODE=explicit-probe and exactly \
-                 {ASGARD_SHADOW_CANDIDATE_COUNT} configured candidate models"
-            )),
-            usage_by_model,
-        );
-    }
-    tracing::info!(
-        mode = window_policy.as_str(),
-        shadow_survivor_study,
-        shadow_probe_steps,
-        "configured Asgard window policy experiment"
-    );
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_window_policy_config",
-        "mode": window_policy.as_str(),
-        "shadow_survivor_study": shadow_survivor_study,
-        "shadow_probe_steps": shadow_probe_steps,
-    }));
     let (task_contract_checklist, checklist_usage) = run_asgard_task_contract_extraction(
         llm,
         supervisor_model,
@@ -5588,7 +5179,6 @@ async fn run_asgard_trajectory_loop(
             config.candidate_models.len(),
             &original_task,
             &live_output,
-            window_policy,
         )
         .await;
         aggregate_usage.add(supervisor.1);
@@ -5616,7 +5206,7 @@ async fn run_asgard_trajectory_loop(
             }
         }
     }
-    let mut initial_advice = match initial_advice {
+    let initial_advice = match initial_advice {
         Some(value) => value,
         None => {
             let error = initial_advice_error
@@ -5643,26 +5233,13 @@ async fn run_asgard_trajectory_loop(
                 next_window_steps: ASGARD_MIN_WINDOW_STEPS,
                 state_summary: "Initial supervisor routing failed validation; using a traced one-lane recovery window."
                     .to_string(),
-                next_window_plan: (window_policy == AsgardWindowPolicyMode::ExplicitProbe)
-                    .then(AsgardWindowPlan::work),
             }
         }
     };
-    if shadow_survivor_study {
-        force_asgard_shadow_probe(&mut initial_advice, shadow_probe_steps);
-        crate::trace_logging::append_trace_record(serde_json::json!({
-            "type": "asgard_shadow_forced_probe",
-            "candidate_count": ASGARD_SHADOW_CANDIDATE_COUNT,
-            "probe_steps": shadow_probe_steps,
-            "top_k": ASGARD_SHADOW_TOP_K,
-            "continuation_steps": ASGARD_SHADOW_CONTINUATION_STEPS,
-        }));
-    }
     let mut current_candidate_count = initial_advice.next_candidate_count;
     let mut current_window_steps = initial_advice.next_window_steps;
     let mut consecutive_winner_failures = 0usize;
     let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
-    let mut next_window_plan = initial_advice.next_window_plan.clone();
     let mut current_supervisor_state_summary = initial_advice.state_summary.clone();
     send_thought(
         cx,
@@ -5676,27 +5253,7 @@ async fn run_asgard_trajectory_loop(
         ),
     );
     let mut canonical_plan = initial_plan;
-    let supervisor_prompt_config = AsgardSupervisorPromptConfig::from_environment();
-    let supervisor_fast_path = AsgardSupervisorFastPathMode::from_environment();
-    tracing::info!(
-        mode = supervisor_prompt_config.mode.as_str(),
-        checkpoint_interval = supervisor_prompt_config.checkpoint_interval,
-        recent_exact_tail = supervisor_prompt_config.recent_exact_tail,
-        fast_path = ?supervisor_fast_path,
-        "configured Asgard supervisor prompt experiment"
-    );
     for window in 1usize.. {
-        let current_window_plan = next_window_plan
-            .clone()
-            .unwrap_or_else(AsgardWindowPlan::work);
-        if window_policy == AsgardWindowPolicyMode::ExplicitProbe {
-            crate::trace_logging::append_trace_record(asgard_window_kind_trace_record(
-                window,
-                current_candidate_count,
-                current_window_steps,
-                &current_window_plan,
-            ));
-        }
         let verified_at_window_start = canonical_ledger
             .last()
             .and_then(|(_, ledger)| render_asgard_verified_at_window_start(ledger));
@@ -5850,7 +5407,6 @@ async fn run_asgard_trajectory_loop(
             });
         }
         let mut candidates = Vec::with_capacity(current_candidate_count);
-        let mut probe_candidate_usage = Vec::with_capacity(current_candidate_count);
         for (
             index,
             model,
@@ -5861,9 +5417,6 @@ async fn run_asgard_trajectory_loop(
             grading_usage,
         ) in futures::future::join_all(futures).await
         {
-            let mut combined_candidate_usage = outcome.usage;
-            combined_candidate_usage.add(grading_usage);
-            probe_candidate_usage.push((index, combined_candidate_usage));
             aggregate_usage.add(outcome.usage);
             aggregate_usage.add(grading_usage);
             usage_by_model
@@ -5890,132 +5443,31 @@ async fn run_asgard_trajectory_loop(
                 }
             }
         }
-        let mut candidate_window_usage = crate::llm_client::TokenUsage::default();
-        let mut candidate_window_usage_rows = probe_candidate_usage
-            .iter()
-            .map(|(lane, usage)| {
-                candidate_window_usage.add(*usage);
-                serde_json::json!({
-                    "lane": lane,
-                    "model": candidates
-                        .iter()
-                        .find(|candidate| candidate.index == *lane)
-                        .map(|candidate| candidate.model.as_str()),
-                    "usage": asgard_usage_trace_value(*usage),
-                })
-            })
-            .collect::<Vec<_>>();
-        candidate_window_usage_rows.sort_by_key(|row| row["lane"].as_u64().unwrap_or(u64::MAX));
-        crate::trace_logging::append_trace_record(serde_json::json!({
-            "type": "asgard_candidate_window_usage",
-            "window": window,
-            "candidate_count": current_candidate_count,
-            "window_steps": current_window_steps,
-            "lanes": candidate_window_usage_rows,
-            "usage": asgard_usage_trace_value(candidate_window_usage),
-        }));
         let supervisor_audit_definitions = match registries.first() {
             Some(registry) => {
                 asgard_audit_tool_definitions(registry.tool_definitions().await, candidates.len())
             }
             None => Vec::new(),
         };
-        let shadow_study =
-            shadow_survivor_study && current_window_plan.kind == AsgardWindowKind::Probe;
-        let shadow_outcome = if shadow_study {
-            if candidates.len() != ASGARD_SHADOW_CANDIDATE_COUNT
-                || current_window_steps != shadow_probe_steps
-            {
-                cleanup_asgard_repositories(&repositories);
-                return (
-                    asgard_failure(anyhow::anyhow!(
-                        "ASGARD_SHADOW_SURVIVOR_STUDY requires an explicit probe with exactly \
-                         {ASGARD_SHADOW_CANDIDATE_COUNT} lanes and \
-                         {shadow_probe_steps} steps (got {} lanes and {} steps)",
-                        candidates.len(),
-                        current_window_steps,
-                    )),
-                    usage_by_model,
-                );
-            }
-            let study = run_asgard_shadow_survivor_study(
-                AsgardShadowStudyContext {
-                    cx,
-                    sessions,
-                    session_id,
-                    llm,
-                    registries: &registries[..current_candidate_count],
-                    repositories: &repositories[..current_candidate_count],
-                    supervisor_model,
-                    reasoning_effort,
-                    service_tier,
-                    structured_output,
-                    idle_timeout,
-                    cancel: cancel.clone(),
-                    original_task: &original_task,
-                    task_contract_checklist: &task_contract_checklist,
-                    context_length,
-                    context_prefix_len,
-                    window,
-                    probe_steps: shadow_probe_steps,
-                    probe_candidate_usage: &probe_candidate_usage,
-                    live_output: &live_output,
-                },
-                candidates,
-            )
-            .await;
-            match study {
-                Ok(study) => {
-                    let AsgardShadowStudyOutcome {
-                        candidates: continued_candidates,
-                        decision,
-                        reviewer_usage,
-                        continuation_usage_by_model,
-                    } = study;
-                    candidates = continued_candidates;
-                    for (model, usage) in continuation_usage_by_model {
-                        aggregate_usage.add(usage);
-                        usage_by_model.entry(model).or_default().add(usage);
-                    }
-                    Some((decision, reviewer_usage))
-                }
-                Err(error) => {
-                    cleanup_asgard_repositories(&repositories);
-                    return (asgard_failure(error), usage_by_model);
-                }
-            }
-        } else {
-            None
-        };
-        let supervisor = if let Some((decision, reviewer_usage)) = &shadow_outcome {
-            (Ok(decision.clone()), *reviewer_usage)
-        } else {
-            run_asgard_supervisor(
-                llm,
-                supervisor_model,
-                idle_timeout,
-                cancel.clone(),
-                window,
-                &candidates,
-                &repositories[..current_candidate_count],
-                &registries[..current_candidate_count],
-                &supervisor_audit_definitions,
-                config.candidate_models.len(),
-                &task_contract_checklist,
-                &original_task,
-                &selected_trajectory_initial,
-                &selected_trajectory_windows,
-                &supervisor_history,
-                &canonical_ledger,
-                supervisor_prompt_config,
-                supervisor_fast_path,
-                window_policy,
-                &current_window_plan,
-                next_advices.as_deref(),
-                &live_output,
-            )
-            .await
-        };
+        let supervisor = run_asgard_supervisor(
+            llm,
+            supervisor_model,
+            idle_timeout,
+            cancel.clone(),
+            window,
+            &candidates,
+            &repositories[..current_candidate_count],
+            &registries[..current_candidate_count],
+            &supervisor_audit_definitions,
+            config.candidate_models.len(),
+            &task_contract_checklist,
+            &original_task,
+            &selected_trajectory_initial,
+            &selected_trajectory_windows,
+            &supervisor_history,
+            &live_output,
+        )
+        .await;
         let supervisor_usage = supervisor.1;
         aggregate_usage.add(supervisor_usage);
         usage_by_model
@@ -6063,8 +5515,6 @@ async fn run_asgard_trajectory_loop(
                         "Window {window} supervisor routing failed validation; selected the first non-failed lane and scheduled a one-lane recovery window."
                     ),
                     contracts: None,
-                    next_window_plan: (window_policy == AsgardWindowPolicyMode::ExplicitProbe)
-                        .then(AsgardWindowPlan::work),
                 }
             }
         };
@@ -6098,7 +5548,6 @@ async fn run_asgard_trajectory_loop(
                     supervisor_history: &supervisor_history,
                     prior_review: prior_completion_review.as_ref(),
                     window_deltas_since_prior_review: &window_deltas_since_prior_review,
-                    window_policy,
                     live_output: &live_output,
                 },
             )
@@ -6147,8 +5596,6 @@ async fn run_asgard_trajectory_loop(
                              window {window}; continuing with a verification window."
                         ),
                         contracts: None,
-                        next_window_plan: (window_policy == AsgardWindowPolicyMode::ExplicitProbe)
-                            .then(AsgardWindowPlan::work),
                     }
                 }
             };
@@ -6186,7 +5633,6 @@ async fn run_asgard_trajectory_loop(
         let supervisor_completion_summary = decision.state_summary.clone();
         current_supervisor_state_summary = decision.state_summary.clone();
         next_advices = Some(decision.advices.clone());
-        next_window_plan = decision.next_window_plan.clone();
         if !supervisor_complete && let Some(advices) = &next_advices {
             current_candidate_count = decision
                 .next_candidate_count
@@ -6291,7 +5737,13 @@ async fn run_asgard_trajectory_loop(
                     common_messages.truncate(context_prefix_len.min(common_messages.len()));
                     common_messages.extend(compaction.checkpoint_messages);
                     winner.outcome.continuation_messages = common_messages.clone();
-                    selected_history_has_compaction_checkpoint = true;
+                    winner.outcome.compaction_checkpoint =
+                        Some(crate::session::CompactionCheckpoint {
+                            messages: common_messages
+                                [context_prefix_len.min(common_messages.len())..]
+                                .to_vec(),
+                            current_plan: canonical_plan.clone(),
+                        });
                     selected_trajectory_initial = common_messages.clone();
                     selected_trajectory_windows.clear();
                     supervisor_history.checkpoint_selected_windows();
@@ -6308,17 +5760,6 @@ async fn run_asgard_trajectory_loop(
             }
         }
         winner.outcome.continuation_messages = common_messages.clone();
-        winner.outcome.compaction_checkpoint =
-            selected_history_has_compaction_checkpoint.then(|| {
-                crate::session::CompactionCheckpoint {
-                    // Persist the cumulative checkpoint plus every exact window
-                    // selected after it. Otherwise a later non-compacting Asgard
-                    // window would overwrite and lose the earlier checkpoint.
-                    messages: common_messages[context_prefix_len.min(common_messages.len())..]
-                        .to_vec(),
-                    current_plan: canonical_plan.clone(),
-                }
-            });
         if supervisor_complete {
             send_thought(
                 cx,
@@ -6384,716 +5825,6 @@ async fn run_asgard_trajectory_loop(
     (outcome, usage_by_model)
 }
 
-async fn run_asgard_shadow_survivor_study(
-    context: AsgardShadowStudyContext<'_>,
-    candidates: Vec<AsgardCandidate>,
-) -> anyhow::Result<AsgardShadowStudyOutcome> {
-    anyhow::ensure!(
-        candidates.len() == ASGARD_SHADOW_CANDIDATE_COUNT,
-        "shadow survivor study requires exactly {ASGARD_SHADOW_CANDIDATE_COUNT} candidates"
-    );
-    let study_id = uuid::Uuid::new_v4().to_string();
-    let base_snapshot_id = uuid::Uuid::new_v4().to_string();
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_shadow_tournament_config",
-        "study_id": study_id,
-        "task": context.session_id,
-        "window": context.window,
-        "candidate_count": ASGARD_SHADOW_CANDIDATE_COUNT,
-        "probe_steps": context.probe_steps,
-        "continuation_steps": ASGARD_SHADOW_CONTINUATION_STEPS,
-        "top_k": ASGARD_SHADOW_TOP_K,
-        "base_snapshot_id": base_snapshot_id,
-    }));
-
-    let probe_messages = asgard_shadow_probe_ranking_messages(
-        context.original_task,
-        context.task_contract_checklist,
-        &candidates,
-        context.registries,
-    )?;
-    let probe_ids = (0..ASGARD_SHADOW_CANDIDATE_COUNT)
-        .map(|lane| format!("lane-{lane}"))
-        .collect::<Vec<_>>();
-    let (probe_ranking_outcome, probe_review_usage) = run_asgard_shadow_ranking(
-        context.llm.as_ref(),
-        AsgardShadowRankingRequest {
-            model: context.supervisor_model,
-            idle_timeout: context.idle_timeout,
-            cancel: context.cancel.clone(),
-            tool_name: "rank_probe_trajectories",
-            expected_ids: probe_ids,
-            messages: probe_messages,
-            stream_sinks: Some(AsgardStreamSinks::new(
-                context.live_output,
-                "Shadow probe reviewer",
-            )),
-        },
-    )
-    .await;
-    let probe_ranking_outcome = probe_ranking_outcome?;
-    let distinction_kind = probe_ranking_outcome.distinction_kind;
-    let distinction_evidence = probe_ranking_outcome.distinction_evidence;
-    let probe_rank_ids = probe_ranking_outcome.ids;
-    let probe_ranking = probe_rank_ids
-        .iter()
-        .map(|id| {
-            id.strip_prefix("lane-")
-                .and_then(|lane| lane.parse::<usize>().ok())
-                .filter(|lane| *lane < ASGARD_SHADOW_CANDIDATE_COUNT)
-                .ok_or_else(|| anyhow::anyhow!("invalid ranked probe id `{id}`"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let survivors = probe_ranking[..ASGARD_SHADOW_TOP_K].to_vec();
-    let killed = probe_ranking[ASGARD_SHADOW_TOP_K..].to_vec();
-    let ranking_trace = probe_ranking
-        .iter()
-        .enumerate()
-        .map(|(rank, lane)| serde_json::json!({ "lane": lane, "rank": rank + 1 }))
-        .collect::<Vec<_>>();
-    let mut candidate_usage_trace = context
-        .probe_candidate_usage
-        .iter()
-        .map(|(lane, usage)| {
-            serde_json::json!({
-                "lane": lane,
-                "usage": asgard_usage_trace_value(*usage),
-            })
-        })
-        .collect::<Vec<_>>();
-    candidate_usage_trace.sort_by_key(|row| row["lane"].as_u64().unwrap_or(u64::MAX));
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_shadow_probe_ranking",
-        "study_id": study_id,
-        "ranking": ranking_trace,
-        "survivors": survivors,
-        "killed": killed,
-        "distinction_kind": distinction_kind,
-        "distinction_evidence": distinction_evidence,
-        "candidate_usage": candidate_usage_trace,
-        "usage": asgard_usage_trace_value(probe_review_usage),
-    }));
-
-    let mut continuations = Vec::with_capacity(candidates.len());
-    for mut candidate in candidates {
-        let registry = context
-            .registries
-            .get(candidate.index)
-            .ok_or_else(|| anyhow::anyhow!("shadow lane {} has no registry", candidate.index))?
-            .clone();
-        let repository = context
-            .repositories
-            .get(candidate.index)
-            .ok_or_else(|| anyhow::anyhow!("shadow lane {} has no repository", candidate.index))?;
-        let repository_root = repository.root.clone();
-        let base_commit = repository.base_commit.clone();
-        let selected_patch = candidate.patch.clone();
-        let model = candidate.model.clone();
-        let messages = candidate.outcome.continuation_messages.clone();
-        let trajectory_message_start = messages.len();
-        let inherited_plan = candidate.outcome.current_plan.clone();
-        let cancel = context.cancel.clone();
-        let candidate_output = context.live_output.clone();
-        let original_task = context.original_task.to_string();
-        continuations.push(async move {
-            let sinks = AsgardStreamSinks::new(
-                &candidate_output,
-                &format!("Shadow continuation {}", candidate.index + 1),
-            );
-            let outcome = crate::tool_loop::run(
-                context.llm,
-                &registry,
-                &model,
-                context.reasoning_effort,
-                context.service_tier,
-                context.structured_output,
-                messages,
-                ASGARD_SHADOW_CONTINUATION_STEPS,
-                context.idle_timeout,
-                cancel,
-                sinks.text,
-                sinks.thought,
-                crate::tool_loop::SpawnedCx::new(context.cx),
-                context.session_id.to_string(),
-                context.sessions.clone(),
-                original_task,
-                crate::tool_loop::NotificationMode::Silent,
-                0,
-                None,
-                None,
-                true,
-                context.context_length,
-                context.context_prefix_len,
-                inherited_plan,
-            )
-            .await;
-            let patch = crate::asgard::capture_patch(&repository_root, &base_commit)?;
-            let delta_patch = crate::asgard::capture_patch_since(
-                &repository_root,
-                &base_commit,
-                &selected_patch,
-            )?;
-            let continuation_messages = asgard_take_window_messages(
-                &outcome.continuation_messages,
-                trajectory_message_start,
-            );
-            let continuation_ledger = asgard_extract_execution_ledger(&continuation_messages);
-            candidate
-                .supervisor_window_messages
-                .extend(continuation_messages);
-            merge_asgard_execution_ledger(&mut candidate.window_ledger, continuation_ledger);
-            let usage = outcome.usage;
-            candidate.outcome = outcome;
-            candidate.patch = patch;
-            candidate.delta_patch = delta_patch;
-            Ok::<_, anyhow::Error>((candidate, model, usage))
-        });
-    }
-
-    let mut continued_candidates = Vec::with_capacity(ASGARD_SHADOW_CANDIDATE_COUNT);
-    let mut continuation_usage_by_model = Vec::with_capacity(ASGARD_SHADOW_CANDIDATE_COUNT);
-    let mut continuation_usage_by_lane = HashMap::new();
-    for continuation in futures::future::join_all(continuations).await {
-        let (candidate, model, usage) = continuation?;
-        continuation_usage_by_lane.insert(candidate.index, usage);
-        continuation_usage_by_model.push((model, usage));
-        continued_candidates.push(candidate);
-    }
-    continued_candidates.sort_by_key(|candidate| candidate.index);
-
-    let mut endpoints = continued_candidates
-        .iter()
-        .map(|candidate| {
-            let review_label = format!("endpoint-{}", uuid::Uuid::new_v4().simple());
-            let endpoint_snapshot_id = uuid::Uuid::new_v4().to_string();
-            let repository = context.repositories.get(candidate.index).ok_or_else(|| {
-                anyhow::anyhow!("shadow endpoint {} has no repository", candidate.index)
-            })?;
-            let dossier = render_asgard_shadow_endpoint(&review_label, candidate, repository)?;
-            Ok(AsgardShadowEndpoint {
-                lane: candidate.index,
-                review_label,
-                endpoint_snapshot_id,
-                dossier,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    endpoints.sort_by(|left, right| left.review_label.cmp(&right.review_label));
-    for endpoint in &endpoints {
-        let usage = continuation_usage_by_lane
-            .get(&endpoint.lane)
-            .copied()
-            .unwrap_or_default();
-        crate::trace_logging::append_trace_record(serde_json::json!({
-            "type": "asgard_shadow_continuation",
-            "study_id": study_id,
-            "lane": endpoint.lane,
-            "review_label": endpoint.review_label,
-            "disposition": if survivors.contains(&endpoint.lane) {
-                "survivor"
-            } else {
-                "killed-shadow"
-            },
-            "base_snapshot_id": base_snapshot_id,
-            "endpoint_snapshot_id": endpoint.endpoint_snapshot_id,
-            "continuation_steps": ASGARD_SHADOW_CONTINUATION_STEPS,
-            "isolated": true,
-            "published_to_canonical": false,
-            "usage": asgard_usage_trace_value(usage),
-        }));
-    }
-
-    let end_messages = asgard_shadow_end_review_messages(
-        context.original_task,
-        context.task_contract_checklist,
-        &endpoints,
-    );
-    let endpoint_ids = endpoints
-        .iter()
-        .map(|endpoint| endpoint.review_label.clone())
-        .collect::<Vec<_>>();
-    let (end_ranking_outcome, end_review_usage) = run_asgard_shadow_ranking(
-        context.llm.as_ref(),
-        AsgardShadowRankingRequest {
-            model: context.supervisor_model,
-            idle_timeout: context.idle_timeout,
-            cancel: context.cancel,
-            tool_name: "rank_shadow_endpoints",
-            expected_ids: endpoint_ids,
-            messages: end_messages,
-            stream_sinks: Some(AsgardStreamSinks::new(
-                context.live_output,
-                "Blinded shadow end reviewer",
-            )),
-        },
-    )
-    .await;
-    let end_rank_ids = end_ranking_outcome?.ids;
-    let end_ranking_trace = end_rank_ids
-        .iter()
-        .enumerate()
-        .map(|(rank, review_label)| {
-            serde_json::json!({ "review_label": review_label, "rank": rank + 1 })
-        })
-        .collect::<Vec<_>>();
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_shadow_end_review",
-        "study_id": study_id,
-        "blinded": true,
-        "probe_metadata_excluded": true,
-        "ranking": end_ranking_trace,
-        "usage": asgard_usage_trace_value(end_review_usage),
-    }));
-    let final_label = end_rank_ids
-        .first()
-        .expect("validated shadow ranking is non-empty");
-    let winner = endpoints
-        .iter()
-        .find(|endpoint| &endpoint.review_label == final_label)
-        .map(|endpoint| endpoint.lane)
-        .ok_or_else(|| anyhow::anyhow!("blinded shadow winner has no lane mapping"))?;
-
-    let decision = AsgardSupervisorDecision {
-        winner,
-        complete: false,
-        advices: vec![Some(
-            "Continue from the blinded shadow-study winner. Reconcile its implementation with the original task contracts, run the narrowest decisive verification, and fix any remaining defect."
-                .to_string(),
-        )],
-        next_candidate_count: Some(1),
-        next_window_steps: Some(1),
-        state_summary: format!(
-            "Shadow survivor study window {} selected opaque endpoint {}; continue with a focused verification window.",
-            context.window, final_label
-        ),
-        contracts: None,
-        next_window_plan: Some(AsgardWindowPlan::work()),
-    };
-    crate::trace_logging::append_trace_record(asgard_decision_trace_record(
-        "supervisor",
-        &decision,
-        AsgardChallengeStats {
-            issued: false,
-            flipped: false,
-            validation_rounds: 0,
-        },
-    ));
-    let mut reviewer_usage = probe_review_usage;
-    reviewer_usage.add(end_review_usage);
-    Ok(AsgardShadowStudyOutcome {
-        candidates: continued_candidates,
-        decision,
-        reviewer_usage,
-        continuation_usage_by_model,
-    })
-}
-
-fn merge_asgard_execution_ledger(
-    target: &mut AsgardExecutionLedger,
-    continuation: AsgardExecutionLedger,
-) {
-    target.entries.extend(continuation.entries);
-    target.edit_steps.extend(continuation.edit_steps);
-    target.total_shell_commands = target
-        .total_shell_commands
-        .saturating_add(continuation.total_shell_commands);
-    target.entries_truncated |= continuation.entries_truncated;
-}
-
-fn asgard_shadow_probe_ranking_messages(
-    original_task: &str,
-    checklist: &AsgardTaskContractChecklist,
-    candidates: &[AsgardCandidate],
-    registries: &[Arc<crate::tools::ToolRegistry>],
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let mut trajectories = String::from("<probe_endpoints>\n");
-    for candidate in candidates {
-        let registry = registries
-            .get(candidate.index)
-            .ok_or_else(|| anyhow::anyhow!("probe lane {} has no registry", candidate.index))?;
-        trajectories.push_str(&render_asgard_candidate_trajectory(
-            candidate,
-            registry.cwd(),
-            "last_selected_decision",
-            &candidate.delta_patch,
-        )?);
-    }
-    trajectories.push_str("</probe_endpoints>");
-    Ok(vec![
-        ChatMessage::system(
-            "You are ranking three bounded Asgard probe endpoints for a survivor-recall research study. Rank every lane from most to least promising for eventually satisfying the complete original task. Judge concrete evidence, falsification results, implementation direction, and unresolved risk. Call rank_probe_trajectories exactly once; do not answer in prose.",
-        ),
-        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
-        ChatMessage::assistant(checklist.block.clone()),
-        ChatMessage::user(trajectories),
-    ])
-}
-
-fn render_asgard_shadow_endpoint(
-    review_label: &str,
-    candidate: &AsgardCandidate,
-    repository: &crate::asgard::CandidateRepository,
-) -> anyhow::Result<String> {
-    let manifest = serde_json::to_string_pretty(&AsgardCandidatePatchManifest {
-        candidate_changed_production_files: asgard_patch_production_inventory(&candidate.patch),
-        candidate_created_test_files: asgard_patch_test_inventory(&candidate.patch).0,
-        candidate_modified_test_files: asgard_patch_test_inventory(&candidate.patch).1,
-        patch_bytes: candidate.patch.len(),
-    })?;
-    let scrub = |text: String| {
-        text.replace(
-            &repository.session_cwd.to_string_lossy().to_string(),
-            "/workspace",
-        )
-        .replace(&repository.root.to_string_lossy().to_string(), "/workspace")
-    };
-    let ledger = scrub(serde_json::to_string_pretty(&candidate.window_ledger)?);
-    let patch = scrub(String::from_utf8_lossy(&candidate.patch).into_owned());
-    let mut evidence_messages = candidate.supervisor_window_messages.clone();
-    rewrite_asgard_cwd(
-        &mut evidence_messages,
-        &repository.session_cwd,
-        Path::new("/workspace"),
-    );
-    let evidence = scrub(render_asgard_dossier_messages(&evidence_messages));
-    Ok(format!(
-        "<shadow_endpoint label=\"{review_label}\">\n\
-         <patch_manifest mechanically_derived=\"true\">\n{manifest}\n</patch_manifest>\n\
-         <cumulative_patch>\n{}\n</cumulative_patch>\n\
-         <execution_ledger mechanically_derived=\"true\">\n{ledger}\n</execution_ledger>\n\
-         <candidate_evidence>\n{}\n</candidate_evidence>\n\
-         </shadow_endpoint>",
-        patch, evidence,
-    ))
-}
-
-fn asgard_shadow_end_review_messages(
-    original_task: &str,
-    checklist: &AsgardTaskContractChecklist,
-    endpoints: &[AsgardShadowEndpoint],
-) -> Vec<ChatMessage> {
-    let dossiers = endpoints
-        .iter()
-        .map(|endpoint| endpoint.dossier.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    vec![
-        ChatMessage::system(
-            "You are the blinded final reviewer in an Asgard counterfactual study. You receive only opaque endpoint labels and endpoint evidence, with all earlier routing metadata withheld. Rank every opaque endpoint from best to worst for satisfying the complete original task. Call rank_shadow_endpoints exactly once; do not answer in prose.",
-        ),
-        ChatMessage::user(format!("ORIGINAL TASK (complete):\n{original_task}")),
-        ChatMessage::assistant(checklist.block.clone()),
-        ChatMessage::user(format!(
-            "<blinded_endpoints>\n{dossiers}\n</blinded_endpoints>"
-        )),
-    ]
-}
-
-fn asgard_shadow_ranking_tool(name: &str, ids: &[String]) -> ToolDefinition {
-    let mut tool = ToolDefinition {
-        r#type: "function".to_string(),
-        function: FunctionDef {
-            name: name.to_string(),
-            description: "Return a strict best-to-worst permutation of every supplied endpoint. This terminal research action must be called exactly once.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["ranking"],
-                "properties": {
-                    "ranking": {
-                        "type": "array",
-                        "minItems": ids.len(),
-                        "maxItems": ids.len(),
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["id", "rank"],
-                            "properties": {
-                                "id": { "type": "string", "enum": ids },
-                                "rank": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "maximum": ids.len(),
-                                }
-                            }
-                        }
-                    }
-                }
-            }),
-        },
-    };
-    if name == "rank_probe_trajectories" {
-        let parameters = tool
-            .function
-            .parameters
-            .as_object_mut()
-            .expect("shadow ranking schema is an object");
-        let properties = parameters
-            .get_mut("properties")
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("shadow ranking schema has properties");
-        properties.insert(
-            "distinction_kind".to_string(),
-            serde_json::json!({
-                "type": "string",
-                "enum": ["architecture-contract", "cosmetic", "mixed", "unclear"],
-                "description": "Whether the probe endpoints differ mainly in architecture/contract reading, only cosmetically, in a mix of both, or cannot yet be distinguished."
-            }),
-        );
-        properties.insert(
-            "distinction_evidence".to_string(),
-            serde_json::json!({
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 6,
-                "items": { "type": "string", "minLength": 1 },
-                "description": "Short evidence references supporting the distinction classification."
-            }),
-        );
-        let required = parameters
-            .get_mut("required")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("shadow ranking schema has required fields");
-        required.push(serde_json::json!("distinction_kind"));
-        required.push(serde_json::json!("distinction_evidence"));
-    }
-    tool
-}
-
-fn parse_asgard_shadow_ranking(
-    value: &serde_json::Value,
-    expected_ids: &[String],
-    require_distinction: bool,
-) -> anyhow::Result<AsgardShadowRankingOutcome> {
-    let rows = value
-        .get("ranking")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("shadow ranking requires a ranking array"))?;
-    anyhow::ensure!(
-        rows.len() == expected_ids.len(),
-        "shadow ranking must include every endpoint"
-    );
-    let mut ranked = rows
-        .iter()
-        .map(|row| {
-            let id = row
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("shadow ranking row requires string id"))?;
-            let rank = row
-                .get("rank")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|rank| usize::try_from(rank).ok())
-                .ok_or_else(|| anyhow::anyhow!("shadow ranking row requires integer rank"))?;
-            Ok((rank, id.to_string()))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    ranked.sort_by_key(|(rank, _)| *rank);
-    anyhow::ensure!(
-        ranked
-            .iter()
-            .enumerate()
-            .all(|(index, (rank, _))| *rank == index + 1),
-        "shadow ranking ranks must be contiguous from one"
-    );
-    let actual = ranked
-        .iter()
-        .map(|(_, id)| id.as_str())
-        .collect::<HashSet<_>>();
-    let expected = expected_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    anyhow::ensure!(
-        actual.len() == expected_ids.len() && actual == expected,
-        "shadow ranking must be an exact endpoint permutation"
-    );
-    let (distinction_kind, distinction_evidence) = if require_distinction {
-        let kind = value
-            .get("distinction_kind")
-            .and_then(serde_json::Value::as_str)
-            .filter(|kind| {
-                matches!(
-                    *kind,
-                    "architecture-contract" | "cosmetic" | "mixed" | "unclear"
-                )
-            })
-            .ok_or_else(|| anyhow::anyhow!("probe ranking requires distinction_kind"))?;
-        let evidence = value
-            .get("distinction_evidence")
-            .and_then(serde_json::Value::as_array)
-            .filter(|rows| !rows.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("probe ranking requires distinction_evidence"))?
-            .iter()
-            .map(|row| {
-                row.as_str()
-                    .map(str::trim)
-                    .filter(|row| !row.is_empty())
-                    .map(str::to_string)
-                    .ok_or_else(|| anyhow::anyhow!("distinction evidence must be non-empty text"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        (Some(kind.to_string()), evidence)
-    } else {
-        (None, Vec::new())
-    };
-    Ok(AsgardShadowRankingOutcome {
-        ids: ranked.into_iter().map(|(_, id)| id).collect(),
-        distinction_kind,
-        distinction_evidence,
-    })
-}
-
-async fn run_asgard_shadow_ranking(
-    llm: &dyn crate::llm_client::LlmBackend,
-    request: AsgardShadowRankingRequest<'_>,
-) -> (
-    anyhow::Result<AsgardShadowRankingOutcome>,
-    crate::llm_client::TokenUsage,
-) {
-    const MAX_ATTEMPTS: usize = 2;
-    let AsgardShadowRankingRequest {
-        model,
-        idle_timeout,
-        cancel,
-        tool_name,
-        expected_ids,
-        mut messages,
-        stream_sinks,
-    } = request;
-    let require_distinction = tool_name == "rank_probe_trajectories";
-    let tools = vec![asgard_shadow_ranking_tool(tool_name, &expected_ids)];
-    let mut usage = crate::llm_client::TokenUsage::default();
-    let mut last_error = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
-        let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
-        let response = stream_chat_no_visible_output_with_retry(
-            llm,
-            "ranking Asgard shadow endpoints",
-            &cancel,
-            || {
-                let text_sink = text_sink.clone();
-                let thought_sink = thought_sink.clone();
-                StreamChatRequest {
-                    model: model.to_string(),
-                    messages: messages.clone(),
-                    tools: Some(tools.clone()),
-                    reasoning_effort: None,
-                    service_tier: None,
-                    temperature: None,
-                    structured_output: None,
-                    on_token: Box::new(move |token| {
-                        if let Some(sink) = &text_sink {
-                            (sink
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                                token
-                            );
-                        }
-                    }),
-                    on_thought: Box::new(move |token| {
-                        if let Some(sink) = &thought_sink {
-                            (sink
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                                token
-                            );
-                        }
-                    }),
-                    cancel: cancel.clone(),
-                    idle_timeouts: idle_timeout,
-                }
-            },
-        )
-        .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => return (Err(error), usage),
-        };
-        usage.add(response.usage());
-        match response {
-            LlmResponse::ToolCalls {
-                text,
-                reasoning_content,
-                calls,
-                ..
-            } if calls.len() == 1 && calls[0].function.name == tool_name => {
-                match crate::tool_arguments::normalize_tool_arguments(&calls[0].function.arguments)
-                {
-                    Ok(arguments) => {
-                        match parse_asgard_shadow_ranking(
-                            &arguments.value,
-                            &expected_ids,
-                            require_distinction,
-                        ) {
-                            Ok(ranking) => return (Ok(ranking), usage),
-                            Err(error) => last_error = Some(error),
-                        }
-                    }
-                    Err(error) => {
-                        last_error =
-                            Some(anyhow::anyhow!("invalid {tool_name} arguments: {error}"));
-                    }
-                }
-                if !text.is_empty() || reasoning_content.as_deref().is_some_and(|s| !s.is_empty()) {
-                    messages.push(ChatMessage::assistant_with_reasoning(
-                        text,
-                        reasoning_content,
-                    ));
-                }
-            }
-            LlmResponse::ToolCalls {
-                text,
-                reasoning_content,
-                calls,
-                ..
-            } => {
-                last_error = Some(anyhow::anyhow!(
-                    "shadow reviewer must call {tool_name} exactly once (got {:?})",
-                    calls
-                        .iter()
-                        .map(|call| call.function.name.as_str())
-                        .collect::<Vec<_>>()
-                ));
-                messages.push(
-                    ChatMessage::assistant_tool_calls_with_content_and_reasoning(
-                        text,
-                        calls,
-                        reasoning_content,
-                    ),
-                );
-            }
-            LlmResponse::Text {
-                text,
-                reasoning_content,
-                ..
-            } => {
-                last_error = Some(anyhow::anyhow!(
-                    "shadow reviewer answered without calling {tool_name}"
-                ));
-                messages.push(ChatMessage::assistant_with_reasoning(
-                    text,
-                    reasoning_content,
-                ));
-            }
-        }
-        if attempt < MAX_ATTEMPTS {
-            messages.push(ChatMessage::user(format!(
-                "Your previous response was invalid: {}. Call {tool_name} exactly once now with a strict permutation; do not answer in prose.",
-                last_error
-                    .as_ref()
-                    .map_or_else(|| "unknown error".to_string(), |error| error.to_string())
-            )));
-        }
-    }
-    (
-        Err(last_error
-            .unwrap_or_else(|| anyhow::anyhow!("shadow reviewer did not call {tool_name}"))),
-        usage,
-    )
-}
-
 fn asgard_should_finish(supervisor_complete: bool, stop: &crate::tool_loop::LoopStop) -> bool {
     // A failed winner lane does not end the run: every lane restarts from the
     // winner snapshot next window, which resurrects it. Only supervisor
@@ -7112,13 +5843,11 @@ async fn run_asgard_initial_advice(
     candidate_count: usize,
     original_task: &str,
     live_output: &AsgardLiveOutput,
-    window_policy: AsgardWindowPolicyMode,
 ) -> (
     anyhow::Result<AsgardSupervisorInitialAdvice>,
     crate::llm_client::TokenUsage,
 ) {
-    let messages =
-        asgard_initial_advice_messages_for_policy(original_task, candidate_count, window_policy);
+    let messages = asgard_initial_advice_messages(original_task, candidate_count);
     run_asgard_initial_advice_tool_steps(
         llm.as_ref(),
         messages,
@@ -7131,7 +5860,6 @@ async fn run_asgard_initial_advice(
             required_winner: None,
             checklist_ids: &[],
             carry_forward_allowed: false,
-            window_policy,
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Supervisor")),
@@ -7303,260 +6031,6 @@ fn asgard_diff_baseline_trace_record(
     })
 }
 
-fn asgard_fast_path_eligibility(
-    mode: AsgardSupervisorFastPathMode,
-    prompt_mode: AsgardSupervisorPromptMode,
-    candidates: &[AsgardCandidate],
-    current_window_plan: &AsgardWindowPlan,
-    current_advices: Option<&[Option<String>]>,
-) -> AsgardFastPathEligibility {
-    let mut reasons = Vec::new();
-    if !mode.is_enabled() {
-        reasons.push("disabled");
-    }
-    if prompt_mode == AsgardSupervisorPromptMode::Full {
-        reasons.push("full_prompt_not_compact");
-    }
-    if candidates.len() != 1 {
-        reasons.push("not_single_lane");
-    }
-    if current_window_plan.kind != AsgardWindowKind::Work {
-        reasons.push("probe_window");
-    }
-    let has_one_serial_advice = current_advices.is_some_and(|advices| {
-        advices.len() == 1
-            && advices[0]
-                .as_deref()
-                .is_some_and(|advice| !advice.trim().is_empty())
-    });
-    if !has_one_serial_advice {
-        reasons.push("missing_single_serial_prerequisite");
-    }
-    let Some(candidate) = candidates.first() else {
-        return AsgardFastPathEligibility {
-            eligible: false,
-            reasons,
-        };
-    };
-    if matches!(
-        candidate.outcome.stop,
-        crate::tool_loop::LoopStop::Failed(_) | crate::tool_loop::LoopStop::Cancelled
-    ) {
-        reasons.push("candidate_execution_failed");
-    }
-    if candidate.delta_patch.is_empty() {
-        reasons.push("no_window_delta");
-    }
-    let last_edit_step = candidate
-        .window_ledger
-        .edit_steps
-        .iter()
-        .map(|edit| edit.step)
-        .max();
-    let last_successful_command_step = candidate
-        .window_ledger
-        .entries
-        .iter()
-        .filter(|entry| entry.exit_code == Some(0))
-        .map(|entry| entry.step)
-        .max();
-    if last_edit_step
-        .zip(last_successful_command_step)
-        .is_none_or(|(edit, command)| command <= edit)
-    {
-        reasons.push("no_successful_post_edit_verification");
-    }
-    AsgardFastPathEligibility {
-        eligible: reasons.is_empty(),
-        reasons,
-    }
-}
-
-fn asgard_fast_path_tool(
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
-) -> ToolDefinition {
-    let mut tool = asgard_select_trajectory_tool_for_policy(1, max_candidate_count, window_policy);
-    tool.function.name = "select_trajectory_fast".to_string();
-    tool.function.description = "Conservative one-response selector for a mechanically eligible serial-repair window. Confirm that the named prerequisite was directly addressed and that the evidence is sufficient for another non-terminal routing decision. This tool cannot declare completion.".to_string();
-    let parameters = tool
-        .function
-        .parameters
-        .as_object_mut()
-        .expect("selector schema is an object");
-    let properties = parameters
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("selector schema has properties");
-    properties.insert(
-        "fast_path_confident".to_string(),
-        serde_json::json!({
-            "type": "boolean",
-            "description": "True only if no audit is needed to make this non-terminal routing decision."
-        }),
-    );
-    properties.insert(
-        "serial_prerequisite_addressed".to_string(),
-        serde_json::json!({
-            "type": "boolean",
-            "description": "True only if the current diff and execution evidence directly address the previously named serial prerequisite."
-        }),
-    );
-    let required = parameters
-        .get_mut("required")
-        .and_then(serde_json::Value::as_array_mut)
-        .expect("selector schema has required fields");
-    required.push(serde_json::json!("fast_path_confident"));
-    required.push(serde_json::json!("serial_prerequisite_addressed"));
-    tool
-}
-
-fn parse_asgard_fast_path_decision(
-    arguments: &str,
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
-) -> anyhow::Result<AsgardSupervisorDecision> {
-    let normalized = crate::tool_arguments::normalize_tool_arguments(arguments)?.value;
-    let mut object = normalized
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("fast-path arguments must be an object"))?;
-    anyhow::ensure!(
-        object
-            .remove("fast_path_confident")
-            .and_then(|value| value.as_bool())
-            == Some(true),
-        "fast-path selector reported uncertainty"
-    );
-    anyhow::ensure!(
-        object
-            .remove("serial_prerequisite_addressed")
-            .and_then(|value| value.as_bool())
-            == Some(true),
-        "fast-path selector did not confirm the serial prerequisite"
-    );
-    let decision = parse_asgard_supervisor_decision_with_policy(
-        &serde_json::to_string(&object)?,
-        1,
-        max_candidate_count,
-        window_policy,
-    )?;
-    anyhow::ensure!(decision.winner == 0, "fast path must keep its only lane");
-    anyhow::ensure!(
-        !decision.complete,
-        "fast path cannot nominate terminal completion"
-    );
-    Ok(decision)
-}
-
-async fn run_asgard_supervisor_fast_path(
-    request: AsgardFastPathRequest<'_>,
-) -> (
-    anyhow::Result<AsgardSupervisorDecision>,
-    crate::llm_client::TokenUsage,
-) {
-    let AsgardFastPathRequest {
-        llm,
-        model,
-        idle_timeout,
-        cancel,
-        mut messages,
-        max_candidate_count,
-        window_policy,
-        serial_prerequisite,
-        stream_sinks,
-    } = request;
-    messages.push(ChatMessage::user(format!(
-        "CONSERVATIVE SERIAL FAST PATH. The prior supervisor funded exactly one lane for this prerequisite:\n\
-         <serial_prerequisite>{serial_prerequisite}</serial_prerequisite>\n\
-         You have exactly one response and no audit tools. Call select_trajectory_fast only if the current diff and mechanically derived execution evidence directly address that prerequisite and no consequential uncertainty requires inspection. Set complete=false; terminal completion is forbidden here. Otherwise answer FULL_SUPERVISOR_REQUIRED in prose so the full supervisor can inspect the lane."
-    )));
-    let tools = vec![asgard_fast_path_tool(max_candidate_count, window_policy)];
-    if std::env::var_os("ASGARD_CAPTURE_SUPERVISOR_REPLAYS").is_some() {
-        crate::trace_logging::append_trace_record(serde_json::json!({
-            "type": "asgard_supervisor_fast_path_request",
-            "model": model,
-            "messages": &messages,
-            "tools": &tools,
-        }));
-    }
-    let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
-    let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
-    let response = stream_chat_no_visible_output_with_retry(
-        llm,
-        "selecting an Asgard serial fast path",
-        &cancel,
-        || {
-            let text_sink = text_sink.clone();
-            let thought_sink = thought_sink.clone();
-            StreamChatRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                tools: Some(tools.clone()),
-                reasoning_effort: None,
-                service_tier: None,
-                temperature: None,
-                structured_output: None,
-                on_token: Box::new(move |token| {
-                    if let Some(sink) = &text_sink {
-                        (sink
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                            token
-                        );
-                    }
-                }),
-                on_thought: Box::new(move |token| {
-                    if let Some(sink) = &thought_sink {
-                        (sink
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                            token
-                        );
-                    }
-                }),
-                cancel: cancel.clone(),
-                idle_timeouts: idle_timeout,
-            }
-        },
-    )
-    .await;
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => return (Err(error), crate::llm_client::TokenUsage::default()),
-    };
-    let usage = response.usage();
-    if std::env::var_os("ASGARD_CAPTURE_SUPERVISOR_REPLAYS").is_some() {
-        crate::trace_logging::append_trace_record(serde_json::json!({
-            "type": "asgard_supervisor_fast_path_response",
-            "response": asgard_supervisor_replay_response_record(1, &response),
-        }));
-    }
-    let decision = match response {
-        LlmResponse::ToolCalls { calls, .. }
-            if calls.len() == 1 && calls[0].function.name == "select_trajectory_fast" =>
-        {
-            parse_asgard_fast_path_decision(
-                &calls[0].function.arguments,
-                max_candidate_count,
-                window_policy,
-            )
-        }
-        LlmResponse::Text { text, .. } => Err(anyhow::anyhow!(
-            "fast-path selector requested full supervision: {}",
-            crate::text::truncate_utf8(text.trim(), 200)
-        )),
-        LlmResponse::ToolCalls { calls, .. } => Err(anyhow::anyhow!(
-            "fast-path selector returned an invalid tool batch: {:?}",
-            calls
-                .iter()
-                .map(|call| call.function.name.as_str())
-                .collect::<Vec<_>>()
-        )),
-    };
-    (decision, usage)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_asgard_supervisor(
     llm: &Arc<dyn crate::llm_client::LlmBackend>,
@@ -7574,12 +6048,6 @@ async fn run_asgard_supervisor(
     selected_trajectory_initial: &[ChatMessage],
     selected_trajectory_windows: &[Vec<ChatMessage>],
     supervisor_history: &AsgardSupervisorHistory,
-    canonical_ledger: &[(usize, AsgardExecutionLedger)],
-    prompt_config: AsgardSupervisorPromptConfig,
-    fast_path_mode: AsgardSupervisorFastPathMode,
-    window_policy: AsgardWindowPolicyMode,
-    current_window_plan: &AsgardWindowPlan,
-    current_advices: Option<&[Option<String>]>,
     live_output: &AsgardLiveOutput,
 ) -> (
     anyhow::Result<AsgardSupervisorDecision>,
@@ -7694,17 +6162,7 @@ async fn run_asgard_supervisor(
         }
     }
     candidate_trajectories.push_str("</candidate_trajectories>");
-    if current_window_plan.kind == AsgardWindowKind::Probe {
-        candidate_trajectories =
-            render_asgard_probe_supervisor_context(current_window_plan, &candidate_trajectories);
-    }
-    if window_policy == AsgardWindowPolicyMode::ExplicitProbe {
-        candidate_trajectories = format!(
-            "{}\n{candidate_trajectories}",
-            asgard_explicit_window_policy_text()
-        );
-    }
-    let full_control_messages = asgard_supervisor_messages(
+    let messages = asgard_supervisor_messages(
         original_task,
         selected_trajectory_initial,
         selected_trajectory_windows,
@@ -7714,63 +6172,10 @@ async fn run_asgard_supervisor(
             max: max_candidate_count,
         },
         task_contract_checklist,
-        candidate_trajectories.clone(),
+        candidate_trajectories,
     );
-    let messages = asgard_supervisor_messages_for_mode(
-        full_control_messages.clone(),
-        selected_trajectory_windows,
-        supervisor_history,
-        canonical_ledger,
-        prompt_config,
-    );
-    let prompt_bytes = render_asgard_dossier_messages(&messages).len();
-    let full_control_prompt_bytes = render_asgard_dossier_messages(&full_control_messages).len();
-    let canonical_ledger_bytes = render_asgard_canonical_ledger(canonical_ledger).len();
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_supervisor_prompt_mode",
-        "window": window,
-        "mode": prompt_config.mode.as_str(),
-        "prompt_bytes": prompt_bytes,
-        "estimated_request_tokens": crate::tokens::approximate_tokens_messages(&messages),
-        "full_control_prompt_bytes": full_control_prompt_bytes,
-        "full_control_estimated_request_tokens": crate::tokens::approximate_tokens_messages(
-            &full_control_messages
-        ),
-        "selected_initial_bytes": render_asgard_dossier_messages(
-            selected_trajectory_initial
-        ).len(),
-        "selected_windows_bytes": selected_trajectory_windows
-            .iter()
-            .map(|messages| render_asgard_dossier_messages(messages).len())
-            .sum::<usize>(),
-        "canonical_ledger_bytes": canonical_ledger_bytes,
-        "current_dossier_bytes": messages
-            .last()
-            .map(asgard_message_text)
-            .map_or(0, |text| text.len()),
-        "checkpoint_interval": prompt_config.checkpoint_interval,
-        "recent_exact_tail": prompt_config.recent_exact_tail,
-    }));
-    if std::env::var_os("ASGARD_CAPTURE_SUPERVISOR_REPLAYS").is_some() {
-        crate::trace_logging::append_trace_record(serde_json::json!({
-            "type": "asgard_supervisor_replay_state",
-            "window": window,
-            "mode": prompt_config.mode.as_str(),
-            "selected_trajectory_initial": selected_trajectory_initial,
-            "selected_trajectory_windows": selected_trajectory_windows,
-            "supervisor_history": {
-                "checkpointed": &supervisor_history.checkpointed,
-                "selected_windows": &supervisor_history.selected_windows,
-            },
-            "canonical_ledger": canonical_ledger,
-            "candidate_trajectories": candidate_trajectories,
-        }));
-    }
     tracing::info!(
         window,
-        mode = prompt_config.mode.as_str(),
-        prompt_bytes,
-        full_control_prompt_bytes,
         selected_initial_bytes = render_asgard_dossier_messages(selected_trajectory_initial).len(),
         selected_windows_bytes = selected_trajectory_windows
             .iter()
@@ -7782,79 +6187,6 @@ async fn run_asgard_supervisor(
             .map_or(0, |text| text.len()),
         "assembled Asgard supervisor dossier"
     );
-    let fast_path = asgard_fast_path_eligibility(
-        fast_path_mode,
-        prompt_config.mode,
-        candidates,
-        current_window_plan,
-        current_advices,
-    );
-    let mut fast_path_usage = crate::llm_client::TokenUsage::default();
-    if fast_path_mode.is_enabled() {
-        if fast_path.eligible {
-            let prerequisite = current_advices
-                .and_then(|advices| advices.first())
-                .and_then(|advice| advice.as_deref())
-                .expect("fast-path eligibility requires one non-empty advice");
-            let (decision, usage) = run_asgard_supervisor_fast_path(AsgardFastPathRequest {
-                llm: llm.as_ref(),
-                model,
-                idle_timeout,
-                cancel: cancel.clone(),
-                messages: messages.clone(),
-                max_candidate_count,
-                window_policy,
-                serial_prerequisite: prerequisite,
-                stream_sinks: Some(AsgardStreamSinks::new(live_output, "Supervisor fast path")),
-            })
-            .await;
-            fast_path_usage.add(usage);
-            match decision {
-                Ok(decision) => {
-                    crate::trace_logging::append_trace_record(serde_json::json!({
-                        "type": "asgard_fast_path",
-                        "window": window,
-                        "eligible": true,
-                        "reasons": [],
-                        "used": true,
-                        "fallback_reason": null,
-                        "usage": asgard_usage_trace_value(usage),
-                    }));
-                    crate::trace_logging::append_trace_record(asgard_decision_trace_record(
-                        "supervisor",
-                        &decision,
-                        AsgardChallengeStats {
-                            issued: false,
-                            flipped: false,
-                            validation_rounds: 0,
-                        },
-                    ));
-                    return (Ok(decision), fast_path_usage);
-                }
-                Err(error) => {
-                    crate::trace_logging::append_trace_record(serde_json::json!({
-                        "type": "asgard_fast_path",
-                        "window": window,
-                        "eligible": true,
-                        "reasons": [],
-                        "used": false,
-                        "fallback_reason": format!("{error:#}"),
-                        "usage": asgard_usage_trace_value(usage),
-                    }));
-                }
-            }
-        } else {
-            crate::trace_logging::append_trace_record(serde_json::json!({
-                "type": "asgard_fast_path",
-                "window": window,
-                "eligible": false,
-                "reasons": fast_path.reasons,
-                "used": false,
-                "fallback_reason": "ineligible",
-                "usage": asgard_usage_trace_value(crate::llm_client::TokenUsage::default()),
-            }));
-        }
-    }
     let (decision, usage) = run_asgard_supervisor_tool_steps(
         llm.as_ref(),
         messages,
@@ -7867,14 +6199,12 @@ async fn run_asgard_supervisor(
             required_winner: None,
             checklist_ids: &[],
             carry_forward_allowed: false,
-            window_policy,
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Supervisor")),
     )
     .await;
-    fast_path_usage.add(usage);
-    (decision.map(|(decision, _stats)| decision), fast_path_usage)
+    (decision.map(|(decision, _stats)| decision), usage)
 }
 
 struct AsgardCompletionReviewContext<'a> {
@@ -7894,7 +6224,6 @@ struct AsgardCompletionReviewContext<'a> {
     supervisor_history: &'a AsgardSupervisorHistory,
     prior_review: Option<&'a AsgardPriorCompletionReview>,
     window_deltas_since_prior_review: &'a [(usize, Vec<u8>)],
-    window_policy: AsgardWindowPolicyMode,
     live_output: &'a AsgardLiveOutput,
 }
 
@@ -7923,7 +6252,6 @@ async fn run_asgard_completion_review(
         supervisor_history,
         prior_review,
         window_deltas_since_prior_review,
-        window_policy,
         live_output,
     } = context;
     debug_assert_eq!(candidates.len(), registries.len());
@@ -7992,7 +6320,7 @@ async fn run_asgard_completion_review(
                 .join("\n")
         })
         .unwrap_or_default();
-    let mut messages = asgard_completion_review_messages(
+    let messages = asgard_completion_review_messages(
         original_task,
         selected_trajectory_initial,
         selected_trajectory_windows,
@@ -8008,7 +6336,6 @@ async fn run_asgard_completion_review(
         prior_review,
         prior_review_delta,
     );
-    append_asgard_explicit_window_policy_message(&mut messages, window_policy);
     tracing::info!(
         window,
         selected_lane = selected_lane + 1,
@@ -8030,7 +6357,6 @@ async fn run_asgard_completion_review(
             required_winner: Some(selected_lane),
             checklist_ids: &task_contract_checklist.contracts,
             carry_forward_allowed: prior_review.is_some(),
-            window_policy,
         },
         cancel,
         Some(AsgardStreamSinks::new(live_output, "Completion reviewer")),
@@ -8122,7 +6448,6 @@ struct AsgardSupervisorToolContext<'a> {
     required_winner: Option<usize>,
     checklist_ids: &'a [AsgardTaskContract],
     carry_forward_allowed: bool,
-    window_policy: AsgardWindowPolicyMode,
 }
 
 struct AsgardAuditContext<'a> {
@@ -8250,10 +6575,7 @@ async fn run_asgard_initial_advice_tool_steps(
     crate::llm_client::TokenUsage,
 ) {
     const MAX_STEPS: usize = 2;
-    let tools = vec![asgard_advise_trajectories_tool_for_policy(
-        context.max_candidate_count,
-        context.window_policy,
-    )];
+    let tools = vec![asgard_advise_trajectories_tool(context.max_candidate_count)];
     let mut usage = crate::llm_client::TokenUsage::default();
     let mut last_invalid_response = None;
 
@@ -8347,10 +6669,9 @@ async fn run_asgard_initial_advice_tool_steps(
                             }
                             let serialized = serde_json::to_string(&normalized)
                                 .expect("normalized tool arguments serialize");
-                            match parse_asgard_initial_advice_for_policy(
+                            match parse_asgard_initial_advice(
                                 &serialized,
                                 context.max_candidate_count,
-                                context.window_policy,
                             ) {
                                 Ok(value) => advice = Some(value),
                                 Err(error) => last_invalid_response = Some(error),
@@ -8426,8 +6747,6 @@ async fn run_asgard_supervisor_tool_steps(
     let mut audit_rounds_used = 0usize;
     let mut selection_attempts = 0usize;
     let mut validation_rounds = 0usize;
-    let capture_replay = std::env::var_os("ASGARD_CAPTURE_SUPERVISOR_REPLAYS").is_some();
-    let mut replay_call_index = 0usize;
 
     loop {
         let audit_phase = audit_rounds_used < audit_round_limit;
@@ -8438,28 +6757,6 @@ async fn run_asgard_supervisor_tool_steps(
         }
         let text_sink = stream_sinks.as_ref().map(|sinks| sinks.text.clone());
         let thought_sink = stream_sinks.as_ref().map(|sinks| sinks.thought.clone());
-        replay_call_index += 1;
-        if capture_replay {
-            crate::trace_logging::append_trace_record(serde_json::json!({
-                "type": "asgard_supervisor_replay_request",
-                "decision_call": if context.required_winner.is_some() {
-                    "completion_review"
-                } else {
-                    "supervisor"
-                },
-                "call_index": replay_call_index,
-                "phase": if audit_phase { "audit" } else { "selection" },
-                "model": context.model,
-                "messages": &messages,
-                "tools": &tools,
-                "parameters": {
-                    "reasoning_effort": null,
-                    "service_tier": null,
-                    "temperature": null,
-                    "structured_output": null,
-                },
-            }));
-        }
         let response = stream_chat_no_visible_output_with_retry(
             llm,
             "selecting an Asgard trajectory",
@@ -8504,23 +6801,8 @@ async fn run_asgard_supervisor_tool_steps(
         .await;
         let response = match response {
             Ok(response) => response,
-            Err(error) => {
-                if capture_replay {
-                    crate::trace_logging::append_trace_record(serde_json::json!({
-                        "type": "asgard_supervisor_replay_response",
-                        "call_index": replay_call_index,
-                        "error": format!("{error:#}"),
-                    }));
-                }
-                return (Err(error), usage);
-            }
+            Err(error) => return (Err(error), usage),
         };
-        if capture_replay {
-            crate::trace_logging::append_trace_record(asgard_supervisor_replay_response_record(
-                replay_call_index,
-                &response,
-            ));
-        }
         usage.add(response.usage());
 
         match response {
@@ -8577,11 +6859,10 @@ async fn run_asgard_supervisor_tool_steps(
                         Ok(arguments) => {
                             let serialized = serde_json::to_string(&arguments.value)
                                 .expect("normalized tool arguments serialize");
-                            match parse_asgard_supervisor_decision_with_policy(
+                            match parse_asgard_supervisor_decision_with_max(
                                 &serialized,
                                 context.candidate_count,
                                 context.max_candidate_count,
-                                context.window_policy,
                             ) {
                                 Ok(decision) => {
                                     if let Some(required_winner) = context.required_winner
@@ -8813,10 +7094,9 @@ async fn run_asgard_supervisor_tool_steps(
 fn asgard_supervisor_tool_definitions(
     context: &AsgardSupervisorToolContext<'_>,
 ) -> Vec<ToolDefinition> {
-    let mut tools = vec![asgard_select_trajectory_tool_for_policy(
+    let mut tools = vec![asgard_select_trajectory_tool(
         context.candidate_count,
         context.max_candidate_count,
-        context.window_policy,
     )];
     if let Some(audit) = &context.audit {
         tools.extend(audit.definitions.clone());
@@ -8839,52 +7119,6 @@ fn asgard_decision_trace_record(
             "validation_rounds": challenge.validation_rounds,
         },
     })
-}
-
-fn asgard_supervisor_replay_response_record(
-    call_index: usize,
-    response: &LlmResponse,
-) -> serde_json::Value {
-    let usage = response.usage();
-    let usage = serde_json::json!({
-        "input": usage.input_tokens,
-        "output": usage.output_tokens,
-        "thought": usage.thought_tokens,
-        "cachedRead": usage.cached_read_tokens,
-        "cachedWrite": usage.cached_write_tokens,
-    });
-    match response {
-        LlmResponse::Text {
-            text,
-            reasoning_content,
-            ..
-        } => serde_json::json!({
-            "type": "asgard_supervisor_replay_response",
-            "call_index": call_index,
-            "response": {
-                "kind": "text",
-                "text": text,
-                "reasoning_content": reasoning_content,
-            },
-            "usage": usage,
-        }),
-        LlmResponse::ToolCalls {
-            text,
-            reasoning_content,
-            calls,
-            ..
-        } => serde_json::json!({
-            "type": "asgard_supervisor_replay_response",
-            "call_index": call_index,
-            "response": {
-                "kind": "tool_calls",
-                "text": text,
-                "reasoning_content": reasoning_content,
-                "tool_calls": calls,
-            },
-            "usage": usage,
-        }),
-    }
 }
 
 fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
@@ -8935,66 +7169,6 @@ Then call advise_trajectories exactly once.
 </initial_advice_procedure>"#
         )),
     ]
-}
-
-fn asgard_initial_advice_messages_for_policy(
-    original_task: &str,
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
-) -> Vec<ChatMessage> {
-    let mut messages = asgard_initial_advice_messages(original_task, max_candidate_count);
-    append_asgard_explicit_window_policy_message(&mut messages, window_policy);
-    messages
-}
-
-fn append_asgard_explicit_window_policy_message(
-    messages: &mut Vec<ChatMessage>,
-    window_policy: AsgardWindowPolicyMode,
-) {
-    if window_policy != AsgardWindowPolicyMode::ExplicitProbe {
-        return;
-    }
-    messages.push(ChatMessage::user(asgard_explicit_window_policy_text()));
-}
-
-fn asgard_explicit_window_policy_text() -> &'static str {
-    r#"<explicit_probe_policy>
-Choose window_kind for every incomplete route.
-- probe: exactly 2-5 lanes (bounded by the configured maximum) for 1-2 steps. Every advice must include a distinct hypothesis, a concrete falsification_action, and an observable continue_stop_signal. Use probes to resolve consequential uncertainty cheaply, not to relabel ordinary implementation work.
-- work: 1-5 lanes for 1-10 steps with the ordinary strategy and scope_basis advice semantics. Omit the three probe-only advice fields.
-The combination is validated; an invalid kind/count/steps/advice combination will be rejected.
-</explicit_probe_policy>"#
-}
-
-fn render_asgard_probe_supervisor_context(
-    plan: &AsgardWindowPlan,
-    candidate_trajectories: &str,
-) -> String {
-    let contracts =
-        serde_json::to_string_pretty(&plan.probe_advices).expect("Asgard probe advice serializes");
-    format!(
-        "<probe_window_contracts structured=\"true\">\n\
-         This was an explicitly bounded probe. Compare each lane against its hypothesis, falsification action, and observable continue/stop signal. Prefer information gain and decisive falsification over patch volume; the probe label itself is not evidence or savings.\n\
-         {contracts}\n\
-         </probe_window_contracts>\n\
-         {candidate_trajectories}"
-    )
-}
-
-fn asgard_window_kind_trace_record(
-    window: usize,
-    candidate_count: usize,
-    window_steps: usize,
-    plan: &AsgardWindowPlan,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "asgard_window_kind",
-        "window": window,
-        "kind": plan.kind.as_str(),
-        "candidate_count": candidate_count,
-        "window_steps": window_steps,
-        "hypotheses": &plan.probe_advices,
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -9118,187 +7292,6 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
     messages
 }
 
-fn asgard_supervisor_messages_for_mode(
-    full_control_messages: Vec<ChatMessage>,
-    selected_trajectory_windows: &[Vec<ChatMessage>],
-    supervisor_history: &AsgardSupervisorHistory,
-    canonical_ledger: &[(usize, AsgardExecutionLedger)],
-    config: AsgardSupervisorPromptConfig,
-) -> Vec<ChatMessage> {
-    if config.mode == AsgardSupervisorPromptMode::Full {
-        return full_control_messages;
-    }
-
-    // The first three messages are the production control's stable system,
-    // original-task, and task-checklist prefix. Keeping them byte-identical
-    // makes cache effects measurable instead of conflating compression with a
-    // prompt rewrite.
-    let mut messages = full_control_messages
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>();
-    let ledger = render_asgard_canonical_ledger(canonical_ledger);
-    let latest = supervisor_history
-        .selected_windows
-        .last()
-        .or_else(|| supervisor_history.checkpointed.last());
-
-    // Before the first selected window there is no cumulative supervisor state
-    // capable of replacing the initial trajectory. Preserve that exact,
-    // cacheable message for the bootstrap decision; the first compact-mode
-    // selection is then required to produce the cumulative replacement used by
-    // later turns.
-    if latest.is_none()
-        && let Some(selected_initial) = full_control_messages.get(3)
-    {
-        messages.push(selected_initial.clone());
-    }
-
-    match config.mode {
-        AsgardSupervisorPromptMode::Full => unreachable!("full mode returned above"),
-        AsgardSupervisorPromptMode::LatestState => {
-            messages.push(asgard_compact_canonical_state_message(
-                "latest-state",
-                latest,
-                &ledger,
-            ));
-        }
-        AsgardSupervisorPromptMode::DecisionLogOnly => {
-            let decisions = supervisor_history
-                .checkpointed
-                .iter()
-                .chain(&supervisor_history.selected_windows)
-                .map(render_asgard_supervisor_history_entry)
-                .collect::<Vec<_>>()
-                .join("\n");
-            messages.push(ChatMessage::assistant(format!(
-                "<canonical_state mode=\"decision-log-only\" cumulative=\"true\">\n\
-                 <prior_decisions>\n{decisions}\n</prior_decisions>\n\
-                 <canonical_execution_history mechanically_derived=\"true\">\n{ledger}\n\
-                 </canonical_execution_history>\n\
-                 {}\n\
-                 </canonical_state>",
-                asgard_cumulative_state_instruction(),
-            )));
-        }
-        AsgardSupervisorPromptMode::CheckpointPlusDelta => {
-            let latest_window = latest.map_or(0, |entry| entry.window);
-            let interval_checkpoint =
-                (latest_window / config.checkpoint_interval) * config.checkpoint_interval;
-            let history_checkpoint = supervisor_history
-                .checkpointed
-                .last()
-                .map_or(0, |entry| entry.window);
-            let checkpoint_window = interval_checkpoint.max(history_checkpoint);
-            let checkpoint = supervisor_history
-                .checkpointed
-                .iter()
-                .chain(&supervisor_history.selected_windows)
-                .find(|entry| entry.window == checkpoint_window);
-            let checkpoint_ledger =
-                render_asgard_canonical_ledger_through(canonical_ledger, checkpoint_window);
-            messages.push(asgard_compact_canonical_state_message(
-                "checkpoint-plus-delta",
-                checkpoint,
-                &checkpoint_ledger,
-            ));
-            let delta_start = supervisor_history
-                .selected_windows
-                .iter()
-                .position(|entry| entry.window > checkpoint_window)
-                .unwrap_or(supervisor_history.selected_windows.len());
-            asgard_append_selected_window_tail(
-                &mut messages,
-                selected_trajectory_windows,
-                supervisor_history,
-                delta_start,
-            );
-        }
-        AsgardSupervisorPromptMode::RecentExactTail => {
-            let selected_len = supervisor_history.selected_windows.len();
-            let tail_start = selected_len.saturating_sub(config.recent_exact_tail);
-            let checkpoint = if tail_start > 0 {
-                supervisor_history.selected_windows.get(tail_start - 1)
-            } else {
-                supervisor_history.checkpointed.last()
-            };
-            messages.push(asgard_compact_canonical_state_message(
-                "recent-exact-tail",
-                checkpoint,
-                &ledger,
-            ));
-            asgard_append_selected_window_tail(
-                &mut messages,
-                selected_trajectory_windows,
-                supervisor_history,
-                tail_start,
-            );
-        }
-    }
-
-    if let Some(current_dossier) = full_control_messages.last() {
-        messages.push(current_dossier.clone());
-    }
-    messages
-}
-
-fn asgard_compact_canonical_state_message(
-    mode: &str,
-    state: Option<&AsgardSupervisorHistoryEntry>,
-    canonical_ledger: &str,
-) -> ChatMessage {
-    let (source_window, summary) = state.map_or((0, "No prior selected window."), |entry| {
-        (entry.window, entry.state_summary.as_str())
-    });
-    ChatMessage::assistant(format!(
-        "<canonical_state mode=\"{mode}\" cumulative=\"true\" source_window=\"{source_window}\">\n\
-         <latest_state_summary lossy=\"true\">\n{summary}\n</latest_state_summary>\n\
-         <canonical_execution_history mechanically_derived=\"true\" \
-         evidence_ids=\"window plus ledger id\">\n{canonical_ledger}\n\
-         </canonical_execution_history>\n\
-         {}\n\
-         </canonical_state>",
-        asgard_cumulative_state_instruction(),
-    ))
-}
-
-fn asgard_cumulative_state_instruction() -> &'static str {
-    "<state_update_contract>The state_summary in your next select_trajectory call must be a \
-     self-contained cumulative replacement for this state: retain the selected architectural \
-     direction, files and symbols involved, established facts with window-qualified evidence \
-     IDs, unresolved task contracts and adverse conditions, known failed approaches or defects, \
-     latest verification results, and the next serial dependency. Do not assume omitted prior \
-     prose will be available on the next routing turn.</state_update_contract>"
-}
-
-fn asgard_append_selected_window_tail(
-    messages: &mut Vec<ChatMessage>,
-    selected_trajectory_windows: &[Vec<ChatMessage>],
-    supervisor_history: &AsgardSupervisorHistory,
-    start: usize,
-) {
-    debug_assert_eq!(
-        selected_trajectory_windows.len(),
-        supervisor_history.selected_windows.len()
-    );
-    for (index, window) in selected_trajectory_windows.iter().enumerate().skip(start) {
-        messages.push(ChatMessage::user(format!(
-            "<selected_trajectory_window_boundary index=\"{index}\" />"
-        )));
-        let decision = supervisor_history
-            .selected_windows
-            .get(index)
-            .map(render_asgard_supervisor_history_entry)
-            .unwrap_or_default();
-        messages.push(ChatMessage::assistant(format!(
-            "<selected_trajectory_window index=\"{index}\">\n{}\n\
-             </selected_trajectory_window>\n{decision}",
-            render_asgard_dossier_messages(window),
-        )));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn asgard_completion_review_messages(
     original_task: &str,
@@ -9409,14 +7402,6 @@ fn render_asgard_canonical_ledger(canonical_ledger: &[(usize, AsgardExecutionLed
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn render_asgard_canonical_ledger_through(
-    canonical_ledger: &[(usize, AsgardExecutionLedger)],
-    checkpoint_window: usize,
-) -> String {
-    let end = canonical_ledger.partition_point(|(window, _)| *window <= checkpoint_window);
-    render_asgard_canonical_ledger(&canonical_ledger[..end])
 }
 
 fn render_asgard_supervisor_history(entries: &[AsgardSupervisorHistoryEntry]) -> String {
@@ -9916,88 +7901,57 @@ struct AsgardCandidateAssessmentContext<'a> {
     current_plan: Option<&'a crate::plan::UpdatePlanArgs>,
 }
 
-#[cfg(test)]
 fn asgard_advise_trajectories_tool(max_candidate_count: usize) -> ToolDefinition {
-    asgard_advise_trajectories_tool_for_policy(max_candidate_count, AsgardWindowPolicyMode::Dynamic)
-}
-
-fn asgard_advise_trajectories_tool_for_policy(
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
-) -> ToolDefinition {
-    let mut required = vec![
-        "next_candidate_count",
-        "next_window_steps",
-        "state_summary",
-        "advices",
-    ];
-    if window_policy == AsgardWindowPolicyMode::ExplicitProbe {
-        required.push("window_kind");
-    }
-    let mut parameters = serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": required,
-        "properties": {
-            "next_candidate_count": {
-                "type": "integer",
-                "minimum": ASGARD_MIN_CANDIDATES,
-                "maximum": max_candidate_count,
-            },
-            "next_window_steps": {
-                "type": "integer",
-                "minimum": ASGARD_MIN_WINDOW_STEPS,
-                "maximum": ASGARD_MAX_WINDOW_STEPS,
-            },
-            "state_summary": { "type": "string", "minLength": 1 },
-            "advices": {
-                "type": "array",
-                "minItems": ASGARD_MIN_CANDIDATES,
-                "maxItems": max_candidate_count,
-                "uniqueItems": true,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["strategy", "scope_basis"],
-                    "properties": {
-                        "strategy": { "type": "string", "minLength": 1 },
-                        "scope_basis": { "type": "string", "minLength": 1 },
-                    },
-                },
-            },
-        },
-    });
-    if window_policy == AsgardWindowPolicyMode::ExplicitProbe {
-        add_asgard_explicit_probe_schema_properties(&mut parameters);
-    }
     ToolDefinition {
         r#type: "function".to_string(),
         function: FunctionDef {
             name: "advise_trajectories".to_string(),
             description: "Choose the first shared Asgard window length and provide distinct advisory strategies for all candidate trajectories. This is the terminal initial supervisor action and must be called exactly once.".to_string(),
-            parameters,
+            parameters: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["next_candidate_count", "next_window_steps", "state_summary", "advices"],
+            "properties": {
+                "next_candidate_count": {
+                    "type": "integer",
+                    "minimum": ASGARD_MIN_CANDIDATES,
+                    "maximum": max_candidate_count,
+                },
+                "next_window_steps": {
+                    "type": "integer",
+                    "minimum": ASGARD_MIN_WINDOW_STEPS,
+                    "maximum": ASGARD_MAX_WINDOW_STEPS,
+                },
+                "state_summary": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "advices": {
+                    "type": "array",
+                    "minItems": ASGARD_MIN_CANDIDATES,
+                    "maxItems": max_candidate_count,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["strategy", "scope_basis"],
+                        "properties": {
+                            "strategy": { "type": "string", "minLength": 1 },
+                            "scope_basis": { "type": "string", "minLength": 1 },
+                        },
+                    },
+                },
+            },
+            }),
         },
     }
 }
 
-#[cfg(test)]
 fn asgard_select_trajectory_tool(
     candidate_count: usize,
     max_candidate_count: usize,
 ) -> ToolDefinition {
-    asgard_select_trajectory_tool_for_policy(
-        candidate_count,
-        max_candidate_count,
-        AsgardWindowPolicyMode::Dynamic,
-    )
-}
-
-fn asgard_select_trajectory_tool_for_policy(
-    candidate_count: usize,
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
-) -> ToolDefinition {
-    let mut tool = ToolDefinition {
+    ToolDefinition {
         r#type: "function".to_string(),
         function: FunctionDef {
             name: "select_trajectory".to_string(),
@@ -10066,122 +8020,7 @@ fn asgard_select_trajectory_tool_for_policy(
             },
             }),
         },
-    };
-    if window_policy == AsgardWindowPolicyMode::ExplicitProbe {
-        add_asgard_explicit_probe_schema_properties(&mut tool.function.parameters);
     }
-    tool
-}
-
-fn add_asgard_explicit_probe_schema_properties(parameters: &mut serde_json::Value) {
-    let selection_schema = parameters
-        .get("properties")
-        .and_then(|properties| properties.get("complete"))
-        .is_some();
-    let properties = parameters
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("Asgard routing schema has object properties");
-    properties.insert(
-        "window_kind".to_string(),
-        serde_json::json!({
-            "type": "string",
-            "enum": ["probe", "work"],
-            "description": "probe requires 2-5 lanes for 1-2 steps and structured falsification advice; work retains normal 1-5 lane, 1-10 step semantics.",
-        }),
-    );
-    let advice_properties = properties
-        .get_mut("advices")
-        .and_then(|advices| advices.get_mut("items"))
-        .and_then(|items| items.get_mut("properties"))
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("Asgard routing advice schema has object properties");
-    for (name, description) in [
-        (
-            "hypothesis",
-            "Required for probe advice: the lane's distinct, falsifiable claim.",
-        ),
-        (
-            "falsification_action",
-            "Required for probe advice: the concrete action that could disprove the hypothesis.",
-        ),
-        (
-            "continue_stop_signal",
-            "Required for probe advice: an observable signal specifying when to continue this direction versus stop it.",
-        ),
-    ] {
-        advice_properties.insert(
-            name.to_string(),
-            serde_json::json!({
-                "type": "string",
-                "minLength": 1,
-                "description": description,
-            }),
-        );
-    }
-    let mut combinations = vec![
-        serde_json::json!({
-            "if": {
-                "required": ["window_kind"],
-                "properties": { "window_kind": { "const": "probe" } },
-            },
-            "then": {
-                "properties": {
-                    "next_candidate_count": { "minimum": 2, "maximum": ASGARD_MAX_CANDIDATES },
-                    "next_window_steps": { "minimum": 1, "maximum": 2 },
-                    "advices": {
-                        "minItems": 2,
-                        "maxItems": ASGARD_MAX_CANDIDATES,
-                        "items": {
-                            "required": [
-                                "strategy",
-                                "scope_basis",
-                                "hypothesis",
-                                "falsification_action",
-                                "continue_stop_signal"
-                            ]
-                        }
-                    }
-                }
-            }
-        }),
-        serde_json::json!({
-            "if": {
-                "required": ["window_kind"],
-                "properties": { "window_kind": { "const": "work" } },
-            },
-            "then": {
-                "properties": {
-                    "advices": {
-                        "items": {
-                            "not": {
-                                "anyOf": [
-                                    { "required": ["hypothesis"] },
-                                    { "required": ["falsification_action"] },
-                                    { "required": ["continue_stop_signal"] }
-                                ]
-                            }
-                        }
-                    }
-                }
-            }
-        }),
-    ];
-    if selection_schema {
-        combinations.push(serde_json::json!({
-            "if": {
-                "required": ["complete"],
-                "properties": { "complete": { "const": false } },
-            },
-            "then": {
-                "required": ["window_kind", "next_candidate_count", "next_window_steps"]
-            }
-        }));
-    }
-    parameters
-        .as_object_mut()
-        .expect("Asgard routing schema is an object")
-        .insert("allOf".to_string(), serde_json::Value::Array(combinations));
 }
 
 fn render_asgard_verified_at_window_start(ledger: &AsgardExecutionLedger) -> Option<String> {
@@ -10502,25 +8341,10 @@ fn asgard_is_test_path(path: &str) -> bool {
         || file.contains(".spec.")
 }
 
-#[cfg(test)]
 fn parse_asgard_supervisor_decision_with_max(
     text: &str,
     candidate_count: usize,
     max_candidate_count: usize,
-) -> anyhow::Result<AsgardSupervisorDecision> {
-    parse_asgard_supervisor_decision_with_policy(
-        text,
-        candidate_count,
-        max_candidate_count,
-        AsgardWindowPolicyMode::Dynamic,
-    )
-}
-
-fn parse_asgard_supervisor_decision_with_policy(
-    text: &str,
-    candidate_count: usize,
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
 ) -> anyhow::Result<AsgardSupervisorDecision> {
     for (start, _) in text.match_indices('{') {
         let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
@@ -10563,7 +8387,6 @@ fn parse_asgard_supervisor_decision_with_policy(
                 next_window_steps: None,
                 state_summary: state_summary.to_string(),
                 contracts,
-                next_window_plan: None,
             });
         }
         let Some(next_candidate_count) =
@@ -10574,20 +8397,10 @@ fn parse_asgard_supervisor_decision_with_policy(
         let Some(next_window_steps) = parse_asgard_next_window_steps(&value) else {
             continue;
         };
-        let Some(mut advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
         else {
             continue;
         };
-        let Some(next_window_plan) = parse_asgard_window_plan(
-            &value,
-            raw_advices,
-            next_candidate_count,
-            next_window_steps,
-            window_policy,
-        ) else {
-            continue;
-        };
-        render_asgard_probe_candidate_advices(&mut advices, next_window_plan.as_ref());
         let contracts = parse_asgard_contract_rows(&value);
         return Ok(AsgardSupervisorDecision {
             winner,
@@ -10597,7 +8410,6 @@ fn parse_asgard_supervisor_decision_with_policy(
             next_window_steps: Some(next_window_steps),
             state_summary: state_summary.to_string(),
             contracts,
-            next_window_plan,
         });
     }
     anyhow::bail!(
@@ -10605,22 +8417,9 @@ fn parse_asgard_supervisor_decision_with_policy(
     )
 }
 
-#[cfg(test)]
 fn parse_asgard_initial_advice(
     text: &str,
     max_candidate_count: usize,
-) -> anyhow::Result<AsgardSupervisorInitialAdvice> {
-    parse_asgard_initial_advice_for_policy(
-        text,
-        max_candidate_count,
-        AsgardWindowPolicyMode::Dynamic,
-    )
-}
-
-fn parse_asgard_initial_advice_for_policy(
-    text: &str,
-    max_candidate_count: usize,
-    window_policy: AsgardWindowPolicyMode,
 ) -> anyhow::Result<AsgardSupervisorInitialAdvice> {
     for (start, _) in text.match_indices('{') {
         let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
@@ -10648,114 +8447,20 @@ fn parse_asgard_initial_advice_for_policy(
         let Some(raw_advices) = value.get("advices").and_then(serde_json::Value::as_array) else {
             continue;
         };
-        let Some(mut advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
         else {
             continue;
         };
-        let Some(next_window_plan) = parse_asgard_window_plan(
-            &value,
-            raw_advices,
-            next_candidate_count,
-            next_window_steps,
-            window_policy,
-        ) else {
-            continue;
-        };
-        render_asgard_probe_candidate_advices(&mut advices, next_window_plan.as_ref());
         return Ok(AsgardSupervisorInitialAdvice {
             advices,
             next_candidate_count,
             next_window_steps,
             state_summary: state_summary.to_string(),
-            next_window_plan,
         });
     }
     anyhow::bail!(
         "Asgard supervisor returned no valid initial advice with a 1-{max_candidate_count} next_candidate_count, matching distinct advices, and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
     )
-}
-
-fn parse_asgard_window_plan(
-    value: &serde_json::Value,
-    raw_advices: &[serde_json::Value],
-    candidate_count: usize,
-    window_steps: usize,
-    window_policy: AsgardWindowPolicyMode,
-) -> Option<Option<AsgardWindowPlan>> {
-    if window_policy == AsgardWindowPolicyMode::Dynamic {
-        return Some(None);
-    }
-    match AsgardWindowKind::parse(value)? {
-        AsgardWindowKind::Work => {
-            let has_probe_only_fields = raw_advices.iter().any(|advice| {
-                advice.as_object().is_some_and(|advice| {
-                    ["hypothesis", "falsification_action", "continue_stop_signal"]
-                        .iter()
-                        .any(|field| advice.contains_key(*field))
-                })
-            });
-            (!has_probe_only_fields).then(|| Some(AsgardWindowPlan::work()))
-        }
-        AsgardWindowKind::Probe => {
-            if !(2..=ASGARD_MAX_CANDIDATES).contains(&candidate_count)
-                || !(1..=2).contains(&window_steps)
-            {
-                return None;
-            }
-            let probe_advices = raw_advices
-                .iter()
-                .enumerate()
-                .map(|(lane, advice)| {
-                    let advice = advice.as_object()?;
-                    let field = |name| {
-                        advice
-                            .get(name)?
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string)
-                    };
-                    Some(AsgardProbeAdvice {
-                        lane,
-                        hypothesis: field("hypothesis")?,
-                        falsification_action: field("falsification_action")?,
-                        continue_stop_signal: field("continue_stop_signal")?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?;
-            let distinct_hypotheses = probe_advices
-                .iter()
-                .map(|advice| advice.hypothesis.to_lowercase())
-                .collect::<HashSet<_>>();
-            (distinct_hypotheses.len() == candidate_count).then_some(Some(AsgardWindowPlan {
-                kind: AsgardWindowKind::Probe,
-                probe_advices,
-            }))
-        }
-    }
-}
-
-fn render_asgard_probe_candidate_advices(
-    advices: &mut [Option<String>],
-    plan: Option<&AsgardWindowPlan>,
-) {
-    let Some(plan) = plan.filter(|plan| plan.kind == AsgardWindowKind::Probe) else {
-        return;
-    };
-    for probe in &plan.probe_advices {
-        let Some(Some(strategy)) = advices.get_mut(probe.lane) else {
-            continue;
-        };
-        *strategy = format!(
-            "{strategy}\n\
-             <probe_contract>\n\
-             hypothesis: {}\n\
-             falsification_action: {}\n\
-             continue_stop_signal: {}\n\
-             </probe_contract>",
-            probe.hypothesis, probe.falsification_action, probe.continue_stop_signal,
-        );
-    }
 }
 
 fn parse_asgard_contract_rows(value: &serde_json::Value) -> Option<Vec<AsgardContractRow>> {
@@ -21669,7 +19374,6 @@ mod tests {
             state_summary: "The selected parser still has an unresolved wildcard assumption."
                 .to_string(),
             contracts: None,
-            next_window_plan: None,
         };
         let mut history = AsgardSupervisorHistory::default();
         history.push(4, &decision);
@@ -22102,158 +19806,6 @@ mod tests {
     }
 
     #[test]
-    fn asgard_supervisor_prompt_modes_preserve_control_and_freeze_checkpoints() {
-        let checklist = AsgardTaskContractChecklist::default();
-        let empty_history = AsgardSupervisorHistory::default();
-        let full = asgard_supervisor_messages(
-            "task",
-            &[ChatMessage::system("stable")],
-            &[],
-            &empty_history,
-            AsgardCandidateCounts { current: 1, max: 3 },
-            &checklist,
-            "current candidates".to_string(),
-        );
-        assert_eq!(
-            asgard_supervisor_messages_for_mode(
-                full.clone(),
-                &[],
-                &empty_history,
-                &[],
-                AsgardSupervisorPromptConfig::default(),
-            ),
-            full,
-        );
-        for mode in [
-            AsgardSupervisorPromptMode::LatestState,
-            AsgardSupervisorPromptMode::CheckpointPlusDelta,
-            AsgardSupervisorPromptMode::DecisionLogOnly,
-            AsgardSupervisorPromptMode::RecentExactTail,
-        ] {
-            let compact = asgard_supervisor_messages_for_mode(
-                full.clone(),
-                &[],
-                &empty_history,
-                &[],
-                AsgardSupervisorPromptConfig {
-                    mode,
-                    ..Default::default()
-                },
-            );
-            assert_eq!(
-                compact
-                    .iter()
-                    .filter(|message| {
-                        asgard_message_text(message).contains("<selected_trajectory_initial>")
-                    })
-                    .count(),
-                1,
-                "{mode:?} must preserve exact selected-initial bootstrap state",
-            );
-        }
-
-        let history_through_four = AsgardSupervisorHistory {
-            checkpointed: Vec::new(),
-            selected_windows: (1..=4)
-                .map(|window| AsgardSupervisorHistoryEntry {
-                    window,
-                    winner: 0,
-                    state_summary: format!("cumulative state through window {window}"),
-                })
-                .collect(),
-        };
-        let history_through_five = AsgardSupervisorHistory {
-            checkpointed: Vec::new(),
-            selected_windows: (1..=5)
-                .map(|window| AsgardSupervisorHistoryEntry {
-                    window,
-                    winner: 0,
-                    state_summary: format!("cumulative state through window {window}"),
-                })
-                .collect(),
-        };
-        let windows_through_four = (1..=4)
-            .map(|window| vec![ChatMessage::assistant(format!("raw window {window}"))])
-            .collect::<Vec<_>>();
-        let windows_through_five = (1..=5)
-            .map(|window| vec![ChatMessage::assistant(format!("raw window {window}"))])
-            .collect::<Vec<_>>();
-        let ledgers_through_five = (1..=5)
-            .map(|window| {
-                (
-                    window,
-                    AsgardExecutionLedger {
-                        entries: vec![AsgardLedgerEntry {
-                            id: "L1".to_string(),
-                            step: 1,
-                            command: format!("verify window {window}"),
-                            exit_code: Some(0),
-                            output_tail: "ok".to_string(),
-                        }],
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let config = AsgardSupervisorPromptConfig {
-            mode: AsgardSupervisorPromptMode::CheckpointPlusDelta,
-            checkpoint_interval: 3,
-            recent_exact_tail: 2,
-        };
-        let compact_four = asgard_supervisor_messages_for_mode(
-            asgard_supervisor_messages(
-                "task",
-                &[],
-                &windows_through_four,
-                &history_through_four,
-                AsgardCandidateCounts { current: 1, max: 3 },
-                &checklist,
-                "candidates at five".to_string(),
-            ),
-            &windows_through_four,
-            &history_through_four,
-            &ledgers_through_five[..4],
-            config,
-        );
-        let compact_five = asgard_supervisor_messages_for_mode(
-            asgard_supervisor_messages(
-                "task",
-                &[],
-                &windows_through_five,
-                &history_through_five,
-                AsgardCandidateCounts { current: 1, max: 3 },
-                &checklist,
-                "candidates at six".to_string(),
-            ),
-            &windows_through_five,
-            &history_through_five,
-            &ledgers_through_five,
-            config,
-        );
-        let checkpoint_four = compact_four
-            .iter()
-            .find(|message| asgard_message_text(message).contains("<canonical_state"))
-            .expect("checkpoint through window four");
-        let checkpoint_five = compact_five
-            .iter()
-            .find(|message| asgard_message_text(message).contains("<canonical_state"))
-            .expect("checkpoint through window five");
-        assert_eq!(checkpoint_four, checkpoint_five);
-        let checkpoint_text = asgard_message_text(checkpoint_four);
-        assert!(checkpoint_text.contains("cumulative state through window 3"));
-        assert!(checkpoint_text.contains("verify window 3"));
-        assert!(!checkpoint_text.contains("verify window 4"));
-        let rendered_five = compact_five
-            .iter()
-            .map(asgard_message_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered_five.contains("raw window 4"));
-        assert!(rendered_five.contains("raw window 5"));
-        assert!(!rendered_five.contains("raw window 1"));
-    }
-
-    #[test]
     fn asgard_execution_ledger_recovers_shell_results_and_edit_steps() {
         let messages = vec![
             ChatMessage::assistant_tool_calls(vec![supervisor_tool_call(
@@ -22438,7 +19990,6 @@ mod tests {
                 required_winner: Some(0),
                 checklist_ids: &checklist_ids,
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -22499,7 +20050,6 @@ mod tests {
                 required_winner: Some(0),
                 checklist_ids: &checklist_ids,
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -22552,7 +20102,6 @@ mod tests {
                 required_winner: Some(0),
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -22588,7 +20137,6 @@ mod tests {
             next_window_steps: Some(3),
             state_summary: "Lane 1 is best but incomplete.".to_string(),
             contracts: None,
-            next_window_plan: None,
         };
 
         let record = asgard_decision_trace_record(
@@ -22629,7 +20177,6 @@ mod tests {
                 evidence: "carried-forward: unchanged since window 2 review".to_string(),
                 adverse_condition_evidence: None,
             }]),
-            next_window_plan: None,
         };
 
         assert!(asgard_validate_contract_rows(&decision, &checklist, true).is_empty());
@@ -22659,7 +20206,6 @@ mod tests {
                 evidence: "carried-forward: unchanged since window 2 review".to_string(),
                 adverse_condition_evidence: None,
             }]),
-            next_window_plan: None,
         };
 
         let violations = asgard_validate_contract_rows(&decision, &checklist, true);
@@ -23018,439 +20564,6 @@ mod tests {
     }
 
     #[test]
-    fn asgard_dynamic_window_policy_preserves_existing_prompts_and_schemas() {
-        assert_eq!(
-            asgard_initial_advice_messages_for_policy(
-                "Implement the requested API.",
-                3,
-                AsgardWindowPolicyMode::Dynamic,
-            ),
-            asgard_initial_advice_messages("Implement the requested API.", 3),
-        );
-        let initial =
-            asgard_advise_trajectories_tool_for_policy(3, AsgardWindowPolicyMode::Dynamic);
-        assert!(initial.function.parameters.get("allOf").is_none());
-        assert!(
-            initial.function.parameters["properties"]
-                .get("window_kind")
-                .is_none()
-        );
-        assert!(
-            initial.function.parameters["properties"]["advices"]["items"]["properties"]
-                .get("hypothesis")
-                .is_none()
-        );
-        let selection =
-            asgard_select_trajectory_tool_for_policy(3, 5, AsgardWindowPolicyMode::Dynamic);
-        assert!(selection.function.parameters.get("allOf").is_none());
-        assert!(
-            selection.function.parameters["properties"]
-                .get("window_kind")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn asgard_explicit_probe_policy_validates_kind_count_steps_and_advice_contracts() {
-        let probe = r#"{
-            "window_kind":"probe",
-            "next_candidate_count":2,
-            "next_window_steps":2,
-            "state_summary":"Probe two consequential interpretations.",
-            "advices":[
-                {"strategy":"Inspect and exercise interpretation A.","scope_basis":"task ambiguity","hypothesis":"The parser accepts the documented boundary.","falsification_action":"Run the focused boundary case before editing.","continue_stop_signal":"Continue only if the boundary fails in the target parser; otherwise stop this direction."},
-                {"strategy":"Inspect and exercise interpretation B.","scope_basis":"task ambiguity","hypothesis":"The caller normalizes the boundary before parsing.","falsification_action":"Trace a distinguishable input through the caller.","continue_stop_signal":"Continue if normalization is absent; stop if the caller already enforces it."}
-            ]
-        }"#;
-        let parsed =
-            parse_asgard_initial_advice_for_policy(probe, 5, AsgardWindowPolicyMode::ExplicitProbe)
-                .unwrap();
-        let plan = parsed.next_window_plan.expect("probe plan");
-        assert_eq!(plan.kind, AsgardWindowKind::Probe);
-        assert_eq!(plan.probe_advices.len(), 2);
-        assert!(
-            parsed.advices[0]
-                .as_deref()
-                .unwrap()
-                .contains("<probe_contract>")
-        );
-        let routed_probe = probe.replacen("{", "{\"winner\":0,\"complete\":false,", 1);
-        let routed = parse_asgard_supervisor_decision_with_policy(
-            &routed_probe,
-            2,
-            5,
-            AsgardWindowPolicyMode::ExplicitProbe,
-        )
-        .unwrap();
-        assert_eq!(
-            routed.next_window_plan.expect("routed probe plan").kind,
-            AsgardWindowKind::Probe
-        );
-
-        let work = r#"{
-            "window_kind":"work",
-            "next_candidate_count":1,
-            "next_window_steps":10,
-            "state_summary":"The defect is now a serial repair.",
-            "advices":[{"strategy":"Implement and verify the repair.","scope_basis":"known defect"}]
-        }"#;
-        assert_eq!(
-            parse_asgard_initial_advice_for_policy(work, 5, AsgardWindowPolicyMode::ExplicitProbe,)
-                .unwrap()
-                .next_window_plan,
-            Some(AsgardWindowPlan::work()),
-        );
-
-        for invalid in [
-            probe.replace("\"next_candidate_count\":2", "\"next_candidate_count\":1"),
-            probe.replace("\"next_window_steps\":2", "\"next_window_steps\":3"),
-            probe.replace(
-                "\"hypothesis\":\"The parser accepts the documented boundary.\",",
-                "",
-            ),
-            work.replace(
-                "\"scope_basis\":\"known defect\"",
-                "\"scope_basis\":\"known defect\",\"hypothesis\":\"not allowed on work\"",
-            ),
-        ] {
-            assert!(
-                parse_asgard_initial_advice_for_policy(
-                    &invalid,
-                    5,
-                    AsgardWindowPolicyMode::ExplicitProbe,
-                )
-                .is_err()
-            );
-        }
-
-        let tool =
-            asgard_advise_trajectories_tool_for_policy(5, AsgardWindowPolicyMode::ExplicitProbe);
-        let schema_validator =
-            jsonschema::validator_for(&tool.function.parameters).expect("valid routing schema");
-        assert!(schema_validator.is_valid(&serde_json::from_str(probe).unwrap()));
-        assert!(schema_validator.is_valid(&serde_json::from_str(work).unwrap()));
-        for invalid in [
-            probe.replace("\"next_candidate_count\":2", "\"next_candidate_count\":1"),
-            probe.replace("\"next_window_steps\":2", "\"next_window_steps\":3"),
-            probe.replace(
-                "\"hypothesis\":\"The parser accepts the documented boundary.\",",
-                "",
-            ),
-            work.replace(
-                "\"scope_basis\":\"known defect\"",
-                "\"scope_basis\":\"known defect\",\"hypothesis\":\"not allowed on work\"",
-            ),
-        ] {
-            assert!(!schema_validator.is_valid(&serde_json::from_str(&invalid).unwrap()));
-        }
-        assert!(tool.function.parameters.get("allOf").is_some());
-        assert!(
-            tool.function.parameters["required"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("window_kind"))
-        );
-        let selector =
-            asgard_select_trajectory_tool_for_policy(2, 5, AsgardWindowPolicyMode::ExplicitProbe);
-        assert_eq!(
-            selector.function.parameters["allOf"]
-                .as_array()
-                .unwrap()
-                .len(),
-            3
-        );
-    }
-
-    #[test]
-    fn asgard_probe_context_and_trace_preserve_structured_hypotheses() {
-        let plan = AsgardWindowPlan {
-            kind: AsgardWindowKind::Probe,
-            probe_advices: vec![AsgardProbeAdvice {
-                lane: 0,
-                hypothesis: "The failure is in parsing.".to_string(),
-                falsification_action: "Run the focused parser case.".to_string(),
-                continue_stop_signal: "Continue on reproduction; stop on pass.".to_string(),
-            }],
-        };
-        let context = render_asgard_probe_supervisor_context(&plan, "<candidates />");
-        assert!(context.contains("information gain"));
-        assert!(context.contains("The failure is in parsing."));
-        assert!(context.ends_with("<candidates />"));
-
-        let trace = asgard_window_kind_trace_record(4, 2, 1, &plan);
-        assert_eq!(trace["type"], "asgard_window_kind");
-        assert_eq!(trace["kind"], "probe");
-        assert_eq!(trace["candidate_count"], 2);
-        assert_eq!(trace["window_steps"], 1);
-        assert_eq!(trace["hypotheses"][0]["lane"], 0);
-    }
-
-    #[test]
-    fn asgard_shadow_rankings_require_exact_permutations() {
-        let ids = vec![
-            "endpoint-a".to_string(),
-            "endpoint-b".to_string(),
-            "endpoint-c".to_string(),
-        ];
-        let valid = serde_json::json!({
-            "ranking": [
-                {"id":"endpoint-c", "rank":1},
-                {"id":"endpoint-a", "rank":2},
-                {"id":"endpoint-b", "rank":3}
-            ]
-        });
-        assert_eq!(
-            parse_asgard_shadow_ranking(&valid, &ids, false)
-                .unwrap()
-                .ids,
-            ["endpoint-c", "endpoint-a", "endpoint-b"]
-        );
-        for invalid in [
-            serde_json::json!({
-                "ranking": [
-                    {"id":"endpoint-a", "rank":1},
-                    {"id":"endpoint-a", "rank":2},
-                    {"id":"endpoint-c", "rank":3}
-                ]
-            }),
-            serde_json::json!({
-                "ranking": [
-                    {"id":"endpoint-a", "rank":1},
-                    {"id":"endpoint-b", "rank":3},
-                    {"id":"endpoint-c", "rank":4}
-                ]
-            }),
-        ] {
-            assert!(parse_asgard_shadow_ranking(&invalid, &ids, false).is_err());
-        }
-        let tool = asgard_shadow_ranking_tool("rank_shadow_endpoints", &ids);
-        let validator = jsonschema::validator_for(&tool.function.parameters).unwrap();
-        assert!(validator.is_valid(&valid));
-
-        let mut classified = valid.clone();
-        classified["distinction_kind"] = serde_json::json!("architecture-contract");
-        classified["distinction_evidence"] =
-            serde_json::json!(["Lane 2 identified a distinct contract boundary."]);
-        let probe_tool = asgard_shadow_ranking_tool("rank_probe_trajectories", &ids);
-        let probe_validator = jsonschema::validator_for(&probe_tool.function.parameters).unwrap();
-        assert!(!probe_validator.is_valid(&valid));
-        assert!(probe_validator.is_valid(&classified));
-        let classified = parse_asgard_shadow_ranking(&classified, &ids, true).unwrap();
-        assert_eq!(
-            classified.distinction_kind.as_deref(),
-            Some("architecture-contract")
-        );
-    }
-
-    #[test]
-    fn asgard_shadow_force_makes_the_calibration_probe_executable() {
-        let mut advice = AsgardSupervisorInitialAdvice {
-            advices: vec![Some("Implement the ordinary work route.".to_string())],
-            next_candidate_count: 1,
-            next_window_steps: 8,
-            state_summary: "Ordinary work was proposed.".to_string(),
-            next_window_plan: Some(AsgardWindowPlan::work()),
-        };
-        force_asgard_shadow_probe(&mut advice, 2);
-        assert_eq!(advice.next_candidate_count, 3);
-        assert_eq!(advice.next_window_steps, 2);
-        let plan = advice.next_window_plan.unwrap();
-        assert_eq!(plan.kind, AsgardWindowKind::Probe);
-        assert_eq!(plan.probe_advices.len(), 3);
-        assert_eq!(advice.advices.len(), 3);
-        assert!(advice.advices.iter().all(|advice| {
-            advice
-                .as_deref()
-                .is_some_and(|advice| advice.contains("<probe_contract>"))
-        }));
-    }
-
-    fn eligible_fast_path_candidate() -> AsgardCandidate {
-        let mut outcome = asgard_failure(anyhow::anyhow!("placeholder"));
-        outcome.stop = crate::tool_loop::LoopStop::Completed { had_text: true };
-        AsgardCandidate {
-            index: 0,
-            model: "deepseek::deepseek-v4-flash".to_string(),
-            outcome,
-            patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+fixed\n".to_vec(),
-            delta_patch: b"diff --git a/src/lib.rs b/src/lib.rs\n+fixed\n".to_vec(),
-            supervisor_window_messages: vec![ChatMessage::assistant("fixed and tested")],
-            window_ledger: AsgardExecutionLedger {
-                entries: vec![AsgardLedgerEntry {
-                    id: "L1".to_string(),
-                    step: 2,
-                    command: "cargo test focused".to_string(),
-                    exit_code: Some(0),
-                    output_tail: "ok".to_string(),
-                }],
-                edit_steps: vec![AsgardLedgerEdit {
-                    step: 1,
-                    file: "src/lib.rs".to_string(),
-                }],
-                total_shell_commands: 1,
-                entries_truncated: false,
-            },
-        }
-    }
-
-    #[test]
-    fn asgard_fast_path_requires_compact_verified_serial_work() {
-        let candidate = eligible_fast_path_candidate();
-        let advice = vec![Some(
-            "Fix the concrete parser boundary and verify it.".to_string(),
-        )];
-        let eligible = asgard_fast_path_eligibility(
-            AsgardSupervisorFastPathMode::Conservative,
-            AsgardSupervisorPromptMode::CheckpointPlusDelta,
-            std::slice::from_ref(&candidate),
-            &AsgardWindowPlan::work(),
-            Some(&advice),
-        );
-        assert!(eligible.eligible, "{:?}", eligible.reasons);
-
-        let full = asgard_fast_path_eligibility(
-            AsgardSupervisorFastPathMode::Conservative,
-            AsgardSupervisorPromptMode::Full,
-            std::slice::from_ref(&candidate),
-            &AsgardWindowPlan::work(),
-            Some(&advice),
-        );
-        assert!(!full.eligible);
-        assert!(full.reasons.contains(&"full_prompt_not_compact"));
-
-        let mut unverified = candidate;
-        unverified.window_ledger.entries[0].exit_code = Some(1);
-        let unverified = asgard_fast_path_eligibility(
-            AsgardSupervisorFastPathMode::Conservative,
-            AsgardSupervisorPromptMode::CheckpointPlusDelta,
-            &[unverified],
-            &AsgardWindowPlan::work(),
-            Some(&advice),
-        );
-        assert!(!unverified.eligible);
-        assert!(
-            unverified
-                .reasons
-                .contains(&"no_successful_post_edit_verification")
-        );
-    }
-
-    #[test]
-    fn asgard_fast_path_parser_is_fail_closed_and_non_terminal() {
-        let valid = serde_json::json!({
-            "winner": 0,
-            "complete": false,
-            "state_summary": "The serial prerequisite was fixed and verified.",
-            "advices": [{
-                "strategy": "Verify the next explicit contract boundary.",
-                "scope_basis": "The remaining task checklist names that boundary."
-            }],
-            "next_candidate_count": 1,
-            "next_window_steps": 2,
-            "fast_path_confident": true,
-            "serial_prerequisite_addressed": true
-        });
-        let tool = asgard_fast_path_tool(3, AsgardWindowPolicyMode::Dynamic);
-        let validator = jsonschema::validator_for(&tool.function.parameters).unwrap();
-        assert!(validator.is_valid(&valid));
-        let decision =
-            parse_asgard_fast_path_decision(&valid.to_string(), 3, AsgardWindowPolicyMode::Dynamic)
-                .unwrap();
-        assert!(!decision.complete);
-        assert_eq!(decision.winner, 0);
-
-        let mut uncertain = valid.clone();
-        uncertain["fast_path_confident"] = serde_json::json!(false);
-        assert!(
-            parse_asgard_fast_path_decision(
-                &uncertain.to_string(),
-                3,
-                AsgardWindowPolicyMode::Dynamic,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("uncertainty")
-        );
-
-        let mut terminal = valid;
-        terminal["complete"] = serde_json::json!(true);
-        terminal["advices"] = serde_json::json!([]);
-        terminal["next_candidate_count"] = serde_json::Value::Null;
-        terminal["next_window_steps"] = serde_json::Value::Null;
-        assert!(
-            parse_asgard_fast_path_decision(
-                &terminal.to_string(),
-                3,
-                AsgardWindowPolicyMode::Dynamic,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("cannot nominate terminal completion")
-        );
-    }
-
-    #[test]
-    fn asgard_shadow_end_review_is_structurally_blinded() {
-        let candidate = AsgardCandidate {
-            index: 2,
-            model: "secret-model".to_string(),
-            outcome: asgard_failure(anyhow::anyhow!("test outcome")),
-            patch: b"diff --git a/lib.rs b/lib.rs\n+neutral endpoint\n".to_vec(),
-            delta_patch: Vec::new(),
-            supervisor_window_messages: vec![ChatMessage::assistant(
-                "neutral evidence from /tmp/asgard-secret-model-lane-2",
-            )],
-            window_ledger: AsgardExecutionLedger::default(),
-        };
-        let label = "endpoint-opaque";
-        let repository = crate::asgard::CandidateRepository {
-            root: PathBuf::from("/tmp/asgard-secret-model-lane-2"),
-            session_cwd: PathBuf::from("/tmp/asgard-secret-model-lane-2"),
-            base_commit: "base".to_string(),
-        };
-        let dossier = render_asgard_shadow_endpoint(label, &candidate, &repository).unwrap();
-        let messages = asgard_shadow_end_review_messages(
-            "Implement the requested behavior.",
-            &AsgardTaskContractChecklist::default(),
-            &[AsgardShadowEndpoint {
-                lane: candidate.index,
-                review_label: label.to_string(),
-                endpoint_snapshot_id: "snapshot".to_string(),
-                dossier,
-            }],
-        );
-        let rendered = render_asgard_dossier_messages(&messages).to_lowercase();
-        assert!(rendered.contains(label));
-        assert!(!rendered.contains("secret-model"));
-        assert!(!rendered.contains("probe_rank"));
-        assert!(!rendered.contains("survivor"));
-        assert!(!rendered.contains("killed"));
-        assert!(!rendered.contains("lane_trajectory"));
-        assert!(!rendered.contains("worktree="));
-    }
-
-    #[test]
-    fn asgard_shadow_usage_trace_preserves_every_bucket() {
-        let value = asgard_usage_trace_value(crate::llm_client::TokenUsage {
-            input_tokens: 11,
-            output_tokens: 12,
-            thought_tokens: 13,
-            cached_read_tokens: 14,
-            cached_write_tokens: 15,
-        });
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "input": 11,
-                "output": 12,
-                "thought": 13,
-                "cachedRead": 14,
-                "cachedWrite": 15,
-            })
-        );
-    }
-
-    #[test]
     fn asgard_initial_advice_prompt_contains_no_candidate_bootstrap() {
         let messages = asgard_initial_advice_messages("Implement the requested API.", 3);
         assert_eq!(messages.len(), 2);
@@ -23509,7 +20622,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -23580,7 +20692,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -23655,7 +20766,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -23720,7 +20830,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -23799,7 +20908,6 @@ mod tests {
                 required_winner: Some(1),
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -23898,7 +21006,6 @@ mod tests {
             required_winner: None,
             checklist_ids: &[],
             carry_forward_allowed: false,
-            window_policy: AsgardWindowPolicyMode::Dynamic,
         };
         let completion_context = AsgardSupervisorToolContext {
             model: "deepseek::deepseek-v4-pro",
@@ -23914,7 +21021,6 @@ mod tests {
             required_winner: Some(1),
             checklist_ids: &[],
             carry_forward_allowed: false,
-            window_policy: AsgardWindowPolicyMode::Dynamic,
         };
 
         assert_eq!(
@@ -24006,7 +21112,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -24142,7 +21247,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,
@@ -24213,7 +21317,6 @@ mod tests {
                 required_winner: None,
                 checklist_ids: &[],
                 carry_forward_allowed: false,
-                window_policy: AsgardWindowPolicyMode::Dynamic,
             },
             tokio_util::sync::CancellationToken::new(),
             None,

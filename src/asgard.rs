@@ -867,45 +867,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shadow_survivor_repositories_stay_isolated_until_final_sync() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
-        run_git(repo, &["add", "tracked.txt"]);
-        run_git(repo, &["commit", "-m", "initial"]);
-
-        let repositories = (0..3)
-            .map(|lane| create_candidate_repository(repo, &format!("shadow-{lane}")))
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        for (lane, repository) in repositories.iter().enumerate() {
-            fs::write(
-                repository.root.join("tracked.txt"),
-                format!("isolated-{lane}{}\n", "x".repeat(lane)),
-            )
-            .unwrap();
-        }
-        for (lane, repository) in repositories.iter().enumerate() {
-            assert_eq!(
-                fs::read_to_string(repository.root.join("tracked.txt")).unwrap(),
-                format!("isolated-{lane}{}\n", "x".repeat(lane))
-            );
-        }
-
-        synchronize_candidate_repositories(&repositories, 2).unwrap();
-        for repository in &repositories {
-            assert_eq!(
-                fs::read_to_string(repository.root.join("tracked.txt")).unwrap(),
-                "isolated-2xx\n"
-            );
-            remove_candidate_repository(repository);
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn repository_sync_skips_matching_files_and_applies_metadata_deltas() {
