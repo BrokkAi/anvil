@@ -16,7 +16,7 @@ use crate::session::SessionStore;
 use crate::structured_output::StructuredOutputRequest;
 use crate::tool_loop::{LoopOutcome, NotificationMode, SpawnedCx, TextSink};
 
-pub(crate) const ASGARD_INTAKE_MAX_STEPS: usize = 6;
+pub(crate) const ASGARD_INTAKE_MAX_STEPS: usize = 8;
 
 pub(crate) const ASGARD_INTAKE_READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
@@ -30,7 +30,7 @@ pub(crate) const ASGARD_INTAKE_READ_ONLY_TOOLS: &[&str] = &[
 
 const READER_L_PROMPT: &str = "You are a specification reader. From the task text alone - you have no repository access - write the behavioral contract a correct implementation must satisfy: every named symbol and API with its exact spelling; every enumerated set with all its members; every scoping qualifier (which commands, modes, or inputs a rule names - and where a rule is stated for one member of a set, flag whether it plausibly extends to the siblings); every exact error message or exception; every input domain (do \"numbers\" include decimals? negatives?); every ordering and formatting rule. Quote the task phrase each item derives from. Flag every detail that admits more than one reading. Output the numbered contract and nothing else.";
 
-const READER_G_PROMPT: &str = "You are a repository scout preparing for a task another team will implement. For each requirement in the task, find the repository evidence that constrains its interpretation: existing naming conventions, sibling APIs and how they behave, golden and fixture files, project layout. Wherever the task quantifies over a set (\"all dialects\", \"each command\"), enumerate the set's actual members from the repository and report the count and every member with its path. Report exact file paths for all evidence. Do not write code or tests. Your final message is the deliverable: a numbered report of constraints and enumerations.";
+const READER_G_PROMPT: &str = "You are a repository scout preparing for a task another team will implement. For each requirement in the task, find the repository evidence that constrains its interpretation: existing naming conventions, sibling APIs and how they behave, golden and fixture files, project layout. Wherever the task quantifies over a set (\"all dialects\", \"each command\"), enumerate the set's actual members from the repository and report the count and every member with its path. Report exact file paths for all evidence. Do not write code or tests. Your final message is the deliverable: a numbered report of constraints and enumerations. You have a hard budget of a few tool steps; your final text report is the only thing that survives this session, so stop exploring early enough to write it. An incomplete report beats no report.";
 
 pub(crate) struct IntakeContracts {
     pub(crate) literal: Option<String>,
@@ -241,16 +241,70 @@ async fn read_grounded_contract(
         None,
     )
     .await;
-    grounded_text_and_usage(outcome)
+    grounded_text_and_usage(run, model, outcome).await
 }
 
-fn grounded_text_and_usage(outcome: LoopOutcome) -> Option<(String, TokenUsage)> {
+async fn grounded_text_and_usage(
+    run: &AsgardIntakeRun<'_>,
+    model: &str,
+    outcome: LoopOutcome,
+) -> Option<(String, TokenUsage)> {
     let text = extract_worker_final_response(&outcome.continuation_messages);
     if text.trim().is_empty() {
         tracing::warn!("Asgard grounded intake returned empty text");
-        return None;
+        return grounded_forced_report(run, model, outcome).await;
     }
     Some((text, outcome.usage))
+}
+
+async fn grounded_forced_report(
+    run: &AsgardIntakeRun<'_>,
+    model: &str,
+    outcome: LoopOutcome,
+) -> Option<(String, TokenUsage)> {
+    if run.cancel.is_cancelled() {
+        return None;
+    }
+    let mut messages = outcome.continuation_messages;
+    messages.push(ChatMessage::user(
+        "Your step budget is exhausted. Write your numbered report now from what you have already seen. Do not call any tools.",
+    ));
+    let result = crate::llm_client::stream_chat_no_visible_output_with_retry(
+        run.llm.as_ref(),
+        "asgard_intake_grounded_forced_report",
+        &run.cancel,
+        || StreamChatRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            tools: None,
+            reasoning_effort: run.reasoning_effort.map(str::to_string),
+            service_tier: run.service_tier.map(str::to_string),
+            temperature: None,
+            structured_output: run.structured_output.cloned(),
+            on_token: Box::new(|_: &str| {}),
+            on_thought: Box::new(|_: &str| {}),
+            cancel: run.cancel.clone(),
+            idle_timeouts: run.idle_timeout,
+        },
+    )
+    .await;
+    match result {
+        Ok(response) if !run.cancel.is_cancelled() => {
+            let (text, fallback_usage) = response_text_and_usage(response)?;
+            if text.trim().is_empty() {
+                tracing::warn!("Asgard grounded intake forced report returned empty text");
+                return None;
+            }
+            let mut usage = outcome.usage;
+            usage.add(fallback_usage);
+            Some((text, usage))
+        }
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!("Asgard grounded intake forced report failed: {error:#}");
+            None
+        }
+    }
 }
 
 fn response_text_and_usage(response: LlmResponse) -> Option<(String, TokenUsage)> {

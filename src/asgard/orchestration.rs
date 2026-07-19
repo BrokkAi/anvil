@@ -147,6 +147,7 @@ impl FinishedWorker {
 #[derive(Clone)]
 struct RunningWorkerMeta {
     parent: CheckpointId,
+    model: String,
     instructions: String,
     turn_progress: Arc<AtomicUsize>,
 }
@@ -309,6 +310,7 @@ async fn launch_worker<'a>(
     let turn_progress = Arc::new(AtomicUsize::new(0));
     let meta = RunningWorkerMeta {
         parent: spawn.from.clone(),
+        model: model.clone(),
         instructions: instructions.clone(),
         turn_progress: turn_progress.clone(),
     };
@@ -1139,6 +1141,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 Ok(spawns) => spawns,
                 Err(error) => return Ok(format!("error: {error}")),
             };
+            let (spawns, duplicate_notes) = dedup_spawn_requests(cx, spawns);
             let remaining_capacity = cx.turn_capacity.saturating_sub(state.spawned_this_turn);
             if spawns.len() > remaining_capacity {
                 return Ok(format!(
@@ -1162,13 +1165,20 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                         .ok_or_else(|| anyhow!("pending worker disappeared during spawn save"))?
                 ));
             }
+            let mut spawned_by_index = HashMap::new();
             for spawn in spawns {
                 let from = spawn.from.clone();
+                let spawn_index = spawned_by_index.len();
                 let worker = launch_spawn(cx, spawn).await?;
                 state.spawned_this_turn += 1;
                 state.spawned.push(worker);
+                spawned_by_index.insert(spawn_index, worker);
                 lines.push(format!("spawned w{worker} from {from}"));
             }
+            lines.extend(render_spawn_duplicate_notes(
+                &duplicate_notes,
+                &spawned_by_index,
+            ));
             Ok(lines.join("\n"))
         }
         FINALIZE_TOOL => {
@@ -1216,6 +1226,104 @@ async fn execute_supervisor_call<'ctx, 'fut>(
         }
         other => Ok(format!("error: unknown supervisor tool {other}")),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SpawnDedupKey {
+    from: CheckpointId,
+    instructions: String,
+    model: String,
+}
+
+#[derive(Clone, Debug)]
+enum SpawnDuplicateNote {
+    InCall { kept_index: usize, count: usize },
+    Running { worker: usize, count: usize },
+}
+
+fn dedup_spawn_requests(
+    cx: &SupervisorLoopContext<'_, '_>,
+    spawns: Vec<SpawnRequest>,
+) -> (Vec<SpawnRequest>, Vec<SpawnDuplicateNote>) {
+    let default_model = &cx.launch.config.candidate_models[0];
+    let mut running_by_key = HashMap::new();
+    for (worker, meta) in cx.running_meta.iter() {
+        running_by_key.insert(
+            SpawnDedupKey {
+                from: meta.parent.clone(),
+                instructions: meta.instructions.clone(),
+                model: meta.model.clone(),
+            },
+            *worker,
+        );
+    }
+
+    let mut kept = Vec::new();
+    let mut kept_by_key = HashMap::new();
+    let mut in_call_duplicates: HashMap<usize, usize> = HashMap::new();
+    let mut running_duplicates: HashMap<usize, usize> = HashMap::new();
+    for spawn in spawns {
+        let key = SpawnDedupKey {
+            from: spawn.from.clone(),
+            instructions: spawn.instructions.clone(),
+            model: spawn
+                .model
+                .clone()
+                .unwrap_or_else(|| default_model.to_string()),
+        };
+        if let Some(worker) = running_by_key.get(&key) {
+            *running_duplicates.entry(*worker).or_default() += 1;
+            continue;
+        }
+        if let Some(kept_index) = kept_by_key.get(&key) {
+            *in_call_duplicates.entry(*kept_index).or_default() += 1;
+            continue;
+        }
+        let kept_index = kept.len();
+        kept_by_key.insert(key, kept_index);
+        kept.push(spawn);
+    }
+
+    let mut notes = in_call_duplicates
+        .into_iter()
+        .map(|(kept_index, count)| SpawnDuplicateNote::InCall { kept_index, count })
+        .chain(
+            running_duplicates
+                .into_iter()
+                .map(|(worker, count)| SpawnDuplicateNote::Running { worker, count }),
+        )
+        .collect::<Vec<_>>();
+    notes.sort_by_key(|note| match note {
+        SpawnDuplicateNote::InCall { kept_index, .. } => (0usize, *kept_index),
+        SpawnDuplicateNote::Running { worker, .. } => (1usize, *worker),
+    });
+    (kept, notes)
+}
+
+fn render_spawn_duplicate_notes(
+    notes: &[SpawnDuplicateNote],
+    spawned_by_index: &HashMap<usize, usize>,
+) -> Vec<String> {
+    notes
+        .iter()
+        .filter_map(|note| match note {
+            SpawnDuplicateNote::InCall { kept_index, count } => {
+                let worker = spawned_by_index.get(kept_index)?;
+                Some(format!(
+                    "skipped {count} duplicate specs (identical to w{worker})"
+                ))
+            }
+            SpawnDuplicateNote::Running { worker, count } => {
+                if *count == 1 {
+                    Some(format!("skipped spec identical to running w{worker}"))
+                } else {
+                    Some(format!(
+                        "skipped {count} specs identical to running w{worker}"
+                    ))
+                }
+            }
+        })
+        .collect()
 }
 
 fn save_pending_if_needed(
@@ -1976,8 +2084,20 @@ mod tests {
         )
     }
 
+    fn spawn_workers_call(id: &str, workers: serde_json::Value) -> ToolCall {
+        named_tool_call(
+            id,
+            "spawn_workers",
+            serde_json::json!({ "workers": workers }),
+        )
+    }
+
     fn save_call(id: &str) -> ToolCall {
         named_tool_call(id, "save_checkpoint", serde_json::json!({}))
+    }
+
+    fn discard_call(id: &str) -> ToolCall {
+        named_tool_call(id, "discard", serde_json::json!({}))
     }
 
     fn finalize_call(id: &str, checkpoint: &str) -> ToolCall {
@@ -2254,6 +2374,183 @@ mod tests {
         assert!(
             failure_initial_user
                 .contains("<grounded_contract>\ngrounded only contract\n</grounded_contract>")
+        );
+    }
+
+    #[tokio::test]
+    async fn asgard_grounded_intake_forces_report_after_step_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let mut worker_responses = Vec::new();
+        for index in 0..crate::asgard::ASGARD_INTAKE_MAX_STEPS {
+            worker_responses.push(tool_response(vec![named_tool_call(
+                &format!("intake-read-{index}"),
+                "read_file",
+                serde_json::json!({ "file_path": "README.md" }),
+            )]));
+        }
+        worker_responses.push(text_response(
+            "1. forced grounded report from observed README",
+        ));
+        worker_responses.push(text_response("worker final report"));
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "report")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
+                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                ],
+            ),
+            ("worker-model", worker_responses),
+        ]));
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("implement intake forced report test")],
+        )
+        .await;
+
+        let requests = backend.requests.lock().expect("requests");
+        let fallback_request = requests
+            .iter()
+            .find(|request| {
+                request.model == "worker-model"
+                    && request.tool_names.is_empty()
+                    && request.messages.last().is_some_and(|message| {
+                        message
+                            .content_text()
+                            .contains("Write your numbered report now")
+                    })
+            })
+            .expect("forced grounded intake fallback request");
+        assert!(
+            fallback_request
+                .messages
+                .last()
+                .expect("fallback user message")
+                .content_text()
+                .contains("Do not call any tools.")
+        );
+
+        let supervisor_request = requests
+            .iter()
+            .find(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
+            .expect("supervisor request");
+        let initial_user = supervisor_request.messages[1].content_text();
+        assert!(initial_user.contains(
+            "<grounded_contract>\n1. forced grounded report from observed README\n</grounded_contract>"
+        ));
+    }
+
+    #[tokio::test]
+    async fn asgard_spawn_workers_dedups_in_call_and_running_specs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let duplicate = "inspect parser";
+        let distinct = "inspect planner";
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![spawn_workers_call(
+                        "sv-spawn-batch",
+                        serde_json::json!([
+                            { "from": "root", "instructions": duplicate },
+                            { "from": "root", "instructions": duplicate },
+                            { "from": "root", "instructions": distinct }
+                        ]),
+                    )]),
+                    tool_response(vec![spawn_call(
+                        "sv-spawn-running-duplicate",
+                        "root",
+                        duplicate,
+                    )]),
+                    text_response("waiting"),
+                    tool_response(vec![discard_call("sv-discard-w1")]),
+                    tool_response(vec![discard_call("sv-discard-w2")]),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded contract text"),
+                    tool_response(vec![named_tool_call(
+                        "w1-read",
+                        "read_file",
+                        serde_json::json!({ "file_path": "README.md" }),
+                    )]),
+                    tool_response(vec![named_tool_call(
+                        "w2-read",
+                        "read_file",
+                        serde_json::json!({ "file_path": "README.md" }),
+                    )]),
+                    text_response("w1 report"),
+                    text_response("w2 report"),
+                ],
+            ),
+        ]));
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("implement spawn dedup test")],
+        )
+        .await;
+
+        let requests = backend.requests.lock().expect("requests");
+        let supervisor_text = requests
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("spawned w1 from root"));
+        assert!(supervisor_text.contains("spawned w2 from root"));
+        assert!(supervisor_text.contains("skipped 1 duplicate specs (identical to w1)"));
+        assert!(supervisor_text.contains("skipped spec identical to running w1"));
+
+        let spawned_lines = supervisor_text
+            .lines()
+            .filter(|line| line.starts_with("spawned w"))
+            .collect::<HashSet<_>>();
+        assert_eq!(spawned_lines.len(), 2);
+        assert!(
+            !spawned_lines
+                .iter()
+                .any(|line| line.starts_with("spawned w3"))
         );
     }
 
@@ -3104,6 +3401,7 @@ mod tests {
             5,
             RunningWorkerMeta {
                 parent: CheckpointId::Worker(2),
+                model: "worker-model".to_string(),
                 instructions: "inspect the parser\nthen test it".to_string(),
                 turn_progress: progress,
             },
