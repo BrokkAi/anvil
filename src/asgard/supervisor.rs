@@ -12,6 +12,7 @@ pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 10;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 
 pub(crate) const SPAWN_WORKERS_TOOL: &str = "spawn_workers";
+pub(crate) const PREFINALIZE_TOOL: &str = "prefinalize";
 pub(crate) const SAVE_CHECKPOINT_TOOL: &str = "save_checkpoint";
 pub(crate) const MERGE_CHECKPOINT_TOOL: &str = "merge_checkpoint";
 pub(crate) const DISCARD_TOOL: &str = "discard";
@@ -64,6 +65,7 @@ pub(crate) fn supervisor_supplement() -> String {
 
 You are the supervisor of a team of asynchronous workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. The difference is that you never touch files or run commands yourself - you act only through these tools:
 - spawn_workers: fork workers from "root" (the original repository state) or any saved checkpoint like "w3". Each worker gets its own checkout of that state plus your instructions, runs up to 10 steps (one step = one batch of tool calls), then reports back for review. Workers may finish sooner; a worker that stops making tool calls is done, and its final message is its report to you.
+- prefinalize: spawn your final verification pass. finalize is locked until prefinalize has run and every prefinalize worker report has been reviewed and resolved.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later.
 - merge_checkpoint: transplant one saved checkpoint's changes onto another saved checkpoint, producing a new checkpoint.
 - discard: permanently discard the just-reviewed trajectory.
@@ -74,7 +76,7 @@ You are the supervisor of a team of asynchronous workers solving the task. Every
 
 Reviews: you review one finished worker at a time - where it forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to 10 steps (a step = one batch of tool calls) - the same budget your workers get. Each turn you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, spawning, and saving freely across up to {supervisor_steps} supervisor steps. Every reviewed trajectory must be resolved before your turn ends: save_checkpoint it, spawn a worker from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. At most {workers} workers can be in flight; the others appear as brief status lines and get their own review turns. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions.
 
-Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written from the task text at the start. If that evidence does not exist yet, spawn a verification worker on that checkpoint first and review what it finds. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run.
+Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. finalize is mechanically locked until a prefinalize verification pass has run and its reports have been reviewed. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written from the task text at the start. If that evidence does not exist yet, spawn a verification worker on that checkpoint first and review what it finds. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run.
 
 Strategy is yours: run independent approaches in parallel, spawn short fact-finding workers to answer questions ("find how X is implemented; report file and line"), branch variants from a good checkpoint, cut losses early, and keep instructions explicit and testable. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Your first duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them. Resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Then write your plan as a numbered obligations ledger via update_plan: each obligation carries the task phrase it derives from, and every set the task quantifies over is written with its count and members. Have a worker write spec tests from the settled ledger - before implementation exists - that lock in the resolved reading; implementation workers run them, and your finalize evidence should show them passing. If the intake is missing, have your first worker pin the specification from the task text instead. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
         supervisor_steps = ASGARD_SUPERVISOR_MAX_STEPS,
@@ -121,6 +123,14 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                         },
                     },
                 }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: PREFINALIZE_TOOL.to_string(),
+                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; plant the classic bugs in the diff's critical paths - swap an argument order, invert a boundary, drop a term - confirm the suite goes red for each plant, revert it, and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); and re-check the task's obligations against the delivered state. If verification reveals needed work stranded in another checkpoint, use merge_checkpoint to pull it in.".to_string(),
+                parameters: spawn_workers_parameters(&allowed_models),
             },
         },
         ToolDefinition {
@@ -222,6 +232,34 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
         },
         crate::tools::update_plan_tool_definition(),
     ]
+}
+
+fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workers"],
+        "properties": {
+            "workers": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": ASGARD_MAX_IN_FLIGHT,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["from", "instructions"],
+                    "properties": {
+                        "from": { "type": "string" },
+                        "instructions": { "type": "string", "minLength": 1 },
+                        "model": {
+                            "type": "string",
+                            "enum": allowed_models,
+                        },
+                    },
+                },
+            },
+        },
+    })
 }
 
 pub(crate) async fn stream_supervisor_response(

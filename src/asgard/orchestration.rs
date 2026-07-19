@@ -16,13 +16,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::asgard::{
     ASGARD_MAX_IN_FLIGHT, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
     CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL,
-    MERGE_CHECKPOINT_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
-    SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
-    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WAIT_TOOL, WorkerStopReason,
-    elide_view_tool_results_for_permanent_record, parse_finalize, parse_merge_checkpoint,
-    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_dag_overview,
-    render_fragment, render_resolved_views, render_window_compact_for_worker, run_asgard_intake,
-    stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
+    MERGE_CHECKPOINT_TOOL, PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL,
+    SnapshotStage, SpawnRequest, SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag,
+    TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WAIT_TOOL,
+    WorkerStopReason, elide_view_tool_results_for_permanent_record, parse_finalize,
+    parse_merge_checkpoint, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
+    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
+    run_asgard_intake, stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
     supervisor_tool_definitions,
 };
 use crate::llm_client::{
@@ -192,6 +192,8 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     allowed_models: &'ctx [String],
     finalize_evidence_bounced: &'ctx mut bool,
     finalize_lineage_bounced: &'ctx mut bool,
+    prefinalize_issued: &'ctx mut bool,
+    prefinalize_workers: &'ctx mut Vec<usize>,
     turn_capacity: usize,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
@@ -206,6 +208,7 @@ struct SupervisorLoopResult {
     usage: TokenUsage,
     steps: usize,
     spawned: Vec<usize>,
+    prefinalized: Vec<usize>,
     saved: bool,
     discarded: bool,
     merged: Vec<usize>,
@@ -215,6 +218,7 @@ struct SupervisorLoopResult {
 struct SupervisorTurnState {
     latest_plan: Option<UpdatePlanArgs>,
     spawned: Vec<usize>,
+    prefinalized: Vec<usize>,
     spawned_this_turn: usize,
     saved_pending: bool,
     discarded: bool,
@@ -237,6 +241,7 @@ struct FinalizeContext<'a> {
     current_plan: Option<&'a UpdatePlanArgs>,
     evidence: &'a [String],
     abandoned: &'a [String],
+    prefinalize_workers: &'a [usize],
 }
 
 struct WorkerLaunch<'a> {
@@ -535,6 +540,8 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut canonical_plan = initial_plan;
     let mut finalize_evidence_bounced = false;
     let mut finalize_lineage_bounced = false;
+    let mut prefinalize_issued = false;
+    let mut prefinalize_workers = Vec::new();
 
     let exit = loop {
         if cancel.is_cancelled() {
@@ -635,6 +642,8 @@ pub(crate) async fn run_asgard_trajectory_loop(
             allowed_models: &config.candidate_models,
             finalize_evidence_bounced: &mut finalize_evidence_bounced,
             finalize_lineage_bounced: &mut finalize_lineage_bounced,
+            prefinalize_issued: &mut prefinalize_issued,
+            prefinalize_workers: &mut prefinalize_workers,
             turn_capacity,
             idle_timeout,
             cancel: cancel.clone(),
@@ -767,6 +776,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 current_plan: canonical_plan.as_ref(),
                 evidence: &evidence,
                 abandoned: &abandoned,
+                prefinalize_workers: &prefinalize_workers,
             },
             checkpoint,
             response,
@@ -827,6 +837,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
     let mut state = SupervisorTurnState {
         latest_plan: None,
         spawned: Vec::new(),
+        prefinalized: Vec::new(),
         spawned_this_turn: 0,
         saved_pending: false,
         discarded: false,
@@ -1053,6 +1064,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         usage,
         steps,
         spawned: state.spawned,
+        prefinalized: state.prefinalized,
         saved: state.saved_pending,
         discarded: state.discarded,
         finalizing_evidence: state.finalizing_evidence,
@@ -1184,45 +1196,19 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 Ok(spawns) => spawns,
                 Err(error) => return Ok(format!("error: {error}")),
             };
-            let (spawns, duplicate_notes) = dedup_spawn_requests(cx, spawns);
-            let remaining_capacity = cx.turn_capacity.saturating_sub(state.spawned_this_turn);
-            if spawns.len() > remaining_capacity {
-                return Ok(format!(
-                    "error: requested {} workers but only {remaining_capacity} capacity slots remain this turn",
-                    spawns.len()
-                ));
-            }
-            let mut lines = Vec::new();
-            if spawns.iter().any(|spawn| {
-                cx.pending
-                    .as_ref()
-                    .is_some_and(|finished| spawn.from == CheckpointId::Worker(finished.worker))
-            }) && !state.saved_pending
-            {
-                save_pending_if_needed(cx, &mut state.saved_pending)?;
-                lines.push(format!(
-                    "saved checkpoint w{}",
-                    cx.pending
-                        .as_ref()
-                        .map(|finished| finished.worker)
-                        .ok_or_else(|| anyhow!("pending worker disappeared during spawn save"))?
-                ));
-            }
-            let mut spawned_by_index = HashMap::new();
-            for spawn in spawns {
-                let from = spawn.from.clone();
-                let spawn_index = spawned_by_index.len();
-                let worker = launch_spawn(cx, spawn).await?;
-                state.spawned_this_turn += 1;
-                state.spawned.push(worker);
-                spawned_by_index.insert(spawn_index, worker);
-                lines.push(format!("spawned w{worker} from {from}"));
-            }
-            lines.extend(render_spawn_duplicate_notes(
-                &duplicate_notes,
-                &spawned_by_index,
-            ));
-            Ok(lines.join("\n"))
+            execute_spawn_requests(cx, state, spawns, SpawnKind::Regular).await
+        }
+        PREFINALIZE_TOOL => {
+            let context = SupervisorTurnContext {
+                dag: &*cx.dag,
+                pending: cx.pending.as_ref().map(|finished| finished.worker),
+                allowed_models: cx.allowed_models,
+            };
+            let spawns = match parse_spawn_workers(call, &context) {
+                Ok(spawns) => spawns,
+                Err(error) => return Ok(format!("error: {error}")),
+            };
+            execute_spawn_requests(cx, state, spawns, SpawnKind::Prefinalize).await
         }
         FINALIZE_TOOL => {
             let context = SupervisorTurnContext {
@@ -1238,6 +1224,22 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             let response = parsed.response;
             let evidence = parsed.evidence;
             let abandoned = parsed.abandoned;
+            if !*cx.prefinalize_issued {
+                state.turn_ended = true;
+                return Ok("error: finalize requires a prefinalize verification pass first: spawn verification workers via prefinalize, review their reports, then finalize.".to_string());
+            }
+            let unresolved_prefinalize = unresolved_prefinalize_workers(cx, state);
+            if !unresolved_prefinalize.is_empty() {
+                state.turn_ended = true;
+                return Ok(format!(
+                    "error: prefinalize workers [{}] have not been reviewed yet; wait for them and review their reports before finalizing.",
+                    unresolved_prefinalize
+                        .iter()
+                        .map(|worker| format!("w{worker}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
             let pending_messages = cx
                 .pending
                 .as_ref()
@@ -1307,6 +1309,89 @@ struct SpawnDedupKey {
 enum SpawnDuplicateNote {
     InCall { kept_index: usize, count: usize },
     Running { worker: usize, count: usize },
+}
+
+#[derive(Clone, Copy)]
+enum SpawnKind {
+    Regular,
+    Prefinalize,
+}
+
+async fn execute_spawn_requests<'ctx, 'fut>(
+    cx: &mut SupervisorLoopContext<'ctx, 'fut>,
+    state: &mut SupervisorTurnState,
+    spawns: Vec<SpawnRequest>,
+    kind: SpawnKind,
+) -> Result<String> {
+    let (spawns, duplicate_notes) = dedup_spawn_requests(cx, spawns);
+    let remaining_capacity = cx.turn_capacity.saturating_sub(state.spawned_this_turn);
+    if spawns.len() > remaining_capacity {
+        return Ok(format!(
+            "error: requested {} workers but only {remaining_capacity} capacity slots remain this turn",
+            spawns.len()
+        ));
+    }
+    let mut lines = Vec::new();
+    if spawns.iter().any(|spawn| {
+        cx.pending
+            .as_ref()
+            .is_some_and(|finished| spawn.from == CheckpointId::Worker(finished.worker))
+    }) && !state.saved_pending
+    {
+        save_pending_if_needed(cx, &mut state.saved_pending)?;
+        lines.push(format!(
+            "saved checkpoint w{}",
+            cx.pending
+                .as_ref()
+                .map(|finished| finished.worker)
+                .ok_or_else(|| anyhow!("pending worker disappeared during spawn save"))?
+        ));
+    }
+    let mut spawned_by_index = HashMap::new();
+    for spawn in spawns {
+        let from = spawn.from.clone();
+        let spawn_index = spawned_by_index.len();
+        let worker = launch_spawn(cx, spawn).await?;
+        state.spawned_this_turn += 1;
+        state.spawned.push(worker);
+        if matches!(kind, SpawnKind::Prefinalize) {
+            *cx.prefinalize_issued = true;
+            cx.prefinalize_workers.push(worker);
+            state.prefinalized.push(worker);
+        }
+        spawned_by_index.insert(spawn_index, worker);
+        let verb = match kind {
+            SpawnKind::Regular => "spawned",
+            SpawnKind::Prefinalize => "prefinalize spawned",
+        };
+        lines.push(format!("{verb} w{worker} from {from}"));
+    }
+    lines.extend(render_spawn_duplicate_notes(
+        &duplicate_notes,
+        &spawned_by_index,
+    ));
+    Ok(lines.join("\n"))
+}
+
+fn unresolved_prefinalize_workers(
+    cx: &SupervisorLoopContext<'_, '_>,
+    state: &SupervisorTurnState,
+) -> Vec<usize> {
+    cx.prefinalize_workers
+        .iter()
+        .copied()
+        .filter(|worker| {
+            cx.running_meta.contains_key(worker)
+                || cx
+                    .review_queue
+                    .iter()
+                    .any(|finished| finished.worker == *worker)
+                || cx
+                    .pending
+                    .as_ref()
+                    .is_some_and(|finished| finished.worker == *worker && !state.saved_pending)
+        })
+        .collect()
 }
 
 fn dedup_spawn_requests(
@@ -1658,6 +1743,7 @@ fn finalize_asgard(
         "evidence": context.evidence,
         "off_lineage_unmerged": off_lineage_unmerged,
         "abandoned": context.abandoned,
+        "prefinalize_workers": context.prefinalize_workers,
     }));
     let evidence_text = if context.evidence.is_empty() {
         "no evidence named".to_string()
@@ -1790,16 +1876,17 @@ fn trace_supervisor_llm_response(turn: usize, response: &LlmResponse) {
 fn supervisor_decision_summary(outcome: &SupervisorLoopResult) -> String {
     if let Some((checkpoint, response)) = &outcome.finalizing {
         return format!(
-            "spawned={:?} saved={} finalized=true checkpoint={checkpoint} response={} discarded={}",
+            "spawned={:?} prefinalized={:?} saved={} finalized=true checkpoint={checkpoint} response={} discarded={}",
             outcome.spawned,
+            outcome.prefinalized,
             outcome.saved,
             response.as_ref().is_some_and(|value| !value.is_empty()),
             outcome.discarded
         );
     }
     format!(
-        "spawned={:?} merged={:?} saved={} finalized=false discarded={}",
-        outcome.spawned, outcome.merged, outcome.saved, outcome.discarded
+        "spawned={:?} prefinalized={:?} merged={:?} saved={} finalized=false discarded={}",
+        outcome.spawned, outcome.prefinalized, outcome.merged, outcome.saved, outcome.discarded
     )
 }
 
@@ -2239,6 +2326,23 @@ mod tests {
         )
     }
 
+    fn prefinalize_call(id: &str, from: &str, instructions: &str) -> ToolCall {
+        named_tool_call(
+            id,
+            "prefinalize",
+            serde_json::json!({
+                "workers": [{
+                    "from": from,
+                    "instructions": instructions,
+                }],
+            }),
+        )
+    }
+
+    fn prefinalize_workers_call(id: &str, workers: serde_json::Value) -> ToolCall {
+        named_tool_call(id, "prefinalize", serde_json::json!({ "workers": workers }))
+    }
+
     fn save_call(id: &str) -> ToolCall {
         named_tool_call(id, "save_checkpoint", serde_json::json!({}))
     }
@@ -2450,6 +2554,12 @@ mod tests {
                     text_response("w1 launched"),
                     tool_response(vec![finalize_call("sv-finalize", "w1")]),
                     tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                    text_response("idle five"),
+                    text_response("idle six"),
+                    text_response("idle seven"),
                 ],
             ),
             (
@@ -2513,6 +2623,12 @@ mod tests {
                     text_response("w1 launched"),
                     tool_response(vec![finalize_call("sv-finalize", "w1")]),
                     tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                    text_response("idle five"),
+                    text_response("idle six"),
+                    text_response("idle seven"),
                 ],
             ),
             (
@@ -2583,6 +2699,9 @@ mod tests {
                     text_response("w1 launched"),
                     tool_response(vec![finalize_call("sv-finalize", "w1")]),
                     tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
                 ],
             ),
             ("worker-model", worker_responses),
@@ -2727,6 +2846,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefinalize_gate_rejects_then_accepts_after_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![finalize_call_with_evidence(
+                        "sv-finalize-before-prefinalize",
+                        "w1",
+                        &["w1m1"],
+                    )]),
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w2",
+                        "w1",
+                        "verify w1",
+                    )]),
+                    text_response("prefinalize launched"),
+                    tool_response(vec![
+                        discard_call("sv-discard-w2"),
+                        finalize_call_with_evidence("sv-finalize-w1", "w1", &["w1m1"]),
+                    ]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![named_tool_call(
+                        "w1-test",
+                        "run_shell_command",
+                        serde_json::json!({ "command": "true" }),
+                    )]),
+                    text_response("w1 report"),
+                    text_response("w2 verification report"),
+                ],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise prefinalize gate")],
+        )
+        .await;
+
+        assert_eq!(outcome.response, "w1 report");
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("error: finalize requires a prefinalize verification pass first: spawn verification workers via prefinalize, review their reports, then finalize."));
+        assert!(supervisor_text.contains("prefinalize spawned w2 from w1"));
+    }
+
+    #[tokio::test]
+    async fn prefinalize_gate_names_unreviewed_workers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![
+                        prefinalize_call("sv-prefinalize-w2", "w1", "verify w1"),
+                        finalize_call_with_evidence("sv-finalize-unreviewed", "w1", &["w1m1"]),
+                    ]),
+                    text_response("saw gate"),
+                    tool_response(vec![discard_call("sv-discard-w2")]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![named_tool_call(
+                        "w1-test",
+                        "run_shell_command",
+                        serde_json::json!({ "command": "true" }),
+                    )]),
+                    text_response("w1 report"),
+                    text_response("w2 verification report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise unreviewed prefinalize gate")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("error: prefinalize workers [w2] have not been reviewed yet; wait for them and review their reports before finalizing."));
+    }
+
+    #[tokio::test]
+    async fn idle_fallback_finalize_bypasses_prefinalize_gate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "finish")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![save_call("sv-save-w1")]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![text_response("intake grounded"), text_response("w1 report")],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend,
+            vec![ChatMessage::user("exercise idle fallback")],
+        )
+        .await;
+
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        assert_eq!(outcome.response, "w1 report");
+    }
+
+    #[tokio::test]
+    async fn prefinalize_uses_spawn_dedup_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![prefinalize_workers_call(
+                        "sv-prefinalize-batch",
+                        serde_json::json!([
+                            { "from": "root", "instructions": "verify" },
+                            { "from": "root", "instructions": "verify" }
+                        ]),
+                    )]),
+                    text_response("prefinalize launched"),
+                    tool_response(vec![discard_call("sv-discard-w1")]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    text_response("w1 verification"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise prefinalize dedup")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("prefinalize spawned w1 from root"));
+        assert!(supervisor_text.contains("skipped 1 duplicate specs (identical to w1)"));
+    }
+
+    #[tokio::test]
     async fn asgard_v2_scripted_e2e_runs_real_loop_and_checkpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -2765,6 +3125,13 @@ mod tests {
                     ]),
                     text_response("w2 saved and w3 launched"),
                     text_response("w3 confirms README exists; nothing worth keeping"),
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w4",
+                        "w2",
+                        "verify w2",
+                    )]),
+                    text_response("w4 launched"),
+                    tool_response(vec![discard_call("sv-discard-w4")]),
                     tool_response(vec![finalize_call("sv-finalize", "w2")]),
                     tool_response(vec![finalize_call("sv-finalize-again", "w2")]),
                 ],
@@ -2782,6 +3149,7 @@ mod tests {
                     )]),
                     text_response("foo.txt now has alpha and beta"),
                     text_response("README.md exists; nothing to change"),
+                    text_response("w4 verification report"),
                 ],
             ),
         ]));
@@ -2893,8 +3261,8 @@ mod tests {
             .iter()
             .filter(|request| request.model == "worker-model")
             .collect::<Vec<_>>();
-        assert_eq!(supervisor_requests.len(), 9);
-        assert_eq!(worker_requests.len(), 6);
+        assert_eq!(supervisor_requests.len(), 12);
+        assert_eq!(worker_requests.len(), 7);
         let first_supervisor_system = supervisor_requests[0].messages[0].content_text();
         let session_prompt_pos = first_supervisor_system
             .find("You are a helpful engineer.")
@@ -2911,7 +3279,7 @@ mod tests {
             .copied()
             .filter(|request| request.tool_names.iter().any(|name| name == "write_file"))
             .collect::<Vec<_>>();
-        assert_eq!(worker_agent_requests.len(), 5);
+        assert_eq!(worker_agent_requests.len(), 6);
         assert!(
             worker_agent_requests
                 .iter()
@@ -2960,7 +3328,7 @@ mod tests {
         assert!(final_idle_text.contains(
             "w3 must be saved, spawned from, or discarded — it is currently none of these"
         ));
-        let finalize_bounce_text = all_message_text(&supervisor_requests[8].messages);
+        let finalize_bounce_text = all_message_text(&supervisor_requests[11].messages);
         assert!(finalize_bounce_text.contains("error: before finalizing, name the evidence: the handles of the test runs you inspected (e.g. [\"w9m4\"]). If you have not seen test output for this checkpoint, spawn a verification worker on it first."));
     }
 
@@ -2993,6 +3361,13 @@ mod tests {
                     ]),
                     text_response("w2 launched"),
                     tool_response(vec![save_call("sv-save-w2")]),
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w3",
+                        "w1",
+                        "verify w1",
+                    )]),
+                    text_response("w3 launched"),
+                    tool_response(vec![discard_call("sv-discard-w3")]),
                     tool_response(vec![finalize_call_with_evidence(
                         "sv-finalize-w1",
                         "w1",
@@ -3021,6 +3396,7 @@ mod tests {
                     text_response("w1 done"),
                     tool_response(vec![write_file_call("w2-write", "b.txt", "b\n")]),
                     text_response("w2 done"),
+                    text_response("w3 verification report"),
                 ],
             ),
         ]));
@@ -3094,6 +3470,13 @@ mod tests {
                     text_response("w2 launched"),
                     tool_response(vec![save_call("sv-save-w2")]),
                     tool_response(vec![merge_call("sv-merge", "w2", "w1")]),
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w4",
+                        "w3",
+                        "verify w3",
+                    )]),
+                    text_response("w4 launched"),
+                    tool_response(vec![discard_call("sv-discard-w4")]),
                     tool_response(vec![finalize_call_with_evidence(
                         "sv-finalize-merged",
                         "w3",
@@ -3116,6 +3499,7 @@ mod tests {
                     text_response("w1 done"),
                     tool_response(vec![write_file_call("w2-write", "b.txt", "b\n")]),
                     text_response("w2 done"),
+                    text_response("w4 verification report"),
                 ],
             ),
         ]));
@@ -3172,9 +3556,22 @@ mod tests {
                         view_call("sv-view-w1", &["w1m1"]),
                         spawn_call("sv-spawn-w2", "w1", "continue after viewing"),
                     ]),
+                    tool_response(vec![discard_call("sv-discard-w2")]),
                     text_response("mixed call accepted"),
-                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
-                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w3",
+                        "w1",
+                        "verify w1",
+                    )]),
+                    text_response("w3 launched"),
+                    tool_response(vec![discard_call("sv-discard-w3")]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                    text_response("idle five"),
+                    text_response("idle six"),
+                    text_response("idle seven"),
                 ],
             ),
             (
@@ -3184,13 +3581,21 @@ mod tests {
                     // read_file keeps this fork-free (shell forks fail under
                     // per-uid NPROC pressure on busy hosts) while producing a
                     // result large enough to cross the elision threshold.
-                    tool_response(vec![named_tool_call(
-                        "w1-read",
-                        "read_file",
-                        serde_json::json!({ "file_path": "payload.txt" }),
-                    )]),
+                    tool_response(vec![
+                        named_tool_call(
+                            "w1-read",
+                            "read_file",
+                            serde_json::json!({ "file_path": "payload.txt" }),
+                        ),
+                        named_tool_call(
+                            "w1-test",
+                            "run_shell_command",
+                            serde_json::json!({ "command": "true" }),
+                        ),
+                    ]),
                     text_response("w1 done"),
                     text_response("w2 done"),
+                    text_response("w3 verification report"),
                 ],
             ),
         ]));
@@ -3256,7 +3661,7 @@ mod tests {
             .expect("in-memory ACP connect_with");
         drain.abort();
 
-        assert_eq!(outcome.response, "w1 done");
+        assert_eq!(outcome.response, "w3 verification report");
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
@@ -3268,10 +3673,14 @@ mod tests {
                         .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
             })
             .collect::<Vec<_>>();
-        let final_request_text = all_message_text(&supervisor_requests[4].messages);
-        assert!(!final_request_text.contains("MIXED_VIEW_PAYLOAD_123"));
-        assert!(final_request_text.contains("[viewed w1m1: read_file,"));
-        assert!(final_request_text.contains("spawned w2 from w1"));
+        let supervisor_text = supervisor_requests
+            .iter()
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!supervisor_text.contains("MIXED_VIEW_PAYLOAD_123"));
+        assert!(supervisor_text.contains("[viewed w1"));
+        assert!(supervisor_text.contains("spawned w2 from w1"));
     }
 
     #[tokio::test]
@@ -3308,11 +3717,16 @@ mod tests {
                     text_response("w1 launched"),
                     tool_response(vec![wait_call("sv-wait-pending")]),
                     tool_response(vec![wait_call("sv-wait-pending-again")]),
-                    tool_response(vec![finalize_call_with_evidence(
-                        "sv-finalize-evidence",
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w2",
                         "w1",
-                        &["w1m1"],
+                        "verify w1",
                     )]),
+                    text_response("w2 launched"),
+                    tool_response(vec![
+                        discard_call("sv-discard-w2"),
+                        finalize_call_with_evidence("sv-finalize-evidence", "w1", &["w1m1"]),
+                    ]),
                 ],
             ),
             (
@@ -3325,6 +3739,7 @@ mod tests {
                         serde_json::json!({ "command": "pwd" }),
                     )]),
                     text_response("w1 final report"),
+                    text_response("w2 verification report"),
                 ],
             ),
         ]));
@@ -3401,7 +3816,7 @@ mod tests {
                         .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
             })
             .collect::<Vec<_>>();
-        assert_eq!(supervisor_requests.len(), 6);
+        assert_eq!(supervisor_requests.len(), 8);
 
         let after_clean_wait = all_message_text(&supervisor_requests[1].messages);
         assert!(after_clean_wait.contains("waiting for the next worker"));
@@ -3433,6 +3848,10 @@ mod tests {
             })
             .expect("asgard finalize trace");
         assert_eq!(finalize_record["evidence"], serde_json::json!(["w1m1"]));
+        assert_eq!(
+            finalize_record["prefinalize_workers"],
+            serde_json::json!([2])
+        );
     }
 
     #[tokio::test]
