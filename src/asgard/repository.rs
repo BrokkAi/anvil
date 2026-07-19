@@ -234,6 +234,10 @@ fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn capture_diffstat(root: &Path, base_commit: &str) -> Result<String> {
+    capture_worktree_diffstat(root, base_commit)
+}
+
+fn capture_worktree_diffstat(root: &Path, base_commit: &str) -> Result<String> {
     let index_path =
         std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
     let _index_guard = TemporaryIndex::new(index_path.clone());
@@ -248,6 +252,27 @@ pub(crate) fn capture_diffstat(root: &Path, base_commit: &str) -> Result<String>
                 "--stat",
                 "--no-ext-diff",
                 base_commit,
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )?
+        .stdout,
+    )
+    .context("git diff --stat output was not UTF-8")
+}
+
+fn capture_commit_diffstat(root: &Path, base_commit: &str, target_commit: &str) -> Result<String> {
+    String::from_utf8(
+        git(
+            root,
+            &[
+                "diff",
+                "--stat",
+                "--no-ext-diff",
+                base_commit,
+                target_commit,
                 "--",
                 ".",
                 ":(exclude).brokk/**",
@@ -351,9 +376,9 @@ pub(crate) struct SnapshotStage {
 }
 
 #[derive(Debug)]
-pub(crate) struct MergeCheckpointOutcome {
-    pub(crate) commit: String,
-    pub(crate) diffstat: String,
+pub(crate) enum MergeCheckpointOutcome {
+    Merged { commit: String, diffstat: String },
+    NoChanges { diffstat: String },
 }
 
 impl SnapshotStage {
@@ -455,18 +480,22 @@ impl SnapshotStage {
 
     pub(crate) fn merge_checkpoint(
         &self,
-        from_parent_commit: &str,
         from_commit: &str,
         onto_commit: &str,
         name: &str,
     ) -> Result<MergeCheckpointOutcome> {
+        let merge_base = merge_base(&self.parent_root, from_commit, onto_commit)?;
+        let diffstat = capture_commit_diffstat(&self.parent_root, &merge_base, from_commit)?;
+        if merge_base == from_commit {
+            return Ok(MergeCheckpointOutcome::NoChanges { diffstat });
+        }
         let diff = git(
             &self.parent_root,
             &[
                 "diff",
                 "--binary",
                 "--no-ext-diff",
-                from_parent_commit,
+                &merge_base,
                 from_commit,
                 "--",
                 ".",
@@ -480,18 +509,27 @@ impl SnapshotStage {
         let _index_guard = TemporaryIndex::new(index_path.clone());
 
         git_with_index(&self.parent_root, &index_path, &["read-tree", onto_commit])?;
-        git_with_index_stdin(
+        if let Err(error) = git_with_index_stdin(
             &self.parent_root,
             &index_path,
             &["apply", "--cached", "--3way", "--binary", "-"],
             &diff,
-        )
-        .map_err(|error| anyhow::anyhow!("merge_checkpoint failed to apply patch:\n{error}"))?;
+        ) {
+            let conflicts = conflicted_files_from_index(&self.parent_root, &index_path)?;
+            return Err(merge_conflict_error(&diff, conflicts, &error));
+        }
         let tree = String::from_utf8(
             git_with_index(&self.parent_root, &index_path, &["write-tree"])?.stdout,
         )
         .context("git write-tree output was not UTF-8")?;
         let tree = tree.trim();
+        let onto_tree = git_text(
+            &self.parent_root,
+            &["rev-parse", &format!("{onto_commit}^{{tree}}")],
+        )?;
+        if tree == onto_tree.trim() {
+            return Ok(MergeCheckpointOutcome::NoChanges { diffstat });
+        }
         let message = format!("asgard checkpoint {name}");
         let commit = String::from_utf8(
             git_with_index(
@@ -516,25 +554,7 @@ impl SnapshotStage {
         let commit = commit.trim().to_string();
         let reference = format!("refs/asgard/{}/{name}", self.run_id);
         git(&self.parent_root, &["update-ref", &reference, &commit])?;
-        let diffstat = String::from_utf8(
-            git(
-                &self.parent_root,
-                &[
-                    "diff",
-                    "--stat",
-                    "--no-ext-diff",
-                    onto_commit,
-                    &commit,
-                    "--",
-                    ".",
-                    ":(exclude).brokk/**",
-                    ":(exclude).bifrost/**",
-                ],
-            )?
-            .stdout,
-        )
-        .context("git diff --stat output was not UTF-8")?;
-        Ok(MergeCheckpointOutcome { commit, diffstat })
+        Ok(MergeCheckpointOutcome::Merged { commit, diffstat })
     }
 
     pub(crate) fn cleanup(&self) {
@@ -629,6 +649,80 @@ fn git_with_index_stdin(
         return Err(stderr.trim().to_string());
     }
     Ok(output)
+}
+
+fn merge_base(root: &Path, from_commit: &str, onto_commit: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["merge-base", from_commit, onto_commit])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "merge_checkpoint could not find a merge-base for {from_commit} and {onto_commit}; \
+             these checkpoints appear to come from disjoint histories. Asgard checkpoints should \
+             descend from the run root. git merge-base said: {}",
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("git merge-base output was not UTF-8")?
+        .trim()
+        .to_string())
+}
+
+fn conflicted_files_from_index(root: &Path, index: &Path) -> Result<Vec<String>> {
+    let output = git_with_index(root, index, &["ls-files", "-u", "-z"])?;
+    let mut files = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(tab_index) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let path = String::from_utf8_lossy(&entry[tab_index + 1..]).to_string();
+        if !files.iter().any(|file| file == &path) {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn merge_conflict_error(diff: &[u8], conflicts: Vec<String>, apply_error: &str) -> anyhow::Error {
+    let mut message = String::from("merge_checkpoint failed to apply patch");
+    if conflicts.is_empty() {
+        message.push_str(&format!(":\n{}", apply_error.trim()));
+    } else {
+        message.push_str("; conflicted files:\n");
+        for file in conflicts {
+            let hunk_count = patch_hunk_count_for_file(diff, &file);
+            message.push_str(&format!("- {file} ({hunk_count} conflicting hunks)\n"));
+        }
+        message.push_str(
+            "The supervisor can spawn a worker from the onto checkpoint with instructions to \
+             resolve these conflicts, then save that resolved checkpoint.",
+        );
+    }
+    anyhow::anyhow!("{message}")
+}
+
+fn patch_hunk_count_for_file(diff: &[u8], file: &str) -> usize {
+    let diff = String::from_utf8_lossy(diff);
+    let a_marker = format!("a/{file}");
+    let b_marker = format!("b/{file}");
+    let mut in_file = false;
+    let mut count = 0;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            in_file = rest
+                .split_whitespace()
+                .any(|path| path == a_marker || path == b_marker);
+        } else if in_file && line.starts_with("@@ ") {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn git_with_index_object_directory(
@@ -1063,9 +1157,11 @@ mod tests {
             .snapshot(&onto_worker.root, base_commit.trim(), "onto")
             .unwrap();
 
-        let merged = stage
-            .merge_checkpoint(base_commit.trim(), &from, &onto, "merged")
-            .unwrap();
+        let MergeCheckpointOutcome::Merged { commit, diffstat } =
+            stage.merge_checkpoint(&from, &onto, "merged").unwrap()
+        else {
+            panic!("merge should create a checkpoint");
+        };
 
         assert_eq!(
             git_text(
@@ -1074,26 +1170,134 @@ mod tests {
             )
             .unwrap()
             .trim(),
-            merged.commit
+            commit
         );
         assert_eq!(
-            git_text(repo, &["show", &format!("{}:from.txt", merged.commit)])
+            git_text(repo, &["show", &format!("{commit}:from.txt")])
                 .unwrap()
                 .replace("\r\n", "\n"),
             "from\n"
         );
         assert_eq!(
-            git_text(repo, &["show", &format!("{}:onto.txt", merged.commit)])
+            git_text(repo, &["show", &format!("{commit}:onto.txt")])
                 .unwrap()
                 .replace("\r\n", "\n"),
             "onto\n"
         );
-        assert!(merged.diffstat.contains("from.txt"));
+        assert!(diffstat.contains("from.txt"));
         assert_eq!(
-            git_text(repo, &["rev-parse", &format!("{}^", merged.commit)])
+            git_text(repo, &["rev-parse", &format!("{commit}^")])
                 .unwrap()
                 .trim(),
             onto
+        );
+
+        remove_candidate_repository(&from_worker);
+        remove_candidate_repository(&onto_worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn merge_checkpoint_transplants_full_divergence_since_merge_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_commit = base_commit.trim();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let from_one_worker = create_candidate_repository(repo, "merge-from-one").unwrap();
+        fs::write(from_one_worker.root.join("first.txt"), "first\n").unwrap();
+        let from_one = stage
+            .snapshot(&from_one_worker.root, base_commit, "from-one")
+            .unwrap();
+
+        let from_two_worker =
+            create_candidate_repository_at(repo, "merge-from-two", &from_one).unwrap();
+        fs::write(from_two_worker.root.join("second.txt"), "second\n").unwrap();
+        let from_two = stage
+            .snapshot(&from_two_worker.root, &from_one, "from-two")
+            .unwrap();
+
+        let onto_worker = create_candidate_repository(repo, "merge-onto-multihop").unwrap();
+        fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
+        let onto = stage
+            .snapshot(&onto_worker.root, base_commit, "onto")
+            .unwrap();
+
+        let MergeCheckpointOutcome::Merged { commit, diffstat } =
+            stage.merge_checkpoint(&from_two, &onto, "merged").unwrap()
+        else {
+            panic!("merge should create a checkpoint");
+        };
+
+        assert_eq!(
+            git_text(repo, &["show", &format!("{commit}:first.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "first\n"
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{commit}:second.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "second\n"
+        );
+        assert!(diffstat.contains("first.txt"));
+        assert!(diffstat.contains("second.txt"));
+
+        remove_candidate_repository(&from_one_worker);
+        remove_candidate_repository(&from_two_worker);
+        remove_candidate_repository(&onto_worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn merge_checkpoint_noop_when_onto_already_contains_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_commit = base_commit.trim();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let from_worker = create_candidate_repository(repo, "merge-noop-from").unwrap();
+        fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
+        let from = stage
+            .snapshot(&from_worker.root, base_commit, "from")
+            .unwrap();
+
+        let onto_worker = create_candidate_repository_at(repo, "merge-noop-onto", &from).unwrap();
+        fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
+        let onto = stage.snapshot(&onto_worker.root, &from, "onto").unwrap();
+
+        let MergeCheckpointOutcome::NoChanges { diffstat } =
+            stage.merge_checkpoint(&from, &onto, "noop").unwrap()
+        else {
+            panic!("merge should be a no-op");
+        };
+
+        assert!(diffstat.is_empty());
+        assert!(
+            Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/asgard/{}/noop", stage.run_id)
+                ])
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .code()
+                .is_some_and(|code| code != 0)
         );
 
         remove_candidate_repository(&from_worker);
@@ -1126,10 +1330,13 @@ mod tests {
             .unwrap();
 
         let error = stage
-            .merge_checkpoint(base_commit.trim(), &from, &onto, "conflict")
+            .merge_checkpoint(&from, &onto, "conflict")
             .expect_err("conflict");
+        let error = format!("{error:#}");
 
-        assert!(format!("{error:#}").contains("same.txt"));
+        assert!(error.contains("same.txt"));
+        assert!(error.contains("conflicting hunks"));
+        assert!(error.contains("spawn a worker from the onto checkpoint"));
         assert!(
             Command::new("git")
                 .args([
@@ -1202,9 +1409,11 @@ mod tests {
         let target = stage.snapshot(&target_worker.root, &a, "target").unwrap();
 
         let error = stage
-            .merge_checkpoint(base_commit, &b, &target, "conflicted-merge")
+            .merge_checkpoint(&b, &target, "conflicted-merge")
             .expect_err("conflicting merge");
-        assert!(format!("{error:#}").contains("same.txt"));
+        let error = format!("{error:#}");
+        assert!(error.contains("same.txt"));
+        assert!(error.contains("conflicting hunks"));
 
         let expected_patch = git(
             repo,

@@ -581,10 +581,11 @@ fn render_dag_children(
         match child {
             DagOverviewChild::Saved(node) => {
                 rendered.push_str(&format!(
-                    "w{worker} \"{}\" saved, {}/{} steps\n",
+                    "w{worker} \"{}\" saved, {}/{} steps{}\n",
                     instruction_stub(&node.window.instructions),
                     node.window.stop.label(),
-                    node.window.steps
+                    node.window.steps,
+                    compact_diffstat_suffix(&node.window.diffstat)
                 ));
                 let mut next_prefix = prefix.to_string();
                 next_prefix.push_str(if is_last { "   " } else { "│  " });
@@ -610,6 +611,20 @@ fn render_dag_children(
                 ));
             }
         }
+    }
+}
+
+fn compact_diffstat_suffix(diffstat: &str) -> String {
+    let text = diffstat
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("; diffstat: {text}")
     }
 }
 
@@ -1016,8 +1031,14 @@ mod tests {
     #[test]
     fn render_dag_overview_merges_saved_discarded_and_live_tree() {
         let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
-        dag.insert(node(3, CheckpointId::Root, "saved root", "c3"))
-            .unwrap();
+        dag.insert(node_with_diffstat(
+            3,
+            CheckpointId::Root,
+            "saved root",
+            "c3",
+            " saved.txt | 1 +\n",
+        ))
+        .unwrap();
         dag.insert(node(
             7,
             CheckpointId::Worker(3),
@@ -1047,7 +1068,7 @@ mod tests {
         assert_eq!(
             rendered,
             "root\n\
-├─ w3 \"instructions saved root\" saved, finished/2 steps\n\
+├─ w3 \"instructions saved root\" saved, finished/2 steps; diffstat: saved.txt | 1 +\n\
 │  ├─ w7 \"instructions saved child instructions that are intentionally\" saved, finished/2 steps\n\
 │  └─ w8 \"live child under review\" under review\n\
 ├─ w4 \"discarded root child\" discarded\n\

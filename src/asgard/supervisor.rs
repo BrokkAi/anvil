@@ -440,11 +440,6 @@ pub(crate) fn parse_merge_checkpoint(
     if from == onto {
         return Err("from and onto must be distinct saved checkpoints".to_string());
     }
-    if context.dag.is_ancestor_of(&from, &onto) {
-        return Err(format!(
-            "{from} is already an ancestor of {onto}; there is nothing to merge"
-        ));
-    }
     Ok(MergeCheckpointRequest { from, onto })
 }
 
@@ -686,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_checkpoint_parser_requires_distinct_saved_nonancestor_checkpoints() {
+    fn merge_checkpoint_parser_requires_distinct_saved_checkpoints() {
         let mut dag = saved_dag();
         dag.insert(TrajectoryNode {
             window: TrajectoryWindow {
@@ -764,11 +759,9 @@ mod tests {
             MERGE_CHECKPOINT_TOOL,
             serde_json::json!({ "from": "w1", "onto": "w3" }),
         );
-        assert!(
-            parse_merge_checkpoint(&ancestor, &context)
-                .expect_err("ancestor rejected")
-                .contains("already an ancestor")
-        );
+        let parsed = parse_merge_checkpoint(&ancestor, &context).expect("ancestor merge allowed");
+        assert_eq!(parsed.from, CheckpointId::Worker(1));
+        assert_eq!(parsed.onto, CheckpointId::Worker(3));
         let pending = supervisor_tool_call(
             "merge",
             MERGE_CHECKPOINT_TOOL,

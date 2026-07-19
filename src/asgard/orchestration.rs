@@ -1559,17 +1559,12 @@ fn merge_checkpoint(
     onto: CheckpointId,
     worker: usize,
 ) -> Result<String> {
-    let from_node = match from {
+    match from {
         CheckpointId::Root => return Err(anyhow!("from root is not a saved checkpoint")),
         CheckpointId::Worker(worker) => dag
             .node(worker)
             .ok_or_else(|| anyhow!("from w{worker} is not a saved checkpoint"))?,
     };
-    let from_parent = from_node.window.parent.clone();
-    let from_parent_commit = dag
-        .commit_for(&from_parent)
-        .ok_or_else(|| anyhow!("unknown parent checkpoint {from_parent}"))?
-        .to_string();
     let from_commit = dag
         .commit_for(&from)
         .ok_or_else(|| anyhow!("unknown checkpoint {from}"))?
@@ -1579,10 +1574,20 @@ fn merge_checkpoint(
         .ok_or_else(|| anyhow!("unknown checkpoint {onto}"))?
         .to_string();
     let name = format!("w{worker}");
-    let outcome = stage.merge_checkpoint(&from_parent_commit, &from_commit, &onto_commit, &name)?;
+    let (commit, diffstat) = match stage.merge_checkpoint(&from_commit, &onto_commit, &name)? {
+        crate::asgard::MergeCheckpointOutcome::Merged { commit, diffstat } => (commit, diffstat),
+        crate::asgard::MergeCheckpointOutcome::NoChanges { diffstat } => {
+            let mut result = format!("merged {from} onto {onto}");
+            if !diffstat.trim().is_empty() {
+                result.push_str(&format!(" (diffstat: {})", diffstat.trim()));
+            }
+            result.push_str(": merge produced no changes; onto already contains this content");
+            return Ok(result);
+        }
+    };
     let instruction_text = format!(
         "The harness merged checkpoint {from}'s changes into this branch:\n{}",
-        outcome.diffstat.trim_end()
+        diffstat.trim_end()
     );
     dag.insert(TrajectoryNode {
         window: TrajectoryWindow {
@@ -1596,24 +1601,24 @@ fn merge_checkpoint(
             final_response: String::new(),
             stop: WorkerStopReason::Finished,
             steps: 0,
-            diffstat: outcome.diffstat.clone(),
+            diffstat: diffstat.clone(),
             usage: TokenUsage::default(),
             elapsed_millis: 0,
         },
-        commit: outcome.commit.clone(),
+        commit: commit.clone(),
         merged_from: vec![from.clone()],
     })?;
     crate::trace_logging::append_trace_record(serde_json::json!({
         "type": "asgard_checkpoint",
         "worker": worker,
         "parent": onto.to_string(),
-        "commit": outcome.commit,
+        "commit": commit,
         "synthetic": "merge_checkpoint",
         "from": from.to_string(),
     }));
     Ok(format!(
         "merged {from} onto {onto} as w{worker} (diffstat: {})",
-        outcome.diffstat.trim()
+        diffstat.trim()
     ))
 }
 
@@ -2510,6 +2515,33 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("git stdout was not UTF-8")
+    }
+
+    fn saved_node(
+        worker: usize,
+        parent: CheckpointId,
+        instructions: &str,
+        commit: String,
+    ) -> TrajectoryNode {
+        TrajectoryNode {
+            window: TrajectoryWindow {
+                worker,
+                parent,
+                instructions: instructions.to_string(),
+                model: "model-a".to_string(),
+                instruction_message: ChatMessage::user(instructions),
+                window_messages: Vec::new(),
+                compact: String::new(),
+                final_response: String::new(),
+                stop: WorkerStopReason::Finished,
+                steps: 1,
+                diffstat: String::new(),
+                usage: TokenUsage::default(),
+                elapsed_millis: 0,
+            },
+            commit,
+            merged_from: Vec::new(),
+        }
     }
 
     fn all_message_text(messages: &[ChatMessage]) -> String {
@@ -3535,6 +3567,75 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(supervisor_text.contains("merged w2 onto w1 as w3"));
+        assert!(supervisor_text.contains("b.txt"));
+        assert!(supervisor_text.contains("diffstat: a.txt"));
+    }
+
+    #[test]
+    fn merge_checkpoint_tool_noop_returns_warning_without_synthetic_node() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let base_commit = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let stage = SnapshotStage::new(&repo, &format!("test-{}", uuid::Uuid::new_v4()))
+            .expect("snapshot stage");
+
+        let from_worker =
+            crate::asgard::create_candidate_repository_at(&repo, "noop-from", &base_commit)
+                .expect("from worker");
+        fs::write(from_worker.root.join("from.txt"), "from\n").expect("write from");
+        let from_commit = stage
+            .snapshot(&from_worker.root, &base_commit, "from")
+            .expect("from snapshot");
+
+        let onto_worker =
+            crate::asgard::create_candidate_repository_at(&repo, "noop-onto", &from_commit)
+                .expect("onto worker");
+        fs::write(onto_worker.root.join("onto.txt"), "onto\n").expect("write onto");
+        let onto_commit = stage
+            .snapshot(&onto_worker.root, &from_commit, "onto")
+            .expect("onto snapshot");
+
+        let mut dag = TrajectoryDag::new(Vec::new(), base_commit);
+        dag.insert(saved_node(
+            1,
+            CheckpointId::Root,
+            "from",
+            from_commit.clone(),
+        ))
+        .expect("insert from");
+        dag.insert(saved_node(2, CheckpointId::Worker(1), "onto", onto_commit))
+            .expect("insert onto");
+
+        let result = merge_checkpoint(
+            &stage,
+            &mut dag,
+            CheckpointId::Worker(1),
+            CheckpointId::Worker(2),
+            3,
+        )
+        .expect("merge no-op");
+
+        assert_eq!(
+            result,
+            "merged w1 onto w2: merge produced no changes; onto already contains this content"
+        );
+        assert!(!dag.contains(&CheckpointId::Worker(3)));
+        let refs = run_git(
+            &repo,
+            &["for-each-ref", "--format=%(refname)", "refs/asgard"],
+        );
+        assert!(!refs.lines().any(|line| line.ends_with("/w3")));
+
+        crate::asgard::remove_candidate_repository(&from_worker);
+        crate::asgard::remove_candidate_repository(&onto_worker);
+        stage.cleanup();
     }
 
     #[tokio::test]
@@ -3660,6 +3761,8 @@ mod tests {
             .join("\n");
         assert!(supervisor_text.contains("error: merge_checkpoint"));
         assert!(supervisor_text.contains("same.txt"));
+        assert!(supervisor_text.contains("conflicting hunks"));
+        assert!(supervisor_text.contains("spawn a worker from the onto checkpoint"));
     }
 
     #[tokio::test]
