@@ -290,7 +290,12 @@ impl TrajectoryDag {
         let mut visited = HashSet::new();
         while let Some(current) = stack.pop() {
             match current {
-                CheckpointId::Root => return ancestor == &CheckpointId::Root,
+                CheckpointId::Root => {
+                    if ancestor == &CheckpointId::Root {
+                        return true;
+                    }
+                    continue;
+                }
                 CheckpointId::Worker(worker) => {
                     if !visited.insert(worker) {
                         continue;
@@ -986,6 +991,26 @@ mod tests {
                 diffstat: " orphan.txt | 2 ++\n".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn is_ancestor_of_explores_plain_parent_chain_after_merge_path_hits_root() {
+        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        dag.insert(node(2, CheckpointId::Root, "two", "c2"))
+            .unwrap();
+        dag.insert(node(3, CheckpointId::Worker(2), "three", "c3"))
+            .unwrap();
+        dag.insert(node(1, CheckpointId::Root, "one", "c1"))
+            .unwrap();
+        let mut merge = node(4, CheckpointId::Worker(3), "merge", "c4");
+        merge.merged_from = vec![CheckpointId::Worker(1)];
+        dag.insert(merge).unwrap();
+        dag.insert(node(5, CheckpointId::Worker(4), "five", "c5"))
+            .unwrap();
+
+        assert!(dag.is_ancestor_of(&CheckpointId::Worker(2), &CheckpointId::Worker(5)));
+        assert!(dag.is_ancestor_of(&CheckpointId::Worker(1), &CheckpointId::Worker(5)));
+        assert!(!dag.is_ancestor_of(&CheckpointId::Worker(5), &CheckpointId::Worker(2)));
     }
 
     #[test]

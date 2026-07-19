@@ -3429,19 +3429,28 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .find(|record| {
                 record["type"] == "asgard_finalize"
+                    && record["checkpoint"] == "w1"
+                    && record["abandoned"] == serde_json::json!(["w2"])
                     && record["off_lineage_unmerged"]
                         .as_array()
-                        .is_some_and(|entries| !entries.is_empty())
+                        .is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry["checkpoint"] == "w2"
+                                    && entry["diffstat"]
+                                        .as_str()
+                                        .is_some_and(|diffstat| diffstat.contains("b.txt"))
+                            })
+                        })
             })
             .expect("finalize trace");
         assert_eq!(finalize["abandoned"], serde_json::json!(["w2"]));
-        assert_eq!(finalize["off_lineage_unmerged"][0]["checkpoint"], "w2");
-        assert!(
-            finalize["off_lineage_unmerged"][0]["diffstat"]
-                .as_str()
-                .unwrap()
-                .contains("b.txt")
-        );
+        let w2_entry = finalize["off_lineage_unmerged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["checkpoint"] == "w2")
+            .expect("w2 off-lineage entry");
+        assert!(w2_entry["diffstat"].as_str().unwrap().contains("b.txt"));
     }
 
     #[tokio::test]
@@ -3526,6 +3535,131 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(supervisor_text.contains("merged w2 onto w1 as w3"));
+    }
+
+    #[tokio::test]
+    async fn failed_merge_checkpoint_then_finalize_delivers_target_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(
+            repo.join("same.txt"),
+            "line 1\nshared line\nline 3\nline 4\n",
+        )
+        .expect("write same");
+        run_git(&repo, &["add", "same.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "create A")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![
+                        save_call("sv-save-w1"),
+                        spawn_call("sv-spawn-w2", "root", "create B"),
+                    ]),
+                    text_response("w2 launched"),
+                    tool_response(vec![
+                        save_call("sv-save-w2"),
+                        spawn_call("sv-spawn-w3", "w1", "create target"),
+                    ]),
+                    text_response("w3 launched"),
+                    tool_response(vec![save_call("sv-save-w3")]),
+                    tool_response(vec![merge_call("sv-merge-conflict", "w2", "w3")]),
+                    tool_response(vec![prefinalize_call(
+                        "sv-prefinalize-w4",
+                        "w3",
+                        "verify w3",
+                    )]),
+                    text_response("w4 launched"),
+                    tool_response(vec![save_call("sv-save-w4")]),
+                    tool_response(vec![finalize_call_with_evidence_and_abandoned(
+                        "sv-finalize-w3",
+                        "w3",
+                        &["w4m1"],
+                        &["w2"],
+                    )]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![write_file_call(
+                        "w1-write",
+                        "same.txt",
+                        "line 1\nA edits the shared line\nline 3\nline 4\n",
+                    )]),
+                    text_response("w1 done"),
+                    tool_response(vec![write_file_call(
+                        "w2-write",
+                        "same.txt",
+                        "line 1\nB edits the shared line\nline 3\nline 4\n",
+                    )]),
+                    text_response("w2 done"),
+                    tool_response(vec![
+                        write_file_call(
+                            "w3-write-same",
+                            "same.txt",
+                            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n",
+                        ),
+                        write_file_call(
+                            "w3-write-target",
+                            "target.txt",
+                            "target content line 1\n\
+                             target content line 2\n\
+                             target content line 3\n\
+                             target content line 4\n\
+                             target content line 5\n",
+                        ),
+                    ]),
+                    text_response("w3 done"),
+                    tool_response(vec![named_tool_call(
+                        "w4-test",
+                        "run_shell_command",
+                        serde_json::json!({ "command": "test -f target.txt" }),
+                    )]),
+                    text_response("w4 verification report"),
+                ],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo.clone(),
+            backend.clone(),
+            vec![ChatMessage::user("exercise failed merge then finalize")],
+        )
+        .await;
+
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        assert_eq!(
+            fs::read_to_string(repo.join("same.txt")).unwrap(),
+            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("target.txt")).unwrap(),
+            "target content line 1\n\
+             target content line 2\n\
+             target content line 3\n\
+             target content line 4\n\
+             target content line 5\n"
+        );
+
+        let requests = backend.requests.lock().expect("requests");
+        let supervisor_text = requests
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("error: merge_checkpoint"));
+        assert!(supervisor_text.contains("same.txt"));
     }
 
     #[tokio::test]

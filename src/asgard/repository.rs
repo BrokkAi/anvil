@@ -335,10 +335,12 @@ impl TemporaryIndex {
 
 impl Drop for TemporaryIndex {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %self.path.display(), "failed to remove temporary Asgard index: {error}");
+        for path in [&self.path, &self.path.with_extension("lock")] {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %path.display(), "failed to remove temporary Asgard index: {error}");
+            }
         }
     }
 }
@@ -1144,6 +1146,123 @@ mod tests {
 
         remove_candidate_repository(&from_worker);
         remove_candidate_repository(&onto_worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn failed_merge_checkpoint_does_not_corrupt_later_finalize_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(
+            repo.join("same.txt"),
+            "line 1\nshared line\nline 3\nline 4\n",
+        )
+        .unwrap();
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "same.txt", "base.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_commit = base_commit.trim();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let a_worker = create_candidate_repository(repo, "merge-corruption-a").unwrap();
+        fs::write(
+            a_worker.root.join("same.txt"),
+            "line 1\nA edits the shared line\nline 3\nline 4\n",
+        )
+        .unwrap();
+        let a = stage.snapshot(&a_worker.root, base_commit, "a").unwrap();
+
+        let b_worker = create_candidate_repository(repo, "merge-corruption-b").unwrap();
+        fs::write(
+            b_worker.root.join("same.txt"),
+            "line 1\nB edits the shared line\nline 3\nline 4\n",
+        )
+        .unwrap();
+        let b = stage.snapshot(&b_worker.root, base_commit, "b").unwrap();
+
+        let target_worker =
+            create_candidate_repository_at(repo, "merge-corruption-target", &a).unwrap();
+        fs::write(
+            target_worker.root.join("same.txt"),
+            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n",
+        )
+        .unwrap();
+        fs::write(
+            target_worker.root.join("target.txt"),
+            "target content line 1\n\
+             target content line 2\n\
+             target content line 3\n\
+             target content line 4\n\
+             target content line 5\n",
+        )
+        .unwrap();
+        let target = stage.snapshot(&target_worker.root, &a, "target").unwrap();
+
+        let error = stage
+            .merge_checkpoint(base_commit, &b, &target, "conflicted-merge")
+            .expect_err("conflicting merge");
+        assert!(format!("{error:#}").contains("same.txt"));
+
+        let expected_patch = git(
+            repo,
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                base_commit,
+                &target,
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )
+        .unwrap()
+        .stdout;
+        let finalized_patch = stage.finalize_patch(base_commit, &target).unwrap();
+        assert_eq!(finalized_patch, expected_patch);
+
+        let fresh =
+            create_candidate_repository_at(repo, "merge-corruption-fresh", base_commit).unwrap();
+        apply_selected_patch(&fresh.root, &finalized_patch).unwrap();
+        run_git(&fresh.root, &["add", "-A"]);
+        let fresh_tree = git_text(&fresh.root, &["write-tree"]).unwrap();
+        let target_tree = git_text(repo, &["rev-parse", &format!("{target}^{{tree}}")]).unwrap();
+        assert_eq!(fresh_tree.trim(), target_tree.trim());
+        assert_text_file_eq(
+            &fresh.root.join("same.txt"),
+            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n",
+        );
+        assert_text_file_eq(
+            &fresh.root.join("target.txt"),
+            "target content line 1\n\
+             target content line 2\n\
+             target content line 3\n\
+             target content line 4\n\
+             target content line 5\n",
+        );
+
+        assert!(
+            Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/asgard/{}/conflicted-merge", stage.run_id)
+                ])
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .code()
+                .is_some_and(|code| code != 0)
+        );
+
+        remove_candidate_repository(&a_worker);
+        remove_candidate_repository(&b_worker);
+        remove_candidate_repository(&target_worker);
+        remove_candidate_repository(&fresh);
         stage.cleanup();
     }
 }
