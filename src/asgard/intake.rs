@@ -28,7 +28,7 @@ pub(crate) const ASGARD_INTAKE_READ_ONLY_TOOLS: &[&str] = &[
     "scan_usages_by_reference",
 ];
 
-const READER_L_PROMPT: &str = "You are a specification reader. From the task text alone - you have no repository access - write the behavioral contract a correct implementation must satisfy: every named symbol and API with its exact spelling; every enumerated set with all its members; every scoping qualifier (which commands, modes, or inputs a rule names - and where a rule is stated for one member of a set, flag whether it plausibly extends to the siblings); every exact error message or exception; every input domain (do \"numbers\" include decimals? negatives?); every ordering and formatting rule. Quote the task phrase each item derives from. Flag every detail that admits more than one reading. Output the numbered contract and nothing else.";
+const READER_L_PROMPT: &str = "You are a specification reader. From the task text alone - you have no repository access - write the behavioral contract a correct implementation must satisfy: every named symbol and API with its exact spelling; every enumerated set with all its members; every scoping qualifier (which commands, modes, or inputs a rule names - and where a rule is stated for one member of a set, flag whether it plausibly extends to the siblings); every exact error message or exception; every input domain (do \"numbers\" include decimals? negatives?); every ordering and formatting rule. Quote the task phrase each item derives from. End with a numbered list titled 'AMBIGUITIES', one line each ('A1:', 'A2:', ...), covering every detail that admits more than one reading. Output the numbered contract followed by the AMBIGUITIES list and nothing else.";
 
 const READER_G_PROMPT: &str = "You are a repository scout preparing for a task another team will implement. For each requirement in the task, find the repository evidence that constrains its interpretation: existing naming conventions, sibling APIs and how they behave, golden and fixture files, project layout. Wherever the task quantifies over a set (\"all dialects\", \"each command\"), enumerate the set's actual members from the repository and report the count and every member with its path. Report exact file paths for all evidence. Do not write code or tests. Your final message is the deliverable: a numbered report of constraints and enumerations. You have a hard budget of a few tool steps; your final text report is the only thing that survives this session, so stop exploring early enough to write it. An incomplete report beats no report.";
 
@@ -332,4 +332,19 @@ fn usage_json(usage: TokenUsage) -> serde_json::Value {
         "cachedRead": usage.cached_read_tokens,
         "cachedWrite": usage.cached_write_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_reader_prompt_requires_numbered_ambiguities() {
+        assert!(READER_L_PROMPT.contains("numbered list titled 'AMBIGUITIES'"));
+        assert!(READER_L_PROMPT.contains("one line each ('A1:', 'A2:', ...)"));
+        assert!(
+            READER_L_PROMPT
+                .contains("Output the numbered contract followed by the AMBIGUITIES list")
+        );
+    }
 }

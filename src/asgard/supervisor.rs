@@ -78,7 +78,7 @@ Reviews: you review one finished worker at a time - where it forked from, your i
 
 Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. finalize is mechanically locked until a prefinalize verification pass has run and its reports have been reviewed. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written from the task text at the start. If that evidence does not exist yet, spawn a verification worker on that checkpoint first and review what it finds. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run.
 
-Strategy is yours: run independent approaches in parallel, spawn short fact-finding workers to answer questions ("find how X is implemented; report file and line"), branch variants from a good checkpoint, cut losses early, and keep instructions explicit and testable. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Your first duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them. Resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Then write your plan as a numbered obligations ledger via update_plan: each obligation carries the task phrase it derives from, and every set the task quantifies over is written with its count and members. Have a worker write spec tests from the settled ledger - before implementation exists - that lock in the resolved reading; implementation workers run them, and your finalize evidence should show them passing. If the intake is missing, have your first worker pin the specification from the task text instead. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
+Strategy is yours: run independent approaches in parallel, spawn short fact-finding workers to answer questions ("find how X is implemented; report file and line"), branch variants from a good checkpoint, cut losses early, and keep instructions explicit and testable. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Your first duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them. Resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. For each numbered ambiguity (A1, A2, ...) in the intake, state your resolution and a one-line rationale in your plan before spawning implementation workers, and give the spec-test worker one test per resolution that locks in your chosen reading. Have a worker write spec tests from the settled reading - before implementation exists - that lock in the resolved reading; implementation workers run them, and your finalize evidence should show them passing. If the intake is missing, have your first worker pin the specification from the task text instead. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
         supervisor_steps = ASGARD_SUPERVISOR_MAX_STEPS,
         workers = ASGARD_MAX_IN_FLIGHT
     )
@@ -129,7 +129,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: PREFINALIZE_TOOL.to_string(),
-                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; plant the classic bugs in the diff's critical paths - swap an argument order, invert a boundary, drop a term - confirm the suite goes red for each plant, revert it, and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); and re-check the task's obligations against the delivered state. If verification reveals needed work stranded in another checkpoint, use merge_checkpoint to pull it in.".to_string(),
+                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; spawn one worker per plant - multi-plant protocols exhaust step budgets; plant one classic bug in the diff's critical paths - swap an argument order, invert a boundary, drop a term - and confirm the suite goes red. Each plant must be a real mutation of the SHIPPED implementation confirmed by inspecting the diff, never a synthetic stand-in function or an edit to test files/mocks. Revert the plant and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); re-check the task's obligations against the delivered state. A hung or timed-out verification run is a blocker: identify the exact hanging test before attributing it to anything pre-existing. Never substitute a weaker ad-hoc check. If verification reveals needed work stranded in another checkpoint, use merge_checkpoint to pull it in.".to_string(),
                 parameters: spawn_workers_parameters(&allowed_models),
             },
         },
@@ -867,5 +867,31 @@ mod tests {
         assert!(text.contains("[attempted view of w9: malformed handle]"));
         // Non-view tool results are untouched.
         assert!(text.contains("spawned w3 from root"));
+    }
+
+    #[test]
+    fn supervisor_supplement_requires_numbered_ambiguity_resolutions() {
+        let supplement = supervisor_supplement();
+
+        assert!(!supplement.contains("numbered obligations ledger"));
+        assert!(supplement.contains("For each numbered ambiguity (A1, A2, ...)"));
+        assert!(supplement.contains("state your resolution and a one-line rationale"));
+        assert!(supplement.contains("one test per resolution"));
+    }
+
+    #[test]
+    fn prefinalize_tool_docs_require_real_single_plants_and_hang_diagnosis() {
+        let tools = supervisor_tool_definitions(&["model-a".to_string()]);
+        let prefinalize = tools
+            .iter()
+            .find(|tool| tool.function.name == PREFINALIZE_TOOL)
+            .expect("prefinalize tool");
+        let description = &prefinalize.function.description;
+
+        assert!(description.contains("spawn one worker per plant"));
+        assert!(description.contains("real mutation of the SHIPPED implementation"));
+        assert!(description.contains("confirmed by inspecting the diff"));
+        assert!(description.contains("hung or timed-out verification run is a blocker"));
+        assert!(description.contains("Never substitute a weaker ad-hoc check"));
     }
 }
