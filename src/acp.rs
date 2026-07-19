@@ -4974,9 +4974,20 @@ narrate what code does or address the user in comments.
 - After changing code, verify it: find the project's real build, test, and lint commands \
 (README, package configuration, CI files, neighboring tests) and run the relevant ones. \
 Never assume standard commands.
-- For behavior changes, also write comprehensive tests — happy path, edge cases, and \
-failure paths — in the project's existing test framework, and run them together with the \
-project's suite. An import check or ad-hoc script is not a substitute for running tests.
+- For behavior changes, also write tests in the project's existing framework and run them \
+together with the project's suite. An import check or ad-hoc script is not a substitute \
+for running tests.
+- A test earns its place by the wrong implementation it would catch — name that bug to \
+yourself as you write it. Assert exact values, not just non-null or no-crash. Pick inputs \
+that expose the classic mistakes: operands where argument order matters, both sides of \
+every boundary, every input kind the task enumerates, orderings the result should not \
+depend on.
+- Exercise new behavior through its public surface, calling it the way the task describes \
+a caller using it, with the task's exact names.
+- After your tests pass, prove the critical ones can fail: plant the bug a test claims to \
+catch (swap the arguments, invert the boundary, drop a term), confirm the suite goes red, \
+then revert the plant. A planted bug that survives means the test is decoration — \
+strengthen it before moving on.
 - Report outcomes faithfully. If tests fail, say so and include the relevant output. Do not \
 claim \"tested\", \"working\", or \"done\" unless you ran the check and saw it pass; if you \
 could not verify, say so plainly.
