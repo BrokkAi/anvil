@@ -4623,6 +4623,7 @@ async fn run_model_turn_in_spawn(
                 None,
                 None,
                 false,
+                None,
                 context_length,
                 context_prefix_len,
                 initial_plan,
@@ -4973,6 +4974,9 @@ narrate what code does or address the user in comments.
 - After changing code, verify it: find the project's real build, test, and lint commands \
 (README, package configuration, CI files, neighboring tests) and run the relevant ones. \
 Never assume standard commands.
+- For behavior changes, also write comprehensive tests — happy path, edge cases, and \
+failure paths — in the project's existing test framework, and run them together with the \
+project's suite. An import check or ad-hoc script is not a substitute for running tests.
 - Report outcomes faithfully. If tests fail, say so and include the relevant output. Do not \
 claim \"tested\", \"working\", or \"done\" unless you ran the check and saw it pass; if you \
 could not verify, say so plainly.

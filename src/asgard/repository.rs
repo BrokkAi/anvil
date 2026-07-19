@@ -1,12 +1,9 @@
-use std::collections::HashMap;
-use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::Instant;
-use std::{fs, io::Write, thread};
+use std::{fs, io::Write};
 
 use anyhow::{Context, Result, bail};
 
@@ -30,7 +27,6 @@ pub(crate) fn config() -> Option<&'static Config> {
 pub(crate) struct CandidateRepository {
     pub root: PathBuf,
     pub session_cwd: PathBuf,
-    pub base_commit: String,
 }
 
 pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
@@ -50,6 +46,10 @@ pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn parent_head_commit(cwd: &Path) -> Result<String> {
+    Ok(git_text(cwd, &["rev-parse", "HEAD"])?.trim().to_string())
 }
 
 /// Applies the selected candidate delta to the live checkout without resetting
@@ -78,11 +78,19 @@ pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn create_candidate_repository(cwd: &Path, label: &str) -> Result<CandidateRepository> {
+#[cfg(test)]
+fn create_candidate_repository(cwd: &Path, label: &str) -> Result<CandidateRepository> {
+    let checkout_commit = git_text(cwd, &["rev-parse", "HEAD"])?;
+    create_candidate_repository_at(cwd, label, checkout_commit.trim())
+}
+
+pub(crate) fn create_candidate_repository_at(
+    cwd: &Path,
+    label: &str,
+    checkout_commit: &str,
+) -> Result<CandidateRepository> {
     let repo = git_text(cwd, &["rev-parse", "--show-toplevel"])?;
     let repo = PathBuf::from(repo.trim());
-    let base_commit = git_text(&repo, &["rev-parse", "HEAD"])?;
-    let base_commit = base_commit.trim().to_string();
     let relative = cwd.strip_prefix(&repo).unwrap_or(Path::new(""));
     let parent = std::env::temp_dir().join("anvil-asgard-clones");
     fs::create_dir_all(&parent)?;
@@ -103,7 +111,7 @@ pub(crate) fn create_candidate_repository(cwd: &Path, label: &str) -> Result<Can
     }
     let checkout = Command::new("git")
         .args(["checkout", "--detach", "--quiet", "--force"])
-        .arg(&base_commit)
+        .arg(checkout_commit)
         .current_dir(&root)
         .stdout(Stdio::null())
         .status()?;
@@ -114,13 +122,35 @@ pub(crate) fn create_candidate_repository(cwd: &Path, label: &str) -> Result<Can
     let repository = CandidateRepository {
         session_cwd: root.join(relative),
         root,
-        base_commit,
     };
     if let Err(error) = seed_build_bootstrap_files(&repo, &repository.root) {
         remove_candidate_repository(&repository);
         return Err(error);
     }
     Ok(repository)
+}
+
+pub(crate) fn recycle_repository(
+    repository: &CandidateRepository,
+    checkout_commit: &str,
+) -> Result<()> {
+    git(
+        &repository.root,
+        &["reset", "--hard", "--quiet", checkout_commit],
+    )?;
+    git(&repository.root, &["clean", "-fdq"])?;
+    git(
+        &repository.root,
+        &["checkout", "--detach", "--quiet", "HEAD"],
+    )?;
+    let branches = git_text(
+        &repository.root,
+        &["for-each-ref", "refs/heads", "--format=%(refname:short)"],
+    )?;
+    for branch in branches.lines().filter(|branch| !branch.is_empty()) {
+        git(&repository.root, &["branch", "-D", branch])?;
+    }
+    Ok(())
 }
 
 fn safe_repository_label(label: &str) -> String {
@@ -179,7 +209,8 @@ fn copy_missing_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
     let index_path =
         std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
     let _index_guard = TemporaryIndex::new(index_path.clone());
@@ -202,54 +233,30 @@ pub(crate) fn capture_patch(root: &Path, base_commit: &str) -> Result<Vec<u8>> {
     .stdout)
 }
 
-/// Captures only the candidate changes made since the selected state at the
-/// start of the current window. The selected state is a cumulative patch from
-/// `base_commit`; a temporary index materializes it without changing the
-/// candidate checkout or its real index.
-pub(crate) fn capture_patch_since(
-    root: &Path,
-    base_commit: &str,
-    selected_patch: &[u8],
-) -> Result<Vec<u8>> {
+pub(crate) fn capture_diffstat(root: &Path, base_commit: &str) -> Result<String> {
     let index_path =
         std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
     let _index_guard = TemporaryIndex::new(index_path.clone());
-
     git_with_index(root, &index_path, &["read-tree", base_commit])?;
-    if !selected_patch.is_empty() {
-        let mut child = Command::new("git")
-            .args(["apply", "--cached", "--binary", "-"])
-            .current_dir(root)
-            .env("GIT_INDEX_FILE", &index_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()?;
-        child
-            .stdin
-            .as_mut()
-            .context("git apply selected Asgard state to temporary index")?
-            .write_all(selected_patch)?;
-        if !child.wait()?.success() {
-            bail!(
-                "failed to materialize selected Asgard state in {}",
-                root.display()
-            );
-        }
-    }
     add_intent_to_add_untracked(root, &index_path)?;
-    Ok(git_with_index(
-        root,
-        &index_path,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--",
-            ".",
-            ":(exclude).brokk/**",
-            ":(exclude).bifrost/**",
-        ],
-    )?
-    .stdout)
+    String::from_utf8(
+        git_with_index(
+            root,
+            &index_path,
+            &[
+                "diff",
+                "--stat",
+                "--no-ext-diff",
+                base_commit,
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )?
+        .stdout,
+    )
+    .context("git diff --stat output was not UTF-8")
 }
 
 fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
@@ -336,252 +343,137 @@ impl Drop for TemporaryIndex {
     }
 }
 
-pub(crate) fn synchronize_candidate_repositories(
-    repositories: &[CandidateRepository],
-    selected_index: usize,
-) -> Result<RepositorySyncStats> {
-    let selected = repositories
-        .get(selected_index)
-        .context("selected Asgard repository index is out of range")?;
-    let started = Instant::now();
-    let stats = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(repositories.len().saturating_sub(1));
-        for (index, repository) in repositories.iter().enumerate() {
-            if index != selected_index {
-                let source = &selected.root;
-                let destination = &repository.root;
-                handles.push(scope.spawn(move || {
-                    synchronize_directory_contents(source, destination).with_context(|| {
-                        format!(
-                            "synchronize selected Asgard repository {} to {}",
-                            source.display(),
-                            destination.display()
-                        )
-                    })
-                }));
-            }
-        }
-
-        let mut total = RepositorySyncStats::default();
-        for handle in handles {
-            let candidate = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("Asgard repository sync thread panicked"))??;
-            total.add(candidate);
-            total.destinations += 1;
-        }
-        Ok::<_, anyhow::Error>(total)
-    })?;
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis(),
-        destinations = stats.destinations,
-        files_copied = stats.files_copied,
-        bytes_copied = stats.bytes_copied,
-        entries_removed = stats.entries_removed,
-        files_unchanged = stats.files_unchanged,
-        metadata_updated = stats.metadata_updated,
-        "synchronized Asgard candidate repositories"
-    );
-    Ok(stats)
+pub(crate) struct SnapshotStage {
+    parent_root: PathBuf,
+    run_id: String,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RepositorySyncStats {
-    pub destinations: usize,
-    pub files_copied: u64,
-    pub bytes_copied: u64,
-    pub entries_removed: u64,
-    pub files_unchanged: u64,
-    pub metadata_updated: u64,
-}
-
-impl RepositorySyncStats {
-    fn add(&mut self, other: Self) {
-        self.files_copied += other.files_copied;
-        self.bytes_copied += other.bytes_copied;
-        self.entries_removed += other.entries_removed;
-        self.files_unchanged += other.files_unchanged;
-        self.metadata_updated += other.metadata_updated;
-    }
-}
-
-fn synchronize_directory_contents(
-    source: &Path,
-    destination: &Path,
-) -> Result<RepositorySyncStats> {
-    let mut stats = RepositorySyncStats::default();
-    let mut destination_entries: HashMap<OsString, fs::DirEntry> = fs::read_dir(destination)
-        .with_context(|| format!("read Asgard repository {}", destination.display()))?
-        .map(|entry| entry.map(|entry| (entry.file_name(), entry)))
-        .collect::<std::io::Result<_>>()?;
-
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("read Asgard repository {}", source.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let source_metadata = fs::symlink_metadata(&source_path)?;
-        let destination_entry = destination_entries.remove(&entry.file_name());
-        let destination_metadata = destination_entry
-            .as_ref()
-            .map(|entry| fs::symlink_metadata(entry.path()))
-            .transpose()?;
-
-        if destination_metadata
-            .as_ref()
-            .is_some_and(|metadata| !same_entry_type(&source_metadata, metadata))
-        {
-            remove_entry(&destination_path, destination_metadata.as_ref().unwrap())?;
-            stats.entries_removed += 1;
-        }
-
-        if source_metadata.is_dir() {
-            if destination_metadata
-                .as_ref()
-                .is_none_or(|metadata| !metadata.is_dir())
-            {
-                fs::create_dir(&destination_path).with_context(|| {
-                    format!(
-                        "create Asgard repository directory {}",
-                        destination_path.display()
-                    )
-                })?;
-            }
-            stats.add(synchronize_directory_contents(
-                &source_path,
-                &destination_path,
-            )?);
-            if !same_permissions(&source_metadata, &fs::metadata(&destination_path)?) {
-                fs::set_permissions(&destination_path, source_metadata.permissions())?;
-                stats.metadata_updated += 1;
-            }
-        } else if source_metadata.file_type().is_symlink() {
-            let same_target = destination_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.file_type().is_symlink())
-                && fs::read_link(&source_path)? == fs::read_link(&destination_path)?;
-            if !same_target {
-                if let Some(metadata) = destination_metadata.as_ref()
-                    && same_entry_type(&source_metadata, metadata)
-                {
-                    remove_entry(&destination_path, metadata)?;
-                    stats.entries_removed += 1;
-                }
-                copy_symlink(&source_path, &destination_path)?;
-                stats.files_copied += 1;
-            } else {
-                stats.files_unchanged += 1;
-            }
-        } else if source_metadata.is_file() {
-            let destination_metadata = destination_metadata
-                .as_ref()
-                .filter(|metadata| metadata.is_file());
-            if destination_metadata
-                .is_some_and(|metadata| same_file_contents(&source_metadata, metadata))
-            {
-                stats.files_unchanged += 1;
-                let destination_metadata = destination_metadata.unwrap();
-                if !same_permissions(&source_metadata, destination_metadata) {
-                    fs::set_permissions(&destination_path, source_metadata.permissions())?;
-                    stats.metadata_updated += 1;
-                }
-            } else {
-                if let Some(metadata) = destination_metadata {
-                    remove_entry(&destination_path, metadata)?;
-                    stats.entries_removed += 1;
-                }
-                copy_file(&source_path, &destination_path, &source_metadata)?;
-                stats.files_copied += 1;
-                stats.bytes_copied += source_metadata.len();
-            }
-        } else {
-            bail!(
-                "unsupported special file in Asgard repository: {}",
-                source_path.display()
-            );
-        }
+impl SnapshotStage {
+    pub(crate) fn new(parent_root: &Path, run_id: &str) -> Result<Self> {
+        let parent_root =
+            PathBuf::from(git_text(parent_root, &["rev-parse", "--show-toplevel"])?.trim());
+        Ok(Self {
+            parent_root,
+            run_id: run_id.to_string(),
+        })
     }
 
-    for (_, entry) in destination_entries {
-        let metadata = fs::symlink_metadata(entry.path())?;
-        remove_entry(&entry.path(), &metadata)?;
-        stats.entries_removed += 1;
-    }
-    Ok(stats)
-}
+    pub(crate) fn snapshot(
+        &self,
+        worker_root: &Path,
+        parent_commit: &str,
+        name: &str,
+    ) -> Result<String> {
+        let git_dir = git_text(&self.parent_root, &["rev-parse", "--absolute-git-dir"])?;
+        let git_dir = PathBuf::from(git_dir.trim());
+        let object_dir = git_dir.join("objects");
+        let index_path =
+            std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
+        let _index_guard = TemporaryIndex::new(index_path.clone());
 
-fn same_entry_type(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.is_dir() == right.is_dir()
-        && left.is_file() == right.is_file()
-        && left.file_type().is_symlink() == right.file_type().is_symlink()
-}
-
-fn same_file_contents(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
-fn same_permissions(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.mode() == right.mode()
-}
-
-#[cfg(not(unix))]
-fn same_permissions(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.permissions().readonly() == right.permissions().readonly()
-}
-
-fn copy_file(source: &Path, destination: &Path, source_metadata: &fs::Metadata) -> Result<()> {
-    fs::copy(source, destination).with_context(|| {
-        format!(
-            "copy Asgard repository file {} to {}",
-            source.display(),
-            destination.display()
+        git_with_index_object_directory(
+            worker_root,
+            &index_path,
+            &object_dir,
+            &[
+                "add",
+                "-A",
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )?;
+        let tree = String::from_utf8(
+            git_with_index_object_directory(
+                worker_root,
+                &index_path,
+                &object_dir,
+                &["write-tree"],
+            )?
+            .stdout,
         )
-    })?;
-    fs::set_permissions(destination, source_metadata.permissions())?;
-    fs::File::open(destination)?
-        .set_times(fs::FileTimes::new().set_modified(source_metadata.modified()?))?;
-    Ok(())
-}
-
-fn remove_entry(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    if metadata.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
+        .context("git write-tree output was not UTF-8")?;
+        let tree = tree.trim();
+        let message = format!("asgard checkpoint {name}");
+        let commit = String::from_utf8(
+            git_with_index_object_directory(
+                worker_root,
+                &index_path,
+                &object_dir,
+                &[
+                    "-c",
+                    "user.name=asgard",
+                    "-c",
+                    "user.email=asgard@anvil.invalid",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    parent_commit,
+                    "-m",
+                    &message,
+                ],
+            )?
+            .stdout,
+        )
+        .context("git commit-tree output was not UTF-8")?;
+        let commit = commit.trim().to_string();
+        let reference = format!("refs/asgard/{}/{name}", self.run_id);
+        git(&self.parent_root, &["update-ref", &reference, &commit])?;
+        Ok(commit)
     }
-    .with_context(|| format!("remove stale Asgard repository entry {}", path.display()))
-}
 
-#[cfg(unix)]
-fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(fs::read_link(source)?, destination).with_context(|| {
-        format!(
-            "copy Asgard repository symlink {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })
-}
+    pub(crate) fn finalize_patch(
+        &self,
+        base_commit: &str,
+        checkpoint_commit: &str,
+    ) -> Result<Vec<u8>> {
+        Ok(git(
+            &self.parent_root,
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                base_commit,
+                checkpoint_commit,
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )?
+        .stdout)
+    }
 
-#[cfg(windows)]
-fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
-    let target = fs::read_link(source)?;
-    let result = if source.metadata().is_ok_and(|metadata| metadata.is_dir()) {
-        std::os::windows::fs::symlink_dir(&target, destination)
-    } else {
-        std::os::windows::fs::symlink_file(&target, destination)
-    };
-    result.with_context(|| {
-        format!(
-            "copy Asgard repository symlink {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })
+    pub(crate) fn cleanup(&self) {
+        let prefix = format!("refs/asgard/{}", self.run_id);
+        match git(
+            &self.parent_root,
+            &["for-each-ref", "--format=%(refname)", &prefix],
+        ) {
+            Ok(output) => match String::from_utf8(output.stdout) {
+                Ok(refs) => {
+                    for reference in refs.lines().filter(|line| !line.is_empty()) {
+                        if let Err(error) = git(&self.parent_root, &["update-ref", "-d", reference])
+                        {
+                            tracing::warn!(
+                                refname = reference,
+                                "failed to delete Asgard snapshot ref: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "git for-each-ref output was not UTF-8 during Asgard snapshot cleanup: {error}"
+                    );
+                }
+            },
+            Err(error) => {
+                tracing::warn!("failed to list Asgard snapshot refs for cleanup: {error}");
+            }
+        }
+    }
 }
 
 pub(crate) fn remove_candidate_repository(repository: &CandidateRepository) {
@@ -616,6 +508,24 @@ fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<std::proces
     Ok(output)
 }
 
+fn git_with_index_object_directory(
+    cwd: &Path,
+    index: &Path,
+    object_directory: &Path,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_OBJECT_DIRECTORY", object_directory)
+        .output()?;
+    if !output.status.success() {
+        bail!("git {} failed in {}", args.join(" "), cwd.display());
+    }
+    Ok(output)
+}
+
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(git(cwd, args)?.stdout).context("git output was not UTF-8")
 }
@@ -640,6 +550,11 @@ mod tests {
     fn assert_text_file_eq(path: &Path, expected: &str) {
         let actual = fs::read_to_string(path).unwrap();
         assert_eq!(actual.replace("\r\n", "\n"), expected);
+    }
+
+    fn configure_test_user(repo: &Path) {
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
     }
 
     #[test]
@@ -692,37 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn captured_window_patch_excludes_the_selected_baseline() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
-        fs::write(repo.join("removed.txt"), "remove later\n").unwrap();
-        run_git(repo, &["add", "tracked.txt", "removed.txt"]);
-        run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-
-        fs::write(repo.join("tracked.txt"), "selected\n").unwrap();
-        fs::write(repo.join("selected-only.txt"), "selected file\n").unwrap();
-        let selected = capture_patch(repo, base_commit.trim()).unwrap();
-
-        fs::write(repo.join("tracked.txt"), "candidate\n").unwrap();
-        fs::remove_file(repo.join("removed.txt")).unwrap();
-        fs::write(repo.join("candidate-only.txt"), "candidate file\n").unwrap();
-        let delta = capture_patch_since(repo, base_commit.trim(), &selected).unwrap();
-        let delta_text = String::from_utf8_lossy(&delta);
-
-        assert!(delta_text.contains("-selected"));
-        assert!(delta_text.contains("+candidate"));
-        assert!(delta_text.contains("candidate-only.txt"));
-        assert!(delta_text.contains("deleted file mode"));
-        assert!(delta_text.contains("removed.txt"));
-        assert!(!delta_text.contains("selected-only.txt"));
-    }
-
-    #[test]
     fn captured_patch_round_trips_tracked_deletions() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
@@ -758,11 +642,12 @@ mod tests {
         fs::write(repo.join("deleted.txt"), "remove me\n").unwrap();
         run_git(repo, &["add", "deleted.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
 
         let candidate = create_candidate_repository(repo, "deletion-test").unwrap();
         fs::remove_file(candidate.root.join("deleted.txt")).unwrap();
         fs::write(candidate.root.join("added.txt"), "keep me\n").unwrap();
-        let patch = capture_patch(&candidate.root, &candidate.base_commit).unwrap();
+        let patch = capture_patch(&candidate.root, base_commit.trim()).unwrap();
         assert!(String::from_utf8_lossy(&patch).contains("deleted file mode"));
 
         apply_selected_patch(repo, &patch).unwrap();
@@ -781,6 +666,7 @@ mod tests {
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
         run_git(repo, &["add", "tracked.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
 
         let candidate = create_candidate_repository(repo, "committed-test").unwrap();
         run_git(
@@ -794,7 +680,7 @@ mod tests {
         run_git(&candidate.root, &["add", "tracked.txt", "added.txt"]);
         run_git(&candidate.root, &["commit", "-m", "solution"]);
 
-        let patch = capture_patch(&candidate.root, &candidate.base_commit).unwrap();
+        let patch = capture_patch(&candidate.root, base_commit.trim()).unwrap();
         apply_selected_patch(repo, &patch).unwrap();
         remove_candidate_repository(&candidate);
 
@@ -803,176 +689,230 @@ mod tests {
     }
 
     #[test]
-    fn repository_sync_copies_branch_index_worktree_and_untracked_state() {
+    fn snapshot_writes_parent_ref_and_shared_clone_can_checkout_commit() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
-        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join(".gitignore"), "ignored.log\n").unwrap();
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let worker = create_candidate_repository(repo, "snapshot-worker").unwrap();
+        fs::write(worker.root.join("tracked.txt"), "snapshot\n").unwrap();
+        fs::write(worker.root.join("untracked.txt"), "included\n").unwrap();
+        fs::create_dir_all(worker.root.join(".brokk")).unwrap();
+        fs::write(worker.root.join(".brokk/state.txt"), "excluded\n").unwrap();
+
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage
+            .snapshot(&worker.root, base_commit.trim(), "first")
+            .unwrap();
+
+        assert_eq!(
+            git_text(
+                repo,
+                &["rev-parse", &format!("refs/asgard/{}/first", stage.run_id)]
+            )
+            .unwrap()
+            .trim(),
+            checkpoint
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{checkpoint}:tracked.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "snapshot\n"
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{checkpoint}:untracked.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "included\n"
+        );
+        let tree_paths = git_text(repo, &["ls-tree", "-r", "--name-only", &checkpoint]).unwrap();
+        assert!(!tree_paths.contains(".brokk/state.txt"));
+
+        let materialized =
+            create_candidate_repository_at(repo, "snapshot-materialized", &checkpoint).unwrap();
+        assert_text_file_eq(&materialized.root.join("tracked.txt"), "snapshot\n");
+        assert_text_file_eq(&materialized.root.join("untracked.txt"), "included\n");
+        assert!(!materialized.root.join(".brokk/state.txt").exists());
+
+        let second =
+            create_candidate_repository_at(repo, "snapshot-reset", base_commit.trim()).unwrap();
+        run_git(&second.root, &["reset", "--hard", &checkpoint]);
+        assert_text_file_eq(&second.root.join("tracked.txt"), "snapshot\n");
+        assert_text_file_eq(&second.root.join("untracked.txt"), "included\n");
+
+        remove_candidate_repository(&worker);
+        remove_candidate_repository(&materialized);
+        remove_candidate_repository(&second);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn snapshot_chains_to_previous_snapshot_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let worker = create_candidate_repository(repo, "snapshot-chain").unwrap();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        fs::write(worker.root.join("tracked.txt"), "snapshot a\n").unwrap();
+        let first = stage
+            .snapshot(&worker.root, base_commit.trim(), "a")
+            .unwrap();
+        fs::write(worker.root.join("tracked.txt"), "snapshot b\n").unwrap();
+        let second = stage.snapshot(&worker.root, &first, "b").unwrap();
+
+        assert_eq!(
+            git_text(repo, &["rev-parse", &format!("{second}^")])
+                .unwrap()
+                .trim(),
+            first
+        );
+
+        remove_candidate_repository(&worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn snapshot_ignores_worker_commit_history_and_uses_harness_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let worker = create_candidate_repository(repo, "snapshot-committed-worker").unwrap();
+        configure_test_user(&worker.root);
+        fs::write(worker.root.join("tracked.txt"), "worker commit\n").unwrap();
+        fs::write(worker.root.join("committed.txt"), "committed addition\n").unwrap();
+        run_git(&worker.root, &["add", "tracked.txt", "committed.txt"]);
+        run_git(&worker.root, &["commit", "-m", "worker commit"]);
+        let worker_commit = git_text(&worker.root, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(worker.root.join("tracked.txt"), "worktree snapshot\n").unwrap();
+        fs::write(worker.root.join("untracked.txt"), "worktree addition\n").unwrap();
+
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage
+            .snapshot(&worker.root, base_commit.trim(), "after-worker-commit")
+            .unwrap();
+        let checkpoint_parent = git_text(repo, &["rev-parse", &format!("{checkpoint}^")]).unwrap();
+
+        assert_eq!(checkpoint_parent.trim(), base_commit.trim());
+        assert_ne!(checkpoint_parent.trim(), worker_commit.trim());
+        assert_eq!(
+            git_text(repo, &["show", &format!("{checkpoint}:tracked.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "worktree snapshot\n"
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{checkpoint}:untracked.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "worktree addition\n"
+        );
+
+        remove_candidate_repository(&worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn recycle_repository_preserves_ignored_files_cleans_untracked_and_deletes_branches() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join(".gitignore"), "build-cache.txt\n").unwrap();
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
         run_git(repo, &["add", ".gitignore", "tracked.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
 
-        let selected = create_candidate_repository(repo, "selected").unwrap();
-        let losing = create_candidate_repository(repo, "losing").unwrap();
-        for candidate in [&selected, &losing] {
-            run_git(
-                &candidate.root,
-                &["config", "user.email", "candidate@example.invalid"],
-            );
-            run_git(&candidate.root, &["config", "user.name", "Candidate"]);
-            // This succeeds in both independent clones. Linked worktrees cannot
-            // safely give every lane the same checked-out branch.
-            run_git(&candidate.root, &["checkout", "-b", "solution"]);
-        }
+        fs::write(repo.join("tracked.txt"), "target\n").unwrap();
+        fs::write(repo.join("target-only.txt"), "target file\n").unwrap();
+        run_git(repo, &["add", "tracked.txt", "target-only.txt"]);
+        run_git(repo, &["commit", "-m", "target"]);
+        let target_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
 
-        fs::write(selected.root.join("tracked.txt"), "committed\n").unwrap();
-        run_git(&selected.root, &["add", "tracked.txt"]);
-        run_git(&selected.root, &["commit", "-m", "selected commit"]);
-        fs::write(selected.root.join("staged.txt"), "index version\n").unwrap();
-        run_git(&selected.root, &["add", "staged.txt"]);
-        fs::write(
-            selected.root.join("staged.txt"),
-            "index version\nworktree version\n",
-        )
-        .unwrap();
-        fs::write(selected.root.join("untracked.txt"), "untracked\n").unwrap();
-        fs::write(selected.root.join("ignored.log"), "ignored state\n").unwrap();
-        run_git(&selected.root, &["config", "asgard.selected", "winner"]);
+        let candidate =
+            create_candidate_repository_at(repo, "recycle", base_commit.trim()).unwrap();
+        run_git(&candidate.root, &["checkout", "-b", "leaked-worker-branch"]);
+        fs::write(candidate.root.join("branch-only.txt"), "branch file\n").unwrap();
+        run_git(&candidate.root, &["add", "branch-only.txt"]);
+        run_git(&candidate.root, &["commit", "-m", "worker branch"]);
+        fs::write(candidate.root.join("build-cache.txt"), "keep cache\n").unwrap();
+        fs::write(candidate.root.join("untracked.txt"), "remove me\n").unwrap();
 
-        fs::write(losing.root.join("tracked.txt"), "losing state\n").unwrap();
-        fs::write(losing.root.join("loser-only.txt"), "remove me\n").unwrap();
+        recycle_repository(&candidate, target_commit.trim()).unwrap();
 
-        let selected_root = selected.root.clone();
-        let losing_root = losing.root.clone();
-        let repositories = vec![selected, losing];
-        synchronize_candidate_repositories(&repositories, 0).unwrap();
-
-        for args in [
-            &["symbolic-ref", "--short", "HEAD"][..],
-            &["rev-parse", "HEAD"],
-            &["status", "--porcelain", "--ignored"],
-            &["diff", "--cached", "--binary"],
-            &["diff", "--binary"],
-        ] {
-            assert_eq!(
-                git(&selected_root, args).unwrap().stdout,
-                git(&losing_root, args).unwrap().stdout
-            );
-        }
+        assert_text_file_eq(&candidate.root.join("build-cache.txt"), "keep cache\n");
+        assert!(!candidate.root.join("untracked.txt").exists());
+        assert_text_file_eq(&candidate.root.join("tracked.txt"), "target\n");
+        assert_text_file_eq(&candidate.root.join("target-only.txt"), "target file\n");
         assert_eq!(
-            git_text(&losing_root, &["config", "--get", "asgard.selected"])
+            git_text(&candidate.root, &["rev-parse", "HEAD"])
                 .unwrap()
                 .trim(),
-            "winner"
+            target_commit.trim()
         );
         assert_eq!(
-            fs::read_to_string(losing_root.join("ignored.log")).unwrap(),
-            "ignored state\n"
+            git_text(
+                &candidate.root,
+                &["for-each-ref", "refs/heads", "--format=%(refname:short)"]
+            )
+            .unwrap(),
+            ""
         );
-        assert!(!losing_root.join("loser-only.txt").exists());
 
-        for repository in &repositories {
-            remove_candidate_repository(repository);
-        }
+        remove_candidate_repository(&candidate);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn repository_sync_skips_matching_files_and_applies_metadata_deltas() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        use std::time::{Duration, SystemTime};
-
+    fn finalized_snapshot_patch_applies_to_fresh_base_checkout() {
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir_all(source.join("nested")).unwrap();
-        fs::create_dir_all(destination.join("nested")).unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        fs::write(repo.join("deleted.txt"), "delete\n").unwrap();
+        run_git(repo, &["add", "tracked.txt", "deleted.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
 
-        let set_mtime = |path: &Path, seconds| {
-            fs::File::open(path)
-                .unwrap()
-                .set_times(
-                    fs::FileTimes::new()
-                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
-                )
-                .unwrap();
-        };
+        let worker = create_candidate_repository(repo, "patch-worker").unwrap();
+        fs::write(worker.root.join("tracked.txt"), "changed\n").unwrap();
+        fs::remove_file(worker.root.join("deleted.txt")).unwrap();
+        fs::write(worker.root.join("added.txt"), "added\n").unwrap();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage
+            .snapshot(&worker.root, base_commit.trim(), "patch")
+            .unwrap();
+        let patch = stage
+            .finalize_patch(base_commit.trim(), &checkpoint)
+            .unwrap();
 
-        fs::write(source.join("unchanged.txt"), "same\n").unwrap();
-        fs::write(destination.join("unchanged.txt"), "same\n").unwrap();
-        set_mtime(&source.join("unchanged.txt"), 10);
-        set_mtime(&destination.join("unchanged.txt"), 10);
-        let unchanged_inode = fs::metadata(destination.join("unchanged.txt"))
-            .unwrap()
-            .ino();
+        let fresh =
+            create_candidate_repository_at(repo, "patch-fresh", base_commit.trim()).unwrap();
+        apply_selected_patch(&fresh.root, &patch).unwrap();
+        assert_text_file_eq(&fresh.root.join("tracked.txt"), "changed\n");
+        assert_text_file_eq(&fresh.root.join("added.txt"), "added\n");
+        assert!(!fresh.root.join("deleted.txt").exists());
 
-        fs::write(source.join("changed.txt"), "new!\n").unwrap();
-        fs::write(destination.join("changed.txt"), "old!\n").unwrap();
-        set_mtime(&source.join("changed.txt"), 20);
-        set_mtime(&destination.join("changed.txt"), 10);
-
-        fs::write(source.join("executable.sh"), "echo ok\n").unwrap();
-        fs::write(destination.join("executable.sh"), "echo ok\n").unwrap();
-        set_mtime(&source.join("executable.sh"), 10);
-        set_mtime(&destination.join("executable.sh"), 10);
-        fs::set_permissions(
-            source.join("executable.sh"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        fs::set_permissions(
-            destination.join("executable.sh"),
-            fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-
-        fs::write(source.join("was-directory"), "now a file\n").unwrap();
-        fs::create_dir(destination.join("was-directory")).unwrap();
-        fs::write(destination.join("was-directory/stale.txt"), "stale\n").unwrap();
-        fs::write(destination.join("nested/remove-me.txt"), "stale\n").unwrap();
-
-        std::os::unix::fs::symlink("new-target", source.join("link")).unwrap();
-        std::os::unix::fs::symlink("old-target", destination.join("link")).unwrap();
-
-        let stats = synchronize_directory_contents(&source, &destination).unwrap();
-
-        assert_eq!(
-            fs::metadata(destination.join("unchanged.txt"))
-                .unwrap()
-                .ino(),
-            unchanged_inode,
-            "matching metadata should avoid replacing the destination file"
-        );
-        assert_text_file_eq(&destination.join("changed.txt"), "new!\n");
-        assert_eq!(
-            fs::metadata(destination.join("changed.txt"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            fs::metadata(source.join("changed.txt"))
-                .unwrap()
-                .modified()
-                .unwrap()
-        );
-        assert_eq!(
-            fs::metadata(destination.join("executable.sh"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        assert_text_file_eq(&destination.join("was-directory"), "now a file\n");
-        assert_eq!(
-            fs::read_link(destination.join("link")).unwrap(),
-            Path::new("new-target")
-        );
-        assert!(!destination.join("nested/remove-me.txt").exists());
-        assert!(stats.files_unchanged >= 2);
-        assert!(stats.files_copied >= 3);
-        assert!(stats.entries_removed >= 3);
-        assert_eq!(stats.metadata_updated, 1);
+        remove_candidate_repository(&worker);
+        remove_candidate_repository(&fresh);
+        stage.cleanup();
     }
 }

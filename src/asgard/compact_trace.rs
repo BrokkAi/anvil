@@ -95,25 +95,16 @@ fn escape_content(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Mints the handle for the tool result at `index` in lane `lane`'s window.
-///
-/// Collision-free across concurrent candidates and across windows by
-/// construction, and self-describing: the supervisor can tell which lane a
-/// handle belongs to before spending a call on it.
-pub(crate) fn asgard_tool_handle(window: usize, lane: usize, index: usize) -> String {
-    format!("w{window}l{lane}m{index}")
+/// Mints the v2 worker-scoped handle for the tool result at `index`.
+pub(crate) fn worker_tool_handle(worker: usize, index: usize) -> String {
+    format!("w{worker}m{index}")
 }
 
-/// Inverse of [`asgard_tool_handle`], returning `(window, lane, index)`.
-pub(crate) fn parse_asgard_tool_handle(handle: &str) -> Option<(usize, usize, usize)> {
+/// Inverse of [`worker_tool_handle`], returning `(worker, index)`.
+pub(crate) fn parse_worker_tool_handle(handle: &str) -> Option<(usize, usize)> {
     let rest = handle.strip_prefix('w')?;
-    let (window, rest) = rest.split_once('l')?;
-    let (lane, index) = rest.split_once('m')?;
-    Some((
-        window.parse().ok()?,
-        lane.parse().ok()?,
-        index.parse().ok()?,
-    ))
+    let (worker, index) = rest.split_once('m')?;
+    Some((worker.parse().ok()?, index.parse().ok()?))
 }
 
 fn argument_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -281,16 +272,14 @@ pub(crate) fn originating_tool_call(
         .find(|call| call.id == tool_call_id)
 }
 
-/// Renders one candidate window compactly, stamping each tool result with a
-/// handle and collapsing byte-identical repeated results to a back-reference.
-///
-/// The dedup matters more under compaction, not less: two identical compact
-/// `<tool>` lines read as two independent confirmations of the same fact, which
-/// is exactly the double-counting a supervisor weighing evidence must not do.
-pub(crate) fn render_window_compact(
-    window: usize,
-    lane: usize,
+/// Renders one v2 worker window compactly.
+pub(crate) fn render_window_compact_for_worker(worker: usize, messages: &[ChatMessage]) -> String {
+    render_window_compact_with_handle(messages, |index| worker_tool_handle(worker, index))
+}
+
+fn render_window_compact_with_handle(
     messages: &[ChatMessage],
+    handle_for_index: impl Fn(usize) -> String,
 ) -> String {
     let mut rendered = String::new();
     let mut seen_results: std::collections::HashMap<String, String> =
@@ -311,7 +300,7 @@ pub(crate) fn render_window_compact(
         match message.role.as_str() {
             "tool" => {
                 let raw = message_text(message);
-                let handle = asgard_tool_handle(window, lane, index);
+                let handle = handle_for_index(index);
                 let call = originating_tool_call(messages, index);
                 let tool = call
                     .map(|call| call.function.name.as_str())
@@ -384,26 +373,16 @@ mod tests {
     }
 
     #[test]
-    fn handles_round_trip() {
-        let handle = asgard_tool_handle(3, 1, 7);
-        assert_eq!(handle, "w3l1m7");
-        assert_eq!(parse_asgard_tool_handle(&handle), Some((3, 1, 7)));
-        assert_eq!(parse_asgard_tool_handle("nonsense"), None);
+    fn worker_handles_round_trip() {
+        let handle = worker_tool_handle(7, 11);
+        assert_eq!(handle, "w7m11");
+        assert_eq!(parse_worker_tool_handle(&handle), Some((7, 11)));
+        assert_eq!(parse_worker_tool_handle("nonsense"), None);
     }
 
     #[test]
-    fn handles_are_unique_across_concurrent_lanes_and_windows() {
-        // Two lanes running the same window at the same message index, and the
-        // same lane in a later window, must never share a handle.
-        let mut handles = std::collections::HashSet::new();
-        for window in 0..3 {
-            for lane in 0..4 {
-                for index in 0..5 {
-                    assert!(handles.insert(asgard_tool_handle(window, lane, index)));
-                }
-            }
-        }
-        assert_eq!(handles.len(), 60);
+    fn worker_handles_reject_v1_lane_handles() {
+        assert_eq!(parse_worker_tool_handle("w3l1m7"), None);
     }
 
     #[test]
@@ -418,13 +397,27 @@ mod tests {
             )),
             ChatMessage::tool_result("c2", "run_shell_command", "ok\nExit code: 0".to_string()),
         ];
-        let rendered = render_window_compact(2, 1, &messages);
+        let rendered = render_window_compact_for_worker(2, &messages);
         assert!(rendered.contains(
-            r#"<tool name="read_file" id="w2l1m1">read src/main.rs (9000 chars omitted)</tool>"#
+            r#"<tool name="read_file" id="w2m1">read src/main.rs (9000 chars omitted)</tool>"#
         ));
-        assert!(rendered.contains(r#"id="w2l1m3">$ "cargo test" (exit 0)"#));
+        assert!(rendered.contains(r#"id="w2m3">$ "cargo test" (exit 0)"#));
         // The 9,000-char result never reaches the supervisor verbatim.
         assert!(!rendered.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn worker_render_stamps_worker_ids_and_deduplicates_results() {
+        let messages = vec![
+            assistant_call(call("c1", "run_shell_command", r#"{"command":"ls"}"#)),
+            ChatMessage::tool_result("c1", "run_shell_command", "same output".to_string()),
+            assistant_call(call("c2", "run_shell_command", r#"{"command":"pwd"}"#)),
+            ChatMessage::tool_result("c2", "run_shell_command", "same output".to_string()),
+        ];
+        let rendered = render_window_compact_for_worker(7, &messages);
+        assert!(rendered.contains(r#"id="w7m1""#));
+        assert!(rendered.contains(r#"id="w7m3" exact_duplicate_of="w7m1""#));
+        assert!(!rendered.contains("w7l"));
     }
 
     #[test]
@@ -435,15 +428,15 @@ mod tests {
             assistant_call(call("c2", "run_shell_command", r#"{"command":"ls"}"#)),
             ChatMessage::tool_result("c2", "run_shell_command", "same output".to_string()),
         ];
-        let rendered = render_window_compact(0, 0, &messages);
-        assert!(rendered.contains(r#"id="w0l0m3" exact_duplicate_of="w0l0m1""#));
+        let rendered = render_window_compact_for_worker(4, &messages);
+        assert!(rendered.contains(r#"id="w4m3" exact_duplicate_of="w4m1""#));
     }
 
     #[test]
     fn reasoning_is_compacted_to_a_length_marker() {
         let mut message = ChatMessage::assistant(String::new());
         message.reasoning_content = Some("a".repeat(4_000));
-        let rendered = render_window_compact(0, 0, &[message]);
+        let rendered = render_window_compact_for_worker(4, &[message]);
         assert!(rendered.contains(r#"<thinking len="4000">"#));
         assert!(rendered.contains('…'));
         assert!(!rendered.contains(&"a".repeat(200)));

@@ -1776,6 +1776,7 @@ pub(crate) async fn run(
     tool_allowlist: Option<Arc<HashSet<String>>>,
     permission_override: Option<PermissionMode>,
     trajectory_window: bool,
+    turn_progress: Option<Arc<std::sync::atomic::AtomicUsize>>,
     context_length: Option<u32>,
     context_prefix_len: usize,
     initial_plan: Option<crate::plan::UpdatePlanArgs>,
@@ -1951,6 +1952,9 @@ pub(crate) async fn run(
         p2t_stop_reason = Some(P2tStopReason::WindowEnd);
     }
     'outer: for turn in 0..turn_limit {
+        if let Some(turn_progress) = &turn_progress {
+            turn_progress.store(turn.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
         if p2t_stop_reason.is_some() {
             if let Some(config) = p2t_config.as_ref() {
                 p2t::append_debug_trace(
@@ -5414,6 +5418,7 @@ async fn execute_subagent(
         nested_tool_allowlist,
         child_permission_override,
         false,
+        None,
         None,
         usize::MAX,
         None,

@@ -1,5 +1,7 @@
 use std::io::Write;
+use std::sync::Mutex;
 const TRACE_JSONL_ENV: &str = "ANVIL_TRACE_JSONL";
+static TRACE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn append_trace_record(record: serde_json::Value) {
     let Ok(path) = std::env::var(TRACE_JSONL_ENV) else {
@@ -27,6 +29,9 @@ pub fn append_trace_record(record: serde_json::Value) {
     };
 
     let result = (|| -> std::io::Result<()> {
+        let _guard = TRACE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
