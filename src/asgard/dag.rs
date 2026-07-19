@@ -6,6 +6,94 @@ use anyhow::{Result, anyhow, bail, ensure};
 
 use crate::llm_client::{ChatMessage, TokenUsage};
 
+/// A successfully expanded tool call, kept structured so the same resolution
+/// can be rendered in full for the model and summarized for the permanent record.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedView {
+    pub(crate) worker: usize,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+    pub(crate) result: String,
+}
+
+/// Tools whose output leads with its verdict (test runners, compilers, search
+/// hits), so the first line summarizes the whole payload. Documents lead with
+/// imports and boilerplate instead, and their first line is noise.
+const RESULT_SHAPED_TOOLS: &[&str] = &[
+    "run_shell_command",
+    "grep_search",
+    "search_symbols",
+    "list_directory",
+    "get_symbol_sources",
+];
+
+const SUMMARY_FIRST_LINE_MAX_CHARS: usize = 120;
+
+fn in_flight_error(worker: usize) -> String {
+    format!(
+        "w{worker} is in flight or awaiting review; its results become viewable when its trajectory is presented for review. Call wait (or simply reply without tool calls) to let that happen."
+    )
+}
+
+pub(crate) fn render_resolved_views(
+    views: &[(String, std::result::Result<ResolvedView, String>)],
+) -> String {
+    let mut rendered = String::new();
+    for (handle, view) in views {
+        match view {
+            Ok(view) => rendered.push_str(&format!(
+                "<tool_call id=\"{handle}\" worker=\"w{}\" name=\"{}\">\n\
+                 <arguments>{}</arguments>\n\
+                 <result>{}</result>\n\
+                 </tool_call>\n",
+                view.worker, view.name, view.arguments, view.result,
+            )),
+            Err(error) => rendered.push_str(&format!(
+                "<tool_call handle=\"{handle}\" error=\"{error}\" />\n"
+            )),
+        }
+    }
+    rendered
+}
+
+/// One line per handle for the permanent record: enough to remember what was
+/// looked at and how it turned out, without carrying the payload forward.
+/// Errors are always kept in full — eliding them once gave the supervisor
+/// amnesia and it repeated the same failing call turn after turn.
+pub(crate) fn summarize_resolved_views(
+    views: &[(String, std::result::Result<ResolvedView, String>)],
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (handle, view) in views {
+        lines.push(match view {
+            Err(error) => format!("[attempted view of {handle}: {error}]"),
+            Ok(view) => {
+                let bytes = view.result.len();
+                let mut all = view.result.lines().filter(|line| !line.trim().is_empty());
+                let first = if RESULT_SHAPED_TOOLS.contains(&view.name.as_str()) {
+                    all.next()
+                } else {
+                    None
+                };
+                match first {
+                    None => format!("[viewed {handle}: {}, {bytes} bytes]", view.name),
+                    Some(first) => {
+                        let first = first.trim();
+                        let truncated: String =
+                            first.chars().take(SUMMARY_FIRST_LINE_MAX_CHARS).collect();
+                        if truncated.len() == first.len() && all.next().is_none() {
+                            format!("[viewed {handle}: \"{truncated}\"]")
+                        } else {
+                            format!("[viewed {handle}: \"{truncated}…\" + {bytes} bytes]")
+                        }
+                    }
+                }
+            }
+        });
+    }
+    lines.join("\n")
+}
+
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub(crate) enum CheckpointId {
     Root,
@@ -226,87 +314,84 @@ impl TrajectoryDag {
         Ok(messages)
     }
 
-    pub(crate) fn resolve_handles(
+    /// Resolve each handle independently, so callers can render the full
+    /// expansion for the model and a per-handle summary for the permanent
+    /// record from the same resolution.
+    pub(crate) fn resolve_handle_views(
         &self,
         handles: &[String],
         pending: Option<(usize, &[ChatMessage])>,
         in_flight: &[usize],
-    ) -> String {
-        let mut rendered = String::new();
-        for handle in handles {
-            let Some((worker, index)) = crate::asgard::parse_worker_tool_handle(handle) else {
-                // A bare checkpoint id ("w11") is a natural but wrong way to
-                // ask for a whole trajectory; answer the intent instead of
-                // calling it malformed.
-                match CheckpointId::parse(handle) {
-                    Some(CheckpointId::Worker(worker)) if self.nodes.contains_key(&worker) => {
-                        rendered.push_str(&format!(
-                            "<tool_call handle=\"{handle}\" error=\"w{worker} is a saved checkpoint, not a tool-result handle; its compact trace was shown at its review. Expand a specific result with a handle like w{worker}m4.\" />\n"
-                        ));
-                    }
-                    Some(CheckpointId::Worker(worker)) if in_flight.contains(&worker) => {
-                        rendered.push_str(&format!(
-                            "<tool_call handle=\"{handle}\" error=\"w{worker} is in flight or awaiting review; its results become viewable when its trajectory is presented for review. Call wait (or simply reply without tool calls) to let that happen.\" />\n"
-                        ));
-                    }
-                    Some(CheckpointId::Worker(worker)) if self.discarded.contains_key(&worker) => {
-                        rendered.push_str(&format!(
-                            "<tool_call handle=\"{handle}\" error=\"trajectory w{worker} was discarded; its full results are gone\" />\n"
-                        ));
-                    }
-                    _ => {
-                        rendered.push_str(&format!(
-                            "<tool_call handle=\"{handle}\" error=\"malformed handle\" />\n"
-                        ));
-                    }
-                }
-                continue;
-            };
+    ) -> Vec<(String, std::result::Result<ResolvedView, String>)> {
+        handles
+            .iter()
+            .map(|handle| {
+                (
+                    handle.clone(),
+                    self.resolve_handle(handle, pending, in_flight),
+                )
+            })
+            .collect()
+    }
 
-            let messages = if let Some((pending_worker, pending_messages)) = pending
-                && pending_worker == worker
-            {
-                Some(pending_messages)
+    fn resolve_handle(
+        &self,
+        handle: &str,
+        pending: Option<(usize, &[ChatMessage])>,
+        in_flight: &[usize],
+    ) -> std::result::Result<ResolvedView, String> {
+        let Some((worker, index)) = crate::asgard::parse_worker_tool_handle(handle) else {
+            // A bare checkpoint id ("w11") is a natural but wrong way to
+            // ask for a whole trajectory; answer the intent instead of
+            // calling it malformed.
+            return Err(match CheckpointId::parse(handle) {
+                Some(CheckpointId::Worker(worker)) if self.nodes.contains_key(&worker) => format!(
+                    "w{worker} is a saved checkpoint, not a tool-result handle; its compact trace was shown at its review. Expand a specific result with a handle like w{worker}m4."
+                ),
+                Some(CheckpointId::Worker(worker)) if in_flight.contains(&worker) => {
+                    in_flight_error(worker)
+                }
+                Some(CheckpointId::Worker(worker)) if self.discarded.contains_key(&worker) => {
+                    format!("trajectory w{worker} was discarded; its full results are gone")
+                }
+                _ => "malformed handle".to_string(),
+            });
+        };
+
+        let messages = if let Some((pending_worker, pending_messages)) = pending
+            && pending_worker == worker
+        {
+            Some(pending_messages)
+        } else {
+            self.nodes
+                .get(&worker)
+                .map(|node| node.window.window_messages.as_slice())
+        };
+        let Some(messages) = messages else {
+            return Err(if self.discarded.contains_key(&worker) {
+                "trajectory was discarded; its full results are gone".to_string()
+            } else if in_flight.contains(&worker) {
+                in_flight_error(worker)
             } else {
-                self.nodes
-                    .get(&worker)
-                    .map(|node| node.window.window_messages.as_slice())
-            };
-            let Some(messages) = messages else {
-                if self.discarded.contains_key(&worker) {
-                    rendered.push_str(&format!(
-                        "<tool_call handle=\"{handle}\" error=\"trajectory was discarded; its full results are gone\" />\n"
-                    ));
-                } else if in_flight.contains(&worker) {
-                    rendered.push_str(&format!(
-                        "<tool_call handle=\"{handle}\" error=\"w{worker} is in flight or awaiting review; its results become viewable when its trajectory is presented for review. Call wait (or simply reply without tool calls) to let that happen.\" />\n"
-                    ));
-                } else {
-                    rendered.push_str(&format!(
-                        "<tool_call handle=\"{handle}\" error=\"unknown worker\" />\n"
-                    ));
-                }
-                continue;
-            };
-            let Some(result) = messages.get(index).filter(|message| message.role == "tool") else {
-                rendered.push_str(&format!(
-                    "<tool_call handle=\"{handle}\" error=\"handle does not name a tool result\" />\n"
-                ));
-                continue;
-            };
+                "unknown worker".to_string()
+            });
+        };
+        let result = messages
+            .get(index)
+            .filter(|message| message.role == "tool")
+            .ok_or_else(|| "handle does not name a tool result".to_string())?;
 
-            let call = crate::asgard::originating_tool_call(messages, index);
-            let name = call.map_or("tool", |call| call.function.name.as_str());
-            let arguments = call.map_or("", |call| call.function.arguments.as_str());
-            rendered.push_str(&format!(
-                "<tool_call id=\"{handle}\" worker=\"w{worker}\" name=\"{name}\">\n\
-                 <arguments>{arguments}</arguments>\n\
-                 <result>{}</result>\n\
-                 </tool_call>\n",
-                result.content_text(),
-            ));
-        }
-        rendered
+        let call = crate::asgard::originating_tool_call(messages, index);
+        Ok(ResolvedView {
+            worker,
+            name: call
+                .map_or("tool", |call| call.function.name.as_str())
+                .to_string(),
+            arguments: call
+                .map_or("", |call| call.function.arguments.as_str())
+                .to_string(),
+            result: result.content_text().to_string(),
+        })
     }
 
     pub(crate) fn handle_is_run_shell_command_result(
@@ -652,7 +737,7 @@ mod tests {
             ChatMessage::tool_result("pending", "run_shell_command", "pending result"),
             ChatMessage::assistant("pending final"),
         ];
-        let rendered = dag.resolve_handles(
+        let views = dag.resolve_handle_views(
             &[
                 "w1m1".to_string(),
                 "w2m1".to_string(),
@@ -665,6 +750,7 @@ mod tests {
             Some((2, &pending)),
             &[9],
         );
+        let rendered = render_resolved_views(&views);
 
         assert!(rendered.contains(&long_result));
         assert!(rendered.contains(r#"<tool_call id="w1m1" worker="w1" name="read_file">"#));
@@ -684,6 +770,28 @@ mod tests {
                 r#"<tool_call handle="w1m2" error="handle does not name a tool result" />"#
             )
         );
+
+        // The permanent-record summary keeps every error verbatim, names the
+        // document-shaped read_file without quoting its first line, and quotes
+        // the single-line shell result without a byte count.
+        let summary = summarize_resolved_views(&views);
+        let lines: Vec<&str> = summary.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("[viewed w1m1: read_file, {} bytes]", long_result.len())
+        );
+        assert_eq!(lines[1], r#"[viewed w2m1: "pending result"]"#);
+        assert_eq!(
+            lines[2],
+            "[attempted view of w3m1: trajectory was discarded; its full results are gone]"
+        );
+        assert_eq!(lines[3], "[attempted view of w4m1: unknown worker]");
+        assert_eq!(lines[4], "[attempted view of w1l0m1: malformed handle]");
+        assert_eq!(
+            lines[5],
+            "[attempted view of w1m2: handle does not name a tool result]"
+        );
+        assert!(lines[6].starts_with("[attempted view of w9m0: w9 is in flight"));
     }
 
     #[test]

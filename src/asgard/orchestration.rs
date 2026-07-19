@@ -20,8 +20,9 @@ use crate::asgard::{
     SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
     VIEW_TOOL_CALL_TOOL, WAIT_TOOL, WorkerStopReason, elide_view_tool_results_for_permanent_record,
     parse_finalize, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
-    render_dag_overview, render_fragment, render_window_compact_for_worker,
-    stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
+    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
+    stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
+    supervisor_tool_definitions,
 };
 use crate::llm_client::{
     ChatMessage, IdleTimeouts, LlmResponse, TokenUsage, ToolCall, ToolDefinition,
@@ -215,6 +216,8 @@ struct SupervisorTurnState {
     finalizing_evidence: Vec<String>,
     turn_ended: bool,
     finalize_bounced_this_step: bool,
+    /// view_tool_call id -> per-handle summary kept in the permanent record.
+    view_summaries: std::collections::HashMap<String, String>,
 }
 
 struct FinalizeContext<'a> {
@@ -787,6 +790,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         finalizing_evidence: Vec::new(),
         turn_ended: false,
         finalize_bounced_this_step: false,
+        view_summaries: std::collections::HashMap::new(),
     };
     let mut steps = 0usize;
     let mut unresolved_reminder_sent = false;
@@ -988,7 +992,8 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
             (!ephemeral_tail_indexes.contains(&tail_index)).then(|| message.clone())
         })
         .collect::<Vec<_>>();
-    let permanent_append = elide_view_tool_results_for_permanent_record(&permanent_tail);
+    let permanent_append =
+        elide_view_tool_results_for_permanent_record(&permanent_tail, &state.view_summaries);
     add_usage(
         cx.aggregate_usage,
         cx.usage_by_model,
@@ -1033,13 +1038,17 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     .copied()
                     .chain(cx.review_queue.iter().map(|finished| finished.worker))
                     .collect();
-                Ok(cx.dag.resolve_handles(
+                let views = cx.dag.resolve_handle_views(
                     &handles,
                     cx.pending
                         .as_ref()
                         .map(|finished| (finished.worker, finished.window_messages.as_slice())),
                     &in_flight,
-                ))
+                );
+                state
+                    .view_summaries
+                    .insert(call.id.clone(), summarize_resolved_views(&views));
+                Ok(render_resolved_views(&views))
             }
             Err(error) => Ok(format!("error: {error}")),
         },
@@ -2323,7 +2332,8 @@ mod tests {
             .filter(|request| request.model == "sv-model")
             .collect::<Vec<_>>();
         let final_request_text = all_message_text(&supervisor_requests[4].messages);
-        assert!(final_request_text.contains("[expanded w1m1 - elided from the permanent record]"));
+        assert!(!final_request_text.contains("MIXED_VIEW_PAYLOAD_123"));
+        assert!(final_request_text.contains("[viewed w1m1: read_file,"));
         assert!(final_request_text.contains("spawned w2 from w1"));
     }
 

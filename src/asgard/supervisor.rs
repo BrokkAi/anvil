@@ -355,43 +355,24 @@ pub(crate) fn parse_update_plan(
         .map_err(|error| format!("Invalid update_plan arguments: {error}"))
 }
 
+/// Replace every `view_tool_call` payload in the permanent record with the
+/// per-handle summary computed when the call ran. Applies to all expansions
+/// regardless of size: the summary carries what the supervisor needs to
+/// remember (what it looked at, what shape the answer had, and every error
+/// verbatim), and the payload itself can always be re-expanded.
 pub(crate) fn elide_view_tool_results_for_permanent_record(
     transcript: &[ChatMessage],
+    view_summaries: &std::collections::HashMap<String, String>,
 ) -> Vec<ChatMessage> {
-    let mut view_handles_by_call = std::collections::HashMap::new();
-    for message in transcript {
-        for call in message.tool_calls.iter().flatten() {
-            if call.function.name == VIEW_TOOL_CALL_TOOL {
-                let handles = parse_view_tool_call(call).unwrap_or_default();
-                view_handles_by_call.insert(call.id.clone(), handles);
-            }
-        }
-    }
-
-    // Errors and other short results stay verbatim: eliding an error hides the
-    // failure from the supervisor's permanent record, and we observed it then
-    // repeating the same failing call turn after turn. Only genuinely large
-    // expansions are worth eliding.
-    const ELISION_MIN_BYTES: usize = 400;
-
     transcript
         .iter()
         .map(|message| {
             if message.role == "tool"
                 && message.name.as_deref() == Some(VIEW_TOOL_CALL_TOOL)
-                && message.content_text().len() >= ELISION_MIN_BYTES
                 && let Some(call_id) = &message.tool_call_id
+                && let Some(summary) = view_summaries.get(call_id)
             {
-                let handles = view_handles_by_call
-                    .get(call_id)
-                    .filter(|handles| !handles.is_empty())
-                    .map(|handles| handles.join(", "))
-                    .unwrap_or_else(|| "unknown handles".to_string());
-                return ChatMessage::tool_result(
-                    call_id,
-                    VIEW_TOOL_CALL_TOOL,
-                    format!("[expanded {handles} - elided from the permanent record]"),
-                );
+                return ChatMessage::tool_result(call_id, VIEW_TOOL_CALL_TOOL, summary.clone());
             }
             message.clone()
         })
@@ -624,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn permanent_record_elides_only_view_tool_results() {
+    fn permanent_record_replaces_view_results_with_their_summaries() {
         let view_call = supervisor_tool_call(
             "view",
             VIEW_TOOL_CALL_TOOL,
@@ -640,30 +621,42 @@ mod tests {
             VIEW_TOOL_CALL_TOOL,
             serde_json::json!({ "handles": ["w9"] }),
         );
-        let huge_payload = format!("huge payload {}", "x".repeat(500));
+        let payload = format!("huge payload {}", "x".repeat(500));
+        let short_payload = "tiny".to_string();
         let transcript = vec![
             ChatMessage::assistant_tool_calls(vec![view_call, spawn_call, error_view_call]),
-            ChatMessage::tool_result("view", VIEW_TOOL_CALL_TOOL, huge_payload.clone()),
+            ChatMessage::tool_result("view", VIEW_TOOL_CALL_TOOL, payload.clone()),
             ChatMessage::tool_result("spawn", SPAWN_WORKERS_TOOL, "spawned w3 from root"),
-            ChatMessage::tool_result(
-                "view-err",
-                VIEW_TOOL_CALL_TOOL,
-                "<tool_call handle=\"w9\" error=\"malformed handle\" />",
-            ),
+            ChatMessage::tool_result("view-err", VIEW_TOOL_CALL_TOOL, short_payload.clone()),
         ];
+        let summaries = std::collections::HashMap::from([
+            (
+                "view".to_string(),
+                "[viewed w1m1: read_file, 512 bytes]\n[viewed w2m3: \"PASS (12) FAIL (0)\"]"
+                    .to_string(),
+            ),
+            (
+                "view-err".to_string(),
+                "[attempted view of w9: malformed handle]".to_string(),
+            ),
+        ]);
 
-        let permanent = elide_view_tool_results_for_permanent_record(&transcript);
+        let permanent = elide_view_tool_results_for_permanent_record(&transcript, &summaries);
         let text = permanent
             .iter()
             .map(ChatMessage::content_text)
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(!text.contains(&huge_payload));
-        assert!(text.contains("[expanded w1m1, w2m3 - elided from the permanent record]"));
+        assert!(!text.contains(&payload));
+        assert!(text.contains("[viewed w1m1: read_file, 512 bytes]"));
+        assert!(text.contains(r#"[viewed w2m3: "PASS (12) FAIL (0)"]"#));
+        // Errors are summarized too, but the summary quotes them in full so the
+        // supervisor sees that a call failed and does not repeat it. Size is
+        // irrelevant: even this short payload is replaced.
+        assert!(!text.contains(&short_payload));
+        assert!(text.contains("[attempted view of w9: malformed handle]"));
+        // Non-view tool results are untouched.
         assert!(text.contains("spawned w3 from root"));
-        // Short results — errors especially — must survive verbatim so the
-        // supervisor can see that a call failed and not repeat it.
-        assert!(text.contains(r#"<tool_call handle="w9" error="malformed handle" />"#));
     }
 }
