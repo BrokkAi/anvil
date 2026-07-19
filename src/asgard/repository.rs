@@ -348,6 +348,12 @@ pub(crate) struct SnapshotStage {
     run_id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct MergeCheckpointOutcome {
+    pub(crate) commit: String,
+    pub(crate) diffstat: String,
+}
+
 impl SnapshotStage {
     pub(crate) fn new(parent_root: &Path, run_id: &str) -> Result<Self> {
         let parent_root =
@@ -445,6 +451,90 @@ impl SnapshotStage {
         .stdout)
     }
 
+    pub(crate) fn merge_checkpoint(
+        &self,
+        from_parent_commit: &str,
+        from_commit: &str,
+        onto_commit: &str,
+        name: &str,
+    ) -> Result<MergeCheckpointOutcome> {
+        let diff = git(
+            &self.parent_root,
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                from_parent_commit,
+                from_commit,
+                "--",
+                ".",
+                ":(exclude).brokk/**",
+                ":(exclude).bifrost/**",
+            ],
+        )?
+        .stdout;
+        let index_path =
+            std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
+        let _index_guard = TemporaryIndex::new(index_path.clone());
+
+        git_with_index(&self.parent_root, &index_path, &["read-tree", onto_commit])?;
+        git_with_index_stdin(
+            &self.parent_root,
+            &index_path,
+            &["apply", "--cached", "--3way", "--binary", "-"],
+            &diff,
+        )
+        .map_err(|error| anyhow::anyhow!("merge_checkpoint failed to apply patch:\n{error}"))?;
+        let tree = String::from_utf8(
+            git_with_index(&self.parent_root, &index_path, &["write-tree"])?.stdout,
+        )
+        .context("git write-tree output was not UTF-8")?;
+        let tree = tree.trim();
+        let message = format!("asgard checkpoint {name}");
+        let commit = String::from_utf8(
+            git_with_index(
+                &self.parent_root,
+                &index_path,
+                &[
+                    "-c",
+                    "user.name=asgard",
+                    "-c",
+                    "user.email=asgard@anvil.invalid",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    onto_commit,
+                    "-m",
+                    &message,
+                ],
+            )?
+            .stdout,
+        )
+        .context("git commit-tree output was not UTF-8")?;
+        let commit = commit.trim().to_string();
+        let reference = format!("refs/asgard/{}/{name}", self.run_id);
+        git(&self.parent_root, &["update-ref", &reference, &commit])?;
+        let diffstat = String::from_utf8(
+            git(
+                &self.parent_root,
+                &[
+                    "diff",
+                    "--stat",
+                    "--no-ext-diff",
+                    onto_commit,
+                    &commit,
+                    "--",
+                    ".",
+                    ":(exclude).brokk/**",
+                    ":(exclude).bifrost/**",
+                ],
+            )?
+            .stdout,
+        )
+        .context("git diff --stat output was not UTF-8")?;
+        Ok(MergeCheckpointOutcome { commit, diffstat })
+    }
+
     pub(crate) fn cleanup(&self) {
         let prefix = format!("refs/asgard/{}", self.run_id);
         match git(
@@ -504,6 +594,37 @@ fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<std::proces
         .output()?;
     if !output.status.success() {
         bail!("git {} failed in {}", args.join(" "), cwd.display());
+    }
+    Ok(output)
+}
+
+fn git_with_index_stdin(
+    cwd: &Path,
+    index: &Path,
+    args: &[&str],
+    stdin: &[u8],
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git {} failed to start: {error}", args.join(" ")))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| format!("git {} stdin unavailable", args.join(" ")))?
+        .write_all(stdin)
+        .map_err(|error| format!("git {} stdin failed: {error}", args.join(" ")))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("git {} failed: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(stderr.trim().to_string());
     }
     Ok(output)
 }
@@ -913,6 +1034,116 @@ mod tests {
 
         remove_candidate_repository(&worker);
         remove_candidate_repository(&fresh);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn merge_checkpoint_combines_sibling_changes_and_updates_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let from_worker = create_candidate_repository(repo, "merge-from").unwrap();
+        fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
+        let from = stage
+            .snapshot(&from_worker.root, base_commit.trim(), "from")
+            .unwrap();
+
+        let onto_worker = create_candidate_repository(repo, "merge-onto").unwrap();
+        fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
+        let onto = stage
+            .snapshot(&onto_worker.root, base_commit.trim(), "onto")
+            .unwrap();
+
+        let merged = stage
+            .merge_checkpoint(base_commit.trim(), &from, &onto, "merged")
+            .unwrap();
+
+        assert_eq!(
+            git_text(
+                repo,
+                &["rev-parse", &format!("refs/asgard/{}/merged", stage.run_id)]
+            )
+            .unwrap()
+            .trim(),
+            merged.commit
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{}:from.txt", merged.commit)])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "from\n"
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{}:onto.txt", merged.commit)])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "onto\n"
+        );
+        assert!(merged.diffstat.contains("from.txt"));
+        assert_eq!(
+            git_text(repo, &["rev-parse", &format!("{}^", merged.commit)])
+                .unwrap()
+                .trim(),
+            onto
+        );
+
+        remove_candidate_repository(&from_worker);
+        remove_candidate_repository(&onto_worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn merge_checkpoint_conflict_does_not_create_checkpoint_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("same.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "same.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let from_worker = create_candidate_repository(repo, "merge-conflict-from").unwrap();
+        fs::write(from_worker.root.join("same.txt"), "from\n").unwrap();
+        let from = stage
+            .snapshot(&from_worker.root, base_commit.trim(), "from")
+            .unwrap();
+
+        let onto_worker = create_candidate_repository(repo, "merge-conflict-onto").unwrap();
+        fs::write(onto_worker.root.join("same.txt"), "onto\n").unwrap();
+        let onto = stage
+            .snapshot(&onto_worker.root, base_commit.trim(), "onto")
+            .unwrap();
+
+        let error = stage
+            .merge_checkpoint(base_commit.trim(), &from, &onto, "conflict")
+            .expect_err("conflict");
+
+        assert!(format!("{error:#}").contains("same.txt"));
+        assert!(
+            Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/asgard/{}/conflict", stage.run_id)
+                ])
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .code()
+                .is_some_and(|code| code != 0)
+        );
+
+        remove_candidate_repository(&from_worker);
+        remove_candidate_repository(&onto_worker);
         stage.cleanup();
     }
 }

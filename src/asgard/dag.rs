@@ -170,6 +170,13 @@ pub(crate) struct TrajectoryWindow {
 pub(crate) struct TrajectoryNode {
     pub(crate) window: TrajectoryWindow,
     pub(crate) commit: String,
+    pub(crate) merged_from: Vec<CheckpointId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OffLineageCheckpoint {
+    pub(crate) checkpoint: CheckpointId,
+    pub(crate) diffstat: String,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +279,56 @@ impl TrajectoryDag {
         self.nodes
             .keys()
             .map(|worker| CheckpointId::Worker(*worker).to_string())
+            .collect()
+    }
+
+    pub(crate) fn is_ancestor_of(&self, ancestor: &CheckpointId, target: &CheckpointId) -> bool {
+        if ancestor == target {
+            return true;
+        }
+        let mut stack = vec![target.clone()];
+        let mut visited = HashSet::new();
+        while let Some(current) = stack.pop() {
+            match current {
+                CheckpointId::Root => return ancestor == &CheckpointId::Root,
+                CheckpointId::Worker(worker) => {
+                    if !visited.insert(worker) {
+                        continue;
+                    }
+                    let Some(node) = self.nodes.get(&worker) else {
+                        continue;
+                    };
+                    if &node.window.parent == ancestor
+                        || node
+                            .merged_from
+                            .iter()
+                            .any(|checkpoint| checkpoint == ancestor)
+                    {
+                        return true;
+                    }
+                    stack.push(node.window.parent.clone());
+                    stack.extend(node.merged_from.iter().cloned());
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn off_lineage_checkpoints_with_diffstat(
+        &self,
+        target: &CheckpointId,
+    ) -> Vec<OffLineageCheckpoint> {
+        self.nodes
+            .iter()
+            .filter_map(|(worker, node)| {
+                let checkpoint = CheckpointId::Worker(*worker);
+                (!self.is_ancestor_of(&checkpoint, target)
+                    && !node.window.diffstat.trim().is_empty())
+                .then(|| OffLineageCheckpoint {
+                    checkpoint,
+                    diffstat: node.window.diffstat.clone(),
+                })
+            })
             .collect()
     }
 
@@ -627,7 +684,20 @@ mod tests {
         TrajectoryNode {
             window: window(worker, parent, label),
             commit: commit.to_string(),
+            merged_from: Vec::new(),
         }
+    }
+
+    fn node_with_diffstat(
+        worker: usize,
+        parent: CheckpointId,
+        label: &str,
+        commit: &str,
+        diffstat: &str,
+    ) -> TrajectoryNode {
+        let mut node = node(worker, parent, label, commit);
+        node.window.diffstat = diffstat.to_string();
+        node
     }
 
     fn text(message: &ChatMessage) -> String {
@@ -727,6 +797,7 @@ mod tests {
         dag.insert(TrajectoryNode {
             window: saved,
             commit: "c1".to_string(),
+            merged_from: Vec::new(),
         })
         .unwrap();
         dag.discard(3, CheckpointId::Root, "discarded".to_string())
@@ -811,6 +882,7 @@ mod tests {
         dag.insert(TrajectoryNode {
             window: saved,
             commit: "c1".to_string(),
+            merged_from: Vec::new(),
         })
         .unwrap();
         let pending = vec![
@@ -867,6 +939,53 @@ mod tests {
         assert_eq!(dag.commit_for(&CheckpointId::Worker(2)), None);
         assert_eq!(dag.checkpoint_labels(), vec!["w1", "w3"]);
         assert!(dag.node(1).is_some());
+    }
+
+    #[test]
+    fn off_lineage_diffstat_checkpoints_excludes_ancestors_and_empty_diffstats() {
+        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        dag.insert(node_with_diffstat(
+            1,
+            CheckpointId::Root,
+            "ancestor",
+            "c1",
+            " ancestor.txt | 1 +\n",
+        ))
+        .unwrap();
+        dag.insert(node_with_diffstat(
+            2,
+            CheckpointId::Worker(1),
+            "target",
+            "c2",
+            " target.txt | 1 +\n",
+        ))
+        .unwrap();
+        dag.insert(node_with_diffstat(
+            3,
+            CheckpointId::Root,
+            "empty orphan",
+            "c3",
+            "   \n",
+        ))
+        .unwrap();
+        dag.insert(node_with_diffstat(
+            4,
+            CheckpointId::Root,
+            "diff orphan",
+            "c4",
+            " orphan.txt | 2 ++\n",
+        ))
+        .unwrap();
+
+        let off_lineage = dag.off_lineage_checkpoints_with_diffstat(&CheckpointId::Worker(2));
+
+        assert_eq!(
+            off_lineage,
+            vec![OffLineageCheckpoint {
+                checkpoint: CheckpointId::Worker(4),
+                diffstat: " orphan.txt | 2 ++\n".to_string(),
+            }]
+        );
     }
 
     #[test]

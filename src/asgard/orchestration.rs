@@ -16,12 +16,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::asgard::{
     ASGARD_MAX_IN_FLIGHT, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
     CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL,
-    SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest, SupervisorStreamCall,
-    SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
-    VIEW_TOOL_CALL_TOOL, WAIT_TOOL, WorkerStopReason, elide_view_tool_results_for_permanent_record,
-    parse_finalize, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
-    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
-    run_asgard_intake, stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
+    MERGE_CHECKPOINT_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
+    SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
+    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WAIT_TOOL, WorkerStopReason,
+    elide_view_tool_results_for_permanent_record, parse_finalize, parse_merge_checkpoint,
+    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_dag_overview,
+    render_fragment, render_resolved_views, render_window_compact_for_worker, run_asgard_intake,
+    stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
     supervisor_tool_definitions,
 };
 use crate::llm_client::{
@@ -163,6 +164,7 @@ enum AsgardExit {
         checkpoint: CheckpointId,
         response: Option<String>,
         evidence: Vec<String>,
+        abandoned: Vec<String>,
     },
     Failure(anyhow::Error),
     Cancelled,
@@ -189,6 +191,7 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     launch: WorkerLaunch<'fut>,
     allowed_models: &'ctx [String],
     finalize_evidence_bounced: &'ctx mut bool,
+    finalize_lineage_bounced: &'ctx mut bool,
     turn_capacity: usize,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
@@ -198,12 +201,14 @@ struct SupervisorLoopContext<'ctx, 'fut> {
 struct SupervisorLoopResult {
     finalizing: Option<(CheckpointId, Option<String>)>,
     finalizing_evidence: Vec<String>,
+    finalizing_abandoned: Vec<String>,
     plan: Option<UpdatePlanArgs>,
     usage: TokenUsage,
     steps: usize,
     spawned: Vec<usize>,
     saved: bool,
     discarded: bool,
+    merged: Vec<usize>,
     permanent_append: Vec<ChatMessage>,
 }
 
@@ -213,8 +218,10 @@ struct SupervisorTurnState {
     spawned_this_turn: usize,
     saved_pending: bool,
     discarded: bool,
+    merged: Vec<usize>,
     finalizing: Option<(CheckpointId, Option<String>)>,
     finalizing_evidence: Vec<String>,
+    finalizing_abandoned: Vec<String>,
     turn_ended: bool,
     finalize_bounced_this_step: bool,
     /// view_tool_call id -> per-handle summary kept in the permanent record.
@@ -229,6 +236,7 @@ struct FinalizeContext<'a> {
     live_output: &'a AsgardLiveOutput,
     current_plan: Option<&'a UpdatePlanArgs>,
     evidence: &'a [String],
+    abandoned: &'a [String],
 }
 
 struct WorkerLaunch<'a> {
@@ -526,6 +534,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut fallback_idle_cycles = 0usize;
     let mut canonical_plan = initial_plan;
     let mut finalize_evidence_bounced = false;
+    let mut finalize_lineage_bounced = false;
 
     let exit = loop {
         if cancel.is_cancelled() {
@@ -625,6 +634,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             },
             allowed_models: &config.candidate_models,
             finalize_evidence_bounced: &mut finalize_evidence_bounced,
+            finalize_lineage_bounced: &mut finalize_lineage_bounced,
             turn_capacity,
             idle_timeout,
             cancel: cancel.clone(),
@@ -661,9 +671,14 @@ pub(crate) async fn run_asgard_trajectory_loop(
                         checkpoint,
                         response,
                         evidence: outcome.finalizing_evidence,
+                        abandoned: outcome.finalizing_abandoned,
                     };
                 }
-                if outcome.spawned.is_empty() && !outcome.saved && pending_window.is_none() {
+                if outcome.spawned.is_empty()
+                    && outcome.merged.is_empty()
+                    && !outcome.saved
+                    && pending_window.is_none()
+                {
                     fallback_idle_cycles += 1;
                     if fallback_idle_cycles >= 3 {
                         if let Some(checkpoint) = latest_saved_checkpoint(&dag) {
@@ -671,6 +686,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                                 checkpoint,
                                 response: None,
                                 evidence: Vec::new(),
+                                abandoned: Vec::new(),
                             };
                         }
                         if running.is_empty() {
@@ -722,6 +738,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                         checkpoint,
                         response: None,
                         evidence: Vec::new(),
+                        abandoned: Vec::new(),
                     };
                 }
                 if fallback_idle_cycles >= 3 {
@@ -739,6 +756,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             checkpoint,
             response,
             evidence,
+            abandoned,
         } => finalize_asgard(
             FinalizeContext {
                 parent_cwd: parent_registry.cwd(),
@@ -748,6 +766,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 live_output: &live_output,
                 current_plan: canonical_plan.as_ref(),
                 evidence: &evidence,
+                abandoned: &abandoned,
             },
             checkpoint,
             response,
@@ -813,6 +832,8 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         discarded: false,
         finalizing: None,
         finalizing_evidence: Vec::new(),
+        finalizing_abandoned: Vec::new(),
+        merged: Vec::new(),
         turn_ended: false,
         finalize_bounced_this_step: false,
         view_summaries: std::collections::HashMap::new(),
@@ -1035,6 +1056,8 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         saved: state.saved_pending,
         discarded: state.discarded,
         finalizing_evidence: state.finalizing_evidence,
+        finalizing_abandoned: state.finalizing_abandoned,
+        merged: state.merged,
         permanent_append,
     })
 }
@@ -1105,6 +1128,26 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     .map(|finished| finished.worker)
                     .ok_or_else(|| anyhow!("pending worker disappeared during save"))?
             ))
+        }
+        MERGE_CHECKPOINT_TOOL => {
+            let context = SupervisorTurnContext {
+                dag: &*cx.dag,
+                pending: cx.pending.as_ref().map(|finished| finished.worker),
+                allowed_models: cx.allowed_models,
+            };
+            let parsed = match parse_merge_checkpoint(call, &context) {
+                Ok(parsed) => parsed,
+                Err(error) => return Ok(format!("error: merge_checkpoint: {error}")),
+            };
+            let new_worker = *cx.worker_counter;
+            match merge_checkpoint(cx.stage, cx.dag, parsed.from, parsed.onto, new_worker) {
+                Ok(result) => {
+                    *cx.worker_counter += 1;
+                    state.merged.push(new_worker);
+                    Ok(result)
+                }
+                Err(error) => Ok(format!("error: merge_checkpoint: {error:#}")),
+            }
         }
         DISCARD_TOOL => {
             if state.saved_pending {
@@ -1194,6 +1237,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             let checkpoint = parsed.checkpoint;
             let response = parsed.response;
             let evidence = parsed.evidence;
+            let abandoned = parsed.abandoned;
             let pending_messages = cx
                 .pending
                 .as_ref()
@@ -1207,6 +1251,29 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 state.finalize_bounced_this_step = true;
                 return Ok("error: before finalizing, name the evidence: the handles of the test runs you inspected (e.g. [\"w9m4\"]). If you have not seen test output for this checkpoint, spawn a verification worker on it first.".to_string());
             }
+            let off_lineage = cx.dag.off_lineage_checkpoints_with_diffstat(&checkpoint);
+            let unacknowledged = off_lineage
+                .iter()
+                .filter(|entry| {
+                    !abandoned
+                        .iter()
+                        .any(|id| id == &entry.checkpoint.to_string())
+                })
+                .collect::<Vec<_>>();
+            if !unacknowledged.is_empty() && !*cx.finalize_lineage_bounced {
+                *cx.finalize_lineage_bounced = true;
+                state.finalize_bounced_this_step = true;
+                let mut message =
+                    "error: finalize would leave diff-bearing saved checkpoints off-lineage:\n"
+                        .to_string();
+                for entry in unacknowledged {
+                    message.push_str(&format!("{}:\n", entry.checkpoint));
+                    message.push_str(entry.diffstat.trim_end());
+                    message.push('\n');
+                }
+                message.push_str("Their work is absent from the delivered lineage. Merge them (merge_checkpoint), or list them in `abandoned` to confirm intentional abandonment.");
+                return Ok(message);
+            }
             if cx
                 .pending
                 .as_ref()
@@ -1217,6 +1284,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             }
             state.finalizing = Some((checkpoint.clone(), response));
             state.finalizing_evidence = evidence.clone();
+            state.finalizing_abandoned = abandoned;
             let evidence_text = if evidence.is_empty() {
                 "no evidence named".to_string()
             } else {
@@ -1399,6 +1467,71 @@ async fn launch_spawn<'a>(
     Ok(worker_id)
 }
 
+fn merge_checkpoint(
+    stage: &SnapshotStage,
+    dag: &mut TrajectoryDag,
+    from: CheckpointId,
+    onto: CheckpointId,
+    worker: usize,
+) -> Result<String> {
+    let from_node = match from {
+        CheckpointId::Root => return Err(anyhow!("from root is not a saved checkpoint")),
+        CheckpointId::Worker(worker) => dag
+            .node(worker)
+            .ok_or_else(|| anyhow!("from w{worker} is not a saved checkpoint"))?,
+    };
+    let from_parent = from_node.window.parent.clone();
+    let from_parent_commit = dag
+        .commit_for(&from_parent)
+        .ok_or_else(|| anyhow!("unknown parent checkpoint {from_parent}"))?
+        .to_string();
+    let from_commit = dag
+        .commit_for(&from)
+        .ok_or_else(|| anyhow!("unknown checkpoint {from}"))?
+        .to_string();
+    let onto_commit = dag
+        .commit_for(&onto)
+        .ok_or_else(|| anyhow!("unknown checkpoint {onto}"))?
+        .to_string();
+    let name = format!("w{worker}");
+    let outcome = stage.merge_checkpoint(&from_parent_commit, &from_commit, &onto_commit, &name)?;
+    let instruction_text = format!(
+        "The harness merged checkpoint {from}'s changes into this branch:\n{}",
+        outcome.diffstat.trim_end()
+    );
+    dag.insert(TrajectoryNode {
+        window: TrajectoryWindow {
+            worker,
+            parent: onto.clone(),
+            instructions: format!("merged {from}'s changes onto {onto}"),
+            model: "asgard".to_string(),
+            instruction_message: ChatMessage::user(instruction_text),
+            window_messages: Vec::new(),
+            compact: String::new(),
+            final_response: String::new(),
+            stop: WorkerStopReason::Finished,
+            steps: 0,
+            diffstat: outcome.diffstat.clone(),
+            usage: TokenUsage::default(),
+            elapsed_millis: 0,
+        },
+        commit: outcome.commit.clone(),
+        merged_from: vec![from.clone()],
+    })?;
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_checkpoint",
+        "worker": worker,
+        "parent": onto.to_string(),
+        "commit": outcome.commit,
+        "synthetic": "merge_checkpoint",
+        "from": from.to_string(),
+    }));
+    Ok(format!(
+        "merged {from} onto {onto} as w{worker} (diffstat: {})",
+        outcome.diffstat.trim()
+    ))
+}
+
 fn resolve_pending(
     stage: &SnapshotStage,
     dag: &mut TrajectoryDag,
@@ -1420,6 +1553,7 @@ fn resolve_pending(
             dag.insert(TrajectoryNode {
                 window,
                 commit: commit.clone(),
+                merged_from: Vec::new(),
             })?;
             crate::trace_logging::append_trace_record(serde_json::json!({
                 "type": "asgard_checkpoint",
@@ -1505,12 +1639,25 @@ fn finalize_asgard(
             .map(|node| node.window.final_response.clone())
             .unwrap_or_default(),
     });
+    let off_lineage_unmerged = context
+        .dag
+        .off_lineage_checkpoints_with_diffstat(&checkpoint)
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "checkpoint": entry.checkpoint.to_string(),
+                "diffstat": entry.diffstat,
+            })
+        })
+        .collect::<Vec<_>>();
     crate::trace_logging::append_trace_record(serde_json::json!({
         "type": "asgard_finalize",
         "checkpoint": checkpoint.to_string(),
         "commit": checkpoint_commit,
         "response_bytes": final_text.len(),
         "evidence": context.evidence,
+        "off_lineage_unmerged": off_lineage_unmerged,
+        "abandoned": context.abandoned,
     }));
     let evidence_text = if context.evidence.is_empty() {
         "no evidence named".to_string()
@@ -1651,8 +1798,8 @@ fn supervisor_decision_summary(outcome: &SupervisorLoopResult) -> String {
         );
     }
     format!(
-        "spawned={:?} saved={} finalized=false discarded={}",
-        outcome.spawned, outcome.saved, outcome.discarded
+        "spawned={:?} merged={:?} saved={} finalized=false discarded={}",
+        outcome.spawned, outcome.merged, outcome.saved, outcome.discarded
     )
 }
 
@@ -2113,6 +2260,31 @@ mod tests {
             id,
             "finalize",
             serde_json::json!({ "checkpoint": checkpoint, "evidence": evidence }),
+        )
+    }
+
+    fn finalize_call_with_evidence_and_abandoned(
+        id: &str,
+        checkpoint: &str,
+        evidence: &[&str],
+        abandoned: &[&str],
+    ) -> ToolCall {
+        named_tool_call(
+            id,
+            "finalize",
+            serde_json::json!({
+                "checkpoint": checkpoint,
+                "evidence": evidence,
+                "abandoned": abandoned
+            }),
+        )
+    }
+
+    fn merge_call(id: &str, from: &str, onto: &str) -> ToolCall {
+        named_tool_call(
+            id,
+            "merge_checkpoint",
+            serde_json::json!({ "from": from, "onto": onto }),
         )
     }
 
@@ -2793,6 +2965,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_bounces_once_for_unabandoned_off_lineage_diffstat() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![
+                        save_call("sv-save-w1"),
+                        spawn_call("sv-spawn-w2", "root", "create b"),
+                    ]),
+                    text_response("w2 launched"),
+                    tool_response(vec![save_call("sv-save-w2")]),
+                    tool_response(vec![finalize_call_with_evidence(
+                        "sv-finalize-w1",
+                        "w1",
+                        &["w1m2"],
+                    )]),
+                    tool_response(vec![finalize_call_with_evidence_and_abandoned(
+                        "sv-finalize-w1-abandoned",
+                        "w1",
+                        &["w1m2"],
+                        &["w2"],
+                    )]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![
+                        write_file_call("w1-write", "a.txt", "a\n"),
+                        named_tool_call(
+                            "w1-test",
+                            "run_shell_command",
+                            serde_json::json!({ "command": "test -f a.txt" }),
+                        ),
+                    ]),
+                    text_response("w1 done"),
+                    tool_response(vec![write_file_call("w2-write", "b.txt", "b\n")]),
+                    text_response("w2 done"),
+                ],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo.clone(),
+            backend.clone(),
+            vec![ChatMessage::user("exercise finalize abandoned")],
+        )
+        .await;
+
+        assert_eq!(outcome.response, "w1 done");
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+        assert!(!repo.join("b.txt").exists());
+
+        let requests = backend.requests.lock().expect("requests");
+        let supervisor_text = requests
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("w2:"));
+        assert!(supervisor_text.contains("b.txt"));
+        assert!(supervisor_text.contains("Their work is absent from the delivered lineage. Merge them (merge_checkpoint), or list them in `abandoned` to confirm intentional abandonment."));
+
+        let trace_records = fs::read_to_string(trace_path).expect("trace");
+        let finalize = trace_records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "asgard_finalize"
+                    && record["off_lineage_unmerged"]
+                        .as_array()
+                        .is_some_and(|entries| !entries.is_empty())
+            })
+            .expect("finalize trace");
+        assert_eq!(finalize["abandoned"], serde_json::json!(["w2"]));
+        assert_eq!(finalize["off_lineage_unmerged"][0]["checkpoint"], "w2");
+        assert!(
+            finalize["off_lineage_unmerged"][0]["diffstat"]
+                .as_str()
+                .unwrap()
+                .contains("b.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_checkpoint_then_finalize_delivers_both_sibling_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![
+                        save_call("sv-save-w1"),
+                        spawn_call("sv-spawn-w2", "root", "create b"),
+                    ]),
+                    text_response("w2 launched"),
+                    tool_response(vec![save_call("sv-save-w2")]),
+                    tool_response(vec![merge_call("sv-merge", "w2", "w1")]),
+                    tool_response(vec![finalize_call_with_evidence(
+                        "sv-finalize-merged",
+                        "w3",
+                        &["w1m2"],
+                    )]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![
+                        write_file_call("w1-write", "a.txt", "a\n"),
+                        named_tool_call(
+                            "w1-test",
+                            "run_shell_command",
+                            serde_json::json!({ "command": "test -f a.txt" }),
+                        ),
+                    ]),
+                    text_response("w1 done"),
+                    tool_response(vec![write_file_call("w2-write", "b.txt", "b\n")]),
+                    text_response("w2 done"),
+                ],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo.clone(),
+            backend.clone(),
+            vec![ChatMessage::user("exercise merge checkpoint")],
+        )
+        .await;
+
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+        assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b\n");
+        let status = run_git(&repo, &["status", "--porcelain"]);
+        assert!(status.contains("a.txt"));
+        assert!(status.contains("b.txt"));
+
+        let requests = backend.requests.lock().expect("requests");
+        let supervisor_text = requests
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("merged w2 onto w1 as w3"));
+    }
+
+    #[tokio::test]
     async fn mixed_view_and_spawn_response_executes_and_elides_view_in_permanent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -3393,6 +3745,7 @@ mod tests {
                 elapsed_millis: 0,
             },
             commit: "c2".to_string(),
+            merged_from: Vec::new(),
         })
         .unwrap();
         let progress = Arc::new(AtomicUsize::new(3));

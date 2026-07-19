@@ -13,6 +13,7 @@ pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 
 pub(crate) const SPAWN_WORKERS_TOOL: &str = "spawn_workers";
 pub(crate) const SAVE_CHECKPOINT_TOOL: &str = "save_checkpoint";
+pub(crate) const MERGE_CHECKPOINT_TOOL: &str = "merge_checkpoint";
 pub(crate) const DISCARD_TOOL: &str = "discard";
 pub(crate) const FINALIZE_TOOL: &str = "finalize";
 pub(crate) const VIEW_TOOL_CALL_TOOL: &str = "view_tool_call";
@@ -30,6 +31,13 @@ pub(crate) struct FinalizeRequest {
     pub(crate) checkpoint: CheckpointId,
     pub(crate) response: Option<String>,
     pub(crate) evidence: Vec<String>,
+    pub(crate) abandoned: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MergeCheckpointRequest {
+    pub(crate) from: CheckpointId,
+    pub(crate) onto: CheckpointId,
 }
 
 pub(crate) struct SupervisorTurnContext<'a> {
@@ -57,6 +65,7 @@ pub(crate) fn supervisor_supplement() -> String {
 You are the supervisor of a team of asynchronous workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. The difference is that you never touch files or run commands yourself - you act only through these tools:
 - spawn_workers: fork workers from "root" (the original repository state) or any saved checkpoint like "w3". Each worker gets its own checkout of that state plus your instructions, runs up to 10 steps (one step = one batch of tool calls), then reports back for review. Workers may finish sooner; a worker that stops making tool calls is done, and its final message is its report to you.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later.
+- merge_checkpoint: transplant one saved checkpoint's changes onto another saved checkpoint, producing a new checkpoint.
 - discard: permanently discard the just-reviewed trajectory.
 - view_tool_call: expands compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only for trajectories that have been presented for review; you cannot watch a worker that is still running. To wait for in-flight workers, call wait (or simply reply without tool calls) - you will be re-engaged when the next one finishes.
 - wait: end this turn and wait. You are re-engaged automatically the moment the next worker finishes. Use this instead of polling, acknowledgment workers, or empty tool calls.
@@ -129,6 +138,22 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
         ToolDefinition {
             r#type: "function".to_string(),
             function: FunctionDef {
+                name: MERGE_CHECKPOINT_TOOL.to_string(),
+                description: "Transplant a saved checkpoint's changes (its diff versus its own parent) onto another saved checkpoint, producing a new checkpoint. Use when finalize warns that a saved checkpoint's work is missing from your delivered lineage. Conflicts fail cleanly - fall back to spawning a worker with explicit porting instructions.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["from", "onto"],
+                    "properties": {
+                        "from": { "type": "string" },
+                        "onto": { "type": "string" },
+                    },
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
                 name: DISCARD_TOOL.to_string(),
                 description: "Discard the just-reviewed trajectory permanently. Every reviewed trajectory must be saved, spawned from (which saves it implicitly), or discarded.".to_string(),
                 parameters: serde_json::json!({
@@ -154,6 +179,11 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "the handles of the test runs you inspected that verify the finalized state",
+                        },
+                        "abandoned": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "checkpoint ids you are deliberately leaving out of the delivered lineage",
                         },
                     },
                 }),
@@ -340,11 +370,44 @@ pub(crate) fn parse_finalize(
         Some(_) => string_array_property(&arguments, "evidence")?,
         None => Vec::new(),
     };
+    let abandoned = match arguments.get("abandoned") {
+        Some(_) => string_array_property(&arguments, "abandoned")?,
+        None => Vec::new(),
+    };
     Ok(FinalizeRequest {
         checkpoint,
         response,
         evidence,
+        abandoned,
     })
+}
+
+pub(crate) fn parse_merge_checkpoint(
+    call: &ToolCall,
+    context: &SupervisorTurnContext<'_>,
+) -> std::result::Result<MergeCheckpointRequest, String> {
+    let arguments = normalize_arguments(&call.function.arguments)?;
+    let from_raw = arguments
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "from must be a string".to_string())?;
+    let onto_raw = arguments
+        .get("onto")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "onto must be a string".to_string())?;
+    let from =
+        parse_saved_checkpoint(from_raw, context).map_err(|error| format!("from {error}"))?;
+    let onto =
+        parse_saved_checkpoint(onto_raw, context).map_err(|error| format!("onto {error}"))?;
+    if from == onto {
+        return Err("from and onto must be distinct saved checkpoints".to_string());
+    }
+    if context.dag.is_ancestor_of(&from, &onto) {
+        return Err(format!(
+            "{from} is already an ancestor of {onto}; there is nothing to merge"
+        ));
+    }
+    Ok(MergeCheckpointRequest { from, onto })
 }
 
 pub(crate) fn parse_update_plan(
@@ -389,6 +452,19 @@ fn parse_available_checkpoint(
         Ok(checkpoint)
     } else {
         Err(format!("{checkpoint} is not root, saved, or under review"))
+    }
+}
+
+fn parse_saved_checkpoint(
+    value: &str,
+    context: &SupervisorTurnContext<'_>,
+) -> std::result::Result<CheckpointId, String> {
+    let checkpoint =
+        CheckpointId::parse(value).ok_or_else(|| format!("{value:?} is not a checkpoint id"))?;
+    match checkpoint {
+        CheckpointId::Root => Err("root is not a saved checkpoint".to_string()),
+        CheckpointId::Worker(worker) if context.dag.node(worker).is_some() => Ok(checkpoint),
+        CheckpointId::Worker(_) => Err(format!("{checkpoint} is not a saved checkpoint")),
     }
 }
 
@@ -464,6 +540,7 @@ mod tests {
                 elapsed_millis: 0,
             },
             commit: "commit-1".to_string(),
+            merged_from: Vec::new(),
         })
         .unwrap();
         dag
@@ -555,7 +632,11 @@ mod tests {
         let call = supervisor_tool_call(
             "finalize",
             FINALIZE_TOOL,
-            serde_json::json!({ "checkpoint": "w4", "response": "done" }),
+            serde_json::json!({
+                "checkpoint": "w4",
+                "response": "done",
+                "abandoned": ["w1"]
+            }),
         );
 
         let parsed = parse_finalize(&call, &context(&dag, Some(4))).expect("valid finalize");
@@ -563,6 +644,103 @@ mod tests {
         assert_eq!(parsed.checkpoint, CheckpointId::Worker(4));
         assert_eq!(parsed.response.as_deref(), Some("done"));
         assert!(parsed.evidence.is_empty());
+        assert_eq!(parsed.abandoned, vec!["w1".to_string()]);
+    }
+
+    #[test]
+    fn merge_checkpoint_parser_requires_distinct_saved_nonancestor_checkpoints() {
+        let mut dag = saved_dag();
+        dag.insert(TrajectoryNode {
+            window: TrajectoryWindow {
+                worker: 2,
+                parent: CheckpointId::Root,
+                instructions: "sibling".to_string(),
+                model: "model-a".to_string(),
+                instruction_message: ChatMessage::user("sibling instructions"),
+                window_messages: Vec::new(),
+                compact: String::new(),
+                final_response: "sibling result".to_string(),
+                stop: WorkerStopReason::Finished,
+                steps: 1,
+                diffstat: String::new(),
+                usage: TokenUsage::default(),
+                elapsed_millis: 0,
+            },
+            commit: "commit-2".to_string(),
+            merged_from: Vec::new(),
+        })
+        .unwrap();
+        dag.insert(TrajectoryNode {
+            window: TrajectoryWindow {
+                worker: 3,
+                parent: CheckpointId::Worker(1),
+                instructions: "child".to_string(),
+                model: "model-a".to_string(),
+                instruction_message: ChatMessage::user("child instructions"),
+                window_messages: Vec::new(),
+                compact: String::new(),
+                final_response: "child result".to_string(),
+                stop: WorkerStopReason::Finished,
+                steps: 1,
+                diffstat: String::new(),
+                usage: TokenUsage::default(),
+                elapsed_millis: 0,
+            },
+            commit: "commit-3".to_string(),
+            merged_from: Vec::new(),
+        })
+        .unwrap();
+        let context = context(&dag, Some(4));
+
+        let call = supervisor_tool_call(
+            "merge",
+            MERGE_CHECKPOINT_TOOL,
+            serde_json::json!({ "from": "w2", "onto": "w1" }),
+        );
+        let parsed = parse_merge_checkpoint(&call, &context).expect("valid merge");
+        assert_eq!(parsed.from, CheckpointId::Worker(2));
+        assert_eq!(parsed.onto, CheckpointId::Worker(1));
+
+        let root = supervisor_tool_call(
+            "merge",
+            MERGE_CHECKPOINT_TOOL,
+            serde_json::json!({ "from": "root", "onto": "w1" }),
+        );
+        assert!(
+            parse_merge_checkpoint(&root, &context)
+                .expect_err("root rejected")
+                .contains("root is not a saved checkpoint")
+        );
+        let same = supervisor_tool_call(
+            "merge",
+            MERGE_CHECKPOINT_TOOL,
+            serde_json::json!({ "from": "w1", "onto": "w1" }),
+        );
+        assert!(
+            parse_merge_checkpoint(&same, &context)
+                .expect_err("same rejected")
+                .contains("distinct")
+        );
+        let ancestor = supervisor_tool_call(
+            "merge",
+            MERGE_CHECKPOINT_TOOL,
+            serde_json::json!({ "from": "w1", "onto": "w3" }),
+        );
+        assert!(
+            parse_merge_checkpoint(&ancestor, &context)
+                .expect_err("ancestor rejected")
+                .contains("already an ancestor")
+        );
+        let pending = supervisor_tool_call(
+            "merge",
+            MERGE_CHECKPOINT_TOOL,
+            serde_json::json!({ "from": "w4", "onto": "w1" }),
+        );
+        assert!(
+            parse_merge_checkpoint(&pending, &context)
+                .expect_err("pending rejected")
+                .contains("w4 is not a saved checkpoint")
+        );
     }
 
     #[test]
