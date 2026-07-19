@@ -856,9 +856,8 @@ dependencies = [
 
 [[package]]
 name = "brokk-rtk"
-version = "0.42.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0446439aaafeb35f7955d85d3de3d10c6f321d9c49a6d87fb14434900f53e88"
+version = "0.43.0"
+source = "git+https://github.com/BrokkAi/rtk.git?tag=brokk-v0.43.0#b6bad35037cf07e111113c56d62da34421b7b13e"
 dependencies = [
  "anyhow",
  "automod",
