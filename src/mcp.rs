@@ -270,6 +270,13 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("creating bifrost cache dir {}", cache_dir.display()))?;
 
+    let _install_lock = acquire_bifrost_install_lock(cache_dir).await?;
+
+    let target = cache_dir.join(BIFROST_BINARY_NAME);
+    if target.is_file() {
+        return Ok(());
+    }
+
     let asset =
         format!("bifrost-v{BUNDLED_BIFROST_VERSION}-{BIFROST_TARGET_TRIPLE}.{BIFROST_ARCHIVE_EXT}");
     let url = format!("{BIFROST_RELEASE_BASE}/v{BUNDLED_BIFROST_VERSION}/{asset}");
@@ -329,7 +336,19 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         "bundled bifrost sha256 mismatch for {url}: got {actual_hex}, expected {expected_hex}"
     );
 
-    let archive_path = cache_dir.join(&asset);
+    let staging_dir = cache_dir.join(format!(
+        ".extract-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir(&staging_dir).await.with_context(|| {
+        format!(
+            "creating bundled bifrost staging dir {}",
+            staging_dir.display()
+        )
+    })?;
+
+    let archive_path = staging_dir.join(&asset);
     tokio::fs::write(&archive_path, &bytes)
         .await
         .with_context(|| format!("writing bundled bifrost archive {}", archive_path.display()))?;
@@ -341,7 +360,7 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         .arg("-xf")
         .arg(&archive_path)
         .arg("-C")
-        .arg(cache_dir)
+        .arg(&staging_dir)
         .status()
         .await
         .with_context(|| format!("invoking tar to extract {}", archive_path.display()))?;
@@ -351,7 +370,7 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         archive_path.display()
     );
 
-    let inner_dir = cache_dir.join(format!(
+    let inner_dir = staging_dir.join(format!(
         "bifrost-v{BUNDLED_BIFROST_VERSION}-{BIFROST_TARGET_TRIPLE}"
     ));
     let inner_binary = inner_dir.join(BIFROST_BINARY_NAME);
@@ -361,36 +380,117 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         inner_binary.display()
     );
 
-    let target = cache_dir.join(BIFROST_BINARY_NAME);
-    if tokio::fs::rename(&inner_binary, &target).await.is_err() {
-        tokio::fs::copy(&inner_binary, &target)
-            .await
-            .with_context(|| {
-                format!(
-                    "moving bundled bifrost from {} to {}",
-                    inner_binary.display(),
-                    target.display()
-                )
-            })?;
-    }
-
-    let _ = tokio::fs::remove_file(&archive_path).await;
-    let _ = tokio::fs::remove_dir_all(&inner_dir).await;
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&target)
+        let mut perms = tokio::fs::metadata(&inner_binary)
             .await
-            .with_context(|| format!("stat bundled bifrost binary {}", target.display()))?
+            .with_context(|| format!("stat bundled bifrost binary {}", inner_binary.display()))?
             .permissions();
         perms.set_mode(0o755);
-        tokio::fs::set_permissions(&target, perms)
+        tokio::fs::set_permissions(&inner_binary, perms)
             .await
-            .with_context(|| format!("chmod 755 {}", target.display()))?;
+            .with_context(|| format!("chmod 755 {}", inner_binary.display()))?;
     }
 
+    tokio::fs::rename(&inner_binary, &target)
+        .await
+        .with_context(|| {
+            format!(
+                "atomically installing bundled bifrost from {} to {}",
+                inner_binary.display(),
+                target.display()
+            )
+        })?;
+
+    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+
     Ok(())
+}
+
+struct BifrostInstallLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl Drop for BifrostInstallLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // Unlock best-effort on drop. The OS also releases the advisory
+            // lock when the file descriptor closes, so failure here cannot
+            // leave a held lock behind.
+            // SAFETY: `as_raw_fd` returns a valid descriptor owned by `self.file`
+            // for the duration of this call, and `flock` does not retain it.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn acquire_bifrost_install_lock(cache_dir: &Path) -> anyhow::Result<BifrostInstallLock> {
+    let lock_path = cache_dir.join(".install.lock");
+
+    #[cfg(unix)]
+    {
+        let file = tokio::task::spawn_blocking({
+            let lock_path = lock_path.clone();
+            move || -> anyhow::Result<std::fs::File> {
+                use std::os::fd::AsRawFd;
+
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(&lock_path)
+                    .with_context(|| {
+                        format!("opening bifrost install lock {}", lock_path.display())
+                    })?;
+                // SAFETY: `as_raw_fd` returns a valid descriptor owned by
+                // `file` for the duration of this call, and `flock` does not
+                // retain it.
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                anyhow::ensure!(
+                    rc == 0,
+                    "locking bifrost install lock {} failed: {}",
+                    lock_path.display(),
+                    std::io::Error::last_os_error()
+                );
+                Ok(file)
+            }
+        })
+        .await
+        .context("joining bifrost install lock task")??;
+        Ok(BifrostInstallLock { file })
+    }
+
+    #[cfg(not(unix))]
+    {
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(BifrostInstallLock { path: lock_path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("creating bifrost install lock {}", lock_path.display())
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl McpServerConfig {
