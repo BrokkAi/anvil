@@ -14,14 +14,14 @@ use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::asgard::{
-    ASGARD_MAX_IN_FLIGHT, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS,
+    ASGARD_MAX_IN_FLIGHT, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
     CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL,
     SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest, SupervisorStreamCall,
     SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
     VIEW_TOOL_CALL_TOOL, WAIT_TOOL, WorkerStopReason, elide_view_tool_results_for_permanent_record,
     parse_finalize, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
     render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
-    stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
+    run_asgard_intake, stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
     supervisor_tool_definitions,
 };
 use crate::llm_client::{
@@ -476,6 +476,30 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
     let original_task = asgard_original_task(&initial_messages);
+    let (intake_contracts, intake_usages) = run_asgard_intake(AsgardIntakeRun {
+        cx,
+        sessions,
+        session_id,
+        llm,
+        parent_cwd: parent_registry.cwd(),
+        config,
+        selected_model,
+        reasoning_effort,
+        service_tier,
+        structured_output,
+        idle_timeout,
+        cancel: cancel.clone(),
+        live_output: &live_output,
+        original_task: &original_task,
+        context_length,
+        context_prefix_len,
+    })
+    .await;
+    let mut aggregate_usage = TokenUsage::default();
+    for (model, usage) in intake_usages {
+        add_usage(&mut aggregate_usage, &mut usage_by_model, &model, usage);
+    }
+    let has_intake = intake_contracts.literal.is_some() || intake_contracts.grounded.is_some();
     let supervisor_system = supervisor_system_message(
         initial_messages
             .first()
@@ -484,19 +508,16 @@ pub(crate) async fn run_asgard_trajectory_loop(
             .as_deref(),
     );
     let mut dag = TrajectoryDag::new(initial_messages.clone(), base_commit.clone());
+    let initial_permanent_user = initial_permanent_user_message(&original_task, &intake_contracts);
     let mut permanent = vec![
         ChatMessage::system(supervisor_system),
-        ChatMessage::user(format!(
-            "<task>\n{original_task}\n</task>\n\
-             The repository's starting state is checkpoint \"root\"."
-        )),
+        ChatMessage::user(initial_permanent_user),
     ];
     let worker_cancel = cancel.child_token();
     let mut running: FuturesUnordered<BoxFuture<'_, FinishedWorker>> = FuturesUnordered::new();
     let mut review_queue = VecDeque::new();
     let mut idle_pool = Vec::new();
     let mut running_meta = HashMap::new();
-    let mut aggregate_usage = TokenUsage::default();
     let mut supervisor_turn = 0usize;
     let mut worker_counter = 1usize;
     let mut clone_counter = 1usize;
@@ -538,9 +559,11 @@ pub(crate) async fn run_asgard_trajectory_loop(
             running.is_empty(),
             dag.checkpoint_labels().is_empty(),
         ) {
-            (false, true, true) => Some(
-                "No workers exist yet. Spawn 1 to 5 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading.",
-            ),
+            (false, true, true) => Some(if has_intake {
+                "No workers exist yet. First resolve the spec intake into a numbered obligations ledger via update_plan, then spawn 1 to 5 workers from \"root\"."
+            } else {
+                "No workers exist yet. Spawn 1 to 5 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading."
+            }),
             (false, true, false) => {
                 Some("No worker is awaiting review. Spawn workers or finalize.")
             }
@@ -1604,6 +1627,39 @@ pub(crate) fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
+fn initial_permanent_user_message(
+    original_task: &str,
+    contracts: &crate::asgard::IntakeContracts,
+) -> String {
+    let base = format!(
+        "<task>\n{original_task}\n</task>\n\
+         The repository's starting state is checkpoint \"root\"."
+    );
+    if contracts.literal.is_none() && contracts.grounded.is_none() {
+        return base;
+    }
+
+    let mut message = format!(
+        "{base}\n\n\
+         <spec_intake>\n\
+         Before this run began, two independent readers examined the task. Reader L read \
+         the task text alone with no repository access; Reader G examined the repository \
+         for evidence that constrains interpretation. Neither saw the other's report.\n"
+    );
+    if let Some(literal) = &contracts.literal {
+        message.push_str("<literal_contract>\n");
+        message.push_str(literal);
+        message.push_str("\n</literal_contract>\n");
+    }
+    if let Some(grounded) = &contracts.grounded {
+        message.push_str("<grounded_contract>\n");
+        message.push_str(grounded);
+        message.push_str("\n</grounded_contract>\n");
+    }
+    message.push_str("</spec_intake>");
+    message
+}
+
 pub(crate) fn asgard_take_window_messages(
     continuation_messages: &[ChatMessage],
     start: usize,
@@ -1639,7 +1695,7 @@ fn worker_stop_reason(stop: &LoopStop) -> WorkerStopReason {
     }
 }
 
-fn extract_worker_final_response(messages: &[ChatMessage]) -> String {
+pub(crate) fn extract_worker_final_response(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .rev()
@@ -1830,6 +1886,83 @@ mod tests {
         }
     }
 
+    fn empty_intake_response() -> LlmResponse {
+        LlmResponse::ToolCalls {
+            text: String::new(),
+            reasoning_content: None,
+            calls: vec![tool_call("empty-intake-tool-call")],
+            usage: TokenUsage::default(),
+        }
+    }
+
+    async fn run_scripted_asgard(
+        repo: std::path::PathBuf,
+        backend: Arc<ScriptedAsgardBackend>,
+        initial_messages: Vec<ChatMessage>,
+    ) -> (LoopOutcome, BTreeMap<String, TokenUsage>) {
+        let llm: Arc<dyn crate::llm_client::LlmBackend> = backend;
+        let sessions = SessionStore::new("worker-model".to_string());
+        let session = sessions.create_session(repo.clone()).await;
+        assert!(
+            sessions
+                .set_permission_mode(&session.id, PermissionMode::BypassPermissions)
+                .await
+        );
+        let parent_registry = sessions
+            .get_or_create_registry(&session.id, repo)
+            .await
+            .expect("parent registry");
+        let config = Config {
+            candidate_models: vec!["worker-model".to_string()],
+            supervisor_model: Some("sv-model".to_string()),
+        };
+        let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
+        let (agent_read, agent_write) = tokio::io::split(agent_io);
+        let drain = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut client_io, &mut tokio::io::sink()).await;
+        });
+
+        let result = Agent
+            .builder()
+            .on_receive_dispatch(
+                async move |message: Dispatch, _cx| {
+                    Ok(Handled::No {
+                        message,
+                        retry: false,
+                    })
+                },
+                on_receive_dispatch!(),
+            )
+            .connect_with(
+                ByteStreams::new(agent_write.compat_write(), agent_read.compat()),
+                async |cx| {
+                    Ok(run_asgard_trajectory_loop(
+                        &cx,
+                        &sessions,
+                        &session.id,
+                        &llm,
+                        &parent_registry,
+                        "worker-model",
+                        None,
+                        None,
+                        None,
+                        initial_messages,
+                        IdleTimeouts::uniform(Duration::from_secs(30)),
+                        tokio_util::sync::CancellationToken::new(),
+                        &config,
+                        None,
+                        0,
+                        None,
+                    )
+                    .await)
+                },
+            )
+            .await
+            .expect("in-memory ACP connect_with");
+        drain.abort();
+        result
+    }
+
     fn spawn_call(id: &str, from: &str, instructions: &str) -> ToolCall {
         named_tool_call(
             id,
@@ -1992,6 +2125,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asgard_intake_injects_contracts_and_uses_read_only_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let sessions = SessionStore::new("worker-model".to_string());
+        let session = sessions.create_session(repo.clone()).await;
+        let parent_registry = sessions
+            .get_or_create_registry(&session.id, repo.clone())
+            .await
+            .expect("parent registry");
+        let allowlist = crate::asgard::intake_read_only_allowlist(&parent_registry).await;
+        assert!(allowlist.contains("read_file"));
+        assert!(!allowlist.contains("run_shell_command"));
+        assert!(!allowlist.contains("write_file"));
+        assert!(!allowlist.contains("edit"));
+        assert!(!allowlist.contains("update_plan"));
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "report")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
+                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded contract text"),
+                    text_response("worker final report"),
+                ],
+            ),
+        ]));
+        let _ = run_scripted_asgard(
+            repo.clone(),
+            backend.clone(),
+            vec![ChatMessage::user("implement intake test")],
+        )
+        .await;
+
+        {
+            let requests = backend.requests.lock().expect("requests");
+            let supervisor_request = requests
+                .iter()
+                .find(|request| {
+                    request.model == "sv-model"
+                        && request
+                            .tool_names
+                            .iter()
+                            .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+                })
+                .expect("supervisor request");
+            let initial_user = supervisor_request.messages[1].content_text();
+            assert!(initial_user.contains("<spec_intake>"));
+            assert!(
+                initial_user
+                    .contains("<literal_contract>\nliteral contract text\n</literal_contract>")
+            );
+            assert!(
+                initial_user
+                    .contains("<grounded_contract>\ngrounded contract text\n</grounded_contract>")
+            );
+        }
+
+        let temp_failure = tempfile::tempdir().expect("tempdir");
+        let repo_failure = temp_failure.path().join("repo");
+        fs::create_dir(&repo_failure).expect("create repo dir");
+        run_git(&repo_failure, &["init", "--quiet"]);
+        run_git(
+            &repo_failure,
+            &["config", "user.email", "asgard@example.invalid"],
+        );
+        run_git(&repo_failure, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo_failure.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo_failure, &["add", "README.md"]);
+        run_git(&repo_failure, &["commit", "--quiet", "-m", "initial"]);
+
+        let failure_backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    empty_intake_response(),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "report")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
+                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded only contract"),
+                    text_response("worker final report"),
+                ],
+            ),
+        ]));
+        let _ = run_scripted_asgard(
+            repo_failure,
+            failure_backend.clone(),
+            vec![ChatMessage::user("implement intake failure test")],
+        )
+        .await;
+        let failure_requests = failure_backend.requests.lock().expect("failure requests");
+        let failure_supervisor_request = failure_requests
+            .iter()
+            .find(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
+            .expect("failure supervisor request");
+        let failure_initial_user = failure_supervisor_request.messages[1].content_text();
+        assert!(failure_initial_user.contains("<spec_intake>"));
+        assert!(!failure_initial_user.contains("<literal_contract>"));
+        assert!(
+            failure_initial_user
+                .contains("<grounded_contract>\ngrounded only contract\n</grounded_contract>")
+        );
+    }
+
+    #[tokio::test]
     async fn asgard_v2_scripted_e2e_runs_real_loop_and_checkpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -2008,6 +2274,7 @@ mod tests {
             (
                 "sv-model",
                 vec![
+                    text_response("intake literal"),
                     tool_response(vec![
                         spawn_call("sv-spawn-w1", "root", "Create foo.txt containing alpha"),
                         update_plan_call("sv-plan", "Create foo.txt", "in_progress"),
@@ -2036,6 +2303,7 @@ mod tests {
             (
                 "worker-model",
                 vec![
+                    text_response("intake grounded"),
                     tool_response(vec![write_file_call("w1-write", "foo.txt", "alpha\n")]),
                     text_response("wrote foo.txt with alpha"),
                     tool_response(vec![write_file_call(
@@ -2144,14 +2412,20 @@ mod tests {
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
-            .filter(|request| request.model == "sv-model")
+            .filter(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
             .collect::<Vec<_>>();
         let worker_requests = requests
             .iter()
             .filter(|request| request.model == "worker-model")
             .collect::<Vec<_>>();
         assert_eq!(supervisor_requests.len(), 9);
-        assert_eq!(worker_requests.len(), 5);
+        assert_eq!(worker_requests.len(), 6);
         let first_supervisor_system = supervisor_requests[0].messages[0].content_text();
         let session_prompt_pos = first_supervisor_system
             .find("You are a helpful engineer.")
@@ -2163,13 +2437,19 @@ mod tests {
             session_prompt_pos < supplement_pos,
             "session system prompt should precede Asgard supplement:\n{first_supervisor_system}"
         );
+        let worker_agent_requests = worker_requests
+            .iter()
+            .copied()
+            .filter(|request| request.tool_names.iter().any(|name| name == "write_file"))
+            .collect::<Vec<_>>();
+        assert_eq!(worker_agent_requests.len(), 5);
         assert!(
-            worker_requests
+            worker_agent_requests
                 .iter()
                 .all(|request| request.tool_names.iter().any(|name| name == "write_file"))
         );
         assert!(
-            worker_requests
+            worker_agent_requests
                 .iter()
                 .all(|request| request.tool_names.iter().all(|name| name != "update_plan"))
         );
@@ -2236,6 +2516,7 @@ mod tests {
             (
                 "sv-model",
                 vec![
+                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "produce output")]),
                     text_response("w1 launched"),
                     tool_response(vec![
@@ -2250,6 +2531,7 @@ mod tests {
             (
                 "worker-model",
                 vec![
+                    text_response("intake grounded"),
                     // read_file keeps this fork-free (shell forks fail under
                     // per-uid NPROC pressure on busy hosts) while producing a
                     // result large enough to cross the elision threshold.
@@ -2329,7 +2611,13 @@ mod tests {
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
-            .filter(|request| request.model == "sv-model")
+            .filter(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
             .collect::<Vec<_>>();
         let final_request_text = all_message_text(&supervisor_requests[4].messages);
         assert!(!final_request_text.contains("MIXED_VIEW_PAYLOAD_123"));
@@ -2358,6 +2646,7 @@ mod tests {
             (
                 "sv-model",
                 vec![
+                    text_response("intake literal"),
                     tool_response(vec![
                         wait_call("sv-wait-clean"),
                         spawn_call("sv-spawn-after-wait", "root", "must not run"),
@@ -2380,6 +2669,7 @@ mod tests {
             (
                 "worker-model",
                 vec![
+                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-pwd",
                         "run_shell_command",
@@ -2454,7 +2744,13 @@ mod tests {
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
-            .filter(|request| request.model == "sv-model")
+            .filter(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
             .collect::<Vec<_>>();
         assert_eq!(supervisor_requests.len(), 6);
 
@@ -2503,6 +2799,7 @@ mod tests {
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
 
         let mut supervisor_responses = vec![
+            text_response("intake literal"),
             tool_response(vec![spawn_call(
                 "sv-spawn-w1",
                 "root",
@@ -2525,7 +2822,13 @@ mod tests {
 
         let backend = Arc::new(ScriptedAsgardBackend::new(vec![
             ("sv-model", supervisor_responses),
-            ("worker-model", vec![text_response("w1 final report")]),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    text_response("w1 final report"),
+                ],
+            ),
         ]));
         let llm: Arc<dyn crate::llm_client::LlmBackend> = backend.clone();
         let sessions = SessionStore::new("worker-model".to_string());
@@ -2596,7 +2899,13 @@ mod tests {
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
-            .filter(|request| request.model == "sv-model")
+            .filter(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
             .collect::<Vec<_>>();
         assert_eq!(supervisor_requests.len(), ASGARD_SUPERVISOR_MAX_STEPS + 5);
         let first_idle_after_cap =

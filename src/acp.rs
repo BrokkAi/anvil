@@ -4976,7 +4976,8 @@ narrate what code does or address the user in comments.
 Never assume standard commands.
 - For behavior changes, also write tests in the project's existing framework and run them \
 together with the project's suite. An import check or ad-hoc script is not a substitute \
-for running tests.
+for running tests. If the project's test runner is broken or unavailable, fixing or \
+unblocking it is part of the task - do not substitute a weaker check and report success.
 - A test earns its place by the wrong implementation it would catch — name that bug to \
 yourself as you write it. Assert exact values, not just non-null or no-crash. Pick inputs \
 that expose the classic mistakes: operands where argument order matters, both sides of \
