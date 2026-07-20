@@ -33,7 +33,7 @@ const SUMMARY_FIRST_LINE_MAX_CHARS: usize = 120;
 
 fn in_flight_error(worker: usize) -> String {
     format!(
-        "w{worker} is in flight or awaiting review; its results become viewable when its trajectory is presented for review. Call wait (or simply reply without tool calls) to let that happen."
+        "w{worker} is running; its results become viewable when its batch is presented for review."
     )
 }
 
@@ -392,7 +392,7 @@ impl TrajectoryDag {
     pub(crate) fn resolve_handle_views(
         &self,
         handles: &[String],
-        pending: Option<(usize, &[ChatMessage])>,
+        pending: &[(usize, &[ChatMessage])],
         in_flight: &[usize],
     ) -> Vec<(String, std::result::Result<ResolvedView, String>)> {
         handles
@@ -409,7 +409,7 @@ impl TrajectoryDag {
     fn resolve_handle(
         &self,
         handle: &str,
-        pending: Option<(usize, &[ChatMessage])>,
+        pending: &[(usize, &[ChatMessage])],
         in_flight: &[usize],
     ) -> std::result::Result<ResolvedView, String> {
         let Some((worker, index)) = crate::asgard::parse_worker_tool_handle(handle) else {
@@ -430,10 +430,11 @@ impl TrajectoryDag {
             });
         };
 
-        let messages = if let Some((pending_worker, pending_messages)) = pending
-            && pending_worker == worker
+        let messages = if let Some((_, pending_messages)) = pending
+            .iter()
+            .find(|(pending_worker, _)| *pending_worker == worker)
         {
-            Some(pending_messages)
+            Some(*pending_messages)
         } else {
             self.nodes
                 .get(&worker)
@@ -469,15 +470,16 @@ impl TrajectoryDag {
     pub(crate) fn handle_is_run_shell_command_result(
         &self,
         handle: &str,
-        pending: Option<(usize, &[ChatMessage])>,
+        pending: &[(usize, &[ChatMessage])],
     ) -> bool {
         let Some((worker, index)) = crate::asgard::parse_worker_tool_handle(handle) else {
             return false;
         };
-        let messages = if let Some((pending_worker, pending_messages)) = pending
-            && pending_worker == worker
+        let messages = if let Some((_, pending_messages)) = pending
+            .iter()
+            .find(|(pending_worker, _)| *pending_worker == worker)
         {
-            Some(pending_messages)
+            Some(*pending_messages)
         } else {
             self.nodes
                 .get(&worker)
@@ -917,7 +919,7 @@ mod tests {
                 "w1m2".to_string(),
                 "w9m0".to_string(),
             ],
-            Some((2, &pending)),
+            &[(2, &pending)],
             &[9],
         );
         let rendered = render_resolved_views(&views);
@@ -932,7 +934,7 @@ mod tests {
         ));
         assert!(rendered.contains(r#"<tool_call handle="w4m1" error="unknown worker" />"#));
         assert!(rendered.contains(
-            r#"<tool_call handle="w9m0" error="w9 is in flight or awaiting review; its results become viewable when its trajectory is presented for review. Call wait (or simply reply without tool calls) to let that happen." />"#
+            r#"<tool_call handle="w9m0" error="w9 is running; its results become viewable when its batch is presented for review." />"#
         ));
         assert!(rendered.contains(r#"<tool_call handle="w1l0m1" error="malformed handle" />"#));
         assert!(
@@ -961,7 +963,7 @@ mod tests {
             lines[5],
             "[attempted view of w1m2: handle does not name a tool result]"
         );
-        assert!(lines[6].starts_with("[attempted view of w9m0: w9 is in flight"));
+        assert!(lines[6].starts_with("[attempted view of w9m0: w9 is running"));
     }
 
     #[test]
@@ -993,11 +995,11 @@ mod tests {
             ChatMessage::tool_result("pending-shell", "run_shell_command", "pending result"),
         ];
 
-        assert!(dag.handle_is_run_shell_command_result("w1m3", None));
-        assert!(dag.handle_is_run_shell_command_result("w2m1", Some((2, &pending))));
-        assert!(!dag.handle_is_run_shell_command_result("w1m1", None));
-        assert!(!dag.handle_is_run_shell_command_result("w1m2", None));
-        assert!(!dag.handle_is_run_shell_command_result("bad", Some((2, &pending))));
+        assert!(dag.handle_is_run_shell_command_result("w1m3", &[]));
+        assert!(dag.handle_is_run_shell_command_result("w2m1", &[(2, &pending)]));
+        assert!(!dag.handle_is_run_shell_command_result("w1m1", &[]));
+        assert!(!dag.handle_is_run_shell_command_result("w1m2", &[]));
+        assert!(!dag.handle_is_run_shell_command_result("bad", &[(2, &pending)]));
     }
 
     #[test]

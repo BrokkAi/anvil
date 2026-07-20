@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 use agent_client_protocol::schema::v1::{
@@ -10,19 +10,18 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use anyhow::{Result, anyhow};
-use futures::future::{BoxFuture, FutureExt};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::future::{BoxFuture, FutureExt, join_all};
 
 use crate::asgard::{
-    ASGARD_MAX_IN_FLIGHT, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
+    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
     CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL,
     MERGE_CHECKPOINT_TOOL, PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL,
     SnapshotStage, SpawnRequest, SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag,
-    TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WAIT_TOOL,
-    WorkerStopReason, elide_view_tool_results_for_permanent_record, parse_finalize,
-    parse_merge_checkpoint, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
-    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
-    run_asgard_intake, stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
+    TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason,
+    elide_view_tool_results_for_permanent_record, parse_finalize, parse_merge_checkpoint,
+    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_dag_overview,
+    render_fragment, render_resolved_views, render_window_compact_for_worker, run_asgard_intake,
+    stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
     supervisor_tool_definitions,
 };
 use crate::llm_client::{
@@ -145,14 +144,6 @@ impl FinishedWorker {
     }
 }
 
-#[derive(Clone)]
-struct RunningWorkerMeta {
-    parent: CheckpointId,
-    model: String,
-    instructions: String,
-    turn_progress: Arc<AtomicUsize>,
-}
-
 #[derive(Clone, Copy)]
 enum PendingResolution {
     Save,
@@ -177,12 +168,10 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     permanent: &'ctx [ChatMessage],
     ephemeral: Vec<ChatMessage>,
     dag: &'ctx mut TrajectoryDag,
-    pending: &'ctx mut Option<FinishedWorker>,
-    pending_window: Option<TrajectoryWindow>,
+    pending: &'ctx mut BTreeMap<usize, FinishedWorker>,
+    pending_windows: BTreeMap<usize, TrajectoryWindow>,
     stage: &'ctx SnapshotStage,
-    running: &'ctx mut FuturesUnordered<BoxFuture<'fut, FinishedWorker>>,
-    running_meta: &'ctx mut HashMap<usize, RunningWorkerMeta>,
-    review_queue: &'ctx mut VecDeque<FinishedWorker>,
+    spawned_batch: Vec<BoxFuture<'fut, FinishedWorker>>,
     idle_pool: &'ctx mut Vec<CandidateRepository>,
     usage_by_model: &'ctx mut BTreeMap<String, TokenUsage>,
     aggregate_usage: &'ctx mut TokenUsage,
@@ -195,13 +184,12 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     prefinalize_issued: &'ctx mut bool,
     prefinalize_workers: &'ctx mut Vec<usize>,
     latest_prefinalize_source_commits: &'ctx mut HashSet<String>,
-    turn_capacity: usize,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
     sinks: AsgardStreamSinks,
 }
 
-struct SupervisorLoopResult {
+struct SupervisorLoopResult<'fut> {
     finalizing: Option<(CheckpointId, Option<String>)>,
     finalizing_evidence: Vec<String>,
     finalizing_abandoned: Vec<String>,
@@ -214,6 +202,7 @@ struct SupervisorLoopResult {
     discarded: bool,
     merged: Vec<usize>,
     permanent_append: Vec<ChatMessage>,
+    spawned_batch: Vec<BoxFuture<'fut, FinishedWorker>>,
 }
 
 struct SupervisorTurnState {
@@ -221,7 +210,8 @@ struct SupervisorTurnState {
     spawned: Vec<usize>,
     prefinalized: Vec<usize>,
     spawned_this_turn: usize,
-    saved_pending: bool,
+    resolved_pending: HashSet<usize>,
+    saved_any: bool,
     discarded: bool,
     merged: Vec<usize>,
     finalizing: Option<(CheckpointId, Option<String>)>,
@@ -271,7 +261,7 @@ async fn launch_worker<'a>(
     parent_commit: String,
     mut messages: Vec<ChatMessage>,
     idle_pool: &mut Vec<CandidateRepository>,
-) -> Result<(BoxFuture<'a, FinishedWorker>, RunningWorkerMeta)> {
+) -> Result<BoxFuture<'a, FinishedWorker>> {
     let repository = if let Some(repository) = idle_pool.pop() {
         if let Err(error) = crate::asgard::recycle_repository(&repository, &parent_commit) {
             crate::asgard::remove_candidate_repository(&repository);
@@ -321,12 +311,6 @@ async fn launch_worker<'a>(
         .clone()
         .unwrap_or_else(|| launch.config.candidate_models[0].clone());
     let turn_progress = Arc::new(AtomicUsize::new(0));
-    let meta = RunningWorkerMeta {
-        parent: spawn.from.clone(),
-        model: model.clone(),
-        instructions: instructions.clone(),
-        turn_progress: turn_progress.clone(),
-    };
     let session_id = launch.session_id.to_string();
     let sessions = launch.sessions.clone();
     let original_task = launch.original_task.to_string();
@@ -442,7 +426,7 @@ async fn launch_worker<'a>(
     }
     .boxed();
 
-    Ok((future, meta))
+    Ok(future)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -533,10 +517,8 @@ pub(crate) async fn run_asgard_trajectory_loop(
         ChatMessage::user(initial_permanent_user),
     ];
     let worker_cancel = cancel.child_token();
-    let mut running: FuturesUnordered<BoxFuture<'_, FinishedWorker>> = FuturesUnordered::new();
-    let mut review_queue = VecDeque::new();
+    let mut pending_batch: BTreeMap<usize, FinishedWorker> = BTreeMap::new();
     let mut idle_pool = Vec::new();
-    let mut running_meta = HashMap::new();
     let mut supervisor_turn = 0usize;
     let mut worker_counter = 1usize;
     let mut clone_counter = 1usize;
@@ -553,46 +535,29 @@ pub(crate) async fn run_asgard_trajectory_loop(
             break AsgardExit::Cancelled;
         }
 
-        let mut pending = if !review_queue.is_empty() {
-            review_queue.pop_front()
-        } else {
-            None
-        };
-        if pending.is_none() && !running.is_empty() {
-            if let Some(finished) = running.next().await {
-                running_meta.remove(&finished.worker);
-                add_usage(
-                    &mut aggregate_usage,
-                    &mut usage_by_model,
-                    &finished.model,
-                    finished.usage,
-                );
-                review_queue.push_back(finished);
-            }
-            continue;
-        }
-
         supervisor_turn += 1;
-        let pending_window = pending.as_ref().map(FinishedWorker::window);
-        if let Some(window) = &pending_window {
-            permanent.push(ChatMessage::user(render_fragment(window)));
+        let pending_windows = pending_batch
+            .iter()
+            .map(|(worker, finished)| (*worker, finished.window()))
+            .collect::<BTreeMap<_, _>>();
+        if !pending_windows.is_empty() {
+            permanent.push(ChatMessage::user(render_batch_review_message(
+                &pending_windows,
+            )));
         }
         let mut idle_note = match (
-            pending_window.is_some(),
-            running.is_empty(),
+            !pending_windows.is_empty(),
             dag.checkpoint_labels().is_empty(),
         ) {
-            (false, true, true) => Some(if has_intake {
-                "No workers exist yet. First resolve the spec intake into a numbered obligations ledger via update_plan, then spawn 1 to 5 workers from \"root\"."
+            (false, true) => Some(if has_intake {
+                "No workers exist yet. First resolve the spec intake into a numbered obligations ledger via update_plan, then spawn 1 to 8 workers from \"root\"."
             } else {
-                "No workers exist yet. Spawn 1 to 5 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading."
+                "No workers exist yet. Spawn 1 to 8 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading."
             }),
-            (false, true, false) => {
-                Some("No worker is awaiting review. Spawn workers or finalize.")
-            }
+            (false, false) => Some("No worker is awaiting review. Spawn workers or finalize."),
             _ => None,
         };
-        if pending_window.is_none() && fallback_idle_cycles > 0 {
+        if pending_windows.is_empty() && fallback_idle_cycles > 0 {
             idle_note = Some(
                 "Previous supervisor turn ended without spawning or finalizing. Spawn workers or finalize now; after 3 idle turns Asgard will finalize the latest checkpoint or fail.",
             );
@@ -610,17 +575,14 @@ pub(crate) async fn run_asgard_trajectory_loop(
         };
         let status = render_asgard_status_block(
             &dag,
-            &running_meta,
-            &review_queue,
-            pending.as_ref(),
-            ASGARD_MAX_IN_FLIGHT.saturating_sub(running.len()),
+            &pending_windows,
+            ASGARD_BATCH_CAP,
             idle_note,
             &parent_status,
         );
         let ephemeral = vec![ChatMessage::user(status)];
         let sinks = AsgardStreamSinks::new(&live_output, "Supervisor");
         let turn_started = Instant::now();
-        let turn_capacity = ASGARD_MAX_IN_FLIGHT.saturating_sub(running.len());
         let turn_result = run_supervisor_agentic_turn(SupervisorLoopContext {
             llm,
             supervisor_model,
@@ -628,12 +590,10 @@ pub(crate) async fn run_asgard_trajectory_loop(
             permanent: &permanent,
             ephemeral,
             dag: &mut dag,
-            pending: &mut pending,
-            pending_window: pending_window.clone(),
+            pending: &mut pending_batch,
+            pending_windows: pending_windows.clone(),
             stage: &stage,
-            running: &mut running,
-            running_meta: &mut running_meta,
-            review_queue: &mut review_queue,
+            spawned_batch: Vec::new(),
             idle_pool: &mut idle_pool,
             usage_by_model: &mut usage_by_model,
             aggregate_usage: &mut aggregate_usage,
@@ -662,7 +622,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
             latest_prefinalize_source_commits: &mut latest_prefinalize_source_commits,
-            turn_capacity,
             idle_timeout,
             cancel: cancel.clone(),
             sinks,
@@ -679,7 +638,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
         };
         trace_supervisor_turn(
             supervisor_turn,
-            pending_window.as_ref().map(|window| window.worker),
+            pending_windows.keys().copied().collect::<Vec<_>>(),
             &turn_result,
             elapsed_millis,
             permanent_bytes,
@@ -701,10 +660,23 @@ pub(crate) async fn run_asgard_trajectory_loop(
                         abandoned: outcome.finalizing_abandoned,
                     };
                 }
+                if !outcome.spawned_batch.is_empty() {
+                    let mut finished_batch = join_all(outcome.spawned_batch).await;
+                    finished_batch.sort_by_key(|finished| finished.worker);
+                    for finished in finished_batch {
+                        add_usage(
+                            &mut aggregate_usage,
+                            &mut usage_by_model,
+                            &finished.model,
+                            finished.usage,
+                        );
+                        pending_batch.insert(finished.worker, finished);
+                    }
+                }
                 if outcome.spawned.is_empty()
                     && outcome.merged.is_empty()
                     && !outcome.saved
-                    && pending_window.is_none()
+                    && pending_windows.is_empty()
                 {
                     fallback_idle_cycles += 1;
                     if fallback_idle_cycles >= 3 {
@@ -716,21 +688,16 @@ pub(crate) async fn run_asgard_trajectory_loop(
                                 abandoned: Vec::new(),
                             };
                         }
-                        if running.is_empty() {
-                            break AsgardExit::Failure(anyhow!(
-                                "Asgard supervisor ended {fallback_idle_cycles} idle turns without spawning or finalizing"
-                            ));
-                        }
+                        break AsgardExit::Failure(anyhow!(
+                            "Asgard supervisor ended {fallback_idle_cycles} idle turns without spawning or finalizing"
+                        ));
                     }
                 } else {
                     fallback_idle_cycles = 0;
                 }
-                if let Some(finished) = pending.take() {
-                    crate::asgard::remove_candidate_repository(&finished.repository);
-                }
             }
             Err(error) => {
-                let mode = if pending.is_some() {
+                let mode = if !pending_batch.is_empty() {
                     "auto_save"
                 } else {
                     "finalize_latest"
@@ -740,30 +707,42 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     "mode": mode,
                     "error": format!("{error:#}"),
                 }));
-                if let Some(finished) = pending.take() {
-                    let window = pending_window.expect("pending window exists");
-                    match resolve_pending(
-                        &stage,
-                        &mut dag,
-                        &finished,
-                        window,
-                        PendingResolution::Save,
-                    ) {
-                        Ok(_) => {
-                            idle_pool.push(finished.repository);
-                            continue;
-                        }
-                        Err(snapshot_error) => {
-                            // Losing one trajectory must not lose the run.
-                            crate::trace_logging::append_trace_record(serde_json::json!({
-                                "type": "asgard_supervisor_fallback",
-                                "mode": "auto_save_failed_continue",
-                                "worker": finished.worker,
-                                "error": format!("{snapshot_error:#}"),
-                            }));
+                if !pending_batch.is_empty() {
+                    let finished_workers = std::mem::take(&mut pending_batch);
+                    let mut saved_any = false;
+                    for (worker, finished) in finished_workers {
+                        let window = pending_windows.get(&worker).cloned().ok_or_else(|| {
+                            anyhow!("pending worker w{worker} missing trajectory window")
+                        });
+                        let Ok(window) = window else {
                             crate::asgard::remove_candidate_repository(&finished.repository);
                             continue;
+                        };
+                        match resolve_pending(
+                            &stage,
+                            &mut dag,
+                            &finished,
+                            window,
+                            PendingResolution::Save,
+                        ) {
+                            Ok(_) => {
+                                idle_pool.push(finished.repository);
+                                saved_any = true;
+                            }
+                            Err(snapshot_error) => {
+                                // Losing one trajectory must not lose the run.
+                                crate::trace_logging::append_trace_record(serde_json::json!({
+                                    "type": "asgard_supervisor_fallback",
+                                    "mode": "auto_save_failed_continue",
+                                    "worker": finished.worker,
+                                    "error": format!("{snapshot_error:#}"),
+                                }));
+                                crate::asgard::remove_candidate_repository(&finished.repository);
+                            }
                         }
+                    }
+                    if saved_any {
+                        continue;
                     }
                 }
                 fallback_idle_cycles += 1;
@@ -778,9 +757,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 if fallback_idle_cycles >= 3 {
                     break AsgardExit::Failure(error);
                 }
-                if running.is_empty() {
-                    break AsgardExit::Failure(error);
-                }
+                break AsgardExit::Failure(error);
             }
         }
     };
@@ -827,17 +804,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     };
 
     worker_cancel.cancel();
-    while let Some(finished) = running.next().await {
-        running_meta.remove(&finished.worker);
-        add_usage(
-            &mut aggregate_usage,
-            &mut usage_by_model,
-            &finished.model,
-            finished.usage,
-        );
-        crate::asgard::remove_candidate_repository(&finished.repository);
-    }
-    for finished in review_queue {
+    for (_, finished) in pending_batch {
         crate::asgard::remove_candidate_repository(&finished.repository);
     }
     cleanup_asgard_repositories(&idle_pool);
@@ -854,7 +821,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
 
 async fn run_supervisor_agentic_turn<'ctx, 'fut>(
     mut cx: SupervisorLoopContext<'ctx, 'fut>,
-) -> Result<SupervisorLoopResult> {
+) -> Result<SupervisorLoopResult<'fut>> {
     let tools = supervisor_tool_definitions(cx.allowed_models);
     let mut usage = TokenUsage::default();
     let mut tail = std::mem::take(&mut cx.ephemeral);
@@ -864,7 +831,8 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         spawned: Vec::new(),
         prefinalized: Vec::new(),
         spawned_this_turn: 0,
-        saved_pending: false,
+        resolved_pending: HashSet::new(),
+        saved_any: false,
         discarded: false,
         finalizing: None,
         finalizing_evidence: Vec::new(),
@@ -883,7 +851,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         if !step_warning_sent && ASGARD_SUPERVISOR_MAX_STEPS.saturating_sub(steps) == 2 {
             ephemeral_tail_indexes.push(tail.len());
             tail.push(ChatMessage::user(
-                "2 steps remain this turn — resolve the reviewed trajectory and wrap up.",
+                "2 steps remain this turn - resolve every reviewed sibling and wrap up.",
             ));
             step_warning_sent = true;
         }
@@ -909,21 +877,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                 text_sink,
                 thought_sink,
             });
-            tokio::pin!(supervisor_future);
-            loop {
-                tokio::select! {
-                    completed = cx.running.next(), if !cx.running.is_empty() => {
-                        if let Some(finished) = completed {
-                            cx.running_meta.remove(&finished.worker);
-                            add_usage(cx.aggregate_usage, cx.usage_by_model, &finished.model, finished.usage);
-                            cx.review_queue.push_back(finished);
-                        }
-                    }
-                    result = &mut supervisor_future => {
-                        break result?;
-                    }
-                }
-            }
+            supervisor_future.await?
         };
         trace_supervisor_llm_response(cx.supervisor_turn, &response);
         usage.add(response.usage());
@@ -940,18 +894,13 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                     text,
                     reasoning_content,
                 ));
-                if pending_unresolved(cx.pending, state.saved_pending)
+                if let Some(worker) = first_unresolved_pending(cx.pending, &state.resolved_pending)
                     && !unresolved_reminder_sent
                     && steps < ASGARD_SUPERVISOR_MAX_STEPS
                 {
-                    let worker = cx
-                        .pending
-                        .as_ref()
-                        .map(|finished| finished.worker)
-                        .ok_or_else(|| anyhow!("pending worker disappeared"))?;
                     ephemeral_tail_indexes.push(tail.len());
                     tail.push(ChatMessage::user(format!(
-                        "w{worker} must be saved, spawned from, or discarded — it is currently none of these"
+                        "w{worker} must be saved, spawned from, or discarded - it is currently none of these"
                     )));
                     unresolved_reminder_sent = true;
                     continue;
@@ -1000,18 +949,14 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                     steps = steps.saturating_sub(1);
                 }
                 if state.turn_ended {
-                    if pending_unresolved(cx.pending, state.saved_pending)
+                    if let Some(worker) =
+                        first_unresolved_pending(cx.pending, &state.resolved_pending)
                         && !unresolved_reminder_sent
                         && steps < ASGARD_SUPERVISOR_MAX_STEPS
                     {
-                        let worker = cx
-                            .pending
-                            .as_ref()
-                            .map(|finished| finished.worker)
-                            .ok_or_else(|| anyhow!("pending worker disappeared"))?;
                         ephemeral_tail_indexes.push(tail.len());
                         tail.push(ChatMessage::user(format!(
-                            "w{worker} must be saved, spawned from, or discarded — it is currently none of these"
+                            "w{worker} must be saved, spawned from, or discarded - it is currently none of these"
                         )));
                         unresolved_reminder_sent = true;
                         state.turn_ended = false;
@@ -1023,18 +968,20 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         }
     }
 
-    if let Some(finished) = cx.pending.take() {
-        if state.saved_pending {
+    let pending = std::mem::take(cx.pending);
+    for (worker, finished) in pending {
+        if state.resolved_pending.contains(&worker) {
             cx.idle_pool.push(finished.repository);
         } else if state
             .finalizing
             .as_ref()
-            .is_some_and(|(checkpoint, _)| *checkpoint != CheckpointId::Worker(finished.worker))
+            .is_some_and(|(checkpoint, _)| *checkpoint != CheckpointId::Worker(worker))
         {
             let window = cx
-                .pending_window
-                .clone()
-                .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
+                .pending_windows
+                .get(&worker)
+                .cloned()
+                .ok_or_else(|| anyhow!("pending worker w{worker} missing trajectory window"))?;
             let _ = resolve_pending(
                 cx.stage,
                 cx.dag,
@@ -1044,24 +991,25 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
             )?;
             state.discarded = true;
             tail.push(ChatMessage::user(format!(
-                "w{} was discarded (run finalized elsewhere)",
-                finished.worker
+                "w{worker} was discarded (run finalized elsewhere)"
             )));
             cx.idle_pool.push(finished.repository);
         } else {
             let window = cx
-                .pending_window
-                .clone()
-                .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
+                .pending_windows
+                .get(&worker)
+                .cloned()
+                .ok_or_else(|| anyhow!("pending worker w{worker} missing trajectory window"))?;
             let _ = resolve_pending(cx.stage, cx.dag, &finished, window, PendingResolution::Save)?;
             crate::trace_logging::append_trace_record(serde_json::json!({
                 "type": "asgard_supervisor_fallback",
                 "mode": "auto_save_unresolved",
+                "worker": worker,
             }));
             tail.push(ChatMessage::user(format!(
-                "w{} was auto-saved: the turn ended without resolving it",
-                finished.worker
+                "w{worker} was auto-saved: the turn ended without resolving it"
             )));
+            state.saved_any = true;
             cx.idle_pool.push(finished.repository);
         }
     }
@@ -1090,12 +1038,13 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         steps,
         spawned: state.spawned,
         prefinalized: state.prefinalized,
-        saved: state.saved_pending,
+        saved: state.saved_any,
         discarded: state.discarded,
         finalizing_evidence: state.finalizing_evidence,
         finalizing_abandoned: state.finalizing_abandoned,
         merged: state.merged,
         permanent_append,
+        spawned_batch: cx.spawned_batch,
     })
 }
 
@@ -1105,30 +1054,16 @@ async fn execute_supervisor_call<'ctx, 'fut>(
     state: &mut SupervisorTurnState,
 ) -> Result<String> {
     match call.function.name.as_str() {
-        WAIT_TOOL => {
-            state.turn_ended = true;
-            Ok("waiting for the next worker".to_string())
-        }
         VIEW_TOOL_CALL_TOOL => match parse_view_tool_call(call) {
             Ok(handles) if handles.is_empty() => Ok(
-                "error: no handles given. There is nothing to poll: to wait for running \
-                 workers, call wait (or simply reply without tool calls) - you are re-engaged \
-                 automatically when the next worker finishes."
-                    .to_string(),
+                "error: no handles given. Workers now run to completion before review; there is nothing to poll.".to_string(),
             ),
             Ok(handles) => {
-                let in_flight: Vec<usize> = cx
-                    .running_meta
-                    .keys()
-                    .copied()
-                    .chain(cx.review_queue.iter().map(|finished| finished.worker))
-                    .collect();
+                let pending_views = pending_view_messages(cx.pending);
                 let views = cx.dag.resolve_handle_views(
                     &handles,
-                    cx.pending
-                        .as_ref()
-                        .map(|finished| (finished.worker, finished.window_messages.as_slice())),
-                    &in_flight,
+                    &pending_views,
+                    &[],
                 );
                 state
                     .view_summaries
@@ -1146,23 +1081,12 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             Err(error) => Ok(format!("error: {error}")),
         },
         SAVE_CHECKPOINT_TOOL => {
-            if state.saved_pending {
-                return Ok(
-                    "error: save_checkpoint: pending trajectory is already saved".to_string(),
-                );
-            }
-            let Some(_) = cx.pending.as_ref() else {
-                return Ok(
-                    "error: save_checkpoint: requires a just-reviewed pending trajectory"
-                        .to_string(),
-                );
+            let worker = match pending_worker_for_call(call, cx.pending, &state.resolved_pending, "save_checkpoint") {
+                Ok(worker) => worker,
+                Err(error) => return Ok(format!("error: {error}")),
             };
-            let outcome = save_pending_if_needed(cx, &mut state.saved_pending)?;
-            let worker = cx
-                .pending
-                .as_ref()
-                .map(|finished| finished.worker)
-                .ok_or_else(|| anyhow!("pending worker disappeared during save"))?;
+            let outcome = save_pending_if_needed(cx, &mut state.resolved_pending, worker)?;
+            state.saved_any = true;
             Ok(match outcome {
                 PendingResolveOutcome::Saved => format!("saved checkpoint w{worker}"),
                 PendingResolveOutcome::Discarded => {
@@ -1171,9 +1095,10 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             })
         }
         MERGE_CHECKPOINT_TOOL => {
+            let pending = pending_ids(cx.pending);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
-                pending: cx.pending.as_ref().map(|finished| finished.worker),
+                pending: &pending,
                 allowed_models: cx.allowed_models,
             };
             let parsed = match parse_merge_checkpoint(call, &context) {
@@ -1191,19 +1116,18 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             }
         }
         DISCARD_TOOL => {
-            if state.saved_pending {
-                return Ok("error: discard: pending trajectory is already saved".to_string());
-            }
-            let Some(finished) = cx.pending.take() else {
-                return Ok(
-                    "error: discard: requires a just-reviewed pending trajectory".to_string(),
-                );
+            let worker = match pending_worker_for_call(call, cx.pending, &state.resolved_pending, "discard") {
+                Ok(worker) => worker,
+                Err(error) => return Ok(format!("error: {error}")),
             };
-            let worker = finished.worker;
+            let Some(finished) = cx.pending.remove(&worker) else {
+                return Ok(format!("error: discard: w{worker} is not pending"));
+            };
             let window = cx
-                .pending_window
-                .clone()
-                .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
+                .pending_windows
+                .get(&worker)
+                .cloned()
+                .ok_or_else(|| anyhow!("pending worker w{worker} missing trajectory window"))?;
             let _ = resolve_pending(
                 cx.stage,
                 cx.dag,
@@ -1211,14 +1135,16 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 window,
                 PendingResolution::Discard,
             )?;
+            state.resolved_pending.insert(worker);
             state.discarded = true;
             cx.idle_pool.push(finished.repository);
             Ok(format!("trajectory w{worker} discarded"))
         }
         SPAWN_WORKERS_TOOL => {
+            let pending = pending_ids(cx.pending);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
-                pending: cx.pending.as_ref().map(|finished| finished.worker),
+                pending: &pending,
                 allowed_models: cx.allowed_models,
             };
             let spawns = match parse_spawn_workers(call, &context) {
@@ -1228,9 +1154,10 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             execute_spawn_requests(cx, state, spawns, SpawnKind::Regular).await
         }
         PREFINALIZE_TOOL => {
+            let pending = pending_ids(cx.pending);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
-                pending: cx.pending.as_ref().map(|finished| finished.worker),
+                pending: &pending,
                 allowed_models: cx.allowed_models,
             };
             let spawns = match parse_spawn_workers(call, &context) {
@@ -1240,9 +1167,10 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             execute_spawn_requests(cx, state, spawns, SpawnKind::Prefinalize).await
         }
         FINALIZE_TOOL => {
+            let pending = pending_ids(cx.pending);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
-                pending: cx.pending.as_ref().map(|finished| finished.worker),
+                pending: &pending,
                 allowed_models: cx.allowed_models,
             };
             let parsed = match parse_finalize(call, &context) {
@@ -1261,7 +1189,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             if !unresolved_prefinalize.is_empty() {
                 state.turn_ended = true;
                 return Ok(format!(
-                    "error: prefinalize workers [{}] have not been reviewed yet; wait for them and review their reports before finalizing.",
+                    "error: prefinalize workers [{}] have not been reviewed yet; review their reports before finalizing.",
                     unresolved_prefinalize
                         .iter()
                         .map(|worker| format!("w{worker}"))
@@ -1281,13 +1209,10 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     "error: the delivered checkpoint ({checkpoint}) is not the state your latest prefinalize verified; run prefinalize from {checkpoint} (or the checkpoint you intend to deliver), review it, then finalize."
                 ));
             }
-            let pending_messages = cx
-                .pending
-                .as_ref()
-                .map(|finished| (finished.worker, finished.window_messages.as_slice()));
+            let pending_messages = pending_view_messages(cx.pending);
             let has_sufficient_evidence = evidence.iter().any(|handle| {
                 cx.dag
-                    .handle_is_run_shell_command_result(handle, pending_messages)
+                    .handle_is_run_shell_command_result(handle, &pending_messages)
             });
             if !has_sufficient_evidence && !*cx.finalize_evidence_bounced {
                 *cx.finalize_evidence_bounced = true;
@@ -1317,13 +1242,12 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 message.push_str("Their work is absent from the delivered lineage. Merge them (merge_checkpoint), or list them in `abandoned` to confirm intentional abandonment.");
                 return Ok(message);
             }
-            if cx
-                .pending
-                .as_ref()
-                .is_some_and(|finished| checkpoint == CheckpointId::Worker(finished.worker))
-                && !state.saved_pending
+            if let CheckpointId::Worker(worker) = checkpoint
+                && cx.pending.contains_key(&worker)
+                && !state.resolved_pending.contains(&worker)
             {
-                save_pending_if_needed(cx, &mut state.saved_pending)?;
+                save_pending_if_needed(cx, &mut state.resolved_pending, worker)?;
+                state.saved_any = true;
             }
             state.finalizing = Some((checkpoint.clone(), response));
             state.finalizing_evidence = evidence.clone();
@@ -1339,6 +1263,79 @@ async fn execute_supervisor_call<'ctx, 'fut>(
     }
 }
 
+fn pending_ids(pending: &BTreeMap<usize, FinishedWorker>) -> Vec<usize> {
+    pending.keys().copied().collect()
+}
+
+fn pending_view_messages(
+    pending: &BTreeMap<usize, FinishedWorker>,
+) -> Vec<(usize, &[ChatMessage])> {
+    pending
+        .iter()
+        .map(|(worker, finished)| (*worker, finished.window_messages.as_slice()))
+        .collect()
+}
+
+fn first_unresolved_pending(
+    pending: &BTreeMap<usize, FinishedWorker>,
+    resolved: &HashSet<usize>,
+) -> Option<usize> {
+    pending
+        .keys()
+        .copied()
+        .find(|worker| !resolved.contains(worker))
+}
+
+fn pending_worker_for_call(
+    call: &ToolCall,
+    pending: &BTreeMap<usize, FinishedWorker>,
+    resolved: &HashSet<usize>,
+    tool: &str,
+) -> std::result::Result<usize, String> {
+    let arguments = crate::tool_arguments::normalize_tool_arguments(&call.function.arguments)
+        .map(|arguments| arguments.value)
+        .map_err(|error| format!("{tool}: unparseable arguments: {error:#}"))?;
+    let requested = arguments
+        .get("worker")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|worker| !worker.is_empty());
+    if let Some(requested) = requested {
+        let CheckpointId::Worker(worker) = CheckpointId::parse(requested)
+            .ok_or_else(|| format!("{tool}: worker must look like \"w7\""))?
+        else {
+            return Err(format!("{tool}: worker must name a worker like \"w7\""));
+        };
+        if resolved.contains(&worker) {
+            return Err(format!("{tool}: w{worker} is already resolved"));
+        }
+        if pending.contains_key(&worker) {
+            return Ok(worker);
+        }
+        return Err(format!("{tool}: w{worker} is not pending review"));
+    }
+
+    let unresolved = pending
+        .keys()
+        .copied()
+        .filter(|worker| !resolved.contains(worker))
+        .collect::<Vec<_>>();
+    match unresolved.as_slice() {
+        [] => Err(format!(
+            "{tool}: requires a just-reviewed pending trajectory"
+        )),
+        [worker] => Ok(*worker),
+        _ => Err(format!(
+            "{tool}: multiple siblings are pending ({}); pass worker like \"w7\"",
+            unresolved
+                .iter()
+                .map(|worker| format!("w{worker}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SpawnDedupKey {
     from: CheckpointId,
@@ -1349,7 +1346,6 @@ struct SpawnDedupKey {
 #[derive(Clone, Debug)]
 enum SpawnDuplicateNote {
     InCall { kept_index: usize, count: usize },
-    Running { worker: usize, count: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -1365,7 +1361,7 @@ async fn execute_spawn_requests<'ctx, 'fut>(
     kind: SpawnKind,
 ) -> Result<String> {
     let (spawns, duplicate_notes) = dedup_spawn_requests(cx, spawns);
-    let remaining_capacity = cx.turn_capacity.saturating_sub(state.spawned_this_turn);
+    let remaining_capacity = ASGARD_BATCH_CAP.saturating_sub(state.spawned_this_turn);
     if spawns.len() > remaining_capacity {
         return Ok(format!(
             "error: requested {} workers but only {remaining_capacity} capacity slots remain this turn",
@@ -1373,30 +1369,34 @@ async fn execute_spawn_requests<'ctx, 'fut>(
         ));
     }
     let mut lines = Vec::new();
-    if spawns.iter().any(|spawn| {
-        cx.pending
-            .as_ref()
-            .is_some_and(|finished| spawn.from == CheckpointId::Worker(finished.worker))
-    }) && !state.saved_pending
-    {
-        let outcome = save_pending_if_needed(cx, &mut state.saved_pending)?;
-        let saved_from_pending = matches!(outcome, PendingResolveOutcome::Saved);
+    let mut pending_sources = spawns
+        .iter()
+        .filter_map(|spawn| match spawn.from {
+            CheckpointId::Worker(worker)
+                if cx.pending.contains_key(&worker)
+                    && !state.resolved_pending.contains(&worker) =>
+            {
+                Some(worker)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    pending_sources.sort_unstable();
+    pending_sources.dedup();
+    for worker in pending_sources {
+        let outcome = save_pending_if_needed(cx, &mut state.resolved_pending, worker)?;
+        state.saved_any = true;
         lines.push(format!(
-            "{} w{}",
+            "{} w{worker}",
             match outcome {
                 PendingResolveOutcome::Saved => "saved checkpoint",
                 PendingResolveOutcome::Discarded => "discarded",
-            },
-            cx.pending
-                .as_ref()
-                .map(|finished| finished.worker)
-                .ok_or_else(|| anyhow!("pending worker disappeared during spawn save"))?
+            }
         ));
-        if !saved_from_pending {
-            lines.push(
-                "error: cannot spawn from the pending trajectory because checkpoint autocommit failed"
-                    .to_string(),
-            );
+        if !matches!(outcome, PendingResolveOutcome::Saved) {
+            lines.push(format!(
+                "error: cannot spawn from w{worker} because checkpoint autocommit failed"
+            ));
             return Ok(lines.join("\n"));
         }
     }
@@ -1429,6 +1429,9 @@ async fn execute_spawn_requests<'ctx, 'fut>(
         &duplicate_notes,
         &spawned_by_index,
     ));
+    if !state.spawned.is_empty() {
+        state.turn_ended = true;
+    }
     Ok(lines.join("\n"))
 }
 
@@ -1440,15 +1443,7 @@ fn unresolved_prefinalize_workers(
         .iter()
         .copied()
         .filter(|worker| {
-            cx.running_meta.contains_key(worker)
-                || cx
-                    .review_queue
-                    .iter()
-                    .any(|finished| finished.worker == *worker)
-                || cx
-                    .pending
-                    .as_ref()
-                    .is_some_and(|finished| finished.worker == *worker && !state.saved_pending)
+            cx.pending.contains_key(worker) && !state.resolved_pending.contains(worker)
         })
         .collect()
 }
@@ -1458,22 +1453,9 @@ fn dedup_spawn_requests(
     spawns: Vec<SpawnRequest>,
 ) -> (Vec<SpawnRequest>, Vec<SpawnDuplicateNote>) {
     let default_model = &cx.launch.config.candidate_models[0];
-    let mut running_by_key = HashMap::new();
-    for (worker, meta) in cx.running_meta.iter() {
-        running_by_key.insert(
-            SpawnDedupKey {
-                from: meta.parent.clone(),
-                instructions: meta.instructions.clone(),
-                model: meta.model.clone(),
-            },
-            *worker,
-        );
-    }
-
     let mut kept = Vec::new();
     let mut kept_by_key = HashMap::new();
     let mut in_call_duplicates: HashMap<usize, usize> = HashMap::new();
-    let mut running_duplicates: HashMap<usize, usize> = HashMap::new();
     for spawn in spawns {
         let key = SpawnDedupKey {
             from: spawn.from.clone(),
@@ -1483,10 +1465,6 @@ fn dedup_spawn_requests(
                 .clone()
                 .unwrap_or_else(|| default_model.to_string()),
         };
-        if let Some(worker) = running_by_key.get(&key) {
-            *running_duplicates.entry(*worker).or_default() += 1;
-            continue;
-        }
         if let Some(kept_index) = kept_by_key.get(&key) {
             *in_call_duplicates.entry(*kept_index).or_default() += 1;
             continue;
@@ -1499,15 +1477,9 @@ fn dedup_spawn_requests(
     let mut notes = in_call_duplicates
         .into_iter()
         .map(|(kept_index, count)| SpawnDuplicateNote::InCall { kept_index, count })
-        .chain(
-            running_duplicates
-                .into_iter()
-                .map(|(worker, count)| SpawnDuplicateNote::Running { worker, count }),
-        )
         .collect::<Vec<_>>();
     notes.sort_by_key(|note| match note {
-        SpawnDuplicateNote::InCall { kept_index, .. } => (0usize, *kept_index),
-        SpawnDuplicateNote::Running { worker, .. } => (1usize, *worker),
+        SpawnDuplicateNote::InCall { kept_index, .. } => *kept_index,
     });
     (kept, notes)
 }
@@ -1525,56 +1497,42 @@ fn render_spawn_duplicate_notes(
                     "skipped {count} duplicate specs (identical to w{worker})"
                 ))
             }
-            SpawnDuplicateNote::Running { worker, count } => {
-                if *count == 1 {
-                    Some(format!("skipped spec identical to running w{worker}"))
-                } else {
-                    Some(format!(
-                        "skipped {count} specs identical to running w{worker}"
-                    ))
-                }
-            }
         })
         .collect()
 }
 
 fn save_pending_if_needed(
     cx: &mut SupervisorLoopContext<'_, '_>,
-    saved_pending: &mut bool,
+    resolved_pending: &mut HashSet<usize>,
+    worker: usize,
 ) -> Result<PendingResolveOutcome> {
-    if *saved_pending {
-        anyhow::bail!("save_checkpoint: pending trajectory is already saved");
+    if resolved_pending.contains(&worker) {
+        anyhow::bail!("save_checkpoint: w{worker} is already resolved");
     }
-    let Some(finished) = cx.pending.as_ref() else {
-        anyhow::bail!("save_checkpoint: requires a just-reviewed pending trajectory");
+    let Some(finished) = cx.pending.get(&worker) else {
+        anyhow::bail!("save_checkpoint: w{worker} is not pending");
     };
     let window = cx
-        .pending_window
-        .clone()
-        .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
+        .pending_windows
+        .get(&worker)
+        .cloned()
+        .ok_or_else(|| anyhow!("pending worker w{worker} missing trajectory window"))?;
     let outcome = resolve_pending(cx.stage, cx.dag, finished, window, PendingResolution::Save)?;
-    *saved_pending = true;
+    resolved_pending.insert(worker);
     send_thought(
         &cx.launch.live_output.cx,
         &cx.launch.live_output.session_id,
         match outcome {
             PendingResolveOutcome::Saved => {
-                format!("Asgard saved checkpoint w{}.\n", finished.worker)
+                format!("Asgard saved checkpoint w{worker}.\n")
             }
             PendingResolveOutcome::Discarded => {
-                format!(
-                    "Asgard discarded w{} after checkpoint autocommit failed.\n",
-                    finished.worker
-                )
+                format!("Asgard discarded w{worker} after checkpoint autocommit failed.\n")
             }
         }
         .as_str(),
     );
     Ok(outcome)
-}
-
-fn pending_unresolved(pending: &Option<FinishedWorker>, saved_pending: bool) -> bool {
-    pending.is_some() && !saved_pending
 }
 
 async fn launch_spawn<'a>(
@@ -1591,7 +1549,7 @@ async fn launch_spawn<'a>(
         .ok_or_else(|| anyhow!("unknown checkpoint {}", spawn.from))?
         .to_string();
     let messages = cx.dag.ancestor_messages(&spawn.from)?;
-    let (future, meta) = launch_worker(
+    let future = launch_worker(
         WorkerLaunch {
             cx: cx.launch.cx,
             sessions: cx.launch.sessions,
@@ -1617,8 +1575,7 @@ async fn launch_spawn<'a>(
         cx.idle_pool,
     )
     .await?;
-    cx.running.push(future);
-    cx.running_meta.insert(worker_id, meta);
+    cx.spawned_batch.push(future);
     Ok(worker_id)
 }
 
@@ -1902,8 +1859,8 @@ fn add_usage(
 
 fn trace_supervisor_turn(
     turn: usize,
-    reviewed: Option<usize>,
-    result: &Result<SupervisorLoopResult>,
+    reviewed: Vec<usize>,
+    result: &Result<SupervisorLoopResult<'_>>,
     elapsed_millis: u64,
     permanent_bytes: usize,
 ) {
@@ -1977,7 +1934,7 @@ fn trace_supervisor_llm_response(turn: usize, response: &LlmResponse) {
     }
 }
 
-fn supervisor_decision_summary(outcome: &SupervisorLoopResult) -> String {
+fn supervisor_decision_summary(outcome: &SupervisorLoopResult<'_>) -> String {
     if let Some((checkpoint, response)) = &outcome.finalizing {
         return format!(
             "spawned={:?} prefinalized={:?} saved={} finalized=true checkpoint={checkpoint} response={} discarded={}",
@@ -2106,6 +2063,21 @@ fn initial_permanent_user_message(
     message
 }
 
+fn render_batch_review_message(windows: &BTreeMap<usize, TrajectoryWindow>) -> String {
+    let mut rendered = format!(
+        "{} workers finished; review each and resolve each before your turn ends.\n\n",
+        windows.len()
+    );
+    for window in windows.values() {
+        rendered.push_str(&render_fragment(window));
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        rendered.push('\n');
+    }
+    rendered
+}
+
 pub(crate) fn asgard_take_window_messages(
     continuation_messages: &[ChatMessage],
     start: usize,
@@ -2171,31 +2143,13 @@ fn count_worker_steps(messages: &[ChatMessage]) -> usize {
 
 fn render_asgard_status_block(
     dag: &TrajectoryDag,
-    running: &HashMap<usize, RunningWorkerMeta>,
-    review_queue: &VecDeque<FinishedWorker>,
-    pending: Option<&FinishedWorker>,
+    pending: &BTreeMap<usize, TrajectoryWindow>,
     capacity_available: usize,
     idle_note: Option<&str>,
     parent_status: &[String],
 ) -> String {
     let mut live = Vec::new();
-    live.extend(running.iter().map(|(worker, meta)| DagLiveEntry {
-        worker: *worker,
-        parent: meta.parent.clone(),
-        status: format!(
-            "in flight, step {}/{}",
-            meta.turn_progress.load(Ordering::Relaxed),
-            ASGARD_WORKER_MAX_STEPS
-        ),
-        instructions: meta.instructions.clone(),
-    }));
-    live.extend(review_queue.iter().map(|worker| DagLiveEntry {
-        worker: worker.worker,
-        parent: worker.parent.clone(),
-        status: "queued for review".to_string(),
-        instructions: worker.instructions.clone(),
-    }));
-    if let Some(worker) = pending {
+    for worker in pending.values() {
         live.push(DagLiveEntry {
             worker: worker.worker,
             parent: worker.parent.clone(),
@@ -2510,8 +2464,20 @@ mod tests {
         named_tool_call(id, "save_checkpoint", serde_json::json!({}))
     }
 
+    fn save_worker_call(id: &str, worker: &str) -> ToolCall {
+        named_tool_call(
+            id,
+            "save_checkpoint",
+            serde_json::json!({ "worker": worker }),
+        )
+    }
+
     fn discard_call(id: &str) -> ToolCall {
         named_tool_call(id, "discard", serde_json::json!({}))
+    }
+
+    fn discard_worker_call(id: &str, worker: &str) -> ToolCall {
+        named_tool_call(id, "discard", serde_json::json!({ "worker": worker }))
     }
 
     fn finalize_call(id: &str, checkpoint: &str) -> ToolCall {
@@ -2553,10 +2519,6 @@ mod tests {
             "merge_checkpoint",
             serde_json::json!({ "from": from, "onto": onto }),
         )
-    }
-
-    fn wait_call(id: &str) -> ToolCall {
-        named_tool_call(id, "wait", serde_json::json!({}))
     }
 
     fn update_plan_call(id: &str, step: &str, status: &str) -> ToolCall {
@@ -2956,7 +2918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asgard_spawn_workers_dedups_in_call_and_running_specs() {
+    async fn asgard_spawn_workers_dedups_in_call_specs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
@@ -2982,14 +2944,26 @@ mod tests {
                             { "from": "root", "instructions": distinct }
                         ]),
                     )]),
-                    tool_response(vec![spawn_call(
-                        "sv-spawn-running-duplicate",
-                        "root",
-                        duplicate,
-                    )]),
-                    text_response("waiting"),
-                    tool_response(vec![discard_call("sv-discard-w1")]),
-                    tool_response(vec![discard_call("sv-discard-w2")]),
+                    tool_response(vec![
+                        named_tool_call(
+                            "sv-discard-w1",
+                            "discard",
+                            serde_json::json!({ "worker": "w1" }),
+                        ),
+                        named_tool_call(
+                            "sv-discard-w2",
+                            "discard",
+                            serde_json::json!({ "worker": "w2" }),
+                        ),
+                    ]),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
                     text_response("done"),
                     text_response("done"),
                     text_response("done"),
@@ -3035,7 +3009,6 @@ mod tests {
         assert!(supervisor_text.contains("spawned w1 from root"));
         assert!(supervisor_text.contains("spawned w2 from root"));
         assert!(supervisor_text.contains("skipped 1 duplicate specs (identical to w1)"));
-        assert!(supervisor_text.contains("skipped spec identical to running w1"));
 
         let spawned_lines = supervisor_text
             .lines()
@@ -3047,6 +3020,278 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("spawned w3"))
         );
+    }
+
+    #[tokio::test]
+    async fn asgard_batch_review_contains_all_siblings_in_one_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![spawn_workers_call(
+                        "sv-spawn-3",
+                        serde_json::json!([
+                            { "from": "root", "instructions": "inspect a" },
+                            { "from": "root", "instructions": "inspect b" },
+                            { "from": "root", "instructions": "inspect c" }
+                        ]),
+                    )]),
+                    tool_response(vec![
+                        discard_worker_call("sv-discard-w1", "w1"),
+                        discard_worker_call("sv-discard-w2", "w2"),
+                        discard_worker_call("sv-discard-w3", "w3"),
+                    ]),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded contract text"),
+                    text_response("batch report"),
+                    text_response("batch report"),
+                    text_response("batch report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise 3-wide batch")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            supervisor_text.contains(
+                "3 workers finished; review each and resolve each before your turn ends."
+            )
+        );
+        assert!(supervisor_text.contains(r#"<worker_trajectory id="w1""#));
+        assert!(supervisor_text.contains(r#"<worker_trajectory id="w2""#));
+        assert!(supervisor_text.contains(r#"<worker_trajectory id="w3""#));
+    }
+
+    #[tokio::test]
+    async fn save_checkpoint_requires_worker_when_batch_review_is_ambiguous() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![spawn_workers_call(
+                        "sv-spawn-2",
+                        serde_json::json!([
+                            { "from": "root", "instructions": "inspect a" },
+                            { "from": "root", "instructions": "inspect b" }
+                        ]),
+                    )]),
+                    tool_response(vec![
+                        save_call("sv-save-ambiguous"),
+                        save_worker_call("sv-save-w2", "w2"),
+                        discard_worker_call("sv-discard-w1", "w1"),
+                    ]),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded contract text"),
+                    text_response("batch report"),
+                    text_response("batch report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise explicit save")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains(
+            "error: save_checkpoint: multiple siblings are pending (w1, w2); pass worker like \"w7\""
+        ));
+        assert!(supervisor_text.contains("saved checkpoint w2"));
+        assert!(supervisor_text.contains("trajectory w1 discarded"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_batch_siblings_auto_save_individually_at_turn_end() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![spawn_workers_call(
+                        "sv-spawn-2",
+                        serde_json::json!([
+                            { "from": "root", "instructions": "inspect a" },
+                            { "from": "root", "instructions": "inspect b" }
+                        ]),
+                    )]),
+                    text_response("leave both unresolved"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded contract text"),
+                    text_response("batch report"),
+                    text_response("batch report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise batch auto-save")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("w1 was auto-saved: the turn ended without resolving it"));
+        assert!(supervisor_text.contains("w2 was auto-saved: the turn ended without resolving it"));
+    }
+
+    #[tokio::test]
+    async fn spawn_workers_is_terminal_within_supervisor_tool_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("literal contract text"),
+                    tool_response(vec![
+                        spawn_call("sv-spawn-w1", "root", "inspect"),
+                        update_plan_call("sv-plan-after-spawn", "must not run", "in_progress"),
+                    ]),
+                    tool_response(vec![discard_call("sv-discard-w1")]),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("grounded contract text"),
+                    text_response("batch report"),
+                ],
+            ),
+        ]));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise terminal spawn")],
+        )
+        .await;
+
+        assert!(outcome.current_plan.is_none());
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains("spawned w1 from root"));
+        assert!(supervisor_text.contains("error: turn already ended"));
     }
 
     #[tokio::test]
@@ -3122,7 +3367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefinalize_gate_names_unreviewed_workers() {
+    async fn prefinalize_spawn_is_terminal_before_finalize_call() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
@@ -3183,7 +3428,8 @@ mod tests {
             .map(|request| all_message_text(&request.messages))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(supervisor_text.contains("error: prefinalize workers [w2] have not been reviewed yet; wait for them and review their reports before finalizing."));
+        assert!(supervisor_text.contains("prefinalize spawned w2 from w1"));
+        assert!(supervisor_text.contains("error: turn already ended"));
     }
 
     #[tokio::test]
@@ -3281,7 +3527,7 @@ mod tests {
             .iter()
             .position(|text| text.contains("<parent_worktree_status>"))
             .expect("parent status after prefinalize");
-        assert!(status_index > prefinalize_index);
+        assert!(status_index >= prefinalize_index);
         assert!(
             texts[..status_index]
                 .iter()
@@ -3598,8 +3844,8 @@ mod tests {
                 vec![
                     text_response("intake literal"),
                     tool_response(vec![
-                        spawn_call("sv-spawn-w1", "root", "Create foo.txt containing alpha"),
                         update_plan_call("sv-plan", "Create foo.txt", "in_progress"),
+                        spawn_call("sv-spawn-w1", "root", "Create foo.txt containing alpha"),
                     ]),
                     text_response("bootstrap workers launched"),
                     tool_response(vec![spawn_call(
@@ -3818,9 +4064,13 @@ mod tests {
         let review_w3_text = all_message_text(&supervisor_requests[6].messages);
         assert!(review_w3_text.contains("w2 ("));
         assert!(review_w3_text.contains("\"Rewrite foo.txt to alpha then beta\" saved"));
-        let final_idle_text = all_message_text(&supervisor_requests[7].messages);
-        assert!(final_idle_text.contains(
-            "w3 must be saved, spawned from, or discarded — it is currently none of these"
+        let supervisor_text = supervisor_requests
+            .iter()
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains(
+            "w3 must be saved, spawned from, or discarded - it is currently none of these"
         ));
         let finalize_bounce_text = all_message_text(&supervisor_requests[11].messages);
         assert!(finalize_bounce_text.contains("error: before finalizing, name the evidence: the handles of the test runs you inspected (e.g. [\"w9m4\"]). If you have not seen test output for this checkpoint, spawn a verification worker on it first."));
@@ -4365,7 +4615,7 @@ mod tests {
             .expect("in-memory ACP connect_with");
         drain.abort();
 
-        assert_eq!(outcome.response, "w3 verification report");
+        assert_eq!(outcome.response, "w1 done");
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
@@ -4388,7 +4638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_turn_records_results_reminds_pending_and_allows_evidence_finalize() {
+    async fn review_reminds_pending_and_allows_evidence_finalize() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
         let trace_path = temp.path().join("trace.jsonl");
@@ -4409,18 +4659,13 @@ mod tests {
                 "sv-model",
                 vec![
                     text_response("intake literal"),
-                    tool_response(vec![
-                        wait_call("sv-wait-clean"),
-                        spawn_call("sv-spawn-after-wait", "root", "must not run"),
-                    ]),
                     tool_response(vec![spawn_call(
                         "sv-spawn-w1",
                         "root",
                         "Run pwd and report",
                     )]),
                     text_response("w1 launched"),
-                    tool_response(vec![wait_call("sv-wait-pending")]),
-                    tool_response(vec![wait_call("sv-wait-pending-again")]),
+                    text_response("not resolved yet"),
                     tool_response(vec![prefinalize_call(
                         "sv-prefinalize-w2",
                         "w1",
@@ -4493,7 +4738,7 @@ mod tests {
                         None,
                         None,
                         None,
-                        vec![ChatMessage::user("exercise wait and evidence finalize")],
+                        vec![ChatMessage::user("exercise review and evidence finalize")],
                         IdleTimeouts::uniform(Duration::from_secs(30)),
                         tokio_util::sync::CancellationToken::new(),
                         &config,
@@ -4520,27 +4765,16 @@ mod tests {
                         .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
             })
             .collect::<Vec<_>>();
-        assert_eq!(supervisor_requests.len(), 8);
-
-        let after_clean_wait = all_message_text(&supervisor_requests[1].messages);
-        assert!(after_clean_wait.contains("waiting for the next worker"));
-        assert!(after_clean_wait.contains("error: turn already ended"));
-        assert!(
-            !after_clean_wait.contains("sv-spawn-after-wait"),
-            "the blocked call id should not leak into content text"
-        );
-
-        let after_pending_wait = all_message_text(&supervisor_requests[4].messages);
-        assert!(after_pending_wait.contains("waiting for the next worker"));
-        assert!(after_pending_wait.contains(
-            "w1 must be saved, spawned from, or discarded — it is currently none of these"
+        let supervisor_text = supervisor_requests
+            .iter()
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains(
+            "w1 must be saved, spawned from, or discarded - it is currently none of these"
         ));
-
-        let final_request_text = all_message_text(&supervisor_requests[5].messages);
-        assert!(
-            final_request_text.contains("w1 was auto-saved: the turn ended without resolving it")
-        );
-        assert!(!final_request_text.contains("error: before finalizing"));
+        assert!(supervisor_text.contains("prefinalize spawned w2 from w1"));
+        assert!(!supervisor_text.contains("error: before finalizing"));
 
         let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
         let finalize_record = trace
@@ -4850,7 +5084,7 @@ mod tests {
     }
 
     #[test]
-    fn status_block_renders_running_queue_checkpoints_and_capacity() {
+    fn status_block_renders_pending_batch_checkpoints_and_capacity() {
         let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
         dag.insert(TrajectoryNode {
             window: TrajectoryWindow {
@@ -4872,24 +5106,29 @@ mod tests {
             merged_from: Vec::new(),
         })
         .unwrap();
-        let progress = Arc::new(AtomicUsize::new(3));
-        let mut running = HashMap::new();
-        running.insert(
+        let mut pending = BTreeMap::new();
+        pending.insert(
             5,
-            RunningWorkerMeta {
+            TrajectoryWindow {
+                worker: 5,
                 parent: CheckpointId::Worker(2),
-                model: "worker-model".to_string(),
                 instructions: "inspect the parser\nthen test it".to_string(),
-                turn_progress: progress,
+                model: "worker-model".to_string(),
+                instruction_message: ChatMessage::user("inspect the parser"),
+                window_messages: Vec::new(),
+                compact: String::new(),
+                final_response: String::new(),
+                stop: WorkerStopReason::Finished,
+                steps: 1,
+                diffstat: String::new(),
+                usage: TokenUsage::default(),
+                elapsed_millis: 0,
             },
         );
-        let review_queue = VecDeque::new();
 
         let rendered = render_asgard_status_block(
             &dag,
-            &running,
-            &review_queue,
-            None,
+            &pending,
             4,
             Some("No worker is awaiting review. Spawn workers or finalize."),
             &[],
@@ -4898,9 +5137,7 @@ mod tests {
         assert!(rendered.contains("<asgard_status>"));
         assert!(rendered.contains("<dag>\nroot\n"));
         assert!(rendered.contains("w2 (c2) \"saved checkpoint\" saved, finished/1 steps"));
-        assert!(
-            rendered.contains("└─ w5 \"inspect the parser then test it\" in flight, step 3/10")
-        );
+        assert!(rendered.contains("└─ w5 \"inspect the parser then test it\" under review"));
         assert!(rendered.contains("capacity_available: 4"));
         assert!(rendered.contains("Spawn workers or finalize."));
     }

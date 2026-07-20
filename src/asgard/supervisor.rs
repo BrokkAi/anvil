@@ -6,9 +6,9 @@ use crate::llm_client::{
     ChatMessage, FunctionDef, LlmBackend, LlmResponse, StreamChatRequest, ToolCall, ToolDefinition,
 };
 
-pub(crate) const ASGARD_MAX_IN_FLIGHT: usize = 5;
+pub(crate) const ASGARD_BATCH_CAP: usize = 8;
 pub(crate) const ASGARD_WORKER_MAX_STEPS: usize = 10;
-pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 10;
+pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 
 pub(crate) const SPAWN_WORKERS_TOOL: &str = "spawn_workers";
@@ -18,7 +18,6 @@ pub(crate) const MERGE_CHECKPOINT_TOOL: &str = "merge_checkpoint";
 pub(crate) const DISCARD_TOOL: &str = "discard";
 pub(crate) const FINALIZE_TOOL: &str = "finalize";
 pub(crate) const VIEW_TOOL_CALL_TOOL: &str = "view_tool_call";
-pub(crate) const WAIT_TOOL: &str = "wait";
 pub(crate) const UPDATE_PLAN_TOOL: &str = "update_plan";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +42,7 @@ pub(crate) struct MergeCheckpointRequest {
 
 pub(crate) struct SupervisorTurnContext<'a> {
     pub(crate) dag: &'a TrajectoryDag,
-    pub(crate) pending: Option<usize>,
+    pub(crate) pending: &'a [usize],
     pub(crate) allowed_models: &'a [String],
 }
 
@@ -63,24 +62,23 @@ pub(crate) fn supervisor_supplement() -> String {
     format!(
         r#"# Asgard supervision
 
-You are the supervisor of a team of asynchronous workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. The difference is that you never touch files or run commands yourself - you act only through these tools:
-- spawn_workers: fork workers from "root" (the original repository state) or any saved checkpoint like "w3". Each worker gets its own checkout of that state plus your instructions, runs up to 10 steps (one step = one batch of tool calls), then reports back for review. Workers may finish sooner; a worker that stops making tool calls is done, and its final message is its report to you.
-- prefinalize: spawn your final verification pass. finalize is locked until prefinalize has run and every prefinalize worker report has been reviewed and resolved.
-- save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later.
+You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. The difference is that you never touch files or run commands yourself - you act only through these tools:
+- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn immediately. The whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of that state plus your instructions, runs up to 10 steps (one step = one batch of tool calls), then reports back for review. Workers may finish sooner; a worker that stops making tool calls is done, and its final message is its report to you.
+- prefinalize: spawn your final verification pass with the same batch semantics as spawn_workers. finalize is locked until prefinalize has run and every prefinalize worker report has been reviewed and resolved.
+- save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one; the argument is optional only when exactly one sibling is pending.
 - merge_checkpoint: merge one saved checkpoint into another saved checkpoint with a real git branch merge, producing a new checkpoint.
-- discard: permanently discard the just-reviewed trajectory.
-- view_tool_call: expands compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only for trajectories that have been presented for review; you cannot watch a worker that is still running. To wait for in-flight workers, call wait (or simply reply without tool calls) - you will be re-engaged when the next one finishes.
-- wait: end this turn and wait. You are re-engaged automatically the moment the next worker finishes. Use this instead of polling, acknowledgment workers, or empty tool calls.
+- discard: permanently discard a reviewed trajectory. When multiple siblings are under review, pass `worker` (for example "w7") to name which one; the argument is optional only when exactly one sibling is pending.
+- view_tool_call: expands compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only for trajectories that have been presented for review.
 - update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
 - finalize: ends the run. The named checkpoint's repository state is delivered as the result, and that worker's final message (or the response you provide) becomes the final answer.
 
-Reviews: you review one finished worker at a time - where it forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to 10 steps (a step = one batch of tool calls) - the same budget your workers get. Each turn you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, spawning, and saving freely across up to {supervisor_steps} supervisor steps. Every reviewed trajectory must be resolved before your turn ends: save_checkpoint it, spawn a worker from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. At most {workers} workers can be in flight; the others appear as brief status lines and get their own review turns. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions.
+Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps (a step = one batch of tool calls). Each turn you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, spawning, and saving across the turn, but a successful spawn_workers or prefinalize ends the turn. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn a worker from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions.
 
 Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. finalize is mechanically locked until a prefinalize verification pass has run and its reports have been reviewed. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written from the task text at the start. If that evidence does not exist yet, spawn a verification worker on that checkpoint first and review what it finds. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run.
 
 Strategy is yours: run independent approaches in parallel, spawn short fact-finding workers to answer questions ("find how X is implemented; report file and line"), branch variants from a good checkpoint, cut losses early, and keep instructions explicit and testable. Workers are also a wall-clock lever: split independent parts of the implementation across parallel workers spawned from the same checkpoint and merge_checkpoint the results afterward - plan the split so the same files are not edited twice and merges stay clean. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Your first duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them. Resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. For each numbered ambiguity (A1, A2, ...) in the intake, state your resolution and a one-line rationale in your plan before spawning implementation workers, and give the spec-test worker one test per resolution that locks in your chosen reading. Have a worker write spec tests from the settled reading - before implementation exists - that lock in the resolved reading; implementation workers run them, and your finalize evidence should show them passing. If the intake is missing, have your first worker pin the specification from the task text instead. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
         supervisor_steps = ASGARD_SUPERVISOR_MAX_STEPS,
-        workers = ASGARD_MAX_IN_FLIGHT
+        workers = ASGARD_BATCH_CAP
     )
 }
 
@@ -97,7 +95,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: SPAWN_WORKERS_TOOL.to_string(),
-                description: "Fork new workers from \"root\" or a saved checkpoint id like \"w3\" (or the just-reviewed worker's id, which saves it); each runs up to 10 steps in its own checkout, then reports back. Never spawn a worker to wait, poll, or acknowledge: call wait (or simply reply without tool calls) to wait, and you are re-engaged automatically the moment a worker finishes.".to_string(),
+                description: "Fork a barrier batch of new workers from \"root\" or a saved checkpoint id like \"w3\" (or a pending reviewed worker's id, which saves it); each runs up to 10 steps in its own checkout, then the whole batch reports back together. A successful spawn ends your turn immediately.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -106,7 +104,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                         "workers": {
                             "type": "array",
                             "minItems": 1,
-                            "maxItems": ASGARD_MAX_IN_FLIGHT,
+                            "maxItems": ASGARD_BATCH_CAP,
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
@@ -137,11 +135,13 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: SAVE_CHECKPOINT_TOOL.to_string(),
-                description: "Save the just-reviewed trajectory as a permanent checkpoint without spawning from it yet.".to_string(),
+                description: "Save a reviewed trajectory as a permanent checkpoint without spawning from it yet. Pass worker like \"w7\" when multiple siblings are pending.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "properties": {},
+                    "properties": {
+                        "worker": { "type": "string" },
+                    },
                 }),
             },
         },
@@ -165,11 +165,13 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: DISCARD_TOOL.to_string(),
-                description: "Discard the just-reviewed trajectory permanently. Every reviewed trajectory must be saved, spawned from (which saves it implicitly), or discarded.".to_string(),
+                description: "Discard a reviewed trajectory permanently. Every reviewed trajectory must be saved, spawned from (which saves it implicitly), or discarded. Pass worker like \"w7\" when multiple siblings are pending.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "properties": {},
+                    "properties": {
+                        "worker": { "type": "string" },
+                    },
                 }),
             },
         },
@@ -196,18 +198,6 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                             "description": "checkpoint ids you are deliberately leaving out of the delivered lineage",
                         },
                     },
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".to_string(),
-            function: FunctionDef {
-                name: WAIT_TOOL.to_string(),
-                description: "End this turn and wait. You are re-engaged automatically the moment the next worker finishes. Use this instead of polling, acknowledgment workers, or empty tool calls.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {},
                 }),
             },
         },
@@ -243,7 +233,7 @@ fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
             "workers": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": ASGARD_MAX_IN_FLIGHT,
+                "maxItems": ASGARD_BATCH_CAP,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -330,16 +320,11 @@ pub(crate) fn parse_spawn_workers(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "workers must be an array".to_string())?;
     if workers.is_empty() {
-        return Err(
-            "workers must contain at least one worker. If you meant to wait for \
-                    in-flight workers, call wait (or simply reply without tool calls) instead — you are \
-                    re-engaged automatically when the next worker finishes."
-                .to_string(),
-        );
+        return Err("workers must contain at least one worker.".to_string());
     }
-    if workers.len() > ASGARD_MAX_IN_FLIGHT {
+    if workers.len() > ASGARD_BATCH_CAP {
         return Err(format!(
-            "workers must contain at most {ASGARD_MAX_IN_FLIGHT} workers"
+            "workers must contain at most {ASGARD_BATCH_CAP} workers"
         ));
     }
 
@@ -505,10 +490,7 @@ pub(crate) fn is_pending_checkpoint(
     checkpoint: &CheckpointId,
     context: &SupervisorTurnContext<'_>,
 ) -> bool {
-    matches!(
-        (checkpoint, context.pending),
-        (CheckpointId::Worker(worker), Some(pending_worker)) if *worker == pending_worker
-    )
+    matches!(checkpoint, CheckpointId::Worker(worker) if context.pending.contains(worker))
 }
 
 fn normalize_arguments(raw: &str) -> std::result::Result<serde_json::Value, String> {
@@ -579,7 +561,7 @@ mod tests {
         dag
     }
 
-    fn context<'a>(dag: &'a TrajectoryDag, pending: Option<usize>) -> SupervisorTurnContext<'a> {
+    fn context<'a>(dag: &'a TrajectoryDag, pending: &'a [usize]) -> SupervisorTurnContext<'a> {
         static ALLOWED: &[String] = &[];
         SupervisorTurnContext {
             dag,
@@ -594,7 +576,7 @@ mod tests {
         let allowed = vec!["model-a".to_string()];
         let context = SupervisorTurnContext {
             dag: &dag,
-            pending: Some(4),
+            pending: &[4],
             allowed_models: &allowed,
         };
         let call = supervisor_tool_call(
@@ -621,7 +603,7 @@ mod tests {
         let allowed = vec!["model-a".to_string()];
         let context = SupervisorTurnContext {
             dag: &dag,
-            pending: None,
+            pending: &[],
             allowed_models: &allowed,
         };
 
@@ -657,6 +639,24 @@ mod tests {
                 .expect_err("empty instructions")
                 .contains("must not be empty")
         );
+
+        let nine_workers = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": (0..9)
+                    .map(|index| serde_json::json!({
+                        "from": "root",
+                        "instructions": format!("worker {index}")
+                    }))
+                    .collect::<Vec<_>>()
+            }),
+        );
+        assert!(
+            parse_spawn_workers(&nine_workers, &context)
+                .expect_err("too many workers")
+                .contains("workers must contain at most 8 workers")
+        );
     }
 
     #[test]
@@ -672,7 +672,7 @@ mod tests {
             }),
         );
 
-        let parsed = parse_finalize(&call, &context(&dag, Some(4))).expect("valid finalize");
+        let parsed = parse_finalize(&call, &context(&dag, &[4])).expect("valid finalize");
 
         assert_eq!(parsed.checkpoint, CheckpointId::Worker(4));
         assert_eq!(parsed.response.as_deref(), Some("done"));
@@ -723,7 +723,7 @@ mod tests {
             merged_from: Vec::new(),
         })
         .unwrap();
-        let context = context(&dag, Some(4));
+        let context = context(&dag, &[4]);
 
         let call = supervisor_tool_call(
             "merge",
