@@ -1922,9 +1922,10 @@ pub(crate) fn resolve_asgard_tool_call_handles(
             };
             &candidate.window_messages
         } else {
-            let retained = audit.retained_windows.iter().find(|retained| {
-                retained.window == handle_window && retained.lane == lane
-            });
+            let retained = audit
+                .retained_windows
+                .iter()
+                .find(|retained| retained.window == handle_window && retained.lane == lane);
             let Some(retained) = retained else {
                 rendered.push_str(&format!(
                     "<tool_call id=\"{handle}\" error=\"window {handle_window} lane {lane} was not \
