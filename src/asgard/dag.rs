@@ -294,6 +294,10 @@ impl TrajectoryDag {
         self.nodes.get(&worker)
     }
 
+    pub(crate) fn is_discarded(&self, worker: usize) -> bool {
+        self.discarded.contains_key(&worker)
+    }
+
     pub(crate) fn checkpoint_labels(&self) -> Vec<String> {
         self.nodes
             .keys()

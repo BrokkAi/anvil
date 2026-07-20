@@ -754,8 +754,15 @@ pub(crate) async fn run_asgard_trajectory_loop(
                             continue;
                         }
                         Err(snapshot_error) => {
+                            // Losing one trajectory must not lose the run.
+                            crate::trace_logging::append_trace_record(serde_json::json!({
+                                "type": "asgard_supervisor_fallback",
+                                "mode": "auto_save_failed_continue",
+                                "worker": finished.worker,
+                                "error": format!("{snapshot_error:#}"),
+                            }));
                             crate::asgard::remove_candidate_repository(&finished.repository);
-                            break AsgardExit::Failure(snapshot_error);
+                            continue;
                         }
                     }
                 }
@@ -1698,6 +1705,15 @@ fn resolve_pending(
     window: TrajectoryWindow,
     resolution: PendingResolution,
 ) -> Result<PendingResolveOutcome> {
+    // Idempotent: a save that degraded to a discard (autocommit failure) can
+    // be followed by a second resolution attempt from the turn-error fallback;
+    // re-resolving must be benign, never fatal to the run.
+    if dag.node(finished.worker).is_some() {
+        return Ok(PendingResolveOutcome::Saved);
+    }
+    if dag.is_discarded(finished.worker) {
+        return Ok(PendingResolveOutcome::Discarded);
+    }
     match resolution {
         PendingResolution::Save => {
             match stage.snapshot(&finished.repository.root, &format!("w{}", finished.worker)) {

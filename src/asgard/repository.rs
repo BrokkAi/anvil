@@ -387,6 +387,10 @@ impl SnapshotStage {
     pub(crate) fn snapshot(&self, worker_root: &Path, name: &str) -> Result<String> {
         add_all_for_checkpoint(worker_root)?;
         let message = format!("asgard checkpoint {name}");
+        // Bookkeeping commits must not run repo hooks: porcelain `git commit`
+        // triggers husky/commitlint (observed: happy-dom rejecting the message
+        // format and eslint --fix mutating files mid-checkpoint), which the old
+        // commit-tree plumbing never did.
         git(
             worker_root,
             &[
@@ -394,7 +398,10 @@ impl SnapshotStage {
                 "user.name=asgard",
                 "-c",
                 "user.email=asgard@anvil.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "commit",
+                "--no-verify",
                 "--allow-empty",
                 "-m",
                 &message,
@@ -453,7 +460,10 @@ impl SnapshotStage {
                 "user.name=asgard",
                 "-c",
                 "user.email=asgard@anvil.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
                 "merge",
+                "--no-verify",
                 "--no-ff",
                 "--no-edit",
                 from_commit,
@@ -922,6 +932,42 @@ mod tests {
 
         assert_text_file_eq(&repo.join("tracked.txt"), "committed solution\n");
         assert_text_file_eq(&repo.join("added.txt"), "committed addition\n");
+    }
+
+    #[test]
+    fn snapshot_succeeds_despite_failing_repo_commit_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        // Simulate husky/commitlint: hooks shared via the parent .git reject
+        // every commit message. Bookkeeping commits must bypass them.
+        let hooks = repo.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        for hook in ["commit-msg", "pre-commit"] {
+            let path = hooks.join(hook);
+            fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        let worker = create_candidate_repository(repo, "hooked-worker").unwrap();
+        fs::write(worker.root.join("tracked.txt"), "changed\n").unwrap();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "hooked").unwrap();
+        assert_eq!(
+            git_text(repo, &["show", &format!("{checkpoint}:tracked.txt")])
+                .unwrap()
+                .trim(),
+            "changed"
+        );
     }
 
     #[test]
