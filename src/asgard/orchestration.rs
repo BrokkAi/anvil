@@ -245,9 +245,6 @@ struct FinalizeContext<'a> {
     prefinalize_workers: &'a [usize],
 }
 
-const PREFINALIZE_VERIFICATION_ONLY_ERROR: &str =
-    "prefinalize trajectories are verification-only; review the report, then discard";
-
 struct WorkerLaunch<'a> {
     cx: &'a ConnectionTo<Client>,
     sessions: &'a SessionStore,
@@ -307,11 +304,10 @@ async fn launch_worker<'a>(
          you are paused for review; the supervisor may resume you or branch another \
          worker from your state. When you stop making tool calls, your turn ends and \
          your final message is delivered to the supervisor - make it a precise report \
-         of what you did, what you verified, and what remains. Leave version control \
-         to the harness: do not commit, reset, or switch branches; if the task itself \
-         requires commits or branch delivery, state that in your final message instead \
-         of doing it. Commits named 'asgard checkpoint wN' in the history are harness \
-         bookkeeping - never amend, reword, rebase, or build on their messages."
+         of what you did, what you verified, and what remains. You work in a git \
+         worktree of a repository shared with other workers; asgard/* refs and \
+         sibling commits are harness state - do not modify, rebase, or build on them. \
+         Your own commits are fine; the harness snapshots your worktree regardless."
     ));
     messages.push(instruction_message.clone());
     crate::asgard::rewrite_asgard_cwd(
@@ -601,6 +597,17 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 "Previous supervisor turn ended without spawning or finalizing. Spawn workers or finalize now; after 3 idle turns Asgard will finalize the latest checkpoint or fail.",
             );
         }
+        let parent_status = if prefinalize_issued {
+            match parent_worktree_status_rollup(parent_registry.cwd()) {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!("failed to inspect Asgard parent worktree status: {error:#}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let status = render_asgard_status_block(
             &dag,
             &running_meta,
@@ -608,6 +615,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             pending.as_ref(),
             ASGARD_MAX_IN_FLIGHT.saturating_sub(running.len()),
             idle_note,
+            &parent_status,
         );
         let ephemeral = vec![ChatMessage::user(status)];
         let sinks = AsgardStreamSinks::new(&live_output, "Supervisor");
@@ -734,12 +742,13 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 }));
                 if let Some(finished) = pending.take() {
                     let window = pending_window.expect("pending window exists");
-                    let resolution = if prefinalize_workers.contains(&finished.worker) {
-                        PendingResolution::Discard
-                    } else {
-                        PendingResolution::Save
-                    };
-                    match resolve_pending(&stage, &mut dag, &finished, window, resolution) {
+                    match resolve_pending(
+                        &stage,
+                        &mut dag,
+                        &finished,
+                        window,
+                        PendingResolution::Save,
+                    ) {
                         Ok(_) => {
                             idle_pool.push(finished.repository);
                             continue;
@@ -1032,24 +1041,6 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                 finished.worker
             )));
             cx.idle_pool.push(finished.repository);
-        } else if cx.prefinalize_workers.contains(&finished.worker) {
-            let window = cx
-                .pending_window
-                .clone()
-                .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
-            let _ = resolve_pending(
-                cx.stage,
-                cx.dag,
-                &finished,
-                window,
-                PendingResolution::Discard,
-            )?;
-            state.discarded = true;
-            tail.push(ChatMessage::user(format!(
-                "w{} was discarded ({PREFINALIZE_VERIFICATION_ONLY_ERROR})",
-                finished.worker
-            )));
-            cx.idle_pool.push(finished.repository);
         } else {
             let window = cx
                 .pending_window
@@ -1153,15 +1144,12 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     "error: save_checkpoint: pending trajectory is already saved".to_string(),
                 );
             }
-            let Some(finished) = cx.pending.as_ref() else {
+            let Some(_) = cx.pending.as_ref() else {
                 return Ok(
                     "error: save_checkpoint: requires a just-reviewed pending trajectory"
                         .to_string(),
                 );
             };
-            if cx.prefinalize_workers.contains(&finished.worker) {
-                return Ok(format!("error: {PREFINALIZE_VERIFICATION_ONLY_ERROR}"));
-            }
             let outcome = save_pending_if_needed(cx, &mut state.saved_pending)?;
             let worker = cx
                 .pending
@@ -1230,9 +1218,6 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 Ok(spawns) => spawns,
                 Err(error) => return Ok(format!("error: {error}")),
             };
-            if spawns_from_pending_prefinalize(cx, &spawns) {
-                return Ok(format!("error: {PREFINALIZE_VERIFICATION_ONLY_ERROR}"));
-            }
             execute_spawn_requests(cx, state, spawns, SpawnKind::Regular).await
         }
         PREFINALIZE_TOOL => {
@@ -1459,18 +1444,6 @@ fn unresolved_prefinalize_workers(
                     .is_some_and(|finished| finished.worker == *worker && !state.saved_pending)
         })
         .collect()
-}
-
-fn spawns_from_pending_prefinalize(
-    cx: &SupervisorLoopContext<'_, '_>,
-    spawns: &[SpawnRequest],
-) -> bool {
-    cx.pending.as_ref().is_some_and(|finished| {
-        cx.prefinalize_workers.contains(&finished.worker)
-            && spawns
-                .iter()
-                .any(|spawn| spawn.from == CheckpointId::Worker(finished.worker))
-    })
 }
 
 fn dedup_spawn_requests(
@@ -2187,6 +2160,7 @@ fn render_asgard_status_block(
     pending: Option<&FinishedWorker>,
     capacity_available: usize,
     idle_note: Option<&str>,
+    parent_status: &[String],
 ) -> String {
     let mut live = Vec::new();
     live.extend(running.iter().map(|(worker, meta)| DagLiveEntry {
@@ -2219,6 +2193,14 @@ fn render_asgard_status_block(
     rendered.push_str("<dag>\n");
     rendered.push_str(&render_dag_overview(dag, &live));
     rendered.push_str("</dag>\n");
+    if !parent_status.is_empty() {
+        rendered.push_str("<parent_worktree_status>\n");
+        for line in parent_status {
+            rendered.push_str(line);
+            rendered.push('\n');
+        }
+        rendered.push_str("</parent_worktree_status>\n");
+    }
     rendered.push_str(&format!("capacity_available: {capacity_available}\n"));
     rendered.push_str("</asgard_status>\n");
     if let Some(note) = idle_note {
@@ -2226,6 +2208,56 @@ fn render_asgard_status_block(
         rendered.push('\n');
     }
     rendered
+}
+
+fn parent_worktree_status_rollup(root: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let status = String::from_utf8(output.stdout)?;
+    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+    for line in status.lines() {
+        let Some(path) = porcelain_status_path(line) else {
+            continue;
+        };
+        let group = first_two_component_group(path);
+        *groups.entry(group).or_default() += 1;
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(group, count)| {
+            if count > 1 {
+                format!("{group}/ [{count} files]")
+            } else {
+                group
+            }
+        })
+        .collect())
+}
+
+fn porcelain_status_path(line: &str) -> Option<&str> {
+    let path = line.get(3..)?.trim();
+    path.rsplit_once(" -> ")
+        .map(|(_, destination)| destination)
+        .or(Some(path))
+}
+
+fn first_two_component_group(path: &str) -> String {
+    let mut components = path.split('/');
+    let Some(first) = components.next() else {
+        return path.to_string();
+    };
+    let Some(second) = components.next() else {
+        return first.to_string();
+    };
+    format!("{first}/{second}")
 }
 
 pub(crate) fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
@@ -2550,19 +2582,30 @@ mod tests {
         tool_names: Vec<String>,
     }
 
+    type ScriptedResponseHook = Arc<dyn Fn(&str, &LlmResponse) + Send + Sync>;
+
     struct ScriptedAsgardBackend {
         responses: HashMap<String, Mutex<VecDeque<LlmResponse>>>,
         requests: Mutex<Vec<RecordedRequest>>,
+        response_hook: Option<ScriptedResponseHook>,
     }
 
     impl ScriptedAsgardBackend {
         fn new(responses: Vec<(&str, Vec<LlmResponse>)>) -> Self {
+            Self::new_with_response_hook(responses, None)
+        }
+
+        fn new_with_response_hook(
+            responses: Vec<(&str, Vec<LlmResponse>)>,
+            response_hook: Option<ScriptedResponseHook>,
+        ) -> Self {
             Self {
                 responses: responses
                     .into_iter()
                     .map(|(model, responses)| (model.to_string(), Mutex::new(responses.into())))
                     .collect(),
                 requests: Mutex::new(Vec::new()),
+                response_hook,
             }
         }
     }
@@ -2608,6 +2651,9 @@ mod tests {
                         "empty scripted response queue for model {model}; last request roles: {roles:?}"
                     )
                 });
+            if let Some(hook) = &self.response_hook {
+                hook(&model, &response);
+            }
             Box::pin(async move { Ok(response) })
         }
     }
@@ -3125,7 +3171,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefinalize_trajectories_are_viewable_but_verification_only() {
+    async fn parent_worktree_status_appears_after_prefinalize_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let hook_repo = repo.clone();
+        let hook = Arc::new(move |model: &str, response: &LlmResponse| {
+            if model == "sv-model"
+                && let LlmResponse::ToolCalls { calls, .. } = response
+                && calls
+                    .iter()
+                    .any(|call| call.function.name == PREFINALIZE_TOOL)
+            {
+                fs::write(hook_repo.join("README.md"), "hello\nparent dirty\n")
+                    .expect("dirty README");
+                fs::create_dir_all(hook_repo.join("src/asgard")).expect("create dirty dir");
+                fs::write(hook_repo.join("src/asgard/one.rs"), "one\n").expect("dirty one");
+                fs::write(hook_repo.join("src/asgard/two.rs"), "two\n").expect("dirty two");
+            }
+        });
+
+        let backend = Arc::new(ScriptedAsgardBackend::new_with_response_hook(
+            vec![
+                (
+                    "sv-model",
+                    vec![
+                        text_response("intake literal"),
+                        tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
+                        text_response("w1 launched"),
+                        tool_response(vec![
+                            save_call("sv-save-w1"),
+                            prefinalize_call("sv-prefinalize-w2", "w1", "verify w1"),
+                        ]),
+                        text_response("w2 launched"),
+                        tool_response(vec![
+                            discard_call("sv-discard-w2"),
+                            finalize_call_with_evidence("sv-finalize-w1", "w1", &["w1m1"]),
+                        ]),
+                    ],
+                ),
+                (
+                    "worker-model",
+                    vec![
+                        text_response("intake grounded"),
+                        tool_response(vec![named_tool_call(
+                            "w1-test",
+                            "run_shell_command",
+                            serde_json::json!({ "command": "true" }),
+                        )]),
+                        text_response("w1 report"),
+                        text_response("w2 verification report"),
+                    ],
+                ),
+            ],
+            Some(hook),
+        ));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise parent status")],
+        )
+        .await;
+
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        let requests = backend.requests.lock().expect("requests");
+        let supervisor_requests = requests
+            .iter()
+            .filter(|request| {
+                request.model == "sv-model"
+                    && request
+                        .tool_names
+                        .iter()
+                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
+            })
+            .collect::<Vec<_>>();
+        let texts = supervisor_requests
+            .iter()
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>();
+        let prefinalize_index = texts
+            .iter()
+            .position(|text| text.contains("prefinalize spawned w2 from w1"))
+            .expect("prefinalize tool result");
+        let status_index = texts
+            .iter()
+            .position(|text| text.contains("<parent_worktree_status>"))
+            .expect("parent status after prefinalize");
+        assert!(status_index > prefinalize_index);
+        assert!(
+            texts[..status_index]
+                .iter()
+                .all(|text| !text.contains("<parent_worktree_status>"))
+        );
+        let after_prefinalize = &texts[status_index];
+        assert!(after_prefinalize.contains("<parent_worktree_status>"));
+        assert!(after_prefinalize.contains("README.md"));
+        assert!(after_prefinalize.contains("src/asgard/ [2 files]"));
+    }
+
+    #[tokio::test]
+    async fn prefinalize_trajectories_are_viewable_saveable_and_spawnable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
@@ -3155,8 +3308,6 @@ mod tests {
                         spawn_call("sv-spawn-from-w2", "w2", "continue from verification"),
                     ]),
                     text_response("leave w2 unresolved"),
-                    tool_response(vec![spawn_call("sv-spawn-w3", "w1", "regular followup")]),
-                    text_response("w3 launched"),
                     text_response("leave w3 unresolved"),
                     text_response("idle one"),
                     text_response("idle two"),
@@ -3205,10 +3356,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(supervisor_text.contains("[viewed w2m1: read_file"));
-        assert!(supervisor_text.contains(&format!("error: {PREFINALIZE_VERIFICATION_ONLY_ERROR}")));
-        assert!(supervisor_text.contains(&format!(
-            "w2 was discarded ({PREFINALIZE_VERIFICATION_ONLY_ERROR})"
-        )));
+        assert!(supervisor_text.contains("saved checkpoint w2"));
+        assert!(supervisor_text.contains("spawned w3 from w2"));
         assert!(supervisor_text.contains("w3 was auto-saved: the turn ended without resolving it"));
     }
 
@@ -3815,11 +3964,10 @@ mod tests {
                     )]),
                     text_response("w4 launched"),
                     tool_response(vec![discard_call("sv-discard-w4")]),
-                    tool_response(vec![finalize_call_with_evidence_and_abandoned(
+                    tool_response(vec![finalize_call_with_evidence(
                         "sv-finalize-merged",
                         "w3",
                         &["w1m2"],
-                        &["w2"],
                     )]),
                 ],
             ),
@@ -3866,7 +4014,7 @@ mod tests {
             .join("\n");
         assert!(supervisor_text.contains("merged w2 onto w1 as w3"));
         assert!(supervisor_text.contains("b.txt"));
-        assert!(supervisor_text.contains("diffstat: a.txt"));
+        assert!(supervisor_text.contains("diffstat: b.txt"));
     }
 
     #[test]
@@ -4064,7 +4212,7 @@ mod tests {
             .join("\n");
         assert!(supervisor_text.contains("error: merge_checkpoint"));
         assert!(supervisor_text.contains("same.txt"));
-        assert!(supervisor_text.contains("conflicting hunks"));
+        assert!(!supervisor_text.contains("conflicting hunks"));
         assert!(supervisor_text.contains("spawn a worker from the onto checkpoint"));
     }
 
@@ -4201,7 +4349,7 @@ mod tests {
             .expect("in-memory ACP connect_with");
         drain.abort();
 
-        assert_eq!(outcome.response, "w1 done");
+        assert_eq!(outcome.response, "w3 verification report");
         let requests = backend.requests.lock().expect("requests");
         let supervisor_requests = requests
             .iter()
@@ -4728,6 +4876,7 @@ mod tests {
             None,
             4,
             Some("No worker is awaiting review. Spawn workers or finalize."),
+            &[],
         );
 
         assert!(rendered.contains("<asgard_status>"));

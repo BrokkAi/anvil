@@ -441,71 +441,46 @@ impl SnapshotStage {
         if merge_base == from_commit {
             return Ok(MergeCheckpointOutcome::NoChanges { diffstat });
         }
-        let diff = git(
+        let scratch = create_candidate_repository_at(
             &self.parent_root,
-            &[
-                "diff",
-                "--binary",
-                "--no-ext-diff",
-                &merge_base,
-                from_commit,
-                "--",
-                ".",
-                ":(exclude).brokk/**",
-                ":(exclude).bifrost/**",
-            ],
-        )?
-        .stdout;
-        let index_path =
-            std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
-        let _index_guard = TemporaryIndex::new(index_path.clone());
-
-        git_with_index(&self.parent_root, &index_path, &["read-tree", onto_commit])?;
-        if let Err(error) = git_with_index_stdin(
-            &self.parent_root,
-            &index_path,
-            &["apply", "--cached", "--3way", "--binary", "-"],
-            &diff,
-        ) {
-            let conflicts = conflicted_files_from_index(&self.parent_root, &index_path)?;
-            return Err(merge_conflict_error(&diff, conflicts, &error));
-        }
-        let tree = String::from_utf8(
-            git_with_index(&self.parent_root, &index_path, &["write-tree"])?.stdout,
-        )
-        .context("git write-tree output was not UTF-8")?;
-        let tree = tree.trim();
-        let onto_tree = git_text(
-            &self.parent_root,
-            &["rev-parse", &format!("{onto_commit}^{{tree}}")],
+            &format!("merge-{name}"),
+            onto_commit,
         )?;
-        if tree == onto_tree.trim() {
-            return Ok(MergeCheckpointOutcome::NoChanges { diffstat });
-        }
-        let message = format!("asgard checkpoint {name}");
-        let commit = String::from_utf8(
-            git_with_index(
-                &self.parent_root,
-                &index_path,
-                &[
-                    "-c",
-                    "user.name=asgard",
-                    "-c",
-                    "user.email=asgard@anvil.invalid",
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    onto_commit,
-                    "-m",
-                    &message,
-                ],
-            )?
-            .stdout,
-        )
-        .context("git commit-tree output was not UTF-8")?;
-        let commit = commit.trim().to_string();
+        let merge_result = git(
+            &scratch.root,
+            &[
+                "-c",
+                "user.name=asgard",
+                "-c",
+                "user.email=asgard@anvil.invalid",
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                from_commit,
+            ],
+        );
+        let commit = match merge_result {
+            Ok(_) => git_text(&scratch.root, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string(),
+            Err(error) => {
+                let conflicts = conflicted_files_from_worktree(&scratch.root)?;
+                let abort_result = git(&scratch.root, &["merge", "--abort"]);
+                let abort_error = abort_result.err().map(|error| format!("{error:#}"));
+                remove_candidate_repository(&scratch);
+                return Err(merge_conflict_error(
+                    conflicts,
+                    &error,
+                    abort_error.as_deref(),
+                ));
+            }
+        };
         let reference = format!("refs/asgard/{}/{name}", self.run_id);
-        self.update_ref(&reference, &commit)?;
+        if let Err(error) = self.update_ref(&reference, &commit) {
+            remove_candidate_repository(&scratch);
+            return Err(error);
+        }
+        remove_candidate_repository(&scratch);
         Ok(MergeCheckpointOutcome::Merged { commit, diffstat })
     }
 
@@ -597,37 +572,6 @@ fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<std::proces
         .output()?;
     if !output.status.success() {
         bail!("{}", git_error_message(cwd, args, &output));
-    }
-    Ok(output)
-}
-
-fn git_with_index_stdin(
-    cwd: &Path,
-    index: &Path,
-    args: &[&str],
-    stdin: &[u8],
-) -> Result<std::process::Output, String> {
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_INDEX_FILE", index)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("git {} failed to start: {error}", args.join(" ")))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| format!("git {} stdin unavailable", args.join(" ")))?
-        .write_all(stdin)
-        .map_err(|error| format!("git {} stdin failed: {error}", args.join(" ")))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("git {} failed: {error}", args.join(" ")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_string());
     }
     Ok(output)
 }
@@ -784,58 +728,38 @@ fn merge_base(root: &Path, from_commit: &str, onto_commit: &str) -> Result<Strin
         .to_string())
 }
 
-fn conflicted_files_from_index(root: &Path, index: &Path) -> Result<Vec<String>> {
-    let output = git_with_index(root, index, &["ls-files", "-u", "-z"])?;
-    let mut files = Vec::new();
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        let Some(tab_index) = entry.iter().position(|byte| *byte == b'\t') else {
-            continue;
-        };
-        let path = String::from_utf8_lossy(&entry[tab_index + 1..]).to_string();
-        if !files.iter().any(|file| file == &path) {
-            files.push(path);
-        }
-    }
-    Ok(files)
+fn conflicted_files_from_worktree(root: &Path) -> Result<Vec<String>> {
+    let output = git(root, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).to_string())
+        .collect())
 }
 
-fn merge_conflict_error(diff: &[u8], conflicts: Vec<String>, apply_error: &str) -> anyhow::Error {
-    let mut message = String::from("merge_checkpoint failed to apply patch");
+fn merge_conflict_error(
+    conflicts: Vec<String>,
+    merge_error: &anyhow::Error,
+    abort_error: Option<&str>,
+) -> anyhow::Error {
+    let mut message = String::from("merge_checkpoint failed to merge");
     if conflicts.is_empty() {
-        message.push_str(&format!(":\n{}", apply_error.trim()));
+        message.push_str(&format!(":\n{merge_error:#}"));
     } else {
         message.push_str("; conflicted files:\n");
         for file in conflicts {
-            let hunk_count = patch_hunk_count_for_file(diff, &file);
-            message.push_str(&format!("- {file} ({hunk_count} conflicting hunks)\n"));
+            message.push_str(&format!("- {file}\n"));
         }
         message.push_str(
             "The supervisor can spawn a worker from the onto checkpoint with instructions to \
              resolve these conflicts, then save that resolved checkpoint.",
         );
     }
-    anyhow::anyhow!("{message}")
-}
-
-fn patch_hunk_count_for_file(diff: &[u8], file: &str) -> usize {
-    let diff = String::from_utf8_lossy(diff);
-    let a_marker = format!("a/{file}");
-    let b_marker = format!("b/{file}");
-    let mut in_file = false;
-    let mut count = 0;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            in_file = rest
-                .split_whitespace()
-                .any(|path| path == a_marker || path == b_marker);
-        } else if in_file && line.starts_with("@@ ") {
-            count += 1;
-        }
+    if let Some(abort_error) = abort_error {
+        message.push_str(&format!("\ngit merge --abort failed: {abort_error}"));
     }
-    count
+    anyhow::anyhow!("{message}")
 }
 
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -1262,12 +1186,9 @@ mod tests {
             "onto\n"
         );
         assert!(diffstat.contains("from.txt"));
-        assert_eq!(
-            git_text(repo, &["rev-parse", &format!("{commit}^")])
-                .unwrap()
-                .trim(),
-            onto
-        );
+        let parents = git_text(repo, &["rev-list", "--parents", "-n", "1", &commit]).unwrap();
+        let parents = parents.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(parents, vec![commit.as_str(), onto.as_str(), from.as_str()]);
 
         remove_candidate_repository(&from_worker);
         remove_candidate_repository(&onto_worker);
@@ -1390,19 +1311,25 @@ mod tests {
         let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let error = stage
-            .merge_checkpoint(&from, &onto, "conflict")
+            .merge_checkpoint(&from, &onto, "scratch-conflict")
             .expect_err("conflict");
         let error = format!("{error:#}");
 
         assert!(error.contains("same.txt"));
-        assert!(error.contains("conflicting hunks"));
+        assert!(!error.contains("conflicting hunks"));
         assert!(error.contains("spawn a worker from the onto checkpoint"));
+        assert_eq!(git_text(repo, &["status", "--porcelain"]).unwrap(), "");
+        assert!(
+            !git_text(repo, &["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains("asgard-merge-scratch-conflict-")
+        );
         assert!(
             Command::new("git")
                 .args([
                     "rev-parse",
                     "--verify",
-                    &format!("refs/asgard/{}/conflict", stage.run_id)
+                    &format!("refs/asgard/{}/scratch-conflict", stage.run_id)
                 ])
                 .current_dir(repo)
                 .status()
@@ -1473,7 +1400,8 @@ mod tests {
             .expect_err("conflicting merge");
         let error = format!("{error:#}");
         assert!(error.contains("same.txt"));
-        assert!(error.contains("conflicting hunks"));
+        assert!(!error.contains("conflicting hunks"));
+        assert_eq!(git_text(repo, &["status", "--porcelain"]).unwrap(), "");
 
         let expected_patch = git(
             repo,
