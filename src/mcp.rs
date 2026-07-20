@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.8.2";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.8.6";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
 const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
