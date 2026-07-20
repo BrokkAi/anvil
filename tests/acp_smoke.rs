@@ -3184,6 +3184,44 @@ fn text_sse_body(text: &str) -> String {
 fn install_fake_managed_bifrost(config_home: &Path, temp: &Path, bifrost_log: &Path) {
     let fake_bifrost = make_fake_bifrost_binary(temp, bifrost_log);
     seed_fake_managed_bifrost(config_home, &fake_bifrost);
+
+    // A batch script copied to `bifrost.exe` is enough to satisfy bundled
+    // Bifrost discovery, but Windows cannot execute that text file as a PE
+    // binary. Persist an equivalent custom Bifrost command through cmd.exe so
+    // smoke tests exercise the setup/default MCP merge with a runnable shim.
+    #[cfg(windows)]
+    persist_windows_fake_bifrost(config_home, &fake_bifrost);
+}
+
+#[cfg(windows)]
+fn persist_windows_fake_bifrost(config_home: &Path, fake_bifrost: &str) {
+    let command = std::env::var_os("COMSPEC")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cmd.exe".to_string());
+    let setup = json!({
+        "mcp_servers": [{
+            "name": "bifrost",
+            "transport": "stdio",
+            "command": command,
+            "args": [
+                "/D",
+                "/C",
+                fake_bifrost,
+                "--root",
+                "{cwd}",
+                "--mcp",
+                "core",
+                "--no-line-numbers"
+            ],
+            "framing": "line",
+            "enabled": true
+        }]
+    });
+    std::fs::write(
+        config_home.join("setup.json"),
+        serde_json::to_vec_pretty(&setup).expect("serialize fake Windows Bifrost setup"),
+    )
+    .expect("persist fake Windows Bifrost setup");
 }
 
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {

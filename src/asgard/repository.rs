@@ -533,6 +533,21 @@ fn same_permissions(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.permissions().readonly() == right.permissions().readonly()
 }
 
+#[cfg(windows)]
+fn open_for_metadata_update(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_for_metadata_update(path: &Path) -> std::io::Result<fs::File> {
+    fs::File::open(path)
+}
+
 fn copy_file(source: &Path, destination: &Path, source_metadata: &fs::Metadata) -> Result<()> {
     fs::copy(source, destination).with_context(|| {
         format!(
@@ -541,9 +556,32 @@ fn copy_file(source: &Path, destination: &Path, source_metadata: &fs::Metadata) 
             destination.display()
         )
     })?;
-    fs::set_permissions(destination, source_metadata.permissions())?;
-    fs::File::open(destination)?
-        .set_times(fs::FileTimes::new().set_modified(source_metadata.modified()?))?;
+    fs::set_permissions(destination, source_metadata.permissions()).with_context(|| {
+        format!(
+            "preserve permissions on Asgard repository file {}",
+            destination.display()
+        )
+    })?;
+    let modified = source_metadata.modified().with_context(|| {
+        format!(
+            "read modification time for Asgard repository file {}",
+            source.display()
+        )
+    })?;
+    open_for_metadata_update(destination)
+        .with_context(|| {
+            format!(
+                "open Asgard repository file {} for metadata update",
+                destination.display()
+            )
+        })?
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .with_context(|| {
+            format!(
+                "preserve modification time on Asgard repository file {}",
+                destination.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -876,6 +914,34 @@ mod tests {
         for repository in &repositories {
             remove_candidate_repository(repository);
         }
+    }
+
+    #[test]
+    fn copy_file_preserves_contents_and_modified_time() {
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        fs::write(&source, "source contents\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567)),
+            )
+            .unwrap();
+        let source_metadata = fs::metadata(&source).unwrap();
+
+        copy_file(&source, &destination, &source_metadata).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"source contents\n");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().modified().unwrap(),
+            source_metadata.modified().unwrap()
+        );
     }
 
     #[cfg(unix)]
