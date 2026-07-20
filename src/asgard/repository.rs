@@ -2,7 +2,9 @@
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 use std::{fs, io::Write};
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +29,7 @@ pub(crate) fn config() -> Option<&'static Config> {
 pub(crate) struct CandidateRepository {
     pub root: PathBuf,
     pub session_cwd: PathBuf,
+    parent_root: PathBuf,
 }
 
 pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
@@ -41,7 +44,7 @@ pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
         .collect();
     if !unexpected.is_empty() {
         bail!(
-            "Asgard clone prototype requires code files to be clean (dirty: {})",
+            "Asgard requires code files to be clean (dirty: {})",
             unexpected.join(", ")
         );
     }
@@ -63,16 +66,18 @@ pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     child
         .stdin
         .as_mut()
         .context("git apply stdin")?
         .write_all(patch)?;
-    if !child.wait()?.success() {
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
         bail!(
-            "failed to apply selected Asgard patch in {}",
-            root.display()
+            "{}",
+            git_error_message(root, &["apply", "--binary", "-"], &output)
         );
     }
     Ok(())
@@ -92,35 +97,20 @@ pub(crate) fn create_candidate_repository_at(
     let repo = git_text(cwd, &["rev-parse", "--show-toplevel"])?;
     let repo = PathBuf::from(repo.trim());
     let relative = cwd.strip_prefix(&repo).unwrap_or(Path::new(""));
-    let parent = std::env::temp_dir().join("anvil-asgard-clones");
+    let parent = std::env::temp_dir().join("anvil-asgard-worktrees");
     fs::create_dir_all(&parent)?;
     let root = parent.join(format!(
         "asgard-{}-{}",
         safe_repository_label(label),
         uuid::Uuid::new_v4()
     ));
-    let status = Command::new("git")
-        .args(["clone", "--shared", "--no-checkout", "--quiet", "--"])
-        .arg(&repo)
-        .arg(&root)
-        .stdout(Stdio::null())
-        .status()?;
-    if !status.success() {
-        remove_directory(&root, "incomplete Asgard clone");
-        bail!("failed to create Asgard clone {}", root.display());
-    }
-    let checkout = Command::new("git")
-        .args(["checkout", "--detach", "--quiet", "--force"])
-        .arg(checkout_commit)
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .status()?;
-    if !checkout.success() {
-        remove_directory(&root, "incomplete Asgard clone");
-        bail!("failed to check out Asgard clone {}", root.display());
+    if let Err(error) = git_worktree_add(&repo, &root, checkout_commit) {
+        remove_directory(&root, "incomplete Asgard worktree");
+        return Err(error);
     }
     let repository = CandidateRepository {
         session_cwd: root.join(relative),
+        parent_root: repo.clone(),
         root,
     };
     if let Err(error) = seed_build_bootstrap_files(&repo, &repository.root) {
@@ -136,20 +126,15 @@ pub(crate) fn recycle_repository(
 ) -> Result<()> {
     git(
         &repository.root,
-        &["reset", "--hard", "--quiet", checkout_commit],
+        &[
+            "checkout",
+            "--detach",
+            "--quiet",
+            "--force",
+            checkout_commit,
+        ],
     )?;
-    git(&repository.root, &["clean", "-fdq"])?;
-    git(
-        &repository.root,
-        &["checkout", "--detach", "--quiet", "HEAD"],
-    )?;
-    let branches = git_text(
-        &repository.root,
-        &["for-each-ref", "refs/heads", "--format=%(refname:short)"],
-    )?;
-    for branch in branches.lines().filter(|branch| !branch.is_empty()) {
-        git(&repository.root, &["branch", "-D", branch])?;
-    }
+    git(&repository.root, &["clean", "-fd"])?;
     Ok(())
 }
 
@@ -167,14 +152,14 @@ fn safe_repository_label(label: &str) -> String {
     sanitized.trim_matches('-').to_owned()
 }
 
-/// Fresh Git clones omit ignored files that a harness may have provisioned
+/// Fresh Git worktrees omit ignored files that a harness may have provisioned
 /// after checkout. Keep small build-launcher payloads available to every lane so
 /// candidates have the same validation entry point as the parent checkout.
-fn seed_build_bootstrap_files(repo: &Path, clone: &Path) -> Result<()> {
+fn seed_build_bootstrap_files(repo: &Path, worktree: &Path) -> Result<()> {
     for relative in [Path::new("gradle/wrapper"), Path::new(".mvn/wrapper")] {
         let source = repo.join(relative);
         if source.is_dir() {
-            copy_missing_tree(&source, &clone.join(relative))?;
+            copy_missing_tree(&source, &worktree.join(relative))?;
         }
     }
     Ok(())
@@ -319,16 +304,22 @@ fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
         .env("GIT_INDEX_FILE", index)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     child
         .stdin
         .as_mut()
         .context("write untracked paths to temporary Asgard index")?
         .write_all(&untracked)?;
-    if !child.wait()?.success() {
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
         bail!(
-            "git add -N for untracked files failed in {}",
-            root.display()
+            "{}",
+            git_error_message(
+                root,
+                &["add", "-N", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                &output
+            )
         );
     }
     Ok(())
@@ -373,6 +364,7 @@ impl Drop for TemporaryIndex {
 pub(crate) struct SnapshotStage {
     parent_root: PathBuf,
     run_id: String,
+    ref_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -388,71 +380,31 @@ impl SnapshotStage {
         Ok(Self {
             parent_root,
             run_id: run_id.to_string(),
+            ref_lock: Mutex::new(()),
         })
     }
 
-    pub(crate) fn snapshot(
-        &self,
-        worker_root: &Path,
-        parent_commit: &str,
-        name: &str,
-    ) -> Result<String> {
-        let git_dir = git_text(&self.parent_root, &["rev-parse", "--absolute-git-dir"])?;
-        let git_dir = PathBuf::from(git_dir.trim());
-        let object_dir = git_dir.join("objects");
-        let index_path =
-            std::env::temp_dir().join(format!("anvil-asgard-index-{}", uuid::Uuid::new_v4()));
-        let _index_guard = TemporaryIndex::new(index_path.clone());
-
-        git_with_index_object_directory(
+    pub(crate) fn snapshot(&self, worker_root: &Path, name: &str) -> Result<String> {
+        add_all_for_checkpoint(worker_root)?;
+        let message = format!("asgard checkpoint {name}");
+        git(
             worker_root,
-            &index_path,
-            &object_dir,
             &[
-                "add",
-                "-A",
-                "--",
-                ".",
-                ":(exclude).brokk/**",
-                ":(exclude).bifrost/**",
+                "-c",
+                "user.name=asgard",
+                "-c",
+                "user.email=asgard@anvil.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                &message,
             ],
         )?;
-        let tree = String::from_utf8(
-            git_with_index_object_directory(
-                worker_root,
-                &index_path,
-                &object_dir,
-                &["write-tree"],
-            )?
-            .stdout,
-        )
-        .context("git write-tree output was not UTF-8")?;
-        let tree = tree.trim();
-        let message = format!("asgard checkpoint {name}");
-        let commit = String::from_utf8(
-            git_with_index_object_directory(
-                worker_root,
-                &index_path,
-                &object_dir,
-                &[
-                    "-c",
-                    "user.name=asgard",
-                    "-c",
-                    "user.email=asgard@anvil.invalid",
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    parent_commit,
-                    "-m",
-                    &message,
-                ],
-            )?
-            .stdout,
-        )
-        .context("git commit-tree output was not UTF-8")?;
-        let commit = commit.trim().to_string();
+        let commit = git_text(worker_root, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
         let reference = format!("refs/asgard/{}/{name}", self.run_id);
-        git(&self.parent_root, &["update-ref", &reference, &commit])?;
+        self.update_ref(&reference, &commit)?;
         Ok(commit)
     }
 
@@ -553,8 +505,17 @@ impl SnapshotStage {
         .context("git commit-tree output was not UTF-8")?;
         let commit = commit.trim().to_string();
         let reference = format!("refs/asgard/{}/{name}", self.run_id);
-        git(&self.parent_root, &["update-ref", &reference, &commit])?;
+        self.update_ref(&reference, &commit)?;
         Ok(MergeCheckpointOutcome::Merged { commit, diffstat })
+    }
+
+    fn update_ref(&self, reference: &str, commit: &str) -> Result<()> {
+        let _guard = self
+            .ref_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        git(&self.parent_root, &["update-ref", reference, commit])?;
+        Ok(())
     }
 
     pub(crate) fn cleanup(&self) {
@@ -585,11 +546,31 @@ impl SnapshotStage {
                 tracing::warn!("failed to list Asgard snapshot refs for cleanup: {error}");
             }
         }
+        if let Err(error) = git(&self.parent_root, &["worktree", "prune"]) {
+            tracing::warn!("failed to prune Asgard worktrees during cleanup: {error}");
+        }
     }
 }
 
 pub(crate) fn remove_candidate_repository(repository: &CandidateRepository) {
-    remove_directory(&repository.root, "Asgard candidate repository");
+    if let Err(error) = git(
+        &repository.parent_root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            path_to_str(&repository.root).unwrap_or(""),
+        ],
+    ) {
+        tracing::warn!(
+            path = %repository.root.display(),
+            "failed to remove Asgard worktree via git: {error}"
+        );
+        remove_directory(&repository.root, "Asgard candidate worktree");
+    }
+    if let Err(error) = git(&repository.parent_root, &["worktree", "prune"]) {
+        tracing::warn!("failed to prune Asgard worktrees after removal: {error}");
+    }
 }
 
 fn remove_directory(path: &Path, description: &str) {
@@ -603,7 +584,7 @@ fn remove_directory(path: &Path, description: &str) {
 fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     let output = Command::new("git").args(args).current_dir(cwd).output()?;
     if !output.status.success() {
-        bail!("git {} failed in {}", args.join(" "), cwd.display());
+        bail!("{}", git_error_message(cwd, args, &output));
     }
     Ok(output)
 }
@@ -615,7 +596,7 @@ fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<std::proces
         .env("GIT_INDEX_FILE", index)
         .output()?;
     if !output.status.success() {
-        bail!("git {} failed in {}", args.join(" "), cwd.display());
+        bail!("{}", git_error_message(cwd, args, &output));
     }
     Ok(output)
 }
@@ -649,6 +630,138 @@ fn git_with_index_stdin(
         return Err(stderr.trim().to_string());
     }
     Ok(output)
+}
+
+fn git_worktree_add(parent_root: &Path, root: &Path, checkout_commit: &str) -> Result<()> {
+    let root = path_to_str(root)?;
+    git(
+        parent_root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            root,
+            checkout_commit,
+        ],
+    )?;
+    Ok(())
+}
+
+fn add_all_for_checkpoint(root: &Path) -> Result<()> {
+    let args = [
+        "add",
+        "-A",
+        "--",
+        ".",
+        ":(exclude).brokk/**",
+        ":(exclude).bifrost/**",
+    ];
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match git(root, &args) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    add_all_for_checkpoint_from_filtered_pathspecs(root).with_context(|| {
+        format!(
+            "git add -A failed after retries in {}; final retry error: {}",
+            root.display(),
+            last_error
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    })
+}
+
+fn add_all_for_checkpoint_from_filtered_pathspecs(root: &Path) -> Result<()> {
+    git(
+        root,
+        &[
+            "add",
+            "-u",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?;
+    let listed = git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?
+    .stdout;
+    let untracked: Vec<u8> = listed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter(|path| path_exists(root, path))
+        .flat_map(|path| path.iter().copied().chain(std::iter::once(0)))
+        .collect();
+    if untracked.is_empty() {
+        return Ok(());
+    }
+    let mut child = Command::new("git")
+        .args(["add", "--pathspec-from-file=-", "--pathspec-file-nul"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .context("write untracked paths to Asgard checkpoint add")?
+        .write_all(&untracked)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "{}",
+            git_error_message(root, &["add", "--pathspec-from-file=-"], &output)
+        );
+    }
+    Ok(())
+}
+
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))
+}
+
+fn git_error_message(cwd: &Path, args: &[&str], output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!(
+            "git {} failed in {} with status {}",
+            args.join(" "),
+            cwd.display(),
+            output.status
+        )
+    } else {
+        format!(
+            "git {} failed in {} with status {}; stderr:\n{}",
+            args.join(" "),
+            cwd.display(),
+            output.status,
+            stderr
+        )
+    }
 }
 
 fn merge_base(root: &Path, from_commit: &str, onto_commit: &str) -> Result<String> {
@@ -723,24 +836,6 @@ fn patch_hunk_count_for_file(diff: &[u8], file: &str) -> usize {
         }
     }
     count
-}
-
-fn git_with_index_object_directory(
-    cwd: &Path,
-    index: &Path,
-    object_directory: &Path,
-    args: &[&str],
-) -> Result<std::process::Output> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_INDEX_FILE", index)
-        .env("GIT_OBJECT_DIRECTORY", object_directory)
-        .output()?;
-    if !output.status.success() {
-        bail!("git {} failed in {}", args.join(" "), cwd.display());
-    }
-    Ok(output)
 }
 
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -850,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_clone_patch_applies_tracked_deletions_to_parent() {
+    fn candidate_worktree_patch_applies_tracked_deletions_to_parent() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -906,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_writes_parent_ref_and_shared_clone_can_checkout_commit() {
+    fn snapshot_writes_parent_ref_and_worktree_can_checkout_commit() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -923,9 +1018,7 @@ mod tests {
         fs::write(worker.root.join(".brokk/state.txt"), "excluded\n").unwrap();
 
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage
-            .snapshot(&worker.root, base_commit.trim(), "first")
-            .unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "first").unwrap();
 
         assert_eq!(
             git_text(
@@ -978,16 +1071,12 @@ mod tests {
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
         run_git(repo, &["add", "tracked.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-
         let worker = create_candidate_repository(repo, "snapshot-chain").unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
         fs::write(worker.root.join("tracked.txt"), "snapshot a\n").unwrap();
-        let first = stage
-            .snapshot(&worker.root, base_commit.trim(), "a")
-            .unwrap();
+        let first = stage.snapshot(&worker.root, "a").unwrap();
         fs::write(worker.root.join("tracked.txt"), "snapshot b\n").unwrap();
-        let second = stage.snapshot(&worker.root, &first, "b").unwrap();
+        let second = stage.snapshot(&worker.root, "b").unwrap();
 
         assert_eq!(
             git_text(repo, &["rev-parse", &format!("{second}^")])
@@ -1001,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_ignores_worker_commit_history_and_uses_harness_parent() {
+    fn snapshot_preserves_worker_commit_history() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -1009,7 +1098,7 @@ mod tests {
         fs::write(repo.join("tracked.txt"), "base\n").unwrap();
         run_git(repo, &["add", "tracked.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let _base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
 
         let worker = create_candidate_repository(repo, "snapshot-committed-worker").unwrap();
         configure_test_user(&worker.root);
@@ -1022,13 +1111,10 @@ mod tests {
         fs::write(worker.root.join("untracked.txt"), "worktree addition\n").unwrap();
 
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage
-            .snapshot(&worker.root, base_commit.trim(), "after-worker-commit")
-            .unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "after-worker-commit").unwrap();
         let checkpoint_parent = git_text(repo, &["rev-parse", &format!("{checkpoint}^")]).unwrap();
 
-        assert_eq!(checkpoint_parent.trim(), base_commit.trim());
-        assert_ne!(checkpoint_parent.trim(), worker_commit.trim());
+        assert_eq!(checkpoint_parent.trim(), worker_commit.trim());
         assert_eq!(
             git_text(repo, &["show", &format!("{checkpoint}:tracked.txt")])
                 .unwrap()
@@ -1047,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn recycle_repository_preserves_ignored_files_cleans_untracked_and_deletes_branches() {
+    fn recycle_repository_preserves_ignored_files_and_cleans_untracked() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -1086,11 +1172,9 @@ mod tests {
             target_commit.trim()
         );
         assert_eq!(
-            git_text(
-                &candidate.root,
-                &["for-each-ref", "refs/heads", "--format=%(refname:short)"]
-            )
-            .unwrap(),
+            git_text(&candidate.root, &["branch", "--show-current"])
+                .unwrap()
+                .trim(),
             ""
         );
 
@@ -1114,9 +1198,7 @@ mod tests {
         fs::remove_file(worker.root.join("deleted.txt")).unwrap();
         fs::write(worker.root.join("added.txt"), "added\n").unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage
-            .snapshot(&worker.root, base_commit.trim(), "patch")
-            .unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "patch").unwrap();
         let patch = stage
             .finalize_patch(base_commit.trim(), &checkpoint)
             .unwrap();
@@ -1142,20 +1224,15 @@ mod tests {
         fs::write(repo.join("base.txt"), "base\n").unwrap();
         run_git(repo, &["add", "base.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
 
         let from_worker = create_candidate_repository(repo, "merge-from").unwrap();
         fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
-        let from = stage
-            .snapshot(&from_worker.root, base_commit.trim(), "from")
-            .unwrap();
+        let from = stage.snapshot(&from_worker.root, "from").unwrap();
 
         let onto_worker = create_candidate_repository(repo, "merge-onto").unwrap();
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage
-            .snapshot(&onto_worker.root, base_commit.trim(), "onto")
-            .unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let MergeCheckpointOutcome::Merged { commit, diffstat } =
             stage.merge_checkpoint(&from, &onto, "merged").unwrap()
@@ -1206,28 +1283,20 @@ mod tests {
         fs::write(repo.join("base.txt"), "base\n").unwrap();
         run_git(repo, &["add", "base.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let base_commit = base_commit.trim();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
 
         let from_one_worker = create_candidate_repository(repo, "merge-from-one").unwrap();
         fs::write(from_one_worker.root.join("first.txt"), "first\n").unwrap();
-        let from_one = stage
-            .snapshot(&from_one_worker.root, base_commit, "from-one")
-            .unwrap();
+        let from_one = stage.snapshot(&from_one_worker.root, "from-one").unwrap();
 
         let from_two_worker =
             create_candidate_repository_at(repo, "merge-from-two", &from_one).unwrap();
         fs::write(from_two_worker.root.join("second.txt"), "second\n").unwrap();
-        let from_two = stage
-            .snapshot(&from_two_worker.root, &from_one, "from-two")
-            .unwrap();
+        let from_two = stage.snapshot(&from_two_worker.root, "from-two").unwrap();
 
         let onto_worker = create_candidate_repository(repo, "merge-onto-multihop").unwrap();
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage
-            .snapshot(&onto_worker.root, base_commit, "onto")
-            .unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let MergeCheckpointOutcome::Merged { commit, diffstat } =
             stage.merge_checkpoint(&from_two, &onto, "merged").unwrap()
@@ -1265,19 +1334,15 @@ mod tests {
         fs::write(repo.join("base.txt"), "base\n").unwrap();
         run_git(repo, &["add", "base.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let base_commit = base_commit.trim();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
 
         let from_worker = create_candidate_repository(repo, "merge-noop-from").unwrap();
         fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
-        let from = stage
-            .snapshot(&from_worker.root, base_commit, "from")
-            .unwrap();
+        let from = stage.snapshot(&from_worker.root, "from").unwrap();
 
         let onto_worker = create_candidate_repository_at(repo, "merge-noop-onto", &from).unwrap();
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, &from, "onto").unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let MergeCheckpointOutcome::NoChanges { diffstat } =
             stage.merge_checkpoint(&from, &onto, "noop").unwrap()
@@ -1314,20 +1379,15 @@ mod tests {
         fs::write(repo.join("same.txt"), "base\n").unwrap();
         run_git(repo, &["add", "same.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
 
         let from_worker = create_candidate_repository(repo, "merge-conflict-from").unwrap();
         fs::write(from_worker.root.join("same.txt"), "from\n").unwrap();
-        let from = stage
-            .snapshot(&from_worker.root, base_commit.trim(), "from")
-            .unwrap();
+        let from = stage.snapshot(&from_worker.root, "from").unwrap();
 
         let onto_worker = create_candidate_repository(repo, "merge-conflict-onto").unwrap();
         fs::write(onto_worker.root.join("same.txt"), "onto\n").unwrap();
-        let onto = stage
-            .snapshot(&onto_worker.root, base_commit.trim(), "onto")
-            .unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let error = stage
             .merge_checkpoint(&from, &onto, "conflict")
@@ -1380,7 +1440,7 @@ mod tests {
             "line 1\nA edits the shared line\nline 3\nline 4\n",
         )
         .unwrap();
-        let a = stage.snapshot(&a_worker.root, base_commit, "a").unwrap();
+        let a = stage.snapshot(&a_worker.root, "a").unwrap();
 
         let b_worker = create_candidate_repository(repo, "merge-corruption-b").unwrap();
         fs::write(
@@ -1388,7 +1448,7 @@ mod tests {
             "line 1\nB edits the shared line\nline 3\nline 4\n",
         )
         .unwrap();
-        let b = stage.snapshot(&b_worker.root, base_commit, "b").unwrap();
+        let b = stage.snapshot(&b_worker.root, "b").unwrap();
 
         let target_worker =
             create_candidate_repository_at(repo, "merge-corruption-target", &a).unwrap();
@@ -1406,7 +1466,7 @@ mod tests {
              target content line 5\n",
         )
         .unwrap();
-        let target = stage.snapshot(&target_worker.root, &a, "target").unwrap();
+        let target = stage.snapshot(&target_worker.root, "target").unwrap();
 
         let error = stage
             .merge_checkpoint(&b, &target, "conflicted-merge")

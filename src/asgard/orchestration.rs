@@ -526,7 +526,11 @@ pub(crate) async fn run_asgard_trajectory_loop(
             .map(ChatMessage::content_text)
             .as_deref(),
     );
-    let mut dag = TrajectoryDag::new(initial_messages.clone(), base_commit.clone());
+    let mut dag = TrajectoryDag::new_with_git_root(
+        initial_messages.clone(),
+        base_commit.clone(),
+        parent_registry.cwd().to_path_buf(),
+    );
     let initial_permanent_user = initial_permanent_user_message(&original_task, &intake_contracts);
     let mut permanent = vec![
         ChatMessage::system(supervisor_system),
@@ -736,7 +740,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                         PendingResolution::Save
                     };
                     match resolve_pending(&stage, &mut dag, &finished, window, resolution) {
-                        Ok(()) => {
+                        Ok(_) => {
                             idle_pool.push(finished.repository);
                             continue;
                         }
@@ -1015,7 +1019,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                 .pending_window
                 .clone()
                 .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
-            resolve_pending(
+            let _ = resolve_pending(
                 cx.stage,
                 cx.dag,
                 &finished,
@@ -1033,7 +1037,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                 .pending_window
                 .clone()
                 .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
-            resolve_pending(
+            let _ = resolve_pending(
                 cx.stage,
                 cx.dag,
                 &finished,
@@ -1051,7 +1055,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                 .pending_window
                 .clone()
                 .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
-            resolve_pending(cx.stage, cx.dag, &finished, window, PendingResolution::Save)?;
+            let _ = resolve_pending(cx.stage, cx.dag, &finished, window, PendingResolution::Save)?;
             crate::trace_logging::append_trace_record(serde_json::json!({
                 "type": "asgard_supervisor_fallback",
                 "mode": "auto_save_unresolved",
@@ -1158,14 +1162,18 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             if cx.prefinalize_workers.contains(&finished.worker) {
                 return Ok(format!("error: {PREFINALIZE_VERIFICATION_ONLY_ERROR}"));
             }
-            save_pending_if_needed(cx, &mut state.saved_pending)?;
-            Ok(format!(
-                "saved checkpoint w{}",
-                cx.pending
-                    .as_ref()
-                    .map(|finished| finished.worker)
-                    .ok_or_else(|| anyhow!("pending worker disappeared during save"))?
-            ))
+            let outcome = save_pending_if_needed(cx, &mut state.saved_pending)?;
+            let worker = cx
+                .pending
+                .as_ref()
+                .map(|finished| finished.worker)
+                .ok_or_else(|| anyhow!("pending worker disappeared during save"))?;
+            Ok(match outcome {
+                PendingResolveOutcome::Saved => format!("saved checkpoint w{worker}"),
+                PendingResolveOutcome::Discarded => {
+                    format!("discarded w{worker}: checkpoint autocommit failed")
+                }
+            })
         }
         MERGE_CHECKPOINT_TOOL => {
             let context = SupervisorTurnContext {
@@ -1201,7 +1209,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 .pending_window
                 .clone()
                 .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
-            resolve_pending(
+            let _ = resolve_pending(
                 cx.stage,
                 cx.dag,
                 &finished,
@@ -1379,14 +1387,26 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             .is_some_and(|finished| spawn.from == CheckpointId::Worker(finished.worker))
     }) && !state.saved_pending
     {
-        save_pending_if_needed(cx, &mut state.saved_pending)?;
+        let outcome = save_pending_if_needed(cx, &mut state.saved_pending)?;
+        let saved_from_pending = matches!(outcome, PendingResolveOutcome::Saved);
         lines.push(format!(
-            "saved checkpoint w{}",
+            "{} w{}",
+            match outcome {
+                PendingResolveOutcome::Saved => "saved checkpoint",
+                PendingResolveOutcome::Discarded => "discarded",
+            },
             cx.pending
                 .as_ref()
                 .map(|finished| finished.worker)
                 .ok_or_else(|| anyhow!("pending worker disappeared during spawn save"))?
         ));
+        if !saved_from_pending {
+            lines.push(
+                "error: cannot spawn from the pending trajectory because checkpoint autocommit failed"
+                    .to_string(),
+            );
+            return Ok(lines.join("\n"));
+        }
     }
     if matches!(kind, SpawnKind::Prefinalize) {
         *cx.latest_prefinalize_source_commits = spawns
@@ -1541,7 +1561,7 @@ fn render_spawn_duplicate_notes(
 fn save_pending_if_needed(
     cx: &mut SupervisorLoopContext<'_, '_>,
     saved_pending: &mut bool,
-) -> Result<()> {
+) -> Result<PendingResolveOutcome> {
     if *saved_pending {
         anyhow::bail!("save_checkpoint: pending trajectory is already saved");
     }
@@ -1552,14 +1572,25 @@ fn save_pending_if_needed(
         .pending_window
         .clone()
         .ok_or_else(|| anyhow!("pending worker missing trajectory window"))?;
-    resolve_pending(cx.stage, cx.dag, finished, window, PendingResolution::Save)?;
+    let outcome = resolve_pending(cx.stage, cx.dag, finished, window, PendingResolution::Save)?;
     *saved_pending = true;
     send_thought(
         &cx.launch.live_output.cx,
         &cx.launch.live_output.session_id,
-        &format!("Asgard saved checkpoint w{}.\n", finished.worker),
+        match outcome {
+            PendingResolveOutcome::Saved => {
+                format!("Asgard saved checkpoint w{}.\n", finished.worker)
+            }
+            PendingResolveOutcome::Discarded => {
+                format!(
+                    "Asgard discarded w{} after checkpoint autocommit failed.\n",
+                    finished.worker
+                )
+            }
+        }
+        .as_str(),
     );
-    Ok(())
+    Ok(outcome)
 }
 
 fn pending_unresolved(pending: &Option<FinishedWorker>, saved_pending: bool) -> bool {
@@ -1572,7 +1603,7 @@ async fn launch_spawn<'a>(
 ) -> Result<usize> {
     let worker_id = *cx.worker_counter;
     *cx.worker_counter += 1;
-    let clone_label = format!("c{}", *cx.clone_counter);
+    let worktree_label = format!("c{}", *cx.clone_counter);
     *cx.clone_counter += 1;
     let parent_commit = cx
         .dag
@@ -1600,7 +1631,7 @@ async fn launch_spawn<'a>(
         },
         &spawn,
         worker_id,
-        clone_label,
+        worktree_label,
         parent_commit,
         messages,
         cx.idle_pool,
@@ -1681,35 +1712,55 @@ fn merge_checkpoint(
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingResolveOutcome {
+    Saved,
+    Discarded,
+}
+
 fn resolve_pending(
     stage: &SnapshotStage,
     dag: &mut TrajectoryDag,
     finished: &FinishedWorker,
     window: TrajectoryWindow,
     resolution: PendingResolution,
-) -> Result<()> {
+) -> Result<PendingResolveOutcome> {
     match resolution {
         PendingResolution::Save => {
-            let parent_commit = dag
-                .commit_for(&window.parent)
-                .ok_or_else(|| anyhow!("unknown checkpoint {}", window.parent))?
-                .to_string();
-            let commit = stage.snapshot(
-                &finished.repository.root,
-                &parent_commit,
-                &format!("w{}", finished.worker),
-            )?;
-            dag.insert(TrajectoryNode {
-                window,
-                commit: commit.clone(),
-                merged_from: Vec::new(),
-            })?;
-            crate::trace_logging::append_trace_record(serde_json::json!({
-                "type": "asgard_checkpoint",
-                "worker": finished.worker,
-                "parent": finished.parent.to_string(),
-                "commit": commit,
-            }));
+            match stage.snapshot(&finished.repository.root, &format!("w{}", finished.worker)) {
+                Ok(commit) => {
+                    dag.insert(TrajectoryNode {
+                        window,
+                        commit: commit.clone(),
+                        merged_from: Vec::new(),
+                    })?;
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_checkpoint",
+                        "worker": finished.worker,
+                        "parent": finished.parent.to_string(),
+                        "commit": commit,
+                    }));
+                    return Ok(PendingResolveOutcome::Saved);
+                }
+                Err(error) => {
+                    let error_text = format!("{error:#}");
+                    dag.discard(
+                        finished.worker,
+                        finished.parent.clone(),
+                        format!(
+                            "{} (checkpoint autocommit failed: {error_text})",
+                            dag_instruction_stub(&finished.instructions)
+                        ),
+                    )?;
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_discard",
+                        "worker": finished.worker,
+                        "reason": "checkpoint_autocommit_failed",
+                        "error": error_text,
+                    }));
+                    return Ok(PendingResolveOutcome::Discarded);
+                }
+            }
         }
         PendingResolution::Discard => {
             dag.discard(
@@ -1723,7 +1774,7 @@ fn resolve_pending(
             }));
         }
     }
-    Ok(())
+    Ok(PendingResolveOutcome::Discarded)
 }
 
 fn dag_instruction_stub(value: &str) -> String {
@@ -1755,7 +1806,7 @@ fn worker_head_moved(root: &Path, parent_commit: &str, worker: usize) -> bool {
             worker,
             expected = parent_commit,
             actual = head.trim(),
-            "Asgard worker moved HEAD; snapshot will ignore worker history"
+            "Asgard worker moved HEAD; checkpoint autocommit will preserve worker history"
         );
     }
     moved
@@ -3206,10 +3257,11 @@ mod tests {
                     )]),
                     text_response("w5 launched"),
                     tool_response(vec![discard_call("sv-discard-w5")]),
-                    tool_response(vec![finalize_call_with_evidence(
+                    tool_response(vec![finalize_call_with_evidence_and_abandoned(
                         "sv-finalize-w4",
                         "w4",
                         &["w1m2"],
+                        &["w2"],
                     )]),
                 ],
             ),
@@ -3599,7 +3651,8 @@ mod tests {
         );
 
         let review_w3_text = all_message_text(&supervisor_requests[6].messages);
-        assert!(review_w3_text.contains("w2 \"Rewrite foo.txt to alpha then beta\" saved"));
+        assert!(review_w3_text.contains("w2 ("));
+        assert!(review_w3_text.contains("\"Rewrite foo.txt to alpha then beta\" saved"));
         let final_idle_text = all_message_text(&supervisor_requests[7].messages);
         assert!(final_idle_text.contains(
             "w3 must be saved, spawned from, or discarded — it is currently none of these"
@@ -3762,10 +3815,11 @@ mod tests {
                     )]),
                     text_response("w4 launched"),
                     tool_response(vec![discard_call("sv-discard-w4")]),
-                    tool_response(vec![finalize_call_with_evidence(
+                    tool_response(vec![finalize_call_with_evidence_and_abandoned(
                         "sv-finalize-merged",
                         "w3",
                         &["w1m2"],
+                        &["w2"],
                     )]),
                 ],
             ),
@@ -3835,7 +3889,7 @@ mod tests {
                 .expect("from worker");
         fs::write(from_worker.root.join("from.txt"), "from\n").expect("write from");
         let from_commit = stage
-            .snapshot(&from_worker.root, &base_commit, "from")
+            .snapshot(&from_worker.root, "from")
             .expect("from snapshot");
 
         let onto_worker =
@@ -3843,7 +3897,7 @@ mod tests {
                 .expect("onto worker");
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").expect("write onto");
         let onto_commit = stage
-            .snapshot(&onto_worker.root, &from_commit, "onto")
+            .snapshot(&onto_worker.root, "onto")
             .expect("onto snapshot");
 
         let mut dag = TrajectoryDag::new(Vec::new(), base_commit);
@@ -4467,7 +4521,8 @@ mod tests {
         assert!(
             first_idle_after_cap.contains("w1 was auto-saved: the turn ended without resolving it")
         );
-        assert!(first_idle_after_cap.contains("w1 \"finish without changes\" saved"));
+        assert!(first_idle_after_cap.contains("w1 ("));
+        assert!(first_idle_after_cap.contains("\"finish without changes\" saved"));
     }
 
     #[test]
@@ -4677,7 +4732,7 @@ mod tests {
 
         assert!(rendered.contains("<asgard_status>"));
         assert!(rendered.contains("<dag>\nroot\n"));
-        assert!(rendered.contains("w2 \"saved checkpoint\" saved, finished/1 steps"));
+        assert!(rendered.contains("w2 (c2) \"saved checkpoint\" saved, finished/1 steps"));
         assert!(
             rendered.contains("└─ w5 \"inspect the parser then test it\" in flight, step 3/10")
         );

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -196,15 +198,32 @@ pub(crate) struct DagLiveEntry {
 pub(crate) struct TrajectoryDag {
     initial_messages: Vec<ChatMessage>,
     base_commit: String,
+    git_root: Option<PathBuf>,
     nodes: BTreeMap<usize, TrajectoryNode>,
     discarded: BTreeMap<usize, DiscardedTombstone>,
 }
 
 impl TrajectoryDag {
+    #[cfg(test)]
     pub(crate) fn new(initial_messages: Vec<ChatMessage>, base_commit: String) -> Self {
         Self {
             initial_messages,
             base_commit,
+            git_root: None,
+            nodes: BTreeMap::new(),
+            discarded: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn new_with_git_root(
+        initial_messages: Vec<ChatMessage>,
+        base_commit: String,
+        git_root: PathBuf,
+    ) -> Self {
+        Self {
+            initial_messages,
+            base_commit,
+            git_root: Some(git_root),
             nodes: BTreeMap::new(),
             discarded: BTreeMap::new(),
         }
@@ -286,37 +305,24 @@ impl TrajectoryDag {
         if ancestor == target {
             return true;
         }
-        let mut stack = vec![target.clone()];
-        let mut visited = HashSet::new();
-        while let Some(current) = stack.pop() {
-            match current {
-                CheckpointId::Root => {
-                    if ancestor == &CheckpointId::Root {
-                        return true;
-                    }
-                    continue;
-                }
-                CheckpointId::Worker(worker) => {
-                    if !visited.insert(worker) {
-                        continue;
-                    }
-                    let Some(node) = self.nodes.get(&worker) else {
-                        continue;
-                    };
-                    if &node.window.parent == ancestor
-                        || node
-                            .merged_from
-                            .iter()
-                            .any(|checkpoint| checkpoint == ancestor)
-                    {
-                        return true;
-                    }
-                    stack.push(node.window.parent.clone());
-                    stack.extend(node.merged_from.iter().cloned());
-                }
+        let (Some(root), Some(ancestor_commit), Some(target_commit)) = (
+            self.git_root.as_deref(),
+            self.commit_for(ancestor),
+            self.commit_for(target),
+        ) else {
+            return false;
+        };
+        match git_is_ancestor(root, ancestor_commit, target_commit) {
+            Ok(is_ancestor) => is_ancestor,
+            Err(error) => {
+                tracing::warn!(
+                    ancestor = %ancestor,
+                    target = %target,
+                    "failed to check Asgard checkpoint ancestry via git: {error:#}"
+                );
+                false
             }
         }
-        false
     }
 
     pub(crate) fn off_lineage_checkpoints_with_diffstat(
@@ -487,6 +493,31 @@ impl TrajectoryDag {
     }
 }
 
+fn git_is_ancestor(root: &Path, ancestor_commit: &str, target_commit: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor_commit,
+            target_commit,
+        ])
+        .current_dir(root)
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "git merge-base --is-ancestor {ancestor_commit} {target_commit} failed in {} with status {}; stderr:\n{}",
+        root.display(),
+        output.status,
+        stderr.trim()
+    );
+}
+
 pub(crate) fn render_fragment(window: &TrajectoryWindow) -> String {
     let mut rendered = String::new();
     rendered.push_str(&format!(
@@ -581,11 +612,13 @@ fn render_dag_children(
         match child {
             DagOverviewChild::Saved(node) => {
                 rendered.push_str(&format!(
-                    "w{worker} \"{}\" saved, {}/{} steps{}\n",
+                    "w{worker} ({}) \"{}\" saved, {}/{} steps{}{}\n",
+                    short_sha(&node.commit),
                     instruction_stub(&node.window.instructions),
                     node.window.stop.label(),
                     node.window.steps,
-                    compact_diffstat_suffix(&node.window.diffstat)
+                    compact_diffstat_suffix(&node.window.diffstat),
+                    compact_merged_from_suffix(&node.merged_from)
                 ));
                 let mut next_prefix = prefix.to_string();
                 next_prefix.push_str(if is_last { "   " } else { "│  " });
@@ -614,6 +647,10 @@ fn render_dag_children(
     }
 }
 
+fn short_sha(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
 fn compact_diffstat_suffix(diffstat: &str) -> String {
     let text = diffstat
         .lines()
@@ -625,6 +662,21 @@ fn compact_diffstat_suffix(diffstat: &str) -> String {
         String::new()
     } else {
         format!("; diffstat: {text}")
+    }
+}
+
+fn compact_merged_from_suffix(merged_from: &[CheckpointId]) -> String {
+    if merged_from.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; merged from: {}",
+            merged_from
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     }
 }
 
@@ -652,6 +704,7 @@ fn escape_attribute(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::llm_client::{FunctionCall, ToolCall};
+    use std::fs;
 
     fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -722,6 +775,28 @@ mod tests {
 
     fn text(message: &ChatMessage) -> String {
         message.content_text()
+    }
+
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git stdout utf8")
+    }
+
+    fn commit_file(repo: &Path, name: &str, content: &str, message: &str) -> String {
+        fs::write(repo.join(name), content).expect("write commit file");
+        run_git(repo, &["add", name]);
+        run_git(repo, &["commit", "--quiet", "-m", message]);
+        run_git(repo, &["rev-parse", "HEAD"]).trim().to_string()
     }
 
     #[test]
@@ -963,12 +1038,24 @@ mod tests {
 
     #[test]
     fn off_lineage_diffstat_checkpoints_excludes_ancestors_and_empty_diffstats() {
-        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init", "--quiet"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        let base = commit_file(repo, "base.txt", "base\n", "base");
+        let c1 = commit_file(repo, "ancestor.txt", "ancestor\n", "ancestor");
+        let c2 = commit_file(repo, "target.txt", "target\n", "target");
+        run_git(repo, &["checkout", "--quiet", "--detach", &base]);
+        let c3 = commit_file(repo, "empty-orphan.txt", "empty\n", "empty orphan");
+        run_git(repo, &["checkout", "--quiet", "--detach", &base]);
+        let c4 = commit_file(repo, "orphan.txt", "orphan\n", "diff orphan");
+        let mut dag = TrajectoryDag::new_with_git_root(Vec::new(), base, repo.to_path_buf());
         dag.insert(node_with_diffstat(
             1,
             CheckpointId::Root,
             "ancestor",
-            "c1",
+            &c1,
             " ancestor.txt | 1 +\n",
         ))
         .unwrap();
@@ -976,7 +1063,7 @@ mod tests {
             2,
             CheckpointId::Worker(1),
             "target",
-            "c2",
+            &c2,
             " target.txt | 1 +\n",
         ))
         .unwrap();
@@ -984,7 +1071,7 @@ mod tests {
             3,
             CheckpointId::Root,
             "empty orphan",
-            "c3",
+            &c3,
             "   \n",
         ))
         .unwrap();
@@ -992,7 +1079,7 @@ mod tests {
             4,
             CheckpointId::Root,
             "diff orphan",
-            "c4",
+            &c4,
             " orphan.txt | 2 ++\n",
         ))
         .unwrap();
@@ -1010,17 +1097,29 @@ mod tests {
 
     #[test]
     fn is_ancestor_of_explores_plain_parent_chain_after_merge_path_hits_root() {
-        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
-        dag.insert(node(2, CheckpointId::Root, "two", "c2"))
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init", "--quiet"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        let base = commit_file(repo, "base.txt", "base\n", "base");
+        let c2 = commit_file(repo, "two.txt", "two\n", "two");
+        let c3 = commit_file(repo, "three.txt", "three\n", "three");
+        run_git(repo, &["checkout", "--quiet", "--detach", &base]);
+        let c1 = commit_file(repo, "one.txt", "one\n", "one");
+        run_git(repo, &["checkout", "--quiet", "--detach", &c3]);
+        run_git(repo, &["merge", "--quiet", "--no-ff", &c1, "-m", "merge"]);
+        let c4 = run_git(repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let c5 = commit_file(repo, "five.txt", "five\n", "five");
+        let mut dag = TrajectoryDag::new_with_git_root(Vec::new(), base, repo.to_path_buf());
+        dag.insert(node(2, CheckpointId::Root, "two", &c2)).unwrap();
+        dag.insert(node(3, CheckpointId::Worker(2), "three", &c3))
             .unwrap();
-        dag.insert(node(3, CheckpointId::Worker(2), "three", "c3"))
-            .unwrap();
-        dag.insert(node(1, CheckpointId::Root, "one", "c1"))
-            .unwrap();
-        let mut merge = node(4, CheckpointId::Worker(3), "merge", "c4");
+        dag.insert(node(1, CheckpointId::Root, "one", &c1)).unwrap();
+        let mut merge = node(4, CheckpointId::Worker(3), "merge", &c4);
         merge.merged_from = vec![CheckpointId::Worker(1)];
         dag.insert(merge).unwrap();
-        dag.insert(node(5, CheckpointId::Worker(4), "five", "c5"))
+        dag.insert(node(5, CheckpointId::Worker(4), "five", &c5))
             .unwrap();
 
         assert!(dag.is_ancestor_of(&CheckpointId::Worker(2), &CheckpointId::Worker(5)));
@@ -1068,8 +1167,8 @@ mod tests {
         assert_eq!(
             rendered,
             "root\n\
-├─ w3 \"instructions saved root\" saved, finished/2 steps; diffstat: saved.txt | 1 +\n\
-│  ├─ w7 \"instructions saved child instructions that are intentionally\" saved, finished/2 steps\n\
+├─ w3 (c3) \"instructions saved root\" saved, finished/2 steps; diffstat: saved.txt | 1 +\n\
+│  ├─ w7 (c7) \"instructions saved child instructions that are intentionally\" saved, finished/2 steps\n\
 │  └─ w8 \"live child under review\" under review\n\
 ├─ w4 \"discarded root child\" discarded\n\
 └─ w5 \"live root child\" in flight, step 2/10\n"
