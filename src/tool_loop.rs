@@ -6845,13 +6845,14 @@ mod tests {
 
         assert!(initial.contains("edit"));
         assert!(initial.contains("write_file"));
-        assert!(initial.contains("list_directory"));
+        assert!(!initial.contains("list_directory"));
         assert!(!initial.contains("read_file"));
         assert!(!initial.contains("grep_search"));
         assert!(!initial.contains("run_shell_command"));
 
         assert!(post_edit.contains("run_shell_command"));
         assert!(post_edit.contains("read_file"));
+        assert!(!post_edit.contains("list_directory"));
         assert!(!post_edit.contains("grep_search"));
     }
 
