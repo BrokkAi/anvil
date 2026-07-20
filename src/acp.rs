@@ -4986,7 +4986,10 @@ depend on.
 - When the spec says one method or case behaves like another, apply every check you wrote \
 for one to each member of the family; sibling members left untested are where the \
 divergence hides. Cover each interaction the spec enumerates (each option x each input \
-kind), not just each feature alone.
+kind), not just each feature alone. When a rule applies across parallel variants of one \
+concept - each dialect, each backend, each kind of reference or entry point - wire it \
+into every variant's path and test each one; the variant handled as an afterthought is \
+where the rule silently never got connected.
 - Exercise new behavior through its public surface, calling it the way the task describes \
 a caller using it, with the task's exact names. Match the surrounding code's conventions \
 exactly - keyword casing, naming style, formatting - the project's existing output is \
