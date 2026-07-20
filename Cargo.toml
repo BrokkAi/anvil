@@ -94,6 +94,12 @@ tiktoken-rs = "0.12"
 # applied to `runShellCommand`. See `tools/shell.rs::apply_rlimits`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows-only: request attribute-write access when preserving timestamps on
+# incrementally synchronized Asgard repository files.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # `test-util` enables `tokio::time::pause()` and `#[tokio::test(start_paused = true)]`,
 # used by the LLM stream idle-timeout test to avoid waiting wall-clock seconds.
