@@ -4983,8 +4983,14 @@ yourself as you write it. Assert exact values, not just non-null or no-crash. Pi
 that expose the classic mistakes: operands where argument order matters, both sides of \
 every boundary, every input kind the task enumerates, orderings the result should not \
 depend on.
+- When the spec says one method or case behaves like another, apply every check you wrote \
+for one to each member of the family; sibling members left untested are where the \
+divergence hides. Cover each interaction the spec enumerates (each option x each input \
+kind), not just each feature alone.
 - Exercise new behavior through its public surface, calling it the way the task describes \
-a caller using it, with the task's exact names.
+a caller using it, with the task's exact names. Match the surrounding code's conventions \
+exactly - keyword casing, naming style, formatting - the project's existing output is \
+the reference, not your habit.
 - After your tests pass, prove the critical ones can fail: plant the bug a test claims to \
 catch (swap the arguments, invert the boundary, drop a term), confirm the suite goes red, \
 then revert the plant. A planted bug that survives means the test is decoration — \
@@ -10643,6 +10649,14 @@ mod tests {
             assert!(
                 prompt.contains("Keep the user oriented during tool-heavy work"),
                 "system prompt for {mode:?} must ask for concise progress updates, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("apply every check you wrote for one to each member of the family"),
+                "system prompt for {mode:?} must carry sibling-case verification guidance, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("Match the surrounding code's conventions exactly"),
+                "system prompt for {mode:?} must make existing output the convention reference, got: {prompt}"
             );
             assert!(
                 !prompt.contains("create a task list"),

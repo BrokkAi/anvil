@@ -529,6 +529,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
     let mut latest_prefinalize_source_commits = HashSet::new();
+    let run_started = Instant::now();
 
     let exit = loop {
         if cancel.is_cancelled() {
@@ -577,6 +578,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             &dag,
             &pending_windows,
             ASGARD_BATCH_CAP,
+            run_started.elapsed().as_secs() / 60,
             idle_note,
             &parent_status,
         );
@@ -2145,6 +2147,7 @@ fn render_asgard_status_block(
     dag: &TrajectoryDag,
     pending: &BTreeMap<usize, TrajectoryWindow>,
     capacity_available: usize,
+    elapsed_minutes: u64,
     idle_note: Option<&str>,
     parent_status: &[String],
 ) -> String {
@@ -2160,6 +2163,7 @@ fn render_asgard_status_block(
 
     let mut rendered = String::new();
     rendered.push_str("<asgard_status>\n");
+    rendered.push_str(&format!("Elapsed: {elapsed_minutes}m since run start.\n"));
     rendered.push_str("<dag>\n");
     rendered.push_str(&render_dag_overview(dag, &live));
     rendered.push_str("</dag>\n");
@@ -4047,6 +4051,16 @@ mod tests {
                 .iter()
                 .any(|name| name == "update_plan")
         );
+        let first_supervisor_ephemeral_tail = supervisor_requests[0]
+            .messages
+            .last()
+            .expect("supervisor request ephemeral tail")
+            .content_text();
+        assert!(first_supervisor_ephemeral_tail.contains("<asgard_status>"));
+        assert!(
+            first_supervisor_ephemeral_tail.contains("Elapsed: 0m since run start."),
+            "supervisor request ephemeral tail must include elapsed time:\n{first_supervisor_ephemeral_tail}"
+        );
 
         let review_w1_text = all_message_text(&supervisor_requests[2].messages);
         assert!(review_w1_text.contains(r#"<worker_trajectory id="w1" continues_from="root""#));
@@ -5130,11 +5144,13 @@ mod tests {
             &dag,
             &pending,
             4,
+            0,
             Some("No worker is awaiting review. Spawn workers or finalize."),
             &[],
         );
 
         assert!(rendered.contains("<asgard_status>"));
+        assert!(rendered.contains("Elapsed: 0m since run start."));
         assert!(rendered.contains("<dag>\nroot\n"));
         assert!(rendered.contains("w2 (c2) \"saved checkpoint\" saved, finished/1 steps"));
         assert!(rendered.contains("└─ w5 \"inspect the parser then test it\" under review"));
