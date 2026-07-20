@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+const SMOKE_BUNDLED_BIFROST_VERSION: &str = "0.8.6";
+
 struct SmokeCase {
     name: &'static str,
     prompt: String,
@@ -3187,7 +3189,7 @@ fn install_fake_managed_bifrost(config_home: &Path, temp: &Path, bifrost_log: &P
 fn seed_fake_managed_bifrost(config_home: &Path, fake_bifrost: &str) {
     let cache_dir = config_home
         .join("bifrost")
-        .join("0.8.2")
+        .join(SMOKE_BUNDLED_BIFROST_VERSION)
         .join(bifrost_target_triple_for_smoke());
     std::fs::create_dir_all(&cache_dir).expect("create fake managed bifrost cache");
     let target = cache_dir.join(bifrost_binary_name_for_smoke());
