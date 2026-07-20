@@ -223,7 +223,6 @@ pub(crate) struct AsgardSupervisorDecision {
     pub(crate) winner: usize,
     pub(crate) complete: bool,
     pub(crate) advices: Vec<Option<String>>,
-    pub(crate) next_candidate_count: Option<usize>,
     pub(crate) next_window_steps: Option<usize>,
     pub(crate) state_summary: String,
     pub(crate) contracts: Option<Vec<AsgardContractRow>>,
@@ -278,7 +277,6 @@ pub(crate) const ASGARD_MAX_WINDOW_STEPS: usize = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AsgardSupervisorInitialAdvice {
     pub(crate) advices: Vec<Option<String>>,
-    pub(crate) next_candidate_count: usize,
     pub(crate) next_window_steps: usize,
     pub(crate) state_summary: String,
 }
@@ -446,7 +444,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 "type": "asgard_supervisor_fallback",
                 "call": "initial_advice",
                 "error": format!("{error:#}"),
-                "next_candidate_count": ASGARD_MIN_CANDIDATES,
                 "next_window_steps": ASGARD_MIN_WINDOW_STEPS,
             }));
             AsgardSupervisorInitialAdvice {
@@ -456,14 +453,13 @@ pub(crate) async fn run_asgard_trajectory_loop(
                      next action, and make concrete progress before the next review."
                         .to_string(),
                 )],
-                next_candidate_count: ASGARD_MIN_CANDIDATES,
                 next_window_steps: ASGARD_MIN_WINDOW_STEPS,
                 state_summary: "Initial supervisor routing failed validation; using a traced one-lane recovery window."
                     .to_string(),
             }
         }
     };
-    let mut current_candidate_count = initial_advice.next_candidate_count;
+    let mut current_candidate_count = initial_advice.advices.len();
     let mut current_window_steps = initial_advice.next_window_steps;
     let mut consecutive_winner_failures = 0usize;
     let mut next_advices: Option<Vec<Option<String>>> = Some(initial_advice.advices.clone());
@@ -715,7 +711,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     "window": window,
                     "error": format!("{error:#}"),
                     "winner": winner,
-                    "next_candidate_count": ASGARD_MIN_CANDIDATES,
                     "next_window_steps": ASGARD_MIN_WINDOW_STEPS,
                 }));
                 AsgardSupervisorDecision {
@@ -727,7 +722,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
                          clearest remaining defect, and report focused verification."
                             .to_string(),
                     )],
-                    next_candidate_count: Some(ASGARD_MIN_CANDIDATES),
                     next_window_steps: Some(ASGARD_MIN_WINDOW_STEPS),
                     state_summary: format!(
                         "Window {window} supervisor routing failed validation; selected the first non-failed lane and scheduled a one-lane recovery window."
@@ -871,7 +865,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
                         winner: decision.winner,
                         complete: false,
                         advices: vec![Some(advice)],
-                        next_candidate_count: Some(ASGARD_MIN_CANDIDATES),
                         next_window_steps: Some(ASGARD_MIN_WINDOW_STEPS),
                         state_summary: format!(
                             "Completion review failed to produce a valid decision in \
@@ -915,9 +908,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
         let supervisor_completion_summary = decision.state_summary.clone();
         next_advices = Some(decision.advices.clone());
         if !supervisor_complete && let Some(advices) = &next_advices {
-            current_candidate_count = decision
-                .next_candidate_count
-                .expect("incomplete Asgard decision has next_candidate_count");
+            current_candidate_count = advices.len();
             current_window_steps = decision
                 .next_window_steps
                 .expect("incomplete Asgard decision has next_window_steps");
@@ -2712,7 +2703,7 @@ pub(crate) fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
 }
 
 pub(crate) fn asgard_window_policy() -> &'static str {
-    "Choose next_candidate_count from 1 through the configured maximum and next_window_steps from 1 through 10. Candidate count buys independent breadth: use more lanes when the diagnosis, architecture, contract reading, or evidence is uncertain enough that genuinely different approaches can teach you something. Do not spend lanes on cosmetic variations. If a concrete bug must be fixed before any new direction can be useful, choose one candidate to fix and verify that serial dependency first. The shared step horizon controls when comparison resumes, not when candidates should declare the task finished. Use short horizons when feedback is valuable soon and longer horizons only for clear, mechanically involved work where interruption adds little value."
+    "Return one distinct advice for each lane to launch, from 1 through the configured maximum, and choose next_window_steps from 1 through 10. The number of advices is the next window's candidate count. Candidate count buys independent breadth: use more lanes when the diagnosis, architecture, contract reading, or evidence is uncertain enough that genuinely different approaches can teach you something. Do not spend lanes on cosmetic variations. If a concrete bug must be fixed before any new direction can be useful, return one advice to fix and verify that serial dependency first. The shared step horizon controls when comparison resumes, not when candidates should declare the task finished. Use short horizons when feedback is valuable soon and longer horizons only for clear, mechanically involved work where interruption adds little value."
 }
 
 pub(crate) fn asgard_initial_advice_messages(
@@ -2739,9 +2730,9 @@ Call advise_trajectories exactly once. Do not call another tool or answer in pro
 <initial_advice_procedure>
 Before calling advise_trajectories:
 1. Re-read the original task. Identify the main required behaviors, explicit implementation constraints, and prohibitions.
-2. Choose next_candidate_count based on how many genuinely useful independent approaches the current uncertainty supports.
+2. Choose how many lane advices to return based on how many genuinely useful independent approaches the current uncertainty supports. The advice count is the number of candidates launched.
 3. Choose next_window_steps based on when the next comparison should be valuable, not on a fixed rollout habit.
-4. Produce exactly next_candidate_count task-compliant strategies. Make them genuinely different. When using multiple lanes, include one strategy that quickly falsifies the most consequential assumption.
+4. Produce that many task-compliant strategies. Make them genuinely different. When using multiple lanes, include one strategy that quickly falsifies the most consequential assumption.
 Then call advise_trajectories exactly once.
 </initial_advice_procedure>"#
         )),
@@ -2772,7 +2763,7 @@ pub(crate) fn asgard_supervisor_messages(
             r#"<mission>
 You are the correctness supervisor for an Asgard coding trajectory. You are comparing {candidate_count} candidate lanes, and may launch 1-{max_candidate_count} lanes next. Every decision must choose the lane with the best long-term chance of solving the original task. Separately decide whether that selected endpoint is complete.
 
-Asgard preserves one canonical trajectory. The lanes shown here all started independently from the same prior winner and repository state, ran for one shared step horizon, and now compete to become the sole next canonical state; losing work is discarded. If the endpoint is incomplete, your next_candidate_count controls the cost-versus-breadth tradeoff for fresh continuations from this winner, and next_window_steps controls when those continuations are compared again.
+Asgard preserves one canonical trajectory. The lanes shown here all started independently from the same prior winner and repository state, ran for one shared step horizon, and now compete to become the sole next canonical state; losing work is discarded. If the endpoint is incomplete, the number of advices you return controls the cost-versus-breadth tradeoff for fresh continuations from this winner, and next_window_steps controls when those continuations are compared again.
 
 Selection does not require certainty. Choose the best continuation under the available evidence even when every lane is flawed or an important question remains unanswered. complete=true is a nomination that the selected endpoint plausibly satisfies the original task; a separate isolated completion review owns the terminal adjudication.
 </mission>
@@ -2808,7 +2799,7 @@ Completion is a property of the endpoint, not of who introduced a defect. Set co
 </scope_and_completion>
 
 <continuation>
-When incomplete, choose next_candidate_count, choose next_window_steps, and return exactly next_candidate_count concise, actionable, mutually distinct advice objects in zero-based lane order. Use more candidates only when uncertainty supports genuinely different investigations or implementations. If an obvious concrete bug must be repaired before new directions become useful, choose one candidate to fix and verify it first. Each strategy must independently comply with the task. With multiple lanes, include one strategy that tests the selected direction's most consequential unverified assumption. When the checklist records materially ambiguous readings, use separate lanes only when implementing or testing those readings will resolve the ambiguity. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
+When incomplete, choose next_window_steps and return one concise, actionable, mutually distinct advice object per lane to launch, in zero-based lane order. The number of advices is the next window's candidate count. Use more candidates only when uncertainty supports genuinely different investigations or implementations. If an obvious concrete bug must be repaired before new directions become useful, return one advice to fix and verify it first. Each strategy must independently comply with the task. With multiple lanes, include one strategy that tests the selected direction's most consequential unverified assumption. When the checklist records materially ambiguous readings, use separate lanes only when implementing or testing those readings will resolve the ambiguity. Advice may tell candidates to inspect source, run a focused build or test, or update_plan. Do not assert exact APIs or implementation facts that the evidence does not establish. Candidates continue normal rollouts and do not stop at Asgard window boundaries.
 
 {}
 </continuation>
@@ -2862,7 +2853,7 @@ Call select_trajectory exactly once and by itself as soon as your judgment is re
 2. Compare each lane's actual direction, defects, evidence, and recoverability. Choose a provisional winner even if all are incomplete.
 3. Decide whether that winner plausibly appears terminal. If so, nominate: complete=true requires only that the endpoint plausibly satisfies the task contracts on the compact trajectories and diffs — the isolated completion review owns terminal adjudication, so do not audit for boundary cases first. If not, investigate only questions that could change the ranking or next-window direction.
 4. Treat the completion judgment as a nomination. A concrete defect, contradiction, or plainly missing required work already visible in the dossier means complete=false and becomes targeted next-window advice; do not search for more before nominating.
-5. If incomplete, choose next_candidate_count, the shared horizon, and exactly next_candidate_count distinct compliant strategies. Scale breadth with uncertainty; use one lane for a concrete serial bug fix.
+5. If incomplete, choose the shared horizon and return one distinct compliant strategy per lane to launch. The strategy count determines candidate count. Scale breadth with uncertainty; use one lane for a concrete serial bug fix.
 6. Call select_trajectory. Do not continue investigating once you can make the best available judgment.
 </decision_procedure>"#,
     )));
@@ -2958,7 +2949,7 @@ Contracts that carry an adverse_condition are verified only under that condition
 
 Delivery-mechanics contracts (kind "delivery": branch, commit, repository cleanliness) rank below functional contracts: mark such a row unverified rather than violated when evidence is merely absent, record the residual risk in state_summary, and do not block completion on absence alone — but a delivery contract affirmatively contradicted by evidence is violated and blocks completion like any other — except when the contradiction is an environmental failure of the delivery action itself (missing git identity, authentication, network): that is unverified with the residual risk noted, not violated, because no amount of task work can resolve it.
 
-complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_candidate_count from 1 to {max_candidate_count}, choose next_window_steps from 1 to 10, and provide exactly next_candidate_count distinct advices telling the next candidate windows precisely what evidence to produce. Use more candidates when materially different fixes or verification strategies are useful under uncertainty; when one concrete defect is a serial prerequisite, choose one candidate to fix and verify it before exploring new directions. Structure each advice as an ordered work list over the violated and unverified contracts: for each, name the contract id, state what is broken or unproven, give the fix obligation first and the proving command second, and require the candidate to run that command and report its output verbatim after the fix — evidence produced before the fix proves nothing. Additionally, for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and its output. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
+complete=true requires every functional (inspection or execution) row verified. Any violated or unverified functional row means complete=false: keep winner={selected_lane}, choose next_window_steps from 1 to 10, and provide 1 to {max_candidate_count} distinct advices telling the next candidate windows precisely what evidence to produce. The advice count is the next window's candidate count. Use more candidates when materially different fixes or verification strategies are useful under uncertainty; when one concrete defect is a serial prerequisite, return one advice to fix and verify it before exploring new directions. Structure each advice as an ordered work list over the violated and unverified contracts: for each, name the contract id, state what is broken or unproven, give the fix obligation first and the proving command second, and require the candidate to run that command and report its output verbatim after the fix — evidence produced before the fix proves nothing. Additionally, for an unverified execution contract, spell out the concrete scenario, the exact assertion, and instruct the candidate to report the command and output verbatim. When the contract is an unblocking contract, the advised scenario must keep the awaited resource permanently silent after the triggering event: assert that the pending operation rejects or returns within a timeout while nothing else wakes it, and perform any release or cleanup only after that assertion. For an unverified type-shape contract, instruct the candidate to write a standalone usage file authored from the contract text verbatim, run the project's type-checker against it, and report the command and output verbatim. Do not rationalize an unresolved row as rare, cosmetic, pre-existing, timing-dependent, or out of scope; the checklist defines scope. When the ledger and patches genuinely cover every contract, return complete=true and do not invent optional work. Call select_trajectory exactly once and by itself. Do not answer in prose.
 </terminal_completion_review>"#,
     );
     let terminal_review = ChatMessage::user(terminal_review_text);
@@ -3452,13 +3443,8 @@ pub(crate) fn asgard_advise_trajectories_tool(max_candidate_count: usize) -> Too
             parameters: serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["next_candidate_count", "next_window_steps", "state_summary", "advices"],
+            "required": ["next_window_steps", "state_summary", "advices"],
             "properties": {
-                "next_candidate_count": {
-                    "type": "integer",
-                    "minimum": ASGARD_MIN_CANDIDATES,
-                    "maximum": max_candidate_count,
-                },
                 "next_window_steps": {
                     "type": "integer",
                     "minimum": ASGARD_MIN_WINDOW_STEPS,
@@ -3509,12 +3495,6 @@ pub(crate) fn asgard_select_trajectory_tool(
                     "maximum": candidate_count.saturating_sub(1),
                 },
                 "complete": { "type": "boolean" },
-                "next_candidate_count": {
-                    "type": "integer",
-                    "minimum": ASGARD_MIN_CANDIDATES,
-                    "maximum": max_candidate_count,
-                    "description": "Required when complete=false; omitted or ignored when complete=true.",
-                },
                 "next_window_steps": {
                     "type": "integer",
                     "minimum": ASGARD_MIN_WINDOW_STEPS,
@@ -3960,21 +3940,15 @@ pub(crate) fn parse_asgard_supervisor_decision_with_max(
                 winner,
                 complete,
                 advices: vec![None; candidate_count],
-                next_candidate_count: None,
                 next_window_steps: None,
                 state_summary: state_summary.to_string(),
                 contracts,
             });
         }
-        let Some(next_candidate_count) =
-            parse_asgard_next_candidate_count(&value, max_candidate_count)
-        else {
-            continue;
-        };
         let Some(next_window_steps) = parse_asgard_next_window_steps(&value) else {
             continue;
         };
-        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, max_candidate_count)
         else {
             continue;
         };
@@ -3983,14 +3957,13 @@ pub(crate) fn parse_asgard_supervisor_decision_with_max(
             winner,
             complete,
             advices,
-            next_candidate_count: Some(next_candidate_count),
             next_window_steps: Some(next_window_steps),
             state_summary: state_summary.to_string(),
             contracts,
         });
     }
     anyhow::bail!(
-        "Asgard supervisor returned neither a valid completed winner nor a winner plus a valid next_candidate_count, matching distinct advices, and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
+        "Asgard supervisor returned neither a valid completed winner nor a winner plus 1-{max_candidate_count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
     )
 }
 
@@ -4002,11 +3975,6 @@ pub(crate) fn parse_asgard_initial_advice(
         let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[start..])
             .into_iter::<serde_json::Value>()
             .next()
-        else {
-            continue;
-        };
-        let Some(next_candidate_count) =
-            parse_asgard_next_candidate_count(&value, max_candidate_count)
         else {
             continue;
         };
@@ -4024,19 +3992,18 @@ pub(crate) fn parse_asgard_initial_advice(
         let Some(raw_advices) = value.get("advices").and_then(serde_json::Value::as_array) else {
             continue;
         };
-        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, next_candidate_count)
+        let Some(advices) = parse_asgard_incomplete_advices(raw_advices, max_candidate_count)
         else {
             continue;
         };
         return Ok(AsgardSupervisorInitialAdvice {
             advices,
-            next_candidate_count,
             next_window_steps,
             state_summary: state_summary.to_string(),
         });
     }
     anyhow::bail!(
-        "Asgard supervisor returned no valid initial advice with a 1-{max_candidate_count} next_candidate_count, matching distinct advices, and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
+        "Asgard supervisor returned no valid initial advice with 1-{max_candidate_count} distinct advices and a {ASGARD_MIN_WINDOW_STEPS}-{ASGARD_MAX_WINDOW_STEPS} next_window_steps"
     )
 }
 
@@ -4170,23 +4137,14 @@ pub(crate) fn parse_asgard_next_window_steps(value: &serde_json::Value) -> Optio
         .then_some(steps)
 }
 
-pub(crate) fn parse_asgard_next_candidate_count(
-    value: &serde_json::Value,
-    max_candidate_count: usize,
-) -> Option<usize> {
-    let count = value.get("next_candidate_count")?.as_u64()? as usize;
-    (ASGARD_MIN_CANDIDATES..=max_candidate_count)
-        .contains(&count)
-        .then_some(count)
-}
-
 pub(crate) fn parse_asgard_incomplete_advices(
     raw_advices: &[serde_json::Value],
-    count: usize,
+    max_candidate_count: usize,
 ) -> Option<Vec<Option<String>>> {
-    if raw_advices.len() != count {
+    if !(ASGARD_MIN_CANDIDATES..=max_candidate_count).contains(&raw_advices.len()) {
         return None;
     }
+    let count = raw_advices.len();
     let advices: Vec<_> = raw_advices
         .iter()
         .filter_map(serde_json::Value::as_object)
@@ -4379,18 +4337,17 @@ mod tests {
     }
 
     #[test]
-    fn asgard_supervisor_parser_requires_dynamic_count_and_matching_advices() {
+    fn asgard_supervisor_parser_infers_dynamic_count_from_advices() {
         let parsed = parse_asgard_supervisor_decision_with_max(
-        r#"{"winner":2,"complete":false,"next_candidate_count":2,"next_window_steps":5,"state_summary":"work remains","advices":[
+        r#"{"winner":2,"complete":false,"next_window_steps":5,"state_summary":"work remains","advices":[
             {"strategy":"test the parser","scope_basis":"parser behavior"},
             {"strategy":"challenge the API","scope_basis":"API behavior"}
         ]}"#,
         3,
         5,
-    )
-    .unwrap();
+        )
+        .unwrap();
         assert_eq!(parsed.winner, 2);
-        assert_eq!(parsed.next_candidate_count, Some(2));
         assert_eq!(parsed.next_window_steps, Some(5));
         assert_eq!(parsed.advices.len(), 2);
 
@@ -4401,17 +4358,15 @@ mod tests {
         )
         .unwrap();
         assert!(completed.complete);
-        assert_eq!(completed.next_candidate_count, None);
         assert_eq!(completed.advices, vec![None, None, None]);
 
         for invalid in [
-            r#"{"winner":1,"complete":false,"next_candidate_count":0,"next_window_steps":5,"state_summary":"work","advices":[]}"#,
-            r#"{"winner":1,"complete":false,"next_candidate_count":6,"next_window_steps":5,"state_summary":"work","advices":[]}"#,
-            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":0,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"}]}"#,
-            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":11,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"}]}"#,
-            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"only one","scope_basis":"task"}]}"#,
-            r#"{"winner":1,"complete":false,"next_candidate_count":2,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"same","scope_basis":"task"},{"strategy":"same","scope_basis":"task"}]}"#,
-            r#"{"winner":3,"complete":false,"next_candidate_count":1,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_window_steps":5,"state_summary":"work","advices":[]}"#,
+            r#"{"winner":1,"complete":false,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"},{"strategy":"c","scope_basis":"task"},{"strategy":"d","scope_basis":"task"},{"strategy":"e","scope_basis":"task"},{"strategy":"f","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_window_steps":0,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_window_steps":11,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"},{"strategy":"b","scope_basis":"task"}]}"#,
+            r#"{"winner":1,"complete":false,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"same","scope_basis":"task"},{"strategy":"same","scope_basis":"task"}]}"#,
+            r#"{"winner":3,"complete":false,"next_window_steps":5,"state_summary":"work","advices":[{"strategy":"a","scope_basis":"task"}]}"#,
         ] {
             assert!(parse_asgard_supervisor_decision_with_max(invalid, 3, 5).is_err());
         }
@@ -4533,7 +4488,6 @@ mod tests {
             winner: 2,
             complete: false,
             advices: vec![Some("independent strategy".to_string())],
-            next_candidate_count: Some(1),
             next_window_steps: Some(4),
             state_summary: "The selected parser still has an unresolved wildcard assumption."
                 .to_string(),
@@ -5019,7 +4973,6 @@ mod tests {
                 winner: 0,
                 complete: false,
                 advices: vec![Some("produce new evidence".to_string())],
-                next_candidate_count: Some(1),
                 next_window_steps: Some(1),
                 state_summary: "prior rejection".to_string(),
                 contracts: None,
@@ -5556,7 +5509,6 @@ mod tests {
                 serde_json::json!({
                     "winner": 0,
                     "complete": false,
-                    "next_candidate_count": 1,
                     "next_window_steps": 3,
                     "state_summary": "More evidence is needed.",
                     "advices": [{
@@ -5662,7 +5614,6 @@ mod tests {
             winner: 0,
             complete: false,
             advices: vec![Some("Verify the exact behavior.".to_string())],
-            next_candidate_count: Some(1),
             next_window_steps: Some(3),
             state_summary: "Lane 1 is best but incomplete.".to_string(),
             contracts: None,
@@ -5697,7 +5648,6 @@ mod tests {
             winner: 0,
             complete: true,
             advices: Vec::new(),
-            next_candidate_count: None,
             next_window_steps: None,
             state_summary: "Complete.".to_string(),
             contracts: Some(vec![AsgardContractRow {
@@ -5726,7 +5676,6 @@ mod tests {
             winner: 0,
             complete: true,
             advices: Vec::new(),
-            next_candidate_count: None,
             next_window_steps: None,
             state_summary: "Complete.".to_string(),
             contracts: Some(vec![AsgardContractRow {
@@ -5809,7 +5758,6 @@ mod tests {
                 winner: 0,
                 complete: false,
                 advices: vec![Some("produce missing evidence".to_string())],
-                next_candidate_count: Some(1),
                 next_window_steps: Some(1),
                 state_summary: "prior rejection".to_string(),
                 contracts: None,
@@ -5966,8 +5914,7 @@ mod tests {
             schema["required"],
             serde_json::json!(["winner", "complete", "state_summary", "advices"])
         );
-        assert_eq!(schema["properties"]["next_candidate_count"]["minimum"], 1);
-        assert_eq!(schema["properties"]["next_candidate_count"]["maximum"], 5);
+        assert!(schema["properties"].get("next_candidate_count").is_none());
         assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 1);
         assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 10);
         assert_eq!(schema["properties"]["advices"]["minItems"], 0);
@@ -5991,41 +5938,34 @@ mod tests {
         let schema = tool.function.parameters;
         assert_eq!(
             schema["required"],
-            serde_json::json!([
-                "next_candidate_count",
-                "next_window_steps",
-                "state_summary",
-                "advices"
-            ])
+            serde_json::json!(["next_window_steps", "state_summary", "advices"])
         );
-        assert_eq!(schema["properties"]["next_candidate_count"]["minimum"], 1);
-        assert_eq!(schema["properties"]["next_candidate_count"]["maximum"], 2);
+        assert!(schema["properties"].get("next_candidate_count").is_none());
         assert_eq!(schema["properties"]["next_window_steps"]["minimum"], 1);
         assert_eq!(schema["properties"]["next_window_steps"]["maximum"], 10);
         assert_eq!(schema["properties"]["advices"]["minItems"], 1);
         assert_eq!(schema["properties"]["advices"]["maxItems"], 2);
 
         let parsed = parse_asgard_initial_advice(
-        r#"{"next_candidate_count":2,"next_window_steps":4,"state_summary":"Start with one implementation lane and one falsification lane.","advices":[
+        r#"{"next_window_steps":4,"state_summary":"Start with one implementation lane and one falsification lane.","advices":[
             {"strategy":"Inspect the relevant parser and implement the narrow fix.","scope_basis":"The task asks for parser behavior."},
             {"strategy":"Write or run the boundary check first, then implement from the observed contract.","scope_basis":"The task asks for parser behavior."}
         ]}"#,
         2,
     )
     .unwrap();
-        assert_eq!(parsed.next_candidate_count, 2);
         assert_eq!(parsed.next_window_steps, 4);
         assert_eq!(parsed.advices.len(), 2);
         assert!(
-        parse_asgard_initial_advice(
-            r#"{"next_candidate_count":2,"next_window_steps":0,"state_summary":"too short","advices":[
+            parse_asgard_initial_advice(
+                r#"{"next_window_steps":0,"state_summary":"too short","advices":[
                 {"strategy":"a","scope_basis":"task"},
                 {"strategy":"b","scope_basis":"task"}
             ]}"#,
-            2,
-        )
-        .is_err()
-    );
+                2,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -6046,7 +5986,6 @@ mod tests {
             "advice-call",
             "advise_trajectories",
             serde_json::json!({
-                "next_candidate_count": 3,
                 "next_window_steps": 4,
                 "state_summary": "Begin with implementation, contract discovery, and falsification lanes.",
                 "advices": [
@@ -6107,38 +6046,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asgard_supervisor_retries_mismatched_advice_count() {
-        let response = |id: &str, next_candidate_count: usize, advices: serde_json::Value| {
-            LlmResponse::ToolCalls {
-                text: String::new(),
-                reasoning_content: None,
-                calls: vec![supervisor_tool_call(
-                    id,
-                    "select_trajectory",
-                    serde_json::json!({
-                        "winner": 0,
-                        "complete": false,
-                        "next_candidate_count": next_candidate_count,
-                        "next_window_steps": 2,
-                        "state_summary": "Work remains.",
-                        "advices": advices,
-                    }),
-                )],
-                usage: crate::llm_client::TokenUsage::default(),
-            }
+    async fn asgard_supervisor_retries_empty_advice_set() {
+        let response = |id: &str, advices: serde_json::Value| LlmResponse::ToolCalls {
+            text: String::new(),
+            reasoning_content: None,
+            calls: vec![supervisor_tool_call(
+                id,
+                "select_trajectory",
+                serde_json::json!({
+                    "winner": 0,
+                    "complete": false,
+                    "next_window_steps": 2,
+                    "state_summary": "Work remains.",
+                    "advices": advices,
+                }),
+            )],
+            usage: crate::llm_client::TokenUsage::default(),
         };
         let backend = ScriptedSupervisorBackend::new(vec![
+            response("invalid-empty", serde_json::json!([])),
             response(
-                "invalid-count",
-                3,
-                serde_json::json!([
-                    {"strategy":"one","scope_basis":"task"},
-                    {"strategy":"two","scope_basis":"task"}
-                ]),
-            ),
-            response(
-                "valid-count",
-                1,
+                "valid-advice",
                 serde_json::json!([
                     {"strategy":"fix the serial bug","scope_basis":"task"}
                 ]),
@@ -6164,12 +6092,11 @@ mod tests {
         .await;
 
         let (decision, _) = decision.expect("corrected decision");
-        assert_eq!(decision.next_candidate_count, Some(1));
+        assert_eq!(decision.advices.len(), 1);
         let requests = backend.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].messages.iter().any(|message| {
-            message.role == "tool"
-                && asgard_message_text(message).contains("matching distinct advices")
+            message.role == "tool" && asgard_message_text(message).contains("1-5 distinct advices")
         }));
     }
 
@@ -6181,7 +6108,6 @@ mod tests {
             serde_json::json!({
                 "winner": 1,
                 "complete": false,
-                "next_candidate_count": 2,
                 "next_window_steps": 4,
                 "state_summary": "Lane 2 has the strongest implementation but lacks verification.",
                 "advices": [
@@ -6327,7 +6253,6 @@ mod tests {
             serde_json::json!({
                 "winner": 1,
                 "complete": false,
-                "next_candidate_count": 3,
                 "next_window_steps": 3,
                 "state_summary": "The isolated endpoint still needs focused verification.",
                 "advices": [
@@ -6681,7 +6606,6 @@ mod tests {
                 serde_json::json!({
                     "winner": 0,
                     "complete": false,
-                    "next_candidate_count": 1,
                     "next_window_steps": 3,
                     "state_summary": "Retrieved the full outputs before selecting.",
                     "advices": [{
@@ -6787,7 +6711,6 @@ mod tests {
             serde_json::json!({
                 "winner": 0,
                 "complete": false,
-                "next_candidate_count": 1,
                 "next_window_steps": 3,
                 "state_summary": "Lane 1 is the best incomplete foundation; focused verification remains.",
                 "advices": [{
