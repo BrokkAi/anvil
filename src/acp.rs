@@ -4995,6 +4995,11 @@ the reference, not your habit.
 catch (swap the arguments, invert the boundary, drop a term), confirm the suite goes red, \
 then revert the plant. A planted bug that survives means the test is decoration — \
 strengthen it before moving on.
+- If you catch yourself arranging a test's setup so a hard case cannot occur — feeding a \
+blocked operation more input, narrowing a scenario until the tricky path is unreachable — \
+the case you avoided is the required test. When a spec demands cancelling or interrupting \
+an in-progress operation, test one left genuinely stuck with no further input, and make \
+the code force it to settle rather than set a flag no resumed loop will ever check.
 - Report outcomes faithfully. If tests fail, say so and include the relevant output. Do not \
 claim \"tested\", \"working\", or \"done\" unless you ran the check and saw it pass; if you \
 could not verify, say so plainly.
