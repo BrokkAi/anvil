@@ -449,6 +449,7 @@ async fn acquire_bifrost_install_lock(cache_dir: &Path) -> anyhow::Result<Bifros
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(&lock_path)
                     .with_context(|| {
                         format!("opening bifrost install lock {}", lock_path.display())
