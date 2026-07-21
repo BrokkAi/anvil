@@ -26,7 +26,6 @@ pub(crate) struct SpawnRequest {
     pub(crate) instructions: String,
     pub(crate) model: Option<String>,
     pub(crate) injected_files: Vec<(String, Vec<u8>)>,
-    pub(crate) max_steps: Option<usize>,
 }
 
 pub(crate) struct FinalizeRequest {
@@ -377,7 +376,6 @@ fn parse_spawn_worker(
         instructions,
         model,
         injected_files: Vec::new(),
-        max_steps: None,
     })
 }
 
