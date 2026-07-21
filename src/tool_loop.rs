@@ -40,6 +40,19 @@ use crate::train_bifrost::{self, TrainingPacket};
 
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
+/// Injected as a plain user message one turn before a trajectory-window run's
+/// (Asgard workers, Asgard intake readers) step budget is exhausted -- see
+/// `trajectory_window_budget_notice`. Wording is shared with
+/// `asgard::intake` so a worker and an intake reader hear the same warning.
+pub(crate) const TRAJECTORY_WINDOW_PENULTIMATE_NOTICE: &str = "Budget notice: this step and \
+    one more remain. This is your last step that may call tools - your final step must be your \
+    report.";
+/// Injected on a trajectory-window run's last turn -- see
+/// `trajectory_window_budget_notice`.
+pub(crate) const TRAJECTORY_WINDOW_FINAL_NOTICE: &str = "Budget notice: this is your final \
+    step. Write your report to the supervisor now - a concise account of what you did, what you \
+    verified with real command output, and what remains. Do not call tools; results from this \
+    step would never be seen.";
 const AUTO_PERMISSION_CLASSIFIER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTO_PERMISSION_CLASSIFIER_MAX_CHARS: usize = 8_000;
 const MAX_PARALLEL_SAFE_TOOL_CALLS: usize = 6;
@@ -2148,6 +2161,19 @@ pub(crate) async fn run(
                     }));
                 }
             }
+        }
+
+        // Trajectory-window runs can't rely on `force_text_response` below
+        // (withholding tools would perturb the cached prefix), so a step
+        // budget running out is instead flagged in-band as a harness user
+        // message, one turn ahead of the deadline and again on it.
+        if let Some(notice) = trajectory_window_budget_notice(
+            trajectory_window,
+            p2t_config.is_some(),
+            turn,
+            max_turns,
+        ) {
+            messages.push(ChatMessage::user(notice));
         }
 
         // For the last turn, normally force a text response. If no file
@@ -4783,6 +4809,41 @@ fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
     })
 }
 
+/// The harness user message to inject before this turn's request, if any,
+/// for a trajectory-window run (Asgard workers, Asgard intake's grounded
+/// reader -- see `asgard::intake::read_grounded_contract`).
+///
+/// Trajectory-window runs never get the live-run `force_text_response`
+/// treatment (that gate is `!trajectory_window` further down in `run`) --
+/// their tool catalog must stay stable across turns for prefix-cache
+/// affinity, so a withheld tool list is not an option. Instead, the model
+/// is warned in-band: one step before the budget runs out, and again on the
+/// final step, telling it plainly that no further tool results will be
+/// seen and its next text is the only thing that survives.
+///
+/// `turn` and `max_turns` are the loop's own 0-indexed turn counter and its
+/// exclusive upper bound (`turn` ranges over `0..max_turns`): the final turn
+/// is turn number `max_turns` minus one, and the one before it is `max_turns`
+/// minus two. Per spec, a budget too small to have a distinct penultimate
+/// turn (fewer than three turns total) only ever gets the final notice.
+fn trajectory_window_budget_notice(
+    trajectory_window: bool,
+    p2t_config_present: bool,
+    turn: usize,
+    max_turns: usize,
+) -> Option<&'static str> {
+    if !trajectory_window || p2t_config_present {
+        return None;
+    }
+    if max_turns >= 3 && turn == max_turns - 2 {
+        Some(TRAJECTORY_WINDOW_PENULTIMATE_NOTICE)
+    } else if turn == max_turns - 1 {
+        Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+    } else {
+        None
+    }
+}
+
 fn has_successful_file_change(tool_exchanges: &[ToolExchange]) -> bool {
     tool_exchanges.iter().any(|exchange| {
         matches!(exchange.tool_name.as_str(), "edit" | "write_file")
@@ -5771,6 +5832,59 @@ mod tests {
         assert_eq!(subagent_max_turns(5, None), 5);
         // An unbounded parent yields an unbounded subagent.
         assert_eq!(subagent_max_turns(usize::MAX, None), usize::MAX);
+    }
+
+    /// `trajectory_window_budget_notice` is the exact expression `run`
+    /// evaluates every turn to decide what harness message (if any) to push
+    /// onto `messages` before building that turn's request -- so what this
+    /// function returns for a given `(turn, max_turns)` is what the model
+    /// sees in its request for that turn. With `trajectory_window: true` and
+    /// `max_turns: 3`, turns run 0, 1, 2 (0-indexed, exclusive upper bound):
+    /// turn 1 is the request a human would call "turn 2 of 3" -- one step
+    /// before the budget -- and turn 2 is "turn 3 of 3", the final request.
+    #[test]
+    fn trajectory_window_budget_notice_warns_before_the_last_two_turns() {
+        // Turn 1 of 3 ("turn 2's request"): one step remains after this one.
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 1, 3),
+            Some(TRAJECTORY_WINDOW_PENULTIMATE_NOTICE)
+        );
+        // Turn 2 of 3 ("turn 3's request"): this is the final step.
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 2, 3),
+            Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+        );
+        // Turn 0 of 3 is neither -- no notice yet.
+        assert_eq!(trajectory_window_budget_notice(true, false, 0, 3), None);
+
+        // `trajectory_window: false` (a live, non-worker run) never gets
+        // these in-band notices -- it has `force_text_response` instead.
+        for turn in 0..3 {
+            assert_eq!(trajectory_window_budget_notice(false, false, turn, 3), None);
+        }
+    }
+
+    #[test]
+    fn trajectory_window_budget_notice_is_final_only_under_three_turns() {
+        // A budget too small to have a distinct penultimate turn only ever
+        // gets the final notice, per spec, never the penultimate one.
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 0, 1),
+            Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+        );
+        assert_eq!(trajectory_window_budget_notice(true, false, 0, 2), None);
+        assert_eq!(
+            trajectory_window_budget_notice(true, false, 1, 2),
+            Some(TRAJECTORY_WINDOW_FINAL_NOTICE)
+        );
+    }
+
+    #[test]
+    fn trajectory_window_budget_notice_skips_p2t_runs() {
+        // p2t/train_bifrost runs manage their own step budgeting and must
+        // not get this notice even when `trajectory_window` is true.
+        assert_eq!(trajectory_window_budget_notice(true, true, 1, 3), None);
+        assert_eq!(trajectory_window_budget_notice(true, true, 2, 3), None);
     }
 
     #[test]

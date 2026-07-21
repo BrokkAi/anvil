@@ -18,6 +18,21 @@ use crate::tool_loop::{LoopOutcome, NotificationMode, SpawnedCx, TextSink};
 
 pub(crate) const ASGARD_INTAKE_MAX_STEPS: usize = 8;
 
+/// Forced-continuation message for `grounded_forced_report`: the grounded
+/// reader's `tool_loop::run` call (below, with `trajectory_window: true`)
+/// already receives the shared `TRAJECTORY_WINDOW_PENULTIMATE_NOTICE` /
+/// `TRAJECTORY_WINDOW_FINAL_NOTICE` in-band one turn before, and on, its last
+/// step -- that reader IS the trajectory-window turn loop, it has no
+/// step-counting of its own, so there is no separate injection point here for
+/// the penultimate warning. This message is the backstop for the rarer case
+/// where the loop still exhausted its turns without producing a report (e.g.
+/// the model used its last step on a tool call anyway): its opening now
+/// shares the shared final-turn notice's "Budget notice" framing so the two
+/// read as one voice, rather than the two differently-worded one-offs they
+/// used to be.
+const ASGARD_INTAKE_EXHAUSTED_REPORT_NOTICE: &str = "Budget notice: this is your final step. \
+    Write your numbered report now from what you have already seen. Do not call any tools.";
+
 pub(crate) const ASGARD_INTAKE_READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "list_directory",
@@ -266,9 +281,7 @@ async fn grounded_forced_report(
         return None;
     }
     let mut messages = outcome.continuation_messages;
-    messages.push(ChatMessage::user(
-        "Your step budget is exhausted. Write your numbered report now from what you have already seen. Do not call any tools.",
-    ));
+    messages.push(ChatMessage::user(ASGARD_INTAKE_EXHAUSTED_REPORT_NOTICE));
     let result = crate::llm_client::stream_chat_no_visible_output_with_retry(
         run.llm.as_ref(),
         "asgard_intake_grounded_forced_report",
@@ -346,5 +359,33 @@ mod tests {
             READER_L_PROMPT
                 .contains("Output the numbered contract followed by the AMBIGUITIES list")
         );
+    }
+
+    /// The grounded reader's turn loop (`read_grounded_contract`) is a plain
+    /// `tool_loop::run` call with `trajectory_window: true`, so its
+    /// penultimate-turn warning already comes from `run`'s own
+    /// `TRAJECTORY_WINDOW_PENULTIMATE_NOTICE` injection -- there is no
+    /// separate step counter in this file to inject into. What remains local
+    /// to intake is the backstop forced-report message for the rarer case
+    /// where the loop still exhausted its turns without a report; its
+    /// wording should read as the same voice as the shared final-turn
+    /// notice, not a different-sounding one-off.
+    #[test]
+    fn exhausted_report_notice_matches_shared_final_notice_voice() {
+        // Same opening framing as the shared trajectory-window final notice
+        // -- the two are meant to read as one voice, word for word on this
+        // clause -- even though this backstop keeps its own domain-specific
+        // instructions after it (a numbered contract report, not a
+        // supervisor report).
+        assert!(
+            ASGARD_INTAKE_EXHAUSTED_REPORT_NOTICE
+                .starts_with("Budget notice: this is your final step.")
+        );
+        assert!(
+            crate::tool_loop::TRAJECTORY_WINDOW_FINAL_NOTICE
+                .starts_with("Budget notice: this is your final step.")
+        );
+        assert!(ASGARD_INTAKE_EXHAUSTED_REPORT_NOTICE.contains("Write your numbered report now"));
+        assert!(ASGARD_INTAKE_EXHAUSTED_REPORT_NOTICE.ends_with("Do not call any tools."));
     }
 }
