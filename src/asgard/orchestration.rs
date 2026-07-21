@@ -110,6 +110,7 @@ pub(crate) const ASGARD_MAX_CANDIDATES: usize = 5;
 const ASGARD_TRANSPLANT_MAX_AUTHORS: usize = 3;
 const ASGARD_TRANSPLANT_MAX_FILES: usize = 24;
 const ASGARD_TRANSPLANT_MAX_ROUNDS: usize = 2;
+const ASGARD_TRANSPLANT_WORKER_MAX_STEPS: usize = 20;
 
 #[derive(Clone, Debug)]
 struct SiblingTestTransplantGroup {
@@ -309,10 +310,11 @@ async fn launch_worker<'a>(
     let tool_allowlist = Arc::new(worker_tool_allowlist(&registry).await);
 
     let instructions = spawn.instructions.clone();
+    let max_steps = spawn.max_steps.unwrap_or(ASGARD_WORKER_MAX_STEPS);
     let instruction_message = ChatMessage::user(format!(
         "<supervisor_instructions>\n{instructions}\n</supervisor_instructions>\n\
          You are a worker agent directed by a supervisor. You have up to \
-         {ASGARD_WORKER_MAX_STEPS} steps (each step = one batch of tool calls) before \
+         {max_steps} steps (each step = one batch of tool calls) before \
          you are paused for review; the supervisor may resume you or branch another \
          worker from your state. When you stop making tool calls, your turn ends and \
          your final message is delivered to the supervisor - make it a precise report \
@@ -366,7 +368,7 @@ async fn launch_worker<'a>(
             service_tier,
             structured_output,
             messages,
-            ASGARD_WORKER_MAX_STEPS,
+            max_steps,
             idle_timeout,
             worker_cancel,
             sinks.text,
@@ -1537,6 +1539,7 @@ async fn execute_spawn_requests<'ctx, 'fut>(
                         instructions,
                         model: None,
                         injected_files,
+                        max_steps: Some(ASGARD_TRANSPLANT_WORKER_MAX_STEPS),
                     },
                 )
                 .await?;
@@ -1641,7 +1644,12 @@ fn sibling_test_transplant_instructions(groups: &[SiblingTestTransplantGroup]) -
          failure whether the test appears to depend on implementation-specific structure \
          (private helpers, invented APIs, exact message wording) rather than task-mandated \
          behavior. Do not modify production code or these test files; you are collecting \
-         evidence for the supervisor."
+         evidence for the supervisor. Budget discipline: after each test command \
+         completes, immediately write down the per-group results so far before running \
+         anything else. If you are close to your step limit, stop running further \
+         groups and deliver the report with what you have - an incomplete report with \
+         verbatim failures is worth far more than a complete run with no report. Your \
+         final text message is the only thing the supervisor ever sees."
     )
 }
 
@@ -2546,6 +2554,21 @@ pub(crate) fn asgard_failure(error: anyhow::Error) -> LoopOutcome {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn transplant_instructions_demand_report_first_budget_discipline() {
+        let groups = vec![SiblingTestTransplantGroup {
+            worker: 7,
+            files: vec!["tests/a_test.py".to_string()],
+            injected_files: vec![("tests/a_test.py".to_string(), b"x".to_vec())],
+        }];
+        let text = sibling_test_transplant_instructions(&groups);
+        assert!(text.contains("[from w7: tests/a_test.py]"));
+        assert!(text.contains("Budget discipline"));
+        assert!(text.contains("an incomplete report with verbatim failures"));
+        assert!(text.contains("only thing the supervisor ever sees"));
+        assert_eq!(ASGARD_TRANSPLANT_WORKER_MAX_STEPS, 20);
+    }
     use std::fs;
     use std::process::Command;
     use std::sync::Mutex;
