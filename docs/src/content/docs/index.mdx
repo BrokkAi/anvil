@@ -1,0 +1,97 @@
+---
+title: Anvil
+description: One agent engine for any ACP interface.
+template: splash
+hero:
+  title: One agent engine. Any interface.
+  tagline: An ACP-native agent runtime for editors, bots, TUIs, and internal tools.
+  actions:
+    - text: Quick start
+      link: quick-start/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/BrokkAi/anvil
+      icon: external
+      variant: secondary
+---
+
+<section class="home-section">
+  <p class="section-label">The boundary is the product</p>
+  <h2>Build the interface. Keep the engine.</h2>
+  <p>
+    Anvil separates the agent runtime from the experience around it. Your client stays small and
+    intentional while one reusable ACP subprocess handles execution semantics.
+  </p>
+
+  <div class="ownership-grid">
+    <article>
+      <small>CLIENT OWNS</small>
+      <h3>The experience</h3>
+      <ul>
+        <li>Conversation and task UI</li>
+        <li>Permission prompts</li>
+        <li>Session controls</li>
+        <li>Streaming presentation</li>
+      </ul>
+    </article>
+    <article>
+      <small>ANVIL OWNS</small>
+      <h3>The agent runtime</h3>
+      <ul>
+        <li>Model routing and tool loop</li>
+        <li>Permission enforcement</li>
+        <li>Sessions and context compaction</li>
+        <li>Sandboxing and MCP servers</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<section class="home-section">
+  <p class="section-label">Runtime capabilities</p>
+  <h2>Serious infrastructure, behind a clean protocol.</h2>
+
+  <div class="capability-grid">
+    <a href="concepts/#model-routing">
+      <span>01 / ROUTE</span>
+      <h3>Model routing</h3>
+      <p>Connect Codex, Bedrock, hosted providers, or local models through stable wire IDs.</p>
+    </a>
+    <a href="concepts/#tooling-and-mcp">
+      <span>02 / EXTEND</span>
+      <h3>Tools + MCP</h3>
+      <p>Ship built-in file and shell tools, skills, subagents, and managed MCP servers.</p>
+    </a>
+    <a href="concepts/#permissions">
+      <span>03 / CONTROL</span>
+      <h3>Permission gates</h3>
+      <p>Keep attended and unattended workflows explicit at the protocol boundary.</p>
+    </a>
+    <a href="concepts/#sessions-and-context">
+      <span>04 / REMEMBER</span>
+      <h3>Persistent sessions</h3>
+      <p>Resume work with durable history, context reporting, and automatic compaction.</p>
+    </a>
+  </div>
+</section>
+
+<section class="home-section">
+  <p class="section-label">One backend, many surfaces</p>
+  <h2>An agent engine that does not dictate the UI.</h2>
+  <p>Use Anvil from an editor, a focused automation, or a frontend that has not been invented yet.</p>
+  <div class="client-line" aria-label="Example Anvil clients">
+    <span>Zed</span><span>JetBrains</span><span>Issue bots</span><span>Review bots</span><span>Custom TUIs</span>
+  </div>
+</section>
+
+<section class="home-section">
+  <div class="docs-callout">
+    <div>
+      <p class="section-label">Documentation preview</p>
+      <h2>Start at the protocol boundary.</h2>
+      <p>The documentation structure is in place. Installation, client wiring, runtime concepts, and configuration will grow here.</p>
+    </div>
+    <a href="quick-start/">Read the quick start <span aria-hidden="true">→</span></a>
+  </div>
+</section>

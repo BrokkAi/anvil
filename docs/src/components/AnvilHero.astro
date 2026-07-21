@@ -1,0 +1,304 @@
+---
+import { LinkButton } from '@astrojs/starlight/components';
+import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+
+const { data } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute.entry;
+const { actions = [] } = data.hero || {};
+---
+
+<section class="anvil-hero" aria-labelledby="_top">
+  <div class="hero-copy">
+    <p class="hero-kicker"><span>01</span> Agent Client Protocol / Rust</p>
+    <h1 id="_top" data-page-title>
+      One agent engine.<br />
+      <em>Any interface.</em>
+    </h1>
+    <p class="hero-tagline">
+      Anvil is the portable agent runtime behind editors, bots, TUIs, and internal tools.
+      Bring the experience. Anvil brings the model loop, tools, permissions, and memory.
+    </p>
+
+    {
+      actions.length > 0 && (
+        <div class="hero-actions">
+          {actions.map(({ icon, link: href, text, variant }) => (
+            <LinkButton href={href} variant={variant} icon={icon?.name}>
+              {text}
+              {icon?.html && <Fragment set:html={icon.html} />}
+            </LinkButton>
+          ))}
+        </div>
+      )
+    }
+
+    <ul class="hero-facts" aria-label="Anvil technical summary">
+      <li><span>Transport</span><strong>stdio / JSON-RPC</strong></li>
+      <li><span>Protocol</span><strong>ACP</strong></li>
+      <li><span>Runtime</span><strong>Rust</strong></li>
+    </ul>
+  </div>
+
+  <div class="runtime-map" aria-label="Anvil runtime architecture">
+    <div class="map-header"><span>ANVIL / RUNTIME MAP</span><small>SESSION 01 — READY</small></div>
+
+    <div class="client-stack">
+      <p>CLIENTS</p>
+      <span>Zed</span><span>JetBrains</span><span>Issue bot</span><span>Custom UI</span>
+    </div>
+
+    <div class="protocol-line"><span>ACP</span><i></i><b>stdio</b></div>
+
+    <div class="anvil-core">
+      <small>PORTABLE AGENT BACKEND</small>
+      <strong>ANVIL</strong>
+      <div class="core-status"><i></i> RUNNING</div>
+      <ul>
+        <li>tool loop</li><li>permission gate</li><li>session store</li><li>context manager</li>
+      </ul>
+    </div>
+
+    <div class="output-grid">
+      <div><span>MODELS</span><strong>Codex · Bedrock · local</strong></div>
+      <div><span>TOOLS</span><strong>Files · shell · skills</strong></div>
+      <div><span>MCP</span><strong>Bifrost · custom servers</strong></div>
+    </div>
+  </div>
+
+  <p class="hero-rail" aria-hidden="true">ANVIL // AGENT INFRASTRUCTURE // ACP NATIVE // MODEL AGNOSTIC</p>
+</section>
+
+<style>
+  @layer starlight.user {
+    .anvil-hero {
+      position: relative;
+      isolation: isolate;
+      display: grid;
+      grid-template-columns: minmax(0, 1.02fr) minmax(28rem, 0.98fr);
+      gap: clamp(2rem, 5vw, 6rem);
+      align-items: center;
+      min-height: min(48rem, calc(100vh - var(--sl-nav-height)));
+      padding: clamp(4.5rem, 9vw, 8rem) clamp(0rem, 2.2vw, 2rem) clamp(7rem, 12vw, 10rem);
+      overflow: hidden;
+    }
+
+    .anvil-hero::before {
+      position: absolute;
+      z-index: -2;
+      inset: 0 -50vw;
+      background:
+        linear-gradient(90deg, transparent 49.9%, var(--anvil-grid-strong) 50%, transparent 50.1%),
+        linear-gradient(transparent 49.9%, var(--anvil-grid-strong) 50%, transparent 50.1%);
+      background-size: 11rem 11rem;
+      content: '';
+      mask-image: linear-gradient(180deg, rgb(0 0 0 / 0.85), transparent 92%);
+    }
+
+    .anvil-hero::after {
+      position: absolute;
+      z-index: -1;
+      inset: 8% -8% auto auto;
+      width: 41rem;
+      height: 41rem;
+      border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 16%, transparent);
+      border-radius: 50%;
+      box-shadow: inset 0 0 0 6rem color-mix(in srgb, var(--anvil-cobalt) 2.5%, transparent);
+      content: '';
+    }
+
+    .hero-copy { position: relative; z-index: 2; }
+
+    .hero-kicker {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin: 0 0 1.5rem;
+      color: var(--anvil-muted);
+      font-family: var(--sl-font-mono);
+      font-size: 0.68rem;
+      font-weight: 650;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    .hero-kicker span {
+      display: grid;
+      width: 1.8rem;
+      height: 1.8rem;
+      place-items: center;
+      border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 42%, transparent);
+      color: var(--anvil-cobalt);
+    }
+
+    .anvil-hero h1 {
+      max-width: 13ch;
+      margin: 0;
+      color: var(--anvil-ink);
+      font-family: var(--anvil-display);
+      font-size: clamp(3.9rem, 7.4vw, 7.4rem);
+      font-weight: 650;
+      letter-spacing: -0.065em;
+      line-height: 0.84;
+    }
+
+    .anvil-hero h1 em {
+      color: var(--anvil-cobalt);
+      font-family: var(--anvil-editorial);
+      font-weight: 500;
+      letter-spacing: -0.075em;
+    }
+
+    .hero-tagline {
+      max-width: 38rem;
+      margin: 2rem 0 0;
+      color: var(--anvil-copy);
+      font-size: clamp(1.06rem, 1.45vw, 1.25rem);
+      line-height: 1.55;
+    }
+
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 2rem; }
+
+    .hero-actions :global(.sl-link-button) {
+      min-width: 9.5rem;
+      justify-content: center;
+      border-radius: 0.12rem;
+      font-family: var(--sl-font-mono);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .hero-facts {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      max-width: 38rem;
+      margin: 3rem 0 0;
+      padding: 0;
+      border-block: 1px solid var(--anvil-line);
+      list-style: none;
+    }
+
+    .hero-facts li { padding: 0.85rem 0.75rem 0.85rem 0; }
+    .hero-facts li + li { padding-inline-start: 0.9rem; border-inline-start: 1px solid var(--anvil-line); }
+    .hero-facts span,
+    .hero-facts strong { display: block; }
+    .hero-facts span {
+      margin-bottom: 0.2rem;
+      color: var(--anvil-muted);
+      font-family: var(--sl-font-mono);
+      font-size: 0.58rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+    .hero-facts strong { color: var(--anvil-ink); font-size: 0.78rem; font-weight: 650; }
+
+    .runtime-map {
+      position: relative;
+      z-index: 2;
+      padding: 1rem;
+      border: 1px solid var(--anvil-line-strong);
+      background:
+        linear-gradient(var(--anvil-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--anvil-grid) 1px, transparent 1px),
+        color-mix(in srgb, var(--anvil-surface) 92%, transparent);
+      background-size: 22px 22px;
+      box-shadow: 0 32px 80px rgb(12 28 53 / 0.16), inset 0 1px var(--anvil-highlight);
+      font-family: var(--sl-font-mono);
+      transform: rotate(0.5deg);
+    }
+
+    .map-header {
+      display: flex;
+      justify-content: space-between;
+      padding-bottom: 0.8rem;
+      border-bottom: 1px solid var(--anvil-line-strong);
+      color: var(--anvil-muted);
+      font-size: 0.58rem;
+      font-weight: 650;
+      letter-spacing: 0.07em;
+    }
+    .map-header small { color: var(--anvil-cobalt); font-size: inherit; }
+
+    .client-stack { display: grid; grid-template-columns: 4.3rem repeat(4, 1fr); gap: 0.4rem; align-items: center; padding: 1.25rem 0; }
+    .client-stack p { margin: 0; color: var(--anvil-muted); font-size: 0.58rem; letter-spacing: 0.08em; }
+    .client-stack span {
+      padding: 0.52rem 0.3rem;
+      border: 1px solid var(--anvil-line);
+      background: var(--anvil-surface-raised);
+      color: var(--anvil-copy);
+      font-size: 0.58rem;
+      text-align: center;
+    }
+
+    .protocol-line { display: grid; grid-template-columns: auto 1fr auto; gap: 0.55rem; align-items: center; color: var(--anvil-cobalt); font-size: 0.6rem; }
+    .protocol-line i { height: 1px; background: repeating-linear-gradient(90deg, var(--anvil-cobalt) 0 4px, transparent 4px 8px); }
+    .protocol-line b { color: var(--anvil-muted); font-weight: 500; }
+
+    .anvil-core {
+      position: relative;
+      margin: 0.65rem 0;
+      padding: 1.5rem;
+      border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 60%, var(--anvil-line));
+      background: linear-gradient(135deg, color-mix(in srgb, var(--anvil-cobalt) 12%, var(--anvil-surface)), var(--anvil-surface) 55%);
+      box-shadow: inset 4px 0 var(--anvil-cobalt);
+    }
+    .anvil-core > small { color: var(--anvil-muted); font-size: 0.55rem; letter-spacing: 0.08em; }
+    .anvil-core > strong {
+      display: block;
+      margin-top: 0.2rem;
+      color: var(--anvil-ink);
+      font-family: var(--anvil-display);
+      font-size: clamp(2.5rem, 5vw, 4.5rem);
+      letter-spacing: -0.06em;
+      line-height: 1;
+    }
+    .core-status { position: absolute; inset: 1.45rem 1.4rem auto auto; color: var(--anvil-cobalt); font-size: 0.57rem; font-weight: 700; letter-spacing: 0.07em; }
+    .core-status i { display: inline-block; width: 0.38rem; height: 0.38rem; margin-right: 0.35rem; border-radius: 50%; background: var(--anvil-cobalt); box-shadow: 0 0 0 3px color-mix(in srgb, var(--anvil-cobalt) 15%, transparent); }
+    .anvil-core ul { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 1rem 0 0; padding: 0; list-style: none; }
+    .anvil-core li { padding: 0.3rem 0.42rem; background: var(--anvil-surface-raised); color: var(--anvil-muted); font-size: 0.54rem; }
+
+    .output-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.55rem; }
+    .output-grid div { min-width: 0; padding: 0.7rem; border: 1px solid var(--anvil-line); background: var(--anvil-surface-raised); }
+    .output-grid span,
+    .output-grid strong { display: block; }
+    .output-grid span { margin-bottom: 0.35rem; color: var(--anvil-cobalt); font-size: 0.54rem; font-weight: 700; letter-spacing: 0.08em; }
+    .output-grid strong { overflow: hidden; color: var(--anvil-copy); font-size: 0.55rem; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+
+    .hero-rail {
+      position: absolute;
+      inset: auto 0 2.4rem;
+      margin: 0;
+      padding-block: 0.65rem;
+      border-block: 1px solid var(--anvil-line);
+      color: var(--anvil-muted);
+      font-family: var(--sl-font-mono);
+      font-size: 0.57rem;
+      letter-spacing: 0.16em;
+      text-align: center;
+      word-spacing: 1.2rem;
+    }
+
+    @media (max-width: 62rem) {
+      .anvil-hero { grid-template-columns: 1fr; min-height: auto; padding-top: 4rem; }
+      .hero-copy { max-width: 47rem; }
+      .runtime-map { width: min(100%, 42rem); justify-self: center; }
+    }
+
+    @media (max-width: 35rem) {
+      .anvil-hero { padding-bottom: 6rem; }
+      .anvil-hero h1 { font-size: clamp(3.5rem, 17vw, 5rem); }
+      .runtime-map { padding: 0.75rem; }
+      .map-header small { display: none; }
+      .client-stack { grid-template-columns: repeat(2, 1fr); }
+      .client-stack p { grid-column: 1 / -1; }
+      .output-grid { grid-template-columns: 1fr; }
+      .hero-facts { grid-template-columns: 1fr; }
+      .hero-facts li + li { padding-inline-start: 0; border-inline-start: 0; border-top: 1px solid var(--anvil-line); }
+      .hero-rail { letter-spacing: 0.08em; word-spacing: 0.2rem; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .runtime-map { transform: none; }
+    }
+  }
+</style>
