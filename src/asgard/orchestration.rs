@@ -109,6 +109,7 @@ pub(crate) const ASGARD_MIN_CANDIDATES: usize = 1;
 pub(crate) const ASGARD_MAX_CANDIDATES: usize = 5;
 const ASGARD_TRANSPLANT_MAX_AUTHORS: usize = 3;
 const ASGARD_TRANSPLANT_MAX_FILES: usize = 24;
+const ASGARD_TRANSPLANT_MAX_ROUNDS: usize = 2;
 
 #[derive(Clone, Debug)]
 struct SiblingTestTransplantGroup {
@@ -132,6 +133,7 @@ struct FinishedWorker {
     usage: TokenUsage,
     elapsed_millis: u64,
     repository: CandidateRepository,
+    injected_paths: Vec<String>,
 }
 
 impl FinishedWorker {
@@ -192,6 +194,7 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     finalize_evidence_bounced: &'ctx mut bool,
     finalize_lineage_bounced: &'ctx mut bool,
     prefinalize_issued: &'ctx mut bool,
+    prefinalize_rounds: &'ctx mut usize,
     prefinalize_workers: &'ctx mut Vec<usize>,
     latest_prefinalize_source_commits: &'ctx mut HashSet<String>,
     idle_timeout: IdleTimeouts,
@@ -289,6 +292,11 @@ async fn launch_worker<'a>(
         crate::asgard::remove_candidate_repository(&repository);
         return Err(error);
     }
+    let injected_paths = spawn
+        .injected_files
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
 
     let Some(registry) = launch
         .sessions
@@ -436,6 +444,7 @@ async fn launch_worker<'a>(
             usage: outcome.usage,
             elapsed_millis,
             repository,
+            injected_paths,
         }
     }
     .boxed();
@@ -591,6 +600,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut finalize_evidence_bounced = false;
     let mut finalize_lineage_bounced = false;
     let mut prefinalize_issued = false;
+    let mut prefinalize_rounds = 0usize;
     let mut prefinalize_workers = Vec::new();
     let mut latest_prefinalize_source_commits = HashSet::new();
     let run_started = Instant::now();
@@ -686,6 +696,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             finalize_evidence_bounced: &mut finalize_evidence_bounced,
             finalize_lineage_bounced: &mut finalize_lineage_bounced,
             prefinalize_issued: &mut prefinalize_issued,
+            prefinalize_rounds: &mut prefinalize_rounds,
             prefinalize_workers: &mut prefinalize_workers,
             latest_prefinalize_source_commits: &mut latest_prefinalize_source_commits,
             idle_timeout,
@@ -1437,6 +1448,12 @@ async fn execute_spawn_requests<'ctx, 'fut>(
     let prefinalize_candidate = matches!(kind, SpawnKind::Prefinalize)
         .then(|| spawns.first().map(|spawn| spawn.from.clone()))
         .flatten();
+    let transplant_allowed = if matches!(kind, SpawnKind::Prefinalize) {
+        *cx.prefinalize_rounds += 1;
+        *cx.prefinalize_rounds <= ASGARD_TRANSPLANT_MAX_ROUNDS
+    } else {
+        false
+    };
     let mut lines = Vec::new();
     let mut pending_sources = spawns
         .iter()
@@ -1496,6 +1513,7 @@ async fn execute_spawn_requests<'ctx, 'fut>(
     }
     if let (SpawnKind::Prefinalize, Some(candidate)) = (kind, prefinalize_candidate)
         && candidate != CheckpointId::Root
+        && transplant_allowed
     {
         let groups = collect_sibling_test_transplants(cx, &candidate)?;
         if !groups.is_empty() {
@@ -1898,7 +1916,11 @@ fn resolve_pending(
     }
     match resolution {
         PendingResolution::Save => {
-            match stage.snapshot(&finished.repository.root, &format!("w{}", finished.worker)) {
+            match stage.snapshot(
+                &finished.repository.root,
+                &format!("w{}", finished.worker),
+                &finished.injected_paths,
+            ) {
                 Ok(commit) => {
                     dag.insert(TrajectoryNode {
                         window,
@@ -4145,6 +4167,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefinalize_auto_adds_sibling_test_verification_worker_at_most_two_rounds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_workers_call(
+                        "sv-spawn-batch",
+                        serde_json::json!([
+                            { "from": "root", "instructions": "candidate implementation" },
+                            { "from": "root", "instructions": "sibling test author" }
+                        ]),
+                    )]),
+                    tool_response(vec![
+                        save_worker_call("sv-save-w1", "w1"),
+                        save_worker_call("sv-save-w2", "w2"),
+                        prefinalize_call("sv-prefinalize-one", "w1", "verify candidate one"),
+                    ]),
+                    tool_response(vec![
+                        discard_worker_call("sv-discard-w3", "w3"),
+                        discard_worker_call("sv-discard-w4", "w4"),
+                        prefinalize_call("sv-prefinalize-two", "w1", "verify candidate two"),
+                    ]),
+                    tool_response(vec![
+                        discard_worker_call("sv-discard-w5", "w5"),
+                        discard_worker_call("sv-discard-w6", "w6"),
+                        prefinalize_call("sv-prefinalize-three", "w1", "verify candidate three"),
+                    ]),
+                    tool_response(vec![
+                        discard_worker_call("sv-discard-w7", "w7"),
+                        finalize_call_with_evidence("sv-finalize", "w1", &["w7m1"]),
+                    ]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![write_file_call(
+                        "w1-write",
+                        "src/lib.rs",
+                        "pub fn candidate() {}\n",
+                    )]),
+                    tool_response(vec![write_file_call(
+                        "w2-write",
+                        "tests/sibling_test.py",
+                        "SIBLING = 1\n",
+                    )]),
+                    text_response("w1 report"),
+                    text_response("w2 report"),
+                    text_response("w3 prefinalize report"),
+                    tool_response(vec![named_tool_call(
+                        "w4-read-injected",
+                        "read_file",
+                        serde_json::json!({ "file_path": "tests/sibling_test.py" }),
+                    )]),
+                    text_response("w4 sibling tests all pass"),
+                    text_response("w5 prefinalize report"),
+                    tool_response(vec![named_tool_call(
+                        "w6-read-injected",
+                        "read_file",
+                        serde_json::json!({ "file_path": "tests/sibling_test.py" }),
+                    )]),
+                    text_response("w6 sibling tests all pass"),
+                    text_response("w7 prefinalize report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise sibling test transplant cap")],
+        )
+        .await;
+
+        let all_requests = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_requests.contains(
+            "prefinalize auto-added sibling-test verification worker w4 (tests from w2: 1 files)"
+        ));
+        assert!(all_requests.contains(
+            "prefinalize auto-added sibling-test verification worker w6 (tests from w2: 1 files)"
+        ));
+        assert!(all_requests.contains("prefinalize spawned w7 from w1"));
+        assert!(
+            !all_requests.contains("prefinalize auto-added sibling-test verification worker w8")
+        );
+    }
+
+    #[tokio::test]
     async fn asgard_v2_scripted_e2e_runs_real_loop_and_checkpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -4632,7 +4765,7 @@ mod tests {
                 .expect("from worker");
         fs::write(from_worker.root.join("from.txt"), "from\n").expect("write from");
         let from_commit = stage
-            .snapshot(&from_worker.root, "from")
+            .snapshot(&from_worker.root, "from", &[])
             .expect("from snapshot");
 
         let onto_worker =
@@ -4640,7 +4773,7 @@ mod tests {
                 .expect("onto worker");
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").expect("write onto");
         let onto_commit = stage
-            .snapshot(&onto_worker.root, "onto")
+            .snapshot(&onto_worker.root, "onto", &[])
             .expect("onto snapshot");
 
         let mut dag = TrajectoryDag::new(Vec::new(), base_commit);
