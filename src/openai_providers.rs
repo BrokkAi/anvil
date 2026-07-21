@@ -70,6 +70,13 @@ pub fn read() -> Result<OpenAiProviderConfig> {
 }
 
 fn parse(bytes: &[u8]) -> Result<OpenAiProviderConfig> {
+    parse_with_api_key_lookup(bytes, |name| std::env::var(name).ok())
+}
+
+fn parse_with_api_key_lookup(
+    bytes: &[u8],
+    api_key_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<OpenAiProviderConfig> {
     let parsed: ProvidersFile = serde_json::from_slice(bytes)?;
     let mut profiles = Vec::with_capacity(parsed.openai.len());
     for (name, raw) in parsed.openai {
@@ -80,7 +87,7 @@ fn parse(bytes: &[u8]) -> Result<OpenAiProviderConfig> {
             Some(env) => {
                 validate_env_name(&env)
                     .with_context(|| format!("invalid api_key_env for openai provider {name:?}"))?;
-                let value = std::env::var(&env).with_context(|| {
+                let value = api_key_lookup(&env).with_context(|| {
                     format!("openai provider {name:?} requires missing environment variable {env}")
                 })?;
                 let trimmed = value.trim();
@@ -297,7 +304,10 @@ mod tests {
     use super::*;
     use crate::setup_state::TestConfigHomeScope;
     use futures::FutureExt;
+    use std::process::Command;
     use std::sync::Mutex;
+
+    const ENV_LOOKUP_CHILD: &str = "ANVIL_OPENAI_PROVIDER_ENV_LOOKUP_CHILD";
 
     fn chat_request(model: &str) -> StreamChatRequest {
         StreamChatRequest {
@@ -371,12 +381,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_profiles_and_appends_v1() {
-        let dir = tempfile::tempdir().expect("config dir");
-        let _scope = TestConfigHomeScope::set(dir.path().to_path_buf());
-        std::fs::write(
-            dir.path().join(PROVIDERS_FILE_NAME),
-            r#"{
+    fn parses_profiles_and_appends_v1_with_injected_key() {
+        let config = parse_with_api_key_lookup(
+            br#"{
               "openai": {
                 "deca": {
                   "base_url": "https://api.genlabs.dev/deca",
@@ -387,11 +394,9 @@ mod tests {
                 }
               }
             }"#,
+            |name| (name == "DECA_API_KEY").then(|| "sk-test".to_string()),
         )
-        .expect("write config");
-        let _env = EnvScope::set("DECA_API_KEY", "sk-test");
-
-        let config = read().expect("valid config");
+        .expect("valid config");
 
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.profiles[0].name, "deca");
@@ -403,6 +408,50 @@ mod tests {
         assert_eq!(config.profiles[1].name, "local-proxy");
         assert_eq!(config.profiles[1].base_url, "http://127.0.0.1:8000/v1");
         assert!(config.profiles[1].api_key.is_none());
+    }
+
+    #[test]
+    fn parses_profiles_with_a_process_environment_key_in_a_child() {
+        let output = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "openai_providers::tests::child_process_environment_lookup",
+            ])
+            .env(ENV_LOOKUP_CHILD, "1")
+            .env("DECA_API_KEY", "sk-test")
+            .output()
+            .expect("run isolated environment lookup test");
+
+        assert!(
+            output.status.success(),
+            "isolated environment lookup test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// This runs only in the subprocess launched by
+    /// `parses_profiles_with_a_process_environment_key_in_a_child`, so its
+    /// real environment lookup cannot race the parent test process.
+    #[test]
+    fn child_process_environment_lookup() {
+        if std::env::var_os(ENV_LOOKUP_CHILD).is_none() {
+            return;
+        }
+
+        let config = parse(
+            br#"{
+              "openai": {
+                "deca": {
+                  "base_url": "https://api.genlabs.dev/deca",
+                  "api_key_env": "DECA_API_KEY"
+                }
+              }
+            }"#,
+        )
+        .expect("process environment key is read");
+
+        assert_eq!(config.profiles[0].api_key.as_deref(), Some("sk-test"));
     }
 
     #[test]
@@ -447,9 +496,7 @@ mod tests {
 
     #[test]
     fn missing_configured_env_var_is_fatal() {
-        let _env = EnvScope::unset("MISSING_OPENAI_PROVIDER_KEY");
-
-        let err = parse(
+        let err = parse_with_api_key_lookup(
             br#"{
               "openai": {
                 "deca": {
@@ -458,6 +505,7 @@ mod tests {
                 }
               }
             }"#,
+            |_| None,
         )
         .expect_err("missing env var");
 
@@ -518,39 +566,5 @@ mod tests {
             .expect_err("bare id is ambiguous");
 
         assert!(format!("{err:#}").contains("profile-qualified"));
-    }
-
-    struct EnvScope {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvScope {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvScope {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
     }
 }
