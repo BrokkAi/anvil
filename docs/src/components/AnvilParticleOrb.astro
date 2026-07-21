@@ -1,0 +1,218 @@
+<div class="particle-orb" data-anvil-orb aria-hidden="true">
+  <canvas></canvas>
+  <span class="orb-core"></span>
+</div>
+
+<script>
+  const TAU = Math.PI * 2;
+  const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
+  type OrbPoint = {
+    x: number;
+    y: number;
+    z: number;
+    size: number;
+    phase: number;
+  };
+
+  function initializeOrb(root: HTMLElement) {
+    if (root.dataset.ready === 'true') return;
+    root.dataset.ready = 'true';
+
+    const canvas = root.querySelector('canvas');
+    const context = canvas?.getContext('2d');
+    if (!canvas || !context) return;
+
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const pointCount = window.matchMedia('(max-width: 560px)').matches ? 900 : 2200;
+    const points: OrbPoint[] = Array.from({ length: pointCount }, (_, index) => {
+      const y = 1 - (index / (pointCount - 1)) * 2;
+      const radius = Math.sqrt(1 - y * y);
+      const angle = GOLDEN_ANGLE * index;
+      return {
+        x: Math.cos(angle) * radius,
+        y,
+        z: Math.sin(angle) * radius,
+        size: 0.55 + ((index * 37) % 100) / 125,
+        phase: ((index * 61) % 100) / 100 * TAU,
+      };
+    });
+
+    let width = 0;
+    let height = 0;
+    let pixelRatio = 1;
+    let frame = 0;
+    let visible = true;
+
+    function resize() {
+      const bounds = root.getBoundingClientRect();
+      width = Math.max(1, bounds.width);
+      height = Math.max(1, bounds.height);
+      pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      draw(performance.now());
+    }
+
+    function draw(time: number) {
+      context.clearRect(0, 0, width, height);
+
+      const styles = getComputedStyle(root);
+      const dot = styles.getPropertyValue('--orb-dot').trim() || '91 140 255';
+      const accent = styles.getPropertyValue('--orb-accent').trim() || '214 226 255';
+      const seconds = time / 1000;
+      const rotationY = reduceMotion.matches ? 0.45 : seconds * 0.075;
+      const rotationX = reduceMotion.matches ? -0.12 : Math.sin(seconds * 0.19) * 0.13 - 0.08;
+      const cosY = Math.cos(rotationY);
+      const sinY = Math.sin(rotationY);
+      const cosX = Math.cos(rotationX);
+      const sinX = Math.sin(rotationX);
+      const radius = Math.min(width, height) * 0.405;
+      const centerX = width / 2;
+      const centerY = height / 2;
+
+      for (const point of points) {
+        const rotatedX = point.x * cosY - point.z * sinY;
+        const rotatedZ = point.x * sinY + point.z * cosY;
+        const rotatedY = point.y * cosX - rotatedZ * sinX;
+        const depth = point.y * sinX + rotatedZ * cosX;
+        const perspective = 1 / (1.92 - depth * 0.34);
+        const x = centerX + rotatedX * radius * perspective * 1.72;
+        const y = centerY + rotatedY * radius * perspective * 1.72;
+        const edge = Math.sqrt(rotatedX * rotatedX + rotatedY * rotatedY);
+        const shimmer = reduceMotion.matches ? 0.88 : 0.72 + Math.sin(seconds * 1.2 + point.phase) * 0.22;
+        const alpha = Math.max(0.18, 0.42 + depth * 0.24 + edge * 0.42) * shimmer;
+        const size = point.size * (0.78 + perspective * 0.72);
+
+        context.beginPath();
+        context.arc(x, y, size, 0, TAU);
+        context.fillStyle = `rgb(${depth > 0.28 ? accent : dot} / ${alpha})`;
+        context.fill();
+      }
+
+      if (!reduceMotion.matches && visible && !document.hidden) {
+        frame = requestAnimationFrame(draw);
+      }
+    }
+
+    const observer = new ResizeObserver(resize);
+    observer.observe(root);
+
+    const visibility = new IntersectionObserver(([entry]) => {
+      visible = entry.isIntersecting;
+      cancelAnimationFrame(frame);
+      if (visible && !document.hidden && !reduceMotion.matches) frame = requestAnimationFrame(draw);
+    }, { rootMargin: '120px' });
+    visibility.observe(root);
+
+    document.addEventListener('visibilitychange', () => {
+      cancelAnimationFrame(frame);
+      if (!document.hidden && visible && !reduceMotion.matches) frame = requestAnimationFrame(draw);
+    });
+
+    reduceMotion.addEventListener('change', () => {
+      cancelAnimationFrame(frame);
+      draw(performance.now());
+    });
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-anvil-orb]').forEach(initializeOrb);
+</script>
+
+<style>
+  @layer starlight.user {
+    .particle-orb {
+      --orb-dot: 22 93 229;
+      --orb-accent: 139 175 255;
+      --orb-visual-opacity: 0.7;
+      position: absolute;
+      z-index: 1;
+      inset: clamp(3.5rem, 7vw, 6rem) clamp(8rem, 21vw, 18rem) auto auto;
+      width: clamp(30rem, 48vw, 48rem);
+      aspect-ratio: 1;
+      pointer-events: none;
+      filter: saturate(1.08);
+      mask-image: radial-gradient(circle, #000 0 62%, rgb(0 0 0 / 0.88) 72%, transparent 84%);
+    }
+
+    :global(:root[data-theme='dark']) .particle-orb {
+      --orb-dot: 91 140 255;
+      --orb-accent: 221 231 255;
+      --orb-visual-opacity: 0.86;
+    }
+
+    .particle-orb::before,
+    .particle-orb::after {
+      position: absolute;
+      inset: 11%;
+      border-radius: 50%;
+      content: '';
+    }
+
+    .particle-orb::before {
+      background: radial-gradient(circle, color-mix(in srgb, var(--anvil-cobalt) 12%, transparent), transparent 63%);
+      box-shadow:
+        0 0 5rem color-mix(in srgb, var(--anvil-cobalt) 15%, transparent),
+        inset 0 0 4rem color-mix(in srgb, var(--anvil-cobalt) 9%, transparent);
+      opacity: var(--orb-visual-opacity);
+    }
+
+    .particle-orb::after {
+      inset: 18%;
+      border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 17%, transparent);
+      box-shadow: inset 0 0 0 5rem color-mix(in srgb, var(--anvil-cobalt) 2.5%, transparent);
+      opacity: var(--orb-visual-opacity);
+    }
+
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; opacity: var(--orb-visual-opacity); }
+
+    .orb-core {
+      position: absolute;
+      inset: 50% auto auto 50%;
+      width: 4.8rem;
+      height: 4.8rem;
+      background: color-mix(in srgb, var(--anvil-cobalt) 72%, white);
+      clip-path: polygon(50% 0, 59% 39%, 100% 50%, 59% 61%, 50% 100%, 41% 61%, 0 50%, 41% 39%);
+      filter: drop-shadow(0 0 0.6rem color-mix(in srgb, var(--anvil-cobalt) 80%, transparent)) drop-shadow(0 0 2rem color-mix(in srgb, var(--anvil-cobalt) 48%, transparent));
+      opacity: 0.88;
+      transform: translate(-50%, -50%);
+      animation: orb-breathe 4.8s ease-in-out infinite;
+    }
+
+    :global(:root[data-theme='dark']) .orb-core {
+      background: #f2f6ff;
+      filter: drop-shadow(0 0 0.7rem rgb(192 214 255 / 0.95)) drop-shadow(0 0 2.4rem rgb(91 140 255 / 0.72));
+    }
+
+    @keyframes orb-breathe {
+      0%, 100% { opacity: 0.88; transform: translate(-50%, -50%) scale(0.9); }
+      50% { opacity: 1; transform: translate(-50%, -50%) scale(1.08); }
+    }
+
+    @media (max-width: 62rem) {
+      .particle-orb {
+        --orb-visual-opacity: 0.56;
+        inset: 4rem clamp(-10rem, -12vw, -4rem) auto auto;
+        width: clamp(28rem, 72vw, 42rem);
+      }
+      :global(:root[data-theme='dark']) .particle-orb { --orb-visual-opacity: 0.74; }
+    }
+
+    @media (max-width: 35rem) {
+      .particle-orb {
+        --orb-visual-opacity: 0.38;
+        inset: 6.2rem -11.5rem auto auto;
+        width: 31rem;
+      }
+      :global(:root[data-theme='dark']) .particle-orb { --orb-visual-opacity: 0.5; }
+      .orb-core { width: 3.6rem; height: 3.6rem; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .orb-core { animation: none; }
+    }
+  }
+</style>

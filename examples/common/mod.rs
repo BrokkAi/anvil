@@ -35,7 +35,7 @@ impl AnvilRun {
         Self {
             agent,
             cwd,
-            behavior_mode: Some("ASK"),
+            behavior_mode: Some("LUTZ"),
             permission_policy: PermissionPolicy::ReadOnly,
             echo: true,
         }
