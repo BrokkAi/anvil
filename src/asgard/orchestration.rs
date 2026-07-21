@@ -287,10 +287,11 @@ async fn launch_worker<'a>(
     let tool_allowlist = Arc::new(worker_tool_allowlist(&registry).await);
 
     let instructions = spawn.instructions.clone();
+    let max_steps = spawn.max_steps.unwrap_or(ASGARD_WORKER_MAX_STEPS);
     let instruction_message = ChatMessage::user(format!(
         "<supervisor_instructions>\n{instructions}\n</supervisor_instructions>\n\
          You are a worker agent directed by a supervisor. You have up to \
-         {ASGARD_WORKER_MAX_STEPS} steps (each step = one batch of tool calls) before \
+         {max_steps} steps (each step = one batch of tool calls) before \
          you are paused for review; the supervisor may resume you or branch another \
          worker from your state. When you stop making tool calls, your turn ends and \
          your final message is delivered to the supervisor - make it a precise report \
@@ -344,7 +345,7 @@ async fn launch_worker<'a>(
             service_tier,
             structured_output,
             messages,
-            ASGARD_WORKER_MAX_STEPS,
+            max_steps,
             idle_timeout,
             worker_cancel,
             sinks.text,

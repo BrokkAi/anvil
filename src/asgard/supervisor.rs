@@ -8,6 +8,7 @@ use crate::llm_client::{
 
 pub(crate) const ASGARD_BATCH_CAP: usize = 8;
 pub(crate) const ASGARD_WORKER_MAX_STEPS: usize = 10;
+pub(crate) const ASGARD_WORKER_MAX_STEPS_CEILING: usize = 150;
 pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 
@@ -30,6 +31,7 @@ pub(crate) struct SpawnRequest {
     pub(crate) from: CheckpointId,
     pub(crate) instructions: String,
     pub(crate) model: Option<String>,
+    pub(crate) max_steps: Option<usize>,
 }
 
 pub(crate) struct FinalizeRequest {
@@ -62,7 +64,7 @@ pub(crate) fn supervisor_supplement() -> String {
         r#"# Asgard supervision
 
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
-- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls); a worker that stops making tool calls sooner is done, and its final message is its report to you.
+- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you.
 - prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
 - git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
@@ -250,6 +252,12 @@ fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
                             "type": "string",
                             "enum": allowed_models,
                         },
+                        "max_steps": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": ASGARD_WORKER_MAX_STEPS_CEILING,
+                            "description": "Step budget for this worker (default 10). Give a worker pursuing a complete solution a large budget; keep quick probes small.",
+                        },
                     },
                 },
             },
@@ -372,10 +380,25 @@ fn parse_spawn_worker(
     {
         return Err(format!("workers[{index}].model {model:?} is not allowed"));
     }
+    let max_steps = match worker.get("max_steps") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let steps = value
+                .as_u64()
+                .ok_or_else(|| format!("workers[{index}].max_steps must be an integer"))?;
+            if steps < 1 || steps > ASGARD_WORKER_MAX_STEPS_CEILING as u64 {
+                return Err(format!(
+                    "workers[{index}].max_steps must be between 1 and {ASGARD_WORKER_MAX_STEPS_CEILING}"
+                ));
+            }
+            Some(steps as usize)
+        }
+    };
     Ok(SpawnRequest {
         from,
         instructions,
         model,
+        max_steps,
     })
 }
 
