@@ -459,13 +459,8 @@ impl SnapshotStage {
         })
     }
 
-    pub(crate) fn snapshot(
-        &self,
-        worker_root: &Path,
-        name: &str,
-        extra_excludes: &[String],
-    ) -> Result<String> {
-        add_all_for_checkpoint(worker_root, extra_excludes)?;
+    pub(crate) fn snapshot(&self, worker_root: &Path, name: &str) -> Result<String> {
+        add_all_for_checkpoint(worker_root)?;
         let message = format!("asgard checkpoint {name}");
         // Bookkeeping commits must not run repo hooks: porcelain `git commit`
         // triggers husky/commitlint (observed: happy-dom rejecting the message
@@ -682,24 +677,15 @@ fn git_worktree_add(parent_root: &Path, root: &Path, checkout_commit: &str) -> R
     Ok(())
 }
 
-fn checkpoint_pathspecs(extra_excludes: &[String]) -> Vec<String> {
-    let mut pathspecs = vec![
-        ".".to_string(),
-        ":(exclude).brokk/**".to_string(),
-        ":(exclude).bifrost/**".to_string(),
+fn add_all_for_checkpoint(root: &Path) -> Result<()> {
+    let args = [
+        "add",
+        "-A",
+        "--",
+        ".",
+        ":(exclude).brokk/**",
+        ":(exclude).bifrost/**",
     ];
-    pathspecs.extend(
-        extra_excludes
-            .iter()
-            .map(|path| format!(":(exclude){path}")),
-    );
-    pathspecs
-}
-
-fn add_all_for_checkpoint(root: &Path, extra_excludes: &[String]) -> Result<()> {
-    let pathspecs = checkpoint_pathspecs(extra_excludes);
-    let mut args = vec!["add", "-A", "--"];
-    args.extend(pathspecs.iter().map(String::as_str));
     let mut last_error = None;
     for attempt in 0..3 {
         match git(root, &args) {
@@ -712,7 +698,7 @@ fn add_all_for_checkpoint(root: &Path, extra_excludes: &[String]) -> Result<()> 
             }
         }
     }
-    add_all_for_checkpoint_from_filtered_pathspecs(root, extra_excludes).with_context(|| {
+    add_all_for_checkpoint_from_filtered_pathspecs(root).with_context(|| {
         format!(
             "git add -A failed after retries in {}; final retry error: {}",
             root.display(),
@@ -724,17 +710,32 @@ fn add_all_for_checkpoint(root: &Path, extra_excludes: &[String]) -> Result<()> 
     })
 }
 
-fn add_all_for_checkpoint_from_filtered_pathspecs(
-    root: &Path,
-    extra_excludes: &[String],
-) -> Result<()> {
-    let pathspecs = checkpoint_pathspecs(extra_excludes);
-    let mut update_args = vec!["add", "-u", "--"];
-    update_args.extend(pathspecs.iter().map(String::as_str));
-    git(root, &update_args)?;
-    let mut list_args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
-    list_args.extend(pathspecs.iter().map(String::as_str));
-    let listed = git(root, &list_args)?.stdout;
+fn add_all_for_checkpoint_from_filtered_pathspecs(root: &Path) -> Result<()> {
+    git(
+        root,
+        &[
+            "add",
+            "-u",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?;
+    let listed = git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?
+    .stdout;
     let untracked: Vec<u8> = listed
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
@@ -1136,7 +1137,7 @@ mod tests {
         let worker = create_candidate_repository(repo, "hooked-worker").unwrap();
         fs::write(worker.root.join("tracked.txt"), "changed\n").unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage.snapshot(&worker.root, "hooked", &[]).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "hooked").unwrap();
         assert_eq!(
             git_text(repo, &["show", &format!("{checkpoint}:tracked.txt")])
                 .unwrap()
@@ -1163,7 +1164,7 @@ mod tests {
         fs::write(worker.root.join(".brokk/state.txt"), "excluded\n").unwrap();
 
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage.snapshot(&worker.root, "first", &[]).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "first").unwrap();
 
         assert_eq!(
             git_text(
@@ -1208,40 +1209,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_excludes_injected_paths_from_commit_tree() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        configure_test_user(repo);
-        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
-        run_git(repo, &["add", "tracked.txt"]);
-        run_git(repo, &["commit", "-m", "initial"]);
-
-        let worker = create_candidate_repository(repo, "snapshot-injected").unwrap();
-        fs::write(worker.root.join("tracked.txt"), "changed\n").unwrap();
-        fs::create_dir_all(worker.root.join("tests")).unwrap();
-        fs::write(worker.root.join("tests/injected_test.rs"), "foreign test\n").unwrap();
-
-        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let injected_paths = vec!["tests/injected_test.rs".to_string()];
-        let checkpoint = stage
-            .snapshot(&worker.root, "exclude-injected", &injected_paths)
-            .unwrap();
-
-        assert_eq!(
-            git_text(repo, &["show", &format!("{checkpoint}:tracked.txt")])
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "changed\n"
-        );
-        let tree_paths = git_text(repo, &["ls-tree", "-r", "--name-only", &checkpoint]).unwrap();
-        assert!(!tree_paths.contains("tests/injected_test.rs"));
-
-        remove_candidate_repository(&worker);
-        stage.cleanup();
-    }
-
-    #[test]
     fn snapshot_chains_to_previous_snapshot_commit() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
@@ -1253,9 +1220,9 @@ mod tests {
         let worker = create_candidate_repository(repo, "snapshot-chain").unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
         fs::write(worker.root.join("tracked.txt"), "snapshot a\n").unwrap();
-        let first = stage.snapshot(&worker.root, "a", &[]).unwrap();
+        let first = stage.snapshot(&worker.root, "a").unwrap();
         fs::write(worker.root.join("tracked.txt"), "snapshot b\n").unwrap();
-        let second = stage.snapshot(&worker.root, "b", &[]).unwrap();
+        let second = stage.snapshot(&worker.root, "b").unwrap();
 
         assert_eq!(
             git_text(repo, &["rev-parse", &format!("{second}^")])
@@ -1290,9 +1257,7 @@ mod tests {
         fs::write(worker.root.join("untracked.txt"), "worktree addition\n").unwrap();
 
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage
-            .snapshot(&worker.root, "after-worker-commit", &[])
-            .unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "after-worker-commit").unwrap();
         let checkpoint_parent = git_text(repo, &["rev-parse", &format!("{checkpoint}^")]).unwrap();
 
         assert_eq!(checkpoint_parent.trim(), worker_commit.trim());
@@ -1379,7 +1344,7 @@ mod tests {
         fs::remove_file(worker.root.join("deleted.txt")).unwrap();
         fs::write(worker.root.join("added.txt"), "added\n").unwrap();
         let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-        let checkpoint = stage.snapshot(&worker.root, "patch", &[]).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "patch").unwrap();
         let patch = stage
             .finalize_patch(base_commit.trim(), &checkpoint)
             .unwrap();
@@ -1409,11 +1374,11 @@ mod tests {
 
         let from_worker = create_candidate_repository(repo, "merge-from").unwrap();
         fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
-        let from = stage.snapshot(&from_worker.root, "from", &[]).unwrap();
+        let from = stage.snapshot(&from_worker.root, "from").unwrap();
 
         let onto_worker = create_candidate_repository(repo, "merge-onto").unwrap();
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto", &[]).unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let MergeCheckpointOutcome::Merged { commit, diffstat } =
             stage.merge_checkpoint(&from, &onto, "merged").unwrap()
@@ -1465,20 +1430,16 @@ mod tests {
 
         let from_one_worker = create_candidate_repository(repo, "merge-from-one").unwrap();
         fs::write(from_one_worker.root.join("first.txt"), "first\n").unwrap();
-        let from_one = stage
-            .snapshot(&from_one_worker.root, "from-one", &[])
-            .unwrap();
+        let from_one = stage.snapshot(&from_one_worker.root, "from-one").unwrap();
 
         let from_two_worker =
             create_candidate_repository_at(repo, "merge-from-two", &from_one).unwrap();
         fs::write(from_two_worker.root.join("second.txt"), "second\n").unwrap();
-        let from_two = stage
-            .snapshot(&from_two_worker.root, "from-two", &[])
-            .unwrap();
+        let from_two = stage.snapshot(&from_two_worker.root, "from-two").unwrap();
 
         let onto_worker = create_candidate_repository(repo, "merge-onto-multihop").unwrap();
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto", &[]).unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let MergeCheckpointOutcome::Merged { commit, diffstat } =
             stage.merge_checkpoint(&from_two, &onto, "merged").unwrap()
@@ -1520,11 +1481,11 @@ mod tests {
 
         let from_worker = create_candidate_repository(repo, "merge-noop-from").unwrap();
         fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
-        let from = stage.snapshot(&from_worker.root, "from", &[]).unwrap();
+        let from = stage.snapshot(&from_worker.root, "from").unwrap();
 
         let onto_worker = create_candidate_repository_at(repo, "merge-noop-onto", &from).unwrap();
         fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto", &[]).unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let MergeCheckpointOutcome::NoChanges { diffstat } =
             stage.merge_checkpoint(&from, &onto, "noop").unwrap()
@@ -1565,11 +1526,11 @@ mod tests {
 
         let from_worker = create_candidate_repository(repo, "merge-conflict-from").unwrap();
         fs::write(from_worker.root.join("same.txt"), "from\n").unwrap();
-        let from = stage.snapshot(&from_worker.root, "from", &[]).unwrap();
+        let from = stage.snapshot(&from_worker.root, "from").unwrap();
 
         let onto_worker = create_candidate_repository(repo, "merge-conflict-onto").unwrap();
         fs::write(onto_worker.root.join("same.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto", &[]).unwrap();
+        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
 
         let error = stage
             .merge_checkpoint(&from, &onto, "scratch-conflict")
@@ -1628,7 +1589,7 @@ mod tests {
             "line 1\nA edits the shared line\nline 3\nline 4\n",
         )
         .unwrap();
-        let a = stage.snapshot(&a_worker.root, "a", &[]).unwrap();
+        let a = stage.snapshot(&a_worker.root, "a").unwrap();
 
         let b_worker = create_candidate_repository(repo, "merge-corruption-b").unwrap();
         fs::write(
@@ -1636,7 +1597,7 @@ mod tests {
             "line 1\nB edits the shared line\nline 3\nline 4\n",
         )
         .unwrap();
-        let b = stage.snapshot(&b_worker.root, "b", &[]).unwrap();
+        let b = stage.snapshot(&b_worker.root, "b").unwrap();
 
         let target_worker =
             create_candidate_repository_at(repo, "merge-corruption-target", &a).unwrap();
@@ -1654,7 +1615,7 @@ mod tests {
              target content line 5\n",
         )
         .unwrap();
-        let target = stage.snapshot(&target_worker.root, "target", &[]).unwrap();
+        let target = stage.snapshot(&target_worker.root, "target").unwrap();
 
         let error = stage
             .merge_checkpoint(&b, &target, "conflicted-merge")
