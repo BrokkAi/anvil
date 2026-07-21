@@ -25,7 +25,6 @@ pub(crate) struct SpawnRequest {
     pub(crate) from: CheckpointId,
     pub(crate) instructions: String,
     pub(crate) model: Option<String>,
-    pub(crate) injected_files: Vec<(String, Vec<u8>)>,
 }
 
 pub(crate) struct FinalizeRequest {
@@ -131,7 +130,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: PREFINALIZE_TOOL.to_string(),
-                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; spawn one worker per plant - multi-plant protocols exhaust step budgets; plant one classic bug in the diff's critical paths - swap an argument order, invert a boundary, drop a term - and confirm the suite goes red. Each plant must be a real mutation of the SHIPPED implementation confirmed by inspecting the diff, never a synthetic stand-in function or an edit to test files/mocks. Revert the plant and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); re-check the task's obligations against the delivered state. Alongside the plant workers, include one verification worker dedicated to adversarial inputs derived from the spec text alone - empty, zero, single vs many, negative, trailing, an attribute present but valueless - exercised through the public surface; near-misses live in the edges the implementation's own tests never generated. When other checkpoints authored test files missing from the candidate, prefinalize auto-adds one sibling-test verification worker that runs them. Treat each reported failure as a divergence to adjudicate against the task text before finalizing: a defensible test the candidate fails means fix the candidate; a test encoding a wrong or implementation-specific reading is dismissed with a stated reason. Never settle this by majority or by which side wrote more tests. A hung or timed-out verification run is a blocker: identify the exact hanging test before attributing it to anything pre-existing. Never substitute a weaker ad-hoc check. If verification reveals needed work stranded in another checkpoint, use merge_checkpoint to pull it in.".to_string(),
+                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; spawn one worker per plant - multi-plant protocols exhaust step budgets; plant one classic bug in the diff's critical paths - swap an argument order, invert a boundary, drop a term - and confirm the suite goes red. Each plant must be a real mutation of the SHIPPED implementation confirmed by inspecting the diff, never a synthetic stand-in function or an edit to test files/mocks. Revert the plant and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); re-check the task's obligations against the delivered state. Alongside the plant workers, include one verification worker dedicated to adversarial inputs derived from the spec text alone - empty, zero, single vs many, negative, trailing, an attribute present but valueless - exercised through the public surface; near-misses live in the edges the implementation's own tests never generated. A hung or timed-out verification run is a blocker: identify the exact hanging test before attributing it to anything pre-existing. Never substitute a weaker ad-hoc check. If verification reveals needed work stranded in another checkpoint, use merge_checkpoint to pull it in.".to_string(),
                 parameters: spawn_workers_parameters(&allowed_models),
             },
         },
@@ -375,7 +374,6 @@ fn parse_spawn_worker(
         from,
         instructions,
         model,
-        injected_files: Vec::new(),
     })
 }
 
@@ -906,7 +904,5 @@ mod tests {
         assert!(description.contains("confirmed by inspecting the diff"));
         assert!(description.contains("hung or timed-out verification run is a blocker"));
         assert!(description.contains("Never substitute a weaker ad-hoc check"));
-        assert!(description.contains("sibling-test verification"));
-        assert!(description.contains("adjudicate against the task text"));
     }
 }

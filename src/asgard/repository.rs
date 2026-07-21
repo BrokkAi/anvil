@@ -55,81 +55,6 @@ pub(crate) fn parent_head_commit(cwd: &Path) -> Result<String> {
     Ok(git_text(cwd, &["rev-parse", "HEAD"])?.trim().to_string())
 }
 
-pub(crate) fn is_test_path(path: &str) -> bool {
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    path.split('/')
-        .any(|component| matches!(component, "test" | "tests" | "__tests__" | "testdata"))
-        || basename.ends_with("_test.go")
-        || basename.contains(".test.")
-        || basename.contains(".spec.")
-        || (basename.starts_with("test_") && basename.ends_with(".py"))
-        || basename == "conftest.py"
-}
-
-pub(crate) fn sibling_test_files(
-    repo_root: &Path,
-    author_commit: &str,
-    author_parent_commit: &str,
-    candidate_commit: &str,
-    max_files: usize,
-) -> Result<Vec<(String, Vec<u8>)>> {
-    if max_files == 0 {
-        return Ok(Vec::new());
-    }
-
-    let candidate_verify = format!("{candidate_commit}^{{commit}}");
-    git(repo_root, &["cat-file", "-e", &candidate_verify])?;
-
-    let diff = git(
-        repo_root,
-        &[
-            "diff",
-            "--name-status",
-            "--no-renames",
-            "-z",
-            author_parent_commit,
-            author_commit,
-        ],
-    )?;
-    let mut paths = Vec::new();
-    let mut fields = diff.stdout.split(|byte| *byte == 0);
-    while let Some(status) = fields.next() {
-        if status.is_empty() {
-            continue;
-        }
-        let Some(path) = fields.next() else {
-            break;
-        };
-        let status = String::from_utf8(status.to_vec()).context("git diff status was not UTF-8")?;
-        if !matches!(status.as_str(), "A" | "M") {
-            continue;
-        }
-        let path = String::from_utf8(path.to_vec()).context("git diff path was not UTF-8")?;
-        if is_test_path(&path) {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    paths.dedup();
-
-    let mut files = Vec::new();
-    for path in paths {
-        if files.len() >= max_files {
-            break;
-        }
-        let author_blob = git_blob_id(repo_root, author_commit, &path)?
-            .with_context(|| format!("missing author blob {author_commit}:{path}"))?;
-        if git_blob_id(repo_root, candidate_commit, &path)?.as_deref() == Some(author_blob.as_str())
-        {
-            continue;
-        }
-        let revision = format!("{author_commit}:{path}");
-        let content = git(repo_root, &["show", &revision])?.stdout;
-        files.push((path, content));
-    }
-    Ok(files)
-}
-
 /// Applies the selected candidate delta to the live checkout without resetting
 /// harness-owned state such as `.brokk/` and `.bifrost/`.
 pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
@@ -851,23 +776,6 @@ fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(git(cwd, args)?.stdout).context("git output was not UTF-8")
 }
 
-fn git_blob_id(cwd: &Path, commit: &str, path: &str) -> Result<Option<String>> {
-    let revision = format!("{commit}:{path}");
-    let output = Command::new("git")
-        .args(["rev-parse", &revision])
-        .current_dir(cwd)
-        .output()?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    Ok(Some(
-        String::from_utf8(output.stdout)
-            .context("git rev-parse output was not UTF-8")?
-            .trim()
-            .to_string(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,90 +801,6 @@ mod tests {
     fn configure_test_user(repo: &Path) {
         run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
         run_git(repo, &["config", "user.name", "Asgard Test"]);
-    }
-
-    #[test]
-    fn test_path_classifier_matches_only_test_conventions() {
-        for path in [
-            "tests/foo.py",
-            "a/b/__tests__/x.ts",
-            "pkg/x_test.go",
-            "src/util.spec.tsx",
-            "testdata/cfg.yml",
-            "test_edge.py",
-            "pkg/test/example.rs",
-            "conftest.py",
-        ] {
-            assert!(is_test_path(path), "{path} should be classified as a test");
-        }
-
-        for path in [
-            "src/lib.rs",
-            "contest.py",
-            "latest_go.go",
-            "attestation/x.go",
-        ] {
-            assert!(
-                !is_test_path(path),
-                "{path} should not be classified as a test"
-            );
-        }
-    }
-
-    #[test]
-    fn sibling_test_files_extracts_novel_sibling_tests() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        configure_test_user(repo);
-        fs::write(repo.join("README.md"), "base\n").unwrap();
-        run_git(repo, &["add", "README.md"]);
-        run_git(repo, &["commit", "-m", "base"]);
-        let base = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let base = base.trim().to_string();
-
-        run_git(repo, &["checkout", "-b", "author"]);
-        fs::create_dir_all(repo.join("tests")).unwrap();
-        fs::create_dir_all(repo.join("src")).unwrap();
-        fs::write(
-            repo.join("tests/a_test.py"),
-            "def test_a():\n    assert True\n",
-        )
-        .unwrap();
-        fs::write(repo.join("src/x.py"), "VALUE = 1\n").unwrap();
-        run_git(repo, &["add", "tests/a_test.py", "src/x.py"]);
-        run_git(repo, &["commit", "-m", "author"]);
-        let author = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let author = author.trim().to_string();
-
-        run_git(repo, &["checkout", "-b", "candidate", &base]);
-        fs::write(repo.join("README.md"), "candidate\n").unwrap();
-        run_git(repo, &["add", "README.md"]);
-        run_git(repo, &["commit", "-m", "candidate"]);
-        let candidate = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let candidate = candidate.trim().to_string();
-
-        let files = sibling_test_files(repo, &author, &base, &candidate, 24).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, "tests/a_test.py");
-        assert_eq!(
-            String::from_utf8(files[0].1.clone()).unwrap(),
-            "def test_a():\n    assert True\n"
-        );
-
-        fs::create_dir_all(repo.join("tests")).unwrap();
-        fs::write(
-            repo.join("tests/a_test.py"),
-            "def test_a():\n    assert True\n",
-        )
-        .unwrap();
-        run_git(repo, &["add", "tests/a_test.py"]);
-        run_git(repo, &["commit", "-m", "candidate has test"]);
-        let candidate_with_test = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let candidate_with_test = candidate_with_test.trim().to_string();
-
-        let files = sibling_test_files(repo, &author, &base, &candidate_with_test, 24).unwrap();
-        assert!(files.is_empty());
     }
 
     #[test]

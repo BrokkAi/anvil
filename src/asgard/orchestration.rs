@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::path::{Component, Path};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -10,7 +9,7 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use futures::future::{BoxFuture, FutureExt, join_all};
 
 use crate::asgard::{
@@ -107,15 +106,6 @@ impl AsgardStreamSinks {
 
 pub(crate) const ASGARD_MIN_CANDIDATES: usize = 1;
 pub(crate) const ASGARD_MAX_CANDIDATES: usize = 5;
-const ASGARD_TRANSPLANT_MAX_AUTHORS: usize = 3;
-const ASGARD_TRANSPLANT_MAX_FILES: usize = 24;
-
-#[derive(Clone, Debug)]
-struct SiblingTestTransplantGroup {
-    worker: usize,
-    files: Vec<String>,
-    injected_files: Vec<(String, Vec<u8>)>,
-}
 
 struct FinishedWorker {
     worker: usize,
@@ -285,10 +275,6 @@ async fn launch_worker<'a>(
             &parent_commit,
         )?
     };
-    if let Err(error) = write_injected_files(&repository, &spawn.injected_files) {
-        crate::asgard::remove_candidate_repository(&repository);
-        return Err(error);
-    }
 
     let Some(registry) = launch
         .sessions
@@ -441,56 +427,6 @@ async fn launch_worker<'a>(
     .boxed();
 
     Ok(future)
-}
-
-fn write_injected_files(
-    repository: &CandidateRepository,
-    injected_files: &[(String, Vec<u8>)],
-) -> Result<()> {
-    for (path, contents) in injected_files {
-        validate_injected_file_path(path)?;
-        let destination = repository.root.join(path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "create injected sibling-test directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        match fs::symlink_metadata(&destination) {
-            Ok(metadata) if metadata.file_type().is_dir() => {
-                bail!("cannot inject sibling-test file over directory {path}");
-            }
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                fs::remove_file(&destination).with_context(|| {
-                    format!(
-                        "remove existing sibling-test symlink {}",
-                        destination.display()
-                    )
-                })?;
-            }
-            Ok(_) | Err(_) => {}
-        }
-        fs::write(&destination, contents).with_context(|| {
-            format!("write injected sibling-test file {}", destination.display())
-        })?;
-    }
-    Ok(())
-}
-
-fn validate_injected_file_path(path: &str) -> Result<()> {
-    let path = Path::new(path);
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        bail!("invalid injected sibling-test path {}", path.display());
-    }
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        bail!("invalid injected sibling-test path {}", path.display());
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1434,9 +1370,6 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             spawns.len()
         ));
     }
-    let prefinalize_candidate = matches!(kind, SpawnKind::Prefinalize)
-        .then(|| spawns.first().map(|spawn| spawn.from.clone()))
-        .flatten();
     let mut lines = Vec::new();
     let mut pending_sources = spawns
         .iter()
@@ -1494,51 +1427,6 @@ async fn execute_spawn_requests<'ctx, 'fut>(
         };
         lines.push(format!("{verb} w{worker} from {from}"));
     }
-    if let (SpawnKind::Prefinalize, Some(candidate)) = (kind, prefinalize_candidate)
-        && candidate != CheckpointId::Root
-    {
-        let groups = collect_sibling_test_transplants(cx, &candidate)?;
-        if !groups.is_empty() {
-            if state.spawned_this_turn >= ASGARD_BATCH_CAP {
-                lines.push("note: sibling-test verification skipped (worker capacity)".to_string());
-                append_sibling_test_transplant_trace(
-                    &candidate,
-                    &groups,
-                    serde_json::json!("skipped_capacity"),
-                );
-            } else {
-                let instructions = sibling_test_transplant_instructions(&groups);
-                let injected_files = groups
-                    .iter()
-                    .flat_map(|group| group.injected_files.clone())
-                    .collect();
-                let worker = launch_spawn(
-                    cx,
-                    SpawnRequest {
-                        from: candidate.clone(),
-                        instructions,
-                        model: None,
-                        injected_files,
-                    },
-                )
-                .await?;
-                state.spawned_this_turn += 1;
-                state.spawned.push(worker);
-                *cx.prefinalize_issued = true;
-                cx.prefinalize_workers.push(worker);
-                state.prefinalized.push(worker);
-                append_sibling_test_transplant_trace(
-                    &candidate,
-                    &groups,
-                    serde_json::json!(worker),
-                );
-                lines.push(format!(
-                    "prefinalize auto-added sibling-test verification worker w{worker} ({})",
-                    sibling_test_transplant_result_summary(&groups)
-                ));
-            }
-        }
-    }
     lines.extend(render_spawn_duplicate_notes(
         &duplicate_notes,
         &spawned_by_index,
@@ -1547,117 +1435,6 @@ async fn execute_spawn_requests<'ctx, 'fut>(
         state.turn_ended = true;
     }
     Ok(lines.join("\n"))
-}
-
-fn collect_sibling_test_transplants(
-    cx: &SupervisorLoopContext<'_, '_>,
-    candidate: &CheckpointId,
-) -> Result<Vec<SiblingTestTransplantGroup>> {
-    let Some(candidate_commit) = cx.dag.commit_for(candidate) else {
-        return Ok(Vec::new());
-    };
-    let mut worker_ids = cx
-        .dag
-        .checkpoint_labels()
-        .into_iter()
-        .filter_map(|label| match CheckpointId::parse(&label) {
-            Some(CheckpointId::Worker(worker)) => Some(worker),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    worker_ids.sort_unstable_by(|left, right| right.cmp(left));
-
-    let mut groups = Vec::new();
-    let mut remaining_files = ASGARD_TRANSPLANT_MAX_FILES;
-    for worker in worker_ids {
-        if groups.len() >= ASGARD_TRANSPLANT_MAX_AUTHORS || remaining_files == 0 {
-            break;
-        }
-        let checkpoint = CheckpointId::Worker(worker);
-        if &checkpoint == candidate || cx.dag.is_ancestor_of(&checkpoint, candidate) {
-            continue;
-        }
-        let Some(node) = cx.dag.node(worker) else {
-            continue;
-        };
-        let Some(author_commit) = cx.dag.commit_for(&checkpoint) else {
-            continue;
-        };
-        let Some(author_parent_commit) = cx.dag.commit_for(&node.window.parent) else {
-            continue;
-        };
-        let injected_files = crate::asgard::sibling_test_files(
-            cx.launch.parent_cwd,
-            author_commit,
-            author_parent_commit,
-            candidate_commit,
-            remaining_files,
-        )?;
-        if injected_files.is_empty() {
-            continue;
-        }
-        remaining_files -= injected_files.len();
-        groups.push(SiblingTestTransplantGroup {
-            worker,
-            files: injected_files
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect(),
-            injected_files,
-        });
-    }
-    Ok(groups)
-}
-
-fn sibling_test_transplant_instructions(groups: &[SiblingTestTransplantGroup]) -> String {
-    let group_list = groups
-        .iter()
-        .map(|group| format!("[from w{}: {}]", group.worker, group.files.join(", ")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "Sibling trajectories wrote test files that are not part of your tree; the harness \
-         has copied them into your worktree: {group_list}. For each source group, run exactly \
-         those tests with the repository's test runner. Report per group: each failing test's \
-         name and its assertion output verbatim, or 'all pass'. Also state in one line per \
-         failure whether the test appears to depend on implementation-specific structure \
-         (private helpers, invented APIs, exact message wording) rather than task-mandated \
-         behavior. Do not modify production code or these test files; you are collecting \
-         evidence for the supervisor."
-    )
-}
-
-fn sibling_test_transplant_result_summary(groups: &[SiblingTestTransplantGroup]) -> String {
-    format!(
-        "tests from {}",
-        groups
-            .iter()
-            .map(|group| format!("w{}: {} files", group.worker, group.files.len()))
-            .collect::<Vec<_>>()
-            .join("; ")
-    )
-}
-
-fn append_sibling_test_transplant_trace(
-    candidate: &CheckpointId,
-    groups: &[SiblingTestTransplantGroup],
-    spawned_worker: serde_json::Value,
-) {
-    let authors = groups
-        .iter()
-        .map(|group| {
-            serde_json::json!({
-                "checkpoint": format!("w{}", group.worker),
-                "files": &group.files,
-            })
-        })
-        .collect::<Vec<_>>();
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_sibling_test_transplant",
-        "candidate": candidate.to_string(),
-        "authors": authors,
-        "spawned_worker": spawned_worker,
-    }));
 }
 
 fn unresolved_prefinalize_workers(
@@ -4050,98 +3827,6 @@ mod tests {
             .join("\n");
         assert!(supervisor_text.contains("prefinalize spawned w1 from root"));
         assert!(supervisor_text.contains("skipped 1 duplicate specs (identical to w1)"));
-    }
-
-    #[tokio::test]
-    async fn prefinalize_auto_adds_sibling_test_verification_worker() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).expect("create repo dir");
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write README");
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-
-        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
-            (
-                "sv-model",
-                vec![
-                    text_response("intake literal"),
-                    tool_response(vec![spawn_workers_call(
-                        "sv-spawn-batch",
-                        serde_json::json!([
-                            { "from": "root", "instructions": "candidate implementation" },
-                            { "from": "root", "instructions": "sibling test author" }
-                        ]),
-                    )]),
-                    tool_response(vec![
-                        save_worker_call("sv-save-w1", "w1"),
-                        save_worker_call("sv-save-w2", "w2"),
-                        prefinalize_call("sv-prefinalize-w1", "w1", "verify candidate"),
-                    ]),
-                    tool_response(vec![
-                        discard_worker_call("sv-discard-w3", "w3"),
-                        discard_worker_call("sv-discard-w4", "w4"),
-                        finalize_call_with_evidence("sv-finalize", "w1", &["w3m1"]),
-                    ]),
-                    text_response("idle one"),
-                    text_response("idle two"),
-                    text_response("idle three"),
-                    text_response("idle four"),
-                ],
-            ),
-            (
-                "worker-model",
-                vec![
-                    text_response("intake grounded"),
-                    tool_response(vec![write_file_call(
-                        "w1-write",
-                        "src/lib.rs",
-                        "pub fn candidate() {}\n",
-                    )]),
-                    tool_response(vec![write_file_call(
-                        "w2-write",
-                        "tests/sibling_test.py",
-                        "SIBLING = 1\n",
-                    )]),
-                    text_response("w1 report"),
-                    text_response("w2 report"),
-                    text_response("w3 prefinalize report"),
-                    tool_response(vec![named_tool_call(
-                        "w4-read-injected",
-                        "read_file",
-                        serde_json::json!({ "file_path": "tests/sibling_test.py" }),
-                    )]),
-                    text_response("w4 sibling tests all pass"),
-                ],
-            ),
-        ]));
-
-        let _ = run_scripted_asgard(
-            repo,
-            backend.clone(),
-            vec![ChatMessage::user("exercise sibling test transplant")],
-        )
-        .await;
-
-        let all_requests = backend
-            .requests
-            .lock()
-            .expect("requests")
-            .iter()
-            .map(|request| all_message_text(&request.messages))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(all_requests.contains(
-            "prefinalize auto-added sibling-test verification worker w4 (tests from w2: 1 files)"
-        ));
-        assert!(
-            all_requests
-                .contains("Sibling trajectories wrote test files that are not part of your tree")
-        );
-        assert!(all_requests.contains("SIBLING = 1"));
     }
 
     #[tokio::test]
