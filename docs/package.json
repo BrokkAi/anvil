@@ -8,7 +8,8 @@
     "build": "npm run check:evaluation && ASTRO_TELEMETRY_DISABLED=1 astro build && node scripts/check-links.mjs",
     "check:evaluation": "node scripts/check-evaluation-fixture.mjs",
     "check": "ASTRO_TELEMETRY_DISABLED=1 astro check",
-    "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview"
+    "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview",
+    "generate:social-card": "node scripts/generate-social-card.mjs"
   },
   "dependencies": {
     "@astrojs/markdown-remark": "^7.2.1",

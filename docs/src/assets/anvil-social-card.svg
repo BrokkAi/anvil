@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
+  <title id="title">Anvil social card</title>
+  <desc id="description">Anvil is a portable agent runtime for ACP clients. One agent engine, your interface.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#18212a"/>
+      <stop offset="0.52" stop-color="#111820"/>
+      <stop offset="1" stop-color="#0d1218"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b335e"/>
+      <stop offset="0.56" stop-color="#162331"/>
+      <stop offset="1" stop-color="#111820"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="48%" r="58%">
+      <stop offset="0" stop-color="#5b8cff" stop-opacity="0.26"/>
+      <stop offset="0.55" stop-color="#5b8cff" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#5b8cff" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="22" height="22" patternUnits="userSpaceOnUse">
+      <path d="M22 0H0V22" fill="none" stroke="#eef1f4" stroke-opacity="0.055"/>
+    </pattern>
+    <filter id="soft-glow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#background)"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect x="1" y="1" width="1198" height="628" rx="18" fill="none" stroke="#eef1f4" stroke-opacity="0.19" stroke-width="2"/>
+  <path d="M0 112H1200M755 112V630" stroke="#eef1f4" stroke-opacity="0.11"/>
+
+  <g transform="translate(70 50)">
+    <path d="M0 0H36L31 9H5ZM5 14H31L27 23H9ZM10 28H26L23 37H13Z" fill="#8f9aa5"/>
+    <path d="M0 0H36L31 9H5Z" fill="#5b8cff"/>
+    <text x="58" y="29" fill="#eef1f4" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="29" font-weight="750" letter-spacing="-0.6">Anvil</text>
+    <text x="157" y="28" fill="#828d99" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="2.3">ACP RUNTIME</text>
+  </g>
+
+  <g transform="translate(70 218)">
+    <text fill="#eef1f4" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="70" font-weight="720" letter-spacing="-3">
+      <tspan x="0" y="0">One agent engine.</tspan>
+      <tspan x="0" y="83" fill="#5b8cff" font-family="Georgia, 'Times New Roman', serif" font-weight="500" font-style="italic">Your interface.</tspan>
+    </text>
+    <text x="2" y="198" fill="#b6bec7" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="22">
+      <tspan x="2">Portable model routing, tools, permissions, and durable sessions</tspan>
+    </text>
+  </g>
+
+  <g transform="translate(70 562)">
+    <circle cx="6" cy="-7" r="5" fill="#5b8cff"/>
+    <text x="22" y="0" fill="#b6bec7" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" letter-spacing="1.15">BROKKAI.GITHUB.IO/ANVIL</text>
+  </g>
+
+  <g transform="translate(775 146)">
+    <circle cx="198" cy="175" r="220" fill="url(#glow)"/>
+    <rect x="0" y="0" width="400" height="367" fill="#111820" fill-opacity="0.92" stroke="#eef1f4" stroke-opacity="0.19"/>
+    <rect x="0" y="0" width="400" height="367" fill="url(#grid)"/>
+    <g transform="translate(24 25)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+      <text fill="#828d99" font-size="13" font-weight="700" letter-spacing="1.8">ANVIL / RUNTIME MAP</text>
+      <text x="352" text-anchor="end" fill="#5b8cff" font-size="12" font-weight="700" letter-spacing="1.3">SESSION 01 — READY</text>
+      <path d="M0 19H352" stroke="#eef1f4" stroke-opacity="0.19"/>
+
+      <text y="56" fill="#828d99" font-size="12" letter-spacing="1.4">CLIENTS</text>
+      <g transform="translate(0 69)" fill="#18212a" stroke="#eef1f4" stroke-opacity="0.14">
+        <rect width="78" height="30"/><rect x="90" width="78" height="30"/><rect x="180" width="78" height="30"/><rect x="270" width="82" height="30"/>
+      </g>
+      <g transform="translate(0 89)" fill="#b6bec7" font-size="10" text-anchor="middle">
+        <text x="39">Zed</text><text x="129">JetBrains</text><text x="219">Issue bot</text><text x="311">Custom UI</text>
+      </g>
+
+      <text y="133" fill="#5b8cff" font-size="12" font-weight="700">ACP</text>
+      <path d="M31 129H302" stroke="#5b8cff" stroke-width="2" stroke-dasharray="5 8"/>
+      <text x="316" y="133" fill="#828d99" font-size="11">stdio</text>
+
+      <g transform="translate(0 150)">
+        <rect width="352" height="105" fill="url(#core)" stroke="#5b8cff" stroke-opacity="0.8"/>
+        <rect width="4" height="105" fill="#5b8cff"/>
+        <text x="18" y="24" fill="#828d99" font-size="10" letter-spacing="1.4">PORTABLE AGENT BACKEND</text>
+        <text x="18" y="65" fill="#eef1f4" font-family="ui-sans-serif, system-ui, sans-serif" font-size="43" font-weight="750" letter-spacing="-2">ANVIL</text>
+        <circle cx="278" cy="20" r="4" fill="#5b8cff" filter="url(#soft-glow)"/>
+        <text x="288" y="24" fill="#5b8cff" font-size="10" font-weight="700" letter-spacing="1">RUNNING</text>
+        <g transform="translate(18 77)" fill="#18212a">
+          <rect width="65" height="18"/><rect x="72" width="91" height="18"/><rect x="170" width="80" height="18"/><rect x="257" width="95" height="18"/>
+        </g>
+        <g transform="translate(18 89)" fill="#828d99" font-size="8.4" text-anchor="middle">
+          <text x="32">tool loop</text><text x="117">permission gate</text><text x="210">session store</text><text x="304">context manager</text>
+        </g>
+      </g>
+
+      <g transform="translate(0 267)">
+        <g fill="#18212a" stroke="#eef1f4" stroke-opacity="0.14"><rect width="112" height="49"/><rect x="120" width="112" height="49"/><rect x="240" width="112" height="49"/></g>
+        <g fill="#5b8cff" font-size="9.5" font-weight="700" letter-spacing="1"><text x="10" y="16">MODELS</text><text x="130" y="16">TOOLS</text><text x="250" y="16">MCP</text></g>
+        <g fill="#b6bec7" font-size="8.6"><text x="10" y="35">Codex · local</text><text x="130" y="35">Files · shell</text><text x="250" y="35">Bifrost · custom</text></g>
+      </g>
+    </g>
+  </g>
+</svg>
