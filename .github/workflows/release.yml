@@ -312,3 +312,12 @@ jobs:
           files: |
             artifacts/brokk-anvil-*.zip
             artifacts/brokk-anvil-*.zip.sha256
+
+      - name: Announce release on Discord
+        continue-on-error: true
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: bash scripts/announce-discord-release.sh

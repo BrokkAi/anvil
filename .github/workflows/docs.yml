@@ -2,15 +2,8 @@ name: Docs
 
 on:
   push:
-    branches:
-      - master
-    paths:
-      - '.github/workflows/docs.yml'
-      - 'docs/**'
-  pull_request:
-    paths:
-      - '.github/workflows/docs.yml'
-      - 'docs/**'
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
 
 permissions:
@@ -53,18 +46,15 @@ jobs:
           PUBLIC_DOCS_BASE: /anvil
 
       - name: Prepare Pages artifact
-        if: github.event_name != 'pull_request'
         run: touch docs/dist/.nojekyll
 
       - name: Upload Pages artifact
-        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v4
         with:
           path: docs/dist
 
   deploy:
     name: deploy docs
-    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     permissions:

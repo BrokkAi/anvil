@@ -172,6 +172,13 @@ They build the supported Linux, Android, Windows, and macOS archives, attach
 SHA-256 sidecars, include the required license and source-notice files, and
 publish the `brokk-anvil` crate.
 
+To announce a published GitHub Release in Discord, set the
+`DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
+webhook URL. The release workflow reuses GitHub's generated release notes,
+prevents mentions from being parsed, suppresses automatic link embeds, and
+leaves a failed Discord delivery as a warning so it cannot invalidate an
+already-published release.
+
 Before tagging, maintainers should confirm that:
 
 1. The version in `Cargo.toml` and `Cargo.lock` matches the intended tag.
