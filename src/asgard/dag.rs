@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::llm_client::{ChatMessage, TokenUsage};
 
@@ -17,19 +17,6 @@ pub(crate) struct ResolvedView {
     pub(crate) arguments: String,
     pub(crate) result: String,
 }
-
-/// Tools whose output leads with its verdict (test runners, compilers, search
-/// hits), so the first line summarizes the whole payload. Documents lead with
-/// imports and boilerplate instead, and their first line is noise.
-const RESULT_SHAPED_TOOLS: &[&str] = &[
-    "run_shell_command",
-    "grep_search",
-    "search_symbols",
-    "list_directory",
-    "get_symbol_sources",
-];
-
-const SUMMARY_FIRST_LINE_MAX_CHARS: usize = 120;
 
 fn in_flight_error(worker: usize) -> String {
     format!(
@@ -58,48 +45,16 @@ pub(crate) fn render_resolved_views(
     rendered
 }
 
-/// One line per handle for the permanent record: enough to remember what was
-/// looked at and how it turned out, without carrying the payload forward.
-/// Errors are always kept in full — eliding them once gave the supervisor
-/// amnesia and it repeated the same failing call turn after turn.
-pub(crate) fn summarize_resolved_views(
-    views: &[(String, std::result::Result<ResolvedView, String>)],
-) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for (handle, view) in views {
-        lines.push(match view {
-            Err(error) => format!("[attempted view of {handle}: {error}]"),
-            Ok(view) => {
-                let bytes = view.result.len();
-                let mut all = view.result.lines().filter(|line| !line.trim().is_empty());
-                let first = if RESULT_SHAPED_TOOLS.contains(&view.name.as_str()) {
-                    all.next()
-                } else {
-                    None
-                };
-                match first {
-                    None => format!("[viewed {handle}: {}, {bytes} bytes]", view.name),
-                    Some(first) => {
-                        let first = first.trim();
-                        let truncated: String =
-                            first.chars().take(SUMMARY_FIRST_LINE_MAX_CHARS).collect();
-                        if truncated.len() == first.len() && all.next().is_none() {
-                            format!("[viewed {handle}: \"{truncated}\"]")
-                        } else {
-                            format!("[viewed {handle}: \"{truncated}…\" + {bytes} bytes]")
-                        }
-                    }
-                }
-            }
-        });
-    }
-    lines.join("\n")
-}
-
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub(crate) enum CheckpointId {
     Root,
     Worker(usize),
+    /// A commit that descends from the run's base commit but was never
+    /// wrapped in a `TrajectoryNode` (e.g. a merge produced directly by the
+    /// supervisor's `git` tool). Only ever constructed by
+    /// [`TrajectoryDag::resolve_checkpoint_by_commit`], which has already
+    /// verified the commit exists and descends from the base commit.
+    Commit(String),
 }
 
 impl CheckpointId {
@@ -120,6 +75,7 @@ impl fmt::Display for CheckpointId {
         match self {
             Self::Root => formatter.write_str("root"),
             Self::Worker(worker) => write!(formatter, "w{worker}"),
+            Self::Commit(commit) => formatter.write_str(short_sha(commit)),
         }
     }
 }
@@ -280,14 +236,93 @@ impl TrajectoryDag {
         match ckpt {
             CheckpointId::Root => true,
             CheckpointId::Worker(worker) => self.nodes.contains_key(worker),
+            // Only ever constructed after resolve_checkpoint_by_commit has
+            // already verified the commit exists and descends from base.
+            CheckpointId::Commit(_) => true,
         }
     }
 
-    pub(crate) fn commit_for(&self, ckpt: &CheckpointId) -> Option<&str> {
+    pub(crate) fn commit_for<'a>(&'a self, ckpt: &'a CheckpointId) -> Option<&'a str> {
         match ckpt {
             CheckpointId::Root => Some(&self.base_commit),
             CheckpointId::Worker(worker) => self.nodes.get(worker).map(|node| node.commit.as_str()),
+            CheckpointId::Commit(commit) => Some(commit.as_str()),
         }
+    }
+
+    /// Resolves a supervisor-supplied string that is not "root"/"wN" to a
+    /// checkpoint by treating it as a git commit reference (short or full
+    /// sha, or any other rev-parse-able ref). The commit must exist in the
+    /// parent repo and must descend from this run's base commit. If it
+    /// happens to equal an already-known checkpoint's commit, that
+    /// checkpoint is returned directly (no wrapper needed); otherwise it is
+    /// wrapped as `CheckpointId::Commit` so it can still be finalized.
+    pub(crate) fn resolve_checkpoint_by_commit(
+        &self,
+        value: &str,
+    ) -> std::result::Result<CheckpointId, String> {
+        let root = self
+            .git_root
+            .as_deref()
+            .ok_or_else(|| "commit-hash checkpoints require a git-backed Asgard run".to_string())?;
+        let full = git_rev_parse_commit(root, value).map_err(|error| {
+            format!("{value:?} is not a known checkpoint or a valid commit ({error:#})")
+        })?;
+        if full == self.base_commit {
+            return Ok(CheckpointId::Root);
+        }
+        if let Some(worker) = self
+            .nodes
+            .iter()
+            .find(|(_, node)| node.commit == full)
+            .map(|(worker, _)| *worker)
+        {
+            return Ok(CheckpointId::Worker(worker));
+        }
+        match git_is_ancestor(root, &self.base_commit, &full) {
+            Ok(true) => Ok(CheckpointId::Commit(full)),
+            Ok(false) => Err(format!(
+                "commit {value} is not a descendant of this run's base commit"
+            )),
+            Err(error) => Err(format!(
+                "failed to verify commit {value} ancestry: {error:#}"
+            )),
+        }
+    }
+
+    /// Walks first-parent ancestry from `sha` until it reaches a commit that
+    /// is either this run's base commit or an already-saved checkpoint's
+    /// commit, returning that checkpoint. Used only for
+    /// `CheckpointId::Commit` fragments (a commit made directly by the
+    /// supervisor's `git` tool, never wrapped in a `TrajectoryNode`).
+    fn nearest_known_checkpoint(&self, root: &Path, sha: &str) -> Result<CheckpointId> {
+        let known: HashMap<&str, CheckpointId> =
+            std::iter::once((self.base_commit.as_str(), CheckpointId::Root))
+                .chain(self.nodes.values().map(|node| {
+                    (
+                        node.commit.as_str(),
+                        CheckpointId::Worker(node.window.worker),
+                    )
+                }))
+                .collect();
+        let output = Command::new("git")
+            .args(["log", "--first-parent", "--format=%H", sha])
+            .current_dir(root)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "git log --first-parent {sha} failed in {}",
+            root.display()
+        );
+        let history = String::from_utf8(output.stdout).context("git log output was not UTF-8")?;
+        for commit in history.lines().skip(1) {
+            if let Some(checkpoint) = known.get(commit) {
+                return Ok(checkpoint.clone());
+            }
+        }
+        bail!(
+            "commit {sha} does not descend from any known Asgard checkpoint via first-parent ancestry"
+        );
     }
 
     pub(crate) fn node(&self, worker: usize) -> Option<&TrajectoryNode> {
@@ -348,6 +383,20 @@ impl TrajectoryDag {
     }
 
     pub(crate) fn ancestor_messages(&self, ckpt: &CheckpointId) -> Result<Vec<ChatMessage>> {
+        if let CheckpointId::Commit(sha) = ckpt {
+            let root = self
+                .git_root
+                .as_deref()
+                .ok_or_else(|| anyhow!("no git root available to resolve commit {sha}"))?;
+            let nearest = self.nearest_known_checkpoint(root, sha)?;
+            let mut messages = self.ancestor_messages(&nearest)?;
+            messages.push(ChatMessage::user(format!(
+                "You start from commit {}, created by the supervisor with git (e.g. a merge); \
+                 it descends from {nearest}.",
+                short_sha(sha)
+            )));
+            return Ok(messages);
+        }
         if !self.contains(ckpt) {
             bail!("unknown checkpoint {ckpt}");
         }
@@ -366,6 +415,9 @@ impl TrajectoryDag {
                         .ok_or_else(|| anyhow!("unknown checkpoint w{worker}"))?;
                     worker_ids.push(worker);
                     current = node.window.parent.clone();
+                }
+                CheckpointId::Commit(sha) => {
+                    bail!("checkpoint chain reached an unresolved commit fragment {sha}");
                 }
             }
         }
@@ -524,12 +576,28 @@ fn git_is_ancestor(root: &Path, ancestor_commit: &str, target_commit: &str) -> R
     );
 }
 
-pub(crate) fn render_fragment(window: &TrajectoryWindow) -> String {
+/// Renders a trajectory fragment for supervisor review. `commit` is this
+/// trajectory's own checkpoint commit, if it has one; in practice a
+/// trajectory under review has not been snapshotted yet (that happens at
+/// save/spawn decision time), so callers pass `None` here today. `parent_commit`
+/// is the checkpoint it forked from, which is already known whenever the
+/// parent is root or an already-saved checkpoint.
+pub(crate) fn render_fragment(
+    window: &TrajectoryWindow,
+    commit: Option<&str>,
+    parent_commit: Option<&str>,
+) -> String {
     let mut rendered = String::new();
+    rendered.push_str(&format!("<worker_trajectory id=\"w{}\"", window.worker));
+    if let Some(commit) = commit {
+        rendered.push_str(&format!(" commit=\"{}\"", short_sha(commit)));
+    }
+    rendered.push_str(&format!(" continues_from=\"{}\"", window.parent));
+    if let Some(parent_commit) = parent_commit {
+        rendered.push_str(&format!(" parent_commit=\"{}\"", short_sha(parent_commit)));
+    }
     rendered.push_str(&format!(
-        "<worker_trajectory id=\"w{}\" continues_from=\"{}\" model=\"{}\" stop=\"{}\" steps=\"{}\">\n",
-        window.worker,
-        window.parent,
+        " model=\"{}\" stop=\"{}\" steps=\"{}\">\n",
         escape_attribute(&window.model),
         window.stop.label(),
         window.steps
@@ -653,8 +721,27 @@ fn render_dag_children(
     }
 }
 
-fn short_sha(commit: &str) -> &str {
+pub(crate) fn short_sha(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
+}
+
+/// Resolves `value` (short or full sha, or any other git ref) to a full
+/// commit sha, failing if it doesn't name a commit object.
+fn git_rev_parse_commit(root: &Path, value: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{value}^{{commit}}"),
+        ])
+        .current_dir(root)
+        .output()?;
+    ensure!(output.status.success(), "not a valid commit");
+    Ok(String::from_utf8(output.stdout)
+        .context("git rev-parse output was not UTF-8")?
+        .trim()
+        .to_string())
 }
 
 fn compact_diffstat_suffix(diffstat: &str) -> String {
@@ -942,28 +1029,6 @@ mod tests {
                 r#"<tool_call handle="w1m2" error="handle does not name a tool result" />"#
             )
         );
-
-        // The permanent-record summary keeps every error verbatim, names the
-        // document-shaped read_file without quoting its first line, and quotes
-        // the single-line shell result without a byte count.
-        let summary = summarize_resolved_views(&views);
-        let lines: Vec<&str> = summary.lines().collect();
-        assert_eq!(
-            lines[0],
-            format!("[viewed w1m1: read_file, {} bytes]", long_result.len())
-        );
-        assert_eq!(lines[1], r#"[viewed w2m1: "pending result"]"#);
-        assert_eq!(
-            lines[2],
-            "[attempted view of w3m1: trajectory was discarded; its full results are gone]"
-        );
-        assert_eq!(lines[3], "[attempted view of w4m1: unknown worker]");
-        assert_eq!(lines[4], "[attempted view of w1l0m1: malformed handle]");
-        assert_eq!(
-            lines[5],
-            "[attempted view of w1m2: handle does not name a tool result]"
-        );
-        assert!(lines[6].starts_with("[attempted view of w9m0: w9 is running"));
     }
 
     #[test]
@@ -1007,7 +1072,7 @@ mod tests {
         let mut trajectory = window(3, CheckpointId::Root, "fragment");
         trajectory.final_response = format!("{}<raw>&unescaped", "a".repeat(200));
         trajectory.diffstat = " src/lib.rs | 2 +".to_string();
-        let rendered = render_fragment(&trajectory);
+        let rendered = render_fragment(&trajectory, None, None);
         assert!(rendered.contains(
             r#"<worker_trajectory id="w3" continues_from="root" model="model-a" stop="finished" steps="2">"#
         ));
@@ -1015,13 +1080,35 @@ mod tests {
         assert!(rendered.contains(&trajectory.final_response));
 
         trajectory.final_response.clear();
-        let empty = render_fragment(&trajectory);
+        let empty = render_fragment(&trajectory, None, None);
         assert!(empty.contains(r#"<final_response none="true" />"#));
 
         trajectory.stop = WorkerStopReason::Failed("boom <bad>".to_string());
-        let failed = render_fragment(&trajectory);
+        let failed = render_fragment(&trajectory, None, None);
         assert!(failed.contains(r#"stop="failed""#));
         assert!(failed.contains("<failure>boom &lt;bad&gt;</failure>"));
+    }
+
+    #[test]
+    fn render_fragment_header_gains_commit_and_parent_shas_when_available() {
+        let trajectory = window(7, CheckpointId::Worker(3), "shorthash");
+
+        // At review time the trajectory itself has not been snapshotted yet
+        // (that happens at save/spawn decision time) - so its own commit is
+        // never available here, but the parent's commit already is.
+        let with_parent = render_fragment(&trajectory, None, Some("91b02dexxxxxxxxxxxxxxxxxxxx"));
+        assert!(with_parent.contains(r#"id="w7""#));
+        assert!(!with_parent.contains(r#" commit="91b02de""#));
+        assert!(with_parent.contains(r#"continues_from="w3""#));
+        assert!(with_parent.contains(r#"parent_commit="91b02de""#));
+
+        let without_either = render_fragment(&trajectory, None, None);
+        assert!(!without_either.contains("commit="));
+        assert!(!without_either.contains("parent_commit="));
+
+        // The trajectory's own commit renders too, when a caller has one.
+        let with_both = render_fragment(&trajectory, Some("a3f81c2xxxxxxxxxxxxxxxxxxxx"), None);
+        assert!(with_both.contains(r#"commit="a3f81c2""#));
     }
 
     #[test]
@@ -1131,6 +1218,81 @@ mod tests {
         assert!(dag.is_ancestor_of(&CheckpointId::Worker(2), &CheckpointId::Worker(5)));
         assert!(dag.is_ancestor_of(&CheckpointId::Worker(1), &CheckpointId::Worker(5)));
         assert!(!dag.is_ancestor_of(&CheckpointId::Worker(5), &CheckpointId::Worker(2)));
+    }
+
+    #[test]
+    fn resolve_checkpoint_by_commit_matches_known_checkpoints_by_full_or_short_sha() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init", "--quiet"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        let base = commit_file(repo, "base.txt", "base\n", "base");
+        let c1 = commit_file(repo, "one.txt", "one\n", "one");
+        let mut dag =
+            TrajectoryDag::new_with_git_root(Vec::new(), base.clone(), repo.to_path_buf());
+        dag.insert(node(1, CheckpointId::Root, "one", &c1)).unwrap();
+
+        assert_eq!(
+            dag.resolve_checkpoint_by_commit(&base),
+            Ok(CheckpointId::Root)
+        );
+        assert_eq!(
+            dag.resolve_checkpoint_by_commit(&c1),
+            Ok(CheckpointId::Worker(1))
+        );
+        // Short shas resolve too - "resolve short->full once at parse time".
+        assert_eq!(
+            dag.resolve_checkpoint_by_commit(&c1[..10]),
+            Ok(CheckpointId::Worker(1))
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_by_commit_rejects_invalid_and_non_descendant_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init", "--quiet"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        let base = commit_file(repo, "base.txt", "base\n", "base");
+        run_git(repo, &["checkout", "--quiet", "--orphan", "unrelated"]);
+        run_git(repo, &["rm", "-rf", "--quiet", "."]);
+        let unrelated = commit_file(repo, "other.txt", "other\n", "unrelated");
+        let dag = TrajectoryDag::new_with_git_root(Vec::new(), base, repo.to_path_buf());
+
+        assert!(dag.resolve_checkpoint_by_commit("not-a-commit").is_err());
+        assert!(
+            dag.resolve_checkpoint_by_commit(&unrelated)
+                .unwrap_err()
+                .contains("not a descendant")
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_by_commit_wraps_novel_descendant_and_ancestor_messages_notes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init", "--quiet"]);
+        run_git(repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(repo, &["config", "user.name", "Asgard Test"]);
+        let base = commit_file(repo, "base.txt", "base\n", "base");
+        let c1 = commit_file(repo, "one.txt", "one\n", "one");
+        let novel = commit_file(repo, "novel.txt", "novel\n", "made outside a worker");
+        let mut dag = TrajectoryDag::new_with_git_root(Vec::new(), base, repo.to_path_buf());
+        dag.insert(node(1, CheckpointId::Root, "one", &c1)).unwrap();
+
+        let resolved = dag
+            .resolve_checkpoint_by_commit(&novel)
+            .expect("descendant resolves");
+        assert_eq!(resolved, CheckpointId::Commit(novel.clone()));
+        assert_eq!(dag.commit_for(&resolved), Some(novel.as_str()));
+
+        let messages = dag.ancestor_messages(&resolved).expect("ancestor messages");
+        let last = messages.last().unwrap().content_text();
+        assert!(last.contains("You start from commit"));
+        assert!(last.contains(short_sha(&novel)));
+        assert!(last.contains("descends from w1"));
     }
 
     #[test]

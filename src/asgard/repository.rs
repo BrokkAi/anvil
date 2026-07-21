@@ -248,27 +248,6 @@ fn capture_worktree_diffstat(root: &Path, base_commit: &str) -> Result<String> {
     .context("git diff --stat output was not UTF-8")
 }
 
-fn capture_commit_diffstat(root: &Path, base_commit: &str, target_commit: &str) -> Result<String> {
-    String::from_utf8(
-        git(
-            root,
-            &[
-                "diff",
-                "--stat",
-                "--no-ext-diff",
-                base_commit,
-                target_commit,
-                "--",
-                ".",
-                ":(exclude).brokk/**",
-                ":(exclude).bifrost/**",
-            ],
-        )?
-        .stdout,
-    )
-    .context("git diff --stat output was not UTF-8")
-}
-
 fn add_intent_to_add_untracked(root: &Path, index: &Path) -> Result<()> {
     let listed = git_with_index(
         root,
@@ -367,12 +346,6 @@ pub(crate) struct SnapshotStage {
     ref_lock: Mutex<()>,
 }
 
-#[derive(Debug)]
-pub(crate) enum MergeCheckpointOutcome {
-    Merged { commit: String, diffstat: String },
-    NoChanges { diffstat: String },
-}
-
 impl SnapshotStage {
     pub(crate) fn new(parent_root: &Path, run_id: &str) -> Result<Self> {
         let parent_root =
@@ -435,63 +408,6 @@ impl SnapshotStage {
             ],
         )?
         .stdout)
-    }
-
-    pub(crate) fn merge_checkpoint(
-        &self,
-        from_commit: &str,
-        onto_commit: &str,
-        name: &str,
-    ) -> Result<MergeCheckpointOutcome> {
-        let merge_base = merge_base(&self.parent_root, from_commit, onto_commit)?;
-        let diffstat = capture_commit_diffstat(&self.parent_root, &merge_base, from_commit)?;
-        if merge_base == from_commit {
-            return Ok(MergeCheckpointOutcome::NoChanges { diffstat });
-        }
-        let scratch = create_candidate_repository_at(
-            &self.parent_root,
-            &format!("merge-{name}"),
-            onto_commit,
-        )?;
-        let merge_result = git(
-            &scratch.root,
-            &[
-                "-c",
-                "user.name=asgard",
-                "-c",
-                "user.email=asgard@anvil.invalid",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "merge",
-                "--no-verify",
-                "--no-ff",
-                "--no-edit",
-                from_commit,
-            ],
-        );
-        let commit = match merge_result {
-            Ok(_) => git_text(&scratch.root, &["rev-parse", "HEAD"])?
-                .trim()
-                .to_string(),
-            Err(error) => {
-                let conflicts = conflicted_files_from_worktree(&scratch.root)?;
-                let abort_result = git(&scratch.root, &["merge", "--abort"]);
-                let abort_error = abort_result.err().map(|error| format!("{error:#}"));
-                remove_candidate_repository(&scratch);
-                return Err(merge_conflict_error(
-                    conflicts,
-                    &error,
-                    abort_error.as_deref(),
-                ));
-            }
-        };
-        let reference = format!("refs/asgard/{}/{name}", self.run_id);
-        if let Err(error) = self.update_ref(&reference, &commit) {
-            remove_candidate_repository(&scratch);
-            return Err(error);
-        }
-        remove_candidate_repository(&scratch);
-        Ok(MergeCheckpointOutcome::Merged { commit, diffstat })
     }
 
     fn update_ref(&self, reference: &str, commit: &str) -> Result<()> {
@@ -718,62 +634,84 @@ fn git_error_message(cwd: &Path, args: &[&str], output: &std::process::Output) -
     }
 }
 
-fn merge_base(root: &Path, from_commit: &str, onto_commit: &str) -> Result<String> {
-    let output = Command::new("git")
-        .args(["merge-base", from_commit, onto_commit])
-        .current_dir(root)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "merge_checkpoint could not find a merge-base for {from_commit} and {onto_commit}; \
-             these checkpoints appear to come from disjoint histories. Asgard checkpoints should \
-             descend from the run root. git merge-base said: {}",
-            stderr.trim()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)
-        .context("git merge-base output was not UTF-8")?
-        .trim()
-        .to_string())
-}
-
-fn conflicted_files_from_worktree(root: &Path) -> Result<Vec<String>> {
-    let output = git(root, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| String::from_utf8_lossy(path).to_string())
-        .collect())
-}
-
-fn merge_conflict_error(
-    conflicts: Vec<String>,
-    merge_error: &anyhow::Error,
-    abort_error: Option<&str>,
-) -> anyhow::Error {
-    let mut message = String::from("merge_checkpoint failed to merge");
-    if conflicts.is_empty() {
-        message.push_str(&format!(":\n{merge_error:#}"));
-    } else {
-        message.push_str("; conflicted files:\n");
-        for file in conflicts {
-            message.push_str(&format!("- {file}\n"));
-        }
-        message.push_str(
-            "The supervisor can spawn a worker from the onto checkpoint with instructions to \
-             resolve these conflicts, then save that resolved checkpoint.",
-        );
-    }
-    if let Some(abort_error) = abort_error {
-        message.push_str(&format!("\ngit merge --abort failed: {abort_error}"));
-    }
-    anyhow::anyhow!("{message}")
-}
-
 fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(git(cwd, args)?.stdout).context("git output was not UTF-8")
+}
+
+/// Execution cap for the supervisor's `git` tool: combined stdout+stderr is
+/// truncated to this many bytes before being handed back as the tool
+/// result. Independent of, and applied before, the 8 KiB permanent-record
+/// retention cap (`RETAINED_PAYLOAD_CAP` in supervisor.rs).
+pub(crate) const SUPERVISOR_GIT_OUTPUT_CAP: usize = 32 * 1024;
+
+pub(crate) struct SupervisorGitOutcome {
+    /// The rendered tool result: combined stdout+stderr (truncated at
+    /// `SUPERVISOR_GIT_OUTPUT_CAP`, with a conflict-abort note and exit code
+    /// appended when relevant).
+    pub(crate) text: String,
+    pub(crate) exit_code: i32,
+    /// Untruncated combined stdout+stderr size, for tracing.
+    pub(crate) bytes: usize,
+}
+
+/// Runs `git <args>` for the supervisor's `git` tool in `root` (the
+/// supervisor's scratch worktree). Never goes through a shell: `args` is
+/// passed to the git CLI as argv, exactly as received. Unlike the other git
+/// helpers in this module, a nonzero git exit code is not a Rust-level
+/// error - the caller (and ultimately the supervisor) sees the command's
+/// real output and exit code either way.
+pub(crate) fn run_supervisor_git(root: &Path, args: &[String]) -> Result<SupervisorGitOutcome> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to spawn git for the supervisor git tool")?;
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let bytes = combined.len();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    let mut text = if combined.len() > SUPERVISOR_GIT_OUTPUT_CAP {
+        let prefix = crate::text::truncate_utf8(&combined, SUPERVISOR_GIT_OUTPUT_CAP);
+        format!("{prefix}\n[truncated, {bytes} bytes total]")
+    } else {
+        combined
+    };
+
+    if exit_code != 0
+        && crate::asgard::first_non_flag_arg(args) == Some("merge")
+        && merge_head_exists(root)
+    {
+        let _ = git(root, &["merge", "--abort"]);
+        text.push_str(
+            "\nnote: conflicted merge aborted; to resolve conflicts spawn a worker instead.",
+        );
+    }
+
+    if exit_code != 0 {
+        text.push_str(&format!("\nexit code: {exit_code}"));
+    }
+
+    Ok(SupervisorGitOutcome {
+        text,
+        exit_code,
+        bytes,
+    })
+}
+
+fn merge_head_exists(root: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "-q", "MERGE_HEAD"])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(test)]
@@ -1186,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_checkpoint_combines_sibling_changes_and_updates_ref() {
+    fn run_supervisor_git_reports_output_exit_code_and_truncates_oversized_combined_output() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -1194,151 +1132,47 @@ mod tests {
         fs::write(repo.join("base.txt"), "base\n").unwrap();
         run_git(repo, &["add", "base.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let worktree = create_candidate_repository(repo, "sv-git").unwrap();
 
-        let from_worker = create_candidate_repository(repo, "merge-from").unwrap();
-        fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
-        let from = stage.snapshot(&from_worker.root, "from").unwrap();
+        let ok = run_supervisor_git(
+            &worktree.root,
+            &["log".to_string(), "--oneline".to_string()],
+        )
+        .unwrap();
+        assert_eq!(ok.exit_code, 0);
+        assert!(ok.text.contains("initial"));
+        assert!(!ok.text.contains("exit code"));
 
-        let onto_worker = create_candidate_repository(repo, "merge-onto").unwrap();
-        fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
+        let failed = run_supervisor_git(
+            &worktree.root,
+            &["show".to_string(), "not-a-real-ref".to_string()],
+        )
+        .unwrap();
+        assert_ne!(failed.exit_code, 0);
+        assert!(failed.text.contains("exit code:"));
 
-        let MergeCheckpointOutcome::Merged { commit, diffstat } =
-            stage.merge_checkpoint(&from, &onto, "merged").unwrap()
-        else {
-            panic!("merge should create a checkpoint");
-        };
-
-        assert_eq!(
-            git_text(
-                repo,
-                &["rev-parse", &format!("refs/asgard/{}/merged", stage.run_id)]
-            )
-            .unwrap()
-            .trim(),
-            commit
-        );
-        assert_eq!(
-            git_text(repo, &["show", &format!("{commit}:from.txt")])
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "from\n"
-        );
-        assert_eq!(
-            git_text(repo, &["show", &format!("{commit}:onto.txt")])
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "onto\n"
-        );
-        assert!(diffstat.contains("from.txt"));
-        let parents = git_text(repo, &["rev-list", "--parents", "-n", "1", &commit]).unwrap();
-        let parents = parents.split_whitespace().collect::<Vec<_>>();
-        assert_eq!(parents, vec![commit.as_str(), onto.as_str(), from.as_str()]);
-
-        remove_candidate_repository(&from_worker);
-        remove_candidate_repository(&onto_worker);
-        stage.cleanup();
-    }
-
-    #[test]
-    fn merge_checkpoint_transplants_full_divergence_since_merge_base() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        configure_test_user(repo);
-        fs::write(repo.join("base.txt"), "base\n").unwrap();
-        run_git(repo, &["add", "base.txt"]);
-        run_git(repo, &["commit", "-m", "initial"]);
-        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-
-        let from_one_worker = create_candidate_repository(repo, "merge-from-one").unwrap();
-        fs::write(from_one_worker.root.join("first.txt"), "first\n").unwrap();
-        let from_one = stage.snapshot(&from_one_worker.root, "from-one").unwrap();
-
-        let from_two_worker =
-            create_candidate_repository_at(repo, "merge-from-two", &from_one).unwrap();
-        fs::write(from_two_worker.root.join("second.txt"), "second\n").unwrap();
-        let from_two = stage.snapshot(&from_two_worker.root, "from-two").unwrap();
-
-        let onto_worker = create_candidate_repository(repo, "merge-onto-multihop").unwrap();
-        fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
-
-        let MergeCheckpointOutcome::Merged { commit, diffstat } =
-            stage.merge_checkpoint(&from_two, &onto, "merged").unwrap()
-        else {
-            panic!("merge should create a checkpoint");
-        };
-
-        assert_eq!(
-            git_text(repo, &["show", &format!("{commit}:first.txt")])
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "first\n"
-        );
-        assert_eq!(
-            git_text(repo, &["show", &format!("{commit}:second.txt")])
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "second\n"
-        );
-        assert!(diffstat.contains("first.txt"));
-        assert!(diffstat.contains("second.txt"));
-
-        remove_candidate_repository(&from_one_worker);
-        remove_candidate_repository(&from_two_worker);
-        remove_candidate_repository(&onto_worker);
-        stage.cleanup();
-    }
-
-    #[test]
-    fn merge_checkpoint_noop_when_onto_already_contains_from() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        configure_test_user(repo);
-        fs::write(repo.join("base.txt"), "base\n").unwrap();
-        run_git(repo, &["add", "base.txt"]);
-        run_git(repo, &["commit", "-m", "initial"]);
-        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-
-        let from_worker = create_candidate_repository(repo, "merge-noop-from").unwrap();
-        fs::write(from_worker.root.join("from.txt"), "from\n").unwrap();
-        let from = stage.snapshot(&from_worker.root, "from").unwrap();
-
-        let onto_worker = create_candidate_repository_at(repo, "merge-noop-onto", &from).unwrap();
-        fs::write(onto_worker.root.join("onto.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
-
-        let MergeCheckpointOutcome::NoChanges { diffstat } =
-            stage.merge_checkpoint(&from, &onto, "noop").unwrap()
-        else {
-            panic!("merge should be a no-op");
-        };
-
-        assert!(diffstat.is_empty());
+        let big = "z".repeat(SUPERVISOR_GIT_OUTPUT_CAP * 2);
+        fs::write(worktree.root.join("big.txt"), &big).unwrap();
+        run_git(&worktree.root, &["add", "big.txt"]);
+        run_git(&worktree.root, &["commit", "-m", "big file"]);
+        let oversized = run_supervisor_git(
+            &worktree.root,
+            &["show".to_string(), "HEAD:big.txt".to_string()],
+        )
+        .unwrap();
+        assert!(oversized.bytes > SUPERVISOR_GIT_OUTPUT_CAP);
+        assert!(oversized.text.len() < oversized.bytes);
         assert!(
-            Command::new("git")
-                .args([
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/asgard/{}/noop", stage.run_id)
-                ])
-                .current_dir(repo)
-                .status()
-                .unwrap()
-                .code()
-                .is_some_and(|code| code != 0)
+            oversized
+                .text
+                .contains(&format!("[truncated, {} bytes total]", oversized.bytes))
         );
 
-        remove_candidate_repository(&from_worker);
-        remove_candidate_repository(&onto_worker);
-        stage.cleanup();
+        remove_candidate_repository(&worktree);
     }
 
     #[test]
-    fn merge_checkpoint_conflict_does_not_create_checkpoint_ref() {
+    fn run_supervisor_git_aborts_conflicted_merge_and_leaves_worktree_clean() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         run_git(repo, &["init"]);
@@ -1346,166 +1180,61 @@ mod tests {
         fs::write(repo.join("same.txt"), "base\n").unwrap();
         run_git(repo, &["add", "same.txt"]);
         run_git(repo, &["commit", "-m", "initial"]);
-        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_commit = base_commit.trim();
 
-        let from_worker = create_candidate_repository(repo, "merge-conflict-from").unwrap();
+        let from_worker = create_candidate_repository(repo, "conflict-from").unwrap();
         fs::write(from_worker.root.join("same.txt"), "from\n").unwrap();
-        let from = stage.snapshot(&from_worker.root, "from").unwrap();
+        run_git(&from_worker.root, &["commit", "-am", "from edits"]);
+        let from_commit = git_text(&from_worker.root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
 
-        let onto_worker = create_candidate_repository(repo, "merge-conflict-onto").unwrap();
+        let onto_worker =
+            create_candidate_repository_at(repo, "conflict-onto", base_commit).unwrap();
         fs::write(onto_worker.root.join("same.txt"), "onto\n").unwrap();
-        let onto = stage.snapshot(&onto_worker.root, "onto").unwrap();
+        run_git(&onto_worker.root, &["commit", "-am", "onto edits"]);
 
-        let error = stage
-            .merge_checkpoint(&from, &onto, "scratch-conflict")
-            .expect_err("conflict");
-        let error = format!("{error:#}");
+        // The supervisor's scratch worktree, checked out at the same
+        // divergent "onto" state, attempts to merge "from" and conflicts.
+        let scratch = create_candidate_repository_at(
+            repo,
+            "sv-git-conflict",
+            git_text(&onto_worker.root, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
 
-        assert!(error.contains("same.txt"));
-        assert!(!error.contains("conflicting hunks"));
-        assert!(error.contains("spawn a worker from the onto checkpoint"));
-        assert_eq!(git_text(repo, &["status", "--porcelain"]).unwrap(), "");
-        assert!(
-            !git_text(repo, &["worktree", "list", "--porcelain"])
-                .unwrap()
-                .contains("asgard-merge-scratch-conflict-")
+        let result = run_supervisor_git(
+            &scratch.root,
+            &[
+                "merge".to_string(),
+                "--no-ff".to_string(),
+                "--no-edit".to_string(),
+                from_commit,
+            ],
+        )
+        .unwrap();
+
+        assert_ne!(result.exit_code, 0);
+        assert!(result.text.contains("note: conflicted merge aborted"));
+        assert!(result.text.contains("spawn a worker instead"));
+        // The abort must actually run: no dangling MERGE_HEAD, clean status,
+        // and a later, unrelated command in the same scratch worktree still
+        // works (a stray merge state does not corrupt it for next use).
+        assert!(!merge_head_exists(&scratch.root));
+        assert_eq!(
+            git_text(&scratch.root, &["status", "--porcelain"]).unwrap(),
+            ""
         );
-        assert!(
-            Command::new("git")
-                .args([
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/asgard/{}/scratch-conflict", stage.run_id)
-                ])
-                .current_dir(repo)
-                .status()
-                .unwrap()
-                .code()
-                .is_some_and(|code| code != 0)
-        );
+        let log_after =
+            run_supervisor_git(&scratch.root, &["log".to_string(), "-1".to_string()]).unwrap();
+        assert_eq!(log_after.exit_code, 0);
 
         remove_candidate_repository(&from_worker);
         remove_candidate_repository(&onto_worker);
-        stage.cleanup();
-    }
-
-    #[test]
-    fn failed_merge_checkpoint_does_not_corrupt_later_finalize_patch() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path();
-        run_git(repo, &["init"]);
-        configure_test_user(repo);
-        fs::write(
-            repo.join("same.txt"),
-            "line 1\nshared line\nline 3\nline 4\n",
-        )
-        .unwrap();
-        fs::write(repo.join("base.txt"), "base\n").unwrap();
-        run_git(repo, &["add", "same.txt", "base.txt"]);
-        run_git(repo, &["commit", "-m", "initial"]);
-        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
-        let base_commit = base_commit.trim();
-        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
-
-        let a_worker = create_candidate_repository(repo, "merge-corruption-a").unwrap();
-        fs::write(
-            a_worker.root.join("same.txt"),
-            "line 1\nA edits the shared line\nline 3\nline 4\n",
-        )
-        .unwrap();
-        let a = stage.snapshot(&a_worker.root, "a").unwrap();
-
-        let b_worker = create_candidate_repository(repo, "merge-corruption-b").unwrap();
-        fs::write(
-            b_worker.root.join("same.txt"),
-            "line 1\nB edits the shared line\nline 3\nline 4\n",
-        )
-        .unwrap();
-        let b = stage.snapshot(&b_worker.root, "b").unwrap();
-
-        let target_worker =
-            create_candidate_repository_at(repo, "merge-corruption-target", &a).unwrap();
-        fs::write(
-            target_worker.root.join("same.txt"),
-            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n",
-        )
-        .unwrap();
-        fs::write(
-            target_worker.root.join("target.txt"),
-            "target content line 1\n\
-             target content line 2\n\
-             target content line 3\n\
-             target content line 4\n\
-             target content line 5\n",
-        )
-        .unwrap();
-        let target = stage.snapshot(&target_worker.root, "target").unwrap();
-
-        let error = stage
-            .merge_checkpoint(&b, &target, "conflicted-merge")
-            .expect_err("conflicting merge");
-        let error = format!("{error:#}");
-        assert!(error.contains("same.txt"));
-        assert!(!error.contains("conflicting hunks"));
-        assert_eq!(git_text(repo, &["status", "--porcelain"]).unwrap(), "");
-
-        let expected_patch = git(
-            repo,
-            &[
-                "diff",
-                "--binary",
-                "--no-ext-diff",
-                base_commit,
-                &target,
-                "--",
-                ".",
-                ":(exclude).brokk/**",
-                ":(exclude).bifrost/**",
-            ],
-        )
-        .unwrap()
-        .stdout;
-        let finalized_patch = stage.finalize_patch(base_commit, &target).unwrap();
-        assert_eq!(finalized_patch, expected_patch);
-
-        let fresh =
-            create_candidate_repository_at(repo, "merge-corruption-fresh", base_commit).unwrap();
-        apply_selected_patch(&fresh.root, &finalized_patch).unwrap();
-        run_git(&fresh.root, &["add", "-A"]);
-        let fresh_tree = git_text(&fresh.root, &["write-tree"]).unwrap();
-        let target_tree = git_text(repo, &["rev-parse", &format!("{target}^{{tree}}")]).unwrap();
-        assert_eq!(fresh_tree.trim(), target_tree.trim());
-        assert_text_file_eq(
-            &fresh.root.join("same.txt"),
-            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n",
-        );
-        assert_text_file_eq(
-            &fresh.root.join("target.txt"),
-            "target content line 1\n\
-             target content line 2\n\
-             target content line 3\n\
-             target content line 4\n\
-             target content line 5\n",
-        );
-
-        assert!(
-            Command::new("git")
-                .args([
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/asgard/{}/conflicted-merge", stage.run_id)
-                ])
-                .current_dir(repo)
-                .status()
-                .unwrap()
-                .code()
-                .is_some_and(|code| code != 0)
-        );
-
-        remove_candidate_repository(&a_worker);
-        remove_candidate_repository(&b_worker);
-        remove_candidate_repository(&target_worker);
-        remove_candidate_repository(&fresh);
-        stage.cleanup();
+        remove_candidate_repository(&scratch);
     }
 }

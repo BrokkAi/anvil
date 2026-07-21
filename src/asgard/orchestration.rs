@@ -14,15 +14,14 @@ use futures::future::{BoxFuture, FutureExt, join_all};
 
 use crate::asgard::{
     ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
-    CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL,
-    MERGE_CHECKPOINT_TOOL, PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL,
-    SnapshotStage, SpawnRequest, SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag,
-    TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason,
-    elide_view_tool_results_for_permanent_record, parse_finalize, parse_merge_checkpoint,
-    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_dag_overview,
-    render_fragment, render_resolved_views, render_window_compact_for_worker, run_asgard_intake,
-    stream_supervisor_response, summarize_resolved_views, supervisor_supplement,
-    supervisor_tool_definitions,
+    CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL,
+    PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
+    SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
+    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, git_refusal, parse_finalize,
+    parse_git_args, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
+    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
+    retain_payloads_for_permanent_record, run_asgard_intake, run_supervisor_git, short_sha,
+    stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
 };
 use crate::llm_client::{
     ChatMessage, IdleTimeouts, LlmResponse, TokenUsage, ToolCall, ToolDefinition,
@@ -173,6 +172,9 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     stage: &'ctx SnapshotStage,
     spawned_batch: Vec<BoxFuture<'fut, FinishedWorker>>,
     idle_pool: &'ctx mut Vec<CandidateRepository>,
+    /// The supervisor's own scratch worktree for the `git` tool, created
+    /// lazily on first use and reused for the whole run.
+    git_scratch: &'ctx mut Option<CandidateRepository>,
     usage_by_model: &'ctx mut BTreeMap<String, TokenUsage>,
     aggregate_usage: &'ctx mut TokenUsage,
     worker_counter: &'ctx mut usize,
@@ -219,8 +221,6 @@ struct SupervisorTurnState {
     finalizing_abandoned: Vec<String>,
     turn_ended: bool,
     finalize_bounced_this_step: bool,
-    /// view_tool_call id -> per-handle summary kept in the permanent record.
-    view_summaries: std::collections::HashMap<String, String>,
 }
 
 struct FinalizeContext<'a> {
@@ -519,6 +519,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let worker_cancel = cancel.child_token();
     let mut pending_batch: BTreeMap<usize, FinishedWorker> = BTreeMap::new();
     let mut idle_pool = Vec::new();
+    let mut git_scratch: Option<CandidateRepository> = None;
     let mut supervisor_turn = 0usize;
     let mut worker_counter = 1usize;
     let mut clone_counter = 1usize;
@@ -544,6 +545,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
         if !pending_windows.is_empty() {
             permanent.push(ChatMessage::user(render_batch_review_message(
                 &pending_windows,
+                &dag,
             )));
         }
         let mut idle_note = match (
@@ -597,6 +599,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             stage: &stage,
             spawned_batch: Vec::new(),
             idle_pool: &mut idle_pool,
+            git_scratch: &mut git_scratch,
             usage_by_model: &mut usage_by_model,
             aggregate_usage: &mut aggregate_usage,
             worker_counter: &mut worker_counter,
@@ -810,6 +813,9 @@ pub(crate) async fn run_asgard_trajectory_loop(
         crate::asgard::remove_candidate_repository(&finished.repository);
     }
     cleanup_asgard_repositories(&idle_pool);
+    if let Some(git_scratch) = git_scratch.take() {
+        crate::asgard::remove_candidate_repository(&git_scratch);
+    }
     let checkpoint_map = checkpoint_commit_map(&dag);
     crate::trace_logging::append_trace_record(serde_json::json!({
         "type": "asgard_checkpoints",
@@ -842,7 +848,6 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         merged: Vec::new(),
         turn_ended: false,
         finalize_bounced_this_step: false,
-        view_summaries: std::collections::HashMap::new(),
     };
     let mut steps = 0usize;
     let mut unresolved_reminder_sent = false;
@@ -1024,8 +1029,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
             (!ephemeral_tail_indexes.contains(&tail_index)).then(|| message.clone())
         })
         .collect::<Vec<_>>();
-    let permanent_append =
-        elide_view_tool_results_for_permanent_record(&permanent_tail, &state.view_summaries);
+    let permanent_append = retain_payloads_for_permanent_record(&permanent_tail);
     add_usage(
         cx.aggregate_usage,
         cx.usage_by_model,
@@ -1067,9 +1071,6 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     &pending_views,
                     &[],
                 );
-                state
-                    .view_summaries
-                    .insert(call.id.clone(), summarize_resolved_views(&views));
                 Ok(render_resolved_views(&views))
             }
             Err(error) => Ok(format!("error: {error}")),
@@ -1090,32 +1091,50 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             let outcome = save_pending_if_needed(cx, &mut state.resolved_pending, worker)?;
             state.saved_any = true;
             Ok(match outcome {
-                PendingResolveOutcome::Saved => format!("saved checkpoint w{worker}"),
+                PendingResolveOutcome::Saved => format!(
+                    "saved checkpoint w{worker}{}",
+                    checkpoint_sha_suffix(cx.dag, &CheckpointId::Worker(worker))
+                ),
                 PendingResolveOutcome::Discarded => {
                     format!("discarded w{worker}: checkpoint autocommit failed")
                 }
             })
         }
-        MERGE_CHECKPOINT_TOOL => {
-            let pending = pending_ids(cx.pending);
-            let context = SupervisorTurnContext {
-                dag: &*cx.dag,
-                pending: &pending,
-                allowed_models: cx.allowed_models,
+        GIT_TOOL => {
+            let args = match parse_git_args(call) {
+                Ok(args) => args,
+                Err(error) => return Ok(format!("error: {error}")),
             };
-            let parsed = match parse_merge_checkpoint(call, &context) {
-                Ok(parsed) => parsed,
-                Err(error) => return Ok(format!("error: merge_checkpoint: {error}")),
-            };
-            let new_worker = *cx.worker_counter;
-            match merge_checkpoint(cx.stage, cx.dag, parsed.from, parsed.onto, new_worker) {
-                Ok(result) => {
-                    *cx.worker_counter += 1;
-                    state.merged.push(new_worker);
-                    Ok(result)
-                }
-                Err(error) => Ok(format!("error: merge_checkpoint: {error:#}")),
+            if let Some(refusal) = git_refusal(&args) {
+                return Ok(refusal);
             }
+            if cx.git_scratch.is_none() {
+                let base_commit = cx
+                    .dag
+                    .commit_for(&CheckpointId::Root)
+                    .ok_or_else(|| anyhow!("missing base commit for Asgard run"))?
+                    .to_string();
+                let repository = crate::asgard::create_candidate_repository_at(
+                    cx.launch.parent_cwd,
+                    "sv-git",
+                    &base_commit,
+                )?;
+                *cx.git_scratch = Some(repository);
+            }
+            let root = cx
+                .git_scratch
+                .as_ref()
+                .expect("git scratch worktree just ensured")
+                .root
+                .clone();
+            let outcome = run_supervisor_git(&root, &args)?;
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_supervisor_git",
+                "args": args,
+                "exit": outcome.exit_code,
+                "bytes": outcome.bytes,
+            }));
+            Ok(outcome.text)
         }
         DISCARD_TOOL => {
             let worker = match pending_worker_for_call(call, cx.pending, &state.resolved_pending, "discard") {
@@ -1241,7 +1260,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     message.push_str(entry.diffstat.trim_end());
                     message.push('\n');
                 }
-                message.push_str("Their work is absent from the delivered lineage. Merge them (merge_checkpoint), or list them in `abandoned` to confirm intentional abandonment.");
+                message.push_str("Their work is absent from the delivered lineage. Merge them with the git tool, or list them in `abandoned` to confirm intentional abandonment.");
                 return Ok(message);
             }
             if let CheckpointId::Worker(worker) = checkpoint
@@ -1263,6 +1282,14 @@ async fn execute_supervisor_call<'ctx, 'fut>(
         }
         other => Ok(format!("error: unknown supervisor tool {other}")),
     }
+}
+
+/// " (a3f81c2)" when `checkpoint`'s commit is known, else "" - used to
+/// append a short sha to save/spawn result text.
+fn checkpoint_sha_suffix(dag: &TrajectoryDag, checkpoint: &CheckpointId) -> String {
+    dag.commit_for(checkpoint)
+        .map(|commit| format!(" ({})", short_sha(commit)))
+        .unwrap_or_default()
 }
 
 fn pending_ids(pending: &BTreeMap<usize, FinishedWorker>) -> Vec<usize> {
@@ -1388,13 +1415,13 @@ async fn execute_spawn_requests<'ctx, 'fut>(
     for worker in pending_sources {
         let outcome = save_pending_if_needed(cx, &mut state.resolved_pending, worker)?;
         state.saved_any = true;
-        lines.push(format!(
-            "{} w{worker}",
-            match outcome {
-                PendingResolveOutcome::Saved => "saved checkpoint",
-                PendingResolveOutcome::Discarded => "discarded",
-            }
-        ));
+        lines.push(match outcome {
+            PendingResolveOutcome::Saved => format!(
+                "saved checkpoint w{worker}{}",
+                checkpoint_sha_suffix(cx.dag, &CheckpointId::Worker(worker))
+            ),
+            PendingResolveOutcome::Discarded => format!("discarded w{worker}"),
+        });
         if !matches!(outcome, PendingResolveOutcome::Saved) {
             lines.push(format!(
                 "error: cannot spawn from w{worker} because checkpoint autocommit failed"
@@ -1425,7 +1452,10 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             SpawnKind::Regular => "spawned",
             SpawnKind::Prefinalize => "prefinalize spawned",
         };
-        lines.push(format!("{verb} w{worker} from {from}"));
+        lines.push(format!(
+            "{verb} w{worker} from {from}{}",
+            checkpoint_sha_suffix(cx.dag, &from)
+        ));
     }
     lines.extend(render_spawn_duplicate_notes(
         &duplicate_notes,
@@ -1581,76 +1611,6 @@ async fn launch_spawn<'a>(
     Ok(worker_id)
 }
 
-fn merge_checkpoint(
-    stage: &SnapshotStage,
-    dag: &mut TrajectoryDag,
-    from: CheckpointId,
-    onto: CheckpointId,
-    worker: usize,
-) -> Result<String> {
-    match from {
-        CheckpointId::Root => return Err(anyhow!("from root is not a saved checkpoint")),
-        CheckpointId::Worker(worker) => dag
-            .node(worker)
-            .ok_or_else(|| anyhow!("from w{worker} is not a saved checkpoint"))?,
-    };
-    let from_commit = dag
-        .commit_for(&from)
-        .ok_or_else(|| anyhow!("unknown checkpoint {from}"))?
-        .to_string();
-    let onto_commit = dag
-        .commit_for(&onto)
-        .ok_or_else(|| anyhow!("unknown checkpoint {onto}"))?
-        .to_string();
-    let name = format!("w{worker}");
-    let (commit, diffstat) = match stage.merge_checkpoint(&from_commit, &onto_commit, &name)? {
-        crate::asgard::MergeCheckpointOutcome::Merged { commit, diffstat } => (commit, diffstat),
-        crate::asgard::MergeCheckpointOutcome::NoChanges { diffstat } => {
-            let mut result = format!("merged {from} onto {onto}");
-            if !diffstat.trim().is_empty() {
-                result.push_str(&format!(" (diffstat: {})", diffstat.trim()));
-            }
-            result.push_str(": merge produced no changes; onto already contains this content");
-            return Ok(result);
-        }
-    };
-    let instruction_text = format!(
-        "The harness merged checkpoint {from}'s changes into this branch:\n{}",
-        diffstat.trim_end()
-    );
-    dag.insert(TrajectoryNode {
-        window: TrajectoryWindow {
-            worker,
-            parent: onto.clone(),
-            instructions: format!("merged {from}'s changes onto {onto}"),
-            model: "asgard".to_string(),
-            instruction_message: ChatMessage::user(instruction_text),
-            window_messages: Vec::new(),
-            compact: String::new(),
-            final_response: String::new(),
-            stop: WorkerStopReason::Finished,
-            steps: 0,
-            diffstat: diffstat.clone(),
-            usage: TokenUsage::default(),
-            elapsed_millis: 0,
-        },
-        commit: commit.clone(),
-        merged_from: vec![from.clone()],
-    })?;
-    crate::trace_logging::append_trace_record(serde_json::json!({
-        "type": "asgard_checkpoint",
-        "worker": worker,
-        "parent": onto.to_string(),
-        "commit": commit,
-        "synthetic": "merge_checkpoint",
-        "from": from.to_string(),
-    }));
-    Ok(format!(
-        "merged {from} onto {onto} as w{worker} (diffstat: {})",
-        diffstat.trim()
-    ))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingResolveOutcome {
     Saved,
@@ -1780,7 +1740,7 @@ fn finalize_asgard(
         return asgard_failure(error);
     }
     let final_text = response.unwrap_or_else(|| match checkpoint {
-        CheckpointId::Root => String::new(),
+        CheckpointId::Root | CheckpointId::Commit(_) => String::new(),
         CheckpointId::Worker(worker) => context
             .dag
             .node(worker)
@@ -1992,6 +1952,9 @@ fn latest_saved_checkpoint(dag: &TrajectoryDag) -> Option<CheckpointId> {
         .max_by_key(|checkpoint| match checkpoint {
             CheckpointId::Root => 0,
             CheckpointId::Worker(worker) => *worker,
+            // checkpoint_labels() only ever yields "wN" strings, so
+            // CheckpointId::parse never produces a Commit fragment here.
+            CheckpointId::Commit(_) => 0,
         })
 }
 
@@ -2065,13 +2028,20 @@ fn initial_permanent_user_message(
     message
 }
 
-fn render_batch_review_message(windows: &BTreeMap<usize, TrajectoryWindow>) -> String {
+fn render_batch_review_message(
+    windows: &BTreeMap<usize, TrajectoryWindow>,
+    dag: &TrajectoryDag,
+) -> String {
     let mut rendered = format!(
         "{} workers finished; review each and resolve each before your turn ends.\n\n",
         windows.len()
     );
     for window in windows.values() {
-        rendered.push_str(&render_fragment(window));
+        // A trajectory under review has not been snapshotted yet (that
+        // happens at save/spawn decision time), so it never has its own
+        // commit here - but its parent, being root or already saved, does.
+        let parent_commit = dag.commit_for(&window.parent);
+        rendered.push_str(&render_fragment(window, None, parent_commit));
         if !rendered.ends_with('\n') {
             rendered.push('\n');
         }
@@ -2517,12 +2487,8 @@ mod tests {
         )
     }
 
-    fn merge_call(id: &str, from: &str, onto: &str) -> ToolCall {
-        named_tool_call(
-            id,
-            "merge_checkpoint",
-            serde_json::json!({ "from": from, "onto": onto }),
-        )
+    fn git_call(id: &str, args: &[&str]) -> ToolCall {
+        named_tool_call(id, "git", serde_json::json!({ "args": args }))
     }
 
     fn update_plan_call(id: &str, step: &str, status: &str) -> ToolCall {
@@ -2653,33 +2619,6 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("git stdout was not UTF-8")
-    }
-
-    fn saved_node(
-        worker: usize,
-        parent: CheckpointId,
-        instructions: &str,
-        commit: String,
-    ) -> TrajectoryNode {
-        TrajectoryNode {
-            window: TrajectoryWindow {
-                worker,
-                parent,
-                instructions: instructions.to_string(),
-                model: "model-a".to_string(),
-                instruction_message: ChatMessage::user(instructions),
-                window_messages: Vec::new(),
-                compact: String::new(),
-                final_response: String::new(),
-                stop: WorkerStopReason::Finished,
-                steps: 1,
-                diffstat: String::new(),
-                usage: TokenUsage::default(),
-                elapsed_millis: 0,
-            },
-            commit,
-            merged_from: Vec::new(),
-        }
     }
 
     fn all_message_text(messages: &[ChatMessage]) -> String {
@@ -3621,7 +3560,10 @@ mod tests {
             .map(|request| all_message_text(&request.messages))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(supervisor_text.contains("[viewed w2m1: read_file"));
+        // The view_tool_call payload is retained verbatim in the permanent
+        // record now, not collapsed to a "[viewed ...]" byte stub.
+        assert!(supervisor_text.contains("hello"));
+        assert!(!supervisor_text.contains("[viewed"));
         assert!(supervisor_text.contains("saved checkpoint w2"));
         assert!(supervisor_text.contains("spawned w3 from w2"));
         assert!(supervisor_text.contains("w3 was auto-saved: the turn ended without resolving it"));
@@ -3659,24 +3601,25 @@ mod tests {
                     )]),
                     text_response("w3 launched"),
                     tool_response(vec![discard_call("sv-discard-w3")]),
-                    tool_response(vec![merge_call("sv-merge", "w2", "w1")]),
+                    // w2 was never itself prefinalized (only w1 was) - finalize must
+                    // reject it even though it is a perfectly good saved checkpoint.
                     tool_response(vec![finalize_call_with_evidence(
-                        "sv-finalize-w4-before-verify",
-                        "w4",
+                        "sv-finalize-w2-before-verify",
+                        "w2",
                         &["w1m2"],
                     )]),
                     tool_response(vec![prefinalize_call(
-                        "sv-prefinalize-w5",
-                        "w4",
-                        "verify w4",
+                        "sv-prefinalize-w4",
+                        "w2",
+                        "verify w2",
                     )]),
-                    text_response("w5 launched"),
-                    tool_response(vec![discard_call("sv-discard-w5")]),
+                    text_response("w4 launched"),
+                    tool_response(vec![discard_call("sv-discard-w4")]),
                     tool_response(vec![finalize_call_with_evidence_and_abandoned(
-                        "sv-finalize-w4",
-                        "w4",
+                        "sv-finalize-w2",
+                        "w2",
                         &["w1m2"],
-                        &["w2"],
+                        &["w1"],
                     )]),
                 ],
             ),
@@ -3696,7 +3639,7 @@ mod tests {
                     tool_response(vec![write_file_call("w2-write", "b.txt", "b\n")]),
                     text_response("w2 done"),
                     text_response("w3 verification report"),
-                    text_response("w5 verification report"),
+                    text_response("w4 verification report"),
                 ],
             ),
         ]));
@@ -3708,8 +3651,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.response, "");
-        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+        assert_eq!(outcome.response, "w2 done");
+        assert!(!repo.join("a.txt").exists());
         assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b\n");
 
         let supervisor_text = backend
@@ -3721,8 +3664,212 @@ mod tests {
             .map(|request| all_message_text(&request.messages))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(supervisor_text.contains("merged w2 onto w1 as w4"));
-        assert!(supervisor_text.contains("error: the delivered checkpoint (w4) is not the state your latest prefinalize verified; run prefinalize from w4 (or the checkpoint you intend to deliver), review it, then finalize."));
+        assert!(supervisor_text.contains("error: the delivered checkpoint (w2) is not the state your latest prefinalize verified; run prefinalize from w2 (or the checkpoint you intend to deliver), review it, then finalize."));
+    }
+
+    /// An `LlmBackend` whose supervisor script is fixed up to a point, then
+    /// switches to reading w1's short sha straight out of the transcript
+    /// (from the "saved checkpoint w1 (<sha>)" text the shorthash feature
+    /// now renders) and finalizing by that hash instead of "w1" - exactly
+    /// how a real supervisor would use it, and proof the two resolve
+    /// identically without the test needing to predict the sha itself.
+    struct ShaCapturingBackend {
+        worker: Mutex<VecDeque<LlmResponse>>,
+        supervisor: Mutex<VecDeque<LlmResponse>>,
+        requests: Mutex<Vec<RecordedRequest>>,
+        captured_sha: Mutex<Option<String>>,
+    }
+
+    impl ShaCapturingBackend {
+        fn new(supervisor: Vec<LlmResponse>, worker: Vec<LlmResponse>) -> Self {
+            Self {
+                worker: Mutex::new(worker.into()),
+                supervisor: Mutex::new(supervisor.into()),
+                requests: Mutex::new(Vec::new()),
+                captured_sha: Mutex::new(None),
+            }
+        }
+    }
+
+    fn extract_saved_w1_sha(text: &str) -> Option<String> {
+        let marker = "checkpoint w1 (";
+        let start = text.find(marker)? + marker.len();
+        let end = start + text[start..].find(')')?;
+        Some(text[start..end].to_string())
+    }
+
+    impl crate::llm_client::LlmBackend for ShaCapturingBackend {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn stream_chat(&self, request: StreamChatRequest) -> BoxFuture<'_, Result<LlmResponse>> {
+            let tool_names = request
+                .tools
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool| tool.function.name)
+                .collect::<Vec<_>>();
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(RecordedRequest {
+                    model: request.model.clone(),
+                    messages: request.messages.clone(),
+                    tool_names,
+                });
+            if request.model == "worker-model" {
+                let response = self
+                    .worker
+                    .lock()
+                    .expect("worker responses")
+                    .pop_front()
+                    .expect("empty worker response queue");
+                return Box::pin(async move { Ok(response) });
+            }
+            if let Some(response) = self
+                .supervisor
+                .lock()
+                .expect("supervisor responses")
+                .pop_front()
+            {
+                return Box::pin(async move { Ok(response) });
+            }
+            let text = all_message_text(&request.messages);
+            let sha = extract_saved_w1_sha(&text)
+                .expect("w1's saved-checkpoint sha must be visible in the transcript by now");
+            *self.captured_sha.lock().expect("captured sha") = Some(sha.clone());
+            let call = finalize_call_with_evidence("sv-finalize-by-sha", &sha, &["w2m1"]);
+            Box::pin(async move { Ok(tool_response(vec![call])) })
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_by_commit_hash_delivers_the_same_state_as_finalize_by_checkpoint_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(ShaCapturingBackend::new(
+            vec![
+                text_response("intake literal"),
+                tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
+                text_response("w1 launched"),
+                tool_response(vec![save_call("sv-save-w1")]),
+                tool_response(vec![prefinalize_call(
+                    "sv-prefinalize-w2",
+                    "w1",
+                    "verify w1",
+                )]),
+                text_response("w2 launched"),
+                // Save (not discard) w2 - its tool call is the finalize
+                // evidence, and a discarded trajectory's results are gone.
+                tool_response(vec![save_call("sv-save-w2")]),
+                // Queue exhausted here - the backend now reads w1's sha out
+                // of the transcript itself and finalizes by that hash.
+            ],
+            vec![
+                text_response("intake grounded"),
+                tool_response(vec![
+                    write_file_call("w1-write", "a.txt", "a\n"),
+                    named_tool_call(
+                        "w1-test",
+                        "run_shell_command",
+                        serde_json::json!({ "command": "test -f a.txt" }),
+                    ),
+                ]),
+                text_response("w1 done"),
+                tool_response(vec![named_tool_call(
+                    "w2-test",
+                    "run_shell_command",
+                    serde_json::json!({ "command": "true" }),
+                )]),
+                text_response("w2 verified"),
+            ],
+        ));
+        let llm: Arc<dyn crate::llm_client::LlmBackend> = backend.clone();
+
+        let sessions = SessionStore::new("worker-model".to_string());
+        let session = sessions.create_session(repo.clone()).await;
+        assert!(
+            sessions
+                .set_permission_mode(&session.id, PermissionMode::BypassPermissions)
+                .await
+        );
+        let parent_registry = sessions
+            .get_or_create_registry(&session.id, repo.clone())
+            .await
+            .expect("parent registry");
+        let config = Config {
+            candidate_models: vec!["worker-model".to_string()],
+            supervisor_model: Some("sv-model".to_string()),
+        };
+        let initial_messages = vec![ChatMessage::user("exercise finalize by commit hash")];
+        let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
+        let (agent_read, agent_write) = tokio::io::split(agent_io);
+        let drain = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut client_io, &mut tokio::io::sink()).await;
+        });
+
+        let (outcome, _) = Agent
+            .builder()
+            .on_receive_dispatch(
+                async move |message: Dispatch, _cx| {
+                    Ok(Handled::No {
+                        message,
+                        retry: false,
+                    })
+                },
+                on_receive_dispatch!(),
+            )
+            .connect_with(
+                ByteStreams::new(agent_write.compat_write(), agent_read.compat()),
+                async |cx| {
+                    Ok(run_asgard_trajectory_loop(
+                        &cx,
+                        &sessions,
+                        &session.id,
+                        &llm,
+                        &parent_registry,
+                        "worker-model",
+                        None,
+                        None,
+                        None,
+                        initial_messages,
+                        IdleTimeouts::uniform(Duration::from_secs(30)),
+                        tokio_util::sync::CancellationToken::new(),
+                        &config,
+                        None,
+                        0,
+                        None,
+                    )
+                    .await)
+                },
+            )
+            .await
+            .expect("in-memory ACP connect_with");
+        drain.abort();
+
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        assert_eq!(outcome.response, "w1 done");
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+
+        let captured_sha = backend
+            .captured_sha
+            .lock()
+            .expect("captured sha")
+            .clone()
+            .expect("finalize-by-sha path must have run");
+        assert_ne!(captured_sha, "w1");
+        assert_eq!(captured_sha.len(), 7);
+        assert!(captured_sha.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[tokio::test]
@@ -4179,7 +4326,7 @@ mod tests {
             .join("\n");
         assert!(supervisor_text.contains("w2:"));
         assert!(supervisor_text.contains("b.txt"));
-        assert!(supervisor_text.contains("Their work is absent from the delivered lineage. Merge them (merge_checkpoint), or list them in `abandoned` to confirm intentional abandonment."));
+        assert!(supervisor_text.contains("Their work is absent from the delivered lineage. Merge them with the git tool, or list them in `abandoned` to confirm intentional abandonment."));
 
         let trace_records = fs::read_to_string(trace_path).expect("trace");
         let finalize = trace_records
@@ -4212,205 +4359,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_checkpoint_then_finalize_delivers_both_sibling_changes() {
+    async fn git_tool_runs_log_refuses_gc_and_aborts_conflicted_merge_through_dispatch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
         run_git(&repo, &["init", "--quiet"]);
         run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
         run_git(&repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write README");
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-
-        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
-            (
-                "sv-model",
-                vec![
-                    text_response("intake literal"),
-                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
-                    text_response("w1 launched"),
-                    tool_response(vec![
-                        save_call("sv-save-w1"),
-                        spawn_call("sv-spawn-w2", "root", "create b"),
-                    ]),
-                    text_response("w2 launched"),
-                    tool_response(vec![save_call("sv-save-w2")]),
-                    tool_response(vec![merge_call("sv-merge", "w2", "w1")]),
-                    tool_response(vec![prefinalize_call(
-                        "sv-prefinalize-w4",
-                        "w3",
-                        "verify w3",
-                    )]),
-                    text_response("w4 launched"),
-                    tool_response(vec![discard_call("sv-discard-w4")]),
-                    tool_response(vec![finalize_call_with_evidence(
-                        "sv-finalize-merged",
-                        "w3",
-                        &["w1m2"],
-                    )]),
-                ],
-            ),
-            (
-                "worker-model",
-                vec![
-                    text_response("intake grounded"),
-                    tool_response(vec![
-                        write_file_call("w1-write", "a.txt", "a\n"),
-                        named_tool_call(
-                            "w1-test",
-                            "run_shell_command",
-                            serde_json::json!({ "command": "test -f a.txt" }),
-                        ),
-                    ]),
-                    text_response("w1 done"),
-                    tool_response(vec![write_file_call("w2-write", "b.txt", "b\n")]),
-                    text_response("w2 done"),
-                    text_response("w4 verification report"),
-                ],
-            ),
-        ]));
-
-        let (outcome, _) = run_scripted_asgard(
-            repo.clone(),
-            backend.clone(),
-            vec![ChatMessage::user("exercise merge checkpoint")],
-        )
-        .await;
-
-        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
-        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
-        assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "b\n");
-        let status = run_git(&repo, &["status", "--porcelain"]);
-        assert!(status.contains("a.txt"));
-        assert!(status.contains("b.txt"));
-
-        let requests = backend.requests.lock().expect("requests");
-        let supervisor_text = requests
-            .iter()
-            .filter(|request| request.model == "sv-model")
-            .map(|request| all_message_text(&request.messages))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(supervisor_text.contains("merged w2 onto w1 as w3"));
-        assert!(supervisor_text.contains("b.txt"));
-        assert!(supervisor_text.contains("diffstat: b.txt"));
-    }
-
-    #[test]
-    fn merge_checkpoint_tool_noop_returns_warning_without_synthetic_node() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).expect("create repo dir");
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write README");
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-        let base_commit = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
-        let stage = SnapshotStage::new(&repo, &format!("test-{}", uuid::Uuid::new_v4()))
-            .expect("snapshot stage");
-
-        let from_worker =
-            crate::asgard::create_candidate_repository_at(&repo, "noop-from", &base_commit)
-                .expect("from worker");
-        fs::write(from_worker.root.join("from.txt"), "from\n").expect("write from");
-        let from_commit = stage
-            .snapshot(&from_worker.root, "from")
-            .expect("from snapshot");
-
-        let onto_worker =
-            crate::asgard::create_candidate_repository_at(&repo, "noop-onto", &from_commit)
-                .expect("onto worker");
-        fs::write(onto_worker.root.join("onto.txt"), "onto\n").expect("write onto");
-        let onto_commit = stage
-            .snapshot(&onto_worker.root, "onto")
-            .expect("onto snapshot");
-
-        let mut dag = TrajectoryDag::new(Vec::new(), base_commit);
-        dag.insert(saved_node(
-            1,
-            CheckpointId::Root,
-            "from",
-            from_commit.clone(),
-        ))
-        .expect("insert from");
-        dag.insert(saved_node(2, CheckpointId::Worker(1), "onto", onto_commit))
-            .expect("insert onto");
-
-        let result = merge_checkpoint(
-            &stage,
-            &mut dag,
-            CheckpointId::Worker(1),
-            CheckpointId::Worker(2),
-            3,
-        )
-        .expect("merge no-op");
-
-        assert_eq!(
-            result,
-            "merged w1 onto w2: merge produced no changes; onto already contains this content"
-        );
-        assert!(!dag.contains(&CheckpointId::Worker(3)));
-        let refs = run_git(
-            &repo,
-            &["for-each-ref", "--format=%(refname)", "refs/asgard"],
-        );
-        assert!(!refs.lines().any(|line| line.ends_with("/w3")));
-
-        crate::asgard::remove_candidate_repository(&from_worker);
-        crate::asgard::remove_candidate_repository(&onto_worker);
-        stage.cleanup();
-    }
-
-    #[tokio::test]
-    async fn failed_merge_checkpoint_then_finalize_delivers_target_tree() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).expect("create repo dir");
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(
-            repo.join("same.txt"),
-            "line 1\nshared line\nline 3\nline 4\n",
-        )
-        .expect("write same");
+        fs::write(repo.join("same.txt"), "base\n").expect("write same");
         run_git(&repo, &["add", "same.txt"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+        // Two branches that conflict on the same file, independent of
+        // Asgard's own dynamic checkpoint refs, so the script can reference
+        // them by name without knowing any run-generated ids in advance.
+        run_git(&repo, &["checkout", "--quiet", "-b", "branch-a"]);
+        fs::write(repo.join("same.txt"), "from branch-a\n").expect("write branch-a");
+        run_git(&repo, &["commit", "--quiet", "-am", "branch-a edit"]);
+        run_git(&repo, &["checkout", "--quiet", &base]);
+        run_git(&repo, &["checkout", "--quiet", "-b", "branch-b"]);
+        fs::write(repo.join("same.txt"), "from branch-b\n").expect("write branch-b");
+        run_git(&repo, &["commit", "--quiet", "-am", "branch-b edit"]);
+        run_git(&repo, &["checkout", "--quiet", &base]);
 
         let backend = Arc::new(ScriptedAsgardBackend::new(vec![
             (
                 "sv-model",
                 vec![
                     text_response("intake literal"),
-                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "create A")]),
-                    text_response("w1 launched"),
                     tool_response(vec![
-                        save_call("sv-save-w1"),
-                        spawn_call("sv-spawn-w2", "root", "create B"),
+                        git_call("sv-git-log", &["log", "--oneline"]),
+                        git_call("sv-git-gc", &["gc"]),
+                        git_call("sv-git-checkout", &["checkout", "branch-a"]),
+                        git_call(
+                            "sv-git-merge",
+                            &["merge", "--no-ff", "--no-edit", "branch-b"],
+                        ),
                     ]),
-                    text_response("w2 launched"),
-                    tool_response(vec![
-                        save_call("sv-save-w2"),
-                        spawn_call("sv-spawn-w3", "w1", "create target"),
-                    ]),
-                    text_response("w3 launched"),
-                    tool_response(vec![save_call("sv-save-w3")]),
-                    tool_response(vec![merge_call("sv-merge-conflict", "w2", "w3")]),
                     tool_response(vec![prefinalize_call(
-                        "sv-prefinalize-w4",
-                        "w3",
-                        "verify w3",
+                        "sv-prefinalize-w1",
+                        "root",
+                        "trivial verification",
                     )]),
-                    text_response("w4 launched"),
-                    tool_response(vec![discard_call("sv-discard-w4")]),
-                    tool_response(vec![finalize_call_with_evidence_and_abandoned(
-                        "sv-finalize-w3",
-                        "w3",
-                        &["w3m3"],
-                        &["w2"],
+                    text_response("w1 launched"),
+                    // Save (not discard) w1 - its tool call is the finalize
+                    // evidence, and a discarded trajectory's results are gone.
+                    tool_response(vec![save_call("sv-save-w1")]),
+                    tool_response(vec![finalize_call_with_evidence(
+                        "sv-finalize-root",
+                        "root",
+                        &["w1m1"],
                     )]),
                 ],
             ),
@@ -4418,46 +4417,12 @@ mod tests {
                 "worker-model",
                 vec![
                     text_response("intake grounded"),
-                    tool_response(vec![write_file_call(
-                        "w1-write",
-                        "same.txt",
-                        "line 1\nA edits the shared line\nline 3\nline 4\n",
-                    )]),
-                    text_response("w1 done"),
-                    tool_response(vec![write_file_call(
-                        "w2-write",
-                        "same.txt",
-                        "line 1\nB edits the shared line\nline 3\nline 4\n",
-                    )]),
-                    text_response("w2 done"),
-                    tool_response(vec![
-                        write_file_call(
-                            "w3-write-same",
-                            "same.txt",
-                            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n",
-                        ),
-                        write_file_call(
-                            "w3-write-target",
-                            "target.txt",
-                            "target content line 1\n\
-                             target content line 2\n\
-                             target content line 3\n\
-                             target content line 4\n\
-                             target content line 5\n",
-                        ),
-                        named_tool_call(
-                            "w3-test",
-                            "run_shell_command",
-                            serde_json::json!({ "command": "test -f target.txt" }),
-                        ),
-                    ]),
-                    text_response("w3 done"),
                     tool_response(vec![named_tool_call(
-                        "w4-test",
+                        "w1-test",
                         "run_shell_command",
-                        serde_json::json!({ "command": "test -f target.txt" }),
+                        serde_json::json!({ "command": "true" }),
                     )]),
-                    text_response("w4 verification report"),
+                    text_response("verified"),
                 ],
             ),
         ]));
@@ -4465,23 +4430,11 @@ mod tests {
         let (outcome, _) = run_scripted_asgard(
             repo.clone(),
             backend.clone(),
-            vec![ChatMessage::user("exercise failed merge then finalize")],
+            vec![ChatMessage::user("exercise the git tool")],
         )
         .await;
 
         assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
-        assert_eq!(
-            fs::read_to_string(repo.join("same.txt")).unwrap(),
-            "line 1\nT keeps A's shared-line choice\nline 3\nline 4\n"
-        );
-        assert_eq!(
-            fs::read_to_string(repo.join("target.txt")).unwrap(),
-            "target content line 1\n\
-             target content line 2\n\
-             target content line 3\n\
-             target content line 4\n\
-             target content line 5\n"
-        );
 
         let requests = backend.requests.lock().expect("requests");
         let supervisor_text = requests
@@ -4490,14 +4443,22 @@ mod tests {
             .map(|request| all_message_text(&request.messages))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(supervisor_text.contains("error: merge_checkpoint"));
-        assert!(supervisor_text.contains("same.txt"));
-        assert!(!supervisor_text.contains("conflicting hunks"));
-        assert!(supervisor_text.contains("spawn a worker from the onto checkpoint"));
+        // `git log` really ran through the tool dispatch path, in the
+        // supervisor's own scratch worktree.
+        assert!(supervisor_text.contains("initial"));
+        // gc is refused before it ever runs.
+        assert!(
+            supervisor_text
+                .contains("refused: gc endangers the shared object store all worktrees depend on.")
+        );
+        // The conflicted merge is aborted automatically, with the exact
+        // guidance the supplement promises.
+        assert!(supervisor_text.contains("note: conflicted merge aborted"));
+        assert!(supervisor_text.contains("to resolve conflicts spawn a worker instead"));
     }
 
     #[tokio::test]
-    async fn mixed_view_and_spawn_response_executes_and_elides_view_in_permanent() {
+    async fn mixed_view_and_spawn_response_executes_and_retains_view_in_permanent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
@@ -4521,7 +4482,10 @@ mod tests {
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "produce output")]),
                     text_response("w1 launched"),
                     tool_response(vec![
-                        view_call("sv-view-w1", &["w1m1"]),
+                        // Both tool results are viewed: the batch's two
+                        // calls are dispatched concurrently, so which one
+                        // lands at index 1 vs 2 isn't guaranteed.
+                        view_call("sv-view-w1", &["w1m1", "w1m2"]),
                         spawn_call("sv-spawn-w2", "w1", "continue after viewing"),
                     ]),
                     tool_response(vec![discard_call("sv-discard-w2")]),
@@ -4547,8 +4511,7 @@ mod tests {
                 vec![
                     text_response("intake grounded"),
                     // read_file keeps this fork-free (shell forks fail under
-                    // per-uid NPROC pressure on busy hosts) while producing a
-                    // result large enough to cross the elision threshold.
+                    // per-uid NPROC pressure on busy hosts).
                     tool_response(vec![
                         named_tool_call(
                             "w1-read",
@@ -4646,8 +4609,11 @@ mod tests {
             .map(|request| all_message_text(&request.messages))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!supervisor_text.contains("MIXED_VIEW_PAYLOAD_123"));
-        assert!(supervisor_text.contains("[viewed w1"));
+        // A ~600 byte payload is well under the 8 KiB retention cap, so it
+        // survives into the permanent record whole - no more "[viewed ...]"
+        // byte stub.
+        assert!(supervisor_text.contains("MIXED_VIEW_PAYLOAD_123"));
+        assert!(!supervisor_text.contains("[viewed w1"));
         assert!(supervisor_text.contains("spawned w2 from w1"));
     }
 

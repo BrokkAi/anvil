@@ -11,10 +11,15 @@ pub(crate) const ASGARD_WORKER_MAX_STEPS: usize = 10;
 pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 
+/// Cap on a single retained payload (view_tool_call or git tool result) kept
+/// verbatim in the permanent record. Bigger payloads keep their first
+/// `RETAINED_PAYLOAD_CAP` bytes plus a marker naming the original size.
+pub(crate) const RETAINED_PAYLOAD_CAP: usize = 8192;
+
 pub(crate) const SPAWN_WORKERS_TOOL: &str = "spawn_workers";
 pub(crate) const PREFINALIZE_TOOL: &str = "prefinalize";
 pub(crate) const SAVE_CHECKPOINT_TOOL: &str = "save_checkpoint";
-pub(crate) const MERGE_CHECKPOINT_TOOL: &str = "merge_checkpoint";
+pub(crate) const GIT_TOOL: &str = "git";
 pub(crate) const DISCARD_TOOL: &str = "discard";
 pub(crate) const FINALIZE_TOOL: &str = "finalize";
 pub(crate) const VIEW_TOOL_CALL_TOOL: &str = "view_tool_call";
@@ -32,12 +37,6 @@ pub(crate) struct FinalizeRequest {
     pub(crate) response: Option<String>,
     pub(crate) evidence: Vec<String>,
     pub(crate) abandoned: Vec<String>,
-}
-
-#[derive(Debug)]
-pub(crate) struct MergeCheckpointRequest {
-    pub(crate) from: CheckpointId,
-    pub(crate) onto: CheckpointId,
 }
 
 pub(crate) struct SupervisorTurnContext<'a> {
@@ -66,7 +65,7 @@ You are the supervisor of a team of barrier-batch workers solving the task. Ever
 - spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls); a worker that stops making tool calls sooner is done, and its final message is its report to you.
 - prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
-- merge_checkpoint: combine two saved checkpoints with a real git merge, producing a new checkpoint - this is how a split batch's parallel work comes back together.
+- git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
 - discard: permanently discard a reviewed trajectory. Pass `worker` to name which one when multiple siblings are under review.
 - view_tool_call: expand compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only once a trajectory has been presented for review.
 - update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
@@ -76,7 +75,7 @@ Reviews: you review a finished batch at a time - where each sibling forked from,
 
 First duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them, resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Calling conventions and argument order are always ambiguities: resolve them against an analogous implementation already in the repo, never by assumption. For each numbered ambiguity (A1, A2, ...) in the intake, state your resolution and a one-line rationale in your plan before spawning implementation workers. Then have two workers in that same batch write spec tests from the settled reading independently - before implementation exists - including one test per resolution that locks in your chosen reading. Where the two suites disagree about the same behavior, you have found an ambiguity nobody flagged: resolve it explicitly before implementing. Implementation workers run the union of both suites, and your finalize evidence should show it passing. If the intake is missing, have your first worker pin the specification from the task text instead.
 
-Batch composition: default to parallel batches, not a lone worker. Whenever the work has two or more independent parts, spawn one worker per part in the same batch and merge_checkpoint the results; a single-worker turn is justified only when the next step genuinely depends on the last result. The intake's PARALLEL PLAN is your default batch composition: when the intake enumerates separable file groups, spawn one worker per group in the same batch, land any file it flags as shared in a precursor first, and aim the redundant pair (below) at the riskiest area it names; deviate from the plan deliberately, not by drift. Plan the split so the same files are not edited twice and merges stay clean. If independent parts share a file, land the shared file first in a quick precursor worker, then split from that checkpoint. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Deliberate redundancy is different: for the riskiest core of the contract - the densest edge surface, the most contested ambiguities - spawn two workers in the same batch to implement that same contract independently from different vantages you name (one from the spec's data model outward, one from the test cases inward), sharing your settled ambiguity resolutions with both. Their tests and behavior will diverge precisely on the edges nobody knew were ambiguous and on slips a single worker's self-tests cannot see. When siblings have implemented the same contract, harvest that divergence before resolving the batch: spawn a differential worker from one sibling's checkpoint that checks out the other sibling's test files directly from its commit (git checkout <sha> -- <paths>) and runs them against the implementation it is standing in. Every cross-sibling failure is an ambiguity two readings resolved differently - adjudicate it against the task text, never by majority or by trusting whichever implementation looks cleaner. Fact-finding stays cheap throughout: short workers that answer questions ("find how X is implemented; report file and line"), variants branched from a good checkpoint, losses cut early, instructions explicit and testable.
+Batch composition: default to parallel batches, not a lone worker. Whenever the work has two or more independent parts, spawn one worker per part in the same batch and merge the results with the git tool; a single-worker turn is justified only when the next step genuinely depends on the last result. The intake's PARALLEL PLAN is your default batch composition: when the intake enumerates separable file groups, spawn one worker per group in the same batch, land any file it flags as shared in a precursor first, and aim the redundant pair (below) at the riskiest area it names; deviate from the plan deliberately, not by drift. Plan the split so the same files are not edited twice and merges stay clean. If independent parts share a file, land the shared file first in a quick precursor worker, then split from that checkpoint. Never spawn multiple workers with identical instructions - duplicates are collapsed, and a stalled approach needs diagnosis, not repetition. Deliberate redundancy is different: for the riskiest core of the contract - the densest edge surface, the most contested ambiguities - spawn two workers in the same batch to implement that same contract independently from different vantages you name (one from the spec's data model outward, one from the test cases inward), sharing your settled ambiguity resolutions with both. Their tests and behavior will diverge precisely on the edges nobody knew were ambiguous and on slips a single worker's self-tests cannot see. When siblings have implemented the same contract, harvest that divergence before resolving the batch: spawn a differential worker from one sibling's checkpoint that checks out the other sibling's test files directly from its commit (git checkout <sha> -- <paths>) and runs them against the implementation it is standing in. Every cross-sibling failure is an ambiguity two readings resolved differently - adjudicate it against the task text, never by majority or by trusting whichever implementation looks cleaner. Fact-finding stays cheap throughout: short workers that answer questions ("find how X is implemented; report file and line"), variants branched from a good checkpoint, losses cut early, instructions explicit and testable.
 
 Finalize is where "Verification" binds you: a worker's report is a claim, not evidence. Do not finalize until the Verification requirements above have actually been discharged on the finalized checkpoint's chain - real test runs whose commands and output you have inspected via view_tool_call. A pre-existing suite that passed before the change proves nothing about the change: the evidence must include tests that exercise the new behavior the task demands - ideally the spec tests written at the start. If that evidence does not exist yet, your prefinalize batch must produce it. A plant is only evidence after re-checking the expected behavior against the spec text or an existing reference implementation - a self-authored test that encodes your own misreading will catch the correct code as the bug. A filtered or single-file test run is progress evidence, not completion evidence: completion evidence is the project's full suite, or a stated reason it cannot be run. Delivery, branches, and commit ceremony are handled outside the run - never spend a worker on commit messages or branch bookkeeping."#,
         supervisor_steps = ASGARD_SUPERVISOR_MAX_STEPS,
@@ -130,7 +129,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: PREFINALIZE_TOOL.to_string(),
-                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; spawn one worker per plant - multi-plant protocols exhaust step budgets; plant one classic bug in the diff's critical paths - swap an argument order, invert a boundary, drop a term - and confirm the suite goes red. Each plant must be a real mutation of the SHIPPED implementation confirmed by inspecting the diff, never a synthetic stand-in function or an edit to test files/mocks. Revert the plant and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); re-check the task's obligations against the delivered state. Alongside the plant workers, include one verification worker dedicated to adversarial inputs derived from the spec text alone - empty, zero, single vs many, negative, trailing, an attribute present but valueless - exercised through the public surface; near-misses live in the edges the implementation's own tests never generated. A hung or timed-out verification run is a blocker: identify the exact hanging test before attributing it to anything pre-existing. Never substitute a weaker ad-hoc check. If verification reveals needed work stranded in another checkpoint, use merge_checkpoint to pull it in.".to_string(),
+                description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; spawn one worker per plant - multi-plant protocols exhaust step budgets; plant one classic bug in the diff's critical paths - swap an argument order, invert a boundary, drop a term - and confirm the suite goes red. Each plant must be a real mutation of the SHIPPED implementation confirmed by inspecting the diff, never a synthetic stand-in function or an edit to test files/mocks. Revert the plant and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); re-check the task's obligations against the delivered state. Alongside the plant workers, include one verification worker dedicated to adversarial inputs derived from the spec text alone - empty, zero, single vs many, negative, trailing, an attribute present but valueless - exercised through the public surface; near-misses live in the edges the implementation's own tests never generated. A hung or timed-out verification run is a blocker: identify the exact hanging test before attributing it to anything pre-existing. Never substitute a weaker ad-hoc check. If verification reveals needed work stranded in another checkpoint, merge it in with the git tool.".to_string(),
                 parameters: spawn_workers_parameters(&allowed_models),
             },
         },
@@ -151,15 +150,18 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
         ToolDefinition {
             r#type: "function".to_string(),
             function: FunctionDef {
-                name: MERGE_CHECKPOINT_TOOL.to_string(),
-                description: "Merge one saved checkpoint into another saved checkpoint using a real git merge of the full branch, including git's rename detection, producing a new two-parent checkpoint. This is how a split batch's parallel work recombines, and how work stranded in a checkpoint outside your delivered lineage is recovered when finalize warns about it. If git reports conflicts, merge_checkpoint aborts the scratch merge cleanly and lists the conflicted files; then spawn a worker from the onto checkpoint with explicit conflict-resolution instructions.".to_string(),
+                name: GIT_TOOL.to_string(),
+                description: "Run a git command directly (args as an argv list, e.g. [\"diff\", \"w2\", \"w5\"]) in your own scratch worktree of the shared repository, created lazily on first use and reused for the whole run. Every checkpoint is a real commit, so this is how you look before deciding (`git diff <parent> <sha>`, `git show <sha> -- <file>`, `git log`) and how you merge: check out the target and merge the other checkpoint's hash - the resulting commit is deliverable by its hash. On a conflicted merge the merge is aborted automatically; spawn a worker to do that merge instead. gc, prune, and reflog expire are refused - they would endanger the shared object store every worktree depends on.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["from", "onto"],
+                    "required": ["args"],
                     "properties": {
-                        "from": { "type": "string" },
-                        "onto": { "type": "string" },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "argv passed to the git CLI directly, never through a shell",
+                        },
                     },
                 }),
             },
@@ -386,8 +388,7 @@ pub(crate) fn parse_finalize(
         .get("checkpoint")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "checkpoint must be a string".to_string())?;
-    let checkpoint = parse_available_checkpoint(checkpoint_raw, context)
-        .map_err(|error| format!("checkpoint {error}"))?;
+    let checkpoint = parse_finalize_checkpoint(checkpoint_raw, context)?;
     let response = arguments
         .get("response")
         .and_then(serde_json::Value::as_str)
@@ -408,27 +409,29 @@ pub(crate) fn parse_finalize(
     })
 }
 
-pub(crate) fn parse_merge_checkpoint(
-    call: &ToolCall,
+/// `checkpoint` is normally "root"/"wN", but also accepts a commit hash
+/// (short or full): rev-parsed in the parent repo and required to descend
+/// from the run's base commit. When the hash matches an already-known
+/// checkpoint's commit that checkpoint is returned directly; a novel
+/// descendant (e.g. a merge made by the `git` tool) is still accepted, so it
+/// can be finalized once its own verification evidence exists.
+fn parse_finalize_checkpoint(
+    value: &str,
     context: &SupervisorTurnContext<'_>,
-) -> std::result::Result<MergeCheckpointRequest, String> {
-    let arguments = normalize_arguments(&call.function.arguments)?;
-    let from_raw = arguments
-        .get("from")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "from must be a string".to_string())?;
-    let onto_raw = arguments
-        .get("onto")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "onto must be a string".to_string())?;
-    let from =
-        parse_saved_checkpoint(from_raw, context).map_err(|error| format!("from {error}"))?;
-    let onto =
-        parse_saved_checkpoint(onto_raw, context).map_err(|error| format!("onto {error}"))?;
-    if from == onto {
-        return Err("from and onto must be distinct saved checkpoints".to_string());
+) -> std::result::Result<CheckpointId, String> {
+    if let Some(checkpoint) = CheckpointId::parse(value) {
+        return if context.dag.contains(&checkpoint) || is_pending_checkpoint(&checkpoint, context) {
+            Ok(checkpoint)
+        } else {
+            Err(format!(
+                "checkpoint {checkpoint} is not root, saved, or under review"
+            ))
+        };
     }
-    Ok(MergeCheckpointRequest { from, onto })
+    context
+        .dag
+        .resolve_checkpoint_by_commit(value)
+        .map_err(|error| format!("checkpoint {error}"))
 }
 
 pub(crate) fn parse_update_plan(
@@ -439,28 +442,73 @@ pub(crate) fn parse_update_plan(
         .map_err(|error| format!("Invalid update_plan arguments: {error}"))
 }
 
-/// Replace every `view_tool_call` payload in the permanent record with the
-/// per-handle summary computed when the call ran. Applies to all expansions
-/// regardless of size: the summary carries what the supervisor needs to
-/// remember (what it looked at, what shape the answer had, and every error
-/// verbatim), and the payload itself can always be re-expanded.
-pub(crate) fn elide_view_tool_results_for_permanent_record(
-    transcript: &[ChatMessage],
-    view_summaries: &std::collections::HashMap<String, String>,
-) -> Vec<ChatMessage> {
+/// Parses the `git` tool's `{args: string[]}` payload into the argv that
+/// will be passed to the git CLI directly - never through a shell, so a
+/// value containing shell metacharacters stays exactly one argv token.
+pub(crate) fn parse_git_args(call: &ToolCall) -> std::result::Result<Vec<String>, String> {
+    let arguments = normalize_arguments(&call.function.arguments)?;
+    string_array_property(&arguments, "args")
+}
+
+/// Returns the first argument that isn't a flag (doesn't start with `-`).
+/// This is a deliberately static, naive scan (it does not special-case
+/// value-taking global flags like `-c <val>`) matching the refusal check's
+/// own "first non-flag argument" rule.
+pub(crate) fn first_non_flag_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+}
+
+/// Refuses git subcommands that would endanger the object store every
+/// worktree (worker and supervisor scratch alike) shares: `gc`, `prune`, and
+/// `reflog expire`. The check is static - on the argv alone, before any git
+/// process runs.
+pub(crate) fn git_refusal(args: &[String]) -> Option<String> {
+    let mut non_flags = args.iter().filter(|arg| !arg.starts_with('-'));
+    let first = non_flags.next()?.as_str();
+    let refused_cmd = match first {
+        "gc" => Some("gc"),
+        "prune" => Some("prune"),
+        "reflog" if non_flags.next().map(String::as_str) == Some("expire") => Some("reflog expire"),
+        _ => None,
+    };
+    refused_cmd.map(|cmd| {
+        format!("refused: {cmd} endangers the shared object store all worktrees depend on.")
+    })
+}
+
+/// Retains `view_tool_call` and `git` tool payloads in the permanent record
+/// instead of collapsing them to a byte-count stub, capping each at
+/// `RETAINED_PAYLOAD_CAP` bytes (verbatim prefix + a marker naming the
+/// original size). Every other tool result passes through unchanged.
+pub(crate) fn retain_payloads_for_permanent_record(transcript: &[ChatMessage]) -> Vec<ChatMessage> {
     transcript
         .iter()
         .map(|message| {
             if message.role == "tool"
-                && message.name.as_deref() == Some(VIEW_TOOL_CALL_TOOL)
+                && matches!(
+                    message.name.as_deref(),
+                    Some(VIEW_TOOL_CALL_TOOL) | Some(GIT_TOOL)
+                )
                 && let Some(call_id) = &message.tool_call_id
-                && let Some(summary) = view_summaries.get(call_id)
             {
-                return ChatMessage::tool_result(call_id, VIEW_TOOL_CALL_TOOL, summary.clone());
+                let name = message.name.clone().unwrap_or_default();
+                let retained = retain_payload(&message.content_text());
+                return ChatMessage::tool_result(call_id, name, retained);
             }
             message.clone()
         })
         .collect()
+}
+
+fn retain_payload(content: &str) -> String {
+    if content.len() <= RETAINED_PAYLOAD_CAP {
+        return content.to_string();
+    }
+    let total = content.len();
+    let prefix = crate::text::truncate_utf8(content, RETAINED_PAYLOAD_CAP);
+    format!("{prefix}\n[retained first {RETAINED_PAYLOAD_CAP} bytes of {total}]")
 }
 
 fn parse_available_checkpoint(
@@ -473,19 +521,6 @@ fn parse_available_checkpoint(
         Ok(checkpoint)
     } else {
         Err(format!("{checkpoint} is not root, saved, or under review"))
-    }
-}
-
-fn parse_saved_checkpoint(
-    value: &str,
-    context: &SupervisorTurnContext<'_>,
-) -> std::result::Result<CheckpointId, String> {
-    let checkpoint =
-        CheckpointId::parse(value).ok_or_else(|| format!("{value:?} is not a checkpoint id"))?;
-    match checkpoint {
-        CheckpointId::Root => Err("root is not a saved checkpoint".to_string()),
-        CheckpointId::Worker(worker) if context.dag.node(worker).is_some() => Ok(checkpoint),
-        CheckpointId::Worker(_) => Err(format!("{checkpoint} is not a saved checkpoint")),
     }
 }
 
@@ -683,98 +718,153 @@ mod tests {
         assert_eq!(parsed.abandoned, vec!["w1".to_string()]);
     }
 
+    fn init_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "asgard@example.invalid"]);
+        run(&["config", "user.name", "Asgard Test"]);
+        (temp, repo)
+    }
+
+    fn commit_file(repo: &std::path::Path, name: &str, content: &str) -> String {
+        std::fs::write(repo.join(name), content).expect("write file");
+        for args in [vec!["add", name], vec!["commit", "--quiet", "-m", name]] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_string()
+    }
+
     #[test]
-    fn merge_checkpoint_parser_requires_distinct_saved_checkpoints() {
-        let mut dag = saved_dag();
+    fn finalize_parser_accepts_a_commit_hash_matching_a_saved_checkpoint() {
+        let (_temp, repo) = init_git_repo();
+        let base = commit_file(&repo, "base.txt", "base\n");
+        let c1 = commit_file(&repo, "one.txt", "one\n");
+        let mut dag = TrajectoryDag::new_with_git_root(
+            vec![ChatMessage::user("task")],
+            base.clone(),
+            repo.clone(),
+        );
         dag.insert(TrajectoryNode {
             window: TrajectoryWindow {
-                worker: 2,
+                worker: 1,
                 parent: CheckpointId::Root,
-                instructions: "sibling".to_string(),
+                instructions: "one".to_string(),
                 model: "model-a".to_string(),
-                instruction_message: ChatMessage::user("sibling instructions"),
+                instruction_message: ChatMessage::user("one"),
                 window_messages: Vec::new(),
                 compact: String::new(),
-                final_response: "sibling result".to_string(),
+                final_response: "done".to_string(),
                 stop: WorkerStopReason::Finished,
                 steps: 1,
                 diffstat: String::new(),
                 usage: TokenUsage::default(),
                 elapsed_millis: 0,
             },
-            commit: "commit-2".to_string(),
+            commit: c1.clone(),
             merged_from: Vec::new(),
         })
         .unwrap();
-        dag.insert(TrajectoryNode {
-            window: TrajectoryWindow {
-                worker: 3,
-                parent: CheckpointId::Worker(1),
-                instructions: "child".to_string(),
-                model: "model-a".to_string(),
-                instruction_message: ChatMessage::user("child instructions"),
-                window_messages: Vec::new(),
-                compact: String::new(),
-                final_response: "child result".to_string(),
-                stop: WorkerStopReason::Finished,
-                steps: 1,
-                diffstat: String::new(),
-                usage: TokenUsage::default(),
-                elapsed_millis: 0,
-            },
-            commit: "commit-3".to_string(),
-            merged_from: Vec::new(),
-        })
-        .unwrap();
-        let context = context(&dag, &[4]);
+        let ctx = context(&dag, &[]);
 
+        let by_full_sha =
+            supervisor_tool_call("f1", FINALIZE_TOOL, serde_json::json!({ "checkpoint": c1 }));
+        let parsed = parse_finalize(&by_full_sha, &ctx).expect("full sha resolves");
+        assert_eq!(parsed.checkpoint, CheckpointId::Worker(1));
+
+        let by_short_sha = supervisor_tool_call(
+            "f2",
+            FINALIZE_TOOL,
+            serde_json::json!({ "checkpoint": &c1[..10] }),
+        );
+        let parsed = parse_finalize(&by_short_sha, &ctx).expect("short sha resolves");
+        assert_eq!(
+            parsed.checkpoint,
+            CheckpointId::Worker(1),
+            "finalize by w1's own commit hash must equal finalize by \"w1\""
+        );
+
+        let unknown = supervisor_tool_call(
+            "f3",
+            FINALIZE_TOOL,
+            serde_json::json!({ "checkpoint": "not-a-known-ref" }),
+        );
+        assert!(parse_finalize(&unknown, &ctx).is_err());
+    }
+
+    #[test]
+    fn git_refusal_blocks_gc_prune_and_reflog_expire_but_allows_reflog_show() {
+        let refuses = |args: &[&str]| {
+            git_refusal(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+
+        assert!(
+            refuses(&["gc"])
+                .expect("gc refused")
+                .contains("refused: gc")
+        );
+        assert!(
+            refuses(&["--no-pager", "prune"])
+                .expect("prune refused")
+                .contains("refused: prune")
+        );
+        assert!(
+            refuses(&["reflog", "expire", "--all"])
+                .expect("reflog expire refused")
+                .contains("refused: reflog expire")
+        );
+        assert!(refuses(&["reflog", "show"]).is_none());
+        assert!(refuses(&["log", "--oneline"]).is_none());
+        assert!(refuses(&["merge", "--no-ff", "deadbeef"]).is_none());
+        assert!(refuses(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_git_args_preserves_argv_tokens_without_shell_join() {
         let call = supervisor_tool_call(
-            "merge",
-            MERGE_CHECKPOINT_TOOL,
-            serde_json::json!({ "from": "w2", "onto": "w1" }),
+            "git",
+            GIT_TOOL,
+            serde_json::json!({ "args": ["commit", "-m", "hello world; rm -rf /"] }),
         );
-        let parsed = parse_merge_checkpoint(&call, &context).expect("valid merge");
-        assert_eq!(parsed.from, CheckpointId::Worker(2));
-        assert_eq!(parsed.onto, CheckpointId::Worker(1));
 
-        let root = supervisor_tool_call(
-            "merge",
-            MERGE_CHECKPOINT_TOOL,
-            serde_json::json!({ "from": "root", "onto": "w1" }),
+        let args = parse_git_args(&call).expect("valid args");
+
+        // A single argv token survives untouched: no shell ever gets to
+        // reinterpret the `;` as a command separator.
+        assert_eq!(
+            args,
+            vec![
+                "commit".to_string(),
+                "-m".to_string(),
+                "hello world; rm -rf /".to_string()
+            ]
         );
-        assert!(
-            parse_merge_checkpoint(&root, &context)
-                .expect_err("root rejected")
-                .contains("root is not a saved checkpoint")
-        );
-        let same = supervisor_tool_call(
-            "merge",
-            MERGE_CHECKPOINT_TOOL,
-            serde_json::json!({ "from": "w1", "onto": "w1" }),
-        );
-        assert!(
-            parse_merge_checkpoint(&same, &context)
-                .expect_err("same rejected")
-                .contains("distinct")
-        );
-        let ancestor = supervisor_tool_call(
-            "merge",
-            MERGE_CHECKPOINT_TOOL,
-            serde_json::json!({ "from": "w1", "onto": "w3" }),
-        );
-        let parsed = parse_merge_checkpoint(&ancestor, &context).expect("ancestor merge allowed");
-        assert_eq!(parsed.from, CheckpointId::Worker(1));
-        assert_eq!(parsed.onto, CheckpointId::Worker(3));
-        let pending = supervisor_tool_call(
-            "merge",
-            MERGE_CHECKPOINT_TOOL,
-            serde_json::json!({ "from": "w4", "onto": "w1" }),
-        );
-        assert!(
-            parse_merge_checkpoint(&pending, &context)
-                .expect_err("pending rejected")
-                .contains("w4 is not a saved checkpoint")
-        );
+
+        let bad = supervisor_tool_call("git", GIT_TOOL, serde_json::json!({ "args": [1, 2] }));
+        assert!(parse_git_args(&bad).is_err());
     }
 
     #[test]
@@ -817,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn permanent_record_replaces_view_results_with_their_summaries() {
+    fn permanent_record_retains_small_view_and_git_payloads_whole() {
         let view_call = supervisor_tool_call(
             "view",
             VIEW_TOOL_CALL_TOOL,
@@ -828,48 +918,60 @@ mod tests {
             SPAWN_WORKERS_TOOL,
             serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
         );
-        let error_view_call = supervisor_tool_call(
-            "view-err",
-            VIEW_TOOL_CALL_TOOL,
-            serde_json::json!({ "handles": ["w9"] }),
-        );
-        let payload = format!("huge payload {}", "x".repeat(500));
-        let short_payload = "tiny".to_string();
+        let git_call =
+            supervisor_tool_call("git", GIT_TOOL, serde_json::json!({ "args": ["log"] }));
+        let view_payload = "PASS (12) FAIL (0)".to_string();
+        let git_payload = "commit abc123\n    initial\n".to_string();
         let transcript = vec![
-            ChatMessage::assistant_tool_calls(vec![view_call, spawn_call, error_view_call]),
-            ChatMessage::tool_result("view", VIEW_TOOL_CALL_TOOL, payload.clone()),
+            ChatMessage::assistant_tool_calls(vec![view_call, spawn_call, git_call]),
+            ChatMessage::tool_result("view", VIEW_TOOL_CALL_TOOL, view_payload.clone()),
             ChatMessage::tool_result("spawn", SPAWN_WORKERS_TOOL, "spawned w3 from root"),
-            ChatMessage::tool_result("view-err", VIEW_TOOL_CALL_TOOL, short_payload.clone()),
+            ChatMessage::tool_result("git", GIT_TOOL, git_payload.clone()),
         ];
-        let summaries = std::collections::HashMap::from([
-            (
-                "view".to_string(),
-                "[viewed w1m1: read_file, 512 bytes]\n[viewed w2m3: \"PASS (12) FAIL (0)\"]"
-                    .to_string(),
-            ),
-            (
-                "view-err".to_string(),
-                "[attempted view of w9: malformed handle]".to_string(),
-            ),
-        ]);
 
-        let permanent = elide_view_tool_results_for_permanent_record(&transcript, &summaries);
+        let permanent = retain_payloads_for_permanent_record(&transcript);
         let text = permanent
             .iter()
             .map(ChatMessage::content_text)
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(!text.contains(&payload));
-        assert!(text.contains("[viewed w1m1: read_file, 512 bytes]"));
-        assert!(text.contains(r#"[viewed w2m3: "PASS (12) FAIL (0)"]"#));
-        // Errors are summarized too, but the summary quotes them in full so the
-        // supervisor sees that a call failed and does not repeat it. Size is
-        // irrelevant: even this short payload is replaced.
-        assert!(!text.contains(&short_payload));
-        assert!(text.contains("[attempted view of w9: malformed handle]"));
-        // Non-view tool results are untouched.
+        // Payloads at or under the cap are retained verbatim - not collapsed
+        // to a "[viewed ...: N bytes]" stub.
+        assert!(text.contains(&view_payload));
+        assert!(!text.contains("[viewed"));
+        assert!(text.contains(&git_payload));
+        assert!(!text.contains("[retained"));
+        // Non-view/git tool results are untouched.
         assert!(text.contains("spawned w3 from root"));
+    }
+
+    #[test]
+    fn permanent_record_truncates_oversized_payloads_at_the_retention_cap() {
+        let view_call = supervisor_tool_call(
+            "view",
+            VIEW_TOOL_CALL_TOOL,
+            serde_json::json!({ "handles": ["w1m1"] }),
+        );
+        let oversized = "x".repeat(RETAINED_PAYLOAD_CAP + 500);
+        let transcript = vec![
+            ChatMessage::assistant_tool_calls(vec![view_call]),
+            ChatMessage::tool_result("view", VIEW_TOOL_CALL_TOOL, oversized.clone()),
+        ];
+
+        let permanent = retain_payloads_for_permanent_record(&transcript);
+        let text = permanent
+            .iter()
+            .map(ChatMessage::content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!text.contains(&oversized));
+        assert!(text.contains(&"x".repeat(RETAINED_PAYLOAD_CAP)));
+        assert!(text.contains(&format!(
+            "[retained first {RETAINED_PAYLOAD_CAP} bytes of {}]",
+            oversized.len()
+        )));
     }
 
     #[test]
