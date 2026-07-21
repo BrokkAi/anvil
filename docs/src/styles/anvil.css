@@ -203,23 +203,52 @@ html[data-has-hero] .sl-markdown-content > .home-section:first-child { margin-to
 .capability-grid h3 { margin: 2.5rem 0 0.65rem; color: var(--anvil-ink); font-size: 1.15rem; }
 .capability-grid p { margin: 0; color: var(--anvil-muted); font-size: 0.9rem; line-height: 1.5; }
 
-.client-line {
+.replaceability-panel {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  margin-top: 2.5rem;
-  border-block: 1px solid var(--anvil-line-strong);
+  grid-template-columns: minmax(0, 1.15fr) minmax(20rem, 0.85fr);
+  gap: clamp(2rem, 6vw, 6rem);
+  align-items: center;
 }
-.client-line span {
-  padding: 1.2rem 0.7rem;
-  color: var(--anvil-muted);
+.replaceability-panel > div > p:not(.section-label) {
+  max-width: 48rem;
+  color: var(--anvil-copy);
+  font-size: 1.08rem;
+}
+.replaceability-panel aside {
+  position: relative;
+  padding: clamp(1.5rem, 3vw, 2.5rem);
+  border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 35%, var(--anvil-line));
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--anvil-cobalt) 9%, transparent), transparent 58%),
+    var(--anvil-surface-raised);
+  box-shadow: inset 3px 0 var(--anvil-cobalt);
+}
+.replaceability-panel aside small {
+  color: var(--anvil-cobalt);
   font-family: var(--sl-font-mono);
-  font-size: 0.7rem;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-  text-align: center;
+  font-size: 0.61rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+}
+.replaceability-panel aside h3 {
+  margin: 1.2rem 0 0.75rem;
+  color: var(--anvil-ink);
+  font-size: 1.4rem;
+}
+.replaceability-panel aside p { margin: 0; color: var(--anvil-copy); font-size: 0.92rem; line-height: 1.62; }
+.replaceability-panel aside a {
+  display: inline-flex;
+  gap: 0.5rem;
+  margin-top: 1.3rem;
+  color: var(--anvil-cobalt);
+  font-family: var(--sl-font-mono);
+  font-size: 0.67rem;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+  text-decoration: none;
   text-transform: uppercase;
 }
-.client-line span + span { border-inline-start: 1px solid var(--anvil-line); }
+.replaceability-panel aside a:hover { text-decoration: underline; text-underline-offset: 0.25rem; }
 
 .docs-callout {
   display: grid;
@@ -253,6 +282,7 @@ html[data-has-hero] .sl-markdown-content > .home-section:first-child { margin-to
 
 @media (max-width: 64rem) {
   .capability-grid { grid-template-columns: repeat(2, 1fr); }
+  .replaceability-panel { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 49.99rem) {
@@ -260,8 +290,6 @@ html[data-has-hero] .sl-markdown-content > .home-section:first-child { margin-to
   .ownership-grid,
   .capability-grid,
   .docs-callout { grid-template-columns: 1fr; }
-  .client-line { grid-template-columns: 1fr 1fr; }
-  .client-line span { border-bottom: 1px solid var(--anvil-line); }
   .docs-callout { align-items: start; }
 }
 

@@ -9,10 +9,9 @@ import type { StarlightRouteData } from '@astrojs/starlight/route-data';
 const { siteTitleHref } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute;
 const root = siteTitleHref.endsWith('/') ? siteTitleHref : `${siteTitleHref}/`;
 const navItems = [
-  { label: 'Overview', slug: 'overview/' },
-  { label: 'Quick start', slug: 'quick-start/' },
-  { label: 'Concepts', slug: 'concepts/' },
-  { label: 'Clients', slug: 'clients/' },
+  { label: 'Install', slug: 'install/' },
+  { label: 'Evaluate', slug: 'evaluate-anvil/' },
+  { label: 'Clients', slug: 'zed/' },
 ];
 const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 ---
@@ -45,7 +44,7 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
   @layer starlight.user {
     .anvil-header-shell {
       display: grid;
-      grid-template-columns: minmax(10rem, auto) minmax(8rem, 22rem) auto;
+      grid-template-columns: minmax(10rem, auto) minmax(0, 1fr) auto auto;
       align-items: center;
       gap: clamp(0.7rem, 1.6vw, 1.5rem);
       height: 100%;

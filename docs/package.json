@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "ASTRO_TELEMETRY_DISABLED=1 astro dev",
-    "build": "ASTRO_TELEMETRY_DISABLED=1 astro build && node scripts/check-links.mjs",
+    "build": "npm run check:evaluation && ASTRO_TELEMETRY_DISABLED=1 astro build && node scripts/check-links.mjs",
+    "check:evaluation": "node scripts/check-evaluation-fixture.mjs",
     "check": "ASTRO_TELEMETRY_DISABLED=1 astro check",
     "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview"
   },

@@ -79,8 +79,11 @@ Add the smallest regression test that would have caught the problem:
   JSON-RPC boundary.
 - Include negative controls for permission, sandbox, path, protocol, and
   persistence changes.
-- Update `README.md` when a user-visible command, setup flow, provider, tool,
-  configuration option, or limitation changes.
+- Update the canonical Starlight documentation under `docs/src/content/docs`
+  when a user-visible command, setup flow, provider, tool, configuration
+  option, or limitation changes. Update `README.md` only when the product
+  overview, shortest entry path, supported top-level surfaces, or a major
+  limitation changes.
 - Update `AGENTS.md` when an implementation invariant or extension checklist
   changes.
 

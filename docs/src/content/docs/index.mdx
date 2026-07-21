@@ -1,27 +1,28 @@
 ---
 title: Anvil
-description: One agent engine for any ACP interface.
+description: One portable agent runtime for your ACP interface.
 template: splash
 hero:
-  title: One agent engine. Any interface.
+  title: One agent engine. Your interface.
   tagline: An ACP-native agent runtime for editors, bots, TUIs, and internal tools.
   actions:
-    - text: Quick start
-      link: quick-start/
+    - text: Evaluate Anvil
+      link: evaluate-anvil/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
-      link: https://github.com/BrokkAi/anvil
-      icon: external
+    - text: Overview
+      link: overview/
+      icon: right-arrow
       variant: secondary
 ---
 
 <section class="home-section">
-  <p class="section-label">The boundary is the product</p>
-  <h2>Build the interface. Keep the engine.</h2>
+  <p class="section-label">A deliberate boundary</p>
+  <h2>Build the experience. Keep the runtime independent.</h2>
   <p>
-    Anvil separates the agent runtime from the experience around it. Your client stays small and
-    intentional while one reusable ACP subprocess handles execution semantics.
+    ACP keeps the client experience independent from the runtime implementation. Editors and bots
+    stay focused on interaction while Anvil provides consistent execution semantics behind a
+    separate process.
   </p>
 
   <div class="ownership-grid">
@@ -53,22 +54,22 @@ hero:
   <h2>Serious infrastructure, behind a clean protocol.</h2>
 
   <div class="capability-grid">
-    <a href="concepts/#model-routing">
+    <a href="providers/">
       <span>01 / ROUTE</span>
       <h3>Model routing</h3>
       <p>Connect Codex, Bedrock, hosted providers, or local models through stable wire IDs.</p>
     </a>
-    <a href="concepts/#tooling-and-mcp">
+    <a href="tools-bifrost/">
       <span>02 / EXTEND</span>
       <h3>Tools + MCP</h3>
       <p>Ship built-in file and shell tools, skills, subagents, and managed MCP servers.</p>
     </a>
-    <a href="concepts/#permissions">
+    <a href="permissions-sandboxing/">
       <span>03 / CONTROL</span>
       <h3>Permission gates</h3>
       <p>Keep attended and unattended workflows explicit at the protocol boundary.</p>
     </a>
-    <a href="concepts/#sessions-and-context">
+    <a href="sessions-context/">
       <span>04 / REMEMBER</span>
       <h3>Persistent sessions</h3>
       <p>Resume work with durable history, context reporting, and automatic compaction.</p>
@@ -77,21 +78,36 @@ hero:
 </section>
 
 <section class="home-section">
-  <p class="section-label">One backend, many surfaces</p>
-  <h2>An agent engine that does not dictate the UI.</h2>
-  <p>Use Anvil from an editor, a focused automation, or a frontend that has not been invented yet.</p>
-  <div class="client-line" aria-label="Example Anvil clients">
-    <span>Zed</span><span>JetBrains</span><span>Issue bots</span><span>Review bots</span><span>Custom TUIs</span>
+  <div class="replaceability-panel">
+    <div>
+      <p class="section-label">Replaceable by design</p>
+      <h2>Change the engine without rebuilding the cockpit.</h2>
+      <p>
+        Because Anvil is an ACP subprocess, a client can point at an official release, a locally
+        built fork, or another compatible executable. Runtime and interface can evolve on separate
+        release cycles while the process boundary stays explicit.
+      </p>
+    </div>
+    <aside>
+      <small>ARCHITECTURE × LICENSE</small>
+      <h3>A practical path to user freedom</h3>
+      <p>
+        ACP is an architectural choice, not an LGPL requirement. But the replaceable executable
+        boundary complements the LGPL freedoms in the Anvil component: recipients can inspect,
+        modify, rebuild, and run their version without needing the client to relink against it.
+      </p>
+      <a href="license-use-cases/">Understand the license boundary <span aria-hidden="true">→</span></a>
+    </aside>
   </div>
 </section>
 
 <section class="home-section">
   <div class="docs-callout">
     <div>
-      <p class="section-label">Documentation preview</p>
-      <h2>Start at the protocol boundary.</h2>
-      <p>The documentation structure is in place. Installation, client wiring, runtime concepts, and configuration will grow here.</p>
+      <p class="section-label">Try it in ten minutes</p>
+      <h2>Verify the whole path.</h2>
+      <p>Install a released binary, connect an ACP client, and verify model routing, Bifrost tools, permissions, and session context in one bounded journey.</p>
     </div>
-    <a href="quick-start/">Read the quick start <span aria-hidden="true">→</span></a>
+    <a href="evaluate-anvil/">Run the evaluation <span aria-hidden="true">→</span></a>
   </div>
 </section>

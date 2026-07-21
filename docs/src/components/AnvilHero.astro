@@ -1,21 +1,23 @@
 ---
 import { LinkButton } from '@astrojs/starlight/components';
 import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+import AnvilParticleOrb from './AnvilParticleOrb.astro';
 
 const { data } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute.entry;
 const { actions = [] } = data.hero || {};
 ---
 
 <section class="anvil-hero" aria-labelledby="_top">
+  <AnvilParticleOrb />
   <div class="hero-copy">
-    <p class="hero-kicker"><span>01</span> Agent Client Protocol / Rust</p>
+    <p class="hero-kicker"><span>01</span> Portable agent runtime / Rust</p>
     <h1 id="_top" data-page-title>
       One agent engine.<br />
-      <em>Any interface.</em>
+      <em>Your interface.</em>
     </h1>
     <p class="hero-tagline">
-      Anvil is the portable agent runtime behind editors, bots, TUIs, and internal tools.
-      Bring the experience. Anvil brings the model loop, tools, permissions, and memory.
+      Anvil packages model routing, tools, permissions, and durable sessions into one replaceable
+      process. Clients shape the experience; operators choose the executable.
     </p>
 
     {
@@ -31,10 +33,10 @@ const { actions = [] } = data.hero || {};
       )
     }
 
-    <ul class="hero-facts" aria-label="Anvil technical summary">
-      <li><span>Transport</span><strong>stdio / JSON-RPC</strong></li>
-      <li><span>Protocol</span><strong>ACP</strong></li>
-      <li><span>Runtime</span><strong>Rust</strong></li>
+    <ul class="hero-facts" aria-label="Anvil design principles">
+      <li><span>Swappable</span><strong>Process, not library</strong></li>
+      <li><span>Portable</span><strong>One executable</strong></li>
+      <li><span>Open</span><strong>LGPL-3.0-only</strong></li>
     </ul>
   </div>
 
@@ -64,7 +66,7 @@ const { actions = [] } = data.hero || {};
     </div>
   </div>
 
-  <p class="hero-rail" aria-hidden="true">ANVIL // AGENT INFRASTRUCTURE // ACP NATIVE // MODEL AGNOSTIC</p>
+  <p class="hero-rail" aria-hidden="true">SEPARATE PROCESS // CLIENT-OWNED UI // REPLACEABLE RUNTIME // OPEN SOURCE</p>
 </section>
 
 <style>
@@ -91,18 +93,6 @@ const { actions = [] } = data.hero || {};
       background-size: 11rem 11rem;
       content: '';
       mask-image: linear-gradient(180deg, rgb(0 0 0 / 0.85), transparent 92%);
-    }
-
-    .anvil-hero::after {
-      position: absolute;
-      z-index: -1;
-      inset: 8% -8% auto auto;
-      width: 41rem;
-      height: 41rem;
-      border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 16%, transparent);
-      border-radius: 50%;
-      box-shadow: inset 0 0 0 6rem color-mix(in srgb, var(--anvil-cobalt) 2.5%, transparent);
-      content: '';
     }
 
     .hero-copy { position: relative; z-index: 2; }
