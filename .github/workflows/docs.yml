@@ -42,8 +42,8 @@ jobs:
         run: npm run build
         working-directory: docs
         env:
-          PUBLIC_DOCS_SITE: https://brokkai.github.io
-          PUBLIC_DOCS_BASE: /anvil
+          PUBLIC_DOCS_SITE: https://anvil.brokk.ai
+          PUBLIC_DOCS_BASE: /
 
       - name: Prepare Pages artifact
         run: touch docs/dist/.nojekyll

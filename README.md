@@ -1,7 +1,7 @@
 <h1 align="center">Anvil</h1>
 
 <p align="center">
-  <a href="https://brokkai.github.io/anvil/">
+  <a href="https://anvil.brokk.ai/">
     <img src="docs/public/anvil-social-card.png" alt="Anvil — one portable agent runtime for your ACP interface" width="720">
   </a>
 </p>
@@ -15,8 +15,8 @@
 
 <p align="center">
   <a href="#install-and-evaluate">Quickstart</a> ·
-  <a href="https://brokkai.github.io/anvil/">Documentation</a> ·
-  <a href="https://brokkai.github.io/anvil/evaluate-anvil/">Ten-minute evaluation</a> ·
+  <a href="https://anvil.brokk.ai/">Documentation</a> ·
+  <a href="https://anvil.brokk.ai/evaluate-anvil/">Ten-minute evaluation</a> ·
   <a href="https://discord.gg/geYkWUeH">Discord</a>
 </p>
 
@@ -51,20 +51,20 @@ cargo install brokk-anvil --locked --force
 anvil --version
 ```
 
-Running `anvil` directly starts a stdio JSON-RPC server; use it through an ACP client. Continue with the [installation guide](https://brokkai.github.io/anvil/install/) or the reproducible [ten-minute evaluation](https://brokkai.github.io/anvil/evaluate-anvil/).
+Running `anvil` directly starts a stdio JSON-RPC server; use it through an ACP client. Continue with the [installation guide](https://anvil.brokk.ai/install/) or the reproducible [ten-minute evaluation](https://anvil.brokk.ai/evaluate-anvil/).
 
 ## Supported Clients
 
-- [Zed](https://brokkai.github.io/anvil/zed/) and [JetBrains](https://brokkai.github.io/anvil/jetbrains/) have repository-backed setup helpers and verified configuration shapes.
-- [Other ACP clients](https://brokkai.github.io/anvil/other-acp-clients/) can launch Anvil as a custom stdio agent.
-- The [client-building guide](https://brokkai.github.io/anvil/build-acp-client/) and `examples/` show issue triage, review, and issue-drafting automations.
+- [Zed](https://anvil.brokk.ai/zed/) and [JetBrains](https://anvil.brokk.ai/jetbrains/) have repository-backed setup helpers and verified configuration shapes.
+- [Other ACP clients](https://anvil.brokk.ai/other-acp-clients/) can launch Anvil as a custom stdio agent.
+- The [client-building guide](https://anvil.brokk.ai/build-acp-client/) and `examples/` show issue triage, review, and issue-drafting automations.
 
 ## Documentation and Development
 
-The [Anvil documentation](https://brokkai.github.io/anvil/) is the canonical user reference for providers, commands, tools, permissions, sessions, extensibility, and trust boundaries.
+The [Anvil documentation](https://anvil.brokk.ai/) is the canonical user reference for providers, commands, tools, permissions, sessions, extensibility, and trust boundaries.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for source development, runtime invariants, tests, dependency-license policy, pull requests, and releases.
 
 ## License
 
-Anvil is licensed under `LGPL-3.0-only`. See the practical [License and Use Cases](https://brokkai.github.io/anvil/license-use-cases/) guide, the controlling [LICENSE](LICENSE), and [third-party notices](https://brokkai.github.io/anvil/third-party-notices/).
+Anvil is licensed under `LGPL-3.0-only`. See the practical [License and Use Cases](https://anvil.brokk.ai/license-use-cases/) guide, the controlling [LICENSE](LICENSE), and [third-party notices](https://anvil.brokk.ai/third-party-notices/).
