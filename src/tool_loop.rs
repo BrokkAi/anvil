@@ -5164,16 +5164,70 @@ async fn run_post_tool_use_hooks(
     }
 }
 
+/// For an Asgard trajectory-window registry (`ToolRegistry::canonical_root`
+/// is set), redirect any occurrence of the canonical parent-repo root in
+/// `args` to this worker's own physical worktree root. Old messages in the
+/// inherited (canonical, never-per-worker-rewritten) chain name the
+/// canonical root, which is shared across sibling workers; without this, a
+/// worker echoing such a path as a tool argument would touch the parent
+/// checkout instead of its own worktree. Outgoing direction only -- this
+/// does not affect what gets recorded back into the message history.
+///
+/// Choke point: `execute_tool` is the single place both tool-execution call
+/// sites (the sequential step path and the parallel-safe batch path) funnel
+/// through, so operating here covers every built-in and MCP tool call
+/// without threading a remap parameter through the whole `run()` call graph.
+/// The swap is done on the serialized argument JSON as a single string, per
+/// the exact-prefix-swap contract, rather than per known path-bearing
+/// field -- most tool schemas have more than one such field (e.g. shell
+/// `command`, `read_file`/`write_file` paths) and the registry alone cannot
+/// enumerate them per tool.
+fn asgard_remap_args(registry: &ToolRegistry, args: Value) -> Value {
+    let Some(canonical_root) = registry.canonical_root() else {
+        return args;
+    };
+    let physical_root = registry.cwd();
+    if canonical_root == physical_root {
+        return args;
+    }
+    let Ok(serialized) = serde_json::to_string(&args) else {
+        return args;
+    };
+    let remapped = crate::text::remap_root_prefix(&serialized, canonical_root, physical_root);
+    if remapped == serialized {
+        return args;
+    }
+    serde_json::from_str(&remapped).unwrap_or(args)
+}
+
+/// For an Asgard trajectory-window registry, relativize this worker's own
+/// tool-result text against its physical worktree root (see
+/// `crate::text::relativize_root_prefix`), so identical actions taken by
+/// sibling workers produce byte-identical tool-result text even though each
+/// worker's physical root differs. Applied at the same choke point as
+/// `asgard_remap_args`, after truncation/hint-appending so the relativized
+/// text is never longer than what was already capped.
+fn asgard_relativize_output(registry: &ToolRegistry, output: &mut String) {
+    let Some(_canonical_root) = registry.canonical_root() else {
+        return;
+    };
+    let relativized = crate::text::relativize_root_prefix(output, registry.cwd());
+    if relativized != *output {
+        *output = relativized;
+    }
+}
+
 async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> ToolExecution {
     // Extract the (truncated) shell command before `args` is moved into
     // execution; cloning the whole args value would deep-copy large
     // payloads (e.g. write_file content) on every tool call.
     let shell_command = shell_command_snippet(request.tool_name, &request.args);
+    let args = asgard_remap_args(registry, request.args);
     let start = Instant::now();
     let result = registry
         .execute_with_sandbox_mode_cancellable(
             request.tool_name,
-            request.args,
+            args,
             request.policy,
             request.outside_sandbox_once,
             request.sandbox_mode,
@@ -5188,12 +5242,14 @@ async fn execute_tool(registry: &ToolRegistry, request: ToolExecRequest<'_>) -> 
         duration,
         success,
     ));
-    tool_result_to_execution(
+    let mut execution = tool_result_to_execution(
         request.tool_name,
         request.shell_sandboxed,
         request.outside_sandbox_once,
         result,
-    )
+    );
+    asgard_relativize_output(registry, &mut execution.output);
+    execution
 }
 
 /// First 120 chars of the `command` argument for `run_shell_command`
@@ -6092,6 +6148,87 @@ mod tests {
         assert_eq!(parallel_batch_len(&registry, &calls, &ordered), 2);
         assert_eq!(parallel_batch_len(&registry, &calls, &ordered[2..]), 0);
         assert_eq!(parallel_batch_len(&registry, &calls, &ordered[3..]), 1);
+    }
+
+    #[tokio::test]
+    async fn asgard_remap_args_redirects_canonical_prefix_to_worker_root() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        let canonical_root = Path::new("/parent/repo");
+        registry.set_canonical_root(canonical_root.to_path_buf());
+        let worker_root = registry.cwd().to_path_buf();
+        let args = serde_json::json!({
+            "file_path": "/parent/repo/src/lib.rs",
+            "command": "cd /parent/repo && cargo test",
+        });
+
+        let remapped = asgard_remap_args(&registry, args);
+
+        let expected_path = format!("{}/src/lib.rs", worker_root.display());
+        let expected_command = format!("cd {} && cargo test", worker_root.display());
+        assert_eq!(remapped["file_path"], expected_path);
+        assert_eq!(remapped["command"], expected_command);
+    }
+
+    #[tokio::test]
+    async fn asgard_remap_args_leaves_unrelated_args_untouched() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        registry.set_canonical_root(Path::new("/parent/repo").to_path_buf());
+        let args = serde_json::json!({
+            "file_path": "/tmp/scratch/notes.txt",
+            "limit": 10,
+        });
+
+        let remapped = asgard_remap_args(&registry, args.clone());
+
+        assert_eq!(remapped, args);
+    }
+
+    #[tokio::test]
+    async fn asgard_remap_args_is_noop_without_canonical_root() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        // `set_canonical_root` never called: an ordinary (non-Asgard)
+        // session registry must never remap tool arguments.
+        let args = serde_json::json!({ "file_path": "/parent/repo/src/lib.rs" });
+
+        let remapped = asgard_remap_args(&registry, args.clone());
+
+        assert_eq!(remapped, args);
+    }
+
+    #[tokio::test]
+    async fn asgard_relativize_output_strips_trailing_slash_but_preserves_bare_root() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        registry.set_canonical_root(Path::new("/parent/repo").to_path_buf());
+        let root = registry.cwd().display().to_string();
+        let mut output = format!(
+            "wrote {root}/src/lib.rs and {root}/Cargo.toml\n\
+             also read /tmp/unrelated/scratch.txt\n\
+             worktree at {root}"
+        );
+
+        asgard_relativize_output(&registry, &mut output);
+
+        assert_eq!(
+            output,
+            "wrote src/lib.rs and Cargo.toml\n\
+             also read /tmp/unrelated/scratch.txt\n\
+             worktree at {root}"
+                .replace("{root}", &root)
+        );
+    }
+
+    #[tokio::test]
+    async fn asgard_relativize_output_is_noop_without_canonical_root() {
+        let (_cwd, registry) = empty_registry_for_test().await;
+        // Not an Asgard trajectory registry: an ordinary session's tool
+        // results must never be relativized.
+        let root = registry.cwd().display().to_string();
+        let original = format!("wrote {root}/src/lib.rs");
+        let mut output = original.clone();
+
+        asgard_relativize_output(&registry, &mut output);
+
+        assert_eq!(output, original);
     }
 
     #[tokio::test]

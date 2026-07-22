@@ -300,10 +300,20 @@ async fn launch_worker<'a>(
         crate::asgard::remove_candidate_repository(&repository);
         return Err(anyhow!("unknown Asgard parent session"));
     };
+    // Inherited chain content is never rewritten per-worker (that is the
+    // whole point: identical instructions across sibling workers keep the
+    // prompt-cache prefix hit). Instead the canonical root is recorded on the
+    // registry so `tool_loop::execute_tool` can, at the tool-execution
+    // boundary, redirect any tool argument that echoes the canonical
+    // (parent-repo) path to this worker's own physical worktree, and
+    // relativize this worker's own tool-result text against its physical
+    // root. See `ToolRegistry::set_canonical_root`.
+    registry.set_canonical_root(launch.parent_cwd.to_path_buf());
     let tool_allowlist = Arc::new(worker_tool_allowlist(&registry).await);
 
     let instructions = spawn.instructions.clone();
     let max_steps = spawn.max_steps.unwrap_or(ASGARD_WORKER_MAX_STEPS);
+    let parent_cwd_display = launch.parent_cwd.display();
     let instruction_message = ChatMessage::user(format!(
         "<supervisor_instructions>\n{instructions}\n</supervisor_instructions>\n\
          You are a worker agent directed by a supervisor. You have up to \
@@ -311,17 +321,14 @@ async fn launch_worker<'a>(
          you are paused for review; the supervisor may resume you or branch another \
          worker from your state. When you stop making tool calls, your turn ends and \
          your final message is delivered to the supervisor - make it a precise report \
-         of what you did, what you verified, and what remains. You work in a git \
-         worktree of a repository shared with other workers; asgard/* refs and \
-         sibling commits are harness state - do not modify, rebase, or build on them. \
-         Your own commits are fine; the harness snapshots your worktree regardless."
+         of what you did, what you verified, and what remains. You are working in a git \
+         worktree of {parent_cwd_display}, shared with other workers; use \
+         repository-relative paths in commands and edits - absolute paths are never \
+         required inside the repository. asgard/* refs and sibling commits are harness \
+         state - do not modify, rebase, or build on them. Your own commits are fine; \
+         the harness snapshots your worktree regardless."
     ));
     messages.push(instruction_message.clone());
-    crate::asgard::rewrite_asgard_cwd(
-        messages.as_mut_slice(),
-        launch.parent_cwd,
-        &repository.session_cwd,
-    );
     let window_start = messages.len();
     let model = spawn
         .model
@@ -332,7 +339,6 @@ async fn launch_worker<'a>(
     let sessions = launch.sessions.clone();
     let original_task = launch.original_task.to_string();
     let live_output = launch.live_output.clone();
-    let parent_cwd = launch.parent_cwd.to_path_buf();
     let reasoning_effort = launch.reasoning_effort;
     let service_tier = launch.service_tier;
     let structured_output = launch.structured_output;
@@ -382,13 +388,12 @@ async fn launch_worker<'a>(
         )
         .await;
         let elapsed_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let mut window_messages =
+        // Captured as-is: the window is already canonical by construction --
+        // messages were never rewritten into the worker's worktree path in
+        // the first place (see `set_canonical_root` above), so there is
+        // nothing to rewrite back on the way out.
+        let window_messages =
             asgard_take_window_messages(&outcome.continuation_messages, window_start);
-        crate::asgard::rewrite_asgard_cwd(
-            window_messages.as_mut_slice(),
-            &repository.session_cwd,
-            &parent_cwd,
-        );
         let stop = worker_stop_reason(&outcome.stop);
         let steps = count_worker_steps(&window_messages);
         let final_response = extract_worker_final_response(&window_messages);
@@ -2252,45 +2257,6 @@ fn first_two_component_group(path: &str) -> String {
         return first.to_string();
     };
     format!("{first}/{second}")
-}
-
-pub(crate) fn rewrite_asgard_cwd(messages: &mut [ChatMessage], from: &Path, to: &Path) {
-    // `PathBuf::join("")` preserves a trailing separator. That is how an
-    // Asgard session rooted at the repository itself is represented, while
-    // tool results and model-authored commands normally omit the separator.
-    // Rewrite the path stem so both spellings are canonicalized.
-    let from_display = from.display().to_string();
-    let from_trimmed = from_display.trim_end_matches(['/', '\\']);
-    let from = if from_trimmed.is_empty() {
-        from_display.as_str()
-    } else {
-        from_trimmed
-    };
-    let to_display = to.display().to_string();
-    let to_trimmed = to_display.trim_end_matches(['/', '\\']);
-    let to = if to_trimmed.is_empty() {
-        to_display.as_str()
-    } else {
-        to_trimmed
-    };
-    if from.is_empty() || from == to {
-        return;
-    }
-    for message in messages {
-        for part in &mut message.content {
-            if let crate::llm_client::ChatContentPart::Text { text } = part {
-                *text = text.replace(from, to);
-            }
-        }
-        if let Some(reasoning) = &mut message.reasoning_content {
-            *reasoning = reasoning.replace(from, to);
-        }
-        if let Some(calls) = &mut message.tool_calls {
-            for call in calls {
-                call.function.arguments = call.function.arguments.replace(from, to);
-            }
-        }
-    }
 }
 
 pub(crate) fn cleanup_asgard_repositories(repositories: &[CandidateRepository]) {
@@ -4267,9 +4233,20 @@ mod tests {
         let w2_first_text = all_message_text(&worker_requests[2].messages);
         assert!(w2_first_text.contains("Create foo.txt containing alpha"));
         assert!(w2_first_text.contains("foo.txt"));
+        // Message content is never rewritten per worker (see
+        // `launch_worker`): the canonical parent repo root is named
+        // directly in the worker's own instruction message, identical
+        // across sibling workers so the shared prefix keeps hitting the
+        // prompt cache. Only this worker's own per-worker physical
+        // worktree path -- never spelled out in message content -- stays
+        // out of it.
         assert!(
-            !w2_first_text.contains(&repo.display().to_string()),
-            "parent repo path leaked into w2 request:\n{w2_first_text}"
+            w2_first_text.contains(&repo.display().to_string()),
+            "the canonical parent repo root should be named in the worker's own instructions:\n{w2_first_text}"
+        );
+        assert!(
+            !w2_first_text.contains("anvil-asgard-worktrees"),
+            "the worker's own physical worktree path leaked into its context:\n{w2_first_text}"
         );
 
         let review_w3_text = all_message_text(&supervisor_requests[6].messages);
@@ -5163,46 +5140,80 @@ mod tests {
         assert!(asgard_take_window_messages(&[ChatMessage::user("x")], 9).is_empty());
     }
 
-    #[test]
-    fn rewrite_asgard_cwd_rewrites_text_reasoning_and_tool_arguments() {
-        let from = Path::new("/parent/repo");
-        let to = Path::new("/tmp/asgard/repo");
-        let mut assistant = ChatMessage::assistant("read /parent/repo/src/lib.rs");
-        assistant.reasoning_content = Some("thinking in /parent/repo".to_string());
-        let mut messages = vec![
-            ChatMessage::user("work in /parent/repo"),
-            assistant,
-            ChatMessage::assistant_tool_calls(vec![ToolCall {
-                id: "call-1".to_string(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: "run_shell_command".to_string(),
-                    arguments: r#"{"command":"cd /parent/repo && cargo test"}"#.to_string(),
-                },
-            }]),
-        ];
+    #[tokio::test]
+    async fn asgard_worker_window_relativizes_physical_root_not_canonical() {
+        // A worker's tool result that echoes its own physical worktree root
+        // (via a real `pwd`) must come back with that root stripped -- both
+        // in the worker's own continued context and in the DAG-captured
+        // window a supervisor `view_tool_call` resolves against. The window
+        // must never carry the worker's random per-worker worktree path
+        // (`anvil-asgard-worktrees/asgard-<uuid>`), only the relativized
+        // form, which is byte-identical no matter which sibling worktree
+        // produced it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
 
-        rewrite_asgard_cwd(&mut messages, from, to);
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "produce output")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![view_call("sv-view-w1", &["w1m1"])]),
+                    tool_response(vec![discard_worker_call("sv-discard-w1", "w1")]),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                    text_response("done"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    tool_response(vec![named_tool_call(
+                        "w1-marker",
+                        "run_shell_command",
+                        serde_json::json!({ "command": "echo REL_MARKER $(pwd)/note.txt" }),
+                    )]),
+                    text_response("w1 report"),
+                ],
+            ),
+        ]));
 
-        let rendered = serde_json::to_string(&messages).unwrap();
-        assert!(rendered.contains("/tmp/asgard/repo"));
-        assert!(!rendered.contains("/parent/repo"));
-    }
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise relativization")],
+        )
+        .await;
 
-    #[test]
-    fn rewrite_asgard_cwd_canonicalizes_trailing_separator_spellings() {
-        // A session rooted at the repository toplevel carries a trailing
-        // separator in its cwd; tool results and model-authored commands
-        // spell the same path without it. Both must rewrite.
-        let mut messages = vec![ChatMessage::user("ls /parent/repo/src")];
-        rewrite_asgard_cwd(
-            &mut messages,
-            Path::new("/parent/repo/"),
-            Path::new("/tmp/asgard/repo/"),
+        let requests = backend.requests.lock().expect("requests");
+        let all_text = requests
+            .iter()
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("REL_MARKER note.txt"),
+            "expected the worker's own physical root stripped down to a \
+             relative reference in captured text:\n{all_text}"
         );
-        let rendered = serde_json::to_string(&messages).unwrap();
-        assert!(rendered.contains("/tmp/asgard/repo/src"));
-        assert!(!rendered.contains("/parent/repo"));
+        assert!(
+            !all_text.contains("anvil-asgard-worktrees"),
+            "the worker's per-worker physical worktree root leaked into \
+             captured messages instead of being relativized:\n{all_text}"
+        );
     }
 
     #[test]

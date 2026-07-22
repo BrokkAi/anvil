@@ -697,6 +697,13 @@ pub(crate) fn run_supervisor_git(root: &Path, args: &[String]) -> Result<Supervi
         text.push_str(&format!("\nexit code: {exit_code}"));
     }
 
+    // Same one-way normalization as an Asgard worker's tool results (see
+    // `tool_loop::asgard_relativize_output`): strip `<root>/` occurrences so
+    // file references are repository-relative, while a bare `root` line
+    // (e.g. from `git rev-parse --show-toplevel`) still shows physical
+    // reality.
+    let text = crate::text::relativize_root_prefix(&text, root);
+
     Ok(SupervisorGitOutcome {
         text,
         exit_code,
@@ -1121,6 +1128,51 @@ mod tests {
         remove_candidate_repository(&worker);
         remove_candidate_repository(&fresh);
         stage.cleanup();
+    }
+
+    #[test]
+    fn run_supervisor_git_relativizes_its_own_scratch_root_but_preserves_bare_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "base.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let worktree = create_candidate_repository(repo, "sv-git-relativize").unwrap();
+
+        // git's own error message names the absolute path we pass verbatim,
+        // preceded by a quote rather than a path character -- a clean
+        // trailing-slash occurrence of the scratch root.
+        let absolute_arg = format!("HEAD:{}/base.txt", worktree.root.display());
+        let missing = run_supervisor_git(&worktree.root, &["show".to_string(), absolute_arg])
+            .expect("run_supervisor_git");
+        assert_ne!(missing.exit_code, 0);
+        assert!(
+            missing.text.contains("'base.txt'"),
+            "expected the scratch root stripped down to a relative reference:\n{}",
+            missing.text
+        );
+        assert!(
+            !missing.text.contains(&worktree.root.display().to_string()),
+            "the supervisor's own scratch worktree root leaked into git tool output:\n{}",
+            missing.text
+        );
+
+        // A bare-root spelling (no trailing separator), as `git
+        // rev-parse --show-toplevel` prints, is left untouched.
+        let toplevel = run_supervisor_git(
+            &worktree.root,
+            &["rev-parse".to_string(), "--show-toplevel".to_string()],
+        )
+        .expect("run_supervisor_git");
+        assert_eq!(toplevel.exit_code, 0);
+        assert_eq!(
+            Path::new(toplevel.text.trim()),
+            worktree.root.canonicalize().unwrap()
+        );
+
+        remove_candidate_repository(&worktree);
     }
 
     #[test]

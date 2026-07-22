@@ -718,6 +718,18 @@ pub struct ToolRegistry {
     /// time. Ordered; executed by `tool_loop::execute_tool` around each
     /// tool call.
     plugin_hooks: Vec<crate::plugins::HookCommand>,
+    /// Set only for an Asgard worker (or intake reader) trajectory registry:
+    /// the canonical parent-repo root that the worker's inherited message
+    /// chain refers to, which is identical across sibling workers and
+    /// generally differs from `cwd` (this worker's own physical worktree
+    /// root). `tool_loop::execute_tool` uses it at the tool-execution
+    /// boundary to (a) redirect a tool argument that echoes the canonical
+    /// root to this worker's physical root instead, so a worker cannot
+    /// accidentally touch the parent checkout, and (b) relativize this
+    /// worker's own tool-result text against its physical root. Set once via
+    /// `set_canonical_root`, immediately after the registry is created and
+    /// before any tool call runs; never mutated after that.
+    canonical_root: std::sync::OnceLock<PathBuf>,
 }
 
 fn render_mcp_instructions(mut entries: Vec<(String, String)>) -> Option<String> {
@@ -746,6 +758,22 @@ impl ToolRegistry {
 
     pub(crate) fn additional_roots(&self) -> &[PathBuf] {
         &self.additional_roots
+    }
+
+    /// Record the canonical parent-repo root for an Asgard worker (or
+    /// intake reader) trajectory registry -- see the field doc on
+    /// `canonical_root`. A no-op past the first call (the registry is
+    /// freshly created per launch and this is only ever called once,
+    /// immediately after creation).
+    pub(crate) fn set_canonical_root(&self, root: PathBuf) {
+        let _ = self.canonical_root.set(root);
+    }
+
+    /// The canonical parent-repo root recorded by `set_canonical_root`, if
+    /// this registry belongs to an Asgard trajectory-window run. `None` for
+    /// every ordinary session registry.
+    pub(crate) fn canonical_root(&self) -> Option<&Path> {
+        self.canonical_root.get().map(PathBuf::as_path)
     }
 
     /// Replace the cached SkillRegistry. Called by `update_cwd` so the
@@ -872,6 +900,7 @@ impl ToolRegistry {
             skills: RwLock::new(skills),
             agents: RwLock::new(agents),
             plugin_hooks,
+            canonical_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -2034,6 +2063,7 @@ mod tests {
             skills: RwLock::new(Arc::new(reg)),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
+            canonical_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -2057,6 +2087,7 @@ mod tests {
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(reg)),
             plugin_hooks: Vec::new(),
+            canonical_root: std::sync::OnceLock::new(),
         }
     }
 
@@ -2248,6 +2279,7 @@ mod tests {
             skills: RwLock::new(Arc::new(SkillRegistry::default())),
             agents: RwLock::new(Arc::new(AgentRegistry::default())),
             plugin_hooks: Vec::new(),
+            canonical_root: std::sync::OnceLock::new(),
         };
         let advertised: Vec<String> = registry
             .tool_definitions()
