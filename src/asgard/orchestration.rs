@@ -105,6 +105,14 @@ impl AsgardStreamSinks {
 
 pub(crate) const ASGARD_MIN_CANDIDATES: usize = 1;
 pub(crate) const ASGARD_MAX_CANDIDATES: usize = 5;
+/// Consecutive width-1 regular `spawn_workers` turns tolerated before the
+/// justify-or-branch gate starts challenging further unjustified width-1
+/// spawns (offline probe: 67-76% branch compliance once challenged).
+const ASGARD_WIDTH1_STREAK_CHALLENGE_THRESHOLD: usize = 3;
+/// Cap on how many times the gate challenges a single run, so an ignored
+/// nudge cannot loop forever.
+const ASGARD_BRANCH_CHALLENGES_MAX_PER_RUN: usize = 2;
+const ASGARD_BRANCH_CHALLENGE_MESSAGE: &str = "error: this lineage has continued width-1 through repeated reviews. Either spawn >=2 workers pursuing genuinely different continuations in this batch, or resubmit with single_because: '<one sentence naming why exactly one continuation is live>'.";
 
 struct FinishedWorker {
     worker: usize,
@@ -186,6 +194,14 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     prefinalize_issued: &'ctx mut bool,
     prefinalize_workers: &'ctx mut Vec<usize>,
     latest_prefinalize_source_commits: &'ctx mut HashSet<String>,
+    /// Count of consecutive regular `spawn_workers` calls (across turns) that
+    /// spawned exactly one worker. Reset to 0 by any width>=2 spawn; a
+    /// justified width-1 spawn (non-empty `single_because`) still increments
+    /// it - the lineage is still continuing width-1, just accountably so.
+    width1_streak: &'ctx mut usize,
+    /// Count of branch challenges already issued this run - capped so the
+    /// nudge cannot loop forever if the supervisor keeps ignoring it.
+    branch_challenges_issued: &'ctx mut usize,
     idle_timeout: IdleTimeouts,
     cancel: tokio_util::sync::CancellationToken,
     sinks: AsgardStreamSinks,
@@ -531,6 +547,8 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
     let mut latest_prefinalize_source_commits = HashSet::new();
+    let mut width1_streak = 0usize;
+    let mut branch_challenges_issued = 0usize;
     let run_started = Instant::now();
 
     let exit = loop {
@@ -628,6 +646,8 @@ pub(crate) async fn run_asgard_trajectory_loop(
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
             latest_prefinalize_source_commits: &mut latest_prefinalize_source_commits,
+            width1_streak: &mut width1_streak,
+            branch_challenges_issued: &mut branch_challenges_issued,
             idle_timeout,
             cancel: cancel.clone(),
             sinks,
@@ -1398,6 +1418,28 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             spawns.len()
         ));
     }
+    let width = spawns.len();
+    if matches!(kind, SpawnKind::Regular) {
+        let justified = width == 1
+            && spawns[0]
+                .single_because
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty());
+        if width == 1
+            && *cx.width1_streak >= ASGARD_WIDTH1_STREAK_CHALLENGE_THRESHOLD
+            && !justified
+            && *cx.branch_challenges_issued < ASGARD_BRANCH_CHALLENGES_MAX_PER_RUN
+        {
+            *cx.branch_challenges_issued += 1;
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_branch_challenge",
+                "turn": cx.supervisor_turn,
+                "streak": *cx.width1_streak,
+                "outcome": "issued",
+            }));
+            return Ok(ASGARD_BRANCH_CHALLENGE_MESSAGE.to_string());
+        }
+    }
     let mut lines = Vec::new();
     let mut pending_sources = spawns
         .iter()
@@ -1464,6 +1506,13 @@ async fn execute_spawn_requests<'ctx, 'fut>(
     ));
     if !state.spawned.is_empty() {
         state.turn_ended = true;
+    }
+    if matches!(kind, SpawnKind::Regular) {
+        if width >= 2 {
+            *cx.width1_streak = 0;
+        } else {
+            *cx.width1_streak += 1;
+        }
     }
     Ok(lines.join("\n"))
 }
@@ -4357,6 +4406,149 @@ mod tests {
             .find(|entry| entry["checkpoint"] == "w2")
             .expect("w2 off-lineage entry");
         assert!(w2_entry["diffstat"].as_str().unwrap().contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn justify_or_branch_gate_challenges_a_fourth_consecutive_width_one_spawn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    // Turn 1: width-1 spawn from root. streak 0 -> 1.
+                    tool_response(vec![spawn_call("sv-w1", "root", "probe the failure")]),
+                    // Turn 2: width-1 spawn continuing from w1. streak 1 -> 2.
+                    tool_response(vec![spawn_call("sv-w2", "w1", "continue the same fix")]),
+                    // Turn 3: width-1 spawn continuing from w2. streak 2 -> 3.
+                    tool_response(vec![spawn_call(
+                        "sv-w3",
+                        "w2",
+                        "continue the same fix again",
+                    )]),
+                    // Turn 4: a naive 4th consecutive width-1 spawn is
+                    // challenged (streak >= 3, no single_because). The
+                    // supervisor's very next tool call in the same batch
+                    // resubmits with single_because and succeeds.
+                    tool_response(vec![
+                        named_tool_call(
+                            "sv-w4-naive",
+                            "spawn_workers",
+                            serde_json::json!({
+                                "workers": [{
+                                    "from": "w3",
+                                    "instructions": "continue the same fix a fourth time",
+                                }]
+                            }),
+                        ),
+                        named_tool_call(
+                            "sv-w4-justified",
+                            "spawn_workers",
+                            serde_json::json!({
+                                "workers": [{
+                                    "from": "w3",
+                                    "instructions": "continue the same fix, justified",
+                                    "single_because": "Only one plausible fix location remains after ruling out the other hypothesis.",
+                                }]
+                            }),
+                        ),
+                    ]),
+                    // Turn 5: width-2 batch from w4. Passes, and resets the streak.
+                    tool_response(vec![spawn_workers_call(
+                        "sv-w5w6",
+                        serde_json::json!([
+                            { "from": "w4", "instructions": "branch hypothesis A" },
+                            { "from": "w4", "instructions": "branch hypothesis B" },
+                        ]),
+                    )]),
+                    // Turn 6: discard w6, and spawn width-1 from w5 with no
+                    // single_because. Since the previous width-2 batch reset
+                    // the streak, this is NOT challenged.
+                    tool_response(vec![
+                        discard_worker_call("sv-discard-w6", "w6"),
+                        spawn_call("sv-w7", "w5", "continue hypothesis A"),
+                    ]),
+                    // Turn 7: resolve w7 and end the turn.
+                    tool_response(vec![discard_worker_call("sv-discard-w7", "w7")]),
+                    text_response("turn 7 wrap up"),
+                    // Idle out to trigger the fallback finalize.
+                    text_response("idle 1"),
+                    text_response("idle 2"),
+                    text_response("idle 3"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    text_response("w1 report"),
+                    text_response("w2 report"),
+                    text_response("w3 report"),
+                    text_response("w4 report"),
+                    text_response("branch report"),
+                    text_response("branch report"),
+                    text_response("w7 report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise the justify-or-branch gate")],
+        )
+        .await;
+
+        let requests = backend.requests.lock().expect("requests");
+        let supervisor_text = requests
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(requests);
+
+        assert!(supervisor_text.contains(
+            "error: this lineage has continued width-1 through repeated reviews. Either spawn \
+             >=2 workers pursuing genuinely different continuations in this batch, or resubmit \
+             with single_because: '<one sentence naming why exactly one continuation is live>'."
+        ));
+        // The justified resubmission in the same batch still spawns w4.
+        assert!(supervisor_text.contains("spawned w4 from w3"));
+        // The width-2 batch spawns both siblings.
+        assert!(supervisor_text.contains("spawned w5 from w4"));
+        assert!(supervisor_text.contains("spawned w6 from w4"));
+        // After the width-2 reset, a plain width-1 continuation is not
+        // re-challenged.
+        assert!(supervisor_text.contains("spawned w7 from w5"));
+
+        let trace_records = fs::read_to_string(&trace_path).expect("trace");
+        let challenges = trace_records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["type"] == "asgard_branch_challenge")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            challenges.len(),
+            1,
+            "expected exactly one challenge to be issued, got {challenges:?}"
+        );
+        assert_eq!(challenges[0]["turn"], serde_json::json!(4));
+        assert_eq!(challenges[0]["streak"], serde_json::json!(3));
+        assert_eq!(challenges[0]["outcome"], serde_json::json!("issued"));
     }
 
     #[tokio::test]

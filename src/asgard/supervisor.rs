@@ -11,6 +11,7 @@ pub(crate) const ASGARD_WORKER_MAX_STEPS: usize = 10;
 pub(crate) const ASGARD_WORKER_MAX_STEPS_CEILING: usize = 150;
 pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
+pub(crate) const ASGARD_SINGLE_BECAUSE_MAX_LENGTH: usize = 300;
 
 /// Cap on a single retained payload (view_tool_call or git tool result) kept
 /// verbatim in the permanent record. Bigger payloads keep their first
@@ -32,6 +33,10 @@ pub(crate) struct SpawnRequest {
     pub(crate) instructions: String,
     pub(crate) model: Option<String>,
     pub(crate) max_steps: Option<usize>,
+    /// When continuing width-1 after repeated width-1 turns: one sentence
+    /// naming why exactly one continuation is live. See
+    /// `ASGARD_SINGLE_BECAUSE_MAX_LENGTH` for the schema-enforced cap.
+    pub(crate) single_because: Option<String>,
 }
 
 pub(crate) struct FinalizeRequest {
@@ -65,6 +70,7 @@ pub(crate) fn supervisor_supplement() -> String {
 
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
 - spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you.
+Example - branching review: worker w4 reports "parser change in; 3 edge tests failing; cause unclear - either tokenizer state reset or the quoting rule". Correct resolution: spawn two workers from w4 concurrently - one per hypothesis - and discard the loser. Counter-example - serial is right: worker w9 reports "rename applied; one import path stale, fix is mechanical". Correct resolution: one worker from w9; branching adds nothing when only one continuation is live.
 - prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
 - git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
@@ -73,7 +79,7 @@ You are the supervisor of a team of barrier-batch workers solving the task. Ever
 - update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
 - finalize: ends the run. The named checkpoint's repository state is delivered as the result, and that worker's final message (or the response you provide) becomes the final answer.
 
-Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions.
+Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions. When a review leaves two plausible continuations - two fix strategies, two readings, fix-forward versus a fresh start from an earlier checkpoint - spawn both concurrently instead of trying them one at a time; serial retries of guesses are the most expensive habit here.
 
 First duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them, resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Calling conventions and argument order are always ambiguities: resolve them against an analogous implementation already in the repo, never by assumption. For each numbered ambiguity (A1, A2, ...) in the intake, state your resolution and a one-line rationale in your plan before spawning implementation workers. Then have two workers in that same batch write spec tests from the settled reading independently - before implementation exists - including one test per resolution that locks in your chosen reading. Where the two suites disagree about the same behavior, you have found an ambiguity nobody flagged: resolve it explicitly before implementing. Implementation workers run the union of both suites, and your finalize evidence should show it passing. If the intake is missing, have your first worker pin the specification from the task text instead.
 
@@ -119,6 +125,11 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                                     "model": {
                                         "type": "string",
                                         "enum": allowed_models,
+                                    },
+                                    "single_because": {
+                                        "type": "string",
+                                        "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
+                                        "description": "When continuing width-1 after repeated width-1 turns: one sentence naming why exactly one continuation is live.",
                                     },
                                 },
                             },
@@ -258,6 +269,11 @@ fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
                             "maximum": ASGARD_WORKER_MAX_STEPS_CEILING,
                             "description": "Step budget for this worker (default 10). Give a worker pursuing a complete solution a large budget; keep quick probes small.",
                         },
+                        "single_because": {
+                            "type": "string",
+                            "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
+                            "description": "When continuing width-1 after repeated width-1 turns: one sentence naming why exactly one continuation is live.",
+                        },
                     },
                 },
             },
@@ -394,11 +410,28 @@ fn parse_spawn_worker(
             Some(steps as usize)
         }
     };
+    let single_because = match worker.get("single_because") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| format!("workers[{index}].single_because must be a string"))?
+                .trim()
+                .to_string();
+            if text.len() > ASGARD_SINGLE_BECAUSE_MAX_LENGTH {
+                return Err(format!(
+                    "workers[{index}].single_because must be at most {ASGARD_SINGLE_BECAUSE_MAX_LENGTH} characters"
+                ));
+            }
+            if text.is_empty() { None } else { Some(text) }
+        }
+    };
     Ok(SpawnRequest {
         from,
         instructions,
         model,
         max_steps,
+        single_because,
     })
 }
 
@@ -656,6 +689,70 @@ mod tests {
 
         assert_eq!(spawns.len(), 3);
         assert_eq!(spawns[2].from, CheckpointId::Worker(4));
+    }
+
+    #[test]
+    fn spawn_parser_accepts_and_round_trips_single_because() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            allowed_models: &[],
+        };
+
+        let with_reason = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [
+                    {
+                        "from": "root",
+                        "instructions": "continue the fix",
+                        "single_because": "Only one plausible fix location remains after ruling out the other hypothesis.",
+                    }
+                ]
+            }),
+        );
+        let spawns = parse_spawn_workers(&with_reason, &context).expect("valid spawn");
+        assert_eq!(
+            spawns[0].single_because.as_deref(),
+            Some("Only one plausible fix location remains after ruling out the other hypothesis.")
+        );
+
+        // Absent and blank single_because both parse to None.
+        let without_reason = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+        );
+        let spawns = parse_spawn_workers(&without_reason, &context).expect("valid spawn");
+        assert_eq!(spawns[0].single_because, None);
+
+        let blank_reason = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x", "single_because": "   " }] }),
+        );
+        let spawns = parse_spawn_workers(&blank_reason, &context).expect("valid spawn");
+        assert_eq!(spawns[0].single_because, None);
+
+        // Over the schema's maxLength is rejected.
+        let too_long = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{
+                    "from": "root",
+                    "instructions": "x",
+                    "single_because": "x".repeat(ASGARD_SINGLE_BECAUSE_MAX_LENGTH + 1),
+                }]
+            }),
+        );
+        assert!(
+            parse_spawn_workers(&too_long, &context)
+                .expect_err("too long single_because")
+                .contains("must be at most")
+        );
     }
 
     #[test]
@@ -1013,6 +1110,29 @@ mod tests {
             supplement.contains("Calling conventions and argument order are always ambiguities")
         );
         assert!(supplement.contains("A plant is only evidence after re-checking"));
+    }
+
+    #[test]
+    fn supervisor_supplement_teaches_branching_via_few_shot_and_reviews_law() {
+        let supplement = supervisor_supplement();
+
+        assert!(supplement.contains(
+            "Example - branching review: worker w4 reports \"parser change in; 3 edge tests \
+             failing; cause unclear - either tokenizer state reset or the quoting rule\". \
+             Correct resolution: spawn two workers from w4 concurrently - one per hypothesis \
+             - and discard the loser."
+        ));
+        assert!(supplement.contains(
+            "Counter-example - serial is right: worker w9 reports \"rename applied; one import \
+             path stale, fix is mechanical\". Correct resolution: one worker from w9; branching \
+             adds nothing when only one continuation is live."
+        ));
+        assert!(supplement.contains(
+            "When a review leaves two plausible continuations - two fix strategies, two \
+             readings, fix-forward versus a fresh start from an earlier checkpoint - spawn \
+             both concurrently instead of trying them one at a time; serial retries of \
+             guesses are the most expensive habit here."
+        ));
     }
 
     #[test]
