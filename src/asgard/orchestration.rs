@@ -17,12 +17,18 @@ use crate::asgard::{
     CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL,
     PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
     SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
-    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, git_refusal, parse_finalize,
-    parse_git_args, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
+    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions, git_refusal,
+    parse_finalize, parse_git_args, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
     render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
     retain_payloads_for_permanent_record, run_asgard_intake, run_supervisor_git, short_sha,
     stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
 };
+use crate::mcp::{McpClient, McpServerConfig};
+
+/// Cap on a single Bifrost code-intelligence result returned to the supervisor
+/// in a turn (truncated with a marker naming the original size). The permanent
+/// record applies its own, smaller `RETAINED_PAYLOAD_CAP` on top of this.
+const ASGARD_BIFROST_RESULT_CAP: usize = 32 * 1024;
 use crate::llm_client::{
     ChatMessage, IdleTimeouts, LlmResponse, TokenUsage, ToolCall, ToolDefinition,
 };
@@ -183,6 +189,17 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     /// The supervisor's own scratch worktree for the `git` tool, created
     /// lazily on first use and reused for the whole run.
     git_scratch: &'ctx mut Option<CandidateRepository>,
+    /// Read-only Bifrost (`core`) code-intelligence client, rooted at the run's
+    /// parent checkout. `None` when spawning it failed (best-effort - a missing
+    /// client never fails the run). Spawned once at run start.
+    bifrost: Option<&'ctx McpClient>,
+    /// Bifrost tool definitions, computed once at run start and appended to the
+    /// supervisor's native tools every turn in stable client order so the tool
+    /// set is byte-identical across turns (prefix-cache stability).
+    bifrost_tools: &'ctx [ToolDefinition],
+    /// Names of the Bifrost tools, for dispatch routing in
+    /// `execute_supervisor_call`.
+    bifrost_tool_names: &'ctx HashSet<String>,
     usage_by_model: &'ctx mut BTreeMap<String, TokenUsage>,
     aggregate_usage: &'ctx mut TokenUsage,
     worker_counter: &'ctx mut usize,
@@ -542,6 +559,33 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut pending_batch: BTreeMap<usize, FinishedWorker> = BTreeMap::new();
     let mut idle_pool = Vec::new();
     let mut git_scratch: Option<CandidateRepository> = None;
+    // Best-effort read-only Bifrost code-intelligence for the supervisor, rooted
+    // at the run's parent checkout (the base state the supervisor plans against).
+    // A spawn failure NEVER fails the run - the feature degrades to absent.
+    let bifrost_client: Option<McpClient> = match McpClient::spawn(
+        &McpServerConfig::bifrost(),
+        parent_registry.cwd(),
+    )
+    .await
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(
+                "Asgard supervisor code-intelligence unavailable (Bifrost spawn failed): {error}"
+            );
+            None
+        }
+    };
+    // Compute the Bifrost tool definitions ONCE, preserving client tool order, so
+    // the supervisor's tool set is byte-identical on every turn (prefix cache).
+    let bifrost_tools: Vec<ToolDefinition> = bifrost_client
+        .as_ref()
+        .map(bifrost_tool_definitions)
+        .unwrap_or_default();
+    let bifrost_tool_names: HashSet<String> = bifrost_tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
     let mut supervisor_turn = 0usize;
     let mut worker_counter = 1usize;
     let mut clone_counter = 1usize;
@@ -624,6 +668,9 @@ pub(crate) async fn run_asgard_trajectory_loop(
             spawned_batch: Vec::new(),
             idle_pool: &mut idle_pool,
             git_scratch: &mut git_scratch,
+            bifrost: bifrost_client.as_ref(),
+            bifrost_tools: &bifrost_tools,
+            bifrost_tool_names: &bifrost_tool_names,
             usage_by_model: &mut usage_by_model,
             aggregate_usage: &mut aggregate_usage,
             worker_counter: &mut worker_counter,
@@ -842,6 +889,9 @@ pub(crate) async fn run_asgard_trajectory_loop(
     if let Some(git_scratch) = git_scratch.take() {
         crate::asgard::remove_candidate_repository(&git_scratch);
     }
+    // Dropping the client kills the Bifrost subprocess (`kill_on_drop(true)` on
+    // the child); no explicit shutdown needed.
+    drop(bifrost_client);
     let checkpoint_map = checkpoint_commit_map(&dag);
     crate::trace_logging::append_trace_record(serde_json::json!({
         "type": "asgard_checkpoints",
@@ -856,7 +906,11 @@ pub(crate) async fn run_asgard_trajectory_loop(
 async fn run_supervisor_agentic_turn<'ctx, 'fut>(
     mut cx: SupervisorLoopContext<'ctx, 'fut>,
 ) -> Result<SupervisorLoopResult<'fut>> {
-    let tools = supervisor_tool_definitions(cx.allowed_models);
+    // Native tools first, then the Bifrost tools in stable client order. Both
+    // slices are fixed for the run, so the assembled list is identical every
+    // turn (prefix-cache stability).
+    let mut tools = supervisor_tool_definitions(cx.allowed_models);
+    tools.extend_from_slice(cx.bifrost_tools);
     let mut usage = TokenUsage::default();
     let mut tail = std::mem::take(&mut cx.ephemeral);
     let transcript_start = tail.len();
@@ -1306,7 +1360,66 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             };
             Ok(format!("finalizing {checkpoint}; {evidence_text}"))
         }
+        name if cx.bifrost_tool_names.contains(name) => {
+            let Some(client) = cx.bifrost else {
+                return Ok(
+                    "error: code-intelligence tools are unavailable this run".to_string(),
+                );
+            };
+            let args = crate::tool_arguments::normalize_tool_arguments(&call.function.arguments)
+                .map(|normalized| normalized.value)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            // Uses the supervisor's own cancellation token (`cx.cancel`), so a
+            // run-level cancel aborts the call; the client also enforces its
+            // internal MCP_CALL_TIMEOUT, so this never blocks forever.
+            match client
+                .call_tool_cancellable(name, args, Some(&cx.cancel))
+                .await
+            {
+                Ok(value) => {
+                    let mut text = render_mcp_result_text(&value);
+                    text = crate::text::relativize_root_prefix(&text, cx.launch.parent_cwd);
+                    if let Some(scratch) = cx.git_scratch.as_ref() {
+                        text = crate::text::relativize_root_prefix(&text, &scratch.root);
+                    }
+                    let full_bytes = text.len();
+                    if full_bytes > ASGARD_BIFROST_RESULT_CAP {
+                        let prefix = crate::text::truncate_utf8(&text, ASGARD_BIFROST_RESULT_CAP);
+                        text = format!(
+                            "{prefix}\n[truncated first {ASGARD_BIFROST_RESULT_CAP} bytes of {full_bytes}]"
+                        );
+                    }
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_supervisor_bifrost",
+                        "tool": name,
+                        "bytes": full_bytes,
+                        "is_error": false,
+                    }));
+                    Ok(text)
+                }
+                Err(error) => {
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_supervisor_bifrost",
+                        "tool": name,
+                        "bytes": 0,
+                        "is_error": true,
+                    }));
+                    Ok(format!("error: {name}: {error}"))
+                }
+            }
+        }
         other => Ok(format!("error: unknown supervisor tool {other}")),
+    }
+}
+
+/// Render a Bifrost tool result (already unwrapped by the MCP client's
+/// `parse_tool_result`: the `structuredContent` value, the first content
+/// block's text, or the raw envelope) into readable text. A JSON string is
+/// returned as its inner text; anything else is pretty-printed JSON.
+fn render_mcp_result_text(value: &serde_json::Value) -> String {
+    match value.as_str() {
+        Some(text) => text.to_string(),
+        None => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
     }
 }
 

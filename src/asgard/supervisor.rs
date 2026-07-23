@@ -5,6 +5,7 @@ use crate::asgard::{CheckpointId, TrajectoryDag};
 use crate::llm_client::{
     ChatMessage, FunctionDef, LlmBackend, LlmResponse, StreamChatRequest, ToolCall, ToolDefinition,
 };
+use crate::mcp::{McpClient, McpToolDef};
 
 pub(crate) const ASGARD_BATCH_CAP: usize = 8;
 pub(crate) const ASGARD_WORKER_MAX_STEPS: usize = 10;
@@ -74,6 +75,7 @@ Example - branching review: worker w4 reports "parser change in; 3 edge tests fa
 - prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
 - git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
+- code intelligence - search_symbols, get_summaries, get_symbol_sources, usage_graph, scan_usages_by_location, get_definitions_by_location, semantic search, and more: read-only Bifrost tools indexing the repository at its base state. Use them to UNDERSTAND before you direct: find the symbols, files, and call sites your task touches so your worker mandates name exact functions and locations instead of describing them. activate_workspace switches Bifrost to another path (for example your git scratch worktree after you check out a checkpoint's hash) to analyze a specific candidate's code.
 - discard: permanently discard a reviewed trajectory. Pass `worker` to name which one when multiple siblings are under review.
 - view_tool_call: expand compact-trace handles like "w3m5" into complete, untruncated arguments and results. Viewing is free - use it whenever a summarized line matters to your decision. Handles exist only once a trajectory has been presented for review.
 - update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
@@ -81,7 +83,7 @@ Example - branching review: worker w4 reports "parser change in; 3 edge tests fa
 
 Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions. When a review leaves two plausible continuations - two fix strategies, two readings, fix-forward versus a fresh start from an earlier checkpoint - spawn both concurrently instead of trying them one at a time; serial retries of guesses are the most expensive habit here.
 
-First duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them, resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Calling conventions and argument order are always ambiguities: resolve them against an analogous implementation already in the repo, never by assumption. For each numbered ambiguity (A1, A2, ...) in the intake, state your resolution and a one-line rationale in your plan before spawning implementation workers. Then have two workers in that same batch write spec tests from the settled reading independently - before implementation exists - including one test per resolution that locks in your chosen reading. Where the two suites disagree about the same behavior, you have found an ambiguity nobody flagged: resolve it explicitly before implementing. Implementation workers run the union of both suites, and your finalize evidence should show it passing. If the intake is missing, have your first worker pin the specification from the task text instead.
+First duty: the task message contains a spec intake - two independent contracts, one written from the task text alone, one grounded in the repository. Diff them, resolve every divergence and flagged ambiguity deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Before you spawn implementation workers, use the code-intelligence tools to map the code the task touches - a mandate that cites the exact functions, files, and call sites to change produces sharper work than a prose description. Calling conventions and argument order are always ambiguities: resolve them against an analogous implementation already in the repo, never by assumption. For each numbered ambiguity (A1, A2, ...) in the intake, state your resolution and a one-line rationale in your plan before spawning implementation workers. Then have two workers in that same batch write spec tests from the settled reading independently - before implementation exists - including one test per resolution that locks in your chosen reading. Where the two suites disagree about the same behavior, you have found an ambiguity nobody flagged: resolve it explicitly before implementing. Implementation workers run the union of both suites, and your finalize evidence should show it passing. If the intake is missing, have your first worker pin the specification from the task text instead.
 
 Portfolio option: when the intake flags material ambiguities the repository cannot settle, or the approach space is genuinely contested, structure the run as a small portfolio instead of resolving everything up front - spawn two or three workers from root with max_steps 80-120, each mandated to a COMPLETE solution under a different resolution of the contested readings (name each mandate explicitly in its instructions), and let them finish. Then judge the rival candidates with evidence, not preference: run each candidate's tests against the others, diff them against each other with git, adjudicate every divergence against the task text, and merge or select before the verification grind. Complete rival candidates are easier to judge than interleaved fragments.
 
@@ -242,6 +244,28 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
         },
         crate::tools::update_plan_tool_definition(),
     ]
+}
+
+/// Maps a live Bifrost (`core` toolset) MCP client's advertised tools into
+/// supervisor `ToolDefinition`s, preserving the client's tool order verbatim so
+/// the supervisor's tool set stays byte-identical across turns (prefix-cache
+/// stability). Names, descriptions, and input schemas pass through unchanged.
+pub(crate) fn bifrost_tool_definitions(client: &McpClient) -> Vec<ToolDefinition> {
+    mcp_tools_to_definitions(client.tools())
+}
+
+fn mcp_tools_to_definitions(tools: &[McpToolDef]) -> Vec<ToolDefinition> {
+    tools
+        .iter()
+        .map(|tool| ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDef {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
+            },
+        })
+        .collect()
 }
 
 fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
@@ -536,19 +560,25 @@ pub(crate) fn git_refusal(args: &[String]) -> Option<String> {
     })
 }
 
-/// Retains `view_tool_call` and `git` tool payloads in the permanent record
-/// instead of collapsing them to a byte-count stub, capping each at
-/// `RETAINED_PAYLOAD_CAP` bytes (verbatim prefix + a marker naming the
-/// original size). Every other tool result passes through unchanged.
+/// Retains read tool payloads - `view_tool_call`, `git`, and the read-only
+/// Bifrost code-intelligence tools - in the permanent record instead of
+/// collapsing them to a byte-count stub, capping each at `RETAINED_PAYLOAD_CAP`
+/// bytes (verbatim prefix + a marker naming the original size). The predicate is
+/// inverted: a tool result is retained unless it comes from an ACTION tool whose
+/// result is a short status string (spawn/prefinalize/save/discard/finalize/
+/// update_plan). This keeps code-intelligence output - evidence later turns need
+/// to plan against - and automatically covers any future read tool without
+/// re-listing names. Action-tool results are already under the cap, so capping
+/// them is a no-op; they pass through effectively unchanged.
 pub(crate) fn retain_payloads_for_permanent_record(transcript: &[ChatMessage]) -> Vec<ChatMessage> {
     transcript
         .iter()
         .map(|message| {
             if message.role == "tool"
-                && matches!(
-                    message.name.as_deref(),
-                    Some(VIEW_TOOL_CALL_TOOL) | Some(GIT_TOOL)
-                )
+                && message
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !is_supervisor_action_tool(name))
                 && let Some(call_id) = &message.tool_call_id
             {
                 let name = message.name.clone().unwrap_or_default();
@@ -558,6 +588,22 @@ pub(crate) fn retain_payloads_for_permanent_record(transcript: &[ChatMessage]) -
             message.clone()
         })
         .collect()
+}
+
+/// Supervisor tools whose result is a short status string, not evidence: these
+/// pass through the permanent record unchanged. Everything else (read tools:
+/// view_tool_call, git, and Bifrost code-intelligence) is retained under the
+/// cap. See [`retain_payloads_for_permanent_record`].
+fn is_supervisor_action_tool(name: &str) -> bool {
+    matches!(
+        name,
+        SPAWN_WORKERS_TOOL
+            | PREFINALIZE_TOOL
+            | SAVE_CHECKPOINT_TOOL
+            | DISCARD_TOOL
+            | FINALIZE_TOOL
+            | UPDATE_PLAN_TOOL
+    )
 }
 
 fn retain_payload(content: &str) -> String {
@@ -1115,6 +1161,8 @@ mod tests {
             supplement.contains("Calling conventions and argument order are always ambiguities")
         );
         assert!(supplement.contains("A plant is only evidence after re-checking"));
+        assert!(supplement.contains("code intelligence"));
+        assert!(supplement.contains("cites the exact functions"));
     }
 
     #[test]
@@ -1154,5 +1202,115 @@ mod tests {
         assert!(description.contains("confirmed by inspecting the diff"));
         assert!(description.contains("hung or timed-out verification run is a blocker"));
         assert!(description.contains("Never substitute a weaker ad-hoc check"));
+    }
+
+    #[test]
+    fn bifrost_tool_defs_preserve_names_descriptions_schemas_and_order() {
+        let tools = vec![
+            McpToolDef {
+                name: "search_symbols".to_string(),
+                description: "find symbols by pattern".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "patterns": { "type": "array" } },
+                    "required": ["patterns"],
+                }),
+                annotations: crate::mcp::McpToolAnnotations {
+                    read_only_hint: Some(true),
+                },
+            },
+            McpToolDef {
+                name: "activate_workspace".to_string(),
+                description: "point bifrost at another path".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                annotations: crate::mcp::McpToolAnnotations::default(),
+            },
+        ];
+
+        let defs = mcp_tools_to_definitions(&tools);
+
+        assert_eq!(defs.len(), 2);
+        // Client order is preserved verbatim (cache stability).
+        assert_eq!(defs[0].function.name, "search_symbols");
+        assert_eq!(defs[1].function.name, "activate_workspace");
+        assert_eq!(defs[0].r#type, "function");
+        assert_eq!(defs[0].function.description, "find symbols by pattern");
+        // input_schema passes through unchanged into `parameters`.
+        assert_eq!(defs[0].function.parameters, tools[0].input_schema);
+        assert_eq!(defs[1].function.parameters, tools[1].input_schema);
+    }
+
+    #[test]
+    fn permanent_record_retains_bifrost_results_and_still_keeps_view_and_git() {
+        let bifrost_call = supervisor_tool_call(
+            "b1",
+            "search_symbols",
+            serde_json::json!({ "patterns": ["X"] }),
+        );
+        let view_call = supervisor_tool_call(
+            "view",
+            VIEW_TOOL_CALL_TOOL,
+            serde_json::json!({ "handles": ["w1m1"] }),
+        );
+        let git_call =
+            supervisor_tool_call("git", GIT_TOOL, serde_json::json!({ "args": ["log"] }));
+        let spawn_call = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+        );
+
+        let bifrost_payload = "fn foo() at src/lib.rs:12\nfn foo_bar() at src/x.rs:3".to_string();
+        let view_payload = "PASS (12) FAIL (0)".to_string();
+        let git_payload = "commit abc123\n    initial\n".to_string();
+        let transcript = vec![
+            ChatMessage::assistant_tool_calls(vec![bifrost_call, view_call, git_call, spawn_call]),
+            ChatMessage::tool_result("b1", "search_symbols", bifrost_payload.clone()),
+            ChatMessage::tool_result("view", VIEW_TOOL_CALL_TOOL, view_payload.clone()),
+            ChatMessage::tool_result("git", GIT_TOOL, git_payload.clone()),
+            ChatMessage::tool_result("spawn", SPAWN_WORKERS_TOOL, "spawned w3 from root"),
+        ];
+
+        let permanent = retain_payloads_for_permanent_record(&transcript);
+        let text = permanent
+            .iter()
+            .map(ChatMessage::content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Bifrost code-intelligence output is retained as evidence.
+        assert!(text.contains(&bifrost_payload));
+        // view_tool_call and git are still retained.
+        assert!(text.contains(&view_payload));
+        assert!(text.contains(&git_payload));
+        // Action-tool status strings still pass through.
+        assert!(text.contains("spawned w3 from root"));
+        // Nothing under the cap gets a truncation marker.
+        assert!(!text.contains("[retained"));
+    }
+
+    #[test]
+    fn permanent_record_caps_oversized_bifrost_results() {
+        let bifrost_call =
+            supervisor_tool_call("b1", "usage_graph", serde_json::json!({ "symbol": "X" }));
+        let oversized = "y".repeat(RETAINED_PAYLOAD_CAP + 500);
+        let transcript = vec![
+            ChatMessage::assistant_tool_calls(vec![bifrost_call]),
+            ChatMessage::tool_result("b1", "usage_graph", oversized.clone()),
+        ];
+
+        let permanent = retain_payloads_for_permanent_record(&transcript);
+        let text = permanent
+            .iter()
+            .map(ChatMessage::content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!text.contains(&oversized));
+        assert!(text.contains(&"y".repeat(RETAINED_PAYLOAD_CAP)));
+        assert!(text.contains(&format!(
+            "[retained first {RETAINED_PAYLOAD_CAP} bytes of {}]",
+            oversized.len()
+        )));
     }
 }
