@@ -1,0 +1,715 @@
+<canvas class="forge-canvas" data-forge-canvas aria-hidden="true"></canvas>
+{/* Layout anchor for the anvil silhouette: marks where in the hero it settles. */}
+<div class="anvil-forge" data-anvil-forge aria-hidden="true"></div>
+
+<script>
+  // Anvil silhouette in a 100x70 design space (y down). M/L/Q/Z mirror canvas path ops.
+  const ANVIL_OPS: Array<[string, ...number[]]> = [
+    ['M', 3, 21],
+    ['Q', 9, 12, 24, 14], // horn top -> face top
+    ['L', 86, 14], // face top
+    ['L', 86, 27], // heel right edge
+    ['L', 62, 27], // heel bottom step
+    ['Q', 60, 32, 59, 37], // heel -> waist (concave)
+    ['L', 58, 46], // waist right
+    ['Q', 60, 52, 72, 54], // waist -> foot flare
+    ['L', 78, 63], // foot right slant
+    ['L', 26, 63], // foot bottom
+    ['L', 32, 54], // foot left slant
+    ['Q', 42, 52, 44, 46], // foot -> waist flare
+    ['L', 45, 37], // waist left
+    ['Q', 44, 30, 36, 26], // waist -> neck
+    ['L', 24, 23], // face underside / neck
+    ['Q', 12, 24, 3, 21], // horn underside
+    ['Z'],
+  ];
+  const DESIGN_W = 100;
+  const DESIGN_H = 70;
+  // Tight bounding box of the silhouette, so we fit the shape, not the design canvas.
+  const BBOX = { x: 3, y: 12, w: 83, h: 51 };
+  const STRIKE_AT = { x: 50, y: 13 }; // on the face, where the hammer lands
+  const TAU = Math.PI * 2;
+
+  // Particle phases are drawn from a fixed 100-entry wheel, so every per-frame
+  // sine/cosine a particle needs is one of 100 values. We evaluate the trig once
+  // per frame into these tables instead of ~5 calls per particle per frame.
+  const PHASE_STEPS = 100;
+  const PHASES = new Float32Array(PHASE_STEPS);
+  for (let i = 0; i < PHASE_STEPS; i++) PHASES[i] = (i / PHASE_STEPS) * TAU;
+
+  // Alpha is quantised so particles can be drawn as a handful of batched fills
+  // rather than one beginPath/fill per particle. 12 steps is below the visible
+  // banding threshold at these dot sizes.
+  const ALPHA_STEPS = 12;
+
+  type Spark = { x: number; y: number; vx: number; vy: number; life: number };
+  type Ember = { x: number; y: number; vy: number; phase: number; life: number };
+
+  function tracePath(ctx: CanvasRenderingContext2D, scale: number) {
+    ctx.beginPath();
+    let sx = 0;
+    let sy = 0;
+    for (const op of ANVIL_OPS) {
+      if (op[0] === 'M') {
+        sx = op[1]; sy = op[2];
+        ctx.moveTo(op[1] * scale, op[2] * scale);
+      } else if (op[0] === 'L') {
+        ctx.lineTo(op[1] * scale, op[2] * scale);
+      } else if (op[0] === 'Q') {
+        ctx.quadraticCurveTo(op[1] * scale, op[2] * scale, op[3] * scale, op[4] * scale);
+      } else if (op[0] === 'Z') {
+        ctx.lineTo(sx * scale, sy * scale);
+        ctx.closePath();
+      }
+    }
+  }
+
+  // Rasterize the silhouette offscreen and reservoir-sample `count` home points
+  // straight out of the scan. Collecting every filled pixel and shuffling the whole
+  // set costs tens of thousands of allocations for a result we immediately truncate.
+  function sampleHomes(count: number): { hx: Float32Array; hy: Float32Array; length: number } {
+    const res = 3; // px per design unit
+    const empty = { hx: new Float32Array(0), hy: new Float32Array(0), length: 0 };
+    const off = document.createElement('canvas');
+    off.width = DESIGN_W * res;
+    off.height = DESIGN_H * res;
+    const ctx = off.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return empty;
+    tracePath(ctx, res);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    const data = ctx.getImageData(0, 0, off.width, off.height).data;
+
+    const hx = new Float32Array(count);
+    const hy = new Float32Array(count);
+    let seen = 0;
+    for (let y = 0; y < off.height; y++) {
+      const row = y * off.width;
+      for (let x = 0; x < off.width; x++) {
+        if (data[(row + x) * 4 + 3] <= 127) continue;
+        // Reservoir sampling (Algorithm R): uniform over all filled pixels, O(1) memory.
+        let slot = seen;
+        if (seen >= count) {
+          slot = (Math.random() * (seen + 1)) | 0;
+          if (slot >= count) { seen++; continue; }
+        }
+        hx[slot] = (x + Math.random()) / res;
+        hy[slot] = (y + Math.random()) / res;
+        seen++;
+      }
+    }
+    const length = Math.min(count, seen);
+    return length === 0 ? empty : { hx, hy, length };
+  }
+
+  /*
+   * Vertical extent of the particle field, from the top of the page.
+   *
+   * The hero's own bottom edge is a bad place to stop: it tends to land near the fold,
+   * so the field ends in a hard horizontal line across the first screen. Instead run
+   * past both the fold and the hero by a fixed slice of viewport height, and let the
+   * mask in the stylesheet fade out that trailing slice. The result has no visible
+   * bottom edge on load, and scrolling reveals a fade rather than a cut.
+   */
+  const FADE_FRACTION = 0.35; // of viewport height
+
+  function fieldGeometry(heroRect: DOMRect) {
+    const bleedTop = heroRect.top + window.scrollY;
+    const fade = window.innerHeight * FADE_FRACTION;
+    const height = Math.max(bleedTop + heroRect.height, window.innerHeight) + fade;
+    return { bleedTop, height, fade };
+  }
+
+  function initializeForge(root: HTMLElement) {
+    if (root.dataset.ready === 'true') return;
+    root.dataset.ready = 'true';
+
+    // The canvas is the full-bleed field (particles scatter page-wide); the root div
+    // only marks where in the hero the anvil silhouette settles.
+    const canvas = root.parentElement?.querySelector<HTMLCanvasElement>('canvas[data-forge-canvas]');
+    const context = canvas?.getContext('2d');
+    const field = canvas?.parentElement;
+    if (!canvas || !context || !field) return;
+
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    // The field is full-bleed, so its area varies hugely between a phone and an
+    // ultrawide. Scale the population with area to hold density constant instead of
+    // shipping a fixed count that is sparse on one and expensive on the other.
+    // ~530px^2 per particle reproduces the density of the original fixed 2000.
+    const initialRect = field.getBoundingClientRect();
+    const fieldArea =
+      document.documentElement.clientWidth * fieldGeometry(initialRect).height;
+    const maxCount = window.matchMedia('(max-width: 560px)').matches ? 1400 : 4200;
+    const count = Math.min(maxCount, Math.max(700, Math.round(fieldArea / 530)));
+    const homes = sampleHomes(count);
+    if (homes.length === 0) return;
+    const n = homes.length;
+
+    // Particle state in typed arrays: one contiguous read per field per frame
+    // instead of chasing 2000 object pointers.
+    const hx = homes.hx;
+    const hy = homes.hy;
+    const px = new Float32Array(n); // home, canvas px (recomputed on layout)
+    const py = new Float32Array(n);
+    const xs = new Float32Array(n);
+    const ys = new Float32Array(n);
+    const vxs = new Float32Array(n);
+    const vys = new Float32Array(n);
+    const sizes = new Float32Array(n);
+    const phaseIdx = new Uint8Array(n);
+    const engageAt = new Float32Array(n);
+    // Draw-time scratch: position with shimmer wobble applied, plus batch id.
+    const drawX = new Float32Array(n);
+    const drawY = new Float32Array(n);
+    const batchOf = new Uint8Array(n);
+
+    for (let i = 0; i < n; i++) {
+      sizes[i] = 0.28 + ((i * 37) % 100) / 260; // design-unit radius ~0.28..0.66
+      phaseIdx[i] = (i * 61) % PHASE_STEPS;
+      // Coalesce wave sweeps left (horn) -> right (heel) with organic jitter.
+      engageAt[i] = 0.9 + (hx[i] / DESIGN_W) * 1.5 + Math.random() * 0.6;
+    }
+
+    // Per-frame trig tables, indexed by phase step.
+    const tShimmer = new Float32Array(PHASE_STEPS);
+    const tWobbleX = new Float32Array(PHASE_STEPS);
+    const tWobbleY = new Float32Array(PHASE_STEPS);
+    const tDriftX = new Float32Array(PHASE_STEPS);
+    const tDriftY = new Float32Array(PHASE_STEPS);
+
+    // Counting sort into (colour x alpha) batches.
+    const BATCHES = ALPHA_STEPS * 2; // [0..11] dot, [12..23] accent
+    const batchCount = new Int32Array(BATCHES);
+    const batchStart = new Int32Array(BATCHES + 1);
+    const order = new Int32Array(n);
+    const batchFill: string[] = new Array(BATCHES).fill('');
+    let hotRgb = '';
+    let staticDotFill = '';
+    let staticAccentFill = '';
+
+    let width = 0;
+    let height = 0;
+    let scale = 1;
+    let offsetX = 0;
+    let offsetY = 0;
+    let startTime = 0;
+    let lastTime = 0;
+    let rafId = 0;
+    let visible = true;
+    let phase: 'scatter' | 'coalesce' | 'forged' = 'scatter';
+    let nextStrikeAt = Number.POSITIVE_INFINITY;
+    let strikeStart = -1;
+
+    const sparks: Spark[] = [];
+    const embers: Ember[] = [];
+    const pointer = { x: 0, y: 0, active: false };
+    // Cached canvas rect for pointer mapping; recomputed lazily after scroll/resize
+    // instead of forcing a layout on every pointermove.
+    let pointerLeft = 0;
+    let pointerTop = 0;
+    let pointerRectStale = true;
+
+    // Colours live in CSS custom properties. Read them once per theme change and
+    // pre-build every fill string, rather than calling getComputedStyle and
+    // allocating 2000 template strings every frame.
+    function readColors() {
+      const styles = getComputedStyle(root);
+      const dot = styles.getPropertyValue('--forge-dot').trim() || '91 140 255';
+      const accent = styles.getPropertyValue('--forge-accent').trim() || '168 196 255';
+      const hot = styles.getPropertyValue('--forge-hot').trim() || '221 231 255';
+      for (let b = 0; b < ALPHA_STEPS; b++) {
+        const alpha = ((b + 0.5) / ALPHA_STEPS).toFixed(3);
+        batchFill[b] = `rgb(${dot} / ${alpha})`;
+        batchFill[b + ALPHA_STEPS] = `rgb(${accent} / ${alpha})`;
+      }
+      hotRgb = hot;
+      staticDotFill = `rgb(${dot} / 0.82)`;
+      staticAccentFill = `rgb(${accent} / 0.82)`;
+    }
+
+    function scatterPositions() {
+      // Dust spread across the entire hero before it condenses into the anvil.
+      for (let i = 0; i < n; i++) {
+        xs[i] = Math.random() * width;
+        ys[i] = Math.random() * height;
+        const drift = Math.random() * TAU;
+        const speed = 0.15 + Math.random() * 0.4;
+        vxs[i] = Math.cos(drift) * speed;
+        vys[i] = Math.sin(drift) * speed;
+      }
+    }
+
+    function layout() {
+      /*
+       * Full-bleed. The hero lives inside Starlight's centred content column, but the
+       * particle field should read as the page backdrop: edge to edge horizontally and
+       * running up behind the header to the very top of the document. We measure the
+       * hero's offset from the viewport edges and page top, then pull the backdrop out
+       * by exactly that much. Measuring beats hard-coding `100vw` / nav-height sums --
+       * it stays correct across the sidebar breakpoint, and `clientWidth` excludes the
+       * scrollbar, so bleeding to it can never introduce horizontal overflow.
+       *
+       * Only the backdrop bleeds. `.hero-copy` and the anvil stay in the column.
+       */
+      const heroRect = field.getBoundingClientRect();
+      const viewportW = document.documentElement.clientWidth;
+      const bleedLeft = heroRect.left;
+      const { bleedTop, height: fieldHeight, fade } = fieldGeometry(heroRect);
+      field.style.setProperty('--hero-bleed-left', `${-bleedLeft}px`);
+      field.style.setProperty('--hero-bleed-right', `${heroRect.right - viewportW}px`);
+      field.style.setProperty('--hero-bleed-top', `${-bleedTop}px`);
+      // Explicit box, not just insets: canvas is a replaced element, so `width: auto`
+      // would collapse it to its 300x150 intrinsic size instead of stretching.
+      canvas.style.left = `${-bleedLeft}px`;
+      canvas.style.top = `${-bleedTop}px`;
+      canvas.style.width = `${viewportW}px`;
+      canvas.style.height = `${fieldHeight}px`;
+      // Where the fade begins, as a percentage of the (variable) field height, so the
+      // faded band stays a constant slice of the viewport at any hero size.
+      canvas.style.setProperty(
+        '--forge-fade-start',
+        `${(((fieldHeight - fade) / fieldHeight) * 100).toFixed(2)}%`,
+      );
+
+      const canvasBounds = canvas.getBoundingClientRect();
+      const forgeBounds = root.getBoundingClientRect();
+      pointerLeft = canvasBounds.left;
+      pointerTop = canvasBounds.top;
+      pointerRectStale = false;
+      width = Math.max(1, canvasBounds.width);
+      height = Math.max(1, canvasBounds.height);
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+      // Backing store is capped at 1.5x: past that the extra pixels cost fill rate
+      // without being visible on soft-edged dots this small.
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+
+      // Centre the silhouette's bbox in the forge div. Homes end up in canvas
+      // (hero-wide) coordinates, since that is the space the particles move in.
+      const fw = Math.max(1, forgeBounds.width);
+      const fh = Math.max(1, forgeBounds.height);
+      const fx = forgeBounds.left - canvasBounds.left;
+      const fy = forgeBounds.top - canvasBounds.top;
+      scale = Math.min(fw / BBOX.w, fh / BBOX.h) * 0.94;
+      offsetX = fx + (fw - BBOX.w * scale) / 2 - BBOX.x * scale;
+      offsetY = fy + (fh - BBOX.h * scale) / 2 - BBOX.y * scale;
+      for (let i = 0; i < n; i++) {
+        px[i] = offsetX + hx[i] * scale;
+        py[i] = offsetY + hy[i] * scale;
+      }
+    }
+
+    function spawnStrike(now: number) {
+      strikeStart = now;
+      const sx = offsetX + STRIKE_AT.x * scale;
+      const sy = offsetY + STRIKE_AT.y * scale;
+      const radius = DESIGN_W * scale * 0.42;
+      const radiusSq = radius * radius;
+      for (let i = 0; i < n; i++) {
+        const dx = xs[i] - sx;
+        const dy = ys[i] - sy;
+        const dSq = dx * dx + dy * dy;
+        if (dSq >= radiusSq || dSq < 0.0001) continue;
+        const d = Math.sqrt(dSq);
+        const falloff = 1 - d / radius;
+        const push = (falloff * 3.1) / d;
+        vxs[i] += dx * push;
+        vys[i] += dy * push - falloff * 1.1;
+      }
+      for (let i = 0; i < 8; i++) {
+        sparks.push({
+          x: sx + (Math.random() - 0.5) * 6 * scale * 0.2,
+          y: sy,
+          vx: (Math.random() - 0.5) * 3.4,
+          vy: -1.6 - Math.random() * 2.1,
+          life: 1,
+        });
+      }
+      nextStrikeAt = now + 5.5 + Math.random() * 2.5;
+    }
+
+    function draw(nowMs: number) {
+      rafId = 0;
+      const now = nowMs / 1000;
+      // The clock starts on the first frame that actually renders, not at boot, so a
+      // page opened in a background tab still plays the coalesce intro when it is
+      // brought forward instead of snapping straight to 'forged'.
+      if (startTime < 0) {
+        startTime = now;
+        lastTime = now;
+      }
+      const elapsed = now - startTime;
+      const dt = Math.min(0.05, Math.max(0.001, now - lastTime));
+      lastTime = now;
+      const step = dt * 60; // normalize physics to 60fps units
+
+      // Drives the strike/ember timing only -- nothing reads this out any more.
+      if (elapsed > 0.9) phase = elapsed > 4.2 ? 'forged' : 'coalesce';
+      if (phase === 'forged' && !Number.isFinite(nextStrikeAt)) nextStrikeAt = now + 2.2;
+      if (now >= nextStrikeAt && visible) spawnStrike(now);
+
+      context.clearRect(0, 0, width, height);
+
+      const springK = 0.045;
+      const damping = Math.pow(0.855, step);
+      const scatterDamping = Math.pow(0.995, step);
+      const driftAccel = 0.008 * step;
+      const intro = Math.min(1, elapsed / 0.9);
+
+      // Evaluate every phase-dependent sine/cosine once for the whole field.
+      for (let k = 0; k < PHASE_STEPS; k++) {
+        const ph = PHASES[k];
+        tShimmer[k] = Math.sin(now * 1.15 + ph);
+        tWobbleX[k] = Math.sin(now * 0.85 + ph) * 0.35;
+        tWobbleY[k] = Math.cos(now * 0.7 + ph * 1.3) * 0.35;
+        tDriftX[k] = Math.sin(now * 0.6 + ph * 3) * driftAccel;
+        tDriftY[k] = Math.cos(now * 0.5 + ph * 2) * driftAccel;
+      }
+
+      batchCount.fill(0);
+      const pointerActive = pointer.active;
+      const pointerX = pointer.x;
+      const pointerY = pointer.y;
+      const pointerRadius = 105;
+      const pointerRadiusSq = pointerRadius * pointerRadius;
+
+      for (let i = 0; i < n; i++) {
+        const k = phaseIdx[i];
+        let x = xs[i];
+        let y = ys[i];
+        let vx = vxs[i];
+        let vy = vys[i];
+
+        if (elapsed < engageAt[i]) {
+          // Scatter: slow wander, wrapped softly inside the canvas.
+          vx = (vx + tDriftX[k]) * scatterDamping;
+          vy = (vy + tDriftY[k]) * scatterDamping;
+          x += vx * step;
+          y += vy * step;
+          if (x < -12) x = width + 12;
+          else if (x > width + 12) x = -12;
+          if (y < -12) y = height + 12;
+          else if (y > height + 12) y = -12;
+        } else {
+          // Forge: critically-underdamped spring home, so particles land with a wobble.
+          vx = (vx + (px[i] - x) * springK * step) * damping;
+          vy = (vy + (py[i] - y) * springK * step) * damping;
+          // Cap flight speed: particles crossing the whole hero read as converging
+          // streams, not a violent snap.
+          const speedSq = vx * vx + vy * vy;
+          if (speedSq > 576) {
+            const inv = 24 / Math.sqrt(speedSq);
+            vx *= inv;
+            vy *= inv;
+          }
+          if (pointerActive) {
+            const dx = x - pointerX;
+            const dy = y - pointerY;
+            const dSq = dx * dx + dy * dy;
+            if (dSq < pointerRadiusSq && dSq > 0.0001) {
+              const d = Math.sqrt(dSq);
+              const force = ((1 - d / pointerRadius) ** 2 * 2.8 * step) / d;
+              vx += dx * force;
+              vy += dy * force;
+            }
+          }
+          x += vx * step;
+          y += vy * step;
+        }
+
+        xs[i] = x;
+        ys[i] = y;
+        vxs[i] = vx;
+        vys[i] = vy;
+
+        // Idle shimmer: tiny render-time drift + alpha breathing. The whole field
+        // fades in from nothing over the first beat.
+        const shimmer = (0.76 + tShimmer[k] * 0.2) * intro;
+        drawX[i] = x + tWobbleX[k];
+        drawY[i] = y + tWobbleY[k];
+        let bucket = (shimmer * ALPHA_STEPS) | 0;
+        if (bucket < 0) bucket = 0;
+        else if (bucket >= ALPHA_STEPS) bucket = ALPHA_STEPS - 1;
+        const batch = i % 10 === 0 ? bucket + ALPHA_STEPS : bucket;
+        batchOf[i] = batch;
+        batchCount[batch]++;
+      }
+
+      // Prefix sums, then scatter indices so each batch is one contiguous run.
+      let running = 0;
+      for (let b = 0; b < BATCHES; b++) {
+        batchStart[b] = running;
+        running += batchCount[b];
+      }
+      batchStart[BATCHES] = running;
+      const cursor = batchCount; // reuse as write cursor
+      for (let b = 0; b < BATCHES; b++) cursor[b] = batchStart[b];
+      for (let i = 0; i < n; i++) order[cursor[batchOf[i]]++] = i;
+
+      // One fill per batch instead of one per particle.
+      for (let b = 0; b < BATCHES; b++) {
+        const from = batchStart[b];
+        const to = batchStart[b + 1];
+        if (from === to) continue;
+        context.beginPath();
+        for (let j = from; j < to; j++) {
+          const i = order[j];
+          const r = Math.max(0.5, sizes[i] * scale);
+          const cx = drawX[i];
+          const cy = drawY[i];
+          context.moveTo(cx + r, cy);
+          context.arc(cx, cy, r, 0, TAU);
+        }
+        context.fillStyle = batchFill[b];
+        context.fill();
+      }
+
+      // Hammer-strike impact flash on the face.
+      if (strikeStart >= 0) {
+        const t = (now - strikeStart) / 0.55;
+        if (t >= 1) {
+          strikeStart = -1;
+        } else if (t < 0.22) {
+          const sx = offsetX + STRIKE_AT.x * scale;
+          const sy = offsetY + STRIKE_AT.y * scale;
+          context.beginPath();
+          context.arc(sx, sy, 2.4 * (1 - t), 0, TAU);
+          context.fillStyle = `rgb(${hotRgb} / ${0.9 * (1 - t / 0.22)})`;
+          context.fill();
+        }
+      }
+
+      // Sparks fly off on strikes. Batched: one path, one fill, alpha via the
+      // shared life curve rounded into the same 12 steps.
+      if (sparks.length > 0) {
+        for (let i = sparks.length - 1; i >= 0; i--) {
+          const s = sparks[i];
+          s.vy += 0.055 * step;
+          s.x += s.vx * step;
+          s.y += s.vy * step;
+          s.life -= 0.022 * step;
+          if (s.life <= 0) sparks.splice(i, 1);
+        }
+        for (let b = 0; b < ALPHA_STEPS; b++) {
+          let opened = false;
+          for (let i = 0; i < sparks.length; i++) {
+            const s = sparks[i];
+            let bucket = ((s.life * 0.85) * ALPHA_STEPS) | 0;
+            if (bucket >= ALPHA_STEPS) bucket = ALPHA_STEPS - 1;
+            if (bucket !== b) continue;
+            if (!opened) { context.beginPath(); opened = true; }
+            context.moveTo(s.x + 1.3, s.y);
+            context.arc(s.x, s.y, 1.3, 0, TAU);
+          }
+          if (opened) {
+            context.fillStyle = `rgb(${hotRgb} / ${((b + 0.5) / ALPHA_STEPS).toFixed(3)})`;
+            context.fill();
+          }
+        }
+      }
+
+      // Embers rise from the face once forged.
+      if (phase === 'forged') {
+        if (embers.length < 8 && Math.random() < 0.06 * step) {
+          embers.push({
+            x: offsetX + (30 + Math.random() * 50) * scale,
+            y: offsetY + 13.5 * scale,
+            vy: -(0.1 + Math.random() * 0.1) * scale,
+            phase: Math.random() * TAU,
+            life: 0,
+          });
+        }
+        for (let i = embers.length - 1; i >= 0; i--) {
+          const e = embers[i];
+          e.life += 0.005 * step;
+          e.y += e.vy * step;
+          e.x += Math.sin(now * 2 + e.phase) * 0.18 * step;
+          if (e.life >= 1 || e.y < 4) {
+            embers.splice(i, 1);
+            continue;
+          }
+          context.beginPath();
+          context.arc(e.x, e.y, 1.05, 0, TAU);
+          context.fillStyle = `rgb(${hotRgb} / ${(1 - e.life) * 0.42})`;
+          context.fill();
+        }
+      }
+
+      schedule();
+    }
+
+    // Single owner of the rAF handle: overlapping observers can request a restart
+    // without ever running two loops at once (which would double the frame cost).
+    function schedule() {
+      if (rafId !== 0 || !visible || document.hidden || reduceMotion.matches) return;
+      rafId = requestAnimationFrame(draw);
+    }
+
+    function halt() {
+      if (rafId === 0) return;
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+
+    function resume() {
+      if (rafId !== 0) return;
+      lastTime = performance.now() / 1000;
+      schedule();
+    }
+
+    function drawStatic() {
+      // Reduced-motion: the anvil, already forged. Durable, like the sessions.
+      layout();
+      context.clearRect(0, 0, width, height);
+      for (let pass = 0; pass < 2; pass++) {
+        context.beginPath();
+        for (let i = 0; i < n; i++) {
+          if ((i % 10 === 0) !== (pass === 1)) continue;
+          const r = Math.max(0.5, sizes[i] * scale);
+          context.moveTo(px[i] + r, py[i]);
+          context.arc(px[i], py[i], r, 0, TAU);
+        }
+        context.fillStyle = pass === 1 ? staticAccentFill : staticDotFill;
+        context.fill();
+      }
+      phase = 'forged';
+    }
+
+    function start() {
+      halt();
+      readColors();
+      if (reduceMotion.matches) {
+        drawStatic();
+        return;
+      }
+      layout();
+      scatterPositions();
+      startTime = -1; // claimed by the first rendered frame
+      schedule();
+    }
+
+    const observer = new ResizeObserver(() => {
+      pointerRectStale = true;
+      if (reduceMotion.matches) drawStatic();
+      else layout();
+    });
+    observer.observe(field);
+
+    const visibility = new IntersectionObserver(
+      ([entry]) => {
+        visible = entry.isIntersecting;
+        if (visible) resume();
+        else halt();
+      },
+      { rootMargin: '120px' },
+    );
+    visibility.observe(root);
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) halt();
+      else resume();
+    });
+
+    // Scrolling moves the canvas under the pointer without resizing it.
+    window.addEventListener('scroll', () => { pointerRectStale = true; }, { passive: true });
+
+    // Keep the cached palette in step with theme flips, in both render modes.
+    new MutationObserver(() => {
+      readColors();
+      if (reduceMotion.matches) drawStatic();
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+    // Repel on hover for real pointing devices (per-event check: hybrid laptops
+    // report a coarse primary pointer but still drive mouse/pen events).
+    field.addEventListener(
+      'pointermove',
+      (event) => {
+        if (event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+        if (pointerRectStale) {
+          const bounds = canvas.getBoundingClientRect();
+          pointerLeft = bounds.left;
+          pointerTop = bounds.top;
+          pointerRectStale = false;
+        }
+        pointer.x = event.clientX - pointerLeft;
+        pointer.y = event.clientY - pointerTop;
+        pointer.active = true;
+      },
+      { passive: true },
+    );
+    field.addEventListener('pointerleave', () => {
+      pointer.active = false;
+    });
+
+    reduceMotion.addEventListener('change', start);
+    start();
+  }
+
+  // Rasterizing the silhouette is a few milliseconds of synchronous work that the
+  // first paint does not need. Let the page render, then build the field.
+  const boot = () =>
+    document.querySelectorAll<HTMLElement>('[data-anvil-forge]').forEach(initializeForge);
+  if ('requestIdleCallback' in window) window.requestIdleCallback(boot, { timeout: 500 });
+  else setTimeout(boot, 0);
+</script>
+
+<style>
+  @layer starlight.user {
+    /*
+     * Geometry (left/top/width/height) is owned by layout() in the script above, which
+     * measures the hero's offset from the viewport edges and page top to bleed the
+     * field full-width and up behind the header. Nothing to set here but the layer.
+     */
+    .forge-canvas {
+      position: absolute;
+      z-index: 1;
+      /*
+       * Dissolve the trailing band instead of ending on a straight edge. --forge-fade-start
+       * is set by layout(); the fallback only matters for the frame before it runs.
+       */
+      mask-image: linear-gradient(180deg, #000 var(--forge-fade-start, 75%), transparent 100%);
+      pointer-events: none;
+    }
+
+    .anvil-forge {
+      --forge-dot: 22 93 229;
+      --forge-accent: 71 107 209;
+      --forge-hot: 18 42 110;
+      position: relative;
+      z-index: 2;
+      width: 100%;
+      height: clamp(22rem, 30vw, 27rem);
+      pointer-events: auto;
+    }
+
+    :global(:root[data-theme='dark']) .anvil-forge {
+      --forge-dot: 91 140 255;
+      --forge-accent: 168 196 255;
+      --forge-hot: 221 231 255;
+    }
+
+    .anvil-forge::before {
+      position: absolute;
+      inset: 12% 6% 18%;
+      background: radial-gradient(
+        ellipse at 50% 42%,
+        color-mix(in srgb, var(--anvil-cobalt) 9%, transparent),
+        transparent 68%
+      );
+      content: '';
+    }
+
+    @media (width < 62rem) {
+      .anvil-forge {
+        width: min(100%, 40rem);
+        height: clamp(19rem, 52vw, 24rem);
+        justify-self: center;
+      }
+    }
+
+    @media (width < 35rem) {
+      .anvil-forge { height: 17rem; }
+    }
+  }
+</style>

@@ -1,22 +1,87 @@
+/*
+ * Breakpoint contract — shared across anvil.css, AnvilHeader.astro, and AnvilHero.astro.
+ * CSS custom properties cannot be used in @media conditions, so these values are kept
+ * in sync by convention:
+ *   --bp-sm  35rem (560px)  — smallest hero/runtime-map collapse
+ *   --bp-md  50rem (800px)  — sidebar / header collapse
+ *   --bp-lg  64rem (1024px) — capability grid / replaceability collapse
+ *   --bp-xl  72rem (1152px) — header primary nav appears
+ */
+
 :root {
-  --sl-font: Inter, "SF Pro Text", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --sl-font-mono: "SFMono-Regular", "Roboto Mono", Consolas, "Liberation Mono", monospace;
-  --anvil-display: "Arial Narrow", "Avenir Next Condensed", Inter, sans-serif;
-  --anvil-editorial: Iowan Old Style, Baskerville, "Times New Roman", serif;
-  --sl-color-accent-low: #dce7ff;
-  --sl-color-accent: #165de5;
-  --sl-color-accent-high: #102d68;
-  --sl-color-white: #151b22;
-  --sl-color-gray-1: #202833;
-  --sl-color-gray-2: #3e4855;
-  --sl-color-gray-3: #66717d;
-  --sl-color-gray-4: #98a1ab;
-  --sl-color-gray-5: #c2c8ce;
-  --sl-color-gray-6: #e4e7e9;
-  --sl-color-black: #f1f2f2;
-  --sl-content-width: 50rem;
-  --sl-sidebar-width: 18.5rem;
-  --sl-nav-height: 4.8rem;
+  /*
+   * These resolve to the self-hosted families declared in astro.config.mjs, each
+   * already carrying a metric-matched fallback stack so first paint does not reflow.
+   */
+  --anvil-font-display: var(--font-staatliches);
+  --anvil-font-body: var(--font-rajdhani);
+  --anvil-font-mono: var(--font-jetbrains-mono);
+  --sl-font: var(--anvil-font-body);
+  --sl-font-mono: var(--anvil-font-mono);
+
+  --anvil-text-2xs: 0.5625rem;
+  --anvil-text-xs: 0.625rem;
+  --anvil-text-sm: 0.6875rem;
+  --anvil-text-base: 0.75rem;
+  --anvil-text-lg: 0.875rem;
+  --anvil-text-xl: 1rem;
+  --anvil-text-2xl: 1.125rem;
+  --anvil-text-3xl: 1.5625rem;
+  --anvil-text-display-page: clamp(3rem, 5vw, 4.8rem);
+  --anvil-text-display-section: clamp(2.7rem, 5vw, 5rem);
+  --anvil-text-display-hero: clamp(3.9rem, 7.4vw, 7.4rem);
+  --anvil-text-display-hero-sm: clamp(3.5rem, 17vw, 5rem);
+  --anvil-text-tagline: clamp(1.06rem, 1.45vw, 1.25rem);
+
+  --anvil-tracking-tight: 0;
+  --anvil-tracking-tighter: 0;
+  --anvil-tracking-tightest: -0.01em;
+  --anvil-tracking-wide: 0.035em;
+  --anvil-tracking-wider: 0.06em;
+  --anvil-tracking-widest: 0.09em;
+
+  --anvil-leading-hero: 0.84;
+  --anvil-leading-display: 0.95;
+  --anvil-leading-body: 1.55;
+  --anvil-leading-loose: 1.62;
+
+  --anvil-weight-regular: 400;
+  --anvil-weight-medium: 500;
+  --anvil-weight-semibold: 600;
+  --anvil-weight-bold: 700;
+  --anvil-weight-extrabold: 800;
+
+  --anvil-space-1: 0.25rem;
+  --anvil-space-2: 0.5rem;
+  --anvil-space-3: 0.75rem;
+  --anvil-space-4: 1rem;
+  --anvil-space-5: 1.25rem;
+  --anvil-space-6: 1.5rem;
+  --anvil-space-8: 2rem;
+  --anvil-space-10: 2.5rem;
+  --anvil-space-12: 3rem;
+  --anvil-space-16: 4rem;
+  --anvil-space-20: 5rem;
+  --anvil-space-24: 6rem;
+
+  /*
+   * A clipped element cannot draw a border across the diagonal cuts. Each shell and
+   * matching 1px-inset shape therefore form a two-layer panel: the shell is the border
+   * ring, while an inset pseudo-element carries the real face and shadow.
+   */
+  --anvil-chamfer-lg: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px));
+  --anvil-chamfer-lg-inset: polygon(0 0, calc(100% - 15px) 0, 100% 15px, 100% 100%, 15px 100%, 0 calc(100% - 15px));
+  --anvil-chamfer-sm: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+  --anvil-chamfer-sm-inset: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
+  --anvil-octagon-lg: polygon(16px 0, calc(100% - 16px) 0, 100% 16px, 100% calc(100% - 16px), calc(100% - 16px) 100%, 16px 100%, 0 calc(100% - 16px), 0 16px);
+  --anvil-octagon-lg-inset: polygon(15px 0, calc(100% - 15px) 0, 100% 15px, 100% calc(100% - 15px), calc(100% - 15px) 100%, 15px 100%, 0 calc(100% - 15px), 0 15px);
+  --anvil-chamfer-reverse-lg: polygon(16px 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%, 0 16px);
+  --anvil-chamfer-reverse-lg-inset: polygon(15px 0, 100% 0, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%, 0 15px);
+  --anvil-three-cut-lg: polygon(16px 0, calc(100% - 16px) 0, 100% 16px, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%, 0 16px);
+  --anvil-three-cut-lg-inset: polygon(15px 0, calc(100% - 15px) 0, 100% 15px, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%, 0 15px);
+  --anvil-integrated-nav: polygon(0 0, 100% 0, 100% 100%, 0 100%);
+  --anvil-integrated-nav-inset: polygon(0 0, 100% 0, 100% 100%, 0 100%);
+
   --anvil-cobalt: #165de5;
   --anvil-ink: #151b22;
   --anvil-copy: #3e4855;
@@ -29,20 +94,31 @@
   --anvil-grid: rgb(21 27 34 / 0.045);
   --anvil-grid-strong: rgb(21 27 34 / 0.075);
   --anvil-highlight: rgb(255 255 255 / 0.86);
+
+  --sl-color-accent-low: #dce7ff;
+  --sl-color-accent: var(--anvil-cobalt);
+  --sl-color-accent-high: #102d68;
+  --sl-color-white: var(--anvil-ink);
+  --sl-color-gray-1: #202833;
+  --sl-color-gray-2: var(--anvil-copy);
+  --sl-color-gray-3: #66717d;
+  --sl-color-gray-4: #98a1ab;
+  --sl-color-gray-5: #c2c8ce;
+  --sl-color-gray-6: #e4e7e9;
+  --sl-color-black: var(--anvil-surface);
+  --sl-content-width: 50rem;
+  --sl-sidebar-width: 18.5rem;
+  --sl-nav-height: 4.8rem;
 }
 
 :root[data-theme='dark'] {
   --sl-color-accent-low: #102653;
-  --sl-color-accent: #6e9cff;
   --sl-color-accent-high: #dce7ff;
-  --sl-color-white: #eef1f4;
   --sl-color-gray-1: #d9dee3;
-  --sl-color-gray-2: #b6bec7;
   --sl-color-gray-3: #828d99;
   --sl-color-gray-4: #59636e;
   --sl-color-gray-5: #343d47;
   --sl-color-gray-6: #202830;
-  --sl-color-black: #0d1218;
   --anvil-cobalt: #5b8cff;
   --anvil-ink: #eef1f4;
   --anvil-copy: #b6bec7;
@@ -57,75 +133,178 @@
   --anvil-highlight: rgb(255 255 255 / 0.04);
 }
 
+/*
+ * Theme-flip transition guard.
+ *
+ * Chromium keeps the previous computed value when a transitioned property reads through
+ * a custom property that changes underneath it -- which is exactly what a theme flip
+ * does. Any element with a transition then stays stranded in the old palette: the
+ * capability cards keep their dark background on a light page, the hero badge link keeps
+ * near-white text on near-white. Elements without a transition repaint correctly, which
+ * is what makes it look so arbitrary.
+ *
+ * The fix is to take transitions out of the picture for the one frame the swap lands on.
+ * AnvilHead.astro sets this attribute the moment data-theme changes and clears it once
+ * the new palette has painted.
+ */
+:root[data-theme-switching] *,
+:root[data-theme-switching] *::before,
+:root[data-theme-switching] *::after {
+  transition: none !important;
+}
+
 html[data-has-hero] { --sl-content-width: 86rem; }
 
-body {
+body { background: var(--anvil-surface); }
+
+/*
+ * The grid is viewport-fixed. `background-attachment: fixed` expresses that in one
+ * line but forces the browser to repaint the full viewport background on every
+ * scroll frame, which rules out compositor-only scrolling. A fixed-position layer
+ * paints identically and gets promoted once, so scrolling never touches it.
+ */
+body::before {
+  position: fixed;
+  z-index: -1;
+  inset: 0;
   background:
     linear-gradient(var(--anvil-grid) 1px, transparent 1px),
-    linear-gradient(90deg, var(--anvil-grid) 1px, transparent 1px),
-    var(--anvil-surface);
-  background-attachment: fixed;
-  background-size: 32px 32px, 32px 32px, auto;
+    linear-gradient(90deg, var(--anvil-grid) 1px, transparent 1px);
+  background-size: 32px 32px;
+  content: '';
+  pointer-events: none;
+}
+
+.anvil-panel {
+  --anvil-panel-shell: var(--anvil-chamfer-lg);
+  --anvil-panel-inner: var(--anvil-chamfer-lg-inset);
+  position: relative;
+  isolation: isolate;
+  background: var(--anvil-line-strong);
+  clip-path: var(--anvil-panel-shell);
+}
+
+.anvil-panel::after {
+  position: absolute;
+  z-index: -1;
+  inset: 1px;
+  clip-path: var(--anvil-panel-inner);
+  content: '';
+}
+
+.anvil-panel--octagon {
+  --anvil-panel-shell: var(--anvil-octagon-lg);
+  --anvil-panel-inner: var(--anvil-octagon-lg-inset);
+}
+
+.anvil-panel--reverse {
+  --anvil-panel-shell: var(--anvil-chamfer-reverse-lg);
+  --anvil-panel-inner: var(--anvil-chamfer-reverse-lg-inset);
+}
+
+.anvil-panel--three-cut {
+  --anvil-panel-shell: var(--anvil-three-cut-lg);
+  --anvil-panel-inner: var(--anvil-three-cut-lg-inset);
 }
 
 .site-title,
 .sl-markdown-content h1,
 .sl-markdown-content h2 {
-  font-family: var(--anvil-display);
-  letter-spacing: -0.04em;
+  font-family: var(--anvil-font-display);
+  font-weight: var(--anvil-weight-regular);
+  letter-spacing: var(--anvil-tracking-tight);
 }
 
-.sl-markdown-content h1 { font-size: clamp(3rem, 5vw, 4.8rem); line-height: 0.95; }
-.sl-markdown-content h2 { margin-top: 2.4em; padding-top: 0.6em; border-top: 1px solid var(--anvil-line); }
+.sl-markdown-content h1 {
+  font-size: var(--anvil-text-display-page);
+  line-height: var(--anvil-leading-display);
+}
+
+.sl-markdown-content h2 {
+  margin-top: 2.4em;
+  padding-top: 0.6em;
+  border-top: 1px solid var(--anvil-line);
+}
+
 .sl-markdown-content h2::before {
   display: inline-block;
   width: 0.85rem;
   height: 0.16rem;
   margin: 0 0.55rem 0.17rem 0;
   background: var(--anvil-cobalt);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--anvil-cobalt) 42%, transparent);
   content: '';
 }
 
 .page > header.header {
   height: var(--sl-nav-height);
-  padding: 0.52rem max(0.65rem, 1.4vw);
+  padding: var(--anvil-space-2) max(0.65rem, 1.4vw);
   border-bottom: 0;
   background: linear-gradient(180deg, color-mix(in srgb, var(--anvil-surface) 96%, transparent), transparent);
 }
 
-@media (min-width: 50rem) {
+/* Interior pages join a rectangular header directly to the sidebar rail. */
+html:not([data-has-hero]) .page > header.header {
+  padding: 0;
+  background: var(--anvil-surface);
+}
+
+html:not([data-has-hero]) .anvil-header-shell {
+  --anvil-panel-shell: var(--anvil-integrated-nav);
+  --anvil-panel-inner: var(--anvil-integrated-nav-inset);
+  width: 100%;
+  max-width: none;
+  margin-inline: 0;
+}
+
+@media (width >= 50rem) {
   #starlight__sidebar.sidebar-pane {
     top: var(--sl-nav-height);
-    padding: 0.55rem 0.55rem 0;
+    padding: var(--anvil-space-2) var(--anvil-space-2) 0;
     border-inline-end: 0;
     background: color-mix(in srgb, var(--anvil-surface) 90%, transparent);
   }
+
   #starlight__sidebar .sidebar-content {
-    padding: 1.25rem 0.8rem 1.5rem;
+    padding: var(--anvil-space-5) var(--anvil-space-3) var(--anvil-space-6);
     border: 1px solid var(--anvil-line);
     border-bottom: 0;
     background: color-mix(in srgb, var(--anvil-surface-raised) 80%, transparent);
   }
+
+  html:not([data-has-hero]) #starlight__sidebar.sidebar-pane {
+    padding-block-start: 0;
+    padding-inline-start: 0;
+  }
+
+  html:not([data-has-hero]) #starlight__sidebar .sidebar-content { border-block-start: 0; }
 }
 
-#starlight__sidebar .top-level > li + li { margin-top: 1rem; }
+#starlight__sidebar .top-level > li + li { margin-top: var(--anvil-space-4); }
+
 #starlight__sidebar .group-label .large,
 #starlight__sidebar a.large {
   color: var(--anvil-muted);
-  font-family: var(--sl-font-mono);
-  font-size: 0.64rem;
-  font-weight: 650;
-  letter-spacing: 0.075em;
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-xs);
+  font-weight: var(--anvil-weight-bold);
+  letter-spacing: var(--anvil-tracking-widest);
   text-transform: uppercase;
 }
+
 #starlight__sidebar a { border-radius: 0; color: var(--anvil-muted); }
+
 #starlight__sidebar a:hover,
-#starlight__sidebar a:focus-visible { color: var(--anvil-ink); background: color-mix(in srgb, var(--anvil-cobalt) 5%, transparent); }
+#starlight__sidebar a:focus-visible {
+  color: var(--anvil-ink);
+  background: color-mix(in srgb, var(--anvil-cobalt) 5%, transparent);
+}
+
 #starlight__sidebar a[aria-current='page'] {
   color: var(--anvil-ink);
   background: linear-gradient(90deg, color-mix(in srgb, var(--anvil-cobalt) 12%, transparent), transparent);
   box-shadow: inset 2px 0 var(--anvil-cobalt);
-  font-weight: 650;
+  font-weight: var(--anvil-weight-bold);
 }
 
 html[data-has-hero] .sl-markdown-content { position: relative; z-index: 3; }
@@ -133,23 +312,30 @@ html[data-has-hero] .sl-markdown-content > .home-section:first-child { margin-to
 
 .home-section {
   margin-block: 0;
-  padding: clamp(3.5rem, 7vw, 6.5rem) clamp(0rem, 2vw, 1.5rem);
+  padding: clamp(3.5rem, 7vw, 6.5rem) clamp(0rem, 2vw, var(--anvil-space-6));
   border-top: 1px solid var(--anvil-line);
 }
 
 .section-label {
   display: flex;
   align-items: center;
-  gap: 0.7rem;
-  margin: 0 0 1.2rem;
+  gap: var(--anvil-space-3);
+  margin: 0 0 var(--anvil-space-5);
   color: var(--anvil-muted);
-  font-family: var(--sl-font-mono);
-  font-size: 0.62rem;
-  font-weight: 650;
-  letter-spacing: 0.1em;
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-xs);
+  font-weight: var(--anvil-weight-bold);
+  letter-spacing: var(--anvil-tracking-widest);
   text-transform: uppercase;
 }
-.section-label::before { width: 1.35rem; height: 2px; background: var(--anvil-cobalt); content: ''; }
+
+.section-label::before {
+  width: 1.35rem;
+  height: 2px;
+  background: var(--anvil-cobalt);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--anvil-cobalt) 70%, transparent);
+  content: '';
+}
 
 .home-section h2 {
   max-width: 18ch;
@@ -157,138 +343,264 @@ html[data-has-hero] .sl-markdown-content > .home-section:first-child { margin-to
   padding: 0;
   border: 0;
   color: var(--anvil-ink);
-  font-family: var(--anvil-display);
-  font-size: clamp(2.7rem, 5vw, 5rem);
-  letter-spacing: -0.055em;
-  line-height: 0.95;
+  font-family: var(--anvil-font-display);
+  font-size: var(--anvil-text-display-section);
+  font-weight: var(--anvil-weight-regular);
+  letter-spacing: var(--anvil-tracking-tighter);
+  line-height: var(--anvil-leading-display);
 }
-.home-section h2::before { display: none; }
-.home-section > p:not(.section-label) { max-width: 48rem; color: var(--anvil-copy); font-size: 1.08rem; }
 
-.ownership-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1px;
-  margin-top: 2.5rem;
-  border: 1px solid var(--anvil-line-strong);
-  background: var(--anvil-line-strong);
+.home-section h2::before { display: none; }
+.home-section > p:not(.section-label) {
+  max-width: 48rem;
+  color: var(--anvil-copy);
+  font-size: var(--anvil-text-2xl);
 }
-.ownership-grid article { padding: clamp(1.5rem, 3vw, 2.5rem); background: var(--anvil-surface-raised); }
-.ownership-grid article:last-child { background: color-mix(in srgb, var(--anvil-cobalt) 7%, var(--anvil-surface-raised)); }
-.ownership-grid small { color: var(--anvil-cobalt); font-family: var(--sl-font-mono); font-size: 0.61rem; font-weight: 700; letter-spacing: 0.09em; }
-.ownership-grid h3 { margin: 0.6rem 0 1.25rem; color: var(--anvil-ink); font-size: 1.45rem; }
-.ownership-grid ul { display: grid; gap: 0.55rem; margin: 0; padding: 0; list-style: none; }
+
+/*
+ * Apply the cut once to each shared-border grid. Clipping individual cards would notch
+ * their shared dividers; the inner wrapper keeps both the diagonal ring and card rows even.
+ */
+.ownership-grid {
+  position: relative;
+  padding: 1px;
+  margin-top: var(--anvil-space-10);
+  background: var(--anvil-line-strong);
+  clip-path: var(--anvil-chamfer-reverse-lg);
+}
+
+.ownership-grid__inner {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
+  gap: 1px;
+  margin: 0;
+  background: var(--anvil-line-strong);
+  clip-path: var(--anvil-chamfer-reverse-lg-inset);
+}
+
+.ownership-grid article {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: clamp(var(--anvil-space-6), 3vw, var(--anvil-space-10));
+  background: var(--anvil-surface-raised);
+}
+
+.ownership-grid article:last-child {
+  background: color-mix(in srgb, var(--anvil-cobalt) 7%, var(--anvil-surface-raised));
+}
+
+.ownership-grid small {
+  color: var(--anvil-cobalt);
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-xs);
+  font-weight: var(--anvil-weight-bold);
+  letter-spacing: var(--anvil-tracking-widest);
+}
+
+.ownership-grid h3 {
+  margin: var(--anvil-space-3) 0 var(--anvil-space-5);
+  color: var(--anvil-ink);
+  font-size: var(--anvil-text-3xl);
+}
+
+.ownership-grid ul {
+  display: grid;
+  flex: 1;
+  gap: var(--anvil-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
 .ownership-grid li { color: var(--anvil-copy); }
-.ownership-grid li::before { margin-right: 0.55rem; color: var(--anvil-cobalt); content: '—'; }
+.ownership-grid li::before {
+  margin-right: var(--anvil-space-2);
+  color: var(--anvil-cobalt);
+  content: '—';
+}
 
 .capability-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 1px;
-  margin-top: 2.5rem;
-  border: 1px solid var(--anvil-line-strong);
+  position: relative;
+  padding: 1px;
+  margin-top: var(--anvil-space-10);
   background: var(--anvil-line-strong);
+  clip-path: var(--anvil-octagon-lg);
 }
+
+.capability-grid__inner {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
+  gap: 1px;
+  margin: 0;
+  background: var(--anvil-line-strong);
+  clip-path: var(--anvil-octagon-lg-inset);
+}
+
 .capability-grid a {
   position: relative;
+  display: flex;
+  flex-direction: column;
   min-height: 13rem;
-  padding: 1.6rem;
+  padding: var(--anvil-space-6);
   background: var(--anvil-surface-raised);
   color: inherit;
   text-decoration: none;
   transition: background-color 150ms ease, transform 150ms ease;
 }
-.capability-grid a:hover { z-index: 1; background: color-mix(in srgb, var(--anvil-cobalt) 8%, var(--anvil-surface-raised)); transform: translateY(-3px); }
-.capability-grid span { color: var(--anvil-cobalt); font-family: var(--sl-font-mono); font-size: 0.6rem; font-weight: 700; }
-.capability-grid h3 { margin: 2.5rem 0 0.65rem; color: var(--anvil-ink); font-size: 1.15rem; }
-.capability-grid p { margin: 0; color: var(--anvil-muted); font-size: 0.9rem; line-height: 1.5; }
+
+.capability-grid a:hover {
+  z-index: 1;
+  background: color-mix(in srgb, var(--anvil-cobalt) 8%, var(--anvil-surface-raised));
+  transform: translateY(-3px);
+}
+
+.capability-grid span {
+  color: var(--anvil-cobalt);
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-xs);
+  font-weight: var(--anvil-weight-bold);
+}
+
+.capability-grid h3 {
+  margin: var(--anvil-space-10) 0 var(--anvil-space-3);
+  color: var(--anvil-ink);
+  font-size: var(--anvil-text-2xl);
+}
+
+.capability-grid p {
+  flex: 1;
+  margin: 0;
+  color: var(--anvil-muted);
+  font-size: var(--anvil-text-lg);
+  line-height: var(--anvil-leading-body);
+}
 
 .replaceability-panel {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(20rem, 0.85fr);
-  gap: clamp(2rem, 6vw, 6rem);
+  gap: clamp(var(--anvil-space-8), 6vw, var(--anvil-space-24));
   align-items: center;
 }
+
 .replaceability-panel > div > p:not(.section-label) {
   max-width: 48rem;
   color: var(--anvil-copy);
-  font-size: 1.08rem;
+  font-size: var(--anvil-text-2xl);
 }
+
 .replaceability-panel aside {
-  position: relative;
-  padding: clamp(1.5rem, 3vw, 2.5rem);
-  border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 35%, var(--anvil-line));
+  padding: clamp(var(--anvil-space-6), 3vw, var(--anvil-space-10));
+  background: color-mix(in srgb, var(--anvil-cobalt) 35%, var(--anvil-line));
+}
+
+.replaceability-panel aside::after {
   background:
     linear-gradient(145deg, color-mix(in srgb, var(--anvil-cobalt) 9%, transparent), transparent 58%),
     var(--anvil-surface-raised);
-  box-shadow: inset 3px 0 var(--anvil-cobalt);
+  box-shadow: inset 0 -4px var(--anvil-cobalt);
 }
+
 .replaceability-panel aside small {
   color: var(--anvil-cobalt);
-  font-family: var(--sl-font-mono);
-  font-size: 0.61rem;
-  font-weight: 700;
-  letter-spacing: 0.09em;
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-xs);
+  font-weight: var(--anvil-weight-bold);
+  letter-spacing: var(--anvil-tracking-widest);
 }
+
 .replaceability-panel aside h3 {
-  margin: 1.2rem 0 0.75rem;
+  margin: var(--anvil-space-5) 0 var(--anvil-space-3);
   color: var(--anvil-ink);
-  font-size: 1.4rem;
+  font-size: var(--anvil-text-3xl);
 }
-.replaceability-panel aside p { margin: 0; color: var(--anvil-copy); font-size: 0.92rem; line-height: 1.62; }
+
+.replaceability-panel aside p {
+  margin: 0;
+  color: var(--anvil-copy);
+  font-size: var(--anvil-text-lg);
+  line-height: var(--anvil-leading-loose);
+}
+
 .replaceability-panel aside a {
   display: inline-flex;
-  gap: 0.5rem;
-  margin-top: 1.3rem;
+  gap: var(--anvil-space-2);
+  margin-top: var(--anvil-space-5);
   color: var(--anvil-cobalt);
-  font-family: var(--sl-font-mono);
-  font-size: 0.67rem;
-  font-weight: 700;
-  letter-spacing: 0.035em;
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-sm);
+  font-weight: var(--anvil-weight-bold);
+  letter-spacing: var(--anvil-tracking-wide);
   text-decoration: none;
   text-transform: uppercase;
 }
-.replaceability-panel aside a:hover { text-decoration: underline; text-underline-offset: 0.25rem; }
+
+.replaceability-panel aside a:hover {
+  text-decoration: underline;
+  text-underline-offset: var(--anvil-space-1);
+}
 
 .docs-callout {
   display: grid;
   grid-template-columns: 1fr auto;
-  gap: 2rem;
+  gap: var(--anvil-space-8);
   align-items: end;
-  padding: clamp(2rem, 5vw, 4rem);
-  border: 1px solid color-mix(in srgb, var(--anvil-cobalt) 35%, var(--anvil-line));
+  padding: clamp(var(--anvil-space-8), 5vw, var(--anvil-space-16));
+  background: color-mix(in srgb, var(--anvil-cobalt) 35%, var(--anvil-line));
+}
+
+.docs-callout::after {
   background:
     linear-gradient(135deg, color-mix(in srgb, var(--anvil-cobalt) 10%, transparent), transparent 55%),
     var(--anvil-surface-raised);
 }
+
 .docs-callout h2 { max-width: 14ch; }
 .docs-callout p { max-width: 42rem; margin-bottom: 0; color: var(--anvil-copy); }
+
 .docs-callout a {
   display: inline-flex;
   align-items: center;
-  gap: 0.6rem;
-  padding: 0.8rem 1rem;
-  border: 1px solid var(--anvil-cobalt);
+  gap: var(--anvil-space-2);
+  padding: var(--anvil-space-3) var(--anvil-space-4);
   background: var(--anvil-cobalt);
   color: white;
-  font-family: var(--sl-font-mono);
-  font-size: 0.68rem;
-  font-weight: 700;
-  letter-spacing: 0.05em;
+  font-family: var(--anvil-font-mono);
+  font-size: var(--anvil-text-sm);
+  font-weight: var(--anvil-weight-extrabold);
+  letter-spacing: var(--anvil-tracking-wider);
   text-decoration: none;
   text-transform: uppercase;
   white-space: nowrap;
+  clip-path: var(--anvil-chamfer-sm);
 }
 
-@media (max-width: 64rem) {
-  .capability-grid { grid-template-columns: repeat(2, 1fr); }
+.replaceability-panel aside::before,
+.docs-callout::before {
+  position: absolute;
+  z-index: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--anvil-cobalt), transparent 70%);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--anvil-cobalt) 55%, transparent);
+  content: '';
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+.replaceability-panel aside::before { inset: auto 16px 0 0; }
+.docs-callout::before { inset: 0 16px auto 0; }
+
+@media (width < 64rem) {
+  .capability-grid__inner { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .replaceability-panel { grid-template-columns: 1fr; }
 }
 
-@media (max-width: 49.99rem) {
+@media (width < 50rem) {
   :root { --sl-nav-height: 4.45rem; }
-  .ownership-grid,
-  .capability-grid,
+  .ownership-grid__inner,
+  .capability-grid__inner,
   .docs-callout { grid-template-columns: 1fr; }
   .docs-callout { align-items: start; }
 }

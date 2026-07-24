@@ -26,26 +26,28 @@ hero:
   </p>
 
   <div class="ownership-grid">
-    <article>
-      <small>CLIENT OWNS</small>
-      <h3>The experience</h3>
-      <ul>
-        <li>Conversation and task UI</li>
-        <li>Permission prompts</li>
-        <li>Session controls</li>
-        <li>Streaming presentation</li>
-      </ul>
-    </article>
-    <article>
-      <small>ANVIL OWNS</small>
-      <h3>The agent runtime</h3>
-      <ul>
-        <li>Model routing and tool loop</li>
-        <li>Permission enforcement</li>
-        <li>Sessions and context compaction</li>
-        <li>Sandboxing and MCP servers</li>
-      </ul>
-    </article>
+    <div class="ownership-grid__inner">
+      <article>
+        <small>CLIENT OWNS</small>
+        <h3>The experience</h3>
+        <ul>
+          <li>Conversation and task UI</li>
+          <li>Permission prompts</li>
+          <li>Session controls</li>
+          <li>Streaming presentation</li>
+        </ul>
+      </article>
+      <article>
+        <small>ANVIL OWNS</small>
+        <h3>The agent runtime</h3>
+        <ul>
+          <li>Model routing and tool loop</li>
+          <li>Permission enforcement</li>
+          <li>Sessions and context compaction</li>
+          <li>Sandboxing and MCP servers</li>
+        </ul>
+      </article>
+    </div>
   </div>
 </section>
 
@@ -54,26 +56,28 @@ hero:
   <h2>Serious infrastructure, behind a clean protocol.</h2>
 
   <div class="capability-grid">
-    <a href="providers/">
-      <span>01 / ROUTE</span>
-      <h3>Model routing</h3>
-      <p>Connect Codex, Bedrock, hosted providers, or local models through stable wire IDs.</p>
-    </a>
-    <a href="tools-bifrost/">
-      <span>02 / EXTEND</span>
-      <h3>Tools + MCP</h3>
-      <p>Ship built-in file and shell tools, skills, subagents, and managed MCP servers.</p>
-    </a>
-    <a href="permissions-sandboxing/">
-      <span>03 / CONTROL</span>
-      <h3>Permission gates</h3>
-      <p>Keep attended and unattended workflows explicit at the protocol boundary.</p>
-    </a>
-    <a href="sessions-context/">
-      <span>04 / REMEMBER</span>
-      <h3>Persistent sessions</h3>
-      <p>Resume work with durable history, context reporting, and automatic compaction.</p>
-    </a>
+    <div class="capability-grid__inner">
+      <a href="providers/">
+        <span>01 / ROUTE</span>
+        <h3>Model routing</h3>
+        <p>Connect Codex, Bedrock, hosted providers, or local models through stable wire IDs.</p>
+      </a>
+      <a href="tools-bifrost/">
+        <span>02 / EXTEND</span>
+        <h3>Tools + MCP</h3>
+        <p>Ship built-in file and shell tools, skills, subagents, and managed MCP servers.</p>
+      </a>
+      <a href="permissions-sandboxing/">
+        <span>03 / CONTROL</span>
+        <h3>Permission gates</h3>
+        <p>Keep attended and unattended workflows explicit at the protocol boundary.</p>
+      </a>
+      <a href="sessions-context/">
+        <span>04 / REMEMBER</span>
+        <h3>Persistent sessions</h3>
+        <p>Resume work with durable history, context reporting, and automatic compaction.</p>
+      </a>
+    </div>
   </div>
 </section>
 
@@ -88,7 +92,7 @@ hero:
         release cycles while the process boundary stays explicit.
       </p>
     </div>
-    <aside>
+    <aside class="anvil-panel anvil-panel--three-cut">
       <small>ARCHITECTURE × LICENSE</small>
       <h3>A practical path to user freedom</h3>
       <p>
@@ -102,7 +106,7 @@ hero:
 </section>
 
 <section class="home-section">
-  <div class="docs-callout">
+  <div class="docs-callout anvil-panel anvil-panel--reverse">
     <div>
       <p class="section-label">Try it in ten minutes</p>
       <h2>Verify the whole path.</h2>
