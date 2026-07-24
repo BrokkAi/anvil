@@ -1816,14 +1816,12 @@ fn convert_messages(
                 // The last user block before an assistant turn is almost always
                 // a tool_result in agentic loops; caching only the Text case
                 // left the entire growing message history uncached every turn.
-                match msg.content.last_mut() {
-                    Some(
-                        BedrockContentOut::Text { cache_control, .. }
-                        | BedrockContentOut::ToolResult { cache_control, .. },
-                    ) => {
-                        *cache_control = Some(CACHE_CONTROL);
-                    }
-                    _ => {}
+                if let Some(
+                    BedrockContentOut::Text { cache_control, .. }
+                    | BedrockContentOut::ToolResult { cache_control, .. },
+                ) = msg.content.last_mut()
+                {
+                    *cache_control = Some(CACHE_CONTROL);
                 }
                 break;
             }
