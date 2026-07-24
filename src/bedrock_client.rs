@@ -294,6 +294,11 @@ fn apply_bedrock_reasoning_presets(models: &mut [ModelMetadata]) {
 
 const CACHE_CONTROL: CacheControl = CacheControl {
     r#type: "ephemeral",
+    // 1-hour TTL (GA on Bedrock, no beta header). Agent sessions reuse the
+    // prompt prefix across long inter-turn gaps — Thor pauses while Eitri runs
+    // sliced code_agent and Loki reviews interleave — which routinely exceeds
+    // the 5-minute default and evicts the prefix before the next turn reads it.
+    ttl: Some("1h"),
 };
 
 fn trace_bedrock_request(body: &BedrockAnthropicRequest) {
@@ -1609,6 +1614,8 @@ struct BedrockOutputConfig {
 #[derive(Debug, Serialize, Clone)]
 struct CacheControl {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1647,6 +1654,8 @@ enum BedrockContentOut {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -1777,6 +1786,7 @@ fn convert_messages(
                     content: vec![BedrockContentOut::ToolResult {
                         tool_use_id,
                         content: tool_output,
+                        cache_control: None,
                     }],
                 });
             }
@@ -1803,9 +1813,17 @@ fn convert_messages(
     if enable_cache {
         for msg in converted.iter_mut().rev() {
             if msg.role == "user" {
-                if let Some(BedrockContentOut::Text { cache_control, .. }) = msg.content.last_mut()
-                {
-                    *cache_control = Some(CACHE_CONTROL);
+                // The last user block before an assistant turn is almost always
+                // a tool_result in agentic loops; caching only the Text case
+                // left the entire growing message history uncached every turn.
+                match msg.content.last_mut() {
+                    Some(
+                        BedrockContentOut::Text { cache_control, .. }
+                        | BedrockContentOut::ToolResult { cache_control, .. },
+                    ) => {
+                        *cache_control = Some(CACHE_CONTROL);
+                    }
+                    _ => {}
                 }
                 break;
             }
@@ -2542,6 +2560,42 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_control_on_trailing_tool_result() {
+        // The common agentic-loop shape: the last user-role message is a
+        // tool_result, not text. The breakpoint must still land on it, or the
+        // entire message-history prefix is billed uncached every turn.
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("What's the weather?"),
+            ChatMessage::assistant("Let me check."),
+            ChatMessage::tool_result("call_1", "get_weather", "72F and sunny"),
+        ];
+        let (_system_blocks, converted) =
+            convert_messages(messages, true).expect("convert with cache");
+
+        let last_user = converted
+            .iter()
+            .rfind(|m| m.role == "user")
+            .expect("last user msg");
+        match last_user.content.last().expect("content") {
+            BedrockContentOut::ToolResult { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "trailing tool_result must carry a cache breakpoint"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_control_serializes_one_hour_ttl() {
+        let json = serde_json::to_value(CACHE_CONTROL).expect("serialize");
+        assert_eq!(json["type"], "ephemeral");
+        assert_eq!(json["ttl"], "1h");
     }
 
     #[test]
