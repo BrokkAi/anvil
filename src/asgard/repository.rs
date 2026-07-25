@@ -57,10 +57,36 @@ pub(crate) fn parent_head_commit(cwd: &Path) -> Result<String> {
 
 /// Applies the selected candidate delta to the live checkout without resetting
 /// harness-owned state such as `.brokk/` and `.bifrost/`.
+///
+/// A plain `git apply` refuses when the patch creates a file that already
+/// exists, untracked, in the target worktree (observed live: a task image
+/// ships a generated, gitignored file such as `src/parser/grammar.ts`; the
+/// delivered patch also adds it; the apply bounces and the delivery is
+/// silently empty). When the straightforward apply would fail, clear any
+/// path the patch touches that is untracked *and* gitignored in the target
+/// worktree -- never anything git already knows about -- and retry once.
 pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
     if patch.is_empty() {
         return Ok(());
     }
+    if git_apply_check(root, patch)? {
+        return run_git_apply(root, patch);
+    }
+    for path in git_apply_numstat_paths(root, patch)? {
+        let full_path = root.join(&path);
+        if full_path.symlink_metadata().is_ok() && is_untracked_and_ignored(root, &path) {
+            fs::remove_file(&full_path).with_context(|| {
+                format!(
+                    "removing untracked, ignored file blocking patch apply: {}",
+                    full_path.display()
+                )
+            })?;
+        }
+    }
+    run_git_apply(root, patch)
+}
+
+fn run_git_apply(root: &Path, patch: &[u8]) -> Result<()> {
     let mut child = Command::new("git")
         .args(["apply", "--binary", "-"])
         .current_dir(root)
@@ -81,6 +107,112 @@ pub(crate) fn apply_selected_patch(root: &Path, patch: &[u8]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Runs `git apply --check --binary -`, reporting whether the patch would
+/// apply cleanly without touching the worktree.
+fn git_apply_check(root: &Path, patch: &[u8]) -> Result<bool> {
+    let mut child = Command::new("git")
+        .args(["apply", "--check", "--binary", "-"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .context("git apply --check stdin")?
+        .write_all(patch)?;
+    Ok(child.wait_with_output()?.status.success())
+}
+
+/// Paths the patch touches, per `git apply --numstat -z --binary -`: NUL-
+/// separated records of `<added>\t<deleted>\t<path>` (a rename's record
+/// carries only the destination path, never both names).
+fn git_apply_numstat_paths(root: &Path, patch: &[u8]) -> Result<Vec<PathBuf>> {
+    let mut child = Command::new("git")
+        .args(["apply", "--numstat", "-z", "--binary", "-"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .context("git apply --numstat stdin")?
+        .write_all(patch)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "{}",
+            git_error_message(
+                root,
+                &["apply", "--numstat", "-z", "--binary", "-"],
+                &output
+            )
+        );
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, |byte| *byte == b'\t');
+            fields.next()?;
+            fields.next()?;
+            fields.next().map(bytes_to_path)
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn bytes_to_path(path: &[u8]) -> PathBuf {
+    PathBuf::from(std::ffi::OsStr::from_bytes(path))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(path: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(path).into_owned())
+}
+
+/// True when `path` (relative to `root`) is both untracked and covered by a
+/// gitignore rule -- the only case where deleting a file the patch wants to
+/// create is safe.
+fn is_untracked_and_ignored(root: &Path, path: &Path) -> bool {
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(path)
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true); // spawn failure: assume tracked, stay conservative
+    if tracked {
+        return false;
+    }
+    Command::new("git")
+        .args(["check-ignore", "-q", "--"])
+        .arg(path)
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Resolves a commit's tree object id via `git rev-parse <commit>^{tree}`,
+/// for identity checks that must compare worktree content rather than commit
+/// shas (a no-op snapshot mints a new sha over an identical tree).
+pub(crate) fn tree_of(repo_root: &Path, commit: &str) -> Result<String> {
+    Ok(
+        git_text(repo_root, &["rev-parse", &format!("{commit}^{{tree}}")])?
+            .trim()
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -1127,6 +1259,93 @@ mod tests {
 
         remove_candidate_repository(&worker);
         remove_candidate_repository(&fresh);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn apply_selected_patch_replaces_an_untracked_ignored_file_the_patch_creates() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        // The task image ships a generated file that is gitignored (e.g. a
+        // build artifact like `src/parser/grammar.ts`); a delivered patch
+        // that also adds it must not bounce off a plain `git apply`.
+        fs::write(repo.join(".gitignore"), "generated.txt\n").unwrap();
+        run_git(repo, &["add", ".gitignore"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let worker = create_candidate_repository(repo, "collision-worker").unwrap();
+        fs::write(worker.root.join("generated.txt"), "worker generated\n").unwrap();
+        // The worker force-adds its own copy of the otherwise-ignored file so
+        // its checkpoint (and the resulting finalize patch) carries it.
+        run_git(&worker.root, &["add", "-f", "generated.txt"]);
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "collision").unwrap();
+        let patch = stage
+            .finalize_patch(base_commit.trim(), &checkpoint)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&patch).contains("generated.txt"));
+
+        // The target checkout already has its own, different, untracked
+        // copy of the ignored file -- exactly the collision `git apply`
+        // refuses on its own.
+        fs::write(
+            repo.join("generated.txt"),
+            "stale local generated content\n",
+        )
+        .unwrap();
+        // Sanity check that this really is the collision a plain `git apply`
+        // refuses, so the fallback path below is actually exercised.
+        assert!(!git_apply_check(repo, &patch).unwrap());
+
+        apply_selected_patch(repo, &patch).unwrap();
+        assert_text_file_eq(&repo.join("generated.txt"), "worker generated\n");
+
+        remove_candidate_repository(&worker);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn apply_selected_patch_still_fails_on_a_genuine_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "line1\nline2\nline3\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let worker = create_candidate_repository(repo, "conflict-worker").unwrap();
+        fs::write(worker.root.join("tracked.txt"), "line1\nCHANGED\nline3\n").unwrap();
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "conflict").unwrap();
+        let patch = stage
+            .finalize_patch(base_commit.trim(), &checkpoint)
+            .unwrap();
+
+        // The target's tracked file no longer matches the patch's context at
+        // all (unlike the untracked+ignored collision above, this file is
+        // tracked, so the collision fallback must not touch it).
+        fs::write(
+            repo.join("tracked.txt"),
+            "unrelated content\nno match here\n",
+        )
+        .unwrap();
+
+        let result = apply_selected_patch(repo, &patch);
+        assert!(
+            result.is_err(),
+            "a genuine content conflict must still fail"
+        );
+        assert_text_file_eq(
+            &repo.join("tracked.txt"),
+            "unrelated content\nno match here\n",
+        );
+
+        remove_candidate_repository(&worker);
         stage.cleanup();
     }
 

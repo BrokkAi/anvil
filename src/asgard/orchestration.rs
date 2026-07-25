@@ -1301,10 +1301,11 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             let Some(checkpoint_commit) = cx.dag.commit_for(&checkpoint) else {
                 return Ok(format!("error: finalize: unknown checkpoint {checkpoint}"));
             };
-            if !cx
-                .latest_prefinalize_source_commits
-                .contains(checkpoint_commit)
-            {
+            if !prefinalize_source_covers(
+                cx.launch.parent_cwd,
+                checkpoint_commit,
+                cx.latest_prefinalize_source_commits,
+            )? {
                 state.turn_ended = true;
                 return Ok(format!(
                     "error: the delivered checkpoint ({checkpoint}) is not the state your latest prefinalize verified; run prefinalize from {checkpoint} (or the checkpoint you intend to deliver), review it, then finalize."
@@ -1648,6 +1649,29 @@ fn unresolved_prefinalize_workers(
         .collect()
 }
 
+/// Whether `checkpoint_commit` is covered by the latest prefinalize pass:
+/// either it *is* one of the verified source commits, or it shares a tree
+/// with one of them. The tree check matters because a no-op verification
+/// worker's snapshot mints a new commit sha over an identical tree (observed
+/// live: w14 -> w15 -> w16 churn), and comparing shas alone would bounce a
+/// finalize of the state that was, in substance, just verified.
+fn prefinalize_source_covers(
+    repo_root: &Path,
+    checkpoint_commit: &str,
+    source_commits: &HashSet<String>,
+) -> Result<bool> {
+    if source_commits.contains(checkpoint_commit) {
+        return Ok(true);
+    }
+    let checkpoint_tree = crate::asgard::tree_of(repo_root, checkpoint_commit)?;
+    for source_commit in source_commits {
+        if crate::asgard::tree_of(repo_root, source_commit)? == checkpoint_tree {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn dedup_spawn_requests(
     cx: &SupervisorLoopContext<'_, '_>,
     spawns: Vec<SpawnRequest>,
@@ -1888,6 +1912,19 @@ fn worker_head_moved(root: &Path, parent_commit: &str, worker: usize) -> bool {
     moved
 }
 
+/// Records a failed finalize attempt to the trace before returning it as an
+/// `asgard_failure`. Early finalize failures previously produced no trace
+/// record at all -- live incidents show `finalized=true` turns with zero
+/// `asgard_finalize` records and an empty delivery graded as a normal result.
+fn trace_finalize_error(checkpoint: &CheckpointId, commit: Option<&str>, error: &anyhow::Error) {
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_finalize",
+        "checkpoint": checkpoint.to_string(),
+        "commit": commit,
+        "error": format!("{error:#}"),
+    }));
+}
+
 fn finalize_asgard(
     context: FinalizeContext<'_>,
     checkpoint: CheckpointId,
@@ -1895,16 +1932,22 @@ fn finalize_asgard(
     usage: TokenUsage,
 ) -> LoopOutcome {
     let Some(checkpoint_commit) = context.dag.commit_for(&checkpoint) else {
-        return asgard_failure(anyhow!("unknown checkpoint {checkpoint}"));
+        let error = anyhow!("unknown checkpoint {checkpoint}");
+        trace_finalize_error(&checkpoint, None, &error);
+        return asgard_failure(error);
     };
     let patch = match context
         .stage
         .finalize_patch(context.base_commit, checkpoint_commit)
     {
         Ok(patch) => patch,
-        Err(error) => return asgard_failure(error),
+        Err(error) => {
+            trace_finalize_error(&checkpoint, Some(checkpoint_commit), &error);
+            return asgard_failure(error);
+        }
     };
     if let Err(error) = crate::asgard::apply_selected_patch(context.parent_cwd, &patch) {
+        trace_finalize_error(&checkpoint, Some(checkpoint_commit), &error);
         return asgard_failure(error);
     }
     let final_text = response.unwrap_or_else(|| match checkpoint {
@@ -3612,6 +3655,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_apply_failure_writes_an_asgard_finalize_trace_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
+        // Plants a file that collides with what w1's finalize patch will try
+        // to create, right before the finalize tool call is processed. This
+        // file is untracked but *not* gitignored -- a genuine collision that
+        // `apply_selected_patch` must still refuse (FIX 1's fallback only
+        // clears untracked+ignored paths) -- so `finalize_asgard` hits its
+        // `apply_selected_patch` error return with no other path resolved.
+        let hook_repo = repo.clone();
+        let hook = Arc::new(move |model: &str, response: &LlmResponse| {
+            if model == "sv-model"
+                && let LlmResponse::ToolCalls { calls, .. } = response
+                && calls.iter().any(|call| call.function.name == FINALIZE_TOOL)
+            {
+                fs::write(
+                    hook_repo.join("a.txt"),
+                    "collides with the delivered patch\n",
+                )
+                .expect("plant colliding file");
+            }
+        });
+
+        let backend = Arc::new(ScriptedAsgardBackend::new_with_response_hook(
+            vec![
+                (
+                    "sv-model",
+                    vec![
+                        text_response("intake literal"),
+                        tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
+                        text_response("w1 launched"),
+                        tool_response(vec![
+                            save_call("sv-save-w1"),
+                            prefinalize_call("sv-prefinalize-w2", "w1", "verify w1"),
+                        ]),
+                        text_response("w2 launched"),
+                        tool_response(vec![
+                            discard_call("sv-discard-w2"),
+                            finalize_call_with_evidence("sv-finalize-w1", "w1", &["w1m2"]),
+                        ]),
+                    ],
+                ),
+                (
+                    "worker-model",
+                    vec![
+                        text_response("intake grounded"),
+                        tool_response(vec![
+                            write_file_call("w1-write", "a.txt", "a\n"),
+                            named_tool_call(
+                                "w1-test",
+                                "run_shell_command",
+                                serde_json::json!({ "command": "test -f a.txt" }),
+                            ),
+                        ]),
+                        text_response("w1 done"),
+                        text_response("w2 verification report"),
+                    ],
+                ),
+            ],
+            Some(hook),
+        ));
+
+        let (outcome, _) = run_scripted_asgard(
+            repo.clone(),
+            backend.clone(),
+            vec![ChatMessage::user("exercise finalize apply failure trace")],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.stop, LoopStop::Failed(_)),
+            "the collision must still fail the apply: {:?}",
+            outcome.stop
+        );
+
+        let trace_records = fs::read_to_string(&trace_path).expect("trace");
+        // Filters on `error` being present, not just `type == "asgard_finalize"`:
+        // the parent temp-dir trace path is a process-wide env var
+        // (`ANVIL_TRACE_JSONL`), so other tests' successful (error-less)
+        // finalize records can land in the same file if they happen to run
+        // concurrently. An errored record is unique to this fix.
+        let finalize = trace_records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["type"] == "asgard_finalize" && record["error"].is_string())
+            .expect("a finalize failure must still write an asgard_finalize trace record");
+        assert_eq!(finalize["checkpoint"], "w1");
+        assert!(
+            finalize["commit"].is_string(),
+            "the checkpoint had already resolved to a commit: {finalize}"
+        );
+        assert!(
+            finalize["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "the apply error must be recorded: {finalize}"
+        );
+    }
+
+    #[tokio::test]
     async fn prefinalize_trajectories_are_viewable_saveable_and_spawnable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -3794,6 +3949,46 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(supervisor_text.contains("error: the delivered checkpoint (w2) is not the state your latest prefinalize verified; run prefinalize from w2 (or the checkpoint you intend to deliver), review it, then finalize."));
+    }
+
+    #[test]
+    fn prefinalize_source_covers_accepts_identical_tree_under_a_different_sha() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let stage = SnapshotStage::new(&repo, &format!("test-{}", uuid::Uuid::new_v4()))
+            .expect("snapshot stage");
+
+        // Two snapshots of an *unchanged* worktree: exactly the no-op
+        // verification-worker case that mints a new commit sha over an
+        // identical tree (live incident: w14 -> w15 -> w16 churn).
+        let first = stage.snapshot(&repo, "first").expect("first snapshot");
+        let second = stage.snapshot(&repo, "second").expect("second snapshot");
+        assert_ne!(first, second, "snapshots must mint distinct commit shas");
+
+        let mut source_commits = HashSet::new();
+        source_commits.insert(first.clone());
+        assert!(
+            prefinalize_source_covers(&repo, &second, &source_commits).expect("tree comparison"),
+            "a checkpoint sharing the verified tree under a new sha must be accepted"
+        );
+
+        // A genuinely different tree must still bounce.
+        fs::write(repo.join("changed.txt"), "new content\n").expect("write changed file");
+        let third = stage.snapshot(&repo, "third").expect("third snapshot");
+        assert!(
+            !prefinalize_source_covers(&repo, &third, &source_commits).expect("tree comparison"),
+            "a checkpoint with a genuinely different tree must not be accepted"
+        );
+
+        stage.cleanup();
     }
 
     /// An `LlmBackend` whose supervisor script is fixed up to a point, then
