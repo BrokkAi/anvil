@@ -32,23 +32,26 @@ pub(crate) struct CandidateRepository {
     parent_root: PathBuf,
 }
 
-pub(crate) fn ensure_compatible_checkout(cwd: &Path) -> Result<()> {
-    let output = git(cwd, &["status", "--porcelain"])?;
-    let status = String::from_utf8(output.stdout).context("git status was not UTF-8")?;
-    let unexpected: Vec<_> = status
-        .lines()
-        .filter(|line| {
-            let path = line.get(3..).unwrap_or("");
-            !path.starts_with(".brokk/") && !path.starts_with(".bifrost/")
-        })
-        .collect();
-    if !unexpected.is_empty() {
-        bail!(
-            "Asgard requires code files to be clean (dirty: {})",
-            unexpected.join(", ")
-        );
-    }
-    Ok(())
+/// Reports non-empty, trimmed `git status --porcelain` output for `cwd`,
+/// excluding harness-owned paths (`.brokk/`, `.bifrost/`) via pathspec magic
+/// so Asgard's own bookkeeping never counts as user dirt. Untracked files
+/// that are gitignored are already omitted by porcelain's default (no
+/// `--ignored`), so they never count either. An empty string means the
+/// working tree is clean from Asgard's point of view.
+pub(crate) fn working_tree_dirt(cwd: &Path) -> Result<String> {
+    Ok(git_text(
+        cwd,
+        &[
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )?
+    .trim()
+    .to_string())
 }
 
 pub(crate) fn parent_head_commit(cwd: &Path) -> Result<String> {
@@ -1507,5 +1510,38 @@ mod tests {
         remove_candidate_repository(&from_worker);
         remove_candidate_repository(&onto_worker);
         remove_candidate_repository(&scratch);
+    }
+
+    #[test]
+    fn working_tree_dirt_ignores_harness_owned_and_gitignored_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        run_git(repo, &["add", "tracked.txt", ".gitignore"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        assert_eq!(working_tree_dirt(repo).unwrap(), "");
+
+        // A gitignored, untracked file must not count as dirt.
+        fs::write(repo.join("ignored.txt"), "generated\n").unwrap();
+        assert_eq!(working_tree_dirt(repo).unwrap(), "");
+
+        // Harness-owned paths (.brokk/, .bifrost/) must not count as dirt,
+        // whether tracked or untracked.
+        fs::create_dir_all(repo.join(".brokk")).unwrap();
+        fs::write(repo.join(".brokk/state.json"), "{}\n").unwrap();
+        fs::create_dir_all(repo.join(".bifrost")).unwrap();
+        fs::write(repo.join(".bifrost/index.bin"), "x\n").unwrap();
+        assert_eq!(working_tree_dirt(repo).unwrap(), "");
+
+        // A genuine uncommitted change to a tracked file must count as dirt.
+        // (The leading status-column space is stripped by the outer `trim()`
+        // when it is also the first character of the whole string.)
+        fs::write(repo.join("tracked.txt"), "base\nedited\n").unwrap();
+        let dirt = working_tree_dirt(repo).unwrap();
+        assert_eq!(dirt, "M tracked.txt");
     }
 }

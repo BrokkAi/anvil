@@ -488,8 +488,15 @@ pub(crate) async fn run_asgard_trajectory_loop(
     initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> (LoopOutcome, BTreeMap<String, TokenUsage>) {
     let mut usage_by_model = BTreeMap::new();
-    if let Err(error) = crate::asgard::ensure_compatible_checkout(parent_registry.cwd()) {
-        return (asgard_failure(error), usage_by_model);
+    match crate::asgard::working_tree_dirt(parent_registry.cwd()) {
+        Ok(dirt) if !dirt.is_empty() => {
+            return (
+                asgard_failure(anyhow!("{}", clean_tree_refusal_message(&dirt))),
+                usage_by_model,
+            );
+        }
+        Ok(_) => {}
+        Err(error) => return (asgard_failure(error), usage_by_model),
     }
     if !(ASGARD_MIN_CANDIDATES..=ASGARD_MAX_CANDIDATES).contains(&config.candidate_models.len()) {
         return (
@@ -2421,6 +2428,34 @@ pub(crate) fn cleanup_asgard_repositories(repositories: &[CandidateRepository]) 
     }
 }
 
+/// Cap on how many `git status --porcelain` lines are echoed back in the
+/// clean-tree refusal message, so a wildly dirty tree doesn't dump its whole
+/// status into a chat turn.
+const CLEAN_TREE_DIRT_PREVIEW_LINES: usize = 10;
+
+/// Builds the refusal message for [`run_asgard_trajectory_loop`]'s clean-tree
+/// precondition. `dirt` is the non-empty, trimmed output of
+/// `working_tree_dirt`.
+fn clean_tree_refusal_message(dirt: &str) -> String {
+    let lines: Vec<&str> = dirt.lines().collect();
+    let mut preview = lines
+        .iter()
+        .take(CLEAN_TREE_DIRT_PREVIEW_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > CLEAN_TREE_DIRT_PREVIEW_LINES {
+        preview.push_str(&format!(
+            "\n(+{} more)",
+            lines.len() - CLEAN_TREE_DIRT_PREVIEW_LINES
+        ));
+    }
+    format!(
+        "Asgard requires a clean working tree; commit or stash your local changes first. \
+         Dirty entries:\n{preview}"
+    )
+}
+
 pub(crate) fn asgard_failure(error: anyhow::Error) -> LoopOutcome {
     let message = format!("Asgard failed: {error:#}");
     tracing::warn!("{message}");
@@ -2943,6 +2978,61 @@ mod tests {
         assert!(
             failure_initial_user
                 .contains("<grounded_contract>\ngrounded only contract\n</grounded_contract>")
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_parent_tree_refuses_before_any_llm_or_worker_activity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        // Uncommitted tracked-file edit: the tree is dirty from Asgard's
+        // point of view at the very start of the loop, before intake.
+        fs::write(repo.join("README.md"), "hello\nlocal edit\n").expect("dirty README");
+
+        // No scripted responses registered for either model: if the loop
+        // reaches intake or the supervisor at all, the backend panics on an
+        // empty response queue, failing the test loudly rather than
+        // silently passing.
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![]));
+        let (outcome, usage_by_model) = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("should never reach the model")],
+        )
+        .await;
+
+        match &outcome.stop {
+            LoopStop::Failed(failure) => {
+                assert!(
+                    failure
+                        .message
+                        .contains("Asgard requires a clean working tree"),
+                    "unexpected failure message: {}",
+                    failure.message
+                );
+                assert!(
+                    failure.message.contains("README.md"),
+                    "failure message should name the dirty file: {}",
+                    failure.message
+                );
+            }
+            other => panic!("expected a clean-tree refusal, got {other:?}"),
+        }
+        assert!(
+            usage_by_model.is_empty(),
+            "no model usage should be recorded"
+        );
+        assert!(
+            backend.requests.lock().expect("requests").is_empty(),
+            "no LLM requests should have been made"
         );
     }
 
