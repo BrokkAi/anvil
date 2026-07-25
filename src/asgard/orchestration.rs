@@ -18,10 +18,11 @@ use crate::asgard::{
     PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
     SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
     UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions, git_refusal,
-    parse_finalize, parse_git_args, parse_spawn_workers, parse_update_plan, parse_view_tool_call,
-    render_dag_overview, render_fragment, render_resolved_views, render_window_compact_for_worker,
-    retain_payloads_for_permanent_record, run_asgard_intake, run_supervisor_git, short_sha,
-    stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
+    parse_finalize, parse_git_args, parse_prefinalize, parse_spawn_workers, parse_update_plan,
+    parse_view_tool_call, render_dag_overview, render_fragment, render_resolved_views,
+    render_window_compact_for_worker, retain_payloads_for_permanent_record, run_asgard_intake,
+    run_supervisor_git, short_sha, stream_supervisor_response, supervisor_supplement,
+    supervisor_tool_definitions,
 };
 use crate::mcp::{McpClient, McpServerConfig};
 
@@ -206,7 +207,7 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     clone_counter: &'ctx mut usize,
     launch: WorkerLaunch<'fut>,
     allowed_models: &'ctx [String],
-    finalize_evidence_bounced: &'ctx mut bool,
+    prefinalize_coverage_bounced: &'ctx mut bool,
     finalize_lineage_bounced: &'ctx mut bool,
     prefinalize_issued: &'ctx mut bool,
     prefinalize_workers: &'ctx mut Vec<usize>,
@@ -253,7 +254,9 @@ struct SupervisorTurnState {
     finalizing_evidence: Vec<String>,
     finalizing_abandoned: Vec<String>,
     turn_ended: bool,
-    finalize_bounced_this_step: bool,
+    /// A gate (prefinalize coverage, finalize lineage) bounced a call this
+    /// step: the step is refunded so the resubmission is free.
+    bounced_this_step: bool,
 }
 
 struct FinalizeContext<'a> {
@@ -598,7 +601,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut clone_counter = 1usize;
     let mut fallback_idle_cycles = 0usize;
     let mut canonical_plan = initial_plan;
-    let mut finalize_evidence_bounced = false;
+    let mut prefinalize_coverage_bounced = false;
     let mut finalize_lineage_bounced = false;
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
@@ -700,7 +703,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 context_prefix_len,
             },
             allowed_models: &config.candidate_models,
-            finalize_evidence_bounced: &mut finalize_evidence_bounced,
+            prefinalize_coverage_bounced: &mut prefinalize_coverage_bounced,
             finalize_lineage_bounced: &mut finalize_lineage_bounced,
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
@@ -934,7 +937,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         finalizing_abandoned: Vec::new(),
         merged: Vec::new(),
         turn_ended: false,
-        finalize_bounced_this_step: false,
+        bounced_this_step: false,
     };
     let mut steps = 0usize;
     let mut unresolved_reminder_sent = false;
@@ -976,7 +979,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         trace_supervisor_llm_response(cx.supervisor_turn, &response);
         usage.add(response.usage());
         steps += 1;
-        state.finalize_bounced_this_step = false;
+        state.bounced_this_step = false;
 
         match response {
             LlmResponse::Text {
@@ -1039,7 +1042,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
                         result,
                     ));
                 }
-                if state.finalize_bounced_this_step {
+                if state.bounced_this_step {
                     steps = steps.saturating_sub(1);
                 }
                 if state.turn_ended {
@@ -1268,11 +1271,37 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 pending: &pending,
                 allowed_models: cx.allowed_models,
             };
-            let spawns = match parse_spawn_workers(call, &context) {
-                Ok(spawns) => spawns,
+            let parsed = match parse_prefinalize(call, &context) {
+                Ok(parsed) => parsed,
                 Err(error) => return Ok(format!("error: {error}")),
             };
-            execute_spawn_requests(cx, state, spawns, SpawnKind::Prefinalize).await
+            let full_suite_worker_count = parsed
+                .workers
+                .iter()
+                .filter(|worker| worker.runs_full_suite)
+                .count();
+            let attacks_total: usize = parsed
+                .workers
+                .iter()
+                .map(|worker| worker.attacks.len())
+                .sum();
+            let skipped_reason_present = parsed.full_suite_skipped.is_some();
+            if full_suite_worker_count == 0
+                && !skipped_reason_present
+                && !*cx.prefinalize_coverage_bounced
+            {
+                *cx.prefinalize_coverage_bounced = true;
+                state.bounced_this_step = true;
+                return Ok("error: prefinalize needs coverage: mark the worker running the FULL unfiltered suite with runs_full_suite (or give full_suite_skipped: '<reason>'), and list your load-bearing beliefs in attacks - naming the worker attacking each. An unattacked belief is exactly the kind that fails the hidden suite. Resubmit prefinalize.".to_string());
+            }
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_prefinalize_coverage",
+                "bounced": *cx.prefinalize_coverage_bounced,
+                "full_suite_worker_count": full_suite_worker_count,
+                "attacks_total": attacks_total,
+                "skipped_reason_present": skipped_reason_present,
+            }));
+            execute_spawn_requests(cx, state, parsed.workers, SpawnKind::Prefinalize).await
         }
         FINALIZE_TOOL => {
             let pending = pending_ids(cx.pending);
@@ -1318,16 +1347,6 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     "error: the delivered checkpoint ({checkpoint}) is not the state your latest prefinalize verified; run prefinalize from {checkpoint} (or the checkpoint you intend to deliver), review it, then finalize."
                 ));
             }
-            let pending_messages = pending_view_messages(cx.pending);
-            let has_sufficient_evidence = evidence.iter().any(|handle| {
-                cx.dag
-                    .handle_is_run_shell_command_result(handle, &pending_messages)
-            });
-            if !has_sufficient_evidence && !*cx.finalize_evidence_bounced {
-                *cx.finalize_evidence_bounced = true;
-                state.finalize_bounced_this_step = true;
-                return Ok("error: before finalizing, name the evidence: the handles of the test runs you inspected (e.g. [\"w9m4\"]). If you have not seen test output for this checkpoint, spawn a verification worker on it first.".to_string());
-            }
             let off_lineage = cx.dag.off_lineage_checkpoints_with_diffstat(&checkpoint);
             let unacknowledged = off_lineage
                 .iter()
@@ -1339,7 +1358,7 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                 .collect::<Vec<_>>();
             if !unacknowledged.is_empty() && !*cx.finalize_lineage_bounced {
                 *cx.finalize_lineage_bounced = true;
-                state.finalize_bounced_this_step = true;
+                state.bounced_this_step = true;
                 let mut message =
                     "error: finalize would leave diff-bearing saved checkpoints off-lineage:\n"
                         .to_string();
@@ -2624,7 +2643,25 @@ mod tests {
         )
     }
 
+    /// A coverage-satisfying prefinalize call: its single worker carries
+    /// `runs_full_suite`, so the coverage gate never bounces it.
     fn prefinalize_call(id: &str, from: &str, instructions: &str) -> ToolCall {
+        named_tool_call(
+            id,
+            "prefinalize",
+            serde_json::json!({
+                "workers": [{
+                    "from": from,
+                    "instructions": instructions,
+                    "runs_full_suite": true,
+                }],
+            }),
+        )
+    }
+
+    /// A prefinalize call with neither `runs_full_suite` nor
+    /// `full_suite_skipped`: bounced once per run by the coverage gate.
+    fn uncovered_prefinalize_call(id: &str, from: &str, instructions: &str) -> ToolCall {
         named_tool_call(
             id,
             "prefinalize",
@@ -4349,8 +4386,8 @@ mod tests {
                     tool_response(vec![prefinalize_workers_call(
                         "sv-prefinalize-batch",
                         serde_json::json!([
-                            { "from": "root", "instructions": "verify" },
-                            { "from": "root", "instructions": "verify" }
+                            { "from": "root", "instructions": "verify", "runs_full_suite": true },
+                            { "from": "root", "instructions": "verify", "runs_full_suite": true }
                         ]),
                     )]),
                     text_response("prefinalize launched"),
@@ -4388,6 +4425,201 @@ mod tests {
             .join("\n");
         assert!(supervisor_text.contains("prefinalize spawned w1 from root"));
         assert!(supervisor_text.contains("skipped 1 duplicate specs (identical to w1)"));
+    }
+
+    #[tokio::test]
+    async fn prefinalize_coverage_bounces_once_then_accepts_even_uncovered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    // First prefinalize: no runs_full_suite, no
+                    // full_suite_skipped - bounced, nothing spawns.
+                    tool_response(vec![uncovered_prefinalize_call(
+                        "sv-pf-uncovered",
+                        "root",
+                        "verify the delivery",
+                    )]),
+                    // Resubmission with coverage: accepted, spawns w1.
+                    tool_response(vec![named_tool_call(
+                        "sv-pf-covered",
+                        "prefinalize",
+                        serde_json::json!({
+                            "workers": [{
+                                "from": "root",
+                                "instructions": "run the full unfiltered suite",
+                                "runs_full_suite": true,
+                                "attacks": ["Belief: nothing else broke -> full unfiltered suite"],
+                            }],
+                        }),
+                    )]),
+                    text_response("reviewing w1"),
+                    // A later uncovered prefinalize never bounces again.
+                    tool_response(vec![
+                        discard_call("sv-discard-w1"),
+                        uncovered_prefinalize_call("sv-pf-uncovered-2", "root", "verify again"),
+                    ]),
+                    text_response("reviewing w2"),
+                    tool_response(vec![discard_call("sv-discard-w2")]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    text_response("w1 verification report"),
+                    text_response("w2 verification report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise prefinalize coverage bounce")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(supervisor_text.contains(
+            "error: prefinalize needs coverage: mark the worker running the FULL unfiltered suite with runs_full_suite (or give full_suite_skipped: '<reason>'), and list your load-bearing beliefs in attacks - naming the worker attacking each. An unattacked belief is exactly the kind that fails the hidden suite. Resubmit prefinalize."
+        ));
+        // The bounced call spawned nothing: the covered resubmission mints w1,
+        // and the later uncovered call spawns w2 without bouncing.
+        assert!(supervisor_text.contains("prefinalize spawned w1 from root"));
+        assert!(supervisor_text.contains("prefinalize spawned w2 from root"));
+
+        let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
+        let coverage_records = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .filter(|record| record["type"] == "asgard_prefinalize_coverage")
+            .collect::<Vec<_>>();
+        // One record per ACCEPTED prefinalize; the bounced call records nothing.
+        assert_eq!(coverage_records.len(), 2, "records: {coverage_records:?}");
+        assert_eq!(coverage_records[0]["bounced"], serde_json::json!(true));
+        assert_eq!(
+            coverage_records[0]["full_suite_worker_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(coverage_records[0]["attacks_total"], serde_json::json!(1));
+        assert_eq!(
+            coverage_records[0]["skipped_reason_present"],
+            serde_json::json!(false)
+        );
+        assert_eq!(coverage_records[1]["bounced"], serde_json::json!(true));
+        assert_eq!(
+            coverage_records[1]["full_suite_worker_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(coverage_records[1]["attacks_total"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn prefinalize_with_skip_reason_is_accepted_first_call_without_bounce() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    text_response("intake literal"),
+                    tool_response(vec![named_tool_call(
+                        "sv-pf-skip",
+                        "prefinalize",
+                        serde_json::json!({
+                            "workers": [{
+                                "from": "root",
+                                "instructions": "verify the docs delivery",
+                            }],
+                            "full_suite_skipped": "docs-only delivery; no test suite applies",
+                        }),
+                    )]),
+                    text_response("reviewing w1"),
+                    tool_response(vec![discard_call("sv-discard-w1")]),
+                    text_response("idle one"),
+                    text_response("idle two"),
+                    text_response("idle three"),
+                    text_response("idle four"),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    text_response("intake grounded"),
+                    text_response("w1 verification report"),
+                ],
+            ),
+        ]));
+
+        let _ = run_scripted_asgard(
+            repo,
+            backend.clone(),
+            vec![ChatMessage::user("exercise prefinalize skip reason")],
+        )
+        .await;
+
+        let supervisor_text = backend
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.model == "sv-model")
+            .map(|request| all_message_text(&request.messages))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!supervisor_text.contains("error: prefinalize needs coverage"));
+        assert!(supervisor_text.contains("prefinalize spawned w1 from root"));
+
+        let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
+        let coverage = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .find(|record| record["type"] == "asgard_prefinalize_coverage")
+            .expect("coverage trace record");
+        assert_eq!(coverage["bounced"], serde_json::json!(false));
+        assert_eq!(coverage["full_suite_worker_count"], serde_json::json!(0));
+        assert_eq!(coverage["attacks_total"], serde_json::json!(0));
+        assert_eq!(coverage["skipped_reason_present"], serde_json::json!(true));
     }
 
     #[tokio::test]
@@ -4436,8 +4668,9 @@ mod tests {
                     )]),
                     text_response("w4 launched"),
                     tool_response(vec![discard_call("sv-discard-w4")]),
+                    // finalize without an evidence array: accepted directly -
+                    // the retired evidence bounce must not fire.
                     tool_response(vec![finalize_call("sv-finalize", "w2")]),
-                    tool_response(vec![finalize_call("sv-finalize-again", "w2")]),
                 ],
             ),
             (
@@ -4565,7 +4798,7 @@ mod tests {
             .iter()
             .filter(|request| request.model == "worker-model")
             .collect::<Vec<_>>();
-        assert_eq!(supervisor_requests.len(), 12);
+        assert_eq!(supervisor_requests.len(), 11);
         assert_eq!(worker_requests.len(), 7);
         let first_supervisor_system = supervisor_requests[0].messages[0].content_text();
         let session_prompt_pos = first_supervisor_system
@@ -4658,8 +4891,9 @@ mod tests {
         assert!(supervisor_text.contains(
             "w3 must be saved, spawned from, or discarded - it is currently none of these"
         ));
-        let finalize_bounce_text = all_message_text(&supervisor_requests[11].messages);
-        assert!(finalize_bounce_text.contains("error: before finalizing, name the evidence: the handles of the test runs you inspected (e.g. [\"w9m4\"]). If you have not seen test output for this checkpoint, spawn a verification worker on it first."));
+        // The evidence gate is retired: a finalize naming no evidence is
+        // accepted on the first call, with no bounce anywhere in the run.
+        assert!(!supervisor_text.contains("error: before finalizing"));
     }
 
     #[tokio::test]

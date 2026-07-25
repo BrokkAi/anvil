@@ -13,6 +13,8 @@ pub(crate) const ASGARD_WORKER_MAX_STEPS_CEILING: usize = 150;
 pub(crate) const ASGARD_SUPERVISOR_MAX_STEPS: usize = 15;
 pub(crate) const ASGARD_VIEW_TOOL_CALL_MAX_HANDLES: usize = 16;
 pub(crate) const ASGARD_SINGLE_BECAUSE_MAX_LENGTH: usize = 300;
+pub(crate) const ASGARD_ATTACK_MAX_LENGTH: usize = 200;
+pub(crate) const ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH: usize = 300;
 
 /// Cap on a single retained payload (view_tool_call or git tool result) kept
 /// verbatim in the permanent record. Bigger payloads keep their first
@@ -38,6 +40,23 @@ pub(crate) struct SpawnRequest {
     /// naming why exactly one continuation is live. See
     /// `ASGARD_SINGLE_BECAUSE_MAX_LENGTH` for the schema-enforced cap.
     pub(crate) single_because: Option<String>,
+    /// Prefinalize coverage: true on the worker whose instructions run the
+    /// project's full, unfiltered test suite on the delivery candidate.
+    /// Always false for regular spawn_workers calls.
+    pub(crate) runs_full_suite: bool,
+    /// Prefinalize coverage: the load-bearing beliefs this worker attacks.
+    /// Each entry is capped at `ASGARD_ATTACK_MAX_LENGTH` characters. Always
+    /// empty for regular spawn_workers calls.
+    pub(crate) attacks: Vec<String>,
+}
+
+/// A parsed prefinalize call: the verification batch plus the optional
+/// top-level `full_suite_skipped` reason (present only when no worker
+/// carries `runs_full_suite` and the supervisor named why that is fine).
+#[derive(Debug)]
+pub(crate) struct PrefinalizeRequest {
+    pub(crate) workers: Vec<SpawnRequest>,
+    pub(crate) full_suite_skipped: Option<String>,
 }
 
 pub(crate) struct FinalizeRequest {
@@ -72,7 +91,7 @@ pub(crate) fn supervisor_supplement() -> String {
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
 - spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you.
 Example - branching review: worker w4 reports "parser change in; 3 edge tests failing; cause unclear - either tokenizer state reset or the quoting rule". Correct resolution: spawn two workers from w4 concurrently - one per hypothesis - and discard the loser. Counter-example - serial is right: worker w9 reports "rename applied; one import path stale, fix is mechanical". Correct resolution: one worker from w9; branching adds nothing when only one continuation is live.
-- prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved.
+- prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
 - git: run a git command (args as an argv list) in your own scratch worktree of the shared repository. Every checkpoint is a real commit - the <dag> overview shows each checkpoint's short hash. Use it to LOOK before deciding: `git diff <parent> <sha>` for a sibling's actual change, `git show <sha> -- <file>`, `git log`. Merges are ordinary `git merge` here: check out the target, merge the other checkpoint's hash, and the resulting commit is deliverable by its hash. On conflict the merge is aborted - spawn a worker to do that merge instead. gc/prune are refused.
 - code intelligence - search_symbols, get_summaries, get_symbol_sources, usage_graph, scan_usages_by_location, get_definitions_by_location, semantic search, and more: read-only Bifrost tools indexing the repository at its base state. Use them to UNDERSTAND before you direct: find the symbols, files, and call sites your task touches so your worker mandates name exact functions and locations instead of describing them. activate_workspace switches Bifrost to another path (for example your git scratch worktree after you check out a checkpoint's hash) to analyze a specific candidate's code.
@@ -145,7 +164,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             function: FunctionDef {
                 name: PREFINALIZE_TOOL.to_string(),
                 description: "Spawn your final verification pass; finalize is locked until this has run and been reviewed. Verification workers should: run the project's full test suite on the checkpoint you intend to deliver; spawn one worker per plant - multi-plant protocols exhaust step budgets; plant one classic bug in the diff's critical paths - swap an argument order, invert a boundary, drop a term - and confirm the suite goes red. Each plant must be a real mutation of the SHIPPED implementation confirmed by inspecting the diff, never a synthetic stand-in function or an edit to test files/mocks. Revert the plant and report any plant the suite failed to catch (a surviving plant means a test must be strengthened before finalizing); re-check the task's obligations against the delivered state. Alongside the plant workers, include one verification worker dedicated to adversarial inputs derived from the spec text alone - empty, zero, single vs many, negative, trailing, an attribute present but valueless - exercised through the public surface; near-misses live in the edges the implementation's own tests never generated. A hung or timed-out verification run is a blocker: identify the exact hanging test before attributing it to anything pre-existing. Never substitute a weaker ad-hoc check. If verification reveals needed work stranded in another checkpoint, merge it in with the git tool.".to_string(),
-                parameters: spawn_workers_parameters(&allowed_models),
+                parameters: prefinalize_parameters(&allowed_models),
             },
         },
         ToolDefinition {
@@ -199,7 +218,7 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
             r#type: "function".to_string(),
             function: FunctionDef {
                 name: FINALIZE_TOOL.to_string(),
-                description: "End the run delivering the named checkpoint's state; response overrides the checkpoint worker's final message as the user-facing answer. Name evidence handles for inspected test runs whenever possible.".to_string(),
+                description: "End the run delivering the named checkpoint's state; response overrides the checkpoint worker's final message as the user-facing answer. Evidence handles for inspected test runs remain welcome context.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -266,7 +285,11 @@ fn mcp_tools_to_definitions(tools: &[McpToolDef]) -> Vec<ToolDefinition> {
         .collect()
 }
 
-fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
+/// Prefinalize's own parameters: the spawn_workers worker shape plus the
+/// coverage contract - per-worker `runs_full_suite` and `attacks`, and a
+/// top-level `full_suite_skipped` reason. spawn_workers keeps its own
+/// schema; these fields never appear there.
+fn prefinalize_parameters(allowed_models: &[&String]) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -298,8 +321,22 @@ fn spawn_workers_parameters(allowed_models: &[&String]) -> serde_json::Value {
                             "maxLength": ASGARD_SINGLE_BECAUSE_MAX_LENGTH,
                             "description": "When continuing width-1 after repeated width-1 turns: one sentence naming why exactly one continuation is live.",
                         },
+                        "runs_full_suite": {
+                            "type": "boolean",
+                            "description": "True on the worker whose instructions run the project's FULL, unfiltered test suite on the delivery candidate. Scoped or filtered runs do not count. Every prefinalize batch needs one of these or a top-level full_suite_skipped reason.",
+                        },
+                        "attacks": {
+                            "type": "array",
+                            "items": { "type": "string", "maxLength": ASGARD_ATTACK_MAX_LENGTH },
+                            "description": "Load-bearing beliefs this worker attacks. A belief is load-bearing when the delivery is wrong if the belief is: an ambiguity you resolved, a 'this cannot affect X' assumption, a compliance claim you have never seen fail-then-pass, any code or signature you dictated. An attack constructs the situation where a wrong belief breaks - it does not re-run tests that already pass. The belief you do not name is the one that fails the hidden suite.",
+                        },
                     },
                 },
+            },
+            "full_suite_skipped": {
+                "type": "string",
+                "maxLength": ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH,
+                "description": "Only when no worker carries runs_full_suite: one sentence naming why a full-suite run is not warranted for this delivery.",
             },
         },
     })
@@ -367,6 +404,47 @@ pub(crate) fn parse_spawn_workers(
     call: &ToolCall,
     context: &SupervisorTurnContext<'_>,
 ) -> std::result::Result<Vec<SpawnRequest>, String> {
+    // Regular spawn_workers never carries the coverage fields; if a model
+    // passes them anyway they are ignored (absent from the tool's schema).
+    parse_spawn_workers_impl(call, context, false)
+}
+
+/// Parses a prefinalize call: the same worker batch as spawn_workers plus the
+/// coverage contract (`runs_full_suite`/`attacks` per worker, top-level
+/// `full_suite_skipped`).
+pub(crate) fn parse_prefinalize(
+    call: &ToolCall,
+    context: &SupervisorTurnContext<'_>,
+) -> std::result::Result<PrefinalizeRequest, String> {
+    let workers = parse_spawn_workers_impl(call, context, true)?;
+    let arguments = normalize_arguments(&call.function.arguments)?;
+    let full_suite_skipped = match arguments.get("full_suite_skipped") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| "full_suite_skipped must be a string".to_string())?
+                .trim()
+                .to_string();
+            if text.len() > ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH {
+                return Err(format!(
+                    "full_suite_skipped must be at most {ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH} characters"
+                ));
+            }
+            if text.is_empty() { None } else { Some(text) }
+        }
+    };
+    Ok(PrefinalizeRequest {
+        workers,
+        full_suite_skipped,
+    })
+}
+
+fn parse_spawn_workers_impl(
+    call: &ToolCall,
+    context: &SupervisorTurnContext<'_>,
+    parse_coverage: bool,
+) -> std::result::Result<Vec<SpawnRequest>, String> {
     let arguments = normalize_arguments(&call.function.arguments)?;
     let workers = arguments
         .get("workers")
@@ -384,7 +462,7 @@ pub(crate) fn parse_spawn_workers(
     workers
         .iter()
         .enumerate()
-        .map(|(index, worker)| parse_spawn_worker(index, worker, context))
+        .map(|(index, worker)| parse_spawn_worker(index, worker, context, parse_coverage))
         .collect()
 }
 
@@ -392,6 +470,7 @@ fn parse_spawn_worker(
     index: usize,
     worker: &serde_json::Value,
     context: &SupervisorTurnContext<'_>,
+    parse_coverage: bool,
 ) -> std::result::Result<SpawnRequest, String> {
     let from_raw = worker
         .get("from")
@@ -450,12 +529,48 @@ fn parse_spawn_worker(
             if text.is_empty() { None } else { Some(text) }
         }
     };
+    let runs_full_suite = if parse_coverage {
+        match worker.get("runs_full_suite") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("workers[{index}].runs_full_suite must be a boolean"))?,
+        }
+    } else {
+        false
+    };
+    let attacks = if parse_coverage {
+        match worker.get("attacks") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(_) => {
+                let attacks = string_array_property(worker, "attacks")
+                    .map_err(|error| format!("workers[{index}].{error}"))?;
+                let mut trimmed = Vec::new();
+                for (attack_index, attack) in attacks.iter().enumerate() {
+                    let attack = attack.trim();
+                    if attack.len() > ASGARD_ATTACK_MAX_LENGTH {
+                        return Err(format!(
+                            "workers[{index}].attacks[{attack_index}] must be at most {ASGARD_ATTACK_MAX_LENGTH} characters"
+                        ));
+                    }
+                    if !attack.is_empty() {
+                        trimmed.push(attack.to_string());
+                    }
+                }
+                trimmed
+            }
+        }
+    } else {
+        Vec::new()
+    };
     Ok(SpawnRequest {
         from,
         instructions,
         model,
         max_steps,
         single_because,
+        runs_full_suite,
+        attacks,
     })
 }
 
@@ -798,6 +913,188 @@ mod tests {
             parse_spawn_workers(&too_long, &context)
                 .expect_err("too long single_because")
                 .contains("must be at most")
+        );
+    }
+
+    #[test]
+    fn prefinalize_parser_parses_coverage_fields_and_threads_full_suite_skipped() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            allowed_models: &[],
+        };
+
+        let call = supervisor_tool_call(
+            "pf",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [
+                    {
+                        "from": "root",
+                        "instructions": "run the full suite",
+                        "runs_full_suite": true,
+                        "attacks": ["  Belief: sorting is stable -> equal keys diffed  "],
+                    },
+                    { "from": "w1", "instructions": "adversarial edges" }
+                ],
+                "full_suite_skipped": "  not warranted: docs-only delivery  ",
+            }),
+        );
+        let parsed = parse_prefinalize(&call, &context).expect("valid prefinalize");
+        assert!(parsed.workers[0].runs_full_suite);
+        assert_eq!(
+            parsed.workers[0].attacks,
+            vec!["Belief: sorting is stable -> equal keys diffed".to_string()]
+        );
+        assert!(!parsed.workers[1].runs_full_suite);
+        assert!(parsed.workers[1].attacks.is_empty());
+        assert_eq!(
+            parsed.full_suite_skipped.as_deref(),
+            Some("not warranted: docs-only delivery")
+        );
+
+        // Absent and blank full_suite_skipped both thread through as None.
+        let without_reason = supervisor_tool_call(
+            "pf",
+            PREFINALIZE_TOOL,
+            serde_json::json!({ "workers": [{ "from": "root", "instructions": "x" }] }),
+        );
+        let parsed = parse_prefinalize(&without_reason, &context).expect("valid prefinalize");
+        assert_eq!(parsed.full_suite_skipped, None);
+        assert!(!parsed.workers[0].runs_full_suite);
+        assert!(parsed.workers[0].attacks.is_empty());
+
+        let blank_reason = supervisor_tool_call(
+            "pf",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "root", "instructions": "x" }],
+                "full_suite_skipped": "   ",
+            }),
+        );
+        let parsed = parse_prefinalize(&blank_reason, &context).expect("valid prefinalize");
+        assert_eq!(parsed.full_suite_skipped, None);
+    }
+
+    #[test]
+    fn prefinalize_parser_enforces_attack_and_skip_reason_caps() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            allowed_models: &[],
+        };
+
+        let long_attack = supervisor_tool_call(
+            "pf",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{
+                    "from": "root",
+                    "instructions": "x",
+                    "attacks": ["a".repeat(ASGARD_ATTACK_MAX_LENGTH + 1)],
+                }]
+            }),
+        );
+        let error = parse_prefinalize(&long_attack, &context).expect_err("201-char attack");
+        assert!(
+            error.contains("workers[0].attacks[0] must be at most 200 characters"),
+            "unexpected error: {error}"
+        );
+
+        let long_reason = supervisor_tool_call(
+            "pf",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "root", "instructions": "x" }],
+                "full_suite_skipped": "b".repeat(ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH + 1),
+            }),
+        );
+        let error = parse_prefinalize(&long_reason, &context).expect_err("301-char reason");
+        assert!(
+            error.contains("full_suite_skipped must be at most 300 characters"),
+            "unexpected error: {error}"
+        );
+
+        let bad_flag = supervisor_tool_call(
+            "pf",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "root", "instructions": "x", "runs_full_suite": "yes" }]
+            }),
+        );
+        assert!(
+            parse_prefinalize(&bad_flag, &context)
+                .expect_err("non-boolean runs_full_suite")
+                .contains("workers[0].runs_full_suite must be a boolean")
+        );
+    }
+
+    #[test]
+    fn spawn_workers_parser_ignores_coverage_fields() {
+        let dag = saved_dag();
+        let context = SupervisorTurnContext {
+            dag: &dag,
+            pending: &[],
+            allowed_models: &[],
+        };
+
+        // The coverage fields are absent from spawn_workers' schema; a model
+        // passing them anyway must not affect the spawn - not even the
+        // per-item cap applies.
+        let call = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{
+                    "from": "root",
+                    "instructions": "x",
+                    "runs_full_suite": true,
+                    "attacks": ["a".repeat(ASGARD_ATTACK_MAX_LENGTH + 100)],
+                }]
+            }),
+        );
+        let spawns = parse_spawn_workers(&call, &context).expect("coverage fields ignored");
+        assert!(!spawns[0].runs_full_suite);
+        assert!(spawns[0].attacks.is_empty());
+    }
+
+    #[test]
+    fn prefinalize_schema_carries_coverage_contract_and_spawn_workers_does_not() {
+        let tools = supervisor_tool_definitions(&["model-a".to_string()]);
+        let prefinalize = tools
+            .iter()
+            .find(|tool| tool.function.name == PREFINALIZE_TOOL)
+            .expect("prefinalize tool");
+        let parameters = &prefinalize.function.parameters;
+        let worker_properties = &parameters["properties"]["workers"]["items"]["properties"];
+        assert_eq!(worker_properties["runs_full_suite"]["type"], "boolean");
+        assert_eq!(
+            worker_properties["attacks"]["items"]["maxLength"],
+            ASGARD_ATTACK_MAX_LENGTH
+        );
+        assert_eq!(
+            parameters["properties"]["full_suite_skipped"]["maxLength"],
+            ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH
+        );
+        // Prefinalize keeps the shared worker fields after the schema split.
+        assert!(worker_properties.get("max_steps").is_some());
+        assert!(worker_properties.get("single_because").is_some());
+
+        let spawn_workers = tools
+            .iter()
+            .find(|tool| tool.function.name == SPAWN_WORKERS_TOOL)
+            .expect("spawn_workers tool");
+        let spawn_parameters = &spawn_workers.function.parameters;
+        let spawn_worker_properties =
+            &spawn_parameters["properties"]["workers"]["items"]["properties"];
+        assert!(spawn_worker_properties.get("runs_full_suite").is_none());
+        assert!(spawn_worker_properties.get("attacks").is_none());
+        assert!(
+            spawn_parameters["properties"]
+                .get("full_suite_skipped")
+                .is_none()
         );
     }
 
@@ -1181,6 +1478,17 @@ mod tests {
              both concurrently instead of trying them one at a time; serial retries of \
              guesses are the most expensive habit here."
         ));
+    }
+
+    #[test]
+    fn supervisor_supplement_teaches_prefinalize_coverage() {
+        let supplement = supervisor_supplement();
+
+        assert!(supplement.contains("mark your full-suite worker with runs_full_suite"));
+        assert!(supplement.contains("broadest attack"));
+        assert!(supplement.contains("or state full_suite_skipped"));
+        assert!(supplement.contains("Refutations name attacks, not reassurance"));
+        assert!(supplement.contains("Dictated code is a belief too"));
     }
 
     #[test]

@@ -518,37 +518,6 @@ impl TrajectoryDag {
             result: result.content_text().to_string(),
         })
     }
-
-    pub(crate) fn handle_is_run_shell_command_result(
-        &self,
-        handle: &str,
-        pending: &[(usize, &[ChatMessage])],
-    ) -> bool {
-        let Some((worker, index)) = crate::asgard::parse_worker_tool_handle(handle) else {
-            return false;
-        };
-        let messages = if let Some((_, pending_messages)) = pending
-            .iter()
-            .find(|(pending_worker, _)| *pending_worker == worker)
-        {
-            Some(*pending_messages)
-        } else {
-            self.nodes
-                .get(&worker)
-                .map(|node| node.window.window_messages.as_slice())
-        };
-        let Some(messages) = messages else {
-            return false;
-        };
-        if messages
-            .get(index)
-            .is_none_or(|message| message.role != "tool")
-        {
-            return false;
-        }
-        crate::asgard::originating_tool_call(messages, index)
-            .is_some_and(|call| call.function.name == "run_shell_command")
-    }
 }
 
 fn git_is_ancestor(root: &Path, ancestor_commit: &str, target_commit: &str) -> Result<bool> {
@@ -1029,42 +998,6 @@ mod tests {
                 r#"<tool_call handle="w1m2" error="handle does not name a tool result" />"#
             )
         );
-    }
-
-    #[test]
-    fn handle_is_run_shell_command_result_checks_saved_and_pending_results() {
-        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
-        let mut saved = window(1, CheckpointId::Root, "saved");
-        saved.window_messages = vec![
-            assistant_call(call("read", "read_file", r#"{"file_path":"x"}"#)),
-            ChatMessage::tool_result("read", "read_file", "read result"),
-            assistant_call(call(
-                "shell",
-                "run_shell_command",
-                r#"{"command":"cargo test"}"#,
-            )),
-            ChatMessage::tool_result("shell", "run_shell_command", "test result"),
-        ];
-        dag.insert(TrajectoryNode {
-            window: saved,
-            commit: "c1".to_string(),
-            merged_from: Vec::new(),
-        })
-        .unwrap();
-        let pending = vec![
-            assistant_call(call(
-                "pending-shell",
-                "run_shell_command",
-                r#"{"command":"pwd"}"#,
-            )),
-            ChatMessage::tool_result("pending-shell", "run_shell_command", "pending result"),
-        ];
-
-        assert!(dag.handle_is_run_shell_command_result("w1m3", &[]));
-        assert!(dag.handle_is_run_shell_command_result("w2m1", &[(2, &pending)]));
-        assert!(!dag.handle_is_run_shell_command_result("w1m1", &[]));
-        assert!(!dag.handle_is_run_shell_command_result("w1m2", &[]));
-        assert!(!dag.handle_is_run_shell_command_result("bad", &[(2, &pending)]));
     }
 
     #[test]
