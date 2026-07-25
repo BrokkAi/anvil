@@ -119,15 +119,6 @@ const ASGARD_WIDTH1_STREAK_CHALLENGE_THRESHOLD: usize = 3;
 /// nudge cannot loop forever.
 const ASGARD_BRANCH_CHALLENGES_MAX_PER_RUN: usize = 2;
 const ASGARD_BRANCH_CHALLENGE_MESSAGE: &str = "error: this lineage has continued width-1 through repeated reviews. Either spawn >=2 workers pursuing genuinely different continuations in this batch, or resubmit with single_because: '<one sentence naming why exactly one continuation is live>'.";
-/// Per-review-turn budget for the supervisor's code-exploration tools (the
-/// `git` tool plus every Bifrost code-intelligence tool). Reading the code to
-/// decide is cheap and encouraged, but open-ended codebase spelunking inside a
-/// single turn is the measured flash-supervisor failure mode (20-37 calls in
-/// one turn before acting); once the budget is spent the supervisor is told to
-/// act and can explore again on its next turn. view_tool_call (reviewing worker
-/// output) is deliberately not budgeted.
-const ASGARD_SUPERVISOR_READ_CALLS_PER_TURN: usize = 10;
-const ASGARD_SUPERVISOR_READ_BUDGET_MESSAGE: &str = "error: code-exploration budget for this review turn is used up (10 git/analysis calls). Decide and act now - spawn workers, save, merge, discard, or finalize; you can explore further on your next review turn.";
 
 struct FinishedWorker {
     worker: usize,
@@ -249,13 +240,11 @@ struct SupervisorLoopResult<'fut> {
     spawned_batch: Vec<BoxFuture<'fut, FinishedWorker>>,
 }
 
-#[derive(Default)]
 struct SupervisorTurnState {
     latest_plan: Option<UpdatePlanArgs>,
     spawned: Vec<usize>,
     prefinalized: Vec<usize>,
     spawned_this_turn: usize,
-    read_calls_this_turn: usize,
     resolved_pending: HashSet<usize>,
     saved_any: bool,
     discarded: bool,
@@ -930,7 +919,6 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
         spawned: Vec::new(),
         prefinalized: Vec::new(),
         spawned_this_turn: 0,
-        read_calls_this_turn: 0,
         resolved_pending: HashSet::new(),
         saved_any: false,
         discarded: false,
@@ -1146,17 +1134,6 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
     })
 }
 
-/// Charge one code-exploration call (the `git` tool or a Bifrost tool) against
-/// the supervisor's per-turn budget. Returns the budget-exhausted message once
-/// the turn's allowance is spent; otherwise records the call and returns None.
-fn charge_supervisor_read_budget(state: &mut SupervisorTurnState) -> Option<String> {
-    if state.read_calls_this_turn >= ASGARD_SUPERVISOR_READ_CALLS_PER_TURN {
-        return Some(ASGARD_SUPERVISOR_READ_BUDGET_MESSAGE.to_string());
-    }
-    state.read_calls_this_turn += 1;
-    None
-}
-
 async fn execute_supervisor_call<'ctx, 'fut>(
     cx: &mut SupervisorLoopContext<'ctx, 'fut>,
     call: &ToolCall,
@@ -1204,9 +1181,6 @@ async fn execute_supervisor_call<'ctx, 'fut>(
             })
         }
         GIT_TOOL => {
-            if let Some(msg) = charge_supervisor_read_budget(state) {
-                return Ok(msg);
-            }
             let args = match parse_git_args(call) {
                 Ok(args) => args,
                 Err(error) => return Ok(format!("error: {error}")),
@@ -1392,9 +1366,6 @@ async fn execute_supervisor_call<'ctx, 'fut>(
                     "error: code-intelligence tools are unavailable this run".to_string(),
                 );
             };
-            if let Some(msg) = charge_supervisor_read_budget(state) {
-                return Ok(msg);
-            }
             let args = crate::tool_arguments::normalize_tool_arguments(&call.function.arguments)
                 .map(|normalized| normalized.value)
                 .unwrap_or_else(|_| serde_json::json!({}));
@@ -2430,20 +2401,6 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::fs;
-
-    #[test]
-    fn supervisor_read_budget_allows_ten_then_refuses_and_resets_per_turn() {
-        let mut state = SupervisorTurnState::default();
-        for _ in 0..ASGARD_SUPERVISOR_READ_CALLS_PER_TURN {
-            assert!(charge_supervisor_read_budget(&mut state).is_none());
-        }
-        let refusal = charge_supervisor_read_budget(&mut state).expect("budget exhausted");
-        assert!(refusal.contains("code-exploration budget"));
-        assert_eq!(refusal, ASGARD_SUPERVISOR_READ_BUDGET_MESSAGE);
-        // A fresh turn's state restores the full allowance.
-        let mut next_turn = SupervisorTurnState::default();
-        assert!(charge_supervisor_read_budget(&mut next_turn).is_none());
-    }
     use std::process::Command;
     use std::sync::Mutex;
     use std::time::Duration;
