@@ -15,6 +15,7 @@ use crate::trace_logging::append_trace_record;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -122,7 +123,10 @@ fn bedrock_reasoning_spec_for_model(model: &str) -> Option<BedrockReasoningSpec>
             send_output_effort: false,
         });
     }
-    if is_prefixed_bedrock_model(&model, &["openai.gpt-5.5", "openai.gpt-5.4"]) {
+    if is_prefixed_bedrock_model(
+        &model,
+        &["openai.gpt-5.6", "openai.gpt-5.5", "openai.gpt-5.4"],
+    ) {
         return Some(BedrockReasoningSpec {
             default_level: Some("medium"),
             presets: OPENAI_GPT_REASONING_PRESETS,
@@ -134,6 +138,7 @@ fn bedrock_reasoning_spec_for_model(model: &str) -> Option<BedrockReasoningSpec>
     let anthropic = |needle: &str| model.contains(needle);
     if anthropic("claude-fable-5")
         || anthropic("claude-mythos-5")
+        || anthropic("claude-opus-5")
         || anthropic("claude-opus-4-8")
         || anthropic("claude-opus-4-7")
         || anthropic("claude-sonnet-5")
@@ -291,6 +296,11 @@ fn apply_bedrock_reasoning_presets(models: &mut [ModelMetadata]) {
 
 const CACHE_CONTROL: CacheControl = CacheControl {
     r#type: "ephemeral",
+    // 1-hour TTL (GA on Bedrock, no beta header). Agent sessions reuse the
+    // prompt prefix across long inter-turn gaps — Thor pauses while Eitri runs
+    // sliced code_agent and Loki reviews interleave — which routinely exceeds
+    // the 5-minute default and evicts the prefix before the next turn reads it.
+    ttl: Some("1h"),
 };
 
 fn trace_bedrock_request(body: &BedrockAnthropicRequest) {
@@ -354,6 +364,8 @@ const BEDROCK_CONTROL_BASE_URL: &str = "https://bedrock";
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_TOKENS: u32 = 8192;
+const BEDROCK_DISCOVERY_MAX_ATTEMPTS: u64 = 4;
+const BEDROCK_DISCOVERY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct BedrockClient {
@@ -370,6 +382,211 @@ pub struct BedrockClient {
     /// model family, but this cache preserves the provider-directed adaptive
     /// fallback if a manual-thinking model rejects `enabled`.
     thinking_shape_cache: Arc<RwLock<HashMap<String, ThinkingShape>>>,
+    /// Content-keyed cache mapping a hash of a Responses API message context
+    /// to the `response_id` it produced, so the next turn on the same
+    /// conversation can chain onto it via `previous_response_id` and send
+    /// only the delta instead of resending the whole conversation. See
+    /// `invoke_responses_model`. Only touched by the Responses API (OpenAI
+    /// Bedrock Mantle) path; irrelevant to the native Anthropic/converse
+    /// path.
+    responses_chain: Arc<std::sync::Mutex<ResponsesChainCache>>,
+    discovery_cache: Arc<BedrockDiscoveryCache>,
+}
+
+struct BedrockDiscoveryCache {
+    mantle_models: LastGoodDiscovery<Vec<ModelMetadata>>,
+    foundation_models: LastGoodDiscovery<Vec<ModelMetadata>>,
+    inference_profiles: LastGoodDiscovery<Vec<BedrockInferenceProfileSummary>>,
+}
+
+impl BedrockDiscoveryCache {
+    fn new() -> Self {
+        Self {
+            mantle_models: LastGoodDiscovery::new("Bedrock Mantle model discovery"),
+            foundation_models: LastGoodDiscovery::new("Bedrock foundation-model discovery"),
+            inference_profiles: LastGoodDiscovery::new("Bedrock inference profile discovery"),
+        }
+    }
+}
+
+struct LastGoodDiscovery<T> {
+    name: &'static str,
+    value: std::sync::Mutex<Option<LastGoodValue<T>>>,
+}
+
+impl<T> LastGoodDiscovery<T> {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            value: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl<T: Clone> LastGoodDiscovery<T> {
+    fn record(&self, value: T) -> T {
+        *self.value.lock().expect("discovery cache mutex poisoned") = Some(LastGoodValue {
+            value: value.clone(),
+            updated_at: std::time::Instant::now(),
+        });
+        value
+    }
+
+    fn get_stale(&self) -> Option<(T, Duration)> {
+        self.value
+            .lock()
+            .expect("discovery cache mutex poisoned")
+            .as_ref()
+            .map(|cached| (cached.value.clone(), cached.updated_at.elapsed()))
+    }
+}
+
+struct LastGoodValue<T> {
+    value: T,
+    updated_at: std::time::Instant,
+}
+
+/// How many message-context -> response_id entries `responses_chain` keeps
+/// before evicting the oldest. Bounds memory for long-lived processes with
+/// many/large conversations without needing a `lru` crate dependency.
+const RESPONSES_CHAIN_CACHE_CAP: usize = 512;
+
+/// Bounded content-keyed cache backing `BedrockClient::responses_chain`.
+/// Plain `HashMap` + FIFO insertion-order eviction -- no promote-on-read --
+/// which is enough to bound memory; see `RESPONSES_CHAIN_CACHE_CAP`.
+#[derive(Debug, Default)]
+struct ResponsesChainCache {
+    entries: HashMap<u64, String>,
+    order: std::collections::VecDeque<u64>,
+    cap: usize,
+}
+
+impl ResponsesChainCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get(&self, key: u64) -> Option<String> {
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: u64, value: String) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key);
+            while self.order.len() > self.cap {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.entries.insert(key, value);
+    }
+
+    fn evict(&mut self, key: u64) {
+        self.entries.remove(&key);
+        self.order.retain(|k| *k != key);
+    }
+}
+
+/// Hashes an ordered Responses API message context (role + normalized
+/// content + tool-call/tool-result fields, in order) to a stable 64-bit key
+/// for `ResponsesChainCache`. Order-sensitive and content-sensitive: any
+/// difference in message order, text, or tool-call identity/arguments
+/// produces a different hash.
+fn hash_responses_context(messages: &[ChatMessage]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    for msg in messages {
+        hash_responses_message(msg, &mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_responses_message(msg: &ChatMessage, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    msg.role.hash(hasher);
+    for part in &msg.content {
+        match part {
+            ChatContentPart::Text { text } => {
+                0u8.hash(hasher);
+                text.hash(hasher);
+            }
+            ChatContentPart::Image { image_url } => {
+                1u8.hash(hasher);
+                image_url.hash(hasher);
+            }
+        }
+    }
+    match &msg.tool_calls {
+        Some(calls) => {
+            calls.len().hash(hasher);
+            for call in calls {
+                call.id.hash(hasher);
+                call.r#type.hash(hasher);
+                call.function.name.hash(hasher);
+                call.function.arguments.hash(hasher);
+            }
+        }
+        None => 0usize.hash(hasher),
+    }
+    msg.tool_call_id.hash(hasher);
+    msg.name.hash(hasher);
+}
+
+/// Finds the largest cached prefix of `messages` that matches a previously
+/// stored Responses API context, so the delta sent as the next turn's input
+/// is as small as possible.
+///
+/// Walks assistant-message boundary indices from the *end* of `messages`
+/// toward the start. For each assistant index `a`, looks up
+/// `hash(messages[0..a])`: a hit means messages `0..a` were exactly the
+/// input of a previously stored response, and `messages[a]` is that
+/// response's assistant turn now echoed back into history. The first
+/// (largest-`a`) hit wins. Returns `(a, previous_response_id)`; the caller
+/// sends `previous_response_id` plus `messages[a+1..]` as the new input.
+///
+/// Returns `None` on a fresh conversation, an evicted/never-seen prefix, or
+/// a first turn -- callers should fall back to sending the full `messages`
+/// as today.
+fn find_responses_continuation(
+    messages: &[ChatMessage],
+    lookup: impl Fn(u64) -> Option<String>,
+) -> Option<(usize, String)> {
+    for a in (0..messages.len()).rev() {
+        if messages[a].role != "assistant" {
+            continue;
+        }
+        let hash = hash_responses_context(&messages[..a]);
+        if let Some(id) = lookup(hash) {
+            return Some((a, id));
+        }
+    }
+    None
+}
+
+/// Heuristic match for a Responses API error indicating `previous_response_id`
+/// was unknown, expired, or otherwise invalid, so the caller can evict the
+/// cache entry and retry once with the full input. The exact error-body
+/// shape isn't documented; this defensively matches a client-error status
+/// plus the field name and a rejection-ish word in the body rather than a
+/// single exact message.
+fn looks_like_expired_previous_response_id(status: reqwest::StatusCode, body: &str) -> bool {
+    if !status.is_client_error() {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("previous_response_id")
+        && (lower.contains("not found")
+            || lower.contains("not exist")
+            || lower.contains("expired")
+            || lower.contains("invalid")
+            || lower.contains("unknown")
+            || lower.contains("no longer"))
 }
 
 /// Which Anthropic extended-thinking request shape a Bedrock model accepts.
@@ -389,6 +606,77 @@ impl std::fmt::Debug for BedrockClient {
             .field("region", &self.region)
             .field("default_model", &self.default_model)
             .finish()
+    }
+}
+
+#[derive(Debug)]
+struct DiscoveryFailure {
+    err: anyhow::Error,
+    attempts: u64,
+}
+
+async fn retry_bedrock_discovery<T, Fut>(
+    source: &'static str,
+    mut operation: impl FnMut() -> Fut,
+) -> std::result::Result<T, DiscoveryFailure>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 1..=BEDROCK_DISCOVERY_MAX_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt == BEDROCK_DISCOVERY_MAX_ATTEMPTS => {
+                return Err(DiscoveryFailure {
+                    err,
+                    attempts: attempt,
+                });
+            }
+            Err(_) => {
+                let delay = bedrock_discovery_retry_backoff(attempt);
+                tracing::debug!(
+                    "{source} attempt {attempt}/{BEDROCK_DISCOVERY_MAX_ATTEMPTS} failed; retrying in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!("retry loop returns on success or final failure")
+}
+
+fn bedrock_discovery_retry_backoff(attempt: u64) -> Duration {
+    let exp = 2u64.saturating_pow(attempt.saturating_sub(1) as u32);
+    let raw = BEDROCK_DISCOVERY_RETRY_BASE_DELAY
+        .as_millis()
+        .saturating_mul(u128::from(exp));
+    let jitter = rand::rng().random_range(0.5..1.5);
+    Duration::from_millis((raw as f64 * jitter) as u64)
+}
+
+fn discovery_result_or_last_good<T: Clone>(
+    cache: &LastGoodDiscovery<T>,
+    result: std::result::Result<T, DiscoveryFailure>,
+    empty: impl FnOnce() -> T,
+) -> T {
+    match result {
+        Ok(value) => cache.record(value),
+        Err(failure) => {
+            tracing::info!(
+                "{} skipped after {} attempts: {:#}",
+                cache.name,
+                failure.attempts,
+                failure.err
+            );
+            if let Some((value, age)) = cache.get_stale() {
+                tracing::warn!(
+                    "{} serving stale catalog data from last successful discovery (age: {:?})",
+                    cache.name,
+                    age
+                );
+                value
+            } else {
+                empty()
+            }
+        }
     }
 }
 
@@ -426,6 +714,10 @@ impl BedrockClient {
             control_base_url: BEDROCK_CONTROL_BASE_URL.to_string(),
             catalog_mode,
             thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
+            responses_chain: Arc::new(std::sync::Mutex::new(ResponsesChainCache::new(
+                RESPONSES_CHAIN_CACHE_CAP,
+            ))),
+            discovery_cache: Arc::new(BedrockDiscoveryCache::new()),
         }
     }
 
@@ -453,6 +745,10 @@ impl BedrockClient {
             control_base_url,
             catalog_mode: crate::setup_state::BedrockCatalogMode::MantlePreferred,
             thinking_shape_cache: Arc::new(RwLock::new(HashMap::new())),
+            responses_chain: Arc::new(std::sync::Mutex::new(ResponsesChainCache::new(
+                RESPONSES_CHAIN_CACHE_CAP,
+            ))),
+            discovery_cache: Arc::new(BedrockDiscoveryCache::new()),
         }
     }
 
@@ -685,6 +981,46 @@ impl BedrockClient {
         }
     }
 
+    /// Posts a single Responses API request and returns the raw HTTP
+    /// response (success or not -- callers decide what to do with a
+    /// non-2xx status). Shared by the fresh-input and delta-continuation
+    /// attempts in `invoke_responses_model` so both retry transiently via
+    /// `send_with_retries` the same way.
+    async fn post_responses_request(
+        &self,
+        url: &str,
+        body: &crate::responses_api::ResponsesRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+        first_progress_timeout: Duration,
+    ) -> Result<reqwest::Response> {
+        crate::http_retry::send_with_retries(
+            "posting Bedrock Responses API request",
+            || {
+                self.http
+                    .post(url)
+                    .header("Accept", "text/event-stream")
+                    .bearer_auth(&self.bearer_token)
+                    .json(body)
+            },
+            Some(cancel),
+            Some(first_progress_timeout),
+        )
+        .await
+    }
+
+    /// Drives one turn of the OpenAI Responses API on Bedrock Mantle.
+    ///
+    /// `LlmBackend::stream_chat` receives the *full* conversation on every
+    /// call with no conversation id, so resending it all every turn with
+    /// `store: false` (the historical behavior) only lets OpenAI's
+    /// prompt-cache match the first-turn prefix -- it never advances as the
+    /// conversation grows. Instead: chain turns server-side via
+    /// `store: true` + `previous_response_id`, keyed off a content hash of
+    /// the message context (`responses_chain`), and send only the new
+    /// messages since the cached response as `input`. See
+    /// `find_responses_continuation` / `hash_responses_context` for the
+    /// matching logic and `looks_like_expired_previous_response_id` for the
+    /// self-healing fallback below.
     async fn invoke_responses_model(&self, request: StreamChatRequest) -> Result<LlmResponse> {
         let StreamChatRequest {
             model,
@@ -704,42 +1040,121 @@ impl BedrockClient {
             .as_deref()
             .filter(|e| reasoning_spec.supports_reasoning_level(e))
             .map(str::to_string);
-        let body = build_responses_request(
-            &model,
-            &messages,
-            tools.as_deref(),
-            reasoning_effort.as_deref(),
-            structured_output.as_ref(),
-        );
         let url = format!(
             "{}/responses",
             mantle_base_url_for_model(&self.mantle_base_url, &model)
         );
-        let resp = crate::http_retry::send_with_retries(
-            "posting Bedrock Responses API request",
-            || {
-                self.http
-                    .post(&url)
-                    .header("Accept", "text/event-stream")
-                    .bearer_auth(&self.bearer_token)
-                    .json(&body)
-            },
-            Some(&cancel),
-            Some(idle_timeouts.first_progress),
-        )
-        .await?;
+
+        // Look for the largest cached prefix of `messages` we can chain
+        // onto. Locking is synchronous and never held across the network
+        // call below.
+        let continuation = {
+            let cache = self
+                .responses_chain
+                .lock()
+                .expect("responses_chain mutex poisoned");
+            find_responses_continuation(&messages, |h| cache.get(h))
+        };
+
+        let build_fresh_body = || {
+            build_responses_request(
+                &model,
+                &messages,
+                tools.as_deref(),
+                reasoning_effort.as_deref(),
+                structured_output.as_ref(),
+                true,
+                None,
+            )
+        };
+
+        let (body, continuation_cache_key) = match &continuation {
+            Some((boundary, previous_response_id)) => {
+                let delta = &messages[boundary + 1..];
+                let body = build_responses_request(
+                    &model,
+                    delta,
+                    tools.as_deref(),
+                    reasoning_effort.as_deref(),
+                    structured_output.as_ref(),
+                    true,
+                    Some(previous_response_id.as_str()),
+                );
+                (body, Some(hash_responses_context(&messages[..*boundary])))
+            }
+            None => (build_fresh_body(), None),
+        };
+
+        let resp = self
+            .post_responses_request(&url, &body, &cancel, idle_timeouts.first_progress)
+            .await?;
         let status = resp.status();
-        if !status.is_success() {
+        let resp = if status.is_success() {
+            resp
+        } else {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(crate::http_retry::retryable_llm_error_for_body(
-                format!("Bedrock Responses API failed (HTTP {status}): {body_text}"),
-                &body_text,
-            ));
-        }
+            if continuation.is_some() && looks_like_expired_previous_response_id(status, &body_text)
+            {
+                // Self-healing: the chained response_id is no longer valid
+                // server-side (expired/evicted upstream). Evict it locally
+                // so we don't keep retrying it, then retry once with the
+                // full conversation and no previous_response_id -- exactly
+                // like a fresh/no-match turn. No tokens have been emitted
+                // yet (we haven't touched the SSE body), so replaying here
+                // cannot duplicate output.
+                if let Some(key) = continuation_cache_key {
+                    self.responses_chain
+                        .lock()
+                        .expect("responses_chain mutex poisoned")
+                        .evict(key);
+                }
+                tracing::warn!(
+                    %status,
+                    "Bedrock Responses API rejected previous_response_id as expired/unknown; evicting and retrying with full input"
+                );
+                let retry_body = build_fresh_body();
+                let retry_resp = self
+                    .post_responses_request(
+                        &url,
+                        &retry_body,
+                        &cancel,
+                        idle_timeouts.first_progress,
+                    )
+                    .await?;
+                let retry_status = retry_resp.status();
+                if !retry_status.is_success() {
+                    let retry_body_text = retry_resp.text().await.unwrap_or_default();
+                    return Err(crate::http_retry::retryable_llm_error_for_body(
+                        format!(
+                            "Bedrock Responses API failed (HTTP {retry_status}) after retrying without previous_response_id: {retry_body_text}"
+                        ),
+                        &retry_body_text,
+                    ));
+                }
+                retry_resp
+            } else {
+                return Err(crate::http_retry::retryable_llm_error_for_body(
+                    format!("Bedrock Responses API failed (HTTP {status}): {body_text}"),
+                    &body_text,
+                ));
+            }
+        };
+
         let stream = resp
             .bytes_stream()
             .map(|r| r.map(|b| b.to_vec()).map_err(anyhow::Error::from));
-        drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeouts).await
+        let outcome =
+            drive_responses_sse_stream(stream, on_token, on_thought, cancel, idle_timeouts).await?;
+
+        if let Some(response_id) = outcome.response_id {
+            let key = hash_responses_context(&messages);
+            self.responses_chain
+                .lock()
+                .expect("responses_chain mutex poisoned")
+                .insert(key, response_id);
+        }
+
+        Ok(outcome.response)
     }
 
     async fn list_mantle_model_metadata(&self) -> Result<Vec<ModelMetadata>> {
@@ -765,6 +1180,22 @@ impl BedrockClient {
             .into_iter()
             .map(|model| model.to_model_metadata())
             .collect())
+    }
+
+    async fn list_mantle_model_metadata_with_fallback(&self) -> Vec<ModelMetadata> {
+        let result = retry_bedrock_discovery("Bedrock Mantle model discovery", || {
+            self.list_mantle_model_metadata()
+        })
+        .await;
+        discovery_result_or_last_good(&self.discovery_cache.mantle_models, result, Vec::new)
+    }
+
+    async fn discover_model_metadata_with_fallback(&self) -> Vec<ModelMetadata> {
+        let result = retry_bedrock_discovery("Bedrock foundation-model discovery", || {
+            self.discover_model_metadata()
+        })
+        .await;
+        discovery_result_or_last_good(&self.discovery_cache.foundation_models, result, Vec::new)
     }
 
     async fn invoke_native_anthropic_with_fallback(
@@ -852,14 +1283,8 @@ impl BedrockClient {
     }
 
     async fn inference_profile_candidates_for_model(&self, model: &str) -> Vec<String> {
-        let mut candidates = self
-            .list_inference_profiles()
-            .await
-            .map(|profiles| match_inference_profiles_to_model(model, &profiles, &self.region))
-            .unwrap_or_else(|err| {
-                tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-                Vec::new()
-            });
+        let profiles = self.list_inference_profiles_with_fallback().await;
+        let mut candidates = match_inference_profiles_to_model(model, &profiles, &self.region);
         candidates.extend(guessed_inference_profile_candidates(model, &self.region));
         dedup_preserve_order(candidates)
     }
@@ -869,10 +1294,7 @@ impl BedrockClient {
             return Ok(model.to_string());
         }
 
-        let profiles = self.list_inference_profiles().await.unwrap_or_else(|err| {
-            tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-            Vec::new()
-        });
+        let profiles = self.list_inference_profiles_with_fallback().await;
         if let Some(invocable_id) =
             preferred_invocable_bedrock_model_id(model, &profiles, &self.region)
         {
@@ -900,6 +1322,14 @@ impl BedrockClient {
             serde_json::from_str(&body).context("parse Bedrock inference profile response")?;
         Ok(parsed.inference_profile_summaries)
     }
+
+    async fn list_inference_profiles_with_fallback(&self) -> Vec<BedrockInferenceProfileSummary> {
+        let result = retry_bedrock_discovery("Bedrock inference profile discovery", || {
+            self.list_inference_profiles()
+        })
+        .await;
+        discovery_result_or_last_good(&self.discovery_cache.inference_profiles, result, Vec::new)
+    }
 }
 
 impl LlmBackend for BedrockClient {
@@ -918,24 +1348,9 @@ impl LlmBackend for BedrockClient {
         Box::pin(async move {
             use crate::setup_state::BedrockCatalogMode;
 
-            let discover_mantle = || async {
-                match self.list_mantle_model_metadata().await {
-                    Ok(models) => models,
-                    Err(err) => {
-                        tracing::info!("Bedrock Mantle model discovery skipped: {err:#}");
-                        Vec::new()
-                    }
-                }
-            };
-            let discover_native = || async {
-                match self.discover_model_metadata().await {
-                    Ok(models) => models,
-                    Err(err) => {
-                        tracing::info!("Bedrock foundation-model discovery skipped: {err:#}");
-                        Vec::new()
-                    }
-                }
-            };
+            let discover_mantle =
+                || async { self.list_mantle_model_metadata_with_fallback().await };
+            let discover_native = || async { self.discover_model_metadata_with_fallback().await };
 
             let (mut models, uses_native) = match self.catalog_mode {
                 BedrockCatalogMode::MantleOnly => (discover_mantle().await, false),
@@ -952,13 +1367,7 @@ impl LlmBackend for BedrockClient {
                 }
             };
             let inference_profiles = if uses_native {
-                match self.list_inference_profiles().await {
-                    Ok(profiles) => profiles,
-                    Err(err) => {
-                        tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-                        Vec::new()
-                    }
-                }
+                self.list_inference_profiles_with_fallback().await
             } else {
                 Vec::new()
             };
@@ -1006,13 +1415,14 @@ fn uses_responses_api(model: &str) -> bool {
     model.starts_with("openai.")
 }
 
-/// The gpt-5.4 and gpt-5.5 model families are served from a dedicated
+/// The gpt-5.4, gpt-5.5, and gpt-5.6 model families are served from a dedicated
 /// `/openai/v1` path on Bedrock Mantle rather than the shared `/v1` path every
 /// other Mantle model uses (per their Bedrock model cards). Match the bare ids
-/// and any suffixed derivative (e.g. `openai.gpt-5.5-codex`), but not unrelated
-/// ids that merely share the numeric prefix (e.g. a future `openai.gpt-5.40`).
+/// and any suffixed derivative (e.g. `openai.gpt-5.5-codex`, `openai.gpt-5.6-sol`),
+/// but not unrelated ids that merely share the numeric prefix (e.g. a future
+/// `openai.gpt-5.40`).
 fn uses_openai_mantle_path(model: &str) -> bool {
-    ["openai.gpt-5.4", "openai.gpt-5.5"]
+    ["openai.gpt-5.4", "openai.gpt-5.5", "openai.gpt-5.6"]
         .iter()
         .any(|base| match model.strip_prefix(base) {
             Some(rest) => rest.is_empty() || rest.starts_with('-'),
@@ -1329,6 +1739,8 @@ struct BedrockOutputConfig {
 #[derive(Debug, Serialize, Clone)]
 struct CacheControl {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1367,6 +1779,8 @@ enum BedrockContentOut {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -1497,6 +1911,7 @@ fn convert_messages(
                     content: vec![BedrockContentOut::ToolResult {
                         tool_use_id,
                         content: tool_output,
+                        cache_control: None,
                     }],
                 });
             }
@@ -1523,7 +1938,13 @@ fn convert_messages(
     if enable_cache {
         for msg in converted.iter_mut().rev() {
             if msg.role == "user" {
-                if let Some(BedrockContentOut::Text { cache_control, .. }) = msg.content.last_mut()
+                // The last user block before an assistant turn is almost always
+                // a tool_result in agentic loops; caching only the Text case
+                // left the entire growing message history uncached every turn.
+                if let Some(
+                    BedrockContentOut::Text { cache_control, .. }
+                    | BedrockContentOut::ToolResult { cache_control, .. },
+                ) = msg.content.last_mut()
                 {
                     *cache_control = Some(CACHE_CONTROL);
                 }
@@ -1825,7 +2246,7 @@ struct BedrockListInferenceProfilesResponse {
     inference_profile_summaries: Vec<BedrockInferenceProfileSummary>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct BedrockInferenceProfileSummary {
     #[serde(rename = "inferenceProfileId")]
     inference_profile_id: String,
@@ -1833,7 +2254,7 @@ struct BedrockInferenceProfileSummary {
     models: Vec<BedrockInferenceProfileModel>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct BedrockInferenceProfileModel {
     #[serde(rename = "modelArn")]
     model_arn: String,
@@ -1861,12 +2282,14 @@ impl BedrockFoundationModelSummary {
 #[cfg(test)]
 mod tests {
     use crate::llm_client::{ChatContentPart, FunctionDef};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{header, method, path, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[test]
     fn percent_encode_model_id() {
@@ -2262,6 +2685,42 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_control_on_trailing_tool_result() {
+        // The common agentic-loop shape: the last user-role message is a
+        // tool_result, not text. The breakpoint must still land on it, or the
+        // entire message-history prefix is billed uncached every turn.
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("What's the weather?"),
+            ChatMessage::assistant("Let me check."),
+            ChatMessage::tool_result("call_1", "get_weather", "72F and sunny"),
+        ];
+        let (_system_blocks, converted) =
+            convert_messages(messages, true).expect("convert with cache");
+
+        let last_user = converted
+            .iter()
+            .rfind(|m| m.role == "user")
+            .expect("last user msg");
+        match last_user.content.last().expect("content") {
+            BedrockContentOut::ToolResult { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "trailing tool_result must carry a cache breakpoint"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_control_serializes_one_hour_ttl() {
+        let json = serde_json::to_value(CACHE_CONTROL).expect("serialize");
+        assert_eq!(json["type"], "ephemeral");
+        assert_eq!(json["ttl"], "1h");
     }
 
     #[test]
@@ -2846,6 +3305,9 @@ mod tests {
         assert!(uses_openai_mantle_path("openai.gpt-5.5"));
         assert!(uses_openai_mantle_path("openai.gpt-5.5-codex"));
         assert!(uses_openai_mantle_path("openai.gpt-5.4-2026-01-01"));
+        assert!(uses_openai_mantle_path("openai.gpt-5.6-sol"));
+        assert!(uses_openai_mantle_path("openai.gpt-5.6-luna"));
+        assert!(uses_openai_mantle_path("openai.gpt-5.6"));
         // Other Mantle models -- including a hypothetical id that merely shares
         // the numeric prefix -- stay on the shared /v1 path.
         assert!(!uses_openai_mantle_path("openai.gpt-oss-120b"));
@@ -2911,6 +3373,224 @@ mod tests {
             }
             other => panic!("expected text response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn responses_api_chains_second_turn_via_previous_response_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_turn1\"}}\n\n\
+                         data: {\"type\":\"response.output_text.delta\",\"delta\":\"turn1 answer\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_turn1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+
+        let request = |messages: Vec<ChatMessage>| StreamChatRequest {
+            model: "openai.gpt-5.5".to_string(),
+            messages,
+            tools: None,
+            reasoning_effort: None,
+            service_tier: None,
+            temperature: None,
+            structured_output: None,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: CancellationToken::new(),
+            idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+        };
+
+        let turn1_messages = vec![ChatMessage::user("turn1 question")];
+        let response1 = client
+            .stream_chat(request(turn1_messages.clone()))
+            .await
+            .expect("turn 1 should succeed");
+        assert!(matches!(response1, LlmResponse::Text { .. }));
+
+        // Simulate the caller re-sending the full conversation as required
+        // by `LlmBackend::stream_chat`'s stateless-caller contract: the
+        // prior assistant turn is echoed back, plus a new user turn.
+        let mut turn2_messages = turn1_messages.clone();
+        turn2_messages.push(ChatMessage::assistant("turn1 answer"));
+        turn2_messages.push(ChatMessage::user("turn2 question"));
+
+        let response2 = client
+            .stream_chat(request(turn2_messages))
+            .await
+            .expect("turn 2 should succeed");
+        assert!(matches!(response2, LlmResponse::Text { .. }));
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 2);
+
+        let turn1_body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("turn 1 body is JSON");
+        assert_eq!(turn1_body["store"], serde_json::json!(true));
+        assert!(
+            turn1_body.get("previous_response_id").is_none(),
+            "first turn has nothing to chain onto: {turn1_body}"
+        );
+        assert_eq!(turn1_body["input"].as_array().unwrap().len(), 1);
+
+        let turn2_body: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).expect("turn 2 body is JSON");
+        assert_eq!(turn2_body["store"], serde_json::json!(true));
+        assert_eq!(
+            turn2_body["previous_response_id"],
+            serde_json::json!("resp_turn1"),
+            "turn 2 must chain onto turn 1's response id: {turn2_body}"
+        );
+        let turn2_input = turn2_body["input"].as_array().expect("input array");
+        assert_eq!(
+            turn2_input.len(),
+            1,
+            "continuation must send only the delta, not the full history: {turn2_input:?}"
+        );
+        let turn2_body_str = turn2_body.to_string();
+        assert!(
+            !turn2_body_str.contains("turn1 question") && !turn2_body_str.contains("turn1 answer"),
+            "continuation input must not resend turn 1 history: {turn2_body_str}"
+        );
+        assert!(turn2_body_str.contains("turn2 question"));
+    }
+
+    #[tokio::test]
+    async fn responses_api_self_heals_on_expired_previous_response_id() {
+        use wiremock::{Match, Request};
+
+        struct HasPreviousResponseId;
+        impl Match for HasPreviousResponseId {
+            fn matches(&self, request: &Request) -> bool {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                v.get("previous_response_id").is_some()
+            }
+        }
+        struct NoPreviousResponseId;
+        impl Match for NoPreviousResponseId {
+            fn matches(&self, request: &Request) -> bool {
+                let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+                    return false;
+                };
+                v.get("previous_response_id").is_none()
+            }
+        }
+
+        let server = MockServer::start().await;
+        // Any request WITHOUT previous_response_id (the initial turn, and
+        // the post-eviction retry) succeeds.
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(NoPreviousResponseId)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_turn1\"}}\n\n\
+                         data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_turn1\"}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        // Any request WITH previous_response_id is rejected as expired/unknown.
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(HasPreviousResponseId)
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "{\"error\":{\"message\":\"previous_response_id 'resp_turn1' not found\"}}",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+
+        let request = |messages: Vec<ChatMessage>| StreamChatRequest {
+            model: "openai.gpt-5.5".to_string(),
+            messages,
+            tools: None,
+            reasoning_effort: None,
+            service_tier: None,
+            temperature: None,
+            structured_output: None,
+            on_token: Box::new(|_| {}),
+            on_thought: Box::new(|_| {}),
+            cancel: CancellationToken::new(),
+            idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+        };
+
+        let turn1_messages = vec![ChatMessage::user("turn1 question")];
+        client
+            .stream_chat(request(turn1_messages.clone()))
+            .await
+            .expect("turn 1 should succeed and seed the chain cache");
+
+        let mut turn2_messages = turn1_messages.clone();
+        turn2_messages.push(ChatMessage::assistant("answer"));
+        turn2_messages.push(ChatMessage::user("turn2 question"));
+
+        // Turn 2 detects a (now-stale) continuation, gets rejected, and must
+        // self-heal by evicting the bad id and retrying with the full
+        // input rather than surfacing the error or corrupting the run.
+        let response2 = client
+            .stream_chat(request(turn2_messages.clone()))
+            .await
+            .expect("turn 2 should self-heal and succeed despite the expired id");
+        assert!(matches!(response2, LlmResponse::Text { .. }));
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests.len(),
+            3,
+            "turn 1, the rejected continuation attempt, and the full-input retry"
+        );
+
+        let retry_body: serde_json::Value =
+            serde_json::from_slice(&requests[2].body).expect("retry body is JSON");
+        assert!(
+            retry_body.get("previous_response_id").is_none(),
+            "retry after eviction must not resend the stale id: {retry_body}"
+        );
+        let retry_body_str = retry_body.to_string();
+        assert!(
+            retry_body_str.contains("turn1 question") && retry_body_str.contains("turn2 question"),
+            "retry after eviction must resend the full conversation: {retry_body_str}"
+        );
+
+        // The stale entry should actually be gone from the cache (not just
+        // papered over by the retry): confirm eviction directly.
+        let stale_key = hash_responses_context(&turn1_messages);
+        let cache = client
+            .responses_chain
+            .lock()
+            .expect("responses_chain mutex poisoned");
+        assert!(
+            cache.get(stale_key).is_none(),
+            "expired previous_response_id entry must be evicted, not just bypassed"
+        );
     }
 
     #[tokio::test]
@@ -3361,6 +4041,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bedrock_discovery_retry_retries_and_succeeds_on_later_attempt() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = retry_bedrock_discovery("test Bedrock discovery", || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("temporary discovery failure");
+                }
+                Ok("ok")
+            }
+        })
+        .await
+        .expect("retry should eventually succeed");
+
+        assert_eq!(result, "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Clone)]
+    struct FoundationModelsThenThrottle {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for FoundationModelsThenThrottle {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "modelSummaries": [{
+                        "modelId": "anthropic.claude-stable",
+                        "inputModalities": ["TEXT"],
+                        "outputModalities": ["TEXT"],
+                        "responseStreamingSupported": true
+                    }]
+                }))
+            } else {
+                ResponseTemplate::new(429).set_body_string("ThrottlingException")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bedrock_discovery_uses_last_good_after_later_total_failure() {
+        use crate::setup_state::BedrockCatalogMode;
+
+        let server = MockServer::start().await;
+        let foundation_calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(FoundationModelsThenThrottle {
+                calls: Arc::clone(&foundation_calls),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-profiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "inferenceProfileSummaries": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        client.catalog_mode = BedrockCatalogMode::NativeOnly;
+
+        let first = client
+            .list_model_metadata()
+            .await
+            .expect("initial discovery should succeed");
+        assert!(first.iter().any(|m| m.id == "anthropic.claude-stable"));
+
+        let second = client
+            .list_model_metadata()
+            .await
+            .expect("stale fallback should still succeed");
+        assert!(
+            second.iter().any(|m| m.id == "anthropic.claude-stable"),
+            "stale last-good model should remain advertised"
+        );
+        assert_eq!(
+            foundation_calls.load(Ordering::SeqCst),
+            1 + BEDROCK_DISCOVERY_MAX_ATTEMPTS as usize
+        );
+    }
+
+    #[test]
+    fn bedrock_discovery_without_last_good_returns_empty_after_failure() {
+        let cache = LastGoodDiscovery::<Vec<ModelMetadata>>::new("test Bedrock discovery");
+        let models = discovery_result_or_last_good(
+            &cache,
+            Err(DiscoveryFailure {
+                err: anyhow::anyhow!("permanent discovery failure"),
+                attempts: BEDROCK_DISCOVERY_MAX_ATTEMPTS,
+            }),
+            Vec::new,
+        );
+
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
     async fn foundation_models_are_rewritten_to_invocable_profile_ids() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3659,5 +4446,250 @@ mod tests {
             normalize_default_bedrock_model("anthropic.claude-opus-4-8", &profiles, "us-east-2",),
             "global.anthropic.claude-opus-4-8"
         );
+    }
+
+    // ---- Responses API continuation (`previous_response_id` chaining) ----
+    //
+    // Pure-logic tests for `hash_responses_context` / `find_responses_continuation`
+    // / `looks_like_expired_previous_response_id`. These don't touch the
+    // network, `BedrockClient`, or `responses_chain` directly -- they exercise
+    // exactly the matching/hashing logic `invoke_responses_model` relies on to
+    // decide what to send. The wiremock round-trip and expiry-fallback tests
+    // further down exercise the full `invoke_responses_model` path.
+
+    fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn responses_context_hash_is_content_and_order_sensitive() {
+        let a = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        let a_again = vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        assert_eq!(hash_responses_context(&a), hash_responses_context(&a_again));
+
+        let different_text = vec![ChatMessage::user("hello!"), ChatMessage::assistant("hi")];
+        assert_ne!(
+            hash_responses_context(&a),
+            hash_responses_context(&different_text)
+        );
+
+        let reordered = vec![ChatMessage::assistant("hi"), ChatMessage::user("hello")];
+        assert_ne!(
+            hash_responses_context(&a),
+            hash_responses_context(&reordered)
+        );
+
+        let shorter = vec![ChatMessage::user("hello")];
+        assert_ne!(hash_responses_context(&a), hash_responses_context(&shorter));
+
+        let with_call_1 = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("call_1", "read_file", "{}")]),
+        ];
+        let with_call_2 = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("call_2", "read_file", "{}")]),
+        ];
+        assert_ne!(
+            hash_responses_context(&with_call_1),
+            hash_responses_context(&with_call_2),
+            "differing tool_call id must change the hash"
+        );
+
+        let with_call_1_again = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("call_1", "read_file", "{}")]),
+        ];
+        assert_eq!(
+            hash_responses_context(&with_call_1),
+            hash_responses_context(&with_call_1_again)
+        );
+
+        let tool_output = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("call_1", "read_file", "{}")]),
+            ChatMessage::tool_result("call_1", "read_file", "contents-a"),
+        ];
+        let tool_output_different = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("call_1", "read_file", "{}")]),
+            ChatMessage::tool_result("call_1", "read_file", "contents-b"),
+        ];
+        assert_ne!(
+            hash_responses_context(&tool_output),
+            hash_responses_context(&tool_output_different),
+            "differing tool_call_id output content must change the hash"
+        );
+    }
+
+    #[test]
+    fn responses_continuation_no_match_returns_none_for_fresh_conversation() {
+        let messages = vec![ChatMessage::user("q1")];
+        let cache: HashMap<u64, String> = HashMap::new();
+        assert!(find_responses_continuation(&messages, |h| cache.get(&h).cloned()).is_none());
+
+        // An assistant turn is present, but nothing about this conversation
+        // was ever cached (e.g. evicted, or the process just started).
+        let messages_with_assistant = vec![ChatMessage::user("q1"), ChatMessage::assistant("a1")];
+        assert!(
+            find_responses_continuation(&messages_with_assistant, |h| cache.get(&h).cloned())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn responses_continuation_matches_next_turn_after_storing_previous_turn() {
+        // Turn N: this is the full input that produced response A.
+        let turn_n = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("call_1", "read_file", "{}")]),
+            ChatMessage::tool_result("call_1", "read_file", "file contents"),
+        ];
+        let mut cache: HashMap<u64, String> = HashMap::new();
+        cache.insert(hash_responses_context(&turn_n), "resp_A".to_string());
+
+        // Turn N+1 = turn-N messages + [assistant echo] + [new tool msg].
+        let new_tool_msg = ChatMessage::tool_result("call_2", "write_file", "ok");
+        let mut turn_n_plus_1 = turn_n.clone();
+        turn_n_plus_1.push(ChatMessage::assistant_tool_calls(vec![tool_call(
+            "call_2",
+            "write_file",
+            "{\"path\":\"a.txt\"}",
+        )]));
+        turn_n_plus_1.push(new_tool_msg.clone());
+
+        let (boundary, previous_response_id) =
+            find_responses_continuation(&turn_n_plus_1, |h| cache.get(&h).cloned())
+                .expect("turn N+1 should be detected as a continuation of turn N");
+
+        assert_eq!(previous_response_id, "resp_A");
+        assert_eq!(boundary, turn_n.len());
+        let delta = &turn_n_plus_1[boundary + 1..];
+        assert_eq!(delta, [new_tool_msg]);
+    }
+
+    #[test]
+    fn responses_continuation_prefers_largest_matching_prefix() {
+        let turn0 = vec![ChatMessage::user("q1")];
+        let turn1 = {
+            let mut m = turn0.clone();
+            m.push(ChatMessage::assistant("a1"));
+            m.push(ChatMessage::user("q2"));
+            m
+        };
+        let turn2 = {
+            let mut m = turn1.clone();
+            m.push(ChatMessage::assistant("a2"));
+            m.push(ChatMessage::user("q3"));
+            m
+        };
+
+        // Both turn0 and turn1 are cached; the larger (more recent) prefix
+        // should win so the delta we send is as small as possible.
+        let mut cache: HashMap<u64, String> = HashMap::new();
+        cache.insert(
+            hash_responses_context(&turn0),
+            "resp_after_turn0".to_string(),
+        );
+        cache.insert(
+            hash_responses_context(&turn1),
+            "resp_after_turn1".to_string(),
+        );
+
+        let (boundary, previous_response_id) =
+            find_responses_continuation(&turn2, |h| cache.get(&h).cloned())
+                .expect("should match the larger cached prefix");
+
+        assert_eq!(previous_response_id, "resp_after_turn1");
+        assert_eq!(boundary, turn1.len());
+    }
+
+    #[test]
+    fn responses_continuation_falls_back_to_older_prefix_when_newer_is_evicted() {
+        let turn0 = vec![ChatMessage::user("q1")];
+        let turn1 = {
+            let mut m = turn0.clone();
+            m.push(ChatMessage::assistant("a1"));
+            m.push(ChatMessage::user("q2"));
+            m
+        };
+        let turn2 = {
+            let mut m = turn1.clone();
+            m.push(ChatMessage::assistant("a2"));
+            m.push(ChatMessage::user("q3"));
+            m
+        };
+
+        // turn1's entry was evicted (or never stored); only turn0 remains.
+        let mut cache: HashMap<u64, String> = HashMap::new();
+        cache.insert(
+            hash_responses_context(&turn0),
+            "resp_after_turn0".to_string(),
+        );
+
+        let (boundary, previous_response_id) =
+            find_responses_continuation(&turn2, |h| cache.get(&h).cloned())
+                .expect("should fall back to the older cached prefix");
+
+        assert_eq!(previous_response_id, "resp_after_turn0");
+        assert_eq!(boundary, turn0.len());
+    }
+
+    #[test]
+    fn responses_chain_cache_evicts_oldest_beyond_cap() {
+        let mut cache = ResponsesChainCache::new(2);
+        cache.insert(1, "a".to_string());
+        cache.insert(2, "b".to_string());
+        cache.insert(3, "c".to_string());
+
+        assert_eq!(cache.get(1), None, "oldest entry should have been evicted");
+        assert_eq!(cache.get(2), Some("b".to_string()));
+        assert_eq!(cache.get(3), Some("c".to_string()));
+    }
+
+    #[test]
+    fn responses_chain_cache_evict_removes_entry() {
+        let mut cache = ResponsesChainCache::new(8);
+        cache.insert(1, "a".to_string());
+        cache.evict(1);
+        assert_eq!(cache.get(1), None);
+    }
+
+    #[test]
+    fn looks_like_expired_previous_response_id_matches_defensively() {
+        assert!(looks_like_expired_previous_response_id(
+            reqwest::StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"previous_response_id 'resp_123' not found\"}}"
+        ));
+        assert!(looks_like_expired_previous_response_id(
+            reqwest::StatusCode::NOT_FOUND,
+            "{\"error\":{\"message\":\"Unknown previous_response_id\"}}"
+        ));
+        assert!(looks_like_expired_previous_response_id(
+            reqwest::StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"previous_response_id has expired\"}}"
+        ));
+
+        // Not client errors, or no mention of previous_response_id, or no
+        // rejection wording -- must not match.
+        assert!(!looks_like_expired_previous_response_id(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "previous_response_id not found"
+        ));
+        assert!(!looks_like_expired_previous_response_id(
+            reqwest::StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"model not found\"}}"
+        ));
+        assert!(!looks_like_expired_previous_response_id(
+            reqwest::StatusCode::BAD_REQUEST,
+            "{\"error\":{\"message\":\"previous_response_id is required\"}}"
+        ));
     }
 }

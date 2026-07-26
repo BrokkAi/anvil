@@ -32,6 +32,11 @@ brokk-acp-sandbox/target/
 
 .claude/
 .bifrost/
+# Astro / Starlight docs
+docs/node_modules/
+docs/dist/
+docs/.astro/
+
 # Mjolnir linked worktrees
 .mjolnir/worktrees/
 __pycache__/

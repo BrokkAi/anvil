@@ -309,7 +309,7 @@ fn tool_calls_from_prefix(tool_calls: &[PrefixToolCall]) -> Vec<ToolCall> {
 }
 
 pub(crate) fn p2t_initial_builtin_tools() -> HashSet<String> {
-    ["write_file", "edit", "list_directory"]
+    ["write_file", "edit"]
         .into_iter()
         .map(str::to_string)
         .collect()

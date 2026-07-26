@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Audit Asgard v11 compact-trajectory runs for supervisor dumbassery.
+"""Audit Asgard compact-trajectory runs (v12+) for supervisor dumbassery.
 
-v11 replaced LLM candidate-window summarization with compact deterministic
+v12 replaced LLM candidate-window summarization with compact deterministic
 rendering plus an unbudgeted `view_tool_call` retrieval tool. That trade only
 pays off if the supervisor actually retrieves. The failure mode v11 removed was
 a summarizer inventing work; the failure mode it introduces is a supervisor
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 import zipfile
@@ -29,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TRACE_NAME = "anvil-trace.jsonl"
+HANDLE_RE = re.compile(r"w(\d+)l(\d+)m(\d+)$")
 
 # A decision reached with no retrieval is not automatically wrong — a window
 # whose compact lines genuinely settle the question needs no expansion. It is
@@ -132,6 +134,30 @@ def decision_claims_execution_evidence(decision: dict) -> bool:
     return any(marker in lowered for marker in EXECUTION_EVIDENCE_MARKERS)
 
 
+def classify_unresolved(runs: list[RunHealth]) -> tuple[int, int, int]:
+    """Splits unresolved handles into prior-window, current-window, malformed.
+
+    Since v13 the winning lane of every earlier window is retained, so a
+    prior-window handle SHOULD resolve. A miss now means either the handle
+    named a losing lane (benign — that work was discarded with its checkout) or
+    retention is not reaching the supervisor. Both are worth surfacing, but only
+    at volume; a current-window or malformed miss is a defect at any count.
+    """
+    prior = current = malformed = 0
+    for run in runs:
+        for record in run.retrievals:
+            window = record.get("window")
+            for handle in record.get("unresolved") or []:
+                parsed = HANDLE_RE.match(handle)
+                if not parsed:
+                    malformed += 1
+                elif int(parsed.group(1)) != window:
+                    prior += 1
+                else:
+                    current += 1
+    return prior, current, malformed
+
+
 def report(runs: list[RunHealth], verbose: bool) -> dict:
     total_handoffs = sum(len(run.handoffs) for run in runs)
     total_retrievals = sum(len(run.retrievals) for run in runs)
@@ -185,7 +211,7 @@ def report(runs: list[RunHealth], verbose: bool) -> dict:
     }
 
     print("=" * 72)
-    print("Asgard v11 compact-trajectory health")
+    print("Asgard compact-trajectory health")
     print("=" * 72)
     print(f"runs analyzed                : {summary['runs']}")
     print(f"candidate handoffs           : {total_handoffs}")
@@ -223,10 +249,29 @@ def report(runs: list[RunHealth], verbose: bool) -> dict:
             "reaching it, or the prompt is not persuading it to expand — check that a "
             "view_tool_call definition appears in the supervisor's tool list."
         )
-    if total_unresolved:
+    prior_miss, current_miss, malformed_miss = classify_unresolved(runs)
+    summary["unresolved_prior_window"] = prior_miss
+    summary["unresolved_current_window"] = current_miss
+    summary["unresolved_malformed"] = malformed_miss
+    requested = total_handles + total_unresolved
+    if prior_miss:
+        pct = 100.0 * prior_miss / requested if requested else 0.0
+        print(f"prior-window misses          : {prior_miss} ({pct:.0f}% of requests)")
+        if pct > 10.0:
+            problems.append(
+                f"RETENTION: {prior_miss} prior-window handles ({pct:.0f}% of requests) failed to "
+                "resolve. Since v13 the winning lane of each earlier window is retained, so this "
+                "should be rare — check that retained_windows reaches the audit context."
+            )
+    if current_miss:
         problems.append(
-            f"HANDLES: {total_unresolved} handle(s) failed to resolve. Expected for "
-            "prior-window handles; investigate if they name the current window."
+            f"HANDLES: {current_miss} handle(s) naming the CURRENT window failed to resolve. "
+            "Either the supervisor invented an id or handle minting and resolution disagree."
+        )
+    if malformed_miss:
+        problems.append(
+            f"HANDLES: {malformed_miss} malformed handle(s) - the supervisor is not copying "
+            "ids verbatim from the compact lines."
         )
     if windows_total and windows_without_retrieval / windows_total > 0.7:
         problems.append(

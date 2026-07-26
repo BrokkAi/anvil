@@ -378,6 +378,7 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
     let pattern = raw_input.get("pattern").and_then(Value::as_str);
     let query = raw_input.get("query").and_then(Value::as_str);
     let command = raw_input.get("command").and_then(Value::as_str);
+    let description = raw_input.get("description").and_then(Value::as_str);
 
     match tool_name {
         "read_file" => file_path
@@ -398,8 +399,11 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
         "web_search" => query
             .map(|q| format!("Search web `{q}`"))
             .unwrap_or_else(|| display.to_string()),
-        "run_shell_command" => command
-            .map(|c| format!("Run `{}`", first_line(c)))
+        "run_shell_command" => description
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(|d| format!("Run: {}", first_line(d)))
+            .or_else(|| command.map(|c| format!("Run `{}`", first_line(c))))
             .unwrap_or_else(|| display.to_string()),
         "task" => {
             // Prefer the human-readable `description` (short label) over
@@ -407,7 +411,6 @@ pub(super) fn tool_title(tool_name: &str, raw_input: &Value) -> String {
             // long and noisy in a card title). The order matters: a
             // generic `brief_input_summary` would pick whichever key
             // iterates first, which gives us `prompt` half the time.
-            let description = raw_input.get("description").and_then(Value::as_str);
             let subagent_type = raw_input.get("subagent_type").and_then(Value::as_str);
             match (subagent_type, description) {
                 (Some(t), Some(d)) if !d.is_empty() => format!("Subagent `{t}`: {d}"),
@@ -596,6 +599,30 @@ mod tests {
         let title = tool_title(
             "run_shell_command",
             &json!({"command": "cargo test\n# extra junk"}),
+        );
+        assert_eq!(title, "Run `cargo test`");
+    }
+
+    #[test]
+    fn run_shell_title_prefers_description() {
+        let title = tool_title(
+            "run_shell_command",
+            &json!({
+                "command": "cargo test --all-targets",
+                "description": "Run focused regression tests\nfor the parser"
+            }),
+        );
+        assert_eq!(title, "Run: Run focused regression tests");
+    }
+
+    #[test]
+    fn run_shell_title_ignores_blank_description() {
+        let title = tool_title(
+            "run_shell_command",
+            &json!({
+                "command": "cargo test",
+                "description": "   "
+            }),
         );
         assert_eq!(title, "Run `cargo test`");
     }

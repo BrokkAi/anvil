@@ -17,9 +17,18 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-pub const BUNDLED_BIFROST_VERSION: &str = "0.8.2";
+pub const BUNDLED_BIFROST_VERSION: &str = "0.8.6";
 const BIFROST_RELEASE_BASE: &str = "https://github.com/BrokkAi/bifrost/releases/download";
-const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Budget for setup RPCs: the initialize handshake, `tools/list`, and SSE
+/// endpoint discovery. These are expected to be fast; a long stall here
+/// usually means the server (or its transport) is broken.
+const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Budget for `tools/call`. Kept generous because MCP tools can run
+/// long-lived work server-side (e.g. Mjolnir's `code_agent`, which the
+/// server itself may hold open for up to 240s). See
+/// https://github.com/BrokkAi/anvil/issues/292 for the fuller adaptive-timeout
+/// design this is standing in for.
+const MCP_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[cfg(target_os = "macos")]
 const BIFROST_TARGET_TRIPLE: &str = "universal-apple-darwin";
@@ -65,9 +74,27 @@ pub enum McpError {
     Spawn(String),
     Io(String),
     Protocol(String),
-    JsonRpc { code: i64, message: String },
-    Timeout { tool: String, timeout: Duration },
-    Cancelled { tool: String },
+    /// HTTP 404 response to a streamable-HTTP request carrying an
+    /// `Mcp-Session-Id`: the server has expired or evicted this session
+    /// (e.g. rmcp's `LocalSessionManager` default 5-minute idle timeout --
+    /// see `transport-streamable-http-server`'s `keep_alive`) and, per the
+    /// MCP spec, expects the client to reinitialize. Carries the same
+    /// formatted message text as `Protocol` (so logs/errors read
+    /// identically) but is kept distinct so `call_tool_with_timeout` can
+    /// reinitialize the session and retry once instead of failing the tool
+    /// call outright.
+    HttpSessionNotFound(String),
+    JsonRpc {
+        code: i64,
+        message: String,
+    },
+    Timeout {
+        tool: String,
+        timeout: Duration,
+    },
+    Cancelled {
+        tool: String,
+    },
 }
 
 impl fmt::Display for McpError {
@@ -76,6 +103,7 @@ impl fmt::Display for McpError {
             McpError::Spawn(s) => write!(f, "spawn failed: {s}"),
             McpError::Io(s) => write!(f, "io error: {s}"),
             McpError::Protocol(s) => write!(f, "protocol error: {s}"),
+            McpError::HttpSessionNotFound(s) => write!(f, "protocol error: {s}"),
             McpError::JsonRpc { code, message } => {
                 write!(f, "jsonrpc error {code}: {message}")
             }
@@ -270,6 +298,13 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("creating bifrost cache dir {}", cache_dir.display()))?;
 
+    let _install_lock = acquire_bifrost_install_lock(cache_dir).await?;
+
+    let target = cache_dir.join(BIFROST_BINARY_NAME);
+    if target.is_file() {
+        return Ok(());
+    }
+
     let asset =
         format!("bifrost-v{BUNDLED_BIFROST_VERSION}-{BIFROST_TARGET_TRIPLE}.{BIFROST_ARCHIVE_EXT}");
     let url = format!("{BIFROST_RELEASE_BASE}/v{BUNDLED_BIFROST_VERSION}/{asset}");
@@ -329,7 +364,19 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         "bundled bifrost sha256 mismatch for {url}: got {actual_hex}, expected {expected_hex}"
     );
 
-    let archive_path = cache_dir.join(&asset);
+    let staging_dir = cache_dir.join(format!(
+        ".extract-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir(&staging_dir).await.with_context(|| {
+        format!(
+            "creating bundled bifrost staging dir {}",
+            staging_dir.display()
+        )
+    })?;
+
+    let archive_path = staging_dir.join(&asset);
     tokio::fs::write(&archive_path, &bytes)
         .await
         .with_context(|| format!("writing bundled bifrost archive {}", archive_path.display()))?;
@@ -341,7 +388,7 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         .arg("-xf")
         .arg(&archive_path)
         .arg("-C")
-        .arg(cache_dir)
+        .arg(&staging_dir)
         .status()
         .await
         .with_context(|| format!("invoking tar to extract {}", archive_path.display()))?;
@@ -351,7 +398,7 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         archive_path.display()
     );
 
-    let inner_dir = cache_dir.join(format!(
+    let inner_dir = staging_dir.join(format!(
         "bifrost-v{BUNDLED_BIFROST_VERSION}-{BIFROST_TARGET_TRIPLE}"
     ));
     let inner_binary = inner_dir.join(BIFROST_BINARY_NAME);
@@ -361,36 +408,118 @@ async fn download_and_extract_bifrost(cache_dir: &Path) -> anyhow::Result<()> {
         inner_binary.display()
     );
 
-    let target = cache_dir.join(BIFROST_BINARY_NAME);
-    if tokio::fs::rename(&inner_binary, &target).await.is_err() {
-        tokio::fs::copy(&inner_binary, &target)
-            .await
-            .with_context(|| {
-                format!(
-                    "moving bundled bifrost from {} to {}",
-                    inner_binary.display(),
-                    target.display()
-                )
-            })?;
-    }
-
-    let _ = tokio::fs::remove_file(&archive_path).await;
-    let _ = tokio::fs::remove_dir_all(&inner_dir).await;
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&target)
+        let mut perms = tokio::fs::metadata(&inner_binary)
             .await
-            .with_context(|| format!("stat bundled bifrost binary {}", target.display()))?
+            .with_context(|| format!("stat bundled bifrost binary {}", inner_binary.display()))?
             .permissions();
         perms.set_mode(0o755);
-        tokio::fs::set_permissions(&target, perms)
+        tokio::fs::set_permissions(&inner_binary, perms)
             .await
-            .with_context(|| format!("chmod 755 {}", target.display()))?;
+            .with_context(|| format!("chmod 755 {}", inner_binary.display()))?;
     }
 
+    tokio::fs::rename(&inner_binary, &target)
+        .await
+        .with_context(|| {
+            format!(
+                "atomically installing bundled bifrost from {} to {}",
+                inner_binary.display(),
+                target.display()
+            )
+        })?;
+
+    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+
     Ok(())
+}
+
+struct BifrostInstallLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl Drop for BifrostInstallLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // Unlock best-effort on drop. The OS also releases the advisory
+            // lock when the file descriptor closes, so failure here cannot
+            // leave a held lock behind.
+            // SAFETY: `as_raw_fd` returns a valid descriptor owned by `self.file`
+            // for the duration of this call, and `flock` does not retain it.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn acquire_bifrost_install_lock(cache_dir: &Path) -> anyhow::Result<BifrostInstallLock> {
+    let lock_path = cache_dir.join(".install.lock");
+
+    #[cfg(unix)]
+    {
+        let file = tokio::task::spawn_blocking({
+            let lock_path = lock_path.clone();
+            move || -> anyhow::Result<std::fs::File> {
+                use std::os::fd::AsRawFd;
+
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&lock_path)
+                    .with_context(|| {
+                        format!("opening bifrost install lock {}", lock_path.display())
+                    })?;
+                // SAFETY: `as_raw_fd` returns a valid descriptor owned by
+                // `file` for the duration of this call, and `flock` does not
+                // retain it.
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                anyhow::ensure!(
+                    rc == 0,
+                    "locking bifrost install lock {} failed: {}",
+                    lock_path.display(),
+                    std::io::Error::last_os_error()
+                );
+                Ok(file)
+            }
+        })
+        .await
+        .context("joining bifrost install lock task")??;
+        Ok(BifrostInstallLock { file })
+    }
+
+    #[cfg(not(unix))]
+    {
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(BifrostInstallLock { path: lock_path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("creating bifrost install lock {}", lock_path.display())
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl McpServerConfig {
@@ -686,11 +815,11 @@ impl McpClient {
             endpoint_tx,
             response_tx,
         ));
-        let endpoint = tokio::time::timeout(MCP_CALL_TIMEOUT, endpoint_rx)
+        let endpoint = tokio::time::timeout(MCP_STARTUP_TIMEOUT, endpoint_rx)
             .await
             .map_err(|_| McpError::Timeout {
                 tool: "SSE endpoint discovery".into(),
-                timeout: MCP_CALL_TIMEOUT,
+                timeout: MCP_STARTUP_TIMEOUT,
             })?
             .map_err(|_| McpError::Protocol("SSE stream closed before endpoint event".into()))??;
         let mut state = McpClientState::Sse {
@@ -741,7 +870,7 @@ impl McpClient {
     }
 
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
-        self.call_tool_with_timeout(name, args, MCP_CALL_TIMEOUT, None)
+        self.call_tool_with_timeout(name, args, MCP_TOOL_CALL_TIMEOUT, None)
             .await
     }
 
@@ -751,7 +880,7 @@ impl McpClient {
         args: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value, McpError> {
-        self.call_tool_with_timeout(name, args, MCP_CALL_TIMEOUT, cancel)
+        self.call_tool_with_timeout(name, args, MCP_TOOL_CALL_TIMEOUT, cancel)
             .await
     }
 
@@ -790,54 +919,104 @@ impl McpClient {
                 "tools/call",
                 json!({ "name": name, "arguments": args }),
             );
-            let result = match cancel {
+            let outcome = match cancel {
                 Some(cancel) => tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => Err(McpError::Cancelled { tool: name.to_string() }),
-                    result = tokio::time::timeout(timeout, call) => result.unwrap_or_else(|_| Err(McpError::Timeout { tool: name.to_string(), timeout })),
+                    _ = cancel.cancelled() => ToolCallOutcome::Cancelled,
+                    result = tokio::time::timeout(timeout, call) => ToolCallOutcome::from(result),
                 },
-                None => tokio::time::timeout(timeout, call)
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(McpError::Timeout {
-                            tool: name.to_string(),
-                            timeout,
-                        })
-                    }),
+                None => ToolCallOutcome::from(tokio::time::timeout(timeout, call).await),
+            };
+            let result = match outcome {
+                ToolCallOutcome::Done(result) => result,
+                ToolCallOutcome::Cancelled => Err(McpError::Cancelled {
+                    tool: name.to_string(),
+                }),
+                ToolCallOutcome::TimedOut => {
+                    notify_cancelled_best_effort(sse_notification(
+                        &state,
+                        "notifications/cancelled",
+                        cancelled_notification_params(id),
+                    ))
+                    .await;
+                    Err(McpError::Timeout {
+                        tool: name.to_string(),
+                        timeout,
+                    })
+                }
             }?;
             return parse_tool_result(result);
         }
 
-        if let McpClientState::Http {
-            client,
-            url,
-            headers,
-            session_id,
-        } = &*state
-        {
-            let call = http_request(
-                client,
-                url,
-                headers,
-                session_id.as_ref(),
-                id,
-                "tools/call",
-                json!({ "name": name, "arguments": args }),
-            );
-            let result = match cancel {
-                Some(cancel) => tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => Err(McpError::Cancelled { tool: name.to_string() }),
-                    result = tokio::time::timeout(timeout, call) => result.unwrap_or_else(|_| Err(McpError::Timeout { tool: name.to_string(), timeout })),
-                },
-                None => tokio::time::timeout(timeout, call)
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(McpError::Timeout {
-                            tool: name.to_string(),
-                            timeout,
-                        })
-                    }),
+        if matches!(&*state, McpClientState::Http { .. }) {
+            let params = json!({ "name": name, "arguments": args });
+            let first = {
+                let McpClientState::Http {
+                    client,
+                    url,
+                    headers,
+                    session_id,
+                } = &*state
+                else {
+                    unreachable!()
+                };
+                call_http_tools_call(
+                    client,
+                    url,
+                    headers,
+                    session_id.as_ref(),
+                    id,
+                    name,
+                    params.clone(),
+                    timeout,
+                    cancel,
+                )
+                .await
+            };
+            let result = match first {
+                // Per the MCP streamable-HTTP spec, a 404 to a
+                // session-bearing request means the server considers the
+                // session gone (rmcp's `LocalSessionManager` evicts it after
+                // `keep_alive`, default 5 minutes idle -- see
+                // `code_agent.rs`'s `HttpServer::start`, which does not
+                // override it). The client is expected to reinitialize
+                // rather than keep presenting the dead session id forever.
+                Err(McpError::HttpSessionNotFound(detail)) => {
+                    tracing::info!(
+                        server = %self.name,
+                        detail = %detail,
+                        "HTTP MCP session not found; reinitializing session and retrying tool call once"
+                    );
+                    match reinit_http_session(&mut state, &self.next_id).await {
+                        Ok(new_instructions) => {
+                            *self.instructions.write().await = new_instructions;
+                            let retry_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                            let McpClientState::Http {
+                                client,
+                                url,
+                                headers,
+                                session_id,
+                            } = &*state
+                            else {
+                                unreachable!()
+                            };
+                            call_http_tools_call(
+                                client,
+                                url,
+                                headers,
+                                session_id.as_ref(),
+                                retry_id,
+                                name,
+                                params,
+                                timeout,
+                                cancel,
+                            )
+                            .await
+                        }
+                        Err(reinit_err) => Err(reinit_err),
+                    }
+                }
+                other => other,
             }?;
             return parse_tool_result(result);
         }
@@ -861,27 +1040,36 @@ impl McpClient {
             unreachable!()
         };
         let read = read_response(io, id);
-        let result = match cancel {
+        let outcome = match cancel {
             Some(cancel) => {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => Err(McpError::Cancelled { tool: name.to_string() }),
-                    result = tokio::time::timeout(timeout, read) => match result {
-                        Ok(result) => result,
-                        Err(_) => Err(McpError::Timeout {
-                            tool: name.to_string(),
-                            timeout,
-                        }),
-                    },
+                    _ = cancel.cancelled() => ToolCallOutcome::Cancelled,
+                    result = tokio::time::timeout(timeout, read) => ToolCallOutcome::from(result),
                 }
             }
-            None => match tokio::time::timeout(timeout, read).await {
-                Ok(result) => result,
-                Err(_) => Err(McpError::Timeout {
+            None => ToolCallOutcome::from(tokio::time::timeout(timeout, read).await),
+        };
+        let result = match outcome {
+            ToolCallOutcome::Done(result) => result,
+            ToolCallOutcome::Cancelled => Err(McpError::Cancelled {
+                tool: name.to_string(),
+            }),
+            ToolCallOutcome::TimedOut => {
+                let McpClientState::Stdio { io, .. } = &mut *state else {
+                    unreachable!()
+                };
+                notify_cancelled_best_effort(write_notification(
+                    io,
+                    "notifications/cancelled",
+                    cancelled_notification_params(id),
+                ))
+                .await;
+                Err(McpError::Timeout {
                     tool: name.to_string(),
                     timeout,
-                }),
-            },
+                })
+            }
         };
         let result = match result {
             Ok(result) => result,
@@ -892,6 +1080,44 @@ impl McpClient {
         };
 
         parse_tool_result(result)
+    }
+}
+
+/// Outcome of racing a `tools/call` future against a timeout and (optionally)
+/// a cancellation token.
+enum ToolCallOutcome {
+    Done(Result<Value, McpError>),
+    Cancelled,
+    TimedOut,
+}
+
+impl From<Result<Result<Value, McpError>, tokio::time::error::Elapsed>> for ToolCallOutcome {
+    fn from(result: Result<Result<Value, McpError>, tokio::time::error::Elapsed>) -> Self {
+        match result {
+            Ok(result) => ToolCallOutcome::Done(result),
+            Err(_) => ToolCallOutcome::TimedOut,
+        }
+    }
+}
+
+/// Params for a `notifications/cancelled` notification, per the MCP spec's
+/// recommendation to inform the server when a client gives up on a request
+/// (here: a `tools/call` that blew through its timeout budget).
+fn cancelled_notification_params(id: i64) -> Value {
+    json!({ "requestId": id, "reason": "Request timed out" })
+}
+
+/// Send a `notifications/cancelled` notification best-effort. Failures are
+/// logged, never surfaced -- they must not mask the timeout error that
+/// triggered the cancellation.
+async fn notify_cancelled_best_effort(
+    send: impl std::future::Future<Output = Result<(), McpError>>,
+) {
+    if let Err(err) = send.await {
+        tracing::debug!(
+            ?err,
+            "failed to send notifications/cancelled after tool-call timeout"
+        );
     }
 }
 
@@ -1156,7 +1382,11 @@ async fn http_request_with_session(
         .await
         .map_err(|e| McpError::Io(format!("read HTTP response: {e}")))?;
     if !status.is_success() {
-        return Err(McpError::Protocol(format!("HTTP {status}: {body}")));
+        let message = format!("HTTP {status}: {body}");
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(McpError::HttpSessionNotFound(message));
+        }
+        return Err(McpError::Protocol(message));
     }
     let value = if content_type.starts_with("text/event-stream") {
         parse_sse_json(&body)?
@@ -1192,6 +1422,106 @@ async fn http_notification(
     } else {
         Err(McpError::Protocol(format!("HTTP {}", response.status())))
     }
+}
+
+/// Issue one `tools/call` over an established HTTP MCP session, racing it
+/// against `timeout` and (if given) `cancel`, and best-effort notifying the
+/// server via `notifications/cancelled` if the call is abandoned to a
+/// timeout. Mirrors the SSE/stdio call paths' cancellation handling; kept as
+/// a free function so `call_tool_with_timeout`'s HTTP branch can invoke it
+/// twice (initial attempt, then once more after `reinit_http_session`)
+/// without holding two conflicting borrows of the client's session state.
+#[allow(clippy::too_many_arguments)]
+async fn call_http_tools_call(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &reqwest::header::HeaderMap,
+    session_id: Option<&reqwest::header::HeaderValue>,
+    id: i64,
+    name: &str,
+    params: Value,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> Result<Value, McpError> {
+    let call = http_request(client, url, headers, session_id, id, "tools/call", params);
+    let outcome = match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => ToolCallOutcome::Cancelled,
+            result = tokio::time::timeout(timeout, call) => ToolCallOutcome::from(result),
+        },
+        None => ToolCallOutcome::from(tokio::time::timeout(timeout, call).await),
+    };
+    match outcome {
+        ToolCallOutcome::Done(result) => result,
+        ToolCallOutcome::Cancelled => Err(McpError::Cancelled {
+            tool: name.to_string(),
+        }),
+        ToolCallOutcome::TimedOut => {
+            notify_cancelled_best_effort(http_notification(
+                client,
+                url,
+                headers,
+                session_id,
+                "notifications/cancelled",
+                cancelled_notification_params(id),
+            ))
+            .await;
+            Err(McpError::Timeout {
+                tool: name.to_string(),
+                timeout,
+            })
+        }
+    }
+}
+
+/// Re-run the initialize handshake on an already-connected HTTP MCP
+/// transport and install the fresh session id it returns, without
+/// rebuilding the `reqwest::Client` or re-fetching `tools/list` (the tool
+/// set does not change across a same-server reinitialization; only the
+/// server-side session state does, e.g. after rmcp's `LocalSessionManager`
+/// idle-timeout eviction). Called from `call_tool_with_timeout` only after
+/// an HTTP 404 ("session not found") on a `tools/call`.
+async fn reinit_http_session(
+    state: &mut McpClientState,
+    next_id: &AtomicI64,
+) -> Result<Option<String>, McpError> {
+    let McpClientState::Http {
+        client,
+        url,
+        headers,
+        session_id,
+    } = state
+    else {
+        unreachable!()
+    };
+    let init_id = next_id.fetch_add(1, Ordering::SeqCst);
+    let (init, new_session_id) = http_request_with_session(
+        client,
+        url,
+        headers,
+        None,
+        init_id,
+        "initialize",
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "brokk-acp-rust", "version": env!("CARGO_PKG_VERSION") },
+        }),
+    )
+    .await?;
+    let instructions = parse_server_instructions(&init);
+    http_notification(
+        client,
+        url,
+        headers,
+        new_session_id.as_ref(),
+        "notifications/initialized",
+        json!({}),
+    )
+    .await?;
+    *session_id = new_session_id;
+    Ok(instructions)
 }
 
 fn parse_sse_json(body: &str) -> Result<Value, McpError> {
@@ -1352,6 +1682,261 @@ mod http_tests {
         );
         thread.join().unwrap();
         assert_eq!(requests.lock().unwrap().len(), 4);
+    }
+
+    /// A `tools/call` that blows through its (parameterized, short-for-test)
+    /// timeout budget should get a best-effort `notifications/cancelled`
+    /// over the same HTTP transport, per the MCP spec's SHOULD.
+    ///
+    /// The fake server dispatches by JSON-RPC `method` (like
+    /// `http_transport_initializes_lists_and_calls_tools` above) rather than
+    /// by request position, because `connect_http` also fires a
+    /// `notifications/initialized` notification between `initialize` and
+    /// `tools/list` that a purely positional server would misattribute.
+    /// `tools/call` is answered, but only well after the client's short test
+    /// timeout has already elapsed and it's moved on to sending the
+    /// cancellation notification: this keeps that connection's
+    /// request/response cycle intact instead of leaving a reused (or
+    /// pipelined) HTTP/1.1 connection resolving a response nobody's
+    /// listening for, which otherwise made the *next* request on that
+    /// connection (the cancellation notification, or even the next test's
+    /// requests) resolve against a stray, previously-completed response.
+    #[tokio::test]
+    async fn http_tool_call_timeout_sends_cancelled_notification() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("start server");
+        let url = format!("http://{}/mcp", server.server_addr());
+        let thread = std::thread::spawn(move || {
+            loop {
+                let mut request = server.recv().expect("request");
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).expect("body");
+                let value: Value = serde_json::from_str(&body).expect("json");
+                seen.lock().unwrap().push(value.clone());
+                match value.get("method").and_then(Value::as_str) {
+                    Some("initialize") => {
+                        request
+                            .respond(tiny_http::Response::from_string(
+                                json!({"jsonrpc":"2.0","id":value["id"],"result":{}}).to_string(),
+                            ))
+                            .expect("respond initialize");
+                    }
+                    Some("notifications/initialized") => {
+                        request
+                            .respond(tiny_http::Response::empty(202))
+                            .expect("respond notifications/initialized");
+                    }
+                    Some("tools/list") => {
+                        request
+                            .respond(tiny_http::Response::from_string(
+                                json!({
+                                    "jsonrpc":"2.0",
+                                    "id":value["id"],
+                                    "result":{"tools":[{"name":"fake_tool","description":"fake","inputSchema":{"type":"object"}}]}
+                                })
+                                .to_string(),
+                            ))
+                            .expect("respond tools/list");
+                    }
+                    Some("tools/call") => {
+                        // Stall well past the client's timeout before
+                        // responding -- see the doc comment above for why.
+                        std::thread::sleep(Duration::from_millis(400));
+                        request
+                            .respond(tiny_http::Response::from_string(
+                                json!({"jsonrpc":"2.0","id":value["id"],"result":{"structuredContent":{"ok":true}}}).to_string(),
+                            ))
+                            .expect("respond tools/call (late, past the client's timeout)");
+                    }
+                    Some("notifications/cancelled") => {
+                        request
+                            .respond(tiny_http::Response::empty(202))
+                            .expect("respond notifications/cancelled");
+                        break;
+                    }
+                    other => panic!("unexpected method in fake HTTP server: {other:?}"),
+                }
+            }
+        });
+        let config = McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            command: String::new(),
+            url: Some(url),
+            headers: vec![],
+            args: vec![],
+            env: vec![],
+            framing: McpFraming::ContentLength,
+            enabled: true,
+        };
+        let client = McpClient::spawn(&config, Path::new("."))
+            .await
+            .expect("connect");
+
+        let err = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_millis(200), None)
+            .await
+            .expect_err("tools/call should time out");
+        assert!(
+            matches!(err, McpError::Timeout { .. }),
+            "expected timeout, got {err}"
+        );
+
+        thread.join().unwrap();
+        let seen = requests.lock().unwrap();
+        let call_index = seen
+            .iter()
+            .position(|msg| msg["method"] == "tools/call")
+            .expect("tools/call should have been sent");
+        let cancel_index = seen
+            .iter()
+            .position(|msg| msg["method"] == "notifications/cancelled")
+            .expect("notifications/cancelled should have been sent");
+        assert!(
+            cancel_index > call_index,
+            "cancellation notification should follow the timed-out tools/call"
+        );
+        assert_eq!(
+            seen[cancel_index]["params"]["reason"].as_str(),
+            Some("Request timed out")
+        );
+        assert_eq!(
+            seen[cancel_index]["params"]["requestId"].as_i64(),
+            seen[call_index]["id"].as_i64()
+        );
+        assert!(
+            seen[cancel_index].get("id").is_none(),
+            "notifications must not carry an id"
+        );
+    }
+
+    /// If the server responds 404 to a `tools/call` -- as rmcp's
+    /// `LocalSessionManager` does once it has evicted a session past its
+    /// idle timeout (see `code_agent.rs`'s `HttpServer::start`, which uses
+    /// that default) -- the client should reinitialize the HTTP MCP session
+    /// and retry the call once, rather than surfacing the dead session as a
+    /// permanent tool-call failure for the rest of the client's lifetime.
+    /// See `reinit_http_session` and the HTTP branch of
+    /// `call_tool_with_timeout`.
+    #[tokio::test]
+    async fn http_session_not_found_reinitializes_and_retries_tool_call() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("start server");
+        let url = format!("http://{}/mcp", server.server_addr());
+        let thread = std::thread::spawn(move || {
+            let mut initializes = 0;
+            let mut calls = 0;
+            loop {
+                let mut request = server.recv().expect("request");
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).expect("body");
+                let value: Value = serde_json::from_str(&body).expect("json");
+                seen.lock().unwrap().push(value.clone());
+                match value.get("method").and_then(Value::as_str) {
+                    Some("initialize") => {
+                        initializes += 1;
+                        let session_header = format!("session-{initializes}");
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(
+                                    json!({"jsonrpc":"2.0","id":value["id"],"result":{}})
+                                        .to_string(),
+                                )
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        "Mcp-Session-Id",
+                                        session_header.as_bytes(),
+                                    )
+                                    .unwrap(),
+                                ),
+                            )
+                            .expect("respond initialize");
+                    }
+                    Some("notifications/initialized") => {
+                        request
+                            .respond(tiny_http::Response::empty(202))
+                            .expect("respond notifications/initialized");
+                    }
+                    Some("tools/list") => {
+                        request
+                            .respond(tiny_http::Response::from_string(
+                                json!({
+                                    "jsonrpc":"2.0",
+                                    "id":value["id"],
+                                    "result":{"tools":[{"name":"fake_tool","description":"fake","inputSchema":{"type":"object"}}]}
+                                })
+                                .to_string(),
+                            ))
+                            .expect("respond tools/list");
+                    }
+                    Some("tools/call") => {
+                        calls += 1;
+                        if calls == 1 {
+                            request
+                                .respond(
+                                    tiny_http::Response::from_string(
+                                        "Not Found: Session not found",
+                                    )
+                                    .with_status_code(404),
+                                )
+                                .expect("respond tools/call (session not found)");
+                        } else {
+                            request
+                                .respond(tiny_http::Response::from_string(
+                                    json!({"jsonrpc":"2.0","id":value["id"],"result":{"structuredContent":{"ok":true}}}).to_string(),
+                                ))
+                                .expect("respond tools/call (retry succeeds)");
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected method in fake HTTP server: {other:?}"),
+                }
+            }
+        });
+        let config = McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            command: String::new(),
+            url: Some(url),
+            headers: vec![],
+            args: vec![],
+            env: vec![],
+            framing: McpFraming::ContentLength,
+            enabled: true,
+        };
+        let client = McpClient::spawn(&config, Path::new("."))
+            .await
+            .expect("connect");
+
+        let result = client
+            .call_tool("fake_tool", json!({}))
+            .await
+            .expect("the client should transparently reinitialize and retry once");
+        assert_eq!(result, json!({"ok": true}));
+
+        thread.join().unwrap();
+        let methods = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|msg| msg["method"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ],
+            "expected: connect handshake, a 404'd tools/call, a reinitialize \
+             handshake, then the retried tools/call"
+        );
     }
 }
 
@@ -1627,6 +2212,41 @@ fn parse_tool_annotations(value: Option<&Value>) -> McpToolAnnotations {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Pins the interim-fix timeout budgets: `tools/call` gets a generous
+    /// 300s (long-running server-side tools like Mjolnir's `code_agent` can
+    /// run up to 240s), while setup RPCs (initialize, `tools/list`, SSE
+    /// endpoint discovery) keep the original 60s. See
+    /// https://github.com/BrokkAi/anvil/issues/292 for the fuller design.
+    #[test]
+    fn startup_and_tool_call_timeouts_have_expected_budgets() {
+        assert_eq!(MCP_STARTUP_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(MCP_TOOL_CALL_TIMEOUT, Duration::from_secs(300));
+        assert!(MCP_TOOL_CALL_TIMEOUT > MCP_STARTUP_TIMEOUT);
+    }
+
+    /// Callers/tests match on the "timed out after {n}s" message, so it must
+    /// survive the timeout value being parameterized per call site.
+    #[test]
+    fn timeout_error_message_format_is_stable_across_timeout_values() {
+        let startup_err = McpError::Timeout {
+            tool: "SSE endpoint discovery".to_string(),
+            timeout: MCP_STARTUP_TIMEOUT,
+        };
+        assert_eq!(
+            startup_err.to_string(),
+            "tool 'SSE endpoint discovery' timed out after 60s"
+        );
+
+        let tool_call_err = McpError::Timeout {
+            tool: "fake_tool".to_string(),
+            timeout: MCP_TOOL_CALL_TIMEOUT,
+        };
+        assert_eq!(
+            tool_call_err.to_string(),
+            "tool 'fake_tool' timed out after 300s"
+        );
+    }
 
     #[test]
     fn server_instructions_omit_absent_empty_and_whitespace_values() {
@@ -2162,6 +2782,92 @@ done
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("timed out waiting for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_log_line(path: &std::path::Path, needle: &str) {
+        for _ in 0..50 {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && contents.contains(needle)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {needle:?} in {}", path.display());
+    }
+
+    /// The MCP spec SHOULDs a `notifications/cancelled` when a client gives
+    /// up on a request. `call_tool_with_timeout` sends that notification and
+    /// then immediately hands the timeout to `mark_unhealthy`, which SIGKILLs
+    /// the stdio child -- there is no guarantee the child's `read` loop is
+    /// ever scheduled again before it dies, so it cannot be trusted to
+    /// observe (and log) the notification itself. Instead the script `tee`s
+    /// all stdin to a log file *before* the read loop consumes it: `tee` runs
+    /// as its own process in the pipeline, so it keeps draining and logging
+    /// stdin even after `sh script.sh` (the immediate, killed child) is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_stdio_call_sends_cancelled_notification() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script_path = tmp.path().join("fake-mcp.sh");
+        let log_path = tmp.path().join("received.log");
+        let script = format!(
+            r#"#!/bin/sh
+tee -a '{log}' | while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'* )
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"capabilities\":{{}}}}}}"
+      ;;
+    *'"method":"tools/list"'* )
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"tools\":[{{\"name\":\"fake_tool\",\"description\":\"Fake\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}"
+      ;;
+    *'"method":"tools/call"'* )
+      sleep 60
+      ;;
+  esac
+done
+"#,
+            log = log_path.display()
+        );
+        write_executable_script(&script_path, &script);
+
+        let client = McpClient::spawn(&fake_mcp_config(&script_path), tmp.path())
+            .await
+            .expect("fake MCP subprocess should start");
+
+        let err = client
+            .call_tool_with_timeout("fake_tool", json!({}), Duration::from_millis(100), None)
+            .await
+            .expect_err("call should time out");
+        assert!(
+            matches!(err, McpError::Timeout { .. }),
+            "expected timeout, got {err}"
+        );
+
+        wait_for_log_line(&log_path, "notifications/cancelled").await;
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        let cancelled_line = log
+            .lines()
+            .find(|line| line.contains("notifications/cancelled"))
+            .expect("cancellation notification should have been logged");
+        let cancelled: Value =
+            serde_json::from_str(cancelled_line).expect("parse cancellation notification");
+        assert_eq!(
+            cancelled["method"].as_str(),
+            Some("notifications/cancelled")
+        );
+        assert_eq!(
+            cancelled["params"]["reason"].as_str(),
+            Some("Request timed out")
+        );
+        // initialize=1, tools/list=2, tools/call=3 for a freshly spawned client.
+        assert_eq!(cancelled["params"]["requestId"].as_i64(), Some(3));
+        assert!(
+            cancelled.get("id").is_none(),
+            "notifications must not carry an id"
+        );
     }
 
     #[cfg(unix)]

@@ -1,0 +1,160 @@
+---
+import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
+import Search from '@astrojs/starlight/components/Search.astro';
+import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
+import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
+import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+
+const { siteTitleHref } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute;
+const root = siteTitleHref.endsWith('/') ? siteTitleHref : `${siteTitleHref}/`;
+const navItems = [
+  { label: 'Install', slug: 'install/' },
+  { label: 'Evaluate', slug: 'evaluate-anvil/' },
+  { label: 'Clients', slug: 'zed/' },
+];
+const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
+---
+
+<div class="anvil-header-shell">
+  <div class="anvil-brand sl-flex">
+    <span class="anvil-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <SiteTitle />
+    <small>ACP runtime</small>
+  </div>
+
+  <nav class="anvil-primary-nav print:hidden" aria-label="Primary">
+    {
+      navItems.map(({ label, slug }) => {
+        const href = `${root}${slug}`;
+        return <a href={href} aria-current={currentPath === href ? 'page' : undefined}>{label}</a>;
+      })
+    }
+  </nav>
+
+  <div class="anvil-header-search sl-flex print:hidden"><Search /></div>
+  <div class="anvil-header-tools sl-hidden md:sl-flex print:hidden">
+    <div class="sl-flex social-icons"><SocialIcons /></div>
+    <ThemeSelect />
+    <LanguageSelect />
+  </div>
+</div>
+
+<style>
+  @layer starlight.user {
+    .anvil-header-shell {
+      display: grid;
+      grid-template-columns: minmax(10rem, auto) minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: clamp(0.7rem, 1.6vw, 1.5rem);
+      height: 100%;
+      max-width: 90rem;
+      margin-inline: auto;
+      padding: 0.48rem 0.7rem 0.48rem 0.85rem;
+      border: 1px solid var(--anvil-line-strong);
+      border-radius: 0.3rem;
+      background: color-mix(in srgb, var(--anvil-surface) 91%, transparent);
+      box-shadow: 0 14px 38px rgb(10 22 38 / 0.11), inset 0 1px var(--anvil-highlight);
+      backdrop-filter: blur(18px) saturate(120%);
+    }
+
+    .anvil-brand {
+      align-items: center;
+      gap: 0.65rem;
+      min-width: 0;
+    }
+
+    .anvil-brand small {
+      padding-inline-start: 0.65rem;
+      border-inline-start: 1px solid var(--anvil-line-strong);
+      color: var(--anvil-muted);
+      font-family: var(--sl-font-mono);
+      font-size: 0.58rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .anvil-mark {
+      position: relative;
+      display: block;
+      flex: 0 0 1.35rem;
+      width: 1.35rem;
+      height: 1.2rem;
+    }
+
+    .anvil-mark i {
+      position: absolute;
+      inset-inline: 0;
+      height: 0.24rem;
+      background: var(--anvil-steel);
+      clip-path: polygon(0 0, 100% 0, 86% 100%, 14% 100%);
+    }
+
+    .anvil-mark i:nth-child(1) { inset-block-start: 0; background: var(--anvil-cobalt); }
+    .anvil-mark i:nth-child(2) { inset: 0.42rem 0.18rem auto; }
+    .anvil-mark i:nth-child(3) { inset: 0.83rem 0.34rem auto; }
+
+    .anvil-brand :global(.site-title) {
+      color: var(--anvil-ink);
+      font-family: var(--sl-font);
+      font-size: 1rem;
+      font-weight: 750;
+      letter-spacing: -0.02em;
+    }
+
+    .anvil-primary-nav {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 0.15rem;
+    }
+
+    .anvil-primary-nav a {
+      position: relative;
+      padding: 0.5rem 0.68rem;
+      color: var(--anvil-muted);
+      font-family: var(--sl-font-mono);
+      font-size: 0.64rem;
+      font-weight: 600;
+      letter-spacing: 0.045em;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+
+    .anvil-primary-nav a::after {
+      position: absolute;
+      inset: auto 0.68rem 0.22rem;
+      height: 2px;
+      background: var(--anvil-cobalt);
+      content: '';
+      transform: scaleX(0);
+      transition: transform 140ms ease;
+    }
+
+    .anvil-primary-nav a:hover,
+    .anvil-primary-nav a:focus-visible,
+    .anvil-primary-nav a[aria-current='page'] { color: var(--anvil-ink); }
+    .anvil-primary-nav a[aria-current='page']::after { transform: scaleX(1); }
+
+    .anvil-header-search { justify-self: end; min-width: 0; }
+    .anvil-header-tools { align-items: center; gap: 0.72rem; }
+    .social-icons { align-items: center; gap: 0.65rem; }
+    .social-icons::after {
+      width: 1px;
+      height: 1.4rem;
+      background: var(--anvil-line-strong);
+      content: '';
+    }
+
+    @media (min-width: 72rem) {
+      .anvil-header-shell { grid-template-columns: minmax(13rem, auto) minmax(0, 1fr) auto auto; }
+      .anvil-primary-nav { display: flex; }
+    }
+
+    @media (max-width: 49.99rem) {
+      .anvil-header-shell { grid-template-columns: minmax(0, 1fr) auto; }
+      .anvil-brand small { display: none; }
+    }
+  }
+</style>
