@@ -15,6 +15,7 @@ use crate::trace_logging::append_trace_record;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -137,6 +138,7 @@ fn bedrock_reasoning_spec_for_model(model: &str) -> Option<BedrockReasoningSpec>
     let anthropic = |needle: &str| model.contains(needle);
     if anthropic("claude-fable-5")
         || anthropic("claude-mythos-5")
+        || anthropic("claude-opus-5")
         || anthropic("claude-opus-4-8")
         || anthropic("claude-opus-4-7")
         || anthropic("claude-sonnet-5")
@@ -362,6 +364,8 @@ const BEDROCK_CONTROL_BASE_URL: &str = "https://bedrock";
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_TOKENS: u32 = 8192;
+const BEDROCK_DISCOVERY_MAX_ATTEMPTS: u64 = 4;
+const BEDROCK_DISCOVERY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct BedrockClient {
@@ -386,6 +390,60 @@ pub struct BedrockClient {
     /// Bedrock Mantle) path; irrelevant to the native Anthropic/converse
     /// path.
     responses_chain: Arc<std::sync::Mutex<ResponsesChainCache>>,
+    discovery_cache: Arc<BedrockDiscoveryCache>,
+}
+
+struct BedrockDiscoveryCache {
+    mantle_models: LastGoodDiscovery<Vec<ModelMetadata>>,
+    foundation_models: LastGoodDiscovery<Vec<ModelMetadata>>,
+    inference_profiles: LastGoodDiscovery<Vec<BedrockInferenceProfileSummary>>,
+}
+
+impl BedrockDiscoveryCache {
+    fn new() -> Self {
+        Self {
+            mantle_models: LastGoodDiscovery::new("Bedrock Mantle model discovery"),
+            foundation_models: LastGoodDiscovery::new("Bedrock foundation-model discovery"),
+            inference_profiles: LastGoodDiscovery::new("Bedrock inference profile discovery"),
+        }
+    }
+}
+
+struct LastGoodDiscovery<T> {
+    name: &'static str,
+    value: std::sync::Mutex<Option<LastGoodValue<T>>>,
+}
+
+impl<T> LastGoodDiscovery<T> {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            value: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl<T: Clone> LastGoodDiscovery<T> {
+    fn record(&self, value: T) -> T {
+        *self.value.lock().expect("discovery cache mutex poisoned") = Some(LastGoodValue {
+            value: value.clone(),
+            updated_at: std::time::Instant::now(),
+        });
+        value
+    }
+
+    fn get_stale(&self) -> Option<(T, Duration)> {
+        self.value
+            .lock()
+            .expect("discovery cache mutex poisoned")
+            .as_ref()
+            .map(|cached| (cached.value.clone(), cached.updated_at.elapsed()))
+    }
+}
+
+struct LastGoodValue<T> {
+    value: T,
+    updated_at: std::time::Instant,
 }
 
 /// How many message-context -> response_id entries `responses_chain` keeps
@@ -551,6 +609,77 @@ impl std::fmt::Debug for BedrockClient {
     }
 }
 
+#[derive(Debug)]
+struct DiscoveryFailure {
+    err: anyhow::Error,
+    attempts: u64,
+}
+
+async fn retry_bedrock_discovery<T, Fut>(
+    source: &'static str,
+    mut operation: impl FnMut() -> Fut,
+) -> std::result::Result<T, DiscoveryFailure>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 1..=BEDROCK_DISCOVERY_MAX_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt == BEDROCK_DISCOVERY_MAX_ATTEMPTS => {
+                return Err(DiscoveryFailure {
+                    err,
+                    attempts: attempt,
+                });
+            }
+            Err(_) => {
+                let delay = bedrock_discovery_retry_backoff(attempt);
+                tracing::debug!(
+                    "{source} attempt {attempt}/{BEDROCK_DISCOVERY_MAX_ATTEMPTS} failed; retrying in {delay:?}"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!("retry loop returns on success or final failure")
+}
+
+fn bedrock_discovery_retry_backoff(attempt: u64) -> Duration {
+    let exp = 2u64.saturating_pow(attempt.saturating_sub(1) as u32);
+    let raw = BEDROCK_DISCOVERY_RETRY_BASE_DELAY
+        .as_millis()
+        .saturating_mul(u128::from(exp));
+    let jitter = rand::rng().random_range(0.5..1.5);
+    Duration::from_millis((raw as f64 * jitter) as u64)
+}
+
+fn discovery_result_or_last_good<T: Clone>(
+    cache: &LastGoodDiscovery<T>,
+    result: std::result::Result<T, DiscoveryFailure>,
+    empty: impl FnOnce() -> T,
+) -> T {
+    match result {
+        Ok(value) => cache.record(value),
+        Err(failure) => {
+            tracing::info!(
+                "{} skipped after {} attempts: {:#}",
+                cache.name,
+                failure.attempts,
+                failure.err
+            );
+            if let Some((value, age)) = cache.get_stale() {
+                tracing::warn!(
+                    "{} serving stale catalog data from last successful discovery (age: {:?})",
+                    cache.name,
+                    age
+                );
+                value
+            } else {
+                empty()
+            }
+        }
+    }
+}
+
 impl BedrockClient {
     pub fn new(bearer_token: String, region: String, default_model: String) -> Self {
         Self::new_with_catalog_mode(
@@ -588,6 +717,7 @@ impl BedrockClient {
             responses_chain: Arc::new(std::sync::Mutex::new(ResponsesChainCache::new(
                 RESPONSES_CHAIN_CACHE_CAP,
             ))),
+            discovery_cache: Arc::new(BedrockDiscoveryCache::new()),
         }
     }
 
@@ -618,6 +748,7 @@ impl BedrockClient {
             responses_chain: Arc::new(std::sync::Mutex::new(ResponsesChainCache::new(
                 RESPONSES_CHAIN_CACHE_CAP,
             ))),
+            discovery_cache: Arc::new(BedrockDiscoveryCache::new()),
         }
     }
 
@@ -1051,6 +1182,22 @@ impl BedrockClient {
             .collect())
     }
 
+    async fn list_mantle_model_metadata_with_fallback(&self) -> Vec<ModelMetadata> {
+        let result = retry_bedrock_discovery("Bedrock Mantle model discovery", || {
+            self.list_mantle_model_metadata()
+        })
+        .await;
+        discovery_result_or_last_good(&self.discovery_cache.mantle_models, result, Vec::new)
+    }
+
+    async fn discover_model_metadata_with_fallback(&self) -> Vec<ModelMetadata> {
+        let result = retry_bedrock_discovery("Bedrock foundation-model discovery", || {
+            self.discover_model_metadata()
+        })
+        .await;
+        discovery_result_or_last_good(&self.discovery_cache.foundation_models, result, Vec::new)
+    }
+
     async fn invoke_native_anthropic_with_fallback(
         &self,
         model: &str,
@@ -1136,14 +1283,8 @@ impl BedrockClient {
     }
 
     async fn inference_profile_candidates_for_model(&self, model: &str) -> Vec<String> {
-        let mut candidates = self
-            .list_inference_profiles()
-            .await
-            .map(|profiles| match_inference_profiles_to_model(model, &profiles, &self.region))
-            .unwrap_or_else(|err| {
-                tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-                Vec::new()
-            });
+        let profiles = self.list_inference_profiles_with_fallback().await;
+        let mut candidates = match_inference_profiles_to_model(model, &profiles, &self.region);
         candidates.extend(guessed_inference_profile_candidates(model, &self.region));
         dedup_preserve_order(candidates)
     }
@@ -1153,10 +1294,7 @@ impl BedrockClient {
             return Ok(model.to_string());
         }
 
-        let profiles = self.list_inference_profiles().await.unwrap_or_else(|err| {
-            tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-            Vec::new()
-        });
+        let profiles = self.list_inference_profiles_with_fallback().await;
         if let Some(invocable_id) =
             preferred_invocable_bedrock_model_id(model, &profiles, &self.region)
         {
@@ -1184,6 +1322,14 @@ impl BedrockClient {
             serde_json::from_str(&body).context("parse Bedrock inference profile response")?;
         Ok(parsed.inference_profile_summaries)
     }
+
+    async fn list_inference_profiles_with_fallback(&self) -> Vec<BedrockInferenceProfileSummary> {
+        let result = retry_bedrock_discovery("Bedrock inference profile discovery", || {
+            self.list_inference_profiles()
+        })
+        .await;
+        discovery_result_or_last_good(&self.discovery_cache.inference_profiles, result, Vec::new)
+    }
 }
 
 impl LlmBackend for BedrockClient {
@@ -1202,24 +1348,9 @@ impl LlmBackend for BedrockClient {
         Box::pin(async move {
             use crate::setup_state::BedrockCatalogMode;
 
-            let discover_mantle = || async {
-                match self.list_mantle_model_metadata().await {
-                    Ok(models) => models,
-                    Err(err) => {
-                        tracing::info!("Bedrock Mantle model discovery skipped: {err:#}");
-                        Vec::new()
-                    }
-                }
-            };
-            let discover_native = || async {
-                match self.discover_model_metadata().await {
-                    Ok(models) => models,
-                    Err(err) => {
-                        tracing::info!("Bedrock foundation-model discovery skipped: {err:#}");
-                        Vec::new()
-                    }
-                }
-            };
+            let discover_mantle =
+                || async { self.list_mantle_model_metadata_with_fallback().await };
+            let discover_native = || async { self.discover_model_metadata_with_fallback().await };
 
             let (mut models, uses_native) = match self.catalog_mode {
                 BedrockCatalogMode::MantleOnly => (discover_mantle().await, false),
@@ -1236,13 +1367,7 @@ impl LlmBackend for BedrockClient {
                 }
             };
             let inference_profiles = if uses_native {
-                match self.list_inference_profiles().await {
-                    Ok(profiles) => profiles,
-                    Err(err) => {
-                        tracing::info!("Bedrock inference profile discovery skipped: {err:#}");
-                        Vec::new()
-                    }
-                }
+                self.list_inference_profiles_with_fallback().await
             } else {
                 Vec::new()
             };
@@ -2121,7 +2246,7 @@ struct BedrockListInferenceProfilesResponse {
     inference_profile_summaries: Vec<BedrockInferenceProfileSummary>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct BedrockInferenceProfileSummary {
     #[serde(rename = "inferenceProfileId")]
     inference_profile_id: String,
@@ -2129,7 +2254,7 @@ struct BedrockInferenceProfileSummary {
     models: Vec<BedrockInferenceProfileModel>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct BedrockInferenceProfileModel {
     #[serde(rename = "modelArn")]
     model_arn: String,
@@ -2157,12 +2282,14 @@ impl BedrockFoundationModelSummary {
 #[cfg(test)]
 mod tests {
     use crate::llm_client::{ChatContentPart, FunctionDef};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
     use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{header, method, path, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[test]
     fn percent_encode_model_id() {
@@ -3911,6 +4038,113 @@ mod tests {
                 "mode: {mode:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bedrock_discovery_retry_retries_and_succeeds_on_later_attempt() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = retry_bedrock_discovery("test Bedrock discovery", || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("temporary discovery failure");
+                }
+                Ok("ok")
+            }
+        })
+        .await
+        .expect("retry should eventually succeed");
+
+        assert_eq!(result, "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Clone)]
+    struct FoundationModelsThenThrottle {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for FoundationModelsThenThrottle {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "modelSummaries": [{
+                        "modelId": "anthropic.claude-stable",
+                        "inputModalities": ["TEXT"],
+                        "outputModalities": ["TEXT"],
+                        "responseStreamingSupported": true
+                    }]
+                }))
+            } else {
+                ResponseTemplate::new(429).set_body_string("ThrottlingException")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bedrock_discovery_uses_last_good_after_later_total_failure() {
+        use crate::setup_state::BedrockCatalogMode;
+
+        let server = MockServer::start().await;
+        let foundation_calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/foundation-models"))
+            .respond_with(FoundationModelsThenThrottle {
+                calls: Arc::clone(&foundation_calls),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-profiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "inferenceProfileSummaries": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-4-6".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        client.catalog_mode = BedrockCatalogMode::NativeOnly;
+
+        let first = client
+            .list_model_metadata()
+            .await
+            .expect("initial discovery should succeed");
+        assert!(first.iter().any(|m| m.id == "anthropic.claude-stable"));
+
+        let second = client
+            .list_model_metadata()
+            .await
+            .expect("stale fallback should still succeed");
+        assert!(
+            second.iter().any(|m| m.id == "anthropic.claude-stable"),
+            "stale last-good model should remain advertised"
+        );
+        assert_eq!(
+            foundation_calls.load(Ordering::SeqCst),
+            1 + BEDROCK_DISCOVERY_MAX_ATTEMPTS as usize
+        );
+    }
+
+    #[test]
+    fn bedrock_discovery_without_last_good_returns_empty_after_failure() {
+        let cache = LastGoodDiscovery::<Vec<ModelMetadata>>::new("test Bedrock discovery");
+        let models = discovery_result_or_last_good(
+            &cache,
+            Err(DiscoveryFailure {
+                err: anyhow::anyhow!("permanent discovery failure"),
+                attempts: BEDROCK_DISCOVERY_MAX_ATTEMPTS,
+            }),
+            Vec::new,
+        );
+
+        assert!(models.is_empty());
     }
 
     #[tokio::test]

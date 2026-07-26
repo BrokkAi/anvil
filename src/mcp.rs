@@ -74,9 +74,27 @@ pub enum McpError {
     Spawn(String),
     Io(String),
     Protocol(String),
-    JsonRpc { code: i64, message: String },
-    Timeout { tool: String, timeout: Duration },
-    Cancelled { tool: String },
+    /// HTTP 404 response to a streamable-HTTP request carrying an
+    /// `Mcp-Session-Id`: the server has expired or evicted this session
+    /// (e.g. rmcp's `LocalSessionManager` default 5-minute idle timeout --
+    /// see `transport-streamable-http-server`'s `keep_alive`) and, per the
+    /// MCP spec, expects the client to reinitialize. Carries the same
+    /// formatted message text as `Protocol` (so logs/errors read
+    /// identically) but is kept distinct so `call_tool_with_timeout` can
+    /// reinitialize the session and retry once instead of failing the tool
+    /// call outright.
+    HttpSessionNotFound(String),
+    JsonRpc {
+        code: i64,
+        message: String,
+    },
+    Timeout {
+        tool: String,
+        timeout: Duration,
+    },
+    Cancelled {
+        tool: String,
+    },
 }
 
 impl fmt::Display for McpError {
@@ -85,6 +103,7 @@ impl fmt::Display for McpError {
             McpError::Spawn(s) => write!(f, "spawn failed: {s}"),
             McpError::Io(s) => write!(f, "io error: {s}"),
             McpError::Protocol(s) => write!(f, "protocol error: {s}"),
+            McpError::HttpSessionNotFound(s) => write!(f, "protocol error: {s}"),
             McpError::JsonRpc { code, message } => {
                 write!(f, "jsonrpc error {code}: {message}")
             }
@@ -929,50 +948,75 @@ impl McpClient {
             return parse_tool_result(result);
         }
 
-        if let McpClientState::Http {
-            client,
-            url,
-            headers,
-            session_id,
-        } = &*state
-        {
-            let call = http_request(
-                client,
-                url,
-                headers,
-                session_id.as_ref(),
-                id,
-                "tools/call",
-                json!({ "name": name, "arguments": args }),
-            );
-            let outcome = match cancel {
-                Some(cancel) => tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => ToolCallOutcome::Cancelled,
-                    result = tokio::time::timeout(timeout, call) => ToolCallOutcome::from(result),
-                },
-                None => ToolCallOutcome::from(tokio::time::timeout(timeout, call).await),
+        if matches!(&*state, McpClientState::Http { .. }) {
+            let params = json!({ "name": name, "arguments": args });
+            let first = {
+                let McpClientState::Http {
+                    client,
+                    url,
+                    headers,
+                    session_id,
+                } = &*state
+                else {
+                    unreachable!()
+                };
+                call_http_tools_call(
+                    client,
+                    url,
+                    headers,
+                    session_id.as_ref(),
+                    id,
+                    name,
+                    params.clone(),
+                    timeout,
+                    cancel,
+                )
+                .await
             };
-            let result = match outcome {
-                ToolCallOutcome::Done(result) => result,
-                ToolCallOutcome::Cancelled => Err(McpError::Cancelled {
-                    tool: name.to_string(),
-                }),
-                ToolCallOutcome::TimedOut => {
-                    notify_cancelled_best_effort(http_notification(
-                        client,
-                        url,
-                        headers,
-                        session_id.as_ref(),
-                        "notifications/cancelled",
-                        cancelled_notification_params(id),
-                    ))
-                    .await;
-                    Err(McpError::Timeout {
-                        tool: name.to_string(),
-                        timeout,
-                    })
+            let result = match first {
+                // Per the MCP streamable-HTTP spec, a 404 to a
+                // session-bearing request means the server considers the
+                // session gone (rmcp's `LocalSessionManager` evicts it after
+                // `keep_alive`, default 5 minutes idle -- see
+                // `code_agent.rs`'s `HttpServer::start`, which does not
+                // override it). The client is expected to reinitialize
+                // rather than keep presenting the dead session id forever.
+                Err(McpError::HttpSessionNotFound(detail)) => {
+                    tracing::info!(
+                        server = %self.name,
+                        detail = %detail,
+                        "HTTP MCP session not found; reinitializing session and retrying tool call once"
+                    );
+                    match reinit_http_session(&mut state, &self.next_id).await {
+                        Ok(new_instructions) => {
+                            *self.instructions.write().await = new_instructions;
+                            let retry_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                            let McpClientState::Http {
+                                client,
+                                url,
+                                headers,
+                                session_id,
+                            } = &*state
+                            else {
+                                unreachable!()
+                            };
+                            call_http_tools_call(
+                                client,
+                                url,
+                                headers,
+                                session_id.as_ref(),
+                                retry_id,
+                                name,
+                                params,
+                                timeout,
+                                cancel,
+                            )
+                            .await
+                        }
+                        Err(reinit_err) => Err(reinit_err),
+                    }
                 }
+                other => other,
             }?;
             return parse_tool_result(result);
         }
@@ -1338,7 +1382,11 @@ async fn http_request_with_session(
         .await
         .map_err(|e| McpError::Io(format!("read HTTP response: {e}")))?;
     if !status.is_success() {
-        return Err(McpError::Protocol(format!("HTTP {status}: {body}")));
+        let message = format!("HTTP {status}: {body}");
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(McpError::HttpSessionNotFound(message));
+        }
+        return Err(McpError::Protocol(message));
     }
     let value = if content_type.starts_with("text/event-stream") {
         parse_sse_json(&body)?
@@ -1374,6 +1422,106 @@ async fn http_notification(
     } else {
         Err(McpError::Protocol(format!("HTTP {}", response.status())))
     }
+}
+
+/// Issue one `tools/call` over an established HTTP MCP session, racing it
+/// against `timeout` and (if given) `cancel`, and best-effort notifying the
+/// server via `notifications/cancelled` if the call is abandoned to a
+/// timeout. Mirrors the SSE/stdio call paths' cancellation handling; kept as
+/// a free function so `call_tool_with_timeout`'s HTTP branch can invoke it
+/// twice (initial attempt, then once more after `reinit_http_session`)
+/// without holding two conflicting borrows of the client's session state.
+#[allow(clippy::too_many_arguments)]
+async fn call_http_tools_call(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &reqwest::header::HeaderMap,
+    session_id: Option<&reqwest::header::HeaderValue>,
+    id: i64,
+    name: &str,
+    params: Value,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> Result<Value, McpError> {
+    let call = http_request(client, url, headers, session_id, id, "tools/call", params);
+    let outcome = match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => ToolCallOutcome::Cancelled,
+            result = tokio::time::timeout(timeout, call) => ToolCallOutcome::from(result),
+        },
+        None => ToolCallOutcome::from(tokio::time::timeout(timeout, call).await),
+    };
+    match outcome {
+        ToolCallOutcome::Done(result) => result,
+        ToolCallOutcome::Cancelled => Err(McpError::Cancelled {
+            tool: name.to_string(),
+        }),
+        ToolCallOutcome::TimedOut => {
+            notify_cancelled_best_effort(http_notification(
+                client,
+                url,
+                headers,
+                session_id,
+                "notifications/cancelled",
+                cancelled_notification_params(id),
+            ))
+            .await;
+            Err(McpError::Timeout {
+                tool: name.to_string(),
+                timeout,
+            })
+        }
+    }
+}
+
+/// Re-run the initialize handshake on an already-connected HTTP MCP
+/// transport and install the fresh session id it returns, without
+/// rebuilding the `reqwest::Client` or re-fetching `tools/list` (the tool
+/// set does not change across a same-server reinitialization; only the
+/// server-side session state does, e.g. after rmcp's `LocalSessionManager`
+/// idle-timeout eviction). Called from `call_tool_with_timeout` only after
+/// an HTTP 404 ("session not found") on a `tools/call`.
+async fn reinit_http_session(
+    state: &mut McpClientState,
+    next_id: &AtomicI64,
+) -> Result<Option<String>, McpError> {
+    let McpClientState::Http {
+        client,
+        url,
+        headers,
+        session_id,
+    } = state
+    else {
+        unreachable!()
+    };
+    let init_id = next_id.fetch_add(1, Ordering::SeqCst);
+    let (init, new_session_id) = http_request_with_session(
+        client,
+        url,
+        headers,
+        None,
+        init_id,
+        "initialize",
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "brokk-acp-rust", "version": env!("CARGO_PKG_VERSION") },
+        }),
+    )
+    .await?;
+    let instructions = parse_server_instructions(&init);
+    http_notification(
+        client,
+        url,
+        headers,
+        new_session_id.as_ref(),
+        "notifications/initialized",
+        json!({}),
+    )
+    .await?;
+    *session_id = new_session_id;
+    Ok(instructions)
 }
 
 fn parse_sse_json(body: &str) -> Result<Value, McpError> {
@@ -1660,6 +1808,134 @@ mod http_tests {
         assert!(
             seen[cancel_index].get("id").is_none(),
             "notifications must not carry an id"
+        );
+    }
+
+    /// If the server responds 404 to a `tools/call` -- as rmcp's
+    /// `LocalSessionManager` does once it has evicted a session past its
+    /// idle timeout (see `code_agent.rs`'s `HttpServer::start`, which uses
+    /// that default) -- the client should reinitialize the HTTP MCP session
+    /// and retry the call once, rather than surfacing the dead session as a
+    /// permanent tool-call failure for the rest of the client's lifetime.
+    /// See `reinit_http_session` and the HTTP branch of
+    /// `call_tool_with_timeout`.
+    #[tokio::test]
+    async fn http_session_not_found_reinitializes_and_retries_tool_call() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("start server");
+        let url = format!("http://{}/mcp", server.server_addr());
+        let thread = std::thread::spawn(move || {
+            let mut initializes = 0;
+            let mut calls = 0;
+            loop {
+                let mut request = server.recv().expect("request");
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).expect("body");
+                let value: Value = serde_json::from_str(&body).expect("json");
+                seen.lock().unwrap().push(value.clone());
+                match value.get("method").and_then(Value::as_str) {
+                    Some("initialize") => {
+                        initializes += 1;
+                        let session_header = format!("session-{initializes}");
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(
+                                    json!({"jsonrpc":"2.0","id":value["id"],"result":{}})
+                                        .to_string(),
+                                )
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        "Mcp-Session-Id",
+                                        session_header.as_bytes(),
+                                    )
+                                    .unwrap(),
+                                ),
+                            )
+                            .expect("respond initialize");
+                    }
+                    Some("notifications/initialized") => {
+                        request
+                            .respond(tiny_http::Response::empty(202))
+                            .expect("respond notifications/initialized");
+                    }
+                    Some("tools/list") => {
+                        request
+                            .respond(tiny_http::Response::from_string(
+                                json!({
+                                    "jsonrpc":"2.0",
+                                    "id":value["id"],
+                                    "result":{"tools":[{"name":"fake_tool","description":"fake","inputSchema":{"type":"object"}}]}
+                                })
+                                .to_string(),
+                            ))
+                            .expect("respond tools/list");
+                    }
+                    Some("tools/call") => {
+                        calls += 1;
+                        if calls == 1 {
+                            request
+                                .respond(
+                                    tiny_http::Response::from_string(
+                                        "Not Found: Session not found",
+                                    )
+                                    .with_status_code(404),
+                                )
+                                .expect("respond tools/call (session not found)");
+                        } else {
+                            request
+                                .respond(tiny_http::Response::from_string(
+                                    json!({"jsonrpc":"2.0","id":value["id"],"result":{"structuredContent":{"ok":true}}}).to_string(),
+                                ))
+                                .expect("respond tools/call (retry succeeds)");
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected method in fake HTTP server: {other:?}"),
+                }
+            }
+        });
+        let config = McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            command: String::new(),
+            url: Some(url),
+            headers: vec![],
+            args: vec![],
+            env: vec![],
+            framing: McpFraming::ContentLength,
+            enabled: true,
+        };
+        let client = McpClient::spawn(&config, Path::new("."))
+            .await
+            .expect("connect");
+
+        let result = client
+            .call_tool("fake_tool", json!({}))
+            .await
+            .expect("the client should transparently reinitialize and retry once");
+        assert_eq!(result, json!({"ok": true}));
+
+        thread.join().unwrap();
+        let methods = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|msg| msg["method"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ],
+            "expected: connect handshake, a 404'd tools/call, a reinitialize \
+             handshake, then the retried tools/call"
         );
     }
 }
