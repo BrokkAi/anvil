@@ -265,6 +265,18 @@ fn build_anthropic_request(
             }
         }
         ThinkingShape::Adaptive => {
+            // Adaptive thinking has no fixed budget_tokens (the model
+            // decides how much to think, and effort strings here aren't
+            // limited to thinking_budget_for_effort's low/medium/high --
+            // xhigh and max are valid too), but it can still spend the
+            // entire flat MAX_TOKENS ceiling on thinking alone, leaving
+            // nothing for the visible answer. Observed as a degenerate
+            // empty completion (thinking-only content, no text/tool_use)
+            // that then has to be retried, wasting real wall-clock time and
+            // occasionally exhausting all retries. Reserve headroom the
+            // same way the Enabled shape does, regardless of which effort
+            // string is in play.
+            request.max_tokens = thinking_max_tokens(MAX_TOKENS);
             request.temperature = None;
             request.thinking = Some(BedrockThinking::Adaptive);
             request.output_config = Some(BedrockOutputConfig {
