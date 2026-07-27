@@ -265,18 +265,21 @@ fn build_anthropic_request(
             }
         }
         ThinkingShape::Adaptive => {
-            // Adaptive thinking has no fixed budget_tokens (the model
-            // decides how much to think, and effort strings here aren't
-            // limited to thinking_budget_for_effort's low/medium/high --
-            // xhigh and max are valid too), but it can still spend the
-            // entire flat MAX_TOKENS ceiling on thinking alone, leaving
-            // nothing for the visible answer. Observed as a degenerate
-            // empty completion (thinking-only content, no text/tool_use)
-            // that then has to be retried, wasting real wall-clock time and
-            // occasionally exhausting all retries. Reserve headroom the
-            // same way the Enabled shape does, regardless of which effort
-            // string is in play.
-            request.max_tokens = thinking_max_tokens(MAX_TOKENS);
+            // Adaptive thinking has no budget_tokens to derive a ceiling
+            // from -- the model decides how much to think, and the legacy
+            // budget arithmetic does not apply (budget_tokens is rejected
+            // outright by the models that use this shape). With only the
+            // flat MAX_TOKENS ceiling, the model can spend the entire
+            // budget thinking and return thinking-only content with no
+            // text or tool_use, which reads as a degenerate empty
+            // completion and gets retried. Confirmed by replay: at 8192,
+            // stop_reason=max_tokens with 8192/8192 thinking tokens and
+            // zero visible output.
+            //
+            // Anthropic's guidance for high-and-above effort with adaptive
+            // thinking is a ceiling of at least ADAPTIVE_MAX_TOKENS, well
+            // above what budget-derived arithmetic would produce.
+            request.max_tokens = ADAPTIVE_MAX_TOKENS;
             request.temperature = None;
             request.thinking = Some(BedrockThinking::Adaptive);
             request.output_config = Some(BedrockOutputConfig {
@@ -376,6 +379,12 @@ const BEDROCK_CONTROL_BASE_URL: &str = "https://bedrock";
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_TOKENS: u32 = 8192;
+
+/// Output ceiling for adaptive-thinking requests. Adaptive thinking spends
+/// from the same budget as the visible answer, so the flat `MAX_TOKENS` is
+/// far too tight: the model exhausts it thinking and returns nothing else.
+/// Anthropic's guidance is at least this much at `high` effort and above.
+const ADAPTIVE_MAX_TOKENS: u32 = 64_000;
 const BEDROCK_DISCOVERY_MAX_ATTEMPTS: u64 = 4;
 const BEDROCK_DISCOVERY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
@@ -3196,6 +3205,54 @@ mod tests {
             .expect("adaptive request should accept xhigh");
         match response {
             LlmResponse::Text { text, .. } => assert_eq!(text, "xhigh ok"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adaptive_requests_reserve_headroom_beyond_the_flat_ceiling() {
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
+            .and(body_partial_json(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "max_tokens": ADAPTIVE_MAX_TOKENS,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "roomy"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("high".to_string()),
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect("adaptive request should carry the adaptive ceiling");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "roomy"),
             other => panic!("expected text response, got {other:?}"),
         }
     }
