@@ -776,9 +776,20 @@ async fn main() -> Result<()> {
     } else {
         args.max_turns
     };
+    // `--asgard-supervisor` accepts a `model+effort` selector the same way
+    // `--models` does in the harness; without the split the suffix reached
+    // the provider as part of the model id and 404'd.
+    let (supervisor_model, supervisor_reasoning_effort) = match args.asgard_supervisor {
+        Some(selector) => {
+            let (model, effort) = asgard::split_model_effort(&selector);
+            (Some(model), effort)
+        }
+        None => (None, None),
+    };
     asgard::configure((!args.asgard_models.is_empty()).then_some(asgard::Config {
         candidate_models: args.asgard_models,
-        supervisor_model: args.asgard_supervisor,
+        supervisor_model,
+        supervisor_reasoning_effort,
     }));
     // Bounds on the LLM timeout values are enforced by the clap
     // `value_parser`, so the values reach us already validated.

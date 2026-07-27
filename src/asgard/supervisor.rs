@@ -75,6 +75,10 @@ pub(crate) struct SupervisorTurnContext<'a> {
 pub(crate) struct SupervisorStreamCall<'a> {
     pub(crate) llm: &'a dyn LlmBackend,
     pub(crate) model: &'a str,
+    /// Effort for this supervisor turn. Previously hardcoded to `None`,
+    /// which silently ran every supervisor at its model default no matter
+    /// what the session or `--asgard-supervisor` asked for.
+    pub(crate) reasoning_effort: Option<&'a str>,
     pub(crate) request_prefix: &'a [ChatMessage],
     pub(crate) tail: &'a [ChatMessage],
     pub(crate) tools: &'a [ToolDefinition],
@@ -358,7 +362,7 @@ pub(crate) async fn stream_supervisor_response(
                 model: call.model.to_string(),
                 messages,
                 tools: Some(call.tools.to_vec()),
-                reasoning_effort: None,
+                reasoning_effort: call.reasoning_effort.map(str::to_string),
                 service_tier: None,
                 temperature: None,
                 structured_output: None,

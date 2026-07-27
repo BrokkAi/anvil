@@ -13,6 +13,31 @@ use anyhow::{Context, Result, bail};
 pub(crate) struct Config {
     pub candidate_models: Vec<String>,
     pub supervisor_model: Option<String>,
+    /// Reasoning effort for supervisor turns, parsed off a `model+effort`
+    /// suffix on `--asgard-supervisor`. `None` means inherit the session's
+    /// effort rather than sending nothing at all.
+    pub supervisor_reasoning_effort: Option<String>,
+}
+
+/// Split a `model+effort` selector into its parts. The suffix is only
+/// treated as an effort when it is one anvil recognizes, so a model id that
+/// legitimately contains `+` is left intact.
+pub(crate) fn split_model_effort(selector: &str) -> (String, Option<String>) {
+    const EFFORTS: [&str; 7] = ["none", "off", "low", "medium", "high", "xhigh", "max"];
+    match selector.rsplit_once('+') {
+        Some((model, suffix))
+            if !model.is_empty() && EFFORTS.contains(&suffix.to_ascii_lowercase().as_str()) =>
+        {
+            let effort = suffix.to_ascii_lowercase();
+            let effort = if effort == "none" {
+                "off".to_string()
+            } else {
+                effort
+            };
+            (model.to_string(), Some(effort))
+        }
+        _ => (selector.to_string(), None),
+    }
 }
 
 static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
@@ -1543,5 +1568,43 @@ mod tests {
         fs::write(repo.join("tracked.txt"), "base\nedited\n").unwrap();
         let dirt = working_tree_dirt(repo).unwrap();
         assert_eq!(dirt, "M tracked.txt");
+    }
+
+    #[test]
+    fn split_model_effort_separates_a_recognized_suffix() {
+        assert_eq!(
+            split_model_effort("bedrock::openai.gpt-5.6-sol+high"),
+            (
+                "bedrock::openai.gpt-5.6-sol".to_string(),
+                Some("high".to_string())
+            )
+        );
+        assert_eq!(
+            split_model_effort("bedrock::us.anthropic.claude-fable-5+XHigh"),
+            (
+                "bedrock::us.anthropic.claude-fable-5".to_string(),
+                Some("xhigh".to_string())
+            )
+        );
+        // `none` is spelled `off` internally.
+        assert_eq!(
+            split_model_effort("m+none"),
+            ("m".to_string(), Some("off".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_model_effort_leaves_unsuffixed_and_plus_bearing_ids_alone() {
+        assert_eq!(
+            split_model_effort("deepseek::deepseek-v4-pro"),
+            ("deepseek::deepseek-v4-pro".to_string(), None)
+        );
+        // A `+` that is not a known effort must not be eaten -- otherwise a
+        // legitimate model id would be silently truncated.
+        assert_eq!(
+            split_model_effort("vendor::model+turbo"),
+            ("vendor::model+turbo".to_string(), None)
+        );
+        assert_eq!(split_model_effort("+high"), ("+high".to_string(), None));
     }
 }

@@ -178,6 +178,7 @@ enum AsgardExit {
 struct SupervisorLoopContext<'ctx, 'fut> {
     llm: &'ctx Arc<dyn crate::llm_client::LlmBackend>,
     supervisor_model: &'ctx str,
+    supervisor_reasoning_effort: Option<&'ctx str>,
     supervisor_turn: usize,
     permanent: &'ctx [ChatMessage],
     ephemeral: Vec<ChatMessage>,
@@ -523,6 +524,13 @@ pub(crate) async fn run_asgard_trajectory_loop(
     };
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
+    // An explicit `--asgard-supervisor model+effort` wins; otherwise the
+    // supervisor inherits the session effort. It previously sent nothing at
+    // all, so every supervisor ran at its model default regardless.
+    let supervisor_reasoning_effort = config
+        .supervisor_reasoning_effort
+        .as_deref()
+        .or(reasoning_effort);
     let original_task = asgard_original_task(&initial_messages);
     let (intake_contracts, intake_usages) = run_asgard_intake(AsgardIntakeRun {
         cx,
@@ -668,6 +676,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
         let turn_result = run_supervisor_agentic_turn(SupervisorLoopContext {
             llm,
             supervisor_model,
+            supervisor_reasoning_effort,
             supervisor_turn,
             permanent: &permanent,
             ephemeral,
@@ -966,6 +975,7 @@ async fn run_supervisor_agentic_turn<'ctx, 'fut>(
             let supervisor_future = stream_supervisor_response(SupervisorStreamCall {
                 llm: cx.llm.as_ref(),
                 model: cx.supervisor_model,
+                reasoning_effort: cx.supervisor_reasoning_effort,
                 request_prefix: cx.permanent,
                 tail: &tail,
                 tools: &tools,
@@ -2574,6 +2584,7 @@ mod tests {
         let config = Config {
             candidate_models: vec!["worker-model".to_string()],
             supervisor_model: Some("sv-model".to_string()),
+            supervisor_reasoning_effort: None,
         };
         let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
         let (agent_read, agent_write) = tokio::io::split(agent_io);
@@ -4261,6 +4272,7 @@ mod tests {
         let config = Config {
             candidate_models: vec!["worker-model".to_string()],
             supervisor_model: Some("sv-model".to_string()),
+            supervisor_reasoning_effort: None,
         };
         let initial_messages = vec![ChatMessage::user("exercise finalize by commit hash")];
         let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
@@ -4705,6 +4717,7 @@ mod tests {
         let config = Config {
             candidate_models: vec!["worker-model".to_string()],
             supervisor_model: Some("sv-model".to_string()),
+            supervisor_reasoning_effort: None,
         };
         let initial_messages = vec![
             ChatMessage::system("You are a helpful engineer."),
@@ -5347,6 +5360,7 @@ mod tests {
         let config = Config {
             candidate_models: vec!["worker-model".to_string()],
             supervisor_model: Some("sv-model".to_string()),
+            supervisor_reasoning_effort: None,
         };
         let initial_messages = vec![ChatMessage::user("exercise mixed supervisor calls")];
         let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
@@ -5489,6 +5503,7 @@ mod tests {
         let config = Config {
             candidate_models: vec!["worker-model".to_string()],
             supervisor_model: Some("sv-model".to_string()),
+            supervisor_reasoning_effort: None,
         };
         let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
         let (agent_read, agent_write) = tokio::io::split(agent_io);
@@ -5633,6 +5648,7 @@ mod tests {
         let config = Config {
             candidate_models: vec!["worker-model".to_string()],
             supervisor_model: Some("sv-model".to_string()),
+            supervisor_reasoning_effort: None,
         };
         let (agent_io, mut client_io) = tokio::io::duplex(1 << 20);
         let (agent_read, agent_write) = tokio::io::split(agent_io);
