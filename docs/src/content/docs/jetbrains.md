@@ -5,6 +5,18 @@ description: Install, configure, validate, and troubleshoot Anvil in JetBrains A
 
 JetBrains ACP clients can launch Anvil as a custom agent server. Use an absolute path to the installed or locally built executable.
 
+## Automatic Configuration
+
+Run the installed Anvil binary:
+
+```bash
+anvil install jetbrains
+```
+
+Anvil detects its own executable path and merges an `Anvil` agent into
+`~/.jetbrains/acp.json`. If an `Anvil` entry already exists, review it and then
+pass `--force` to replace only that entry.
+
 ## Manual Configuration
 
 Add an entry to `~/.jetbrains/acp.json`:
