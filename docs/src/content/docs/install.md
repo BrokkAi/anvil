@@ -36,13 +36,29 @@ $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
 if ($actual -ne $expected) { throw "SHA-256 mismatch" }
 ```
 
-Extract the archive, place `anvil` or `anvil.exe` somewhere stable, and record its absolute path for the client configuration. Confirm the binary:
+Extract the archive and place `anvil` or `anvil.exe` somewhere stable. Confirm the binary:
 
 ```bash
 /absolute/path/to/anvil --version
 ```
 
 If a Unix extraction tool drops the executable bit, run `chmod +x /absolute/path/to/anvil`. macOS releases are not currently notarized, so Gatekeeper may require you to approve the downloaded binary through the normal system security UI.
+
+Anvil can configure supported ACP clients with the absolute path of the
+currently running executable:
+
+```bash
+anvil install zed
+anvil install jetbrains
+anvil install neovim --plugin codecompanion
+anvil install neovim --plugin avante
+```
+
+Use `--force` to replace an existing Anvil entry or generated Neovim module.
+When `--plugin` is omitted for Neovim, Anvil prompts in an interactive terminal
+and defaults to CodeCompanion in non-interactive use. Move the executable to its
+stable location before running an installer; editor settings retain that
+detected absolute path.
 
 ## Install With Cargo
 
@@ -72,7 +88,7 @@ To omit the embedded Wasm parser sandbox:
 cargo build --release --no-default-features --bin anvil
 ```
 
-The source checkout also provides `cargo xtask build-acp-for-zed` and `cargo xtask build-acp-for-jetbrains`. These helpers are not included by `cargo install`; installed users configure the absolute binary path manually.
+The source checkout also provides `cargo xtask build-acp-for-zed` and `cargo xtask build-acp-for-jetbrains`. These developer helpers build first and then configure the resulting checkout binary. Installed users should use `anvil install`.
 
 ## Linux Sandbox Prerequisite
 

@@ -53,9 +53,17 @@ anvil --version
 
 Running `anvil` directly starts a stdio JSON-RPC server; use it through an ACP client. Continue with the [installation guide](https://anvil.brokk.ai/install/) or the reproducible [ten-minute evaluation](https://anvil.brokk.ai/evaluate-anvil/).
 
+Configure a supported ACP client directly from the installed binary:
+
+```bash
+anvil install zed
+anvil install jetbrains
+anvil install neovim --plugin codecompanion
+```
+
 ## Supported Clients
 
-- [Zed](https://anvil.brokk.ai/zed/) and [JetBrains](https://anvil.brokk.ai/jetbrains/) have repository-backed setup helpers and verified configuration shapes.
+- [Zed](https://anvil.brokk.ai/zed/), [JetBrains](https://anvil.brokk.ai/jetbrains/), and [Neovim](https://anvil.brokk.ai/neovim/) have direct installers and verified configuration shapes.
 - [Other ACP clients](https://anvil.brokk.ai/other-acp-clients/) can launch Anvil as a custom stdio agent.
 - The [client-building guide](https://anvil.brokk.ai/build-acp-client/) and `examples/` show issue triage, review, and issue-drafting automations.
 
