@@ -567,12 +567,13 @@ fn wire_nvim_plugin_setup(
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let path = resolve_symlink_target(path)?;
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating parent directory {}", parent.display()))?;
-    let existing_permissions: Option<Permissions> = fs::metadata(path)
+    let existing_permissions: Option<Permissions> = fs::metadata(&path)
         .ok()
         .map(|metadata| metadata.permissions());
     let temp_path = parent.join(format!(
@@ -595,16 +596,35 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         }
         #[cfg(windows)]
         if path.exists() {
-            fs::remove_file(path)
+            fs::remove_file(&path)
                 .with_context(|| format!("replacing existing file {}", path.display()))?;
         }
-        fs::rename(&temp_path, path)
+        fs::rename(&temp_path, &path)
             .with_context(|| format!("installing generated configuration {}", path.display()))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+/// Resolve an existing symbolic link before replacing a configuration file.
+///
+/// Renaming a temporary file onto a symlink replaces the link itself rather
+/// than its target, which breaks dotfile-managed editor configuration. A
+/// dangling link is intentionally an error: replacing it would silently lose
+/// the user's link instead of repairing the managed target.
+fn resolve_symlink_target(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => path
+            .canonicalize()
+            .with_context(|| format!("resolving symbolic link {}", path.display())),
+        Ok(_) => Ok(path.to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_owned()),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading metadata for {}", path.display()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -724,5 +744,26 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_preserves_existing_symlink() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("managed-settings.json");
+        let link = temp.path().join("settings.json");
+        fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        atomic_write(&link, b"new").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), target);
     }
 }
