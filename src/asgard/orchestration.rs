@@ -524,13 +524,12 @@ pub(crate) async fn run_asgard_trajectory_loop(
     };
     let live_output = AsgardLiveOutput::new(cx, session_id);
     let supervisor_model = config.supervisor_model.as_deref().unwrap_or(selected_model);
-    // An explicit `--asgard-supervisor model+effort` wins; otherwise the
-    // supervisor inherits the session effort. It previously sent nothing at
-    // all, so every supervisor ran at its model default regardless.
-    let supervisor_reasoning_effort = config
-        .supervisor_reasoning_effort
-        .as_deref()
-        .or(reasoning_effort);
+    // Supervisor effort is opt-in via `--asgard-supervisor model+effort`.
+    // It deliberately does not inherit the session effort: that value comes
+    // from the worker model, and coupling the two makes a high-effort worker
+    // silently drag the supervisor along, so there is no way to run (say)
+    // `luna+xhigh` workers under a default-effort supervisor.
+    let supervisor_reasoning_effort = config.supervisor_reasoning_effort.as_deref();
     let original_task = asgard_original_task(&initial_messages);
     let (intake_contracts, intake_usages) = run_asgard_intake(AsgardIntakeRun {
         cx,
