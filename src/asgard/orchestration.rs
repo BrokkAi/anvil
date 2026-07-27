@@ -531,25 +531,41 @@ pub(crate) async fn run_asgard_trajectory_loop(
     // `luna+xhigh` workers under a default-effort supervisor.
     let supervisor_reasoning_effort = config.supervisor_reasoning_effort.as_deref();
     let original_task = asgard_original_task(&initial_messages);
-    let (intake_contracts, intake_usages) = run_asgard_intake(AsgardIntakeRun {
-        cx,
-        sessions,
-        session_id,
-        llm,
-        parent_cwd: parent_registry.cwd(),
-        config,
-        selected_model,
-        reasoning_effort,
-        service_tier,
-        structured_output,
-        idle_timeout,
-        cancel: cancel.clone(),
-        live_output: &live_output,
-        original_task: &original_task,
-        context_length,
-        context_prefix_len,
-    })
-    .await;
+    // Intake is an ablation knob for measuring what the two-reader spec
+    // pass is worth: `ASGARD_INTAKE=0` skips it and hands the supervisor the
+    // bare task. `initial_permanent_user_message` already renders the
+    // no-contract case, so nothing downstream needs to know.
+    let intake_enabled = intake_enabled_from(std::env::var("ASGARD_INTAKE").ok().as_deref());
+    let (intake_contracts, intake_usages) = if intake_enabled {
+        run_asgard_intake(AsgardIntakeRun {
+            cx,
+            sessions,
+            session_id,
+            llm,
+            parent_cwd: parent_registry.cwd(),
+            config,
+            selected_model,
+            reasoning_effort,
+            service_tier,
+            structured_output,
+            idle_timeout,
+            cancel: cancel.clone(),
+            live_output: &live_output,
+            original_task: &original_task,
+            context_length,
+            context_prefix_len,
+        })
+        .await
+    } else {
+        tracing::info!("ASGARD_INTAKE disabled; supervisor starts from the bare task");
+        (
+            crate::asgard::IntakeContracts {
+                literal: None,
+                grounded: None,
+            },
+            Vec::new(),
+        )
+    };
     let mut aggregate_usage = TokenUsage::default();
     for (model, usage) in intake_usages {
         add_usage(&mut aggregate_usage, &mut usage_by_model, &model, usage);
@@ -2239,6 +2255,12 @@ pub(crate) fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
         .find(|message| message.role == "user")
         .map(ChatMessage::content_text)
         .unwrap_or_default()
+}
+
+/// Whether the intake pass runs, given the raw `ASGARD_INTAKE` value.
+/// Absent means enabled, so the ablation has to be asked for explicitly.
+fn intake_enabled_from(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("off") | Some("false"))
 }
 
 fn initial_permanent_user_message(
@@ -4646,6 +4668,22 @@ mod tests {
         assert_eq!(coverage["full_suite_worker_count"], serde_json::json!(0));
         assert_eq!(coverage["attacks_total"], serde_json::json!(0));
         assert_eq!(coverage["skipped_reason_present"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn intake_runs_unless_explicitly_disabled() {
+        assert!(intake_enabled_from(None), "absent must mean enabled");
+        assert!(intake_enabled_from(Some("1")));
+        assert!(
+            intake_enabled_from(Some("")),
+            "empty is not a disable request"
+        );
+        for off in ["0", "off", "false"] {
+            assert!(
+                !intake_enabled_from(Some(off)),
+                "{off} should disable intake"
+            );
+        }
     }
 
     #[tokio::test]
