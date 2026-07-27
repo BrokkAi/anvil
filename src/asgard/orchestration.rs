@@ -2508,7 +2508,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::fs;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -2859,6 +2859,21 @@ mod tests {
             }
             Box::pin(async move { Ok(response) })
         }
+    }
+
+    /// True when `sha` names an object in `root`. Used to tell this test's
+    /// trace records apart from those a concurrently-running test appended
+    /// to the same file; every test builds its own throwaway repo, so a
+    /// foreign commit never resolves here.
+    fn commit_is_local(root: &Path, sha: &str) -> bool {
+        Command::new("git")
+            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     fn run_git(root: &Path, args: &[&str]) -> String {
@@ -5574,12 +5589,20 @@ mod tests {
         assert!(!supervisor_text.contains("error: before finalizing"));
 
         let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
+        // `ANVIL_TRACE_JSONL` is process-global and read at write time, so
+        // asgard tests running in parallel append into whichever file is
+        // currently configured -- several of them emit an `asgard_finalize`
+        // carrying this same evidence. Match on a commit that exists in
+        // *this* test's repo so a sibling's record can't be picked up.
         let finalize_record = trace
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
             .find(|record| {
                 record["type"] == "asgard_finalize"
                     && record["evidence"] == serde_json::json!(["w1m1"])
+                    && record["commit"]
+                        .as_str()
+                        .is_some_and(|sha| commit_is_local(&repo, sha))
             })
             .expect("asgard finalize trace");
         assert_eq!(finalize_record["evidence"], serde_json::json!(["w1m1"]));
