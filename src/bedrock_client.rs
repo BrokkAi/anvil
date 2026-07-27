@@ -1,14 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use crate::llm_client::IdleTimeouts;
+use crate::http_retry::RetryableLlmError;
 use crate::llm_client::{
-    ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    ModelsResponse, OpenAiClient, OutputBudgetExhaustedError, ReasoningLevelPreset,
-    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
+    ChatContentPart, ChatMessage, FunctionCall, IdleTimeouts, IncompleteStreamError, LlmBackend,
+    LlmResponse, ModelMetadata, ModelsResponse, OpenAiClient, OutputBudgetExhaustedError,
+    ReasoningLevelPreset, StreamChatRequest, TokenSink, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
 use crate::trace_logging::append_trace_record;
@@ -783,7 +782,11 @@ impl BedrockClient {
         }
     }
 
-    fn invoke_url(&self, model: &str) -> String {
+    /// URL for the native Anthropic streaming endpoint. The non-streaming
+    /// `/invoke` sibling returns nothing until generation completes, which
+    /// leaves an `ADAPTIVE_MAX_TOKENS` run with zero observability; this one
+    /// emits `application/vnd.amazon.eventstream` frames as they are produced.
+    fn invoke_stream_url(&self, model: &str) -> String {
         let encoded = percent_encode_path_segment(model);
         if self.runtime_base_url.starts_with("http://")
             || self.runtime_base_url.starts_with("https://")
@@ -792,24 +795,24 @@ impl BedrockClient {
                 || self.runtime_base_url == "http://bedrock-runtime"
             {
                 return format!(
-                    "{}.{}.amazonaws.com/model/{encoded}/invoke",
+                    "{}.{}.amazonaws.com/model/{encoded}/invoke-with-response-stream",
                     self.runtime_base_url.trim_end_matches('.'),
                     self.region,
                 );
             }
             if self.runtime_base_url.contains("amazonaws.com") {
                 return format!(
-                    "{}/model/{encoded}/invoke",
+                    "{}/model/{encoded}/invoke-with-response-stream",
                     self.runtime_base_url.trim_end_matches('/')
                 );
             }
             return format!(
-                "{}/model/{encoded}/invoke",
+                "{}/model/{encoded}/invoke-with-response-stream",
                 self.runtime_base_url.trim_end_matches('/')
             );
         }
         format!(
-            "{}.{}.amazonaws.com/model/{encoded}/invoke",
+            "{}.{}.amazonaws.com/model/{encoded}/invoke-with-response-stream",
             self.runtime_base_url, self.region
         )
     }
@@ -876,7 +879,7 @@ impl BedrockClient {
             mut on_token,
             mut on_thought,
             cancel,
-            idle_timeouts: _,
+            idle_timeouts,
         } = request;
         let resolved_model = self.resolve_invocable_model_id(&model).await?;
         let enable_cache = requires_explicit_caching(&resolved_model);
@@ -914,8 +917,8 @@ impl BedrockClient {
             None => preferred_shape,
         };
 
-        let url = self.invoke_url(&resolved_model);
-        let body_text = loop {
+        let url = self.invoke_stream_url(&resolved_model);
+        let outcome = loop {
             let body = build_anthropic_request(
                 ANTHROPIC_VERSION,
                 system.clone(),
@@ -930,17 +933,25 @@ impl BedrockClient {
             );
             trace_bedrock_request(&body);
             match self
-                .invoke_native_anthropic_with_fallback(&resolved_model, &url, &body, &cancel)
+                .invoke_native_anthropic_with_fallback(
+                    &resolved_model,
+                    &url,
+                    &body,
+                    &cancel,
+                    idle_timeouts,
+                    &mut on_token,
+                    &mut on_thought,
+                )
                 .await
             {
-                Ok(text) => {
+                Ok(outcome) => {
                     if effort.is_some() {
                         self.thinking_shape_cache
                             .write()
                             .await
                             .insert(resolved_model.clone(), shape);
                     }
-                    break text;
+                    break outcome;
                 }
                 // The model rejected the legacy `enabled` shape and told us to
                 // use `adaptive` + `output_config.effort`. Switch shape once
@@ -960,47 +971,25 @@ impl BedrockClient {
                 Err(err) => return Err(err),
             }
         };
-        if body_text.is_empty() && cancel.is_cancelled() {
+        let NativeStreamOutcome {
+            text,
+            thoughts,
+            calls,
+            usage,
+            stop_reason,
+        } = outcome;
+        if cancel.is_cancelled() {
             return Ok(LlmResponse::Text {
-                text: String::new(),
-                reasoning_content: None,
-                usage: TokenUsage::default(),
+                text,
+                reasoning_content: (!thoughts.is_empty()).then_some(thoughts),
+                usage,
             });
         }
-        let parsed: BedrockAnthropicResponse =
-            serde_json::from_str(&body_text).context("parse Bedrock response")?;
-        let mut text = String::new();
-        let mut thoughts = String::new();
-        let mut calls = Vec::new();
-        for block in parsed.content {
-            match block {
-                BedrockContentBlock::Text { text: part } => text.push_str(&part),
-                BedrockContentBlock::Thinking { thinking: part } => thoughts.push_str(&part),
-                BedrockContentBlock::ToolUse { id, name, input } => {
-                    calls.push(ToolCall {
-                        id,
-                        r#type: "function".to_string(),
-                        function: FunctionCall {
-                            name,
-                            arguments: input.to_string(),
-                        },
-                    });
-                }
-                BedrockContentBlock::Other => {}
-            }
-        }
-        if !thoughts.is_empty() {
-            on_thought(&thoughts);
-        }
-        if !text.is_empty() {
-            on_token(&text);
-        }
-        let usage = parsed.usage.into_usage();
-        if calls.is_empty() && parsed.stop_reason.as_deref() == Some("max_tokens") {
+        if calls.is_empty() && stop_reason.as_deref() == Some("max_tokens") {
             // Hit the output ceiling with nothing to show for it. Under
             // adaptive thinking this is the budget-exhaustion case: the
-            // whole allowance went to thinking, so `content` carries only
-            // thinking blocks. Retrying re-sends an identical request that
+            // whole allowance went to thinking, so the stream carried only
+            // thinking deltas. Retrying re-sends an identical request that
             // hits the identical cap, so classify it as non-retryable
             // rather than letting it read as a generic empty completion.
             if text.trim().is_empty() {
@@ -1243,19 +1232,32 @@ impl BedrockClient {
         discovery_result_or_last_good(&self.discovery_cache.foundation_models, result, Vec::new)
     }
 
+    /// Opens the native Anthropic stream, retrying through inference profile
+    /// ids when the plain model id is rejected as on-demand-unsupported.
+    ///
+    /// The profile retry is only sound because it happens before any frame is
+    /// consumed: a rejected request is a 4xx with a JSON error body, so no
+    /// token has reached `on_token`/`on_thought` yet and replaying cannot
+    /// duplicate visible output.
+    #[allow(clippy::too_many_arguments)]
     async fn invoke_native_anthropic_with_fallback(
         &self,
         model: &str,
         url: &str,
         body: &BedrockAnthropicRequest,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<String> {
-        let Some((status, body_text)) = self.post_native_invoke(url, body, cancel).await? else {
-            return Ok(String::new());
+        idle: IdleTimeouts,
+        on_token: &mut TokenSink,
+        on_thought: &mut TokenSink,
+    ) -> Result<NativeStreamOutcome> {
+        let (status, body_text) = match self.post_native_invoke(url, body, cancel).await? {
+            NativeInvokeAttempt::Cancelled => return Ok(NativeStreamOutcome::default()),
+            NativeInvokeAttempt::Streaming(resp) => {
+                return drive_native_anthropic_stream(resp, on_token, on_thought, cancel, idle)
+                    .await;
+            }
+            NativeInvokeAttempt::Failed { status, body } => (status, body),
         };
-        if status.is_success() {
-            return Ok(body_text);
-        }
 
         if !needs_inference_profile_retry(status, &body_text)
             || looks_like_inference_profile_identifier(model)
@@ -1273,15 +1275,18 @@ impl BedrockClient {
                 model,
                 profile_id
             );
-            let retry_url = self.invoke_url(&profile_id);
-            let Some((retry_status, retry_body)) =
-                self.post_native_invoke(&retry_url, body, cancel).await?
-            else {
-                return Ok(String::new());
+            let retry_url = self.invoke_stream_url(&profile_id);
+            let (retry_status, retry_body) = match self
+                .post_native_invoke(&retry_url, body, cancel)
+                .await?
+            {
+                NativeInvokeAttempt::Cancelled => return Ok(NativeStreamOutcome::default()),
+                NativeInvokeAttempt::Streaming(resp) => {
+                    return drive_native_anthropic_stream(resp, on_token, on_thought, cancel, idle)
+                        .await;
+                }
+                NativeInvokeAttempt::Failed { status, body } => (status, body),
             };
-            if retry_status.is_success() {
-                return Ok(retry_body);
-            }
             last_retry_error = Some((profile_id, retry_status, retry_body));
         }
 
@@ -1307,12 +1312,13 @@ impl BedrockClient {
         url: &str,
         body: &BedrockAnthropicRequest,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Option<(reqwest::StatusCode, String)>> {
-        // The native Anthropic path is a single blocking POST -- nothing
-        // arrives until generation finishes -- so the client's default
-        // timeout has to cover a whole ADAPTIVE_MAX_TOKENS generation at
-        // high effort, which routinely exceeds it. Override per request
-        // rather than globally so discovery calls keep failing fast.
+    ) -> Result<NativeInvokeAttempt> {
+        // Ceiling on the whole exchange, headers plus streamed body. Now that
+        // frames arrive continuously the per-chunk idle timeouts below are the
+        // load-bearing stall detector, so this could be relaxed toward the
+        // client-wide default; left as-is until the streaming path has run in
+        // anger. Overridden per request rather than globally so discovery
+        // calls keep failing fast.
         let send = self
             .http
             .post(url)
@@ -1323,14 +1329,19 @@ impl BedrockClient {
 
         let resp = tokio::select! {
             _ = cancel.cancelled() => {
-                return Ok(None);
+                return Ok(NativeInvokeAttempt::Cancelled);
             }
             resp = send => resp.context("failed to send Bedrock request")?,
         };
 
         let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        Ok(Some((status, body_text)))
+        if status.is_success() {
+            return Ok(NativeInvokeAttempt::Streaming(resp));
+        }
+        Ok(NativeInvokeAttempt::Failed {
+            status,
+            body: resp.text().await.unwrap_or_default(),
+        })
     }
 
     async fn inference_profile_candidates_for_model(&self, model: &str) -> Vec<String> {
@@ -1777,10 +1788,10 @@ enum BedrockThinking {
     #[serde(rename = "enabled")]
     Enabled { budget_tokens: u32 },
     /// `display` defaults to `omitted` on the models that use this shape,
-    /// which returns thinking blocks whose text is an empty string. Ask for
-    /// summaries instead so the reasoning reaches `on_thought` and the
-    /// trace: this path does not stream, so the summary carried in the
-    /// final body is the only visibility into a long generation.
+    /// which streams thinking blocks whose text is an empty string. Ask for
+    /// summaries instead so the reasoning reaches `on_thought` and the trace
+    /// as `thinking_delta` events -- otherwise a long generation streams
+    /// nothing at all until the answer starts.
     #[serde(rename = "adaptive")]
     Adaptive { display: &'static str },
 }
@@ -1857,35 +1868,78 @@ struct BedrockTool {
     cache_control: Option<CacheControl>,
 }
 
+/// One Anthropic streaming event, as carried inside an eventstream frame.
 #[derive(Debug, Deserialize)]
-struct BedrockAnthropicResponse {
+#[serde(tag = "type")]
+enum AnthropicStreamEvent {
+    #[serde(rename = "message_start")]
+    MessageStart { message: AnthropicStreamMessage },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        index: u64,
+        content_block: AnthropicStreamBlockStart,
+    },
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta {
+        index: u64,
+        delta: AnthropicStreamDelta,
+    },
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        delta: AnthropicStreamMessageDelta,
+        #[serde(default)]
+        usage: Option<BedrockUsage>,
+    },
+    #[serde(rename = "message_stop")]
+    MessageStop,
+    /// `error` events are terminal: the model stopped mid-generation.
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        error: serde_json::Value,
+    },
+    /// `content_block_stop`, `ping`, and anything the provider adds later.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamMessage {
     #[serde(default)]
-    content: Vec<BedrockContentBlock>,
-    #[serde(default)]
-    usage: BedrockUsage,
+    usage: Option<BedrockUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AnthropicStreamBlockStart {
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AnthropicStreamDelta {
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
+    /// `signature_delta` and friends carry no user-visible content.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamMessageDelta {
     /// `max_tokens` here means the model hit the output ceiling. With
     /// adaptive thinking that regularly means it spent the whole budget
     /// thinking and emitted nothing else -- see `invoke_model`, which turns
     /// that case into `OutputBudgetExhaustedError` so it is not retried.
     #[serde(default)]
     stop_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum BedrockContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(other)]
-    Other,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1910,6 +1964,420 @@ impl BedrockUsage {
             cached_write_tokens: self.cache_creation_input_tokens,
         }
     }
+}
+
+/// Streaming splits usage across two events: `message_start` carries the
+/// input and cache counts (with a placeholder output count), `message_delta`
+/// carries the final output count. Merge by non-zero field so neither event
+/// can blank out what the other reported.
+fn merge_stream_usage(total: &mut TokenUsage, part: TokenUsage) {
+    for (slot, value) in [
+        (&mut total.input_tokens, part.input_tokens),
+        (&mut total.output_tokens, part.output_tokens),
+        (&mut total.thought_tokens, part.thought_tokens),
+        (&mut total.cached_read_tokens, part.cached_read_tokens),
+        (&mut total.cached_write_tokens, part.cached_write_tokens),
+    ] {
+        if value != 0 {
+            *slot = value;
+        }
+    }
+}
+
+/// What one native streaming POST produced. A non-2xx never reaches the
+/// stream, so the caller can still fall back to an inference profile.
+enum NativeInvokeAttempt {
+    Cancelled,
+    Streaming(reqwest::Response),
+    Failed {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
+/// Everything a completed native Anthropic stream accumulated. Text and
+/// thoughts have already been forwarded to the sinks as they arrived; these
+/// copies are what the caller returns in `LlmResponse`.
+#[derive(Debug, Default)]
+struct NativeStreamOutcome {
+    text: String,
+    thoughts: String,
+    calls: Vec<ToolCall>,
+    usage: TokenUsage,
+    stop_reason: Option<String>,
+}
+
+/// A `tool_use` block being assembled from `input_json_delta` fragments.
+struct PartialToolUse {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Bedrock reports mid-stream failures as eventstream exception frames or
+/// Anthropic `error` events rather than an HTTP status, so the retry tier has
+/// to be recovered from the failure name. These are the transient ones
+/// documented for `InvokeModelWithResponseStream` plus Anthropic's own
+/// overload/api error kinds.
+const RETRYABLE_STREAM_FAILURES: &[&str] = &[
+    "internalServerException",
+    "modelStreamErrorException",
+    "modelTimeoutException",
+    "serviceUnavailableException",
+    "throttlingException",
+    "overloaded_error",
+    "api_error",
+];
+
+fn stream_failure_error(kind: &str, body: &str) -> anyhow::Error {
+    let message = format!("Bedrock stream failed ({kind}): {body}");
+    if RETRYABLE_STREAM_FAILURES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(kind))
+    {
+        return crate::http_retry::retryable_llm_error(
+            message,
+            RetryableLlmError::fast("Bedrock stream failure"),
+        );
+    }
+    crate::http_retry::retryable_llm_error_for_body(message, body)
+}
+
+/// Consumes an `invoke-with-response-stream` body, forwarding text and
+/// summarized thinking to the sinks as it arrives.
+///
+/// Unlike every other backend here the wire format is not SSE: Bedrock frames
+/// the response as `application/vnd.amazon.eventstream` (see
+/// `EventStreamDecoder`), and each frame's payload is a base64-wrapped
+/// Anthropic streaming event.
+async fn drive_native_anthropic_stream(
+    resp: reqwest::Response,
+    on_token: &mut TokenSink,
+    on_thought: &mut TokenSink,
+    cancel: &tokio_util::sync::CancellationToken,
+    idle: IdleTimeouts,
+) -> Result<NativeStreamOutcome> {
+    let mut stream = std::pin::pin!(resp.bytes_stream());
+    let mut decoder = EventStreamDecoder::default();
+    let mut outcome = NativeStreamOutcome::default();
+    let mut tool_blocks: BTreeMap<u64, PartialToolUse> = BTreeMap::new();
+    let mut deadline = tokio::time::Instant::now() + idle.first_progress;
+    let mut saw_progress = false;
+    let mut completed = false;
+    let mut failure: Option<anyhow::Error> = None;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            chunk_or_timeout = tokio::time::timeout_at(deadline, stream.next()) => {
+                let Ok(chunk_opt) = chunk_or_timeout else {
+                    if saw_progress {
+                        return Err(crate::http_retry::retryable_llm_error(
+                            format!(
+                                "Bedrock stream stalled mid-stream for {}s; aborting",
+                                idle.inter_chunk.as_secs()
+                            ),
+                            RetryableLlmError::fast("Bedrock stream stalled mid-stream"),
+                        ));
+                    }
+                    return Err(crate::http_retry::retryable_llm_error(
+                        format!(
+                            "Bedrock stream made no first token for {}s; aborting",
+                            idle.first_progress.as_secs()
+                        ),
+                        RetryableLlmError::fast("Bedrock stream made no first token"),
+                    ));
+                };
+                let Some(chunk) = chunk_opt else { break };
+                let chunk = chunk.map_err(|err| {
+                    crate::http_retry::retryable_llm_context(
+                        anyhow::Error::new(err),
+                        "Bedrock stream read error",
+                        RetryableLlmError::fast("Bedrock stream read error"),
+                    )
+                })?;
+                decoder.push(&chunk);
+
+                let mut made_progress = false;
+                while let Some(frame) = decoder.next_frame()? {
+                    made_progress = true;
+                    let Some(event) = decode_anthropic_event(&frame)? else {
+                        continue;
+                    };
+                    match event {
+                        AnthropicStreamEvent::MessageStart { message } => {
+                            if let Some(usage) = message.usage {
+                                merge_stream_usage(&mut outcome.usage, usage.into_usage());
+                            }
+                        }
+                        AnthropicStreamEvent::ContentBlockStart { index, content_block } => {
+                            if let AnthropicStreamBlockStart::ToolUse { id, name } = content_block {
+                                tool_blocks.insert(
+                                    index,
+                                    PartialToolUse { id, name, arguments: String::new() },
+                                );
+                            }
+                        }
+                        AnthropicStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                            AnthropicStreamDelta::Text { text } => {
+                                on_token(&text);
+                                outcome.text.push_str(&text);
+                            }
+                            AnthropicStreamDelta::Thinking { thinking } => {
+                                on_thought(&thinking);
+                                outcome.thoughts.push_str(&thinking);
+                            }
+                            AnthropicStreamDelta::InputJson { partial_json } => {
+                                if let Some(block) = tool_blocks.get_mut(&index) {
+                                    block.arguments.push_str(&partial_json);
+                                }
+                            }
+                            AnthropicStreamDelta::Other => {}
+                        },
+                        AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                            if let Some(stop_reason) = delta.stop_reason {
+                                outcome.stop_reason = Some(stop_reason);
+                            }
+                            if let Some(usage) = usage {
+                                merge_stream_usage(&mut outcome.usage, usage.into_usage());
+                            }
+                        }
+                        AnthropicStreamEvent::MessageStop => {
+                            completed = true;
+                            break;
+                        }
+                        AnthropicStreamEvent::Error { error } => {
+                            let kind = error
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            failure = Some(stream_failure_error(&kind, &error.to_string()));
+                            completed = true;
+                            break;
+                        }
+                        AnthropicStreamEvent::Other => {}
+                    }
+                }
+
+                if made_progress {
+                    saw_progress = true;
+                    deadline = tokio::time::Instant::now() + idle.inter_chunk;
+                }
+                if completed {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    // Cancellation is a caller decision, not a provider failure: hand back
+    // whatever streamed before the abort rather than reporting a truncated
+    // stream. Half-built tool calls are dropped -- their arguments are
+    // partial JSON and there is nothing to execute them for.
+    if cancel.is_cancelled() {
+        return Ok(outcome);
+    }
+    if !completed {
+        return Err(anyhow::Error::new(IncompleteStreamError::new(
+            "Bedrock eventstream",
+            "message_stop",
+        )));
+    }
+    for (_, block) in std::mem::take(&mut tool_blocks) {
+        let arguments = if block.arguments.trim().is_empty() {
+            // Anthropic sends no `input_json_delta` at all for a no-argument
+            // tool call.
+            "{}".to_string()
+        } else {
+            block.arguments
+        };
+        let arguments = crate::tool_arguments::normalize_streamed_tool_arguments(
+            &block.id,
+            &block.name,
+            arguments,
+            "Bedrock eventstream",
+        )?;
+        outcome.calls.push(ToolCall {
+            id: block.id,
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: block.name,
+                arguments,
+            },
+        });
+    }
+    Ok(outcome)
+}
+
+/// Turns one eventstream frame into an Anthropic streaming event, or `None`
+/// for frames that carry no model output (unknown message/event types).
+fn decode_anthropic_event(frame: &EventStreamFrame) -> Result<Option<AnthropicStreamEvent>> {
+    match frame.header(":message-type").unwrap_or("event") {
+        "event" => {}
+        message_type @ ("exception" | "error") => {
+            let kind = frame
+                .header(":exception-type")
+                .or_else(|| frame.header(":error-code"))
+                .unwrap_or(message_type);
+            let body = String::from_utf8_lossy(&frame.payload).into_owned();
+            return Err(stream_failure_error(kind, &body));
+        }
+        other => {
+            tracing::debug!(
+                message_type = other,
+                "ignoring unknown Bedrock eventstream message type"
+            );
+            return Ok(None);
+        }
+    }
+    if frame
+        .header(":event-type")
+        .is_some_and(|kind| kind != "chunk")
+    {
+        return Ok(None);
+    }
+
+    #[derive(Deserialize)]
+    struct ChunkEnvelope {
+        bytes: String,
+    }
+
+    use base64::Engine as _;
+    let envelope: ChunkEnvelope = serde_json::from_slice(&frame.payload)
+        .context("parse Bedrock eventstream chunk envelope")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(envelope.bytes.as_bytes())
+        .context("base64-decode Bedrock eventstream chunk")?;
+    let event = serde_json::from_slice(&decoded).with_context(|| {
+        format!(
+            "parse Anthropic stream event: {}",
+            String::from_utf8_lossy(&decoded)
+        )
+    })?;
+    Ok(Some(event))
+}
+
+/// AWS caps an eventstream message at 16 MiB. A larger length prefix means we
+/// lost frame sync, so fail instead of reserving on a bogus number.
+const EVENTSTREAM_MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+/// `total_length` (4) + `headers_length` (4) + prelude CRC (4).
+const EVENTSTREAM_PRELUDE_LEN: usize = 12;
+/// Trailing message CRC.
+const EVENTSTREAM_TRAILER_LEN: usize = 4;
+
+#[derive(Debug)]
+struct EventStreamFrame {
+    /// String-valued headers only; the binary/numeric header types the spec
+    /// defines never appear on this API's frames.
+    headers: Vec<(String, String)>,
+    payload: Vec<u8>,
+}
+
+impl EventStreamFrame {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Incremental decoder for AWS `application/vnd.amazon.eventstream` framing:
+///
+/// ```text
+/// [total len u32][headers len u32][prelude CRC u32][headers][payload][CRC u32]
+/// ```
+///
+/// Frames are split arbitrarily across HTTP chunks, so bytes accumulate here
+/// until a whole frame is available. Both CRCs are ignored: the transport is
+/// TLS, which already detects corruption, and verifying them would mean
+/// carrying a CRC32 implementation for no additional protection.
+#[derive(Default)]
+struct EventStreamDecoder {
+    buf: Vec<u8>,
+}
+
+impl EventStreamDecoder {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    fn next_frame(&mut self) -> Result<Option<EventStreamFrame>> {
+        if self.buf.len() < EVENTSTREAM_PRELUDE_LEN {
+            return Ok(None);
+        }
+        let total_len =
+            u32::from_be_bytes(self.buf[0..4].try_into().expect("4-byte slice")) as usize;
+        let headers_len =
+            u32::from_be_bytes(self.buf[4..8].try_into().expect("4-byte slice")) as usize;
+        let overhead = EVENTSTREAM_PRELUDE_LEN + EVENTSTREAM_TRAILER_LEN;
+        if total_len < overhead
+            || total_len > EVENTSTREAM_MAX_FRAME_LEN
+            || headers_len > total_len - overhead
+        {
+            anyhow::bail!(
+                "malformed Bedrock eventstream frame (total {total_len} bytes, headers {headers_len} bytes)"
+            );
+        }
+        if self.buf.len() < total_len {
+            return Ok(None);
+        }
+        let frame: Vec<u8> = self.buf.drain(..total_len).collect();
+        let headers_end = EVENTSTREAM_PRELUDE_LEN + headers_len;
+        Ok(Some(EventStreamFrame {
+            headers: parse_eventstream_headers(&frame[EVENTSTREAM_PRELUDE_LEN..headers_end])?,
+            payload: frame[headers_end..total_len - EVENTSTREAM_TRAILER_LEN].to_vec(),
+        }))
+    }
+}
+
+fn parse_eventstream_headers(mut region: &[u8]) -> Result<Vec<(String, String)>> {
+    const STRING_VALUE_TYPE: u8 = 7;
+    let mut headers = Vec::new();
+    while let Some((&name_len, rest)) = region.split_first() {
+        let name_len = usize::from(name_len);
+        if rest.len() < name_len + 1 {
+            anyhow::bail!("truncated Bedrock eventstream header name");
+        }
+        let name = String::from_utf8_lossy(&rest[..name_len]).into_owned();
+        let value_type = rest[name_len];
+        region = &rest[name_len + 1..];
+
+        // Value widths per the eventstream spec. Only strings are retained,
+        // but every type has to be skipped by the right width to stay in sync.
+        let value_len = match value_type {
+            0 | 1 => 0,
+            2 => 1,
+            3 => 2,
+            4 => 4,
+            5 | 8 => 8,
+            9 => 16,
+            6 | STRING_VALUE_TYPE => {
+                if region.len() < 2 {
+                    anyhow::bail!("truncated Bedrock eventstream header length");
+                }
+                let len = usize::from(u16::from_be_bytes([region[0], region[1]]));
+                region = &region[2..];
+                len
+            }
+            other => anyhow::bail!("unsupported Bedrock eventstream header value type {other}"),
+        };
+        if region.len() < value_len {
+            anyhow::bail!("truncated Bedrock eventstream header value");
+        }
+        if value_type == STRING_VALUE_TYPE {
+            headers.push((
+                name,
+                String::from_utf8_lossy(&region[..value_len]).into_owned(),
+            ));
+        }
+        region = &region[value_len..];
+    }
+    Ok(headers)
 }
 
 fn convert_messages(
@@ -2353,6 +2821,155 @@ mod tests {
     use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    const EVENTSTREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
+
+    /// One content block in a mocked streaming response.
+    enum StreamBlock<'a> {
+        Text(&'a str),
+        Thinking(&'a str),
+        ToolUse {
+            id: &'a str,
+            name: &'a str,
+            /// Sent as a single `input_json_delta`; use `""` for a tool call
+            /// the model emits with no arguments at all.
+            input_json: &'a str,
+        },
+    }
+
+    /// Expands content blocks into the Anthropic event sequence the streaming
+    /// endpoint emits: usage split across `message_start`/`message_delta`,
+    /// one start/delta/stop trio per block, then `message_stop`.
+    fn anthropic_stream_events(
+        blocks: &[StreamBlock<'_>],
+        stop_reason: Option<&str>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Vec<serde_json::Value> {
+        let mut events = vec![serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_test",
+                "role": "assistant",
+                "content": [],
+                "usage": {"input_tokens": input_tokens, "output_tokens": 1}
+            }
+        })];
+        for (index, block) in blocks.iter().enumerate() {
+            let (start, delta) = match block {
+                StreamBlock::Text(text) => (
+                    serde_json::json!({"type": "text", "text": ""}),
+                    Some(serde_json::json!({"type": "text_delta", "text": text})),
+                ),
+                StreamBlock::Thinking(thinking) => (
+                    serde_json::json!({"type": "thinking", "thinking": ""}),
+                    Some(serde_json::json!({"type": "thinking_delta", "thinking": thinking})),
+                ),
+                StreamBlock::ToolUse {
+                    id,
+                    name,
+                    input_json,
+                } => (
+                    serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                    (!input_json.is_empty()).then(|| {
+                        serde_json::json!({"type": "input_json_delta", "partial_json": input_json})
+                    }),
+                ),
+            };
+            events.push(serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": start
+            }));
+            if let Some(delta) = delta {
+                events.push(serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": delta
+                }));
+            }
+            events.push(serde_json::json!({"type": "content_block_stop", "index": index}));
+        }
+        events.push(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": {"output_tokens": output_tokens}
+        }));
+        events.push(serde_json::json!({"type": "message_stop"}));
+        events
+    }
+
+    /// Frames arbitrary events the way `invoke-with-response-stream` does:
+    /// a 12-byte prelude, string headers, a base64 `{"bytes":...}` payload,
+    /// and a trailing CRC slot. Both CRC slots are zero -- the decoder does
+    /// not verify them.
+    fn eventstream_body(events: &[serde_json::Value]) -> Vec<u8> {
+        use base64::Engine as _;
+        let mut body = Vec::new();
+        for event in events {
+            let payload = serde_json::json!({
+                "bytes": base64::engine::general_purpose::STANDARD.encode(event.to_string())
+            })
+            .to_string();
+            body.extend_from_slice(&eventstream_frame(
+                &[
+                    (":message-type", "event"),
+                    (":event-type", "chunk"),
+                    (":content-type", "application/json"),
+                ],
+                payload.as_bytes(),
+            ));
+        }
+        body
+    }
+
+    fn eventstream_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut headers_bytes = Vec::new();
+        for (name, value) in headers {
+            headers_bytes.push(u8::try_from(name.len()).expect("header name fits in a byte"));
+            headers_bytes.extend_from_slice(name.as_bytes());
+            headers_bytes.push(7);
+            headers_bytes.extend_from_slice(
+                &u16::try_from(value.len())
+                    .expect("header value fits in u16")
+                    .to_be_bytes(),
+            );
+            headers_bytes.extend_from_slice(value.as_bytes());
+        }
+        let total =
+            EVENTSTREAM_PRELUDE_LEN + headers_bytes.len() + payload.len() + EVENTSTREAM_TRAILER_LEN;
+        let mut frame = Vec::with_capacity(total);
+        frame.extend_from_slice(
+            &u32::try_from(total)
+                .expect("frame fits in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(
+            &u32::try_from(headers_bytes.len())
+                .expect("headers fit in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&headers_bytes);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame
+    }
+
+    /// Wraps a mocked streaming body in the response shape Bedrock returns.
+    fn eventstream_response(events: &[serde_json::Value]) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(eventstream_body(events), EVENTSTREAM_CONTENT_TYPE)
+    }
+
+    /// The common case: one text block, no thinking, no tool calls.
+    fn text_stream_response(text: &str, input_tokens: u64, output_tokens: u64) -> ResponseTemplate {
+        eventstream_response(&anthropic_stream_events(
+            &[StreamBlock::Text(text)],
+            Some("end_turn"),
+            input_tokens,
+            output_tokens,
+        ))
+    }
+
     #[test]
     fn percent_encode_model_id() {
         assert_eq!(
@@ -2624,8 +3241,8 @@ mod tests {
         );
 
         assert_eq!(
-            client.invoke_url("us.anthropic.claude-sonnet-4-6"),
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-6/invoke"
+            client.invoke_stream_url("us.anthropic.claude-sonnet-4-6"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-6/invoke-with-response-stream"
         );
     }
 
@@ -2641,8 +3258,8 @@ mod tests {
         );
 
         assert_eq!(
-            client.invoke_url("a/b c"),
-            "https://bedrock-runtime.us-east-1.amazonaws.com/model/a%2Fb%20c/invoke"
+            client.invoke_stream_url("a/b c"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/a%2Fb%20c/invoke-with-response-stream"
         );
     }
 
@@ -3040,18 +3657,22 @@ mod tests {
         // Claude 4.6+ uses adaptive thinking plus output_config.effort, not
         // the legacy budget_tokens shape.
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-sonnet-4-6/invoke"))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-4-6/invoke-with-response-stream",
+            ))
             .and(body_partial_json(serde_json::json!({
                 "thinking": {"type": "adaptive"},
                 "output_config": {"effort": "medium"}
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [
-                    {"type": "thinking", "thinking": "let me reason"},
-                    {"type": "text", "text": "done"}
+            .respond_with(eventstream_response(&anthropic_stream_events(
+                &[
+                    StreamBlock::Thinking("let me reason"),
+                    StreamBlock::Text("done"),
                 ],
-                "usage": {"input_tokens": 5, "output_tokens": 3}
-            })))
+                Some("end_turn"),
+                5,
+                3,
+            )))
             .mount(&server)
             .await;
 
@@ -3106,12 +3727,11 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-3-5-sonnet/invoke"))
+            .and(path(
+                "/model/us.anthropic.claude-3-5-sonnet/invoke-with-response-stream",
+            ))
             .and(GenericThinkingBlock)
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "plain"}],
-                "usage": {"input_tokens": 2, "output_tokens": 1}
-            })))
+            .respond_with(text_stream_response("plain", 2, 1))
             .mount(&server)
             .await;
 
@@ -3163,12 +3783,11 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/model/global.anthropic.claude-sonnet-4-5/invoke"))
+            .and(path(
+                "/model/global.anthropic.claude-sonnet-4-5/invoke-with-response-stream",
+            ))
             .and(ManualThinkingOnly)
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "manual ok"}],
-                "usage": {"input_tokens": 2, "output_tokens": 1}
-            })))
+            .respond_with(text_stream_response("manual ok", 2, 1))
             .mount(&server)
             .await;
 
@@ -3208,15 +3827,14 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/model/global.anthropic.claude-opus-4-8/invoke"))
+            .and(path(
+                "/model/global.anthropic.claude-opus-4-8/invoke-with-response-stream",
+            ))
             .and(body_partial_json(serde_json::json!({
                 "thinking": {"type": "adaptive"},
                 "output_config": {"effort": "xhigh"}
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "xhigh ok"}],
-                "usage": {"input_tokens": 2, "output_tokens": 1}
-            })))
+            .respond_with(text_stream_response("xhigh ok", 2, 1))
             .mount(&server)
             .await;
 
@@ -3256,22 +3874,26 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
             .and(body_partial_json(serde_json::json!({
                 // `display` must be explicit: the provider default is
-                // `omitted`, which returns thinking blocks with empty text
-                // and leaves this non-streaming path with no visibility at
-                // all into a long generation.
+                // `omitted`, which streams thinking blocks with empty text
+                // and leaves a long generation emitting nothing until the
+                // answer starts.
                 "thinking": {"type": "adaptive", "display": "summarized"},
                 "max_tokens": ADAPTIVE_MAX_TOKENS,
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [
-                    {"type": "thinking", "thinking": "weighing options"},
-                    {"type": "text", "text": "roomy"}
+            .respond_with(eventstream_response(&anthropic_stream_events(
+                &[
+                    StreamBlock::Thinking("weighing options"),
+                    StreamBlock::Text("roomy"),
                 ],
-                "usage": {"input_tokens": 2, "output_tokens": 1}
-            })))
+                Some("end_turn"),
+                2,
+                1,
+            )))
             .mount(&server)
             .await;
 
@@ -3305,7 +3927,7 @@ mod tests {
             LlmResponse::Text { text, .. } => assert_eq!(text, "roomy"),
             other => panic!("expected text response, got {other:?}"),
         }
-        // The summary is the only window into this non-streaming path.
+        // Summarized thinking must reach `on_thought` as it streams.
         assert_eq!(thoughts.lock().unwrap().as_str(), "weighing options");
     }
 
@@ -3315,12 +3937,15 @@ mod tests {
         // The budget-exhaustion shape: the whole allowance went to thinking,
         // so there is no text and no tool_use to return.
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "thinking", "thinking": "deliberating"}],
-                "stop_reason": "max_tokens",
-                "usage": {"input_tokens": 5, "output_tokens": 64000}
-            })))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
+            .respond_with(eventstream_response(&anthropic_stream_events(
+                &[StreamBlock::Thinking("deliberating")],
+                Some("max_tokens"),
+                5,
+                64_000,
+            )))
             .mount(&server)
             .await;
 
@@ -3365,15 +3990,18 @@ mod tests {
         // Same ceiling hit, but the model did emit something usable --
         // return the truncated content instead of erroring.
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [
-                    {"type": "thinking", "thinking": "deliberating"},
-                    {"type": "text", "text": "partial answer"}
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
+            .respond_with(eventstream_response(&anthropic_stream_events(
+                &[
+                    StreamBlock::Thinking("deliberating"),
+                    StreamBlock::Text("partial answer"),
                 ],
-                "stop_reason": "max_tokens",
-                "usage": {"input_tokens": 5, "output_tokens": 64000}
-            })))
+                Some("max_tokens"),
+                5,
+                64_000,
+            )))
             .mount(&server)
             .await;
 
@@ -3418,7 +4046,7 @@ mod tests {
         // the documented "use adaptive + output_config.effort" 400.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/model/anthropic.claude-opus-4-5/invoke"))
+            .and(path("/model/anthropic.claude-opus-4-5/invoke-with-response-stream"))
             .and(body_partial_json(serde_json::json!({
                 "thinking": {"type": "enabled"}
             })))
@@ -3453,15 +4081,19 @@ mod tests {
             }
         }
         Mock::given(method("POST"))
-            .and(path("/model/anthropic.claude-opus-4-5/invoke"))
+            .and(path(
+                "/model/anthropic.claude-opus-4-5/invoke-with-response-stream",
+            ))
             .and(AdaptiveShape(adaptive_hits.clone()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [
-                    {"type": "thinking", "thinking": "weighing"},
-                    {"type": "text", "text": "adaptive ok"}
+            .respond_with(eventstream_response(&anthropic_stream_events(
+                &[
+                    StreamBlock::Thinking("weighing"),
+                    StreamBlock::Text("adaptive ok"),
                 ],
-                "usage": {"input_tokens": 6, "output_tokens": 4}
-            })))
+                Some("end_turn"),
+                6,
+                4,
+            )))
             .mount(&server)
             .await;
 
@@ -3956,12 +4588,9 @@ mod tests {
     async fn anthropic_models_still_use_native_invoke() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex(r"/model/.+/invoke$"))
+            .and(path_regex(r"/model/.+/invoke-with-response-stream$"))
             .and(header("authorization", "Bearer token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "native ok"}],
-                "usage": {"input_tokens": 2, "output_tokens": 1}
-            })))
+            .respond_with(text_stream_response("native ok", 2, 9))
             .mount(&server)
             .await;
 
@@ -3992,10 +4621,411 @@ mod tests {
         match response {
             LlmResponse::Text { text, usage, .. } => {
                 assert_eq!(text, "native ok");
+                // Streaming splits usage: inputs arrive in `message_start`,
+                // the real output count only in `message_delta`.
                 assert_eq!(usage.input_tokens, 2);
+                assert_eq!(usage.output_tokens, 9);
             }
             other => panic!("expected text response, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_tool_calls_are_assembled_from_input_json_deltas() {
+        let server = MockServer::start().await;
+        // Split the arguments across two `input_json_delta` events: the
+        // provider fragments them arbitrarily and only the concatenation is
+        // valid JSON.
+        let mut events = vec![
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 11, "output_tokens": 1}}
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {}}
+            }),
+        ];
+        for fragment in ["{\"path\":", "\"/tmp/x\"}"] {
+            events.push(serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": fragment}
+            }));
+        }
+        events.push(serde_json::json!({"type": "content_block_stop", "index": 0}));
+        events.push(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 12}
+        }));
+        events.push(serde_json::json!({"type": "message_stop"}));
+
+        Mock::given(method("POST"))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
+            .respond_with(eventstream_response(&events))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect("streamed tool call should succeed");
+        match response {
+            LlmResponse::ToolCalls { calls, usage, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_1");
+                assert_eq!(calls[0].function.name, "read_file");
+                assert_eq!(calls[0].function.arguments, "{\"path\":\"/tmp/x\"}");
+                assert_eq!(usage.input_tokens, 11);
+                assert_eq!(usage.output_tokens, 12);
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_calls_keep_leading_text_and_default_empty_arguments() {
+        let server = MockServer::start().await;
+        // A no-argument tool call streams no `input_json_delta` at all, and
+        // any text emitted before it has to survive alongside the call.
+        Mock::given(method("POST"))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
+            .respond_with(eventstream_response(&anthropic_stream_events(
+                &[
+                    StreamBlock::Text("checking"),
+                    StreamBlock::ToolUse {
+                        id: "call_0",
+                        name: "list_files",
+                        input_json: "",
+                    },
+                ],
+                Some("tool_use"),
+                3,
+                4,
+            )))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect("streamed tool call should succeed");
+        match response {
+            LlmResponse::ToolCalls { text, calls, .. } => {
+                assert_eq!(text, "checking");
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function.name, "list_files");
+                assert_eq!(calls[0].function.arguments, "{}");
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_exception_frames_stay_retryable() {
+        let server = MockServer::start().await;
+        let mut body = eventstream_body(&[serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 1, "output_tokens": 1}}
+        })]);
+        // Bedrock reports mid-stream failures as exception frames, not as an
+        // HTTP status, so the retry tier has to come from the frame headers.
+        body.extend_from_slice(&eventstream_frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "throttlingException"),
+            ],
+            br#"{"message":"Too many requests"}"#,
+        ));
+        Mock::given(method("POST"))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, EVENTSTREAM_CONTENT_TYPE))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let error = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect_err("a stream exception must not read as a successful turn");
+        assert_eq!(
+            crate::llm_client::llm_retry_tier(&error),
+            Some(crate::http_retry::LlmRetryTier::Fast),
+            "throttling must stay retryable: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_without_message_stop_is_retryable() {
+        let server = MockServer::start().await;
+        // Everything but the terminating `message_stop`: a connection that
+        // died mid-generation must not be mistaken for a complete answer.
+        let mut events =
+            anthropic_stream_events(&[StreamBlock::Text("half an answ")], Some("end_turn"), 1, 2);
+        events.pop();
+        Mock::given(method("POST"))
+            .and(path(
+                "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream",
+            ))
+            .respond_with(eventstream_response(&events))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let error = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: None,
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect_err("a stream cut short must not read as a complete turn");
+        assert!(
+            crate::llm_client::is_incomplete_stream_error(&error),
+            "expected an incomplete-stream error, got {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_stream_emits_tokens_before_completion_and_honors_cancellation() {
+        // wiremock can only delay a whole response, which cannot show that
+        // frames reach the sinks while the request is still open. Serve the
+        // prefix by hand over a chunked connection that then stalls forever:
+        // the only way this test finishes is if tokens are delivered
+        // mid-stream and cancellation aborts the still-open body.
+        let prefix = eventstream_body(&[
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 4, "output_tokens": 1}}
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "streamed early"}
+            }),
+        ]);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling stream server");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept streaming client");
+            let mut scratch = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
+            let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            response.extend_from_slice(format!("{:x}\r\n", prefix.len()).as_bytes());
+            response.extend_from_slice(&prefix);
+            response.extend_from_slice(b"\r\n");
+            tokio::io::AsyncWriteExt::write_all(&mut socket, &response)
+                .await
+                .expect("write streamed prefix");
+            tokio::io::AsyncWriteExt::flush(&mut socket)
+                .await
+                .expect("flush streamed prefix");
+            // Never terminate the chunked body.
+            std::future::pending::<()>().await;
+        });
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            format!("http://{addr}"),
+            format!("http://{addr}/v1"),
+            format!("http://{addr}"),
+        );
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let cancel_for_request = cancel.clone();
+        let request = client.stream_chat(StreamChatRequest {
+            model: "us.anthropic.claude-sonnet-5".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: None,
+            reasoning_effort: None,
+            service_tier: None,
+            temperature: None,
+            structured_output: None,
+            on_token: Box::new(move |t| {
+                tx.send(t.to_string()).expect("token receiver alive");
+            }),
+            on_thought: Box::new(|_| {}),
+            cancel: cancel_for_request,
+            // Generous enough that only cancellation can end this stream.
+            idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(120)),
+        });
+
+        let waiter = tokio::spawn(async move {
+            let token = rx.recv().await.expect("a token before the stream finishes");
+            cancel.cancel();
+            token
+        });
+
+        let response = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("cancellation must abort the open stream")
+            .expect("cancelled stream returns what it already produced");
+        let token = waiter.await.expect("token waiter");
+        assert_eq!(token, "streamed early");
+        match response {
+            LlmResponse::Text { text, usage, .. } => {
+                assert_eq!(text, "streamed early");
+                assert_eq!(usage.input_tokens, 4);
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn eventstream_decoder_reassembles_frames_split_across_chunks() {
+        let body = eventstream_body(&[
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 7, "output_tokens": 1}}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hi"}
+            }),
+        ]);
+
+        // One byte at a time: frames straddle HTTP chunk boundaries in
+        // practice, so a partial frame must decode to nothing, not an error.
+        let mut decoder = EventStreamDecoder::default();
+        let mut events = Vec::new();
+        for byte in &body {
+            decoder.push(std::slice::from_ref(byte));
+            while let Some(frame) = decoder.next_frame().expect("frame decodes") {
+                events.push(
+                    decode_anthropic_event(&frame)
+                        .expect("event decodes")
+                        .expect("chunk frame carries an event"),
+                );
+            }
+        }
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            AnthropicStreamEvent::MessageStart { message } => {
+                assert_eq!(
+                    message.usage.as_ref().map(|u| u.input_tokens),
+                    Some(7),
+                    "message_start must carry the input token count"
+                );
+            }
+            other => panic!("expected message_start, got {other:?}"),
+        }
+        match &events[1] {
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicStreamDelta::Text { text },
+                ..
+            } => assert_eq!(text, "hi"),
+            other => panic!("expected a text delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eventstream_decoder_rejects_impossible_frame_lengths() {
+        let mut decoder = EventStreamDecoder::default();
+        // total_length smaller than the fixed prelude + trailer: a bogus
+        // length prefix means frame sync is lost, not a short read.
+        decoder.push(&[0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let err = decoder
+            .next_frame()
+            .expect_err("an impossible frame length must fail loudly");
+        assert!(
+            format!("{err:#}").contains("malformed Bedrock eventstream frame"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -4018,18 +5048,17 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/model/anthropic.claude-opus-4-8/invoke"))
+            .and(path("/model/anthropic.claude-opus-4-8/invoke-with-response-stream"))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "message": "Invocation of model ID anthropic.claude-opus-4-8 with on-demand throughput isn’t supported. Retry your request with the ID or ARN of an inference profile that contains this model."
             })))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/model/global.anthropic.claude-opus-4-8/invoke"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "profile ok"}],
-                "usage": {"input_tokens": 4, "output_tokens": 2}
-            })))
+            .and(path(
+                "/model/global.anthropic.claude-opus-4-8/invoke-with-response-stream",
+            ))
+            .respond_with(text_stream_response("profile ok", 4, 2))
             .mount(&server)
             .await;
 
@@ -4086,11 +5115,10 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/model/us.anthropic.claude-opus-4-8/invoke"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "resolved first"}],
-                "usage": {"input_tokens": 3, "output_tokens": 2}
-            })))
+            .and(path(
+                "/model/us.anthropic.claude-opus-4-8/invoke-with-response-stream",
+            ))
+            .respond_with(text_stream_response("resolved first", 3, 2))
             .mount(&server)
             .await;
 
