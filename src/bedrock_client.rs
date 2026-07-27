@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::llm_client::IdleTimeouts;
 use crate::llm_client::{
     ChatContentPart, ChatMessage, FunctionCall, LlmBackend, LlmResponse, ModelMetadata,
-    ModelsResponse, OpenAiClient, ReasoningLevelPreset, StreamChatRequest, TokenUsage, ToolCall,
-    ToolDefinition,
+    ModelsResponse, OpenAiClient, OutputBudgetExhaustedError, ReasoningLevelPreset,
+    StreamChatRequest, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::responses_api::{build_responses_request, drive_responses_sse_stream};
 use crate::trace_logging::append_trace_record;
@@ -986,6 +986,20 @@ impl BedrockClient {
             on_token(&text);
         }
         let usage = parsed.usage.into_usage();
+        if calls.is_empty() && parsed.stop_reason.as_deref() == Some("max_tokens") {
+            // Hit the output ceiling with nothing to show for it. Under
+            // adaptive thinking this is the budget-exhaustion case: the
+            // whole allowance went to thinking, so `content` carries only
+            // thinking blocks. Retrying re-sends an identical request that
+            // hits the identical cap, so classify it as non-retryable
+            // rather than letting it read as a generic empty completion.
+            if text.trim().is_empty() {
+                return Err(anyhow::Error::new(OutputBudgetExhaustedError));
+            }
+            tracing::warn!(
+                "Bedrock response hit max_tokens after emitting text; returning truncated content"
+            );
+        }
         if calls.is_empty() {
             Ok(LlmResponse::Text {
                 text,
@@ -1828,6 +1842,12 @@ struct BedrockAnthropicResponse {
     content: Vec<BedrockContentBlock>,
     #[serde(default)]
     usage: BedrockUsage,
+    /// `max_tokens` here means the model hit the output ceiling. With
+    /// adaptive thinking that regularly means it spent the whole budget
+    /// thinking and emitted nothing else -- see `invoke_model`, which turns
+    /// that case into `OutputBudgetExhaustedError` so it is not retried.
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3253,6 +3273,104 @@ mod tests {
             .expect("adaptive request should carry the adaptive ceiling");
         match response {
             LlmResponse::Text { text, .. } => assert_eq!(text, "roomy"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_only_max_tokens_response_is_not_retryable() {
+        let server = MockServer::start().await;
+        // The budget-exhaustion shape: the whole allowance went to thinking,
+        // so there is no text and no tool_use to return.
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "thinking", "thinking": "deliberating"}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 5, "output_tokens": 64000}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let error = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("high".to_string()),
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect_err("thinking-only max_tokens must not look like a usable response");
+        assert!(
+            crate::llm_client::is_output_budget_exhausted_error(&error),
+            "expected budget exhaustion, got {error:#}"
+        );
+        // Non-retryable: re-sending would hit the identical cap.
+        assert!(
+            crate::llm_client::llm_retry_tier(&error).is_none(),
+            "budget exhaustion must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_response_with_text_is_still_returned() {
+        let server = MockServer::start().await;
+        // Same ceiling hit, but the model did emit something usable --
+        // return the truncated content instead of erroring.
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [
+                    {"type": "thinking", "thinking": "deliberating"},
+                    {"type": "text", "text": "partial answer"}
+                ],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 5, "output_tokens": 64000}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = BedrockClient::with_base_urls(
+            "token".to_string(),
+            "us-east-2".to_string(),
+            "us.anthropic.claude-sonnet-5".to_string(),
+            server.uri(),
+            format!("{}/v1", server.uri()),
+            server.uri(),
+        );
+        let response = client
+            .stream_chat(StreamChatRequest {
+                model: "us.anthropic.claude-sonnet-5".to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: None,
+                reasoning_effort: Some("high".to_string()),
+                service_tier: None,
+                temperature: None,
+                structured_output: None,
+                on_token: Box::new(|_| {}),
+                on_thought: Box::new(|_| {}),
+                cancel: CancellationToken::new(),
+                idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
+            })
+            .await
+            .expect("truncated-but-non-empty content should still be returned");
+        match response {
+            LlmResponse::Text { text, .. } => assert_eq!(text, "partial answer"),
             other => panic!("expected text response, got {other:?}"),
         }
     }
