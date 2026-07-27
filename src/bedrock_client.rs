@@ -394,6 +394,26 @@ const ADAPTIVE_MAX_TOKENS: u32 = 64_000;
 /// as `operation timed out` with workers dying at clean multiples of that
 /// timeout. Sized to let an `ADAPTIVE_MAX_TOKENS` generation finish.
 const NATIVE_INVOKE_TIMEOUT: Duration = Duration::from_secs(1_800);
+
+/// Idle floor for native Anthropic streaming. Adaptive thinking on a real
+/// supervisor request -- large system prompt, full tool schemas, accumulated
+/// history -- goes quiet for minutes at a time while the model reasons, and
+/// nothing is emitted during that window even with `display: "summarized"`.
+/// The general-purpose 60s stall timeout reads that as a hung stream and
+/// aborts a turn that was progressing normally, which is how a whole sweep
+/// came back with empty patches. Keep a backstop, but well above the gaps
+/// this workload actually produces, and inside NATIVE_INVOKE_TIMEOUT so a
+/// genuinely wedged stream is still bounded.
+const NATIVE_STREAM_IDLE_FLOOR: Duration = Duration::from_secs(600);
+
+/// Raise `idle` to the native-streaming floor, leaving anything already
+/// more generous alone.
+fn native_stream_idle_timeouts(idle: IdleTimeouts) -> IdleTimeouts {
+    IdleTimeouts {
+        first_progress: idle.first_progress.max(NATIVE_STREAM_IDLE_FLOOR),
+        inter_chunk: idle.inter_chunk.max(NATIVE_STREAM_IDLE_FLOOR),
+    }
+}
 const BEDROCK_DISCOVERY_MAX_ATTEMPTS: u64 = 4;
 const BEDROCK_DISCOVERY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
@@ -1253,8 +1273,14 @@ impl BedrockClient {
         let (status, body_text) = match self.post_native_invoke(url, body, cancel).await? {
             NativeInvokeAttempt::Cancelled => return Ok(NativeStreamOutcome::default()),
             NativeInvokeAttempt::Streaming(resp) => {
-                return drive_native_anthropic_stream(resp, on_token, on_thought, cancel, idle)
-                    .await;
+                return drive_native_anthropic_stream(
+                    resp,
+                    on_token,
+                    on_thought,
+                    cancel,
+                    native_stream_idle_timeouts(idle),
+                )
+                .await;
             }
             NativeInvokeAttempt::Failed { status, body } => (status, body),
         };
@@ -1276,17 +1302,21 @@ impl BedrockClient {
                 profile_id
             );
             let retry_url = self.invoke_stream_url(&profile_id);
-            let (retry_status, retry_body) = match self
-                .post_native_invoke(&retry_url, body, cancel)
-                .await?
-            {
-                NativeInvokeAttempt::Cancelled => return Ok(NativeStreamOutcome::default()),
-                NativeInvokeAttempt::Streaming(resp) => {
-                    return drive_native_anthropic_stream(resp, on_token, on_thought, cancel, idle)
+            let (retry_status, retry_body) =
+                match self.post_native_invoke(&retry_url, body, cancel).await? {
+                    NativeInvokeAttempt::Cancelled => return Ok(NativeStreamOutcome::default()),
+                    NativeInvokeAttempt::Streaming(resp) => {
+                        return drive_native_anthropic_stream(
+                            resp,
+                            on_token,
+                            on_thought,
+                            cancel,
+                            native_stream_idle_timeouts(idle),
+                        )
                         .await;
-                }
-                NativeInvokeAttempt::Failed { status, body } => (status, body),
-            };
+                    }
+                    NativeInvokeAttempt::Failed { status, body } => (status, body),
+                };
             last_retry_error = Some((profile_id, retry_status, retry_body));
         }
 
@@ -3866,6 +3896,24 @@ mod tests {
             LlmResponse::Text { text, .. } => assert_eq!(text, "xhigh ok"),
             other => panic!("expected text response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_stream_idle_floor_survives_a_short_session_timeout() {
+        // The session default is 60s inter-chunk; adaptive thinking on a
+        // real supervisor request goes quiet far longer than that, so the
+        // floor must win or normal turns get aborted as "stalled".
+        let raised = native_stream_idle_timeouts(IdleTimeouts::uniform(Duration::from_secs(60)));
+        assert_eq!(raised.inter_chunk, NATIVE_STREAM_IDLE_FLOOR);
+        assert_eq!(raised.first_progress, NATIVE_STREAM_IDLE_FLOOR);
+
+        // An operator who configured something more generous keeps it.
+        let generous = IdleTimeouts::uniform(Duration::from_secs(1_200));
+        let kept = native_stream_idle_timeouts(generous);
+        assert_eq!(kept.inter_chunk, Duration::from_secs(1_200));
+
+        // The backstop stays inside the whole-request ceiling.
+        assert!(NATIVE_STREAM_IDLE_FLOOR < NATIVE_INVOKE_TIMEOUT);
     }
 
     #[tokio::test]
