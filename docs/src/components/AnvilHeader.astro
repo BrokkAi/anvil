@@ -16,11 +16,10 @@ const navItems = [
 const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 ---
 
-<div class="anvil-header-shell">
+<div class="anvil-header-shell anvil-panel anvil-panel--octagon">
   <div class="anvil-brand sl-flex">
     <span class="anvil-mark" aria-hidden="true"><i></i><i></i><i></i></span>
     <SiteTitle />
-    <small>ACP runtime</small>
   </div>
 
   <nav class="anvil-primary-nav print:hidden" aria-label="Primary">
@@ -44,15 +43,16 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
   @layer starlight.user {
     .anvil-header-shell {
       display: grid;
-      grid-template-columns: minmax(10rem, auto) minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(11rem, auto) minmax(8rem, 22rem) auto;
       align-items: center;
-      gap: clamp(0.7rem, 1.6vw, 1.5rem);
+      gap: clamp(0.7rem, 1.6vw, var(--anvil-space-6));
       height: 100%;
       max-width: 90rem;
       margin-inline: auto;
-      padding: 0.48rem 0.7rem 0.48rem 0.85rem;
-      border: 1px solid var(--anvil-line-strong);
-      border-radius: 0.3rem;
+      padding: var(--anvil-space-2) var(--anvil-space-6);
+    }
+
+    .anvil-header-shell::after {
       background: color-mix(in srgb, var(--anvil-surface) 91%, transparent);
       box-shadow: 0 14px 38px rgb(10 22 38 / 0.11), inset 0 1px var(--anvil-highlight);
       backdrop-filter: blur(18px) saturate(120%);
@@ -60,19 +60,8 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 
     .anvil-brand {
       align-items: center;
-      gap: 0.65rem;
+      gap: var(--anvil-space-3);
       min-width: 0;
-    }
-
-    .anvil-brand small {
-      padding-inline-start: 0.65rem;
-      border-inline-start: 1px solid var(--anvil-line-strong);
-      color: var(--anvil-muted);
-      font-family: var(--sl-font-mono);
-      font-size: 0.58rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      white-space: nowrap;
     }
 
     .anvil-mark {
@@ -97,27 +86,29 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 
     .anvil-brand :global(.site-title) {
       color: var(--anvil-ink);
-      font-family: var(--sl-font);
-      font-size: 1rem;
-      font-weight: 750;
-      letter-spacing: -0.02em;
+      font-size: 1.375rem;
+      font-weight: var(--anvil-weight-bold);
+      letter-spacing: var(--anvil-tracking-wide);
+      line-height: 1;
+      text-transform: uppercase;
+      transform: translateY(0.0625rem);
     }
 
     .anvil-primary-nav {
       display: none;
       align-items: center;
       justify-content: center;
-      gap: 0.15rem;
+      gap: var(--anvil-space-2);
     }
 
     .anvil-primary-nav a {
       position: relative;
-      padding: 0.5rem 0.68rem;
+      padding: var(--anvil-space-2) var(--anvil-space-3);
       color: var(--anvil-muted);
-      font-family: var(--sl-font-mono);
-      font-size: 0.64rem;
-      font-weight: 600;
-      letter-spacing: 0.045em;
+      font-family: var(--anvil-font-mono);
+      font-size: var(--anvil-text-xs);
+      font-weight: var(--anvil-weight-semibold);
+      letter-spacing: var(--anvil-tracking-widest);
       text-decoration: none;
       text-transform: uppercase;
     }
@@ -137,9 +128,17 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
     .anvil-primary-nav a[aria-current='page'] { color: var(--anvil-ink); }
     .anvil-primary-nav a[aria-current='page']::after { transform: scaleX(1); }
 
-    .anvil-header-search { justify-self: end; min-width: 0; }
-    .anvil-header-tools { align-items: center; gap: 0.72rem; }
-    .social-icons { align-items: center; gap: 0.65rem; }
+    .anvil-header-search {
+      justify-self: end;
+      width: clamp(14rem, 20vw, 24rem);
+      min-width: 0;
+    }
+    .anvil-header-search :global(button[data-open-modal]) { max-width: none; }
+    .anvil-header-tools,
+    .social-icons { align-items: center; gap: var(--anvil-space-3); }
+    .anvil-header-tools :global(starlight-theme-select select) {
+      padding-inline-start: calc(var(--sl-label-icon-size) + var(--sl-inline-padding) + 0.375rem);
+    }
     .social-icons::after {
       width: 1px;
       height: 1.4rem;
@@ -147,14 +146,14 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
       content: '';
     }
 
-    @media (min-width: 72rem) {
-      .anvil-header-shell { grid-template-columns: minmax(13rem, auto) minmax(0, 1fr) auto auto; }
+    @media (width >= 72rem) {
+      .anvil-header-shell { grid-template-columns: minmax(8rem, auto) minmax(0, 1fr) auto auto; }
       .anvil-primary-nav { display: flex; }
     }
 
-    @media (max-width: 49.99rem) {
+    @media (width < 50rem) {
       .anvil-header-shell { grid-template-columns: minmax(0, 1fr) auto; }
-      .anvil-brand small { display: none; }
+      .anvil-header-search { width: auto; }
     }
   }
 </style>
