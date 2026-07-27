@@ -92,6 +92,32 @@ pub(crate) fn retryable_llm_error_for_body(
     anyhow::anyhow!(message)
 }
 
+/// Classify a failed HTTP exchange, preferring the status code over the
+/// response body. A 5xx or 429 is retryable by definition, whatever prose
+/// the provider puts in the body -- Bedrock, for instance, returns
+/// `{"message":"The system encountered an unexpected error during
+/// processing. Try your request again."}` on a 500, which matches none of
+/// the body markers and would otherwise be treated as terminal. Body
+/// markers still apply when the status alone does not settle it (notably
+/// providers that report failures inside a 200).
+pub(crate) fn retryable_llm_error_for_status_and_body(
+    message: impl Into<String>,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    let message = message.into();
+    if status.is_server_error() {
+        return retryable_llm_error(message, RetryableLlmError::fast("server error status"));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return retryable_llm_error(
+            message,
+            RetryableLlmError::gateway_transient("rate limited status"),
+        );
+    }
+    retryable_llm_error_for_body(message, body)
+}
+
 pub(crate) fn retryable_llm_error_for_responses_failure(
     message: impl Into<String>,
     failure: &str,
@@ -439,5 +465,52 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "explicit request timeout waited too long"
         );
+    }
+
+    #[test]
+    fn bedrock_500_is_retryable_despite_an_unrecognized_body() {
+        // Verbatim body Bedrock returns on a 500. It matches none of the
+        // body markers, so body-only classification called it terminal and
+        // a transient blip killed an entire task on the supervisor's first
+        // turn.
+        let body = r#"{"message":"The system encountered an unexpected error during processing. Try your request again."}"#;
+        assert!(
+            !contains_standard_transient_marker(body),
+            "body markers must not be what makes this retryable"
+        );
+        let error = retryable_llm_error_for_status_and_body(
+            "Bedrock request failed",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body,
+        );
+        assert_eq!(
+            crate::llm_client::llm_retry_tier(&error),
+            Some(LlmRetryTier::Fast)
+        );
+    }
+
+    #[test]
+    fn rate_limited_status_gets_the_patient_tier() {
+        let error = retryable_llm_error_for_status_and_body(
+            "rate limited",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+        );
+        assert_eq!(
+            crate::llm_client::llm_retry_tier(&error),
+            Some(LlmRetryTier::GatewayTransient)
+        );
+    }
+
+    #[test]
+    fn client_errors_stay_terminal() {
+        // A 400 is a real rejection -- retrying re-sends the same bad
+        // request. Body markers still get their say.
+        let error = retryable_llm_error_for_status_and_body(
+            "bad request",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"message":"The provided model identifier is invalid."}"#,
+        );
+        assert!(crate::llm_client::llm_retry_tier(&error).is_none());
     }
 }

@@ -1178,17 +1178,19 @@ impl BedrockClient {
                 let retry_status = retry_resp.status();
                 if !retry_status.is_success() {
                     let retry_body_text = retry_resp.text().await.unwrap_or_default();
-                    return Err(crate::http_retry::retryable_llm_error_for_body(
+                    return Err(crate::http_retry::retryable_llm_error_for_status_and_body(
                         format!(
                             "Bedrock Responses API failed (HTTP {retry_status}) after retrying without previous_response_id: {retry_body_text}"
                         ),
+                        retry_status,
                         &retry_body_text,
                     ));
                 }
                 retry_resp
             } else {
-                return Err(crate::http_retry::retryable_llm_error_for_body(
+                return Err(crate::http_retry::retryable_llm_error_for_status_and_body(
                     format!("Bedrock Responses API failed (HTTP {status}): {body_text}"),
+                    status,
                     &body_text,
                 ));
             }
@@ -1288,8 +1290,9 @@ impl BedrockClient {
         if !needs_inference_profile_retry(status, &body_text)
             || looks_like_inference_profile_identifier(model)
         {
-            return Err(crate::http_retry::retryable_llm_error_for_body(
+            return Err(crate::http_retry::retryable_llm_error_for_status_and_body(
                 format!("Bedrock request failed (HTTP {status}): {body_text}"),
+                status,
                 &body_text,
             ));
         }
@@ -1326,13 +1329,16 @@ impl BedrockClient {
                 profile_id
             );
             let bodies = format!("{body_text}\n{retry_body}");
-            return Err(crate::http_retry::retryable_llm_error_for_body(
-                message, &bodies,
+            return Err(crate::http_retry::retryable_llm_error_for_status_and_body(
+                message,
+                retry_status,
+                &bodies,
             ));
         }
 
-        Err(crate::http_retry::retryable_llm_error_for_body(
+        Err(crate::http_retry::retryable_llm_error_for_status_and_body(
             format!("Bedrock request failed (HTTP {status}): {body_text}"),
+            status,
             &body_text,
         ))
     }
