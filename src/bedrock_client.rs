@@ -281,7 +281,9 @@ fn build_anthropic_request(
             // above what budget-derived arithmetic would produce.
             request.max_tokens = ADAPTIVE_MAX_TOKENS;
             request.temperature = None;
-            request.thinking = Some(BedrockThinking::Adaptive);
+            request.thinking = Some(BedrockThinking::Adaptive {
+                display: "summarized",
+            });
             request.output_config = Some(BedrockOutputConfig {
                 effort: effort.to_string(),
             });
@@ -385,6 +387,14 @@ const MAX_TOKENS: u32 = 8192;
 /// far too tight: the model exhausts it thinking and returns nothing else.
 /// Anthropic's guidance is at least this much at `high` effort and above.
 const ADAPTIVE_MAX_TOKENS: u32 = 64_000;
+
+/// Wall-clock budget for one native Anthropic invoke. This path does not
+/// stream -- the caller blocks until the entire response body is ready --
+/// so the ceiling above translates directly into request duration, and the
+/// client-wide 600s timeout cuts long generations off mid-flight. Observed
+/// as `operation timed out` with workers dying at clean multiples of that
+/// timeout. Sized to let an `ADAPTIVE_MAX_TOKENS` generation finish.
+const NATIVE_INVOKE_TIMEOUT: Duration = Duration::from_secs(1_800);
 const BEDROCK_DISCOVERY_MAX_ATTEMPTS: u64 = 4;
 const BEDROCK_DISCOVERY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
@@ -1298,9 +1308,15 @@ impl BedrockClient {
         body: &BedrockAnthropicRequest,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<(reqwest::StatusCode, String)>> {
+        // The native Anthropic path is a single blocking POST -- nothing
+        // arrives until generation finishes -- so the client's default
+        // timeout has to cover a whole ADAPTIVE_MAX_TOKENS generation at
+        // high effort, which routinely exceeds it. Override per request
+        // rather than globally so discovery calls keep failing fast.
         let send = self
             .http
             .post(url)
+            .timeout(NATIVE_INVOKE_TIMEOUT)
             .bearer_auth(&self.bearer_token)
             .json(body)
             .send();
@@ -1760,8 +1776,13 @@ struct BedrockAnthropicRequest {
 enum BedrockThinking {
     #[serde(rename = "enabled")]
     Enabled { budget_tokens: u32 },
+    /// `display` defaults to `omitted` on the models that use this shape,
+    /// which returns thinking blocks whose text is an empty string. Ask for
+    /// summaries instead so the reasoning reaches `on_thought` and the
+    /// trace: this path does not stream, so the summary carried in the
+    /// final body is the only visibility into a long generation.
     #[serde(rename = "adaptive")]
-    Adaptive,
+    Adaptive { display: &'static str },
 }
 
 /// `output_config.effort` companion for Anthropic effort-aware thinking.
@@ -3237,11 +3258,18 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/model/us.anthropic.claude-sonnet-5/invoke"))
             .and(body_partial_json(serde_json::json!({
-                "thinking": {"type": "adaptive"},
+                // `display` must be explicit: the provider default is
+                // `omitted`, which returns thinking blocks with empty text
+                // and leaves this non-streaming path with no visibility at
+                // all into a long generation.
+                "thinking": {"type": "adaptive", "display": "summarized"},
                 "max_tokens": ADAPTIVE_MAX_TOKENS,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "roomy"}],
+                "content": [
+                    {"type": "thinking", "thinking": "weighing options"},
+                    {"type": "text", "text": "roomy"}
+                ],
                 "usage": {"input_tokens": 2, "output_tokens": 1}
             })))
             .mount(&server)
@@ -3255,6 +3283,8 @@ mod tests {
             format!("{}/v1", server.uri()),
             server.uri(),
         );
+        let thoughts = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = thoughts.clone();
         let response = client
             .stream_chat(StreamChatRequest {
                 model: "us.anthropic.claude-sonnet-5".to_string(),
@@ -3265,7 +3295,7 @@ mod tests {
                 temperature: None,
                 structured_output: None,
                 on_token: Box::new(|_| {}),
-                on_thought: Box::new(|_| {}),
+                on_thought: Box::new(move |t| captured.lock().unwrap().push_str(t)),
                 cancel: CancellationToken::new(),
                 idle_timeouts: IdleTimeouts::uniform(Duration::from_secs(5)),
             })
@@ -3275,6 +3305,8 @@ mod tests {
             LlmResponse::Text { text, .. } => assert_eq!(text, "roomy"),
             other => panic!("expected text response, got {other:?}"),
         }
+        // The summary is the only window into this non-streaming path.
+        assert_eq!(thoughts.lock().unwrap().as_str(), "weighing options");
     }
 
     #[tokio::test]
