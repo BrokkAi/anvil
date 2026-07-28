@@ -1,19 +1,59 @@
 use std::io::Write;
 use std::sync::Mutex;
 const TRACE_JSONL_ENV: &str = "ANVIL_TRACE_JSONL";
+const TRACE_RUN_ID_ENV: &str = "ANVIL_TRACE_RUN_ID";
 static TRACE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-pub fn append_trace_record(record: serde_json::Value) {
+#[derive(Clone)]
+struct TraceContext {
+    path: String,
+    run_id: Option<String>,
+}
+
+tokio::task_local! {
+    static TRACE_CONTEXT: TraceContext;
+}
+
+pub async fn with_trace_context_from_env<F, T>(run_id: Option<String>, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
     let Ok(path) = std::env::var(TRACE_JSONL_ENV) else {
-        return;
+        return future.await;
     };
-    let path = path.trim();
+    let path = path.trim().to_string();
     if path.is_empty() {
-        return;
+        return future.await;
     }
+    let run_id = run_id.or_else(trace_run_id_from_env);
+    TRACE_CONTEXT
+        .scope(TraceContext { path, run_id }, future)
+        .await
+}
+
+pub fn trace_run_id_from_env() -> Option<String> {
+    std::env::var(TRACE_RUN_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn append_trace_record(record: serde_json::Value) {
+    let context = TRACE_CONTEXT.try_with(Clone::clone).ok().or_else(|| {
+        let path = std::env::var(TRACE_JSONL_ENV).ok()?;
+        let path = path.trim().to_string();
+        (!path.is_empty()).then_some(TraceContext { path, run_id: None })
+    });
+    let Some(context) = context else { return };
 
     let mut record = record;
     if let Some(obj) = record.as_object_mut() {
+        if let Some(run_id) = context.run_id {
+            obj.insert(
+                "trace_run_id".to_string(),
+                serde_json::Value::String(run_id),
+            );
+        }
         obj.insert(
             "timestamp".to_string(),
             serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
@@ -35,12 +75,15 @@ pub fn append_trace_record(record: serde_json::Value) {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&context.path)?;
         writeln!(file, "{line}")?;
         Ok(())
     })();
 
     if let Err(e) = result {
-        tracing::warn!("failed to append LLM trace record to {path}: {e:#}");
+        tracing::warn!(
+            "failed to append LLM trace record to {}: {e:#}",
+            context.path
+        );
     }
 }

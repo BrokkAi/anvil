@@ -509,6 +509,54 @@ pub(crate) async fn run_asgard_trajectory_loop(
     context_prefix_len: usize,
     initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> (LoopOutcome, BTreeMap<String, TokenUsage>) {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let trace_run_id =
+        crate::trace_logging::trace_run_id_from_env().unwrap_or_else(|| run_id.clone());
+    crate::trace_logging::with_trace_context_from_env(
+        Some(trace_run_id),
+        run_asgard_trajectory_loop_inner(
+            run_id,
+            cx,
+            sessions,
+            session_id,
+            llm,
+            parent_registry,
+            selected_model,
+            reasoning_effort,
+            service_tier,
+            structured_output,
+            initial_messages,
+            idle_timeout,
+            cancel,
+            config,
+            context_length,
+            context_prefix_len,
+            initial_plan,
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_asgard_trajectory_loop_inner(
+    run_id: String,
+    cx: &ConnectionTo<Client>,
+    sessions: &SessionStore,
+    session_id: &str,
+    llm: &Arc<dyn crate::llm_client::LlmBackend>,
+    parent_registry: &Arc<crate::tools::ToolRegistry>,
+    selected_model: &str,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    structured_output: Option<&StructuredOutputRequest>,
+    initial_messages: Vec<ChatMessage>,
+    idle_timeout: IdleTimeouts,
+    cancel: tokio_util::sync::CancellationToken,
+    config: &crate::asgard::Config,
+    context_length: Option<u32>,
+    context_prefix_len: usize,
+    initial_plan: Option<crate::plan::UpdatePlanArgs>,
+) -> (LoopOutcome, BTreeMap<String, TokenUsage>) {
     let mut usage_by_model = BTreeMap::new();
     if !(ASGARD_MIN_CANDIDATES..=ASGARD_MAX_CANDIDATES).contains(&config.candidate_models.len()) {
         return (
@@ -536,7 +584,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
         Ok(_) => base_commit.clone(),
         Err(error) => return (asgard_failure(error), usage_by_model),
     };
-    let run_id = uuid::Uuid::new_v4().to_string();
     let stage = match SnapshotStage::new(parent_registry.cwd(), &run_id) {
         Ok(stage) => stage,
         Err(error) => return (asgard_failure(error), usage_by_model),
@@ -5194,9 +5241,14 @@ mod tests {
     async fn asgard_v2_scripted_e2e_runs_real_loop_and_checkpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
         let trace_path = temp.path().join("trace.jsonl");
+        let trace_run_id = uuid::Uuid::new_v4().to_string();
         let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
         let _trace_env =
             crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+        let _trace_run_id_env = crate::openrouter_auth::test_support::EnvScope::set(
+            "ANVIL_TRACE_RUN_ID",
+            &trace_run_id,
+        );
 
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
@@ -5471,18 +5523,16 @@ mod tests {
         assert!(!supervisor_text.contains("error: before finalizing"));
 
         let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
-        let trace_records = trace
+        let all_trace_records = trace
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
             .collect::<Vec<_>>();
-        // Match the LAST record of each shape: a lingering async task from a
-        // previously-finished test can drain into this test's fresh trace
-        // file (append_trace_record re-reads ANVIL_TRACE_JSONL at write time,
-        // after ENV_GUARD has moved on), and such leaks land before this
-        // run's own records. First-match picked up a foreign w3 window once.
+        let trace_records = all_trace_records
+            .iter()
+            .filter(|record| record["trace_run_id"] == trace_run_id)
+            .collect::<Vec<_>>();
         let w2_window = trace_records
             .iter()
-            .rev()
             .find(|record| {
                 record["type"] == "asgard_worker_window"
                     && record["worker"] == serde_json::json!(2)
@@ -5492,7 +5542,6 @@ mod tests {
             .expect("w2 worker-window trace");
         let w3_launch = trace_records
             .iter()
-            .rev()
             .find(|record| {
                 record["type"] == "asgard_spawn_launch"
                     && record["worker"] == serde_json::json!(3)
@@ -5502,7 +5551,6 @@ mod tests {
             .expect("w3 spawn-launch trace");
         let w3_window = trace_records
             .iter()
-            .rev()
             .find(|record| {
                 record["type"] == "asgard_worker_window"
                     && record["worker"] == serde_json::json!(3)
