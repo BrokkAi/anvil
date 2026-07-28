@@ -2067,6 +2067,11 @@ const RETRYABLE_STREAM_FAILURES: &[&str] = &[
 
 fn stream_failure_error(kind: &str, body: &str) -> anyhow::Error {
     let message = format!("Bedrock stream failed ({kind}): {body}");
+    // A daily quota reported as a `throttlingException` is still a wall;
+    // the exception kind must not out-vote the quota id in the body.
+    if let Some(error) = crate::http_retry::fatal_daily_quota_error(&message, body) {
+        return error;
+    }
     if RETRYABLE_STREAM_FAILURES
         .iter()
         .any(|known| known.eq_ignore_ascii_case(kind))

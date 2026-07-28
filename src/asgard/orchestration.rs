@@ -809,6 +809,21 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 }
             }
             Err(error) => {
+                // A dead supervisor must not be laundered into a result. The
+                // fallback below exists for a supervisor that failed a turn it
+                // could plausibly retake; a per-day provider quota means every
+                // remaining turn fails too, so auto-saving and finalizing the
+                // latest checkpoint would ship an arbitrary trajectory that no
+                // supervisor ever judged. Fail loudly instead: a dead attempt
+                // is rerunnable, a laundered one poisons the results.
+                if crate::http_retry::is_fatal_llm_quota_error(&error) {
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_supervisor_fallback",
+                        "mode": "abort_quota_exhausted",
+                        "error": format!("{error:#}"),
+                    }));
+                    break AsgardExit::Failure(error);
+                }
                 let mode = if !pending_batch.is_empty() {
                     "auto_save"
                 } else {
@@ -2808,10 +2823,19 @@ mod tests {
 
     type ScriptedResponseHook = Arc<dyn Fn(&str, &LlmResponse) + Send + Sync>;
 
+    /// Builds the error a model returns once its scripted queue runs dry,
+    /// for tests about how the run reacts to an LLM failure rather than to
+    /// an LLM answer.
+    type ScriptedExhaustionError = Arc<dyn Fn() -> anyhow::Error + Send + Sync>;
+
     struct ScriptedAsgardBackend {
         responses: HashMap<String, Mutex<VecDeque<LlmResponse>>>,
         requests: Mutex<Vec<RecordedRequest>>,
         response_hook: Option<ScriptedResponseHook>,
+        /// Per-model: what to fail with after the script is spent. Models
+        /// absent from this map keep panicking on exhaustion, so a test that
+        /// simply under-scripts still fails loudly.
+        exhaustion_errors: HashMap<String, ScriptedExhaustionError>,
     }
 
     impl ScriptedAsgardBackend {
@@ -2830,7 +2854,18 @@ mod tests {
                     .collect(),
                 requests: Mutex::new(Vec::new()),
                 response_hook,
+                exhaustion_errors: HashMap::new(),
             }
+        }
+
+        fn failing_after_script(
+            mut self,
+            model: &str,
+            error: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.exhaustion_errors
+                .insert(model.to_string(), Arc::new(error));
+            self
         }
     }
 
@@ -2863,18 +2898,22 @@ mod tests {
                     messages,
                     tool_names,
                 });
-            let response = self
+            let queued = self
                 .responses
                 .get(&model)
                 .unwrap_or_else(|| panic!("no scripted responses registered for model {model}"))
                 .lock()
                 .expect("response lock")
-                .pop_front()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "empty scripted response queue for model {model}; last request roles: {roles:?}"
-                    )
-                });
+                .pop_front();
+            let Some(response) = queued else {
+                if let Some(make_error) = self.exhaustion_errors.get(&model) {
+                    let error = make_error();
+                    return Box::pin(async move { Err(error) });
+                }
+                panic!(
+                    "empty scripted response queue for model {model}; last request roles: {roles:?}"
+                );
+            };
             if let Some(hook) = &self.response_hook {
                 hook(&model, &response);
             }
@@ -4411,6 +4450,138 @@ mod tests {
         .await;
 
         assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        assert_eq!(outcome.response, "w1 report");
+    }
+
+    /// Verbatim body the Bedrock mantle endpoint returned once its daily
+    /// input-token quota blew -- for the rest of that day, on every request.
+    const DAILY_QUOTA_BODY: &str = r#"{"error":{"code":"rate_limit_exceeded","message":"quota input-tpd:842609633142:openai.gpt-5.6-sol (InputTokens) exceeded by 88030.29629390592","param":null,"type":"rate_limit_error"}}"#;
+
+    /// A saved checkpoint plus a supervisor that can no longer take a turn is
+    /// precisely the shape that produced 186 laundered attempts: the fallback
+    /// finalized w1 and the harness recorded an ordinary completion. A daily
+    /// quota must abort the run instead, so the attempt is rerunnable rather
+    /// than silently wrong.
+    #[tokio::test]
+    async fn quota_exhausted_supervisor_error_aborts_instead_of_finalizing_latest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(
+            ScriptedAsgardBackend::new(vec![
+                (
+                    "sv-model",
+                    vec![
+                        text_response("intake literal"),
+                        tool_response(vec![spawn_call("sv-spawn-w1", "root", "finish")]),
+                        text_response("w1 launched"),
+                        tool_response(vec![save_call("sv-save-w1")]),
+                        text_response("w1 saved"),
+                    ],
+                ),
+                (
+                    "worker-model",
+                    vec![text_response("intake grounded"), text_response("w1 report")],
+                ),
+            ])
+            // Every later supervisor turn hits the wall, exactly as the real
+            // endpoint behaved for the rest of the day.
+            .failing_after_script("sv-model", || {
+                crate::http_retry::retryable_llm_error_for_status_and_body(
+                    "Bedrock request failed (HTTP 429)",
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    DAILY_QUOTA_BODY,
+                )
+            }),
+        );
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend,
+            vec![ChatMessage::user("exercise the quota abort")],
+        )
+        .await;
+
+        let LoopStop::Failed(failure) = &outcome.stop else {
+            panic!(
+                "quota-exhausted supervisor must fail the run, not finalize a checkpoint nobody \
+                 judged; got {:?} with response {:?}",
+                outcome.stop, outcome.response
+            );
+        };
+        assert!(
+            failure
+                .message
+                .contains("input-tpd:842609633142:openai.gpt-5.6-sol"),
+            "failure should name the exhausted quota: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("daily token quota exhausted"),
+            "failure should explain why it is fatal: {}",
+            failure.message
+        );
+        assert_ne!(
+            outcome.response, "w1 report",
+            "the run must not present the fallback-finalized trajectory as its answer"
+        );
+    }
+
+    /// The abort is keyed on the daily quota, not on "the supervisor errored".
+    /// An ordinary terminal error keeps the existing finalize-latest fallback.
+    #[tokio::test]
+    async fn non_quota_supervisor_error_still_finalizes_latest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let backend = Arc::new(
+            ScriptedAsgardBackend::new(vec![
+                (
+                    "sv-model",
+                    vec![
+                        text_response("intake literal"),
+                        tool_response(vec![spawn_call("sv-spawn-w1", "root", "finish")]),
+                        text_response("w1 launched"),
+                        tool_response(vec![save_call("sv-save-w1")]),
+                        text_response("w1 saved"),
+                    ],
+                ),
+                (
+                    "worker-model",
+                    vec![text_response("intake grounded"), text_response("w1 report")],
+                ),
+            ])
+            .failing_after_script("sv-model", || {
+                anyhow!("chat completion failed (HTTP 400): missing required field messages")
+            }),
+        );
+
+        let (outcome, _) = run_scripted_asgard(
+            repo,
+            backend,
+            vec![ChatMessage::user("exercise the ordinary fallback")],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.stop, LoopStop::Completed { .. }),
+            "non-quota supervisor errors keep the finalize-latest fallback, got {:?}",
+            outcome.stop
+        );
         assert_eq!(outcome.response, "w1 report");
     }
 

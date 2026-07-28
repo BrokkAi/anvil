@@ -136,6 +136,13 @@ pub(crate) fn llm_retry_tier(error: &anyhow::Error) -> Option<LlmRetryTier> {
         return None;
     }
 
+    // A per-day quota outranks every retry marker, including one a
+    // mid-stream wrapper may have layered on top of it: waiting cannot
+    // clear it, so retrying only converts a loud failure into a quiet one.
+    if crate::http_retry::is_fatal_llm_quota_error(error) {
+        return None;
+    }
+
     if is_incomplete_stream_error(error) {
         return Some(LlmRetryTier::Fast);
     }
