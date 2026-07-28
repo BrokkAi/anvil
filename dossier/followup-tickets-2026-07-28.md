@@ -1,5 +1,9 @@
 # Follow-up tickets from the permission-classifier discovery (2026-07-28)
 
+Filed on GitHub: mjolnir#506 (handshake, mj half), anvil#311 (effective-mode
+reporting), anvil#312 (classifier hygiene), anvil#313 (cheaper classifier
+model). Item 1 (mj flag plumbing) landed as mjolnir 83b35b8.
+
 Context: mjolnir's `--permission-mode bypassPermissions` never reached anvil
 over ACP; every benchmark session ran in Auto mode and paid an untraced
 classifier LLM call per gated tool call (~52% of wall-clock, 19% spurious
