@@ -112,7 +112,7 @@ power to see either.
 | ~~C: refuse test edits at tool layer~~ | **dropped by owner** | Benchmark overfitting — real-world use must allow editing tests. |
 | Prompt norm | **landed `dea93d8`** | Base anvil system prompt (all sessions, unconditional): "Prefer fixing production code over weakening an existing test; if a test is genuinely obsolete, say so explicitly." |
 | D: 5xx retry tier | **landed `0ab3358`** | LLM 5xx: Fast (4 attempts, ~1.4s total) → GatewayTransient (12 attempts, ~3.5min envelope). A 2-second Bedrock blip should not kill a 90-minute attempt. |
-| E: empty-DAG loud-fail | in flight (last remaining) | Supervisor failure + no real checkpoint → abort loudly; never finalize root into a 0-byte "success." |
+| E: empty-DAG loud-fail | **landed `67a236b`** | Supervisor failure + no real checkpoint → explicit abort with `abort_empty_dag` trace. Note: current code already aborted incidentally; what was broken was the audit trail (trace claimed `finalize_latest` before checking anything existed). |
 
 Counterfactual yield on the diagnosed set: B flips both DELIVERY cases (2
 would-be solves), E+D convert both INFRA cases to honest retryable failures,
@@ -132,6 +132,19 @@ untouched by any harness fix.
   pinning (EC2 placement chooses). AppArmor userns sysctl on VMs approved by owner.
   Remaining validation: one real single-task run end-to-end (blocked only on
   the fixed anvil binary).
+
+### Open holes flagged during implementation (not yet addressed)
+
+- **Supervisor can `finalize("root")` deliberately** — `finalize_asgard` accepts
+  the root checkpoint and will emit a legitimate 0-byte patch. A live supervisor
+  choosing to deliver nothing is arguably valid (impossible task?) but is the
+  remaining route to a silent empty delivery. Design call needed.
+- **`codex_client.rs:868` tier inconsistency** — duplicates the transient-marker
+  classification and still uses the Fast tier, so the same body string now maps
+  to different patience depending on provider path. Follow-up candidate.
+- **Mid-stream retry sites stay Fast deliberately** — replaying a
+  partially-consumed stream is a different risk than re-sending an unstarted
+  request; left as-is.
 
 ## 5. Remaining gap vs vanilla — the honest accounting
 
