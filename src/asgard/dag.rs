@@ -7,6 +7,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::llm_client::{ChatMessage, TokenUsage};
+use crate::tokens::approximate_tokens_messages;
 
 /// A successfully expanded tool call, kept structured so the same resolution
 /// can be rendered in full for the model and summarized for the permanent record.
@@ -115,6 +116,7 @@ pub(crate) struct TrajectoryWindow {
     pub(crate) model: String,
     pub(crate) instruction_message: ChatMessage,
     pub(crate) window_messages: Vec<ChatMessage>,
+    pub(crate) rendered_tokens: u64,
     pub(crate) compact: String,
     pub(crate) final_response: String,
     pub(crate) stop: WorkerStopReason,
@@ -148,6 +150,7 @@ pub(crate) struct DagLiveEntry {
     pub(crate) parent: CheckpointId,
     pub(crate) status: String,
     pub(crate) instructions: String,
+    pub(crate) context_tokens: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -364,6 +367,25 @@ impl TrajectoryDag {
         }
     }
 
+    pub(crate) fn is_first_parent_ancestor_of(
+        &self,
+        ancestor: &CheckpointId,
+        target: &CheckpointId,
+    ) -> bool {
+        if ancestor == target {
+            return true;
+        }
+        if matches!(ancestor, CheckpointId::Root) {
+            return self.contains(target);
+        }
+        let Ok(chain) = self.first_parent_chain_workers(target) else {
+            return false;
+        };
+        chain
+            .into_iter()
+            .any(|worker| &CheckpointId::Worker(worker) == ancestor)
+    }
+
     pub(crate) fn off_lineage_checkpoints_with_diffstat(
         &self,
         target: &CheckpointId,
@@ -401,6 +423,28 @@ impl TrajectoryDag {
             bail!("unknown checkpoint {ckpt}");
         }
 
+        let worker_ids = self.first_parent_chain_workers(ckpt)?;
+        let mut messages = self.initial_messages.clone();
+        for worker in worker_ids {
+            let node = self
+                .nodes
+                .get(&worker)
+                .ok_or_else(|| anyhow!("unknown checkpoint w{worker}"))?;
+            messages.push(node.window.instruction_message.clone());
+            messages.extend(node.window.window_messages.clone());
+        }
+        Ok(messages)
+    }
+
+    pub(crate) fn initial_messages(&self) -> &[ChatMessage] {
+        &self.initial_messages
+    }
+
+    pub(crate) fn first_parent_chain_workers(&self, ckpt: &CheckpointId) -> Result<Vec<usize>> {
+        if !self.contains(ckpt) {
+            bail!("unknown checkpoint {ckpt}");
+        }
+
         let mut worker_ids = Vec::new();
         let mut current = ckpt.clone();
         let mut visited = HashSet::new();
@@ -425,9 +469,18 @@ impl TrajectoryDag {
             matches!(current, CheckpointId::Root),
             "ancestor walk exceeded saved node count"
         );
+        worker_ids.reverse();
+        Ok(worker_ids)
+    }
 
-        let mut messages = self.initial_messages.clone();
-        for worker in worker_ids.into_iter().rev() {
+    pub(crate) fn prefix_window_messages(
+        &self,
+        from: &CheckpointId,
+        prefix_from: Option<&crate::asgard::PrefixFrom>,
+    ) -> Result<Vec<ChatMessage>> {
+        let worker_ids = self.included_worker_ids(from, prefix_from)?;
+        let mut messages = Vec::new();
+        for worker in worker_ids {
             let node = self
                 .nodes
                 .get(&worker)
@@ -436,6 +489,69 @@ impl TrajectoryDag {
             messages.extend(node.window.window_messages.clone());
         }
         Ok(messages)
+    }
+
+    pub(crate) fn included_worker_ids(
+        &self,
+        from: &CheckpointId,
+        prefix_from: Option<&crate::asgard::PrefixFrom>,
+    ) -> Result<Vec<usize>> {
+        let chain = self.first_parent_chain_workers(from)?;
+        match prefix_from {
+            None | Some(crate::asgard::PrefixFrom::Checkpoint(CheckpointId::Root)) => Ok(chain),
+            Some(crate::asgard::PrefixFrom::Fresh) => Ok(Vec::new()),
+            Some(crate::asgard::PrefixFrom::Checkpoint(CheckpointId::Worker(prefix_worker))) => {
+                let position = chain
+                    .iter()
+                    .position(|worker| worker == prefix_worker)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "prefix_from w{prefix_worker} is not on {from}'s first-parent lineage"
+                        )
+                    })?;
+                Ok(chain[position..].to_vec())
+            }
+            Some(crate::asgard::PrefixFrom::Checkpoint(CheckpointId::Commit(commit))) => {
+                bail!(
+                    "prefix_from commit fragments are not supported for worker spawning: {commit}"
+                )
+            }
+        }
+    }
+
+    pub(crate) fn prefix_context_tokens(
+        &self,
+        from: &CheckpointId,
+        prefix_from: Option<&crate::asgard::PrefixFrom>,
+    ) -> Result<u64> {
+        self.included_worker_ids(from, prefix_from).map(|workers| {
+            workers
+                .into_iter()
+                .filter_map(|worker| self.nodes.get(&worker))
+                .map(|node| window_context_tokens(&node.window))
+                .sum()
+        })
+    }
+
+    pub(crate) fn full_inherit_context_tokens(&self, checkpoint: &CheckpointId) -> u64 {
+        self.prefix_context_tokens(checkpoint, None).unwrap_or(0)
+    }
+
+    pub(crate) fn parent_checkpoint(&self, checkpoint: &CheckpointId) -> Option<CheckpointId> {
+        match checkpoint {
+            CheckpointId::Worker(worker) => self
+                .nodes
+                .get(worker)
+                .map(|node| node.window.parent.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn node_for_checkpoint(&self, checkpoint: &CheckpointId) -> Option<&TrajectoryNode> {
+        match checkpoint {
+            CheckpointId::Worker(worker) => self.nodes.get(worker),
+            _ => None,
+        }
     }
 
     /// Resolve each handle independently, so callers can render the full
@@ -582,8 +698,9 @@ pub(crate) fn render_fragment(
         ));
     }
     rendered.push_str(&format!(
-        "<runtime elapsed_millis=\"{}\" input_tokens=\"{}\" output_tokens=\"{}\" thought_tokens=\"{}\" cached_read_tokens=\"{}\" cached_write_tokens=\"{}\" />\n",
+        "<runtime elapsed_millis=\"{}\" context_tokens=\"{}\" input_tokens=\"{}\" output_tokens=\"{}\" thought_tokens=\"{}\" cached_read_tokens=\"{}\" cached_write_tokens=\"{}\" />\n",
         window.elapsed_millis,
+        window_context_tokens(window),
         window.usage.input_tokens,
         window.usage.output_tokens,
         window.usage.thought_tokens,
@@ -610,9 +727,38 @@ pub(crate) fn render_fragment(
     rendered
 }
 
-pub(crate) fn render_dag_overview(dag: &TrajectoryDag, live: &[DagLiveEntry]) -> String {
-    let mut rendered = String::from("root\n");
-    render_dag_children(dag, live, &CheckpointId::Root, "", &mut rendered);
+pub(crate) fn window_context_tokens(window: &TrajectoryWindow) -> u64 {
+    window.rendered_tokens
+}
+
+pub(crate) fn rendered_window_tokens(
+    instruction_message: &ChatMessage,
+    window_messages: &[ChatMessage],
+) -> u64 {
+    let mut messages = Vec::with_capacity(window_messages.len().saturating_add(1));
+    messages.push(instruction_message.clone());
+    messages.extend_from_slice(window_messages);
+    approximate_tokens_messages(&messages) as u64
+}
+
+pub(crate) fn render_dag_overview(
+    dag: &TrajectoryDag,
+    live: &[DagLiveEntry],
+    prefix_recency: &HashMap<CheckpointId, std::time::Instant>,
+) -> String {
+    let mut rendered = format!(
+        "root (full-inherit ctx: {}){}\n",
+        format_token_count(0),
+        prefix_recency_suffix(prefix_recency.get(&CheckpointId::Root))
+    );
+    render_dag_children(
+        dag,
+        live,
+        prefix_recency,
+        &CheckpointId::Root,
+        "",
+        &mut rendered,
+    );
     rendered
 }
 
@@ -625,6 +771,7 @@ enum DagOverviewChild<'a> {
 fn render_dag_children(
     dag: &TrajectoryDag,
     live: &[DagLiveEntry],
+    prefix_recency: &HashMap<CheckpointId, std::time::Instant>,
     parent: &CheckpointId,
     prefix: &str,
     rendered: &mut String,
@@ -654,12 +801,15 @@ fn render_dag_children(
         rendered.push_str(if is_last { "└─ " } else { "├─ " });
         match child {
             DagOverviewChild::Saved(node) => {
+                let checkpoint = CheckpointId::Worker(worker);
                 rendered.push_str(&format!(
-                    "w{worker} ({}) \"{}\" saved, {}/{} steps{}{}\n",
+                    "w{worker} ({}) \"{}\" saved, {}/{} steps; full-inherit ctx: {}{}{}{}\n",
                     short_sha(&node.commit),
                     instruction_stub(&node.window.instructions),
                     node.window.stop.label(),
                     node.window.steps,
+                    format_token_count(dag.full_inherit_context_tokens(&checkpoint)),
+                    prefix_recency_suffix(prefix_recency.get(&checkpoint)),
                     compact_diffstat_suffix(&node.window.diffstat),
                     compact_merged_from_suffix(&node.merged_from)
                 ));
@@ -668,6 +818,7 @@ fn render_dag_children(
                 render_dag_children(
                     dag,
                     live,
+                    prefix_recency,
                     &CheckpointId::Worker(worker),
                     &next_prefix,
                     rendered,
@@ -681,12 +832,37 @@ fn render_dag_children(
             }
             DagOverviewChild::Live(entry) => {
                 rendered.push_str(&format!(
-                    "w{worker} \"{}\" {}\n",
+                    "w{worker} \"{}\" {}; full-inherit ctx: {}\n",
                     instruction_stub(&entry.instructions),
-                    entry.status
+                    entry.status,
+                    format_token_count(
+                        dag.full_inherit_context_tokens(parent)
+                            .saturating_add(entry.context_tokens)
+                    )
                 ));
             }
         }
+    }
+}
+
+fn prefix_recency_suffix(last_used: Option<&std::time::Instant>) -> String {
+    let Some(last_used) = last_used else {
+        return String::new();
+    };
+    let elapsed = last_used.elapsed();
+    let minutes = elapsed.as_secs() / 60;
+    if minutes == 0 {
+        " (prefix'd just now)".to_string()
+    } else {
+        format!(" (prefix'd {minutes}m ago)")
+    }
+}
+
+pub(crate) fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{}k", (tokens + 500) / 1_000)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -789,6 +965,7 @@ mod tests {
 
     fn window(worker: usize, parent: CheckpointId, label: &str) -> TrajectoryWindow {
         let call_id = format!("c{worker}");
+        let instruction_message = ChatMessage::user(format!("instruction message {label}"));
         let messages = vec![
             assistant_call(call(
                 &call_id,
@@ -803,7 +980,8 @@ mod tests {
             parent,
             instructions: format!("instructions {label}"),
             model: "model-a".to_string(),
-            instruction_message: ChatMessage::user(format!("instruction message {label}")),
+            rendered_tokens: rendered_window_tokens(&instruction_message, &messages),
+            instruction_message,
             compact: crate::asgard::render_window_compact_for_worker(worker, &messages),
             window_messages: messages,
             final_response: format!("final {label}"),
@@ -1254,25 +1432,55 @@ mod tests {
                 parent: CheckpointId::Root,
                 status: "in flight, step 2/10".to_string(),
                 instructions: "live root child".to_string(),
+                context_tokens: 0,
             },
             DagLiveEntry {
                 worker: 8,
                 parent: CheckpointId::Worker(3),
                 status: "under review".to_string(),
                 instructions: "live child\nunder review".to_string(),
+                context_tokens: 0,
             },
         ];
 
-        let rendered = render_dag_overview(&dag, &live);
+        let rendered = render_dag_overview(&dag, &live, &HashMap::new());
 
         assert_eq!(
             rendered,
-            "root\n\
-├─ w3 (c3) \"instructions saved root\" saved, finished/2 steps; diffstat: saved.txt | 1 +\n\
-│  ├─ w7 (c7) \"instructions saved child instructions that are intentionally\" saved, finished/2 steps\n\
-│  └─ w8 \"live child under review\" under review\n\
+            "root (full-inherit ctx: 0)\n\
+├─ w3 (c3) \"instructions saved root\" saved, finished/2 steps; full-inherit ctx: 23; diffstat: saved.txt | 1 +\n\
+│  ├─ w7 (c7) \"instructions saved child instructions that are intentionally\" saved, finished/2 steps; full-inherit ctx: 78\n\
+│  └─ w8 \"live child under review\" under review; full-inherit ctx: 23\n\
 ├─ w4 \"discarded root child\" discarded\n\
-└─ w5 \"live root child\" in flight, step 2/10\n"
+└─ w5 \"live root child\" in flight, step 2/10; full-inherit ctx: 0\n"
         );
+    }
+
+    #[test]
+    fn dag_overview_reports_full_inherit_context_totals_and_window_tokens() {
+        let mut dag = TrajectoryDag::new(Vec::new(), "base".to_string());
+        let mut first = node(1, CheckpointId::Root, "first", "c1");
+        first.window.usage.input_tokens = 1_200;
+        first.window.usage.cached_read_tokens = 300;
+        first.window.rendered_tokens = 12;
+        dag.insert(first).unwrap();
+        let mut second = node(2, CheckpointId::Worker(1), "second", "c2");
+        second.window.usage.input_tokens = 500;
+        second.window.usage.cached_read_tokens = 500;
+        second.window.rendered_tokens = 8;
+        dag.insert(second).unwrap();
+
+        let rendered = render_dag_overview(&dag, &[], &HashMap::new());
+        assert!(rendered.contains(
+            "w1 (c1) \"instructions first\" saved, finished/2 steps; full-inherit ctx: 12"
+        ));
+        assert!(rendered.contains(
+            "w2 (c2) \"instructions second\" saved, finished/2 steps; full-inherit ctx: 20"
+        ));
+
+        let fragment = render_fragment(&dag.node(1).expect("w1").window, Some("c1"), Some("base"));
+        assert!(fragment.contains(r#"context_tokens="12""#));
+        assert!(fragment.contains(r#"input_tokens="1200""#));
+        assert!(fragment.contains(r#"cached_read_tokens="300""#));
     }
 }

@@ -15,13 +15,15 @@ use futures::future::{BoxFuture, FutureExt, join_all};
 use crate::asgard::{
     ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, CandidateRepository,
     CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL, PREFINALIZE_TOOL,
-    SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest, SupervisorStreamCall,
-    SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
-    VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions, git_refusal, parse_finalize,
-    parse_git_args, parse_prefinalize, parse_spawn_workers, parse_update_plan,
-    parse_view_tool_call, render_dag_overview, render_fragment, render_resolved_views,
-    render_window_compact_for_worker, retain_payloads_for_permanent_record, run_supervisor_git,
-    short_sha, stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
+    PrefixFrom, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
+    SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
+    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions,
+    format_token_count, git_refusal, parse_finalize, parse_git_args, parse_prefinalize,
+    parse_spawn_workers, parse_update_plan, parse_view_tool_call, render_dag_overview,
+    render_fragment, render_resolved_views, render_window_compact_for_worker,
+    rendered_window_tokens, retain_payloads_for_permanent_record, run_supervisor_git, short_sha,
+    stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
+    window_context_tokens,
 };
 use crate::mcp::{McpClient, McpServerConfig};
 
@@ -135,6 +137,7 @@ struct FinishedWorker {
     instructions: String,
     instruction_message: ChatMessage,
     window_messages: Vec<ChatMessage>,
+    rendered_tokens: u64,
     compact: String,
     final_response: String,
     stop: WorkerStopReason,
@@ -154,6 +157,7 @@ impl FinishedWorker {
             model: self.model.clone(),
             instruction_message: self.instruction_message.clone(),
             window_messages: self.window_messages.clone(),
+            rendered_tokens: self.rendered_tokens,
             compact: self.compact.clone(),
             final_response: self.final_response.clone(),
             stop: self.stop.clone(),
@@ -220,6 +224,7 @@ struct SupervisorLoopContext<'ctx, 'fut> {
     prefinalize_issued: &'ctx mut bool,
     prefinalize_workers: &'ctx mut Vec<usize>,
     latest_prefinalize_source_commits: &'ctx mut HashSet<String>,
+    prefix_recency: &'ctx mut HashMap<CheckpointId, Instant>,
     /// Count of consecutive regular `spawn_workers` calls (across turns) that
     /// spawned exactly one worker. Reset to 0 by any width>=2 spawn; a
     /// justified width-1 spawn (non-empty `single_because`) still increments
@@ -437,6 +442,7 @@ async fn launch_worker<'a>(
             }
         };
         let compact = render_window_compact_for_worker(worker_id, &window_messages);
+        let rendered_tokens = rendered_window_tokens(&instruction_message, &window_messages);
         let raw_bytes = serialized_messages_len(&window_messages);
         let compact_bytes = compact.len();
         crate::trace_logging::append_trace_record(serde_json::json!({
@@ -464,6 +470,7 @@ async fn launch_worker<'a>(
             instructions,
             instruction_message,
             window_messages,
+            rendered_tokens,
             compact,
             final_response,
             stop,
@@ -597,6 +604,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     let mut prefinalize_issued = false;
     let mut prefinalize_workers = Vec::new();
     let mut latest_prefinalize_source_commits = HashSet::new();
+    let mut prefix_recency: HashMap<CheckpointId, Instant> = HashMap::new();
     let mut width1_streak = 0usize;
     let mut branch_challenges_issued = 0usize;
     let run_started = Instant::now();
@@ -646,6 +654,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
         let status = render_asgard_status_block(
             &dag,
             &pending_windows,
+            &prefix_recency,
             ASGARD_BATCH_CAP,
             run_started.elapsed().as_secs() / 60,
             idle_note,
@@ -698,6 +707,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
             prefinalize_issued: &mut prefinalize_issued,
             prefinalize_workers: &mut prefinalize_workers,
             latest_prefinalize_source_commits: &mut latest_prefinalize_source_commits,
+            prefix_recency: &mut prefix_recency,
             width1_streak: &mut width1_streak,
             branch_challenges_issued: &mut branch_challenges_issued,
             idle_timeout,
@@ -1267,9 +1277,11 @@ async fn execute_supervisor_call<'ctx, 'fut>(
         }
         SPAWN_WORKERS_TOOL => {
             let pending = pending_ids(cx.pending);
+            let pending_parents = pending_parent_entries(cx);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
                 pending: &pending,
+                pending_parents: &pending_parents,
                 allowed_models: cx.allowed_models,
             };
             let spawns = match parse_spawn_workers(call, &context) {
@@ -1280,9 +1292,11 @@ async fn execute_supervisor_call<'ctx, 'fut>(
         }
         PREFINALIZE_TOOL => {
             let pending = pending_ids(cx.pending);
+            let pending_parents = pending_parent_entries(cx);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
                 pending: &pending,
+                pending_parents: &pending_parents,
                 allowed_models: cx.allowed_models,
             };
             let parsed = match parse_prefinalize(call, &context) {
@@ -1319,9 +1333,11 @@ async fn execute_supervisor_call<'ctx, 'fut>(
         }
         FINALIZE_TOOL => {
             let pending = pending_ids(cx.pending);
+            let pending_parents = pending_parent_entries(cx);
             let context = SupervisorTurnContext {
                 dag: &*cx.dag,
                 pending: &pending,
+                pending_parents: &pending_parents,
                 allowed_models: cx.allowed_models,
             };
             let parsed = match parse_finalize(call, &context) {
@@ -1476,6 +1492,13 @@ fn pending_ids(pending: &BTreeMap<usize, FinishedWorker>) -> Vec<usize> {
     pending.keys().copied().collect()
 }
 
+fn pending_parent_entries(cx: &SupervisorLoopContext<'_, '_>) -> Vec<(usize, CheckpointId)> {
+    cx.pending_windows
+        .iter()
+        .map(|(worker, window)| (*worker, window.parent.clone()))
+        .collect()
+}
+
 fn pending_view_messages(
     pending: &BTreeMap<usize, FinishedWorker>,
 ) -> Vec<(usize, &[ChatMessage])> {
@@ -1548,6 +1571,7 @@ fn pending_worker_for_call(
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SpawnDedupKey {
     from: CheckpointId,
+    prefix_from: Option<PrefixFrom>,
     instructions: String,
     model: String,
 }
@@ -1561,6 +1585,11 @@ enum SpawnDuplicateNote {
 enum SpawnKind {
     Regular,
     Prefinalize,
+}
+
+struct LaunchedSpawn {
+    worker: usize,
+    prefix_context_tokens: u64,
 }
 
 async fn execute_spawn_requests<'ctx, 'fut>(
@@ -1641,7 +1670,8 @@ async fn execute_spawn_requests<'ctx, 'fut>(
     for spawn in spawns {
         let from = spawn.from.clone();
         let spawn_index = spawned_by_index.len();
-        let worker = launch_spawn(cx, spawn).await?;
+        let launched = launch_spawn(cx, spawn).await?;
+        let worker = launched.worker;
         state.spawned_this_turn += 1;
         state.spawned.push(worker);
         if matches!(kind, SpawnKind::Prefinalize) {
@@ -1655,8 +1685,9 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             SpawnKind::Prefinalize => "prefinalize spawned",
         };
         lines.push(format!(
-            "{verb} w{worker} from {from}{}",
-            checkpoint_sha_suffix(cx.dag, &from)
+            "{verb} w{worker} from {from}{}; prefix ctx: {} tokens",
+            checkpoint_sha_suffix(cx.dag, &from),
+            format_token_count(launched.prefix_context_tokens)
         ));
     }
     lines.extend(render_spawn_duplicate_notes(
@@ -1723,6 +1754,7 @@ fn dedup_spawn_requests(
     for spawn in spawns {
         let key = SpawnDedupKey {
             from: spawn.from.clone(),
+            prefix_from: spawn.prefix_from.clone(),
             instructions: spawn.instructions.clone(),
             model: spawn
                 .model
@@ -1802,7 +1834,7 @@ fn save_pending_if_needed(
 async fn launch_spawn<'a>(
     cx: &mut SupervisorLoopContext<'_, 'a>,
     spawn: SpawnRequest,
-) -> Result<usize> {
+) -> Result<LaunchedSpawn> {
     let worker_id = *cx.worker_counter;
     *cx.worker_counter += 1;
     let worktree_label = format!("c{}", *cx.clone_counter);
@@ -1812,7 +1844,22 @@ async fn launch_spawn<'a>(
         .commit_for(&spawn.from)
         .ok_or_else(|| anyhow!("unknown checkpoint {}", spawn.from))?
         .to_string();
-    let messages = cx.dag.ancestor_messages(&spawn.from)?;
+    let prefix_context_tokens = cx
+        .dag
+        .prefix_context_tokens(&spawn.from, spawn.prefix_from.as_ref())?;
+    let orientation = orientation_block(
+        cx.dag,
+        cx.launch.parent_cwd,
+        cx.bifrost,
+        cx.bifrost_tool_names,
+        &cx.cancel,
+        &spawn,
+    )
+    .await?;
+    let messages = assemble_spawn_messages(cx.dag, cx.launch.parent_cwd, &spawn, orientation)?;
+    if let Some(checkpoint) = prefix_recency_checkpoint(&spawn) {
+        cx.prefix_recency.insert(checkpoint, Instant::now());
+    }
     let future = launch_worker(
         WorkerLaunch {
             cx: cx.launch.cx,
@@ -1840,7 +1887,269 @@ async fn launch_spawn<'a>(
     )
     .await?;
     cx.spawned_batch.push(future);
-    Ok(worker_id)
+    Ok(LaunchedSpawn {
+        worker: worker_id,
+        prefix_context_tokens,
+    })
+}
+
+fn prefix_recency_checkpoint(spawn: &SpawnRequest) -> Option<CheckpointId> {
+    match &spawn.prefix_from {
+        None => Some(spawn.from.clone()),
+        Some(PrefixFrom::Checkpoint(checkpoint)) => Some(checkpoint.clone()),
+        Some(PrefixFrom::Fresh) => None,
+    }
+}
+
+fn assemble_spawn_messages(
+    dag: &TrajectoryDag,
+    repo_root: &Path,
+    spawn: &SpawnRequest,
+    orientation: Option<String>,
+) -> Result<Vec<ChatMessage>> {
+    let mut messages = initial_messages_with_orientation(dag.initial_messages(), orientation);
+    messages.extend(dag.prefix_window_messages(&spawn.from, spawn.prefix_from.as_ref())?);
+    if let Some(briefing) = merge_briefing(dag, repo_root, spawn)? {
+        messages.push(ChatMessage::user(briefing));
+    }
+    Ok(messages)
+}
+
+fn initial_messages_with_orientation(
+    initial_messages: &[ChatMessage],
+    orientation: Option<String>,
+) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    let mut orientation = orientation.map(ChatMessage::user);
+    for message in initial_messages {
+        messages.push(message.clone());
+        if message.role == "system"
+            && let Some(orientation_message) = orientation.take()
+        {
+            messages.push(orientation_message);
+        }
+    }
+    if let Some(orientation_message) = orientation {
+        messages.insert(0, orientation_message);
+    }
+    messages
+}
+
+async fn orientation_block(
+    dag: &TrajectoryDag,
+    repo_root: &Path,
+    bifrost: Option<&McpClient>,
+    bifrost_tool_names: &HashSet<String>,
+    cancel: &tokio_util::sync::CancellationToken,
+    spawn: &SpawnRequest,
+) -> Result<Option<String>> {
+    let Some((base, target, elided_label)) = orientation_span(dag, spawn)? else {
+        return Ok(None);
+    };
+    let diffstat = git_diffstat_between(repo_root, &base, &target)?;
+    let analysis =
+        analyze_diff_orientation(bifrost, bifrost_tool_names, cancel, &base, &target).await;
+    Ok(Some(format!(
+        "<elided_prefix_orientation>\n\
+         This is deterministic background for prior trajectory windows this worker did not inherit: {elided_label}.\n\
+         <diffstat base=\"{}\" target=\"{}\">\n{}\n</diffstat>\n\
+         <bifrost_analyze_diff base=\"{}\" target=\"{}\">\n{}\n</bifrost_analyze_diff>\n\
+         </elided_prefix_orientation>",
+        short_sha(&base),
+        short_sha(&target),
+        diffstat.trim_end(),
+        short_sha(&base),
+        short_sha(&target),
+        analysis.trim_end()
+    )))
+}
+
+fn orientation_span(
+    dag: &TrajectoryDag,
+    spawn: &SpawnRequest,
+) -> Result<Option<(String, String, String)>> {
+    let Some(prefix_from) = spawn.prefix_from.as_ref() else {
+        return Ok(None);
+    };
+    let base = dag
+        .commit_for(&CheckpointId::Root)
+        .ok_or_else(|| anyhow!("missing root commit"))?
+        .to_string();
+    match prefix_from {
+        PrefixFrom::Fresh => {
+            let target = dag
+                .commit_for(&spawn.from)
+                .ok_or_else(|| anyhow!("missing checkpoint {}", spawn.from))?
+                .to_string();
+            Ok(Some((base, target, format!("root through {}", spawn.from))))
+        }
+        PrefixFrom::Checkpoint(checkpoint) => {
+            let target_checkpoint = dag
+                .parent_checkpoint(checkpoint)
+                .unwrap_or(CheckpointId::Root);
+            let target = dag
+                .commit_for(&target_checkpoint)
+                .ok_or_else(|| anyhow!("missing checkpoint {target_checkpoint}"))?
+                .to_string();
+            Ok(Some((
+                base,
+                target,
+                format!("root through parent of {checkpoint} ({target_checkpoint})"),
+            )))
+        }
+    }
+}
+
+async fn analyze_diff_orientation(
+    bifrost: Option<&McpClient>,
+    bifrost_tool_names: &HashSet<String>,
+    cancel: &tokio_util::sync::CancellationToken,
+    base: &str,
+    target: &str,
+) -> String {
+    if base == target {
+        return "No code diff in the elided span.".to_string();
+    }
+    let Some(client) = bifrost else {
+        return "Bifrost analyze_diff unavailable for this run.".to_string();
+    };
+    if !bifrost_tool_names.contains("analyze_diff") {
+        return "Bifrost analyze_diff tool unavailable for this run.".to_string();
+    }
+    let args = serde_json::json!({
+        "base": base,
+        "target": target,
+    });
+    match client
+        .call_tool_cancellable("analyze_diff", args, Some(cancel))
+        .await
+    {
+        Ok(value) => {
+            let mut text = render_mcp_result_text(&value);
+            let full_bytes = text.len();
+            if full_bytes > ASGARD_BIFROST_RESULT_CAP {
+                let prefix = crate::text::truncate_utf8(&text, ASGARD_BIFROST_RESULT_CAP);
+                text = format!(
+                    "{prefix}\n[truncated first {ASGARD_BIFROST_RESULT_CAP} bytes of {full_bytes}]"
+                );
+            }
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_supervisor_bifrost",
+                "tool": "analyze_diff",
+                "bytes": full_bytes,
+                "is_error": false,
+                "purpose": "prefix_orientation",
+            }));
+            text
+        }
+        Err(error) => {
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_supervisor_bifrost",
+                "tool": "analyze_diff",
+                "bytes": 0,
+                "is_error": true,
+                "purpose": "prefix_orientation",
+            }));
+            format!("Bifrost analyze_diff failed: {error:#}")
+        }
+    }
+}
+
+fn merge_briefing(
+    dag: &TrajectoryDag,
+    repo_root: &Path,
+    spawn: &SpawnRequest,
+) -> Result<Option<String>> {
+    let Some(node) = dag.node_for_checkpoint(&spawn.from) else {
+        return Ok(None);
+    };
+    if node.merged_from.len() != 1 {
+        return Ok(None);
+    }
+    let merged_side = &node.merged_from[0];
+    let included = dag.included_worker_ids(&spawn.from, spawn.prefix_from.as_ref())?;
+    if let CheckpointId::Worker(worker) = merged_side
+        && included.contains(worker)
+    {
+        return Ok(None);
+    }
+    let first_parent = &node.window.parent;
+    let first_parent_commit = dag
+        .commit_for(first_parent)
+        .ok_or_else(|| anyhow!("missing first-parent checkpoint {first_parent}"))?;
+    let merged_side_commit = dag
+        .commit_for(merged_side)
+        .ok_or_else(|| anyhow!("missing merged-side checkpoint {merged_side}"))?;
+    let merge_base = git_merge_base(repo_root, first_parent_commit, merged_side_commit)?;
+    let first_parent_diffstat = git_diffstat_between(repo_root, &merge_base, first_parent_commit)?;
+    let merged_side_diff = git_diff_between(repo_root, &merge_base, merged_side_commit)?;
+    Ok(Some(format!(
+        "<merge_briefing>\n\
+         Checkpoint {} is a merge. This worker did not inherit merged-side trajectory windows from {merged_side}; this briefing uses merge-base diffs instead of comparing sides head-to-head.\n\
+         <first_parent_diffstat base=\"{}\" target=\"{}\">\n{}\n</first_parent_diffstat>\n\
+         <merged_side_diff base=\"{}\" target=\"{}\">\n{}\n</merged_side_diff>\n\
+         </merge_briefing>",
+        spawn.from,
+        short_sha(&merge_base),
+        short_sha(first_parent_commit),
+        first_parent_diffstat.trim_end(),
+        short_sha(&merge_base),
+        short_sha(merged_side_commit),
+        merged_side_diff.trim_end()
+    )))
+}
+
+fn git_merge_base(root: &Path, left: &str, right: &str) -> Result<String> {
+    Ok(git_text_output(root, &["merge-base", left, right])?
+        .trim()
+        .to_string())
+}
+
+fn git_diffstat_between(root: &Path, base: &str, target: &str) -> Result<String> {
+    git_text_output(
+        root,
+        &[
+            "diff",
+            "--stat",
+            "--no-ext-diff",
+            base,
+            target,
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )
+}
+
+fn git_diff_between(root: &Path, base: &str, target: &str) -> Result<String> {
+    git_text_output(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            base,
+            target,
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ],
+    )
+}
+
+fn git_text_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git").args(args).current_dir(root).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed in {} with status {}; stderr:\n{}",
+            args.join(" "),
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2341,6 +2650,7 @@ fn count_worker_steps(messages: &[ChatMessage]) -> usize {
 fn render_asgard_status_block(
     dag: &TrajectoryDag,
     pending: &BTreeMap<usize, TrajectoryWindow>,
+    prefix_recency: &HashMap<CheckpointId, Instant>,
     capacity_available: usize,
     elapsed_minutes: u64,
     idle_note: Option<&str>,
@@ -2353,6 +2663,7 @@ fn render_asgard_status_block(
             parent: worker.parent.clone(),
             status: "under review".to_string(),
             instructions: worker.instructions.clone(),
+            context_tokens: window_context_tokens(worker),
         });
     }
 
@@ -2360,7 +2671,7 @@ fn render_asgard_status_block(
     rendered.push_str("<asgard_status>\n");
     rendered.push_str(&format!("Elapsed: {elapsed_minutes}m since run start.\n"));
     rendered.push_str("<dag>\n");
-    rendered.push_str(&render_dag_overview(dag, &live));
+    rendered.push_str(&render_dag_overview(dag, &live, prefix_recency));
     rendered.push_str("</dag>\n");
     if !parent_status.is_empty() {
         rendered.push_str("<parent_worktree_status>\n");
@@ -2890,6 +3201,242 @@ mod tests {
             .map(ChatMessage::content_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn test_window(
+        worker: usize,
+        parent: CheckpointId,
+        instructions: &str,
+        usage: TokenUsage,
+    ) -> TrajectoryWindow {
+        let instruction_message = ChatMessage::user(format!("instructions for w{worker}"));
+        let window_messages = vec![ChatMessage::assistant(format!("window body w{worker}"))];
+        let rendered_tokens = rendered_window_tokens(&instruction_message, &window_messages);
+        TrajectoryWindow {
+            worker,
+            parent,
+            instructions: instructions.to_string(),
+            model: "worker-model".to_string(),
+            instruction_message,
+            window_messages,
+            rendered_tokens,
+            compact: String::new(),
+            final_response: format!("final w{worker}"),
+            stop: WorkerStopReason::Finished,
+            steps: 1,
+            diffstat: String::new(),
+            usage,
+            elapsed_millis: 0,
+        }
+    }
+
+    fn insert_test_node(
+        dag: &mut TrajectoryDag,
+        worker: usize,
+        parent: CheckpointId,
+        instructions: &str,
+        commit: &str,
+        usage: TokenUsage,
+    ) {
+        dag.insert(TrajectoryNode {
+            window: test_window(worker, parent, instructions, usage),
+            commit: commit.to_string(),
+            merged_from: Vec::new(),
+        })
+        .expect("insert test node");
+    }
+
+    #[test]
+    fn spawn_message_assembly_is_deterministic_for_same_prefix_pair() {
+        let mut dag = TrajectoryDag::new(
+            vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("original task"),
+            ],
+            "base".to_string(),
+        );
+        insert_test_node(
+            &mut dag,
+            1,
+            CheckpointId::Root,
+            "root child",
+            "c1",
+            TokenUsage {
+                input_tokens: 11,
+                cached_read_tokens: 7,
+                ..TokenUsage::default()
+            },
+        );
+        insert_test_node(
+            &mut dag,
+            2,
+            CheckpointId::Worker(1),
+            "grandchild",
+            "c2",
+            TokenUsage {
+                input_tokens: 13,
+                cached_read_tokens: 5,
+                ..TokenUsage::default()
+            },
+        );
+        let spawn = SpawnRequest {
+            from: CheckpointId::Worker(2),
+            prefix_from: Some(PrefixFrom::Checkpoint(CheckpointId::Worker(2))),
+            instructions: "new work".to_string(),
+            model: None,
+            max_steps: None,
+            single_because: None,
+            runs_full_suite: false,
+            attacks: Vec::new(),
+        };
+
+        let first = assemble_spawn_messages(
+            &dag,
+            Path::new("."),
+            &spawn,
+            Some("orientation".to_string()),
+        )
+        .expect("messages");
+        let second = assemble_spawn_messages(
+            &dag,
+            Path::new("."),
+            &spawn,
+            Some("orientation".to_string()),
+        )
+        .expect("messages");
+
+        assert_eq!(first, second);
+        let text = all_message_text(&first);
+        assert!(text.contains("orientation"));
+        assert!(text.contains("instructions for w2"));
+        assert!(text.contains("window body w2"));
+        assert!(!text.contains("instructions for w1"));
+        assert_eq!(
+            dag.prefix_context_tokens(&spawn.from, spawn.prefix_from.as_ref())
+                .expect("prefix tokens"),
+            8
+        );
+    }
+
+    #[test]
+    fn fresh_spawn_assembly_has_orientation_and_no_inherited_windows() {
+        let mut dag = TrajectoryDag::new(vec![ChatMessage::user("task")], "base".to_string());
+        insert_test_node(
+            &mut dag,
+            1,
+            CheckpointId::Root,
+            "root child",
+            "c1",
+            TokenUsage {
+                input_tokens: 3,
+                cached_read_tokens: 4,
+                ..TokenUsage::default()
+            },
+        );
+        let spawn = SpawnRequest {
+            from: CheckpointId::Worker(1),
+            prefix_from: Some(PrefixFrom::Fresh),
+            instructions: "verify fresh".to_string(),
+            model: None,
+            max_steps: None,
+            single_because: None,
+            runs_full_suite: false,
+            attacks: Vec::new(),
+        };
+
+        let messages = assemble_spawn_messages(
+            &dag,
+            Path::new("."),
+            &spawn,
+            Some("fresh orientation".to_string()),
+        )
+        .expect("messages");
+        let text = all_message_text(&messages);
+
+        assert!(text.contains("fresh orientation"));
+        assert!(!text.contains("instructions for w1"));
+        assert_eq!(
+            dag.prefix_context_tokens(&spawn.from, spawn.prefix_from.as_ref())
+                .expect("prefix tokens"),
+            0
+        );
+    }
+
+    #[test]
+    fn merge_briefing_uses_merge_base_side_diffs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("base.txt"), "base\n").expect("write base");
+        run_git(&repo, &["add", "base.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "base"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        fs::write(repo.join("d.txt"), "first parent\n").expect("write d");
+        run_git(&repo, &["add", "d.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "first parent"]);
+        let d = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        run_git(&repo, &["checkout", "--quiet", "--detach", &base]);
+        fs::write(repo.join("e.txt"), "merged side\n").expect("write e");
+        run_git(&repo, &["add", "e.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "merged side"]);
+        let e = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        run_git(&repo, &["checkout", "--quiet", "--detach", &d]);
+        run_git(&repo, &["merge", "--quiet", "--no-ff", &e, "-m", "merge"]);
+        let merge = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let mut dag =
+            TrajectoryDag::new_with_git_root(vec![ChatMessage::user("task")], base, repo.clone());
+        insert_test_node(
+            &mut dag,
+            1,
+            CheckpointId::Root,
+            "merged side worker",
+            &e,
+            TokenUsage::default(),
+        );
+        insert_test_node(
+            &mut dag,
+            2,
+            CheckpointId::Root,
+            "first parent worker",
+            &d,
+            TokenUsage::default(),
+        );
+        let mut merge_node = TrajectoryNode {
+            window: test_window(
+                3,
+                CheckpointId::Worker(2),
+                "merge worker",
+                TokenUsage::default(),
+            ),
+            commit: merge,
+            merged_from: vec![CheckpointId::Worker(1)],
+        };
+        merge_node.window.diffstat = "merge diffstat".to_string();
+        dag.insert(merge_node).expect("insert merge node");
+        let spawn = SpawnRequest {
+            from: CheckpointId::Worker(3),
+            prefix_from: None,
+            instructions: "continue merge".to_string(),
+            model: None,
+            max_steps: None,
+            single_because: None,
+            runs_full_suite: false,
+            attacks: Vec::new(),
+        };
+
+        let messages = assemble_spawn_messages(&dag, &repo, &spawn, None).expect("messages");
+        let text = all_message_text(&messages);
+
+        assert!(text.contains("<merge_briefing>"));
+        assert!(text.contains("<first_parent_diffstat"));
+        assert!(text.contains("d.txt"));
+        assert!(text.contains("<merged_side_diff"));
+        assert!(text.contains("e.txt"));
+        assert!(!text.contains("instructions for w1"));
     }
 
     #[tokio::test]
@@ -5866,6 +6413,7 @@ mod tests {
                 model: "model-a".to_string(),
                 instruction_message: ChatMessage::user("saved worker instructions"),
                 window_messages: Vec::new(),
+                rendered_tokens: 0,
                 compact: String::new(),
                 final_response: String::new(),
                 stop: WorkerStopReason::Finished,
@@ -5888,6 +6436,7 @@ mod tests {
                 model: "worker-model".to_string(),
                 instruction_message: ChatMessage::user("inspect the parser"),
                 window_messages: Vec::new(),
+                rendered_tokens: 0,
                 compact: String::new(),
                 final_response: String::new(),
                 stop: WorkerStopReason::Finished,
@@ -5901,6 +6450,7 @@ mod tests {
         let rendered = render_asgard_status_block(
             &dag,
             &pending,
+            &HashMap::new(),
             4,
             0,
             Some("No worker is awaiting review. Spawn workers or finalize."),
@@ -5909,9 +6459,15 @@ mod tests {
 
         assert!(rendered.contains("<asgard_status>"));
         assert!(rendered.contains("Elapsed: 0m since run start."));
-        assert!(rendered.contains("<dag>\nroot\n"));
-        assert!(rendered.contains("w2 (c2) \"saved checkpoint\" saved, finished/1 steps"));
-        assert!(rendered.contains("└─ w5 \"inspect the parser then test it\" under review"));
+        assert!(rendered.contains("<dag>\nroot (full-inherit ctx: 0)\n"));
+        assert!(
+            rendered.contains(
+                "w2 (c2) \"saved checkpoint\" saved, finished/1 steps; full-inherit ctx: 0"
+            )
+        );
+        assert!(rendered.contains(
+            "└─ w5 \"inspect the parser then test it\" under review; full-inherit ctx: 0"
+        ));
         assert!(rendered.contains("capacity_available: 4"));
         assert!(rendered.contains("Spawn workers or finalize."));
     }

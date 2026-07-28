@@ -33,6 +33,7 @@ pub(crate) const UPDATE_PLAN_TOOL: &str = "update_plan";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnRequest {
     pub(crate) from: CheckpointId,
+    pub(crate) prefix_from: Option<PrefixFrom>,
     pub(crate) instructions: String,
     pub(crate) model: Option<String>,
     pub(crate) max_steps: Option<usize>,
@@ -48,6 +49,12 @@ pub(crate) struct SpawnRequest {
     /// Each entry is capped at `ASGARD_ATTACK_MAX_LENGTH` characters. Always
     /// empty for regular spawn_workers calls.
     pub(crate) attacks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum PrefixFrom {
+    Fresh,
+    Checkpoint(CheckpointId),
 }
 
 /// A parsed prefinalize call: the verification batch plus the optional
@@ -69,6 +76,7 @@ pub(crate) struct FinalizeRequest {
 pub(crate) struct SupervisorTurnContext<'a> {
     pub(crate) dag: &'a TrajectoryDag,
     pub(crate) pending: &'a [usize],
+    pub(crate) pending_parents: &'a [(usize, CheckpointId)],
     pub(crate) allowed_models: &'a [String],
 }
 
@@ -93,7 +101,7 @@ pub(crate) fn supervisor_supplement() -> String {
         r#"# Asgard supervision
 
 You are the supervisor of a team of barrier-batch workers solving the task. Everything above still governs the work: workers are agents operating under those instructions with the full standard agent toolset (file reading and editing, search, code intelligence, and the shell), and the standards in "How you work" and "Verification" are requirements you enforce through your workers, not suggestions. You never touch files or run commands yourself - you act only through these tools:
-- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you.
+- spawn_workers: fork 1 to {workers} workers from "root" (the original repository state) or any saved checkpoint like "w3". A successful spawn ends your turn; the whole batch runs concurrently to completion, then all sibling reports return together for review. Each worker gets its own checkout of the forked state plus your instructions and runs up to {worker_steps} steps (one step = one batch of tool calls) unless you set max_steps for it - size the budget to the assignment, from a small probe to a long self-contained attempt; a worker that stops making tool calls sooner is done, and its final message is its report to you. Workers measurably degrade as context approaches or passes 256k tokens; prefer prefixes that keep projected context well under that.
 Example - branching review: worker w4 reports "parser change in; 3 edge tests failing; cause unclear - either tokenizer state reset or the quoting rule". Correct resolution: spawn two workers from w4 concurrently - one per hypothesis - and discard the loser. Counter-example - serial is right: worker w9 reports "rename applied; one import path stale, fix is mechanical". Correct resolution: one worker from w9; branching adds nothing when only one continuation is live.
 - prefinalize: spawn your final verification pass, with the same batch semantics as spawn_workers. finalize stays locked until a prefinalize batch has run and every one of its reports has been reviewed and resolved. Coverage: mark your full-suite worker with runs_full_suite - it is your broadest attack, attacking the belief that nothing else broke - or state full_suite_skipped. Refutations name attacks, not reassurance: 'w15 re-runs the suite' attacks nothing; 'Belief: unchanged relation data never marks an entity changed -> a worker builds an entity whose relation data is cloned-but-equal and diffs it' attacks the belief - if you are wrong, its test goes red. Dictated code is a belief too: if you handed a worker a signature, some worker must call it in every form the task text implies before you may believe it.
 - save_checkpoint: a reviewed trajectory you save (or spawn a worker from) becomes a permanent checkpoint you can branch from later. When multiple siblings are under review, pass `worker` (for example "w7") to name which one.
@@ -104,7 +112,7 @@ Example - branching review: worker w4 reports "parser change in; 3 edge tests fa
 - update_plan: maintain the user-visible plan for the overall task. Workers cannot see or update it; fold their progress into it yourself.
 - finalize: ends the run. The named checkpoint's repository state is delivered as the result, and that worker's final message (or the response you provide) becomes the final answer.
 
-Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions, and know nothing about sibling workers or your plans - put everything they need into the instructions. When a review leaves two plausible continuations - two fix strategies, two readings, fix-forward versus a fresh start from an earlier checkpoint - spawn both concurrently instead of trying them one at a time; serial retries of guesses are the most expensive habit here.
+Reviews: you review a finished batch at a time - where each sibling forked from, your instructions, a compact trace of each step, a diffstat, and its final message verbatim. Each of your turns allows up to {supervisor_steps} steps, and you also receive an ephemeral <dag> overview of every fragment by id, including discarded ones. You may mix viewing, plan updates, and resolutions across the turn, but a successful spawn_workers or prefinalize ends it. Every reviewed sibling must be resolved before your turn ends: save_checkpoint it, spawn from it (which saves it), or discard it. Discarded trajectories are gone permanently and their handles die with them. Workers inherit the full conversation along their ancestor chain plus your new instructions by default, and know nothing about sibling workers or your plans - put everything they need into the instructions. You may set prefix_from to an ancestor checkpoint on the worker's first-parent lineage to inherit only windows from that checkpoint through `from`, inclusive; set prefix_from to "none" for a fresh worker with no inherited windows. Elided history is replaced by deterministic git diff orientation, and re-using a recently-used prefix is cheaper because providers can reuse prompt-cache prefixes. When a review leaves two plausible continuations - two fix strategies, two readings, fix-forward versus a fresh start from an earlier checkpoint - spawn both concurrently instead of trying them one at a time; serial retries of guesses are the most expensive habit here.
 
 First duty: pin the specification before anything is built. Read the task text for the behavioral contract a correct implementation must satisfy - every named symbol with its exact spelling, every enumerated set with all its members, every exact error message, every input domain, every ordering and formatting rule - and write down, numbered (A1, A2, ...), every detail that admits more than one reading and every boundary its quantifiers create ("empty", "each", "all", "zero", "trailing", "at least"). Resolve each one deliberately - spawn a fact-finding worker when repository evidence is needed - and record the settled reading. Before you spawn implementation workers, use the code-intelligence tools to map the code the task touches - a mandate that cites the exact functions, files, and call sites to change produces sharper work than a prose description. Calling conventions and argument order are always ambiguities: resolve them against an analogous implementation already in the repo, never by assumption. For each numbered ambiguity (A1, A2, ...), state your resolution and a one-line rationale in your plan before spawning implementation workers. Then have two workers in that same batch write spec tests from the settled reading independently - before implementation exists - including one test per resolution that locks in your chosen reading. Where the two suites disagree about the same behavior, you have found an ambiguity nobody flagged: resolve it explicitly before implementing. Implementation workers run the union of both suites, and your finalize evidence should show it passing.
 
@@ -146,6 +154,10 @@ pub(crate) fn supervisor_tool_definitions(allowed_models: &[String]) -> Vec<Tool
                                 "required": ["from", "instructions"],
                                 "properties": {
                                     "from": { "type": "string" },
+                                    "prefix_from": {
+                                        "type": "string",
+                                        "description": "Optional context prefix control. Omit for full first-parent lineage inheritance. Set to an ancestor checkpoint id on the from lineage to inherit only windows from that checkpoint through from; set to \"none\" for no inherited windows. Elided history is replaced by deterministic git diff orientation. Reusing a recently used prefix_from is cheaper because provider prompt caching can hit.",
+                                    },
                                     "instructions": { "type": "string", "minLength": 1 },
                                     "model": {
                                         "type": "string",
@@ -309,6 +321,10 @@ fn prefinalize_parameters(allowed_models: &[&String]) -> serde_json::Value {
                     "required": ["from", "instructions"],
                     "properties": {
                         "from": { "type": "string" },
+                        "prefix_from": {
+                            "type": "string",
+                            "description": "Optional context prefix control. Prefinalize workers default to \"none\" when omitted. Otherwise use an ancestor checkpoint id on the from lineage to inherit only windows from that checkpoint through from. Elided history is replaced by deterministic git diff orientation.",
+                        },
                         "instructions": { "type": "string", "minLength": 1 },
                         "model": {
                             "type": "string",
@@ -482,6 +498,7 @@ fn parse_spawn_worker(
         .ok_or_else(|| format!("workers[{index}].from must be a string"))?;
     let from = parse_available_checkpoint(from_raw, context)
         .map_err(|error| format!("workers[{index}].from {error}"))?;
+    let prefix_from = parse_prefix_from(index, worker, &from, context, parse_coverage)?;
     let instructions = worker
         .get("instructions")
         .and_then(serde_json::Value::as_str)
@@ -569,6 +586,7 @@ fn parse_spawn_worker(
     };
     Ok(SpawnRequest {
         from,
+        prefix_from,
         instructions,
         model,
         max_steps,
@@ -576,6 +594,57 @@ fn parse_spawn_worker(
         runs_full_suite,
         attacks,
     })
+}
+
+fn parse_prefix_from(
+    index: usize,
+    worker: &serde_json::Value,
+    from: &CheckpointId,
+    context: &SupervisorTurnContext<'_>,
+    prefinalize_default_fresh: bool,
+) -> std::result::Result<Option<PrefixFrom>, String> {
+    let Some(value) = worker.get("prefix_from") else {
+        return Ok(prefinalize_default_fresh.then_some(PrefixFrom::Fresh));
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("workers[{index}].prefix_from must be a string"))?
+        .trim();
+    if text == "none" {
+        return Ok(Some(PrefixFrom::Fresh));
+    }
+    if text.is_empty() {
+        return Err(format!(
+            "workers[{index}].prefix_from must be \"none\" or a checkpoint id"
+        ));
+    }
+    let checkpoint = parse_available_checkpoint(text, context)
+        .map_err(|error| format!("workers[{index}].prefix_from {error}"))?;
+    if !is_lineage_prefix(&checkpoint, from, context) {
+        return Err(format!(
+            "workers[{index}].prefix_from {checkpoint} is not an ancestor of {from} on its first-parent lineage"
+        ));
+    }
+    Ok(Some(PrefixFrom::Checkpoint(checkpoint)))
+}
+
+fn is_lineage_prefix(
+    prefix: &CheckpointId,
+    from: &CheckpointId,
+    context: &SupervisorTurnContext<'_>,
+) -> bool {
+    if prefix == from {
+        return true;
+    }
+    if let CheckpointId::Worker(worker) = from
+        && let Some((_, parent)) = context
+            .pending_parents
+            .iter()
+            .find(|(pending_worker, _)| pending_worker == worker)
+    {
+        return context.dag.is_first_parent_ancestor_of(prefix, parent);
+    }
+    context.dag.is_first_parent_ancestor_of(prefix, from)
 }
 
 pub(crate) fn parse_finalize(
@@ -805,6 +874,7 @@ mod tests {
                 model: "model-a".to_string(),
                 instruction_message: ChatMessage::user("saved worker instructions"),
                 window_messages: Vec::new(),
+                rendered_tokens: 0,
                 compact: String::new(),
                 final_response: "saved result".to_string(),
                 stop: WorkerStopReason::Finished,
@@ -825,6 +895,7 @@ mod tests {
         SupervisorTurnContext {
             dag,
             pending,
+            pending_parents: &[],
             allowed_models: ALLOWED,
         }
     }
@@ -836,6 +907,7 @@ mod tests {
         let context = SupervisorTurnContext {
             dag: &dag,
             pending: &[4],
+            pending_parents: &[(4, CheckpointId::Worker(1))],
             allowed_models: &allowed,
         };
         let call = supervisor_tool_call(
@@ -862,6 +934,7 @@ mod tests {
         let context = SupervisorTurnContext {
             dag: &dag,
             pending: &[],
+            pending_parents: &[],
             allowed_models: &[],
         };
 
@@ -921,11 +994,111 @@ mod tests {
     }
 
     #[test]
+    fn spawn_parser_validates_prefix_from_on_first_parent_lineage() {
+        let mut dag = saved_dag();
+        dag.insert(TrajectoryNode {
+            window: TrajectoryWindow {
+                worker: 2,
+                parent: CheckpointId::Worker(1),
+                instructions: "child".to_string(),
+                model: "model-a".to_string(),
+                instruction_message: ChatMessage::user("child worker instructions"),
+                window_messages: Vec::new(),
+                rendered_tokens: 0,
+                compact: String::new(),
+                final_response: "child result".to_string(),
+                stop: WorkerStopReason::Finished,
+                steps: 1,
+                diffstat: String::new(),
+                usage: TokenUsage::default(),
+                elapsed_millis: 0,
+            },
+            commit: "commit-2".to_string(),
+            merged_from: Vec::new(),
+        })
+        .unwrap();
+        dag.insert(TrajectoryNode {
+            window: TrajectoryWindow {
+                worker: 3,
+                parent: CheckpointId::Root,
+                instructions: "sibling".to_string(),
+                model: "model-a".to_string(),
+                instruction_message: ChatMessage::user("sibling worker instructions"),
+                window_messages: Vec::new(),
+                rendered_tokens: 0,
+                compact: String::new(),
+                final_response: "sibling result".to_string(),
+                stop: WorkerStopReason::Finished,
+                steps: 1,
+                diffstat: String::new(),
+                usage: TokenUsage::default(),
+                elapsed_millis: 0,
+            },
+            commit: "commit-3".to_string(),
+            merged_from: Vec::new(),
+        })
+        .unwrap();
+        let context = context(&dag, &[]);
+
+        let valid = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "w2", "prefix_from": "w1", "instructions": "x" }]
+            }),
+        );
+        let spawns = parse_spawn_workers(&valid, &context).expect("valid prefix");
+        assert_eq!(
+            spawns[0].prefix_from,
+            Some(PrefixFrom::Checkpoint(CheckpointId::Worker(1)))
+        );
+
+        let fresh = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "w2", "prefix_from": "none", "instructions": "x" }]
+            }),
+        );
+        let spawns = parse_spawn_workers(&fresh, &context).expect("fresh prefix");
+        assert_eq!(spawns[0].prefix_from, Some(PrefixFrom::Fresh));
+
+        let sibling = supervisor_tool_call(
+            "spawn",
+            SPAWN_WORKERS_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "w2", "prefix_from": "w3", "instructions": "x" }]
+            }),
+        );
+        assert!(
+            parse_spawn_workers(&sibling, &context)
+                .expect_err("sibling prefix")
+                .contains("is not an ancestor of w2 on its first-parent lineage")
+        );
+    }
+
+    #[test]
+    fn prefinalize_defaults_prefix_from_to_fresh() {
+        let dag = saved_dag();
+        let context = context(&dag, &[]);
+        let call = supervisor_tool_call(
+            "prefinalize",
+            PREFINALIZE_TOOL,
+            serde_json::json!({
+                "workers": [{ "from": "w1", "instructions": "verify", "runs_full_suite": true }]
+            }),
+        );
+        let parsed = parse_prefinalize(&call, &context).expect("prefinalize parses");
+        assert_eq!(parsed.workers[0].prefix_from, Some(PrefixFrom::Fresh));
+    }
+
+    #[test]
     fn prefinalize_parser_parses_coverage_fields_and_threads_full_suite_skipped() {
         let dag = saved_dag();
         let context = SupervisorTurnContext {
             dag: &dag,
             pending: &[],
+            pending_parents: &[],
             allowed_models: &[],
         };
 
@@ -987,6 +1160,7 @@ mod tests {
         let context = SupervisorTurnContext {
             dag: &dag,
             pending: &[],
+            pending_parents: &[],
             allowed_models: &[],
         };
 
@@ -1041,6 +1215,7 @@ mod tests {
         let context = SupervisorTurnContext {
             dag: &dag,
             pending: &[],
+            pending_parents: &[],
             allowed_models: &[],
         };
 
@@ -1083,6 +1258,7 @@ mod tests {
             ASGARD_FULL_SUITE_SKIPPED_MAX_LENGTH
         );
         // Prefinalize keeps the shared worker fields after the schema split.
+        assert!(worker_properties.get("prefix_from").is_some());
         assert!(worker_properties.get("max_steps").is_some());
         assert!(worker_properties.get("single_because").is_some());
 
@@ -1093,6 +1269,7 @@ mod tests {
         let spawn_parameters = &spawn_workers.function.parameters;
         let spawn_worker_properties =
             &spawn_parameters["properties"]["workers"]["items"]["properties"];
+        assert!(spawn_worker_properties.get("prefix_from").is_some());
         assert!(spawn_worker_properties.get("runs_full_suite").is_none());
         assert!(spawn_worker_properties.get("attacks").is_none());
         assert!(
@@ -1109,6 +1286,7 @@ mod tests {
         let context = SupervisorTurnContext {
             dag: &dag,
             pending: &[],
+            pending_parents: &[],
             allowed_models: &allowed,
         };
 
@@ -1243,6 +1421,7 @@ mod tests {
                 model: "model-a".to_string(),
                 instruction_message: ChatMessage::user("one"),
                 window_messages: Vec::new(),
+                rendered_tokens: 0,
                 compact: String::new(),
                 final_response: "done".to_string(),
                 stop: WorkerStopReason::Finished,
