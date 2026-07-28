@@ -57,6 +57,114 @@ pub(crate) struct CandidateRepository {
     parent_root: PathBuf,
 }
 
+/// Env gate for the delivered-patch test-file guard (Change B). Off unless
+/// explicitly switched on, so ordinary development use of Asgard delivers
+/// test files like any other file; benchmark harnesses set it.
+const ASGARD_TEST_FILE_GUARD_ENV: &str = "ASGARD_TEST_FILE_GUARD";
+
+/// The one place a path is judged to be a test file. Language-generic and
+/// deliberately conservative -- it names the conventions a test runner
+/// itself keys on, so it stays right without knowing the project.
+///
+/// Two shapes only:
+/// - `<dir>/**` matches when any directory component of the path equals
+///   `<dir>`, so a file anywhere under a `tests/` or `test/` tree counts;
+/// - everything else matches the file's basename with a single `*`
+///   wildcard.
+const TEST_FILE_PATH_PATTERNS: &[&str] = &[
+    "*_test.go",
+    "test_*.py",
+    "*_test.py",
+    "tests/**",
+    "test/**",
+    "*.test.ts",
+    "*.test.tsx",
+    "*.test.js",
+    "*.spec.ts",
+    "*.spec.tsx",
+    "*.spec.js",
+    "*_spec.rb",
+    "*Test.java",
+    "*Tests.cs",
+];
+
+/// Whether the delivered-patch test-file guard runs, given the raw
+/// `ASGARD_TEST_FILE_GUARD` value. Anything other than an explicit on
+/// ("1", "true", "on", "yes", case-insensitive) leaves it off, so a typo in
+/// a harness config fails safe toward normal delivery.
+fn test_file_guard_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+fn test_file_guard_enabled() -> bool {
+    test_file_guard_enabled_from(std::env::var(ASGARD_TEST_FILE_GUARD_ENV).ok().as_deref())
+}
+
+/// Whether `path` (repo-root-relative, `/`-separated) names a test file per
+/// [`TEST_FILE_PATH_PATTERNS`].
+fn is_test_file_path(path: &str) -> bool {
+    TEST_FILE_PATH_PATTERNS
+        .iter()
+        .any(|pattern| matches_test_file_pattern(path, pattern))
+}
+
+fn matches_test_file_pattern(path: &str, pattern: &str) -> bool {
+    if let Some(directory) = pattern.strip_suffix("/**") {
+        // Every component but the last one, which is the file's own name.
+        let mut components = path.split('/').collect::<Vec<_>>();
+        components.pop();
+        return components.contains(&directory);
+    }
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return basename == pattern;
+    };
+    basename.len() >= prefix.len() + suffix.len()
+        && basename.starts_with(prefix)
+        && basename.ends_with(suffix)
+}
+
+/// A test file the run touched, as reported by `git diff --name-status`.
+#[derive(Debug, PartialEq, Eq)]
+struct TouchedTestFile {
+    path: String,
+    /// True when the file already existed at the base commit (the worker
+    /// edited or deleted it) rather than being created by the run.
+    pre_existing: bool,
+}
+
+/// Parses `git diff --name-status -z --no-renames` output into the test
+/// files it names. Every record is a status field followed by one path,
+/// each NUL-terminated.
+fn parse_touched_test_files(stdout: &[u8]) -> Vec<TouchedTestFile> {
+    let mut fields = stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    let mut touched = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        let Ok(path) = std::str::from_utf8(path) else {
+            tracing::warn!("skipping non-UTF-8 path in Asgard test-file guard");
+            continue;
+        };
+        if !is_test_file_path(path) {
+            continue;
+        }
+        // "A" is the only status that means the run created the file; "M",
+        // "D", "T" and the rest all imply it was there at the base commit.
+        let pre_existing = status.first() != Some(&b'A');
+        touched.push(TouchedTestFile {
+            path: path.to_string(),
+            pre_existing,
+        });
+    }
+    touched
+}
+
 /// Reports non-empty, trimmed `git status --porcelain` output for `cwd`,
 /// excluding harness-owned paths (`.brokk/`, `.bifrost/`) via pathspec magic
 /// so Asgard's own bookkeeping never counts as user dirt. Untracked files
@@ -548,17 +656,89 @@ impl SnapshotStage {
         Ok(commit)
     }
 
+    /// The delivered patch: `base_commit..checkpoint_commit`, minus
+    /// harness-owned paths, and -- when [`test_file_guard_enabled`] -- minus
+    /// every test file the run touched (see [`TEST_FILE_PATH_PATTERNS`]).
     pub(crate) fn finalize_patch(
         &self,
         base_commit: &str,
         checkpoint_commit: &str,
     ) -> Result<Vec<u8>> {
-        Ok(git(
+        self.finalize_patch_guarded(base_commit, checkpoint_commit, test_file_guard_enabled())
+    }
+
+    /// [`finalize_patch`](Self::finalize_patch) with the env gate already
+    /// resolved, so tests can exercise both sides without mutating the
+    /// process environment.
+    fn finalize_patch_guarded(
+        &self,
+        base_commit: &str,
+        checkpoint_commit: &str,
+        guard_test_files: bool,
+    ) -> Result<Vec<u8>> {
+        let mut args: Vec<String> = [
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            base_commit,
+            checkpoint_commit,
+            "--",
+            ".",
+            ":(exclude).brokk/**",
+            ":(exclude).bifrost/**",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        if guard_test_files {
+            let excluded = self.touched_test_files(base_commit, checkpoint_commit)?;
+            // `literal` magic so a path that happens to contain glob
+            // metacharacters still excludes exactly itself.
+            args.extend(
+                excluded
+                    .iter()
+                    .map(|file| format!(":(exclude,literal){}", file.path)),
+            );
+            crate::trace_logging::append_trace_record(serde_json::json!({
+                "type": "asgard_test_guard",
+                "base_commit": base_commit,
+                "checkpoint_commit": checkpoint_commit,
+                "excluded_count": excluded.len(),
+                "excluded": excluded
+                    .iter()
+                    .map(|file| serde_json::json!({
+                        "path": file.path,
+                        "pre_existing": file.pre_existing,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
+            if !excluded.is_empty() {
+                tracing::info!(
+                    count = excluded.len(),
+                    "Asgard test-file guard excluded test files from the delivered patch"
+                );
+            }
+        }
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        Ok(git(&self.parent_root, &args)?.stdout)
+    }
+
+    /// Every test file changed between the two commits, whether the worker
+    /// created it or edited one that already existed at `base_commit`.
+    fn touched_test_files(
+        &self,
+        base_commit: &str,
+        checkpoint_commit: &str,
+    ) -> Result<Vec<TouchedTestFile>> {
+        // `--no-renames` keeps every record a single status plus a single
+        // path, so the NUL-separated stream parses without special cases.
+        let output = git(
             &self.parent_root,
             &[
                 "diff",
-                "--binary",
-                "--no-ext-diff",
+                "--name-status",
+                "-z",
+                "--no-renames",
                 base_commit,
                 checkpoint_commit,
                 "--",
@@ -566,8 +746,8 @@ impl SnapshotStage {
                 ":(exclude).brokk/**",
                 ":(exclude).bifrost/**",
             ],
-        )?
-        .stdout)
+        )?;
+        Ok(parse_touched_test_files(&output.stdout))
     }
 
     fn update_ref(&self, reference: &str, commit: &str) -> Result<()> {
@@ -1287,6 +1467,159 @@ mod tests {
 
         remove_candidate_repository(&worker);
         remove_candidate_repository(&fresh);
+        stage.cleanup();
+    }
+
+    #[test]
+    fn test_file_patterns_cover_the_conventions_graders_reset() {
+        for path in [
+            "pkg/service_test.go",
+            "tests/test_parser.py",
+            "src/parser_test.py",
+            "tests/fixtures/data.json",
+            "test/helpers.rb",
+            "deep/nested/tests/unit/thing.js",
+            "web/src/App.test.ts",
+            "web/src/App.test.tsx",
+            "web/src/App.test.js",
+            "web/src/App.spec.ts",
+            "web/src/App.spec.tsx",
+            "web/src/App.spec.js",
+            "spec/models/user_spec.rb",
+            "src/main/java/com/x/ParserTest.java",
+            "src/ParserTests.cs",
+        ] {
+            assert!(is_test_file_path(path), "{path} should be a test file");
+        }
+
+        for path in [
+            // Production code that merely mentions a test-ish word.
+            "src/parser.go",
+            "src/testing.go",
+            "src/latest.py",
+            "src/contest.rb",
+            // A directory named `tests` only counts as a directory
+            // component, never as the file itself or a longer name.
+            "tests",
+            "src/attests/thing.js",
+            // `*Test.java` is a suffix on the basename, not anywhere.
+            "src/main/java/com/x/TestParser.java",
+            // Rust's in-file `#[cfg(test)]` convention has no path
+            // signature, and `src/lib.rs` must never be treated as a test.
+            "src/lib.rs",
+        ] {
+            assert!(!is_test_file_path(path), "{path} should not be a test file");
+        }
+    }
+
+    #[test]
+    fn test_file_guard_is_off_unless_explicitly_switched_on() {
+        assert!(!test_file_guard_enabled_from(None), "absent means off");
+        assert!(!test_file_guard_enabled_from(Some("")));
+        assert!(!test_file_guard_enabled_from(Some("0")));
+        assert!(!test_file_guard_enabled_from(Some("no")));
+        assert!(!test_file_guard_enabled_from(Some("maybe")));
+        for on in ["1", "true", "TRUE", "on", "yes", " 1 "] {
+            assert!(test_file_guard_enabled_from(Some(on)), "{on} should enable");
+        }
+    }
+
+    #[test]
+    fn touched_test_files_parses_name_status_and_marks_pre_existing() {
+        let stdout =
+            b"M\0pkg/existing_test.go\0A\0pkg/new_test.go\0M\0pkg/service.go\0D\0tests/old.py\0";
+        assert_eq!(
+            parse_touched_test_files(stdout),
+            vec![
+                TouchedTestFile {
+                    path: "pkg/existing_test.go".to_string(),
+                    pre_existing: true,
+                },
+                TouchedTestFile {
+                    path: "pkg/new_test.go".to_string(),
+                    pre_existing: false,
+                },
+                TouchedTestFile {
+                    path: "tests/old.py".to_string(),
+                    pre_existing: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finalize_patch_guard_drops_test_files_but_keeps_production_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("service.go"), "package main\n").unwrap();
+        fs::write(repo.join("service_test.go"), "// original expectation\n").unwrap();
+        run_git(repo, &["add", "service.go", "service_test.go"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+        let base_commit = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_commit = base_commit.trim();
+
+        let worker = create_candidate_repository(repo, "guard-worker").unwrap();
+        fs::write(worker.root.join("service.go"), "package main\n// fixed\n").unwrap();
+        // The carnage case: the worker rewrites a pre-existing test AND
+        // authors a new one whose name a hidden test patch may also claim.
+        fs::write(
+            worker.root.join("service_test.go"),
+            "// rewritten expectation\n",
+        )
+        .unwrap();
+        fs::create_dir(worker.root.join("tests")).unwrap();
+        fs::write(worker.root.join("tests/extra_test.go"), "// new\n").unwrap();
+        fs::write(worker.root.join("helper.go"), "package main\n").unwrap();
+
+        let stage = SnapshotStage::new(repo, &format!("test-{}", uuid::Uuid::new_v4())).unwrap();
+        let checkpoint = stage.snapshot(&worker.root, "guard").unwrap();
+
+        let unguarded = String::from_utf8(
+            stage
+                .finalize_patch_guarded(base_commit, &checkpoint, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(unguarded.contains("service_test.go"));
+        assert!(unguarded.contains("tests/extra_test.go"));
+
+        let guarded = String::from_utf8(
+            stage
+                .finalize_patch_guarded(base_commit, &checkpoint, true)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !guarded.contains("service_test.go"),
+            "an edited pre-existing test file must not be delivered:\n{guarded}"
+        );
+        assert!(
+            !guarded.contains("tests/extra_test.go"),
+            "a worker-authored test file must not be delivered:\n{guarded}"
+        );
+        assert!(
+            guarded.contains("service.go") && guarded.contains("// fixed"),
+            "production changes must survive the guard:\n{guarded}"
+        );
+        assert!(
+            guarded.contains("helper.go"),
+            "new production files must survive the guard:\n{guarded}"
+        );
+
+        // Snapshots keep the test files regardless -- only delivery filters.
+        assert_eq!(
+            git_text(
+                repo,
+                &["show", &format!("{checkpoint}:tests/extra_test.go")]
+            )
+            .unwrap()
+            .replace("\r\n", "\n"),
+            "// new\n"
+        );
+
+        remove_candidate_repository(&worker);
         stage.cleanup();
     }
 
