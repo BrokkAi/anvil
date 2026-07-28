@@ -3010,7 +3010,7 @@ pub async fn run_agent(
                     // drivers and are ignored here (errors were already streamed
                     // to the user). `stop` is mapped to the ACP `StopReason` so a
                     // turn-limit exhaustion isn't reported as a normal `EndTurn`.
-                    let turn_result = run_model_turn_in_spawn(
+                    let turn_result = match run_model_turn_in_spawn(
                         &cx_for_loop,
                         &sessions_for_loop,
                         &session_id_for_loop,
@@ -3032,7 +3032,26 @@ pub async fn run_agent(
                         turn_recap_enabled_for_loop,
                         prompt_text_for_turn,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(turn_result) => turn_result,
+                        Err(LoopIterationError::Terminal(message)) => {
+                            sessions_for_loop.finish_prompt(&session_id_for_loop).await;
+                            if let Err(e) = responder.respond_with_error(
+                                agent_client_protocol::Error::internal_error().data(
+                                    serde_json::json!({
+                                        "reason": message,
+                                    }),
+                                ),
+                            ) {
+                                tracing::warn!(
+                                    session_id = %session_id_for_loop,
+                                    "failed to deliver prompt error: {e}"
+                                );
+                            }
+                            return Ok(());
+                        }
+                    };
                     let structured_output_result = turn_result.structured_output;
                     let cumulative_usage = turn_result.cumulative_usage;
                     let cancelled = cancel_status.is_cancelled();
@@ -4548,7 +4567,7 @@ async fn run_model_turn_in_spawn(
     cancel: tokio_util::sync::CancellationToken,
     turn_recap_enabled: bool,
     prompt_text_for_turn: String,
-) -> ModelTurnResult {
+) -> Result<ModelTurnResult, LoopIterationError> {
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
 
@@ -4659,6 +4678,17 @@ async fn run_model_turn_in_spawn(
             )
         }
     };
+    if is_asgard_startup_failure(
+        crate::asgard::config().is_some(),
+        &outcome,
+        usage_by_model.as_ref(),
+    ) {
+        let message = match &outcome.stop {
+            crate::tool_loop::LoopStop::Failed(failure) => failure.message.clone(),
+            _ => "Asgard failed before startup completed".to_string(),
+        };
+        return Err(LoopIterationError::Terminal(message));
+    }
     outcome.usage.add(initial_usage);
     if let Some(usage_by_model) = usage_by_model.as_mut() {
         usage_by_model
@@ -4765,14 +4795,27 @@ async fn run_model_turn_in_spawn(
         },
     )
     .await;
-    ModelTurnResult {
+    Ok(ModelTurnResult {
         structured_output: structured_output_result,
         cumulative_usage,
         response: response_text,
         stop,
         tool_stats,
         persisted_fragment_id,
-    }
+    })
+}
+
+fn is_asgard_startup_failure(
+    asgard_enabled: bool,
+    outcome: &crate::tool_loop::LoopOutcome,
+    usage_by_model: Option<&BTreeMap<String, crate::llm_client::TokenUsage>>,
+) -> bool {
+    asgard_enabled
+        && matches!(outcome.stop, crate::tool_loop::LoopStop::Failed(_))
+        && outcome.tool_exchanges.is_empty()
+        && outcome.replay_events.is_empty()
+        && outcome.usage.is_zero()
+        && usage_by_model.is_none_or(BTreeMap::is_empty)
 }
 
 fn append_mcp_instructions_to_system_prompt(messages: &mut [ChatMessage], instructions: &str) {
@@ -4850,7 +4893,7 @@ async fn run_prepared_model_turn(
         return Err(LoopIterationError::Terminal("unknown session".to_string()));
     };
 
-    Ok(run_model_turn_in_spawn(
+    run_model_turn_in_spawn(
         cx,
         sessions,
         session_id,
@@ -4872,7 +4915,7 @@ async fn run_prepared_model_turn(
         turn_recap_enabled,
         prompt_text.to_string(),
     )
-    .await)
+    .await
 }
 
 fn build_system_prompt(
@@ -10480,6 +10523,37 @@ mod tests {
             acp_stop_reason(&LoopStop::MaxTurns { max_turns: 200 }, true),
             StopReason::Cancelled,
         );
+    }
+
+    #[test]
+    fn asgard_startup_failure_is_prompt_level_error_candidate() {
+        use crate::tool_loop::{LoopOutcome, LoopStop, TurnFailure};
+
+        let outcome = LoopOutcome {
+            response: "\n**Error:** Asgard failed: baseline commit failed\n".to_string(),
+            tool_exchanges: Vec::new(),
+            replay_events: Vec::new(),
+            usage: crate::llm_client::TokenUsage::default(),
+            stop: LoopStop::Failed(TurnFailure {
+                retryable: false,
+                message: "Asgard failed: baseline commit failed".to_string(),
+            }),
+            continuation_messages: Vec::new(),
+            current_plan: None,
+            compaction_checkpoint: None,
+        };
+        let usage_by_model = BTreeMap::new();
+
+        assert!(is_asgard_startup_failure(
+            true,
+            &outcome,
+            Some(&usage_by_model)
+        ));
+        assert!(!is_asgard_startup_failure(
+            false,
+            &outcome,
+            Some(&usage_by_model)
+        ));
     }
 
     #[test]

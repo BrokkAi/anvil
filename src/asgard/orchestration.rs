@@ -277,6 +277,7 @@ struct FinalizeContext<'a> {
     stage: &'a SnapshotStage,
     dag: &'a TrajectoryDag,
     base_commit: &'a str,
+    apply_base_commit: &'a str,
     live_output: &'a AsgardLiveOutput,
     current_plan: Option<&'a UpdatePlanArgs>,
     evidence: &'a [String],
@@ -509,16 +510,6 @@ pub(crate) async fn run_asgard_trajectory_loop(
     initial_plan: Option<crate::plan::UpdatePlanArgs>,
 ) -> (LoopOutcome, BTreeMap<String, TokenUsage>) {
     let mut usage_by_model = BTreeMap::new();
-    match crate::asgard::working_tree_dirt(parent_registry.cwd()) {
-        Ok(dirt) if !dirt.is_empty() => {
-            return (
-                asgard_failure(anyhow!("{}", clean_tree_refusal_message(&dirt))),
-                usage_by_model,
-            );
-        }
-        Ok(_) => {}
-        Err(error) => return (asgard_failure(error), usage_by_model),
-    }
     if !(ASGARD_MIN_CANDIDATES..=ASGARD_MAX_CANDIDATES).contains(&config.candidate_models.len()) {
         return (
             asgard_failure(anyhow!(
@@ -532,6 +523,17 @@ pub(crate) async fn run_asgard_trajectory_loop(
 
     let base_commit = match crate::asgard::parent_head_commit(parent_registry.cwd()) {
         Ok(commit) => commit,
+        Err(error) => return (asgard_failure(error), usage_by_model),
+    };
+    let root_checkpoint_commit = match crate::asgard::working_tree_dirt(parent_registry.cwd()) {
+        Ok(dirt) if !dirt.is_empty() => {
+            match crate::asgard::baseline_dirty_working_tree(parent_registry.cwd(), &dirt) {
+                Ok(Some(commit)) => commit,
+                Ok(None) => base_commit.clone(),
+                Err(error) => return (asgard_failure(error), usage_by_model),
+            }
+        }
+        Ok(_) => base_commit.clone(),
         Err(error) => return (asgard_failure(error), usage_by_model),
     };
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -558,7 +560,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     );
     let mut dag = TrajectoryDag::new_with_git_root(
         initial_messages.clone(),
-        base_commit.clone(),
+        root_checkpoint_commit.clone(),
         parent_registry.cwd().to_path_buf(),
     );
     let initial_permanent_user = initial_permanent_user_message(&original_task);
@@ -888,6 +890,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
                 stage: &stage,
                 dag: &dag,
                 base_commit: &base_commit,
+                apply_base_commit: &root_checkpoint_commit,
                 live_output: &live_output,
                 current_plan: canonical_plan.as_ref(),
                 evidence: &evidence,
@@ -2311,7 +2314,7 @@ fn finalize_asgard(
         trace_finalize_error(&checkpoint, None, &error);
         return asgard_failure(error);
     };
-    let patch = match context
+    let delivery_patch = match context
         .stage
         .finalize_patch(context.base_commit, checkpoint_commit)
     {
@@ -2321,7 +2324,21 @@ fn finalize_asgard(
             return asgard_failure(error);
         }
     };
-    if let Err(error) = crate::asgard::apply_selected_patch(context.parent_cwd, &patch) {
+    let apply_patch = if context.apply_base_commit == context.base_commit {
+        delivery_patch
+    } else {
+        match context
+            .stage
+            .finalize_patch(context.apply_base_commit, checkpoint_commit)
+        {
+            Ok(patch) => patch,
+            Err(error) => {
+                trace_finalize_error(&checkpoint, Some(checkpoint_commit), &error);
+                return asgard_failure(error);
+            }
+        }
+    };
+    if let Err(error) = crate::asgard::apply_selected_patch(context.parent_cwd, &apply_patch) {
         trace_finalize_error(&checkpoint, Some(checkpoint_commit), &error);
         return asgard_failure(error);
     }
@@ -2770,34 +2787,6 @@ pub(crate) fn cleanup_asgard_repositories(repositories: &[CandidateRepository]) 
     for repository in repositories {
         crate::asgard::remove_candidate_repository(repository);
     }
-}
-
-/// Cap on how many `git status --porcelain` lines are echoed back in the
-/// clean-tree refusal message, so a wildly dirty tree doesn't dump its whole
-/// status into a chat turn.
-const CLEAN_TREE_DIRT_PREVIEW_LINES: usize = 10;
-
-/// Builds the refusal message for [`run_asgard_trajectory_loop`]'s clean-tree
-/// precondition. `dirt` is the non-empty, trimmed output of
-/// `working_tree_dirt`.
-fn clean_tree_refusal_message(dirt: &str) -> String {
-    let lines: Vec<&str> = dirt.lines().collect();
-    let mut preview = lines
-        .iter()
-        .take(CLEAN_TREE_DIRT_PREVIEW_LINES)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if lines.len() > CLEAN_TREE_DIRT_PREVIEW_LINES {
-        preview.push_str(&format!(
-            "\n(+{} more)",
-            lines.len() - CLEAN_TREE_DIRT_PREVIEW_LINES
-        ));
-    }
-    format!(
-        "Asgard requires a clean working tree; commit or stash your local changes first. \
-         Dirty entries:\n{preview}"
-    )
 }
 
 pub(crate) fn asgard_failure(error: anyhow::Error) -> LoopOutcome {
@@ -3466,7 +3455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dirty_parent_tree_refuses_before_any_llm_or_worker_activity() {
+    async fn dirty_parent_tree_is_absorbed_into_the_asgard_baseline() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
@@ -3476,47 +3465,88 @@ mod tests {
         fs::write(repo.join("README.md"), "hello\n").expect("write README");
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let original_base = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
 
-        // Uncommitted tracked-file edit: the tree is dirty from Asgard's
-        // point of view at the very start of the loop.
+        // Deliberate environment setup: tracked and untracked changes are
+        // present before Asgard starts.
         fs::write(repo.join("README.md"), "hello\nlocal edit\n").expect("dirty README");
+        fs::write(repo.join("env.txt"), "provisioned\n").expect("dirty untracked");
 
-        // No scripted responses registered for either model: if the loop
-        // reaches the supervisor at all, the backend panics on an
-        // empty response queue, failing the test loudly rather than
-        // silently passing.
-        let backend = Arc::new(ScriptedAsgardBackend::new(vec![]));
+        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
+            (
+                "sv-model",
+                vec![
+                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "write solution")]),
+                    text_response("w1 launched"),
+                    tool_response(vec![
+                        save_call("sv-save-w1"),
+                        prefinalize_call("sv-prefinalize-w2", "w1", "verify w1"),
+                    ]),
+                    text_response("w2 launched"),
+                    tool_response(vec![
+                        discard_call("sv-discard-w2"),
+                        finalize_call_with_evidence("sv-finalize-w1", "w1", &["w1m2"]),
+                    ]),
+                ],
+            ),
+            (
+                "worker-model",
+                vec![
+                    tool_response(vec![write_file_call(
+                        "w1-write",
+                        "README.md",
+                        "hello\nlocal edit\nworker edit\n",
+                    )]),
+                    text_response("w1 report"),
+                    text_response("w2 verification report"),
+                ],
+            ),
+        ]));
         let (outcome, usage_by_model) = run_scripted_asgard(
-            repo,
+            repo.clone(),
             backend.clone(),
-            vec![ChatMessage::user("should never reach the model")],
+            vec![ChatMessage::user("preserve dirty environment setup")],
         )
         .await;
 
-        match &outcome.stop {
-            LoopStop::Failed(failure) => {
-                assert!(
-                    failure
-                        .message
-                        .contains("Asgard requires a clean working tree"),
-                    "unexpected failure message: {}",
-                    failure.message
-                );
-                assert!(
-                    failure.message.contains("README.md"),
-                    "failure message should name the dirty file: {}",
-                    failure.message
-                );
-            }
-            other => panic!("expected a clean-tree refusal, got {other:?}"),
-        }
+        assert!(matches!(outcome.stop, LoopStop::Completed { .. }));
+        assert!(!usage_by_model.is_empty());
         assert!(
-            usage_by_model.is_empty(),
-            "no model usage should be recorded"
+            !backend.requests.lock().expect("requests").is_empty(),
+            "the dirty tree must not prevent LLM work"
+        );
+        assert_eq!(
+            crate::asgard::working_tree_dirt(&repo).expect("asgard dirt"),
+            "M README.md",
+            "baseline edits are committed and the selected worker patch is applied"
+        );
+        let delivered = run_git(&repo, &["diff", &original_base]);
+        assert!(
+            delivered.contains("local edit"),
+            "delivered diff against original base must include tracked env edit:\n{delivered}"
         );
         assert!(
-            backend.requests.lock().expect("requests").is_empty(),
-            "no LLM requests should have been made"
+            delivered.contains("env.txt"),
+            "delivered diff against original base must include untracked env file:\n{delivered}"
+        );
+        assert!(
+            delivered.contains("worker edit"),
+            "delivered diff against original base must include worker change:\n{delivered}"
+        );
+
+        let trace_records = fs::read_to_string(&trace_path).expect("trace");
+        let baseline = trace_records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["type"] == "asgard_baseline_commit")
+            .expect("baseline trace record");
+        assert_eq!(
+            baseline["files"],
+            serde_json::json!(["README.md", "env.txt"])
         );
     }
 

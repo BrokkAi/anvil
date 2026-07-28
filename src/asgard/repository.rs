@@ -187,6 +187,65 @@ pub(crate) fn working_tree_dirt(cwd: &Path) -> Result<String> {
     .to_string())
 }
 
+pub(crate) fn baseline_dirty_working_tree(cwd: &Path, dirt: &str) -> Result<Option<String>> {
+    if dirt.trim().is_empty() {
+        return Ok(None);
+    }
+    add_all_for_checkpoint(cwd).context("stage dirty working tree for Asgard baseline commit")?;
+    git(
+        cwd,
+        &[
+            "-c",
+            "user.name=asgard",
+            "-c",
+            "user.email=asgard@anvil.invalid",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--no-verify",
+            "-m",
+            "asgard baseline dirty working tree",
+        ],
+    )
+    .context("commit dirty working tree for Asgard baseline")?;
+    let commit = parent_head_commit(cwd)?;
+    let files = dirty_status_files(dirt);
+    crate::trace_logging::append_trace_record(serde_json::json!({
+        "type": "asgard_baseline_commit",
+        "commit": commit,
+        "files": files,
+    }));
+    tracing::info!(
+        commit,
+        files = files.len(),
+        "Asgard absorbed dirty working tree into baseline commit"
+    );
+    Ok(Some(commit))
+}
+
+fn dirty_status_files(dirt: &str) -> Vec<String> {
+    dirt.lines()
+        .filter_map(|line| {
+            let path = if line.as_bytes().get(2) == Some(&b' ') {
+                line.get(3..)?
+            } else if line.as_bytes().get(1) == Some(&b' ') {
+                line.get(2..)?
+            } else {
+                line
+            }
+            .trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(
+                path.rsplit_once(" -> ")
+                    .map_or(path, |(_, renamed_to)| renamed_to)
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn parent_head_commit(cwd: &Path) -> Result<String> {
     Ok(git_text(cwd, &["rev-parse", "HEAD"])?.trim().to_string())
 }
@@ -1252,6 +1311,50 @@ mod tests {
                 .unwrap()
                 .trim(),
             "changed"
+        );
+    }
+
+    #[test]
+    fn baseline_dirty_working_tree_commits_tracked_and_untracked_without_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        run_git(repo, &["init"]);
+        configure_test_user(repo);
+        fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "tracked.txt"]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        let hooks = repo.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        for hook in ["commit-msg", "pre-commit"] {
+            let path = hooks.join(hook);
+            fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        fs::write(repo.join("tracked.txt"), "env edit\n").unwrap();
+        fs::write(repo.join("untracked.txt"), "env file\n").unwrap();
+        let dirt = working_tree_dirt(repo).unwrap();
+        let commit = baseline_dirty_working_tree(repo, &dirt)
+            .unwrap()
+            .expect("baseline commit");
+
+        assert_eq!(working_tree_dirt(repo).unwrap(), "");
+        assert_eq!(
+            git_text(repo, &["show", &format!("{commit}:tracked.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "env edit\n"
+        );
+        assert_eq!(
+            git_text(repo, &["show", &format!("{commit}:untracked.txt")])
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "env file\n"
         );
     }
 
