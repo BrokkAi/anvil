@@ -25,6 +25,14 @@ use crate::asgard::{
 };
 use crate::mcp::{McpClient, McpServerConfig};
 
+/// Why a supervisor failure with nothing saved aborts instead of falling
+/// back to "finalize the latest checkpoint": with an empty DAG the latest
+/// checkpoint IS the base commit, so the fallback would deliver an empty
+/// patch and report a clean completion over an orchestration that never
+/// produced anything.
+const EMPTY_DAG_ABORT_REASON: &str = "Asgard supervisor failed before any worker checkpoint \
+     existed; aborting rather than delivering the unchanged base commit as a result";
+
 /// Cap on a single Bifrost code-intelligence result returned to the supervisor
 /// in a turn (truncated with a marker naming the original size). The permanent
 /// record applies its own, smaller `RETAINED_PAYLOAD_CAP` on top of this.
@@ -782,17 +790,12 @@ pub(crate) async fn run_asgard_trajectory_loop(
                     }));
                     break AsgardExit::Failure(error);
                 }
-                let mode = if !pending_batch.is_empty() {
-                    "auto_save"
-                } else {
-                    "finalize_latest"
-                };
-                crate::trace_logging::append_trace_record(serde_json::json!({
-                    "type": "asgard_supervisor_fallback",
-                    "mode": mode,
-                    "error": format!("{error:#}"),
-                }));
                 if !pending_batch.is_empty() {
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_supervisor_fallback",
+                        "mode": "auto_save",
+                        "error": format!("{error:#}"),
+                    }));
                     let finished_workers = std::mem::take(&mut pending_batch);
                     let mut saved_any = false;
                     for (worker, finished) in finished_workers {
@@ -830,19 +833,32 @@ pub(crate) async fn run_asgard_trajectory_loop(
                         continue;
                     }
                 }
-                fallback_idle_cycles += 1;
-                if let Some(checkpoint) = latest_saved_checkpoint(&dag) {
-                    break AsgardExit::Finalize {
-                        checkpoint,
-                        response: None,
-                        evidence: Vec::new(),
-                        abandoned: Vec::new(),
-                    };
-                }
-                if fallback_idle_cycles >= 3 {
-                    break AsgardExit::Failure(error);
-                }
-                break AsgardExit::Failure(error);
+                let Some(checkpoint) = latest_saved_checkpoint(&dag) else {
+                    // Nothing but "root" exists, which is the base commit
+                    // the run started from. Finalizing it emits a
+                    // well-formed zero-byte patch and reports an ordinary
+                    // completion over a dead orchestration -- observed on
+                    // two sweep attempts that died inside 5% of their time
+                    // budget and still graded as ordinary results.
+                    crate::trace_logging::append_trace_record(serde_json::json!({
+                        "type": "asgard_supervisor_fallback",
+                        "mode": "abort_empty_dag",
+                        "error": format!("{error:#}"),
+                    }));
+                    break AsgardExit::Failure(error.context(EMPTY_DAG_ABORT_REASON));
+                };
+                crate::trace_logging::append_trace_record(serde_json::json!({
+                    "type": "asgard_supervisor_fallback",
+                    "mode": "finalize_latest",
+                    "checkpoint": checkpoint.to_string(),
+                    "error": format!("{error:#}"),
+                }));
+                break AsgardExit::Finalize {
+                    checkpoint,
+                    response: None,
+                    evidence: Vec::new(),
+                    abandoned: Vec::new(),
+                };
             }
         }
     };
@@ -4243,6 +4259,89 @@ mod tests {
             outcome.stop
         );
         assert_eq!(outcome.response, "w1 report");
+    }
+
+    /// The supervisor dying on turn 1 leaves a DAG with nothing in it but
+    /// the base commit. Finalizing "the latest checkpoint" there delivers a
+    /// well-formed zero-byte patch and reports an ordinary completion --
+    /// a dead orchestration dressed as a clean run, which is how two sweep
+    /// attempts burned out under 5% of their time budget and still graded.
+    #[tokio::test]
+    async fn supervisor_failure_with_an_empty_dag_aborts_instead_of_finalizing_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("create repo dir");
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Asgard Test"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
+        let base_commit = run_git(&repo, &["rev-parse", "HEAD"]);
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
+        // Not a quota wall -- an ordinary retryable error whose retries ran
+        // out, which is what a Bedrock 500 storm looks like from here.
+        let backend = Arc::new(
+            ScriptedAsgardBackend::new(vec![("sv-model", vec![])])
+                .failing_after_script("sv-model", || {
+                    anyhow!("Bedrock request failed (HTTP 500) after 12 attempts")
+                }),
+        );
+
+        let (outcome, _) = run_scripted_asgard(
+            repo.clone(),
+            backend,
+            vec![ChatMessage::user("exercise the empty-dag abort")],
+        )
+        .await;
+
+        let LoopStop::Failed(failure) = &outcome.stop else {
+            panic!(
+                "a supervisor that died before any checkpoint existed must fail the run, not \
+                 deliver an empty patch; got {:?} with response {:?}",
+                outcome.stop, outcome.response
+            );
+        };
+        assert!(
+            failure
+                .message
+                .contains("Bedrock request failed (HTTP 500)"),
+            "the failure must name the underlying supervisor error: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains(EMPTY_DAG_ABORT_REASON),
+            "the failure must say why it aborted rather than finalizing: {}",
+            failure.message
+        );
+        assert_eq!(
+            run_git(&repo, &["rev-parse", "HEAD"]),
+            base_commit,
+            "nothing may be delivered to the parent checkout"
+        );
+        assert_eq!(
+            crate::asgard::working_tree_dirt(&repo).expect("worktree status"),
+            "",
+            "an aborted run must leave the parent checkout untouched"
+        );
+
+        // Only the positive record is asserted: `ANVIL_TRACE_JSONL` is a
+        // process-wide env var, so a concurrently running test's records can
+        // land in this same file. That nothing was delivered is settled by
+        // the unchanged parent checkout above.
+        let trace_records = fs::read_to_string(&trace_path).expect("trace");
+        assert!(
+            trace_records
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .any(|record| record["type"] == "asgard_supervisor_fallback"
+                    && record["mode"] == "abort_empty_dag"),
+            "the abort must be auditable in the trace: {trace_records}"
+        );
     }
 
     #[tokio::test]
