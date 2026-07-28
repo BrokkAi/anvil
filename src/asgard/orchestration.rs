@@ -382,6 +382,7 @@ async fn launch_worker<'a>(
     let cx = launch.cx;
     let llm = launch.llm;
     let parent = spawn.from.clone();
+    let prefix_from = prefix_from_trace_value(spawn.prefix_from.as_ref());
 
     let future = async move {
         send_thought(
@@ -451,6 +452,8 @@ async fn launch_worker<'a>(
             "parent": parent.to_string(),
             "model": model,
             "steps": steps,
+            "rendered_tokens": rendered_tokens,
+            "prefix_from": prefix_from,
             "stop": stop.label(),
             "elapsed_millis": elapsed_millis,
             "usage": usage_json(outcome.usage),
@@ -1590,6 +1593,7 @@ enum SpawnKind {
 struct LaunchedSpawn {
     worker: usize,
     prefix_context_tokens: u64,
+    prefix_from: String,
 }
 
 async fn execute_spawn_requests<'ctx, 'fut>(
@@ -1689,6 +1693,18 @@ async fn execute_spawn_requests<'ctx, 'fut>(
             checkpoint_sha_suffix(cx.dag, &from),
             format_token_count(launched.prefix_context_tokens)
         ));
+        crate::trace_logging::append_trace_record(serde_json::json!({
+            "type": "asgard_spawn_launch",
+            "turn": cx.supervisor_turn,
+            "kind": match kind {
+                SpawnKind::Regular => "regular",
+                SpawnKind::Prefinalize => "prefinalize",
+            },
+            "worker": worker,
+            "from": from.to_string(),
+            "prefix_from": launched.prefix_from,
+            "prefix_context_tokens": launched.prefix_context_tokens,
+        }));
     }
     lines.extend(render_spawn_duplicate_notes(
         &duplicate_notes,
@@ -1847,6 +1863,7 @@ async fn launch_spawn<'a>(
     let prefix_context_tokens = cx
         .dag
         .prefix_context_tokens(&spawn.from, spawn.prefix_from.as_ref())?;
+    let prefix_from = prefix_from_trace_value(spawn.prefix_from.as_ref());
     let orientation = orientation_block(
         cx.dag,
         cx.launch.parent_cwd,
@@ -1890,7 +1907,16 @@ async fn launch_spawn<'a>(
     Ok(LaunchedSpawn {
         worker: worker_id,
         prefix_context_tokens,
+        prefix_from,
     })
+}
+
+fn prefix_from_trace_value(prefix_from: Option<&PrefixFrom>) -> String {
+    match prefix_from {
+        None => "full".to_string(),
+        Some(PrefixFrom::Fresh) => "none".to_string(),
+        Some(PrefixFrom::Checkpoint(checkpoint)) => checkpoint.to_string(),
+    }
 }
 
 fn prefix_recency_checkpoint(spawn: &SpawnRequest) -> Option<CheckpointId> {
@@ -5137,6 +5163,11 @@ mod tests {
     #[tokio::test]
     async fn asgard_v2_scripted_e2e_runs_real_loop_and_checkpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let trace_path = temp.path().join("trace.jsonl");
+        let _env_guard = crate::openrouter_auth::test_support::ENV_GUARD.lock().await;
+        let _trace_env =
+            crate::openrouter_auth::test_support::EnvScope::set("ANVIL_TRACE_JSONL", &trace_path);
+
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).expect("create repo dir");
         run_git(&repo, &["init", "--quiet"]);
@@ -5164,10 +5195,13 @@ mod tests {
                     text_response("w2 launched from w1"),
                     tool_response(vec![
                         save_call("sv-save-w2"),
-                        spawn_call(
+                        spawn_workers_call(
                             "sv-spawn-w3",
-                            "w2",
-                            "Check whether README.md exists and report",
+                            serde_json::json!([{
+                                "from": "w2",
+                                "prefix_from": "w2",
+                                "instructions": "Check whether README.md exists and report",
+                            }]),
                         ),
                     ]),
                     text_response("w2 saved and w3 launched"),
@@ -5405,6 +5439,44 @@ mod tests {
         // The evidence gate is retired: a finalize naming no evidence is
         // accepted on the first call, with no bounce anywhere in the run.
         assert!(!supervisor_text.contains("error: before finalizing"));
+
+        let trace = fs::read_to_string(&trace_path).expect("trace jsonl");
+        let trace_records = trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .collect::<Vec<_>>();
+        let w2_window = trace_records
+            .iter()
+            .find(|record| {
+                record["type"] == "asgard_worker_window"
+                    && record["worker"] == serde_json::json!(2)
+                    && record["parent"] == "w1"
+                    && record["prefix_from"] == "full"
+            })
+            .expect("w2 worker-window trace");
+        let w3_launch = trace_records
+            .iter()
+            .find(|record| {
+                record["type"] == "asgard_spawn_launch"
+                    && record["worker"] == serde_json::json!(3)
+                    && record["from"] == "w2"
+                    && record["prefix_from"] == "w2"
+            })
+            .expect("w3 spawn-launch trace");
+        let w3_window = trace_records
+            .iter()
+            .find(|record| {
+                record["type"] == "asgard_worker_window"
+                    && record["worker"] == serde_json::json!(3)
+                    && record["parent"] == "w2"
+                    && record["prefix_from"] == "w2"
+            })
+            .expect("w3 worker-window trace");
+        assert!(w3_window["rendered_tokens"].as_u64().is_some());
+        assert_eq!(
+            w3_launch["prefix_context_tokens"],
+            w2_window["rendered_tokens"]
+        );
     }
 
     #[tokio::test]
