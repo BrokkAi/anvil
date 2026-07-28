@@ -50,6 +50,7 @@ const MAX_CONTENT_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONTENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTED_PERMISSION_NOTICE_BYTES: usize = 1024;
 const DEFAULT_SESSION_NAME: &str = "New Session";
+const BROKK_ACP_PERMISSION_MODE_ENV: &str = "BROKK_ACP_PERMISSION_MODE";
 
 // ---------------------------------------------------------------------------
 // Store limits
@@ -467,6 +468,42 @@ impl PermissionMode {
             "readOnly" => Some(Self::ReadOnly),
             "bypassPermissions" => Some(Self::BypassPermissions),
             _ => None,
+        }
+    }
+}
+
+fn initial_permission_mode() -> PermissionMode {
+    let default = PermissionMode::default();
+    match std::env::var(BROKK_ACP_PERMISSION_MODE_ENV) {
+        Ok(value) => match PermissionMode::parse(&value) {
+            Some(mode) => {
+                tracing::info!(
+                    permission_mode = mode.as_str(),
+                    source = "env",
+                    env_var = BROKK_ACP_PERMISSION_MODE_ENV,
+                    "applying ACP permission mode default"
+                );
+                mode
+            }
+            None => {
+                tracing::warn!(
+                    value,
+                    default_permission_mode = default.as_str(),
+                    env_var = BROKK_ACP_PERMISSION_MODE_ENV,
+                    "ignoring invalid ACP permission mode default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            tracing::warn!(
+                value = %value.to_string_lossy(),
+                default_permission_mode = default.as_str(),
+                env_var = BROKK_ACP_PERMISSION_MODE_ENV,
+                "ignoring non-unicode ACP permission mode default"
+            );
+            default
         }
     }
 }
@@ -930,7 +967,7 @@ impl Session {
     ) -> Self {
         let now = current_timestamp_millis();
         let mode = SessionMode::Lutz;
-        let permission_mode = PermissionMode::default();
+        let permission_mode = initial_permission_mode();
         let manifest = SessionManifest {
             id: id.clone(),
             name,
@@ -1040,7 +1077,7 @@ impl Session {
             model,
             history,
             manifest,
-            permission_mode: PermissionMode::default(),
+            permission_mode: initial_permission_mode(),
             sandbox_mode,
             sandbox_mode_explicitly_set: sandbox_mode.is_some(),
             always_allow_tools: HashSet::new(),
@@ -3571,7 +3608,6 @@ impl SessionStore {
             select_session_reasoning_effort(&model, default_reasoning_effort, &catalog);
         let prefs = self.setup_state_snapshot();
         let session_mode = SessionMode::Lutz;
-        let permission_mode = PermissionMode::default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let mut session = match sandbox_mode {
@@ -3597,7 +3633,6 @@ impl SessionStore {
         session.mcp_servers = mcp_servers.clone();
         session.manifest.brokk_mcp_servers = mcp_servers;
         session.selected_reasoning_effort = reasoning_effort;
-        session.permission_mode = permission_mode;
         session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
 
@@ -3708,7 +3743,6 @@ impl SessionStore {
         let model = self.default_model.read().await.clone();
 
         let prefs = self.setup_state_snapshot();
-        let permission_mode = PermissionMode::default();
         let sandbox_mode = usable_sandbox_mode_preference(prefs.last_sandbox_mode);
         let turn_recap_enabled = prefs.turn_recap_enabled.unwrap_or(true);
         let manifest_additional_directories =
@@ -3742,7 +3776,6 @@ impl SessionStore {
                 return false;
             }
         };
-        session.permission_mode = permission_mode;
         session.turn_recap_enabled = turn_recap_enabled;
         session.set_always_allow_keys(load_repo_always_allow_keys(&session.permission_scope_root));
         let inserted = {
@@ -5218,6 +5251,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openrouter_auth::test_support::{ENV_GUARD, EnvScope};
     use crate::setup_state::TestConfigHomeScope;
 
     fn write_legacy_session_config_setup(config_dir: &Path) {
@@ -5803,6 +5837,45 @@ mod tests {
         assert_eq!(PermissionMode::parse(""), None);
         assert_eq!(PermissionMode::parse("ACCEPTEDITS"), None);
         assert_eq!(PermissionMode::parse("accept-edits"), None);
+    }
+
+    #[test]
+    fn initial_permission_mode_uses_env_bypass_permissions() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let _env = EnvScope::set(BROKK_ACP_PERMISSION_MODE_ENV, "bypassPermissions");
+        let session = Session::new(
+            "env-bypass".to_string(),
+            std::env::temp_dir(),
+            "test-model".to_string(),
+            "test".to_string(),
+        );
+        assert_eq!(session.permission_mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn initial_permission_mode_preserves_default_when_env_unset() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let _env = EnvScope::remove(BROKK_ACP_PERMISSION_MODE_ENV);
+        let session = Session::new(
+            "env-unset".to_string(),
+            std::env::temp_dir(),
+            "test-model".to_string(),
+            "test".to_string(),
+        );
+        assert_eq!(session.permission_mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn initial_permission_mode_ignores_invalid_env_value() {
+        let _lock = ENV_GUARD.blocking_lock();
+        let _env = EnvScope::set(BROKK_ACP_PERMISSION_MODE_ENV, "bypass-permissions");
+        let session = Session::new(
+            "env-invalid".to_string(),
+            std::env::temp_dir(),
+            "test-model".to_string(),
+            "test".to_string(),
+        );
+        assert_eq!(session.permission_mode, PermissionMode::Auto);
     }
 
     /// `create_session` writes a manifest.json that round-trips through
