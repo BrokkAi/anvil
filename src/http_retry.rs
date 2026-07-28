@@ -161,7 +161,7 @@ pub(crate) fn retryable_llm_error_for_body(
     if contains_standard_transient_marker(body) {
         return retryable_llm_error(
             message,
-            RetryableLlmError::fast("standard transient response body"),
+            RetryableLlmError::gateway_transient("standard transient response body"),
         );
     }
     anyhow::anyhow!(message)
@@ -179,6 +179,15 @@ pub(crate) fn retryable_llm_error_for_body(
 /// The one thing that outranks the status is a per-day quota id in the body:
 /// a 429 that says `input-tpd:...` is a wall, not a throttle, and no amount
 /// of backoff gets past it. See [`FatalLlmQuotaError`].
+///
+/// A 5xx gets the same patient tier as a 429. `Fast` spends its four
+/// attempts inside about 1.4 seconds, which is less patience than a routine
+/// provider blip needs: a roughly two-second Bedrock 500 storm killed a
+/// supervisor's first turn four minutes into a 90-minute run, and the run
+/// delivered a zero-byte patch. `GatewayTransient`'s ~3.5-minute envelope
+/// is the right patience for unattended long-running work, and it is still
+/// bounded, so a permanent rejection wearing a 500 fails in minutes rather
+/// than hanging.
 pub(crate) fn retryable_llm_error_for_status_and_body(
     message: impl Into<String>,
     status: reqwest::StatusCode,
@@ -189,7 +198,10 @@ pub(crate) fn retryable_llm_error_for_status_and_body(
         return error;
     }
     if status.is_server_error() {
-        return retryable_llm_error(message, RetryableLlmError::fast("server error status"));
+        return retryable_llm_error(
+            message,
+            RetryableLlmError::gateway_transient("server error status"),
+        );
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return retryable_llm_error(
@@ -228,6 +240,9 @@ pub(crate) fn contains_gateway_transient_marker(message: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+/// Body markers that mean the same thing a 5xx or a 429 status means, and
+/// so earn the same patient retry tier: every one of them names an overload
+/// or a throttle on the provider's side, never a defect in the request.
 pub(crate) fn contains_standard_transient_marker(message: &str) -> bool {
     [
         "server_error",
@@ -570,7 +585,49 @@ mod tests {
         );
         assert_eq!(
             crate::llm_client::llm_retry_tier(&error),
-            Some(LlmRetryTier::Fast)
+            Some(LlmRetryTier::GatewayTransient)
+        );
+    }
+
+    /// A 5xx must outlast a provider blip that is longer than the fast
+    /// tier's whole 1.4-second budget: the same two-second Bedrock storm
+    /// that used to kill a 90-minute run on its first supervisor turn.
+    #[test]
+    fn server_errors_get_the_patient_tier_from_status_or_body() {
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let error = retryable_llm_error_for_status_and_body("upstream failed", status, "{}");
+            assert_eq!(
+                crate::llm_client::llm_retry_tier(&error),
+                Some(LlmRetryTier::GatewayTransient),
+                "{status} should get the patient tier"
+            );
+        }
+
+        // The body-marker path says the same thing about the same
+        // conditions, so it earns the same patience.
+        for body in [
+            r#"{"error":{"type":"server_error"}}"#,
+            r#"{"error":{"type":"server_is_overloaded"}}"#,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}"#,
+        ] {
+            let error = retryable_llm_error_for_body("chat completion failed", body);
+            assert_eq!(
+                crate::llm_client::llm_retry_tier(&error),
+                Some(LlmRetryTier::GatewayTransient),
+                "{body} should get the patient tier"
+            );
+        }
+
+        // The patient tier is still bounded: a permanent rejection wearing
+        // a 500 fails in minutes rather than retrying forever.
+        assert_eq!(
+            LlmRetryTier::GatewayTransient.max_attempts(),
+            LLM_GATEWAY_TRANSIENT_MAX_ATTEMPTS
         );
     }
 
