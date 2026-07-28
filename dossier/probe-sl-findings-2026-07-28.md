@@ -118,6 +118,17 @@ Watch items, not yet mechanized: worker-contradicts-instruction as a bounce
 condition (arcane); sol late-turn reasoning collapse (consider effort floor on
 finalize turns); barrier straggler idle (80 worker-min in go-git).
 
+## Open item: the anvil-hard task cluster (deconfounder correction)
+
+The 3h-cap rerun of the 11 vanilla-sweep timeout tasks (classifier-fixed
+binary) finished 6/21 valid = 29% against those tasks' ~70% published rate —
+they are anvil-hard, not merely slow. Corrected full-set deconfounder:
+~103/168 = 61% vs 72.2% published, an ~11-point scaffold gap concentrated in
+this cluster (one task still timed out at 3h). Does not change the structure
+verdict (probe tasks are scaffold-insensitive 4/4s), but the cluster deserves
+its own audit; leading suspect is anvil's step granularity (~151 small steps
+vs mini-swe's ~64) interacting with these tasks' shapes.
+
 ## Verdict
 
 The architecture question from the deconfounder dossier is answered: with the
