@@ -13,16 +13,15 @@ use anyhow::{Result, anyhow};
 use futures::future::{BoxFuture, FutureExt, join_all};
 
 use crate::asgard::{
-    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, AsgardIntakeRun,
-    CandidateRepository, CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL,
-    PREFINALIZE_TOOL, SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest,
-    SupervisorStreamCall, SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow,
-    UPDATE_PLAN_TOOL, VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions, git_refusal,
-    parse_finalize, parse_git_args, parse_prefinalize, parse_spawn_workers, parse_update_plan,
+    ASGARD_BATCH_CAP, ASGARD_SUPERVISOR_MAX_STEPS, ASGARD_WORKER_MAX_STEPS, CandidateRepository,
+    CheckpointId, DISCARD_TOOL, DagLiveEntry, FINALIZE_TOOL, GIT_TOOL, PREFINALIZE_TOOL,
+    SAVE_CHECKPOINT_TOOL, SPAWN_WORKERS_TOOL, SnapshotStage, SpawnRequest, SupervisorStreamCall,
+    SupervisorTurnContext, TrajectoryDag, TrajectoryNode, TrajectoryWindow, UPDATE_PLAN_TOOL,
+    VIEW_TOOL_CALL_TOOL, WorkerStopReason, bifrost_tool_definitions, git_refusal, parse_finalize,
+    parse_git_args, parse_prefinalize, parse_spawn_workers, parse_update_plan,
     parse_view_tool_call, render_dag_overview, render_fragment, render_resolved_views,
-    render_window_compact_for_worker, retain_payloads_for_permanent_record, run_asgard_intake,
-    run_supervisor_git, short_sha, stream_supervisor_response, supervisor_supplement,
-    supervisor_tool_definitions,
+    render_window_compact_for_worker, retain_payloads_for_permanent_record, run_supervisor_git,
+    short_sha, stream_supervisor_response, supervisor_supplement, supervisor_tool_definitions,
 };
 use crate::mcp::{McpClient, McpServerConfig};
 
@@ -531,46 +530,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
     // `luna+xhigh` workers under a default-effort supervisor.
     let supervisor_reasoning_effort = config.supervisor_reasoning_effort.as_deref();
     let original_task = asgard_original_task(&initial_messages);
-    // Intake is an ablation knob for measuring what the two-reader spec
-    // pass is worth: `ASGARD_INTAKE=0` skips it and hands the supervisor the
-    // bare task. `initial_permanent_user_message` already renders the
-    // no-contract case, so nothing downstream needs to know.
-    let intake_enabled = intake_enabled_from(std::env::var("ASGARD_INTAKE").ok().as_deref());
-    let (intake_contracts, intake_usages) = if intake_enabled {
-        run_asgard_intake(AsgardIntakeRun {
-            cx,
-            sessions,
-            session_id,
-            llm,
-            parent_cwd: parent_registry.cwd(),
-            config,
-            selected_model,
-            reasoning_effort,
-            service_tier,
-            structured_output,
-            idle_timeout,
-            cancel: cancel.clone(),
-            live_output: &live_output,
-            original_task: &original_task,
-            context_length,
-            context_prefix_len,
-        })
-        .await
-    } else {
-        tracing::info!("ASGARD_INTAKE disabled; supervisor starts from the bare task");
-        (
-            crate::asgard::IntakeContracts {
-                literal: None,
-                grounded: None,
-            },
-            Vec::new(),
-        )
-    };
     let mut aggregate_usage = TokenUsage::default();
-    for (model, usage) in intake_usages {
-        add_usage(&mut aggregate_usage, &mut usage_by_model, &model, usage);
-    }
-    let has_intake = intake_contracts.literal.is_some() || intake_contracts.grounded.is_some();
     let supervisor_system = supervisor_system_message(
         initial_messages
             .first()
@@ -583,7 +543,7 @@ pub(crate) async fn run_asgard_trajectory_loop(
         base_commit.clone(),
         parent_registry.cwd().to_path_buf(),
     );
-    let initial_permanent_user = initial_permanent_user_message(&original_task, &intake_contracts);
+    let initial_permanent_user = initial_permanent_user_message(&original_task);
     let mut permanent = vec![
         ChatMessage::system(supervisor_system),
         ChatMessage::user(initial_permanent_user),
@@ -653,11 +613,9 @@ pub(crate) async fn run_asgard_trajectory_loop(
             !pending_windows.is_empty(),
             dag.checkpoint_labels().is_empty(),
         ) {
-            (false, true) => Some(if has_intake {
-                "No workers exist yet. First resolve the spec intake into a numbered obligations ledger via update_plan, then spawn 1 to 8 workers from \"root\"."
-            } else {
-                "No workers exist yet. Spawn 1 to 8 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading."
-            }),
+            (false, true) => Some(
+                "No workers exist yet. Spawn 1 to 8 workers from \"root\" to begin. Consider dedicating the first worker to pinning the specification: tests written from the task text alone that lock in every detail that admits more than one reading.",
+            ),
             (false, false) => Some("No worker is awaiting review. Spawn workers or finalize."),
             _ => None,
         };
@@ -2272,43 +2230,11 @@ pub(crate) fn asgard_original_task(initial_messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the intake pass runs, given the raw `ASGARD_INTAKE` value.
-/// Absent means enabled, so the ablation has to be asked for explicitly.
-fn intake_enabled_from(value: Option<&str>) -> bool {
-    !matches!(value, Some("0") | Some("off") | Some("false"))
-}
-
-fn initial_permanent_user_message(
-    original_task: &str,
-    contracts: &crate::asgard::IntakeContracts,
-) -> String {
-    let base = format!(
+fn initial_permanent_user_message(original_task: &str) -> String {
+    format!(
         "<task>\n{original_task}\n</task>\n\
          The repository's starting state is checkpoint \"root\"."
-    );
-    if contracts.literal.is_none() && contracts.grounded.is_none() {
-        return base;
-    }
-
-    let mut message = format!(
-        "{base}\n\n\
-         <spec_intake>\n\
-         Before this run began, two independent readers examined the task. Reader L read \
-         the task text alone with no repository access; Reader G examined the repository \
-         for evidence that constrains interpretation. Neither saw the other's report.\n"
-    );
-    if let Some(literal) = &contracts.literal {
-        message.push_str("<literal_contract>\n");
-        message.push_str(literal);
-        message.push_str("\n</literal_contract>\n");
-    }
-    if let Some(grounded) = &contracts.grounded {
-        message.push_str("<grounded_contract>\n");
-        message.push_str(grounded);
-        message.push_str("\n</grounded_contract>\n");
-    }
-    message.push_str("</spec_intake>");
-    message
+    )
 }
 
 fn render_batch_review_message(
@@ -2587,15 +2513,6 @@ mod tests {
         LlmResponse::Text {
             text: text.to_string(),
             reasoning_content: None,
-            usage: TokenUsage::default(),
-        }
-    }
-
-    fn empty_intake_response() -> LlmResponse {
-        LlmResponse::ToolCalls {
-            text: String::new(),
-            reasoning_content: None,
-            calls: vec![tool_call("empty-intake-tool-call")],
             usage: TokenUsage::default(),
         }
     }
@@ -2960,151 +2877,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asgard_intake_injects_contracts_and_uses_read_only_tools() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).expect("create repo dir");
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write README");
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-
-        let sessions = SessionStore::new("worker-model".to_string());
-        let session = sessions.create_session(repo.clone()).await;
-        let parent_registry = sessions
-            .get_or_create_registry(&session.id, repo.clone())
-            .await
-            .expect("parent registry");
-        let allowlist = crate::asgard::intake_read_only_allowlist(&parent_registry).await;
-        assert!(allowlist.contains("read_file"));
-        assert!(!allowlist.contains("run_shell_command"));
-        assert!(!allowlist.contains("write_file"));
-        assert!(!allowlist.contains("edit"));
-        assert!(!allowlist.contains("update_plan"));
-
-        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
-            (
-                "sv-model",
-                vec![
-                    text_response("literal contract text"),
-                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "report")]),
-                    text_response("w1 launched"),
-                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
-                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
-                    text_response("idle two"),
-                    text_response("idle three"),
-                    text_response("idle four"),
-                    text_response("idle five"),
-                    text_response("idle six"),
-                    text_response("idle seven"),
-                ],
-            ),
-            (
-                "worker-model",
-                vec![
-                    text_response("grounded contract text"),
-                    text_response("worker final report"),
-                ],
-            ),
-        ]));
-        let _ = run_scripted_asgard(
-            repo.clone(),
-            backend.clone(),
-            vec![ChatMessage::user("implement intake test")],
-        )
-        .await;
-
-        {
-            let requests = backend.requests.lock().expect("requests");
-            let supervisor_request = requests
-                .iter()
-                .find(|request| {
-                    request.model == "sv-model"
-                        && request
-                            .tool_names
-                            .iter()
-                            .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
-                })
-                .expect("supervisor request");
-            let initial_user = supervisor_request.messages[1].content_text();
-            assert!(initial_user.contains("<spec_intake>"));
-            assert!(
-                initial_user
-                    .contains("<literal_contract>\nliteral contract text\n</literal_contract>")
-            );
-            assert!(
-                initial_user
-                    .contains("<grounded_contract>\ngrounded contract text\n</grounded_contract>")
-            );
-        }
-
-        let temp_failure = tempfile::tempdir().expect("tempdir");
-        let repo_failure = temp_failure.path().join("repo");
-        fs::create_dir(&repo_failure).expect("create repo dir");
-        run_git(&repo_failure, &["init", "--quiet"]);
-        run_git(
-            &repo_failure,
-            &["config", "user.email", "asgard@example.invalid"],
-        );
-        run_git(&repo_failure, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo_failure.join("README.md"), "hello\n").expect("write README");
-        run_git(&repo_failure, &["add", "README.md"]);
-        run_git(&repo_failure, &["commit", "--quiet", "-m", "initial"]);
-
-        let failure_backend = Arc::new(ScriptedAsgardBackend::new(vec![
-            (
-                "sv-model",
-                vec![
-                    empty_intake_response(),
-                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "report")]),
-                    text_response("w1 launched"),
-                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
-                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
-                    text_response("idle two"),
-                    text_response("idle three"),
-                    text_response("idle four"),
-                    text_response("idle five"),
-                    text_response("idle six"),
-                    text_response("idle seven"),
-                ],
-            ),
-            (
-                "worker-model",
-                vec![
-                    text_response("grounded only contract"),
-                    text_response("worker final report"),
-                ],
-            ),
-        ]));
-        let _ = run_scripted_asgard(
-            repo_failure,
-            failure_backend.clone(),
-            vec![ChatMessage::user("implement intake failure test")],
-        )
-        .await;
-        let failure_requests = failure_backend.requests.lock().expect("failure requests");
-        let failure_supervisor_request = failure_requests
-            .iter()
-            .find(|request| {
-                request.model == "sv-model"
-                    && request
-                        .tool_names
-                        .iter()
-                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
-            })
-            .expect("failure supervisor request");
-        let failure_initial_user = failure_supervisor_request.messages[1].content_text();
-        assert!(failure_initial_user.contains("<spec_intake>"));
-        assert!(!failure_initial_user.contains("<literal_contract>"));
-        assert!(
-            failure_initial_user
-                .contains("<grounded_contract>\ngrounded only contract\n</grounded_contract>")
-        );
-    }
-
-    #[tokio::test]
     async fn dirty_parent_tree_refuses_before_any_llm_or_worker_activity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -3117,11 +2889,11 @@ mod tests {
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
 
         // Uncommitted tracked-file edit: the tree is dirty from Asgard's
-        // point of view at the very start of the loop, before intake.
+        // point of view at the very start of the loop.
         fs::write(repo.join("README.md"), "hello\nlocal edit\n").expect("dirty README");
 
         // No scripted responses registered for either model: if the loop
-        // reaches intake or the supervisor at all, the backend panics on an
+        // reaches the supervisor at all, the backend panics on an
         // empty response queue, failing the test loudly rather than
         // silently passing.
         let backend = Arc::new(ScriptedAsgardBackend::new(vec![]));
@@ -3157,92 +2929,6 @@ mod tests {
             backend.requests.lock().expect("requests").is_empty(),
             "no LLM requests should have been made"
         );
-    }
-
-    #[tokio::test]
-    async fn asgard_grounded_intake_forces_report_after_step_cap() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir(&repo).expect("create repo dir");
-        run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "asgard@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Asgard Test"]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write README");
-        run_git(&repo, &["add", "README.md"]);
-        run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
-
-        let mut worker_responses = Vec::new();
-        for index in 0..crate::asgard::ASGARD_INTAKE_MAX_STEPS {
-            worker_responses.push(tool_response(vec![named_tool_call(
-                &format!("intake-read-{index}"),
-                "read_file",
-                serde_json::json!({ "file_path": "README.md" }),
-            )]));
-        }
-        worker_responses.push(text_response(
-            "1. forced grounded report from observed README",
-        ));
-        worker_responses.push(text_response("worker final report"));
-
-        let backend = Arc::new(ScriptedAsgardBackend::new(vec![
-            (
-                "sv-model",
-                vec![
-                    text_response("literal contract text"),
-                    tool_response(vec![spawn_call("sv-spawn-w1", "root", "report")]),
-                    text_response("w1 launched"),
-                    tool_response(vec![finalize_call("sv-finalize", "w1")]),
-                    tool_response(vec![finalize_call("sv-finalize-again", "w1")]),
-                    text_response("idle two"),
-                    text_response("idle three"),
-                    text_response("idle four"),
-                ],
-            ),
-            ("worker-model", worker_responses),
-        ]));
-        let _ = run_scripted_asgard(
-            repo,
-            backend.clone(),
-            vec![ChatMessage::user("implement intake forced report test")],
-        )
-        .await;
-
-        let requests = backend.requests.lock().expect("requests");
-        let fallback_request = requests
-            .iter()
-            .find(|request| {
-                request.model == "worker-model"
-                    && request.tool_names.is_empty()
-                    && request.messages.last().is_some_and(|message| {
-                        message
-                            .content_text()
-                            .contains("Write your numbered report now")
-                    })
-            })
-            .expect("forced grounded intake fallback request");
-        assert!(
-            fallback_request
-                .messages
-                .last()
-                .expect("fallback user message")
-                .content_text()
-                .contains("Do not call any tools.")
-        );
-
-        let supervisor_request = requests
-            .iter()
-            .find(|request| {
-                request.model == "sv-model"
-                    && request
-                        .tool_names
-                        .iter()
-                        .any(|name| name == crate::asgard::SPAWN_WORKERS_TOOL)
-            })
-            .expect("supervisor request");
-        let initial_user = supervisor_request.messages[1].content_text();
-        assert!(initial_user.contains(
-            "<grounded_contract>\n1. forced grounded report from observed README\n</grounded_contract>"
-        ));
     }
 
     #[tokio::test]
@@ -3638,7 +3324,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
                     text_response("w1 launched"),
                     tool_response(vec![finalize_call_with_evidence(
@@ -3661,7 +3346,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-test",
                         "run_shell_command",
@@ -3710,7 +3394,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
                     text_response("w1 launched"),
                     tool_response(vec![
@@ -3728,7 +3411,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-test",
                         "run_shell_command",
@@ -3793,7 +3475,6 @@ mod tests {
                 (
                     "sv-model",
                     vec![
-                        text_response("intake literal"),
                         tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
                         text_response("w1 launched"),
                         tool_response(vec![
@@ -3810,7 +3491,6 @@ mod tests {
                 (
                     "worker-model",
                     vec![
-                        text_response("intake grounded"),
                         tool_response(vec![named_tool_call(
                             "w1-test",
                             "run_shell_command",
@@ -3908,7 +3588,6 @@ mod tests {
                 (
                     "sv-model",
                     vec![
-                        text_response("intake literal"),
                         tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
                         text_response("w1 launched"),
                         tool_response(vec![
@@ -3925,7 +3604,6 @@ mod tests {
                 (
                     "worker-model",
                     vec![
-                        text_response("intake grounded"),
                         tool_response(vec![
                             write_file_call("w1-write", "a.txt", "a\n"),
                             named_tool_call(
@@ -3995,7 +3673,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "implement")]),
                     text_response("w1 launched"),
                     tool_response(vec![prefinalize_call(
@@ -4022,7 +3699,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-test",
                         "run_shell_command",
@@ -4082,7 +3758,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
                     text_response("w1 launched"),
                     tool_response(vec![
@@ -4123,7 +3798,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![
                         write_file_call("w1-write", "a.txt", "a\n"),
                         named_tool_call(
@@ -4296,7 +3970,6 @@ mod tests {
 
         let backend = Arc::new(ShaCapturingBackend::new(
             vec![
-                text_response("intake literal"),
                 tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
                 text_response("w1 launched"),
                 tool_response(vec![save_call("sv-save-w1")]),
@@ -4313,7 +3986,6 @@ mod tests {
                 // of the transcript itself and finalizes by that hash.
             ],
             vec![
-                text_response("intake grounded"),
                 tool_response(vec![
                     write_file_call("w1-write", "a.txt", "a\n"),
                     named_tool_call(
@@ -4426,7 +4098,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "finish")]),
                     text_response("w1 launched"),
                     tool_response(vec![save_call("sv-save-w1")]),
@@ -4436,10 +4107,7 @@ mod tests {
                     text_response("idle four"),
                 ],
             ),
-            (
-                "worker-model",
-                vec![text_response("intake grounded"), text_response("w1 report")],
-            ),
+            ("worker-model", vec![text_response("w1 report")]),
         ]));
 
         let (outcome, _) = run_scripted_asgard(
@@ -4479,17 +4147,13 @@ mod tests {
                 (
                     "sv-model",
                     vec![
-                        text_response("intake literal"),
                         tool_response(vec![spawn_call("sv-spawn-w1", "root", "finish")]),
                         text_response("w1 launched"),
                         tool_response(vec![save_call("sv-save-w1")]),
                         text_response("w1 saved"),
                     ],
                 ),
-                (
-                    "worker-model",
-                    vec![text_response("intake grounded"), text_response("w1 report")],
-                ),
+                ("worker-model", vec![text_response("w1 report")]),
             ])
             // Every later supervisor turn hits the wall, exactly as the real
             // endpoint behaved for the rest of the day.
@@ -4553,17 +4217,13 @@ mod tests {
                 (
                     "sv-model",
                     vec![
-                        text_response("intake literal"),
                         tool_response(vec![spawn_call("sv-spawn-w1", "root", "finish")]),
                         text_response("w1 launched"),
                         tool_response(vec![save_call("sv-save-w1")]),
                         text_response("w1 saved"),
                     ],
                 ),
-                (
-                    "worker-model",
-                    vec![text_response("intake grounded"), text_response("w1 report")],
-                ),
+                ("worker-model", vec![text_response("w1 report")]),
             ])
             .failing_after_script("sv-model", || {
                 anyhow!("chat completion failed (HTTP 400): missing required field messages")
@@ -4601,7 +4261,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![prefinalize_workers_call(
                         "sv-prefinalize-batch",
                         serde_json::json!([
@@ -4617,13 +4276,7 @@ mod tests {
                     text_response("idle four"),
                 ],
             ),
-            (
-                "worker-model",
-                vec![
-                    text_response("intake grounded"),
-                    text_response("w1 verification"),
-                ],
-            ),
+            ("worker-model", vec![text_response("w1 verification")]),
         ]));
 
         let _ = run_scripted_asgard(
@@ -4666,7 +4319,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     // First prefinalize: no runs_full_suite, no
                     // full_suite_skipped - bounced, nothing spawns.
                     tool_response(vec![uncovered_prefinalize_call(
@@ -4704,7 +4356,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     text_response("w1 verification report"),
                     text_response("w2 verification report"),
                 ],
@@ -4781,7 +4432,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![named_tool_call(
                         "sv-pf-skip",
                         "prefinalize",
@@ -4803,10 +4453,7 @@ mod tests {
             ),
             (
                 "worker-model",
-                vec![
-                    text_response("intake grounded"),
-                    text_response("w1 verification report"),
-                ],
+                vec![text_response("w1 verification report")],
             ),
         ]));
 
@@ -4841,22 +4488,6 @@ mod tests {
         assert_eq!(coverage["skipped_reason_present"], serde_json::json!(true));
     }
 
-    #[test]
-    fn intake_runs_unless_explicitly_disabled() {
-        assert!(intake_enabled_from(None), "absent must mean enabled");
-        assert!(intake_enabled_from(Some("1")));
-        assert!(
-            intake_enabled_from(Some("")),
-            "empty is not a disable request"
-        );
-        for off in ["0", "off", "false"] {
-            assert!(
-                !intake_enabled_from(Some(off)),
-                "{off} should disable intake"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn asgard_v2_scripted_e2e_runs_real_loop_and_checkpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4874,7 +4505,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![
                         update_plan_call("sv-plan", "Create foo.txt", "in_progress"),
                         spawn_call("sv-spawn-w1", "root", "Create foo.txt containing alpha"),
@@ -4911,7 +4541,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![write_file_call("w1-write", "foo.txt", "alpha\n")]),
                     text_response("wrote foo.txt with alpha"),
                     tool_response(vec![write_file_call(
@@ -5035,7 +4664,7 @@ mod tests {
             .filter(|request| request.model == "worker-model")
             .collect::<Vec<_>>();
         assert_eq!(supervisor_requests.len(), 11);
-        assert_eq!(worker_requests.len(), 7);
+        assert_eq!(worker_requests.len(), 6);
         let first_supervisor_system = supervisor_requests[0].messages[0].content_text();
         let session_prompt_pos = first_supervisor_system
             .find("You are a helpful engineer.")
@@ -5152,7 +4781,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "create a")]),
                     text_response("w1 launched"),
                     tool_response(vec![
@@ -5184,7 +4812,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![
                         write_file_call("w1-write", "a.txt", "a\n"),
                         named_tool_call(
@@ -5273,7 +4900,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     // Turn 1: width-1 spawn from root. streak 0 -> 1.
                     tool_response(vec![spawn_call("sv-w1", "root", "probe the failure")]),
                     // Turn 2: width-1 spawn continuing from w1. streak 1 -> 2.
@@ -5338,7 +4964,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     text_response("w1 report"),
                     text_response("w2 report"),
                     text_response("w3 report"),
@@ -5425,7 +5050,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![
                         git_call("sv-git-log", &["log", "--oneline"]),
                         git_call("sv-git-gc", &["gc"]),
@@ -5454,7 +5078,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-test",
                         "run_shell_command",
@@ -5516,7 +5139,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "produce output")]),
                     text_response("w1 launched"),
                     tool_response(vec![
@@ -5547,7 +5169,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     // read_file keeps this fork-free (shell forks fail under
                     // per-uid NPROC pressure on busy hosts).
                     tool_response(vec![
@@ -5677,7 +5298,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call(
                         "sv-spawn-w1",
                         "root",
@@ -5700,7 +5320,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-pwd",
                         "run_shell_command",
@@ -5833,7 +5452,6 @@ mod tests {
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
 
         let mut supervisor_responses = vec![
-            text_response("intake literal"),
             tool_response(vec![spawn_call(
                 "sv-spawn-w1",
                 "root",
@@ -5856,13 +5474,7 @@ mod tests {
 
         let backend = Arc::new(ScriptedAsgardBackend::new(vec![
             ("sv-model", supervisor_responses),
-            (
-                "worker-model",
-                vec![
-                    text_response("intake grounded"),
-                    text_response("w1 final report"),
-                ],
-            ),
+            ("worker-model", vec![text_response("w1 final report")]),
         ]));
         let llm: Arc<dyn crate::llm_client::LlmBackend> = backend.clone();
         let sessions = SessionStore::new("worker-model".to_string());
@@ -6043,7 +5655,6 @@ mod tests {
             (
                 "sv-model",
                 vec![
-                    text_response("intake literal"),
                     tool_response(vec![spawn_call("sv-spawn-w1", "root", "produce output")]),
                     text_response("w1 launched"),
                     tool_response(vec![view_call("sv-view-w1", &["w1m1"])]),
@@ -6059,7 +5670,6 @@ mod tests {
             (
                 "worker-model",
                 vec![
-                    text_response("intake grounded"),
                     tool_response(vec![named_tool_call(
                         "w1-marker",
                         "run_shell_command",

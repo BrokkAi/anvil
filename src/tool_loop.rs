@@ -41,9 +41,8 @@ use crate::train_bifrost::{self, TrainingPacket};
 const MAX_TOOL_RESULT_BYTES: usize = 50_000;
 pub(crate) const TRAIN_BIFROST_ENV: &str = "BRK_TRAIN_BIFROST";
 /// Injected as a plain user message one turn before a trajectory-window run's
-/// (Asgard workers, Asgard intake readers) step budget is exhausted -- see
-/// `trajectory_window_budget_notice`. Wording is shared with
-/// `asgard::intake` so a worker and an intake reader hear the same warning.
+/// (Asgard workers') step budget is exhausted -- see
+/// `trajectory_window_budget_notice`.
 pub(crate) const TRAJECTORY_WINDOW_PENULTIMATE_NOTICE: &str = "Budget notice: this step and \
     one more remain. This is your last step that may call tools - your final step must be your \
     report.";
@@ -4810,8 +4809,7 @@ fn executed_tool_counts(tool_exchanges: &[ToolExchange]) -> Value {
 }
 
 /// The harness user message to inject before this turn's request, if any,
-/// for a trajectory-window run (Asgard workers, Asgard intake's grounded
-/// reader -- see `asgard::intake::read_grounded_contract`).
+/// for a trajectory-window run (Asgard workers).
 ///
 /// Trajectory-window runs never get the live-run `force_text_response`
 /// treatment (that gate is `!trajectory_window` further down in `run`) --

@@ -718,7 +718,7 @@ pub struct ToolRegistry {
     /// time. Ordered; executed by `tool_loop::execute_tool` around each
     /// tool call.
     plugin_hooks: Vec<crate::plugins::HookCommand>,
-    /// Set only for an Asgard worker (or intake reader) trajectory registry:
+    /// Set only for an Asgard worker trajectory registry:
     /// the canonical parent-repo root that the worker's inherited message
     /// chain refers to, which is identical across sibling workers and
     /// generally differs from `cwd` (this worker's own physical worktree
@@ -760,8 +760,8 @@ impl ToolRegistry {
         &self.additional_roots
     }
 
-    /// Record the canonical parent-repo root for an Asgard worker (or
-    /// intake reader) trajectory registry -- see the field doc on
+    /// Record the canonical parent-repo root for an Asgard worker
+    /// trajectory registry -- see the field doc on
     /// `canonical_root`. A no-op past the first call (the registry is
     /// freshly created per launch and this is only ever called once,
     /// immediately after creation).
